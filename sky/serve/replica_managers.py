@@ -3499,7 +3499,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             launch_thread = self._launch_thread_pool[replica_id]
             if launch_thread.is_alive():
                 self._replica_to_launch_cancelled[replica_id] = True
-                start_wait_time = time.time()
+                wait_deadline = (time.monotonic() +
+                                 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
                 timeout_reached = False
                 while True:
                     # Launch request id found. cancel it.
@@ -3514,11 +3515,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # It's possible that the launch thread immediately
                         # finished after we check. Exit the loop now.
                         break
-                    if (time.time() - start_wait_time
-                            > _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS):
+                    remaining = wait_deadline - time.monotonic()
+                    if remaining <= 0:
                         timeout_reached = True
                         break
-                    time.sleep(0.1)
+                    time.sleep(min(0.1, remaining))
                 if timeout_reached:
                     logger.warning(
                         'Failed to cancel launch request for replica '

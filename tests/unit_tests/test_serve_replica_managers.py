@@ -214,6 +214,116 @@ def _fake_replica_info(replica_id, status=None):
     return info
 
 
+class TestLaunchCancellationWait:
+
+    @staticmethod
+    def _run(monkeypatch,
+             launch_thread,
+             *,
+             on_sleep=None,
+             forbid_wall_clock=False):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._resource_scope = None
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._launch_thread_pool[1] = launch_thread
+        # Stop after the launch wait. Down-thread creation is exercised by
+        # the cleanup tests below and would only obscure these timing checks.
+        manager._down_thread_pool[1] = mock.Mock()
+        manager._persist_replica = mock.Mock()
+        info = replica_managers.ReplicaInfo(1, 'svc-1', '8080', False, None, 1,
+                                            None)
+
+        now = [0.0]
+        sleeps = []
+
+        def _sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+            if on_sleep is not None:
+                on_sleep(manager, len(sleeps))
+
+        fake_time = mock.Mock(wraps=replica_managers.time)
+        fake_time.monotonic.side_effect = lambda: now[0]
+        fake_time.sleep.side_effect = _sleep
+        if forbid_wall_clock:
+            fake_time.time.side_effect = AssertionError('wall clock consulted')
+        monkeypatch.setattr(replica_managers, 'time', fake_time)
+        monkeypatch.setattr(replica_managers,
+                            '_WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS', 0.15)
+        get_info = mock.Mock(return_value=info)
+        monkeypatch.setattr(replica_managers.serve_state,
+                            'get_replica_info_from_id', get_info)
+        cancel = mock.Mock()
+        monkeypatch.setattr(replica_managers.sdk, 'api_cancel', cancel)
+
+        manager._terminate_replica(1,
+                                   sync_down_logs=False,
+                                   replica_drain_delay_seconds=0,
+                                   is_scale_down=True)
+        manager._persist_replica.assert_called_once_with(1, info)
+        get_info.assert_called_once_with('svc', 1)
+        launch_thread.join.assert_called_once_with()
+        return manager, sleeps, cancel, fake_time
+
+    def test_wait_uses_monotonic_clock_and_clamps_final_sleep(
+            self, monkeypatch):
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = True
+
+        _, sleeps, cancel, fake_time = self._run(monkeypatch,
+                                                 launch_thread,
+                                                 forbid_wall_clock=True)
+
+        assert sleeps == pytest.approx([0.1, 0.05])
+        assert fake_time.monotonic.call_count == 4
+        cancel.assert_not_called()
+
+    def test_request_published_at_deadline_is_cancelled(self, monkeypatch):
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = True
+
+        def _publish_request(manager, sleep_count):
+            if sleep_count == 2:
+                manager._replica_to_request_id[1] = 'request-1'
+
+        _, sleeps, cancel, fake_time = self._run(monkeypatch,
+                                                 launch_thread,
+                                                 on_sleep=_publish_request)
+
+        assert sleeps == pytest.approx([0.1, 0.05])
+        assert fake_time.monotonic.call_count == 3
+        cancel.assert_called_once_with('request-1')
+
+    def test_cancellation_acknowledgement_stops_wait(self, monkeypatch):
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = True
+
+        def _acknowledge(manager, _sleep_count):
+            manager._replica_to_launch_cancelled.pop(1)
+
+        _, sleeps, cancel, fake_time = self._run(monkeypatch,
+                                                 launch_thread,
+                                                 on_sleep=_acknowledge)
+
+        assert sleeps == [0.1]
+        assert fake_time.monotonic.call_count == 2
+        cancel.assert_not_called()
+
+    def test_launch_thread_completion_stops_without_sleep(self, monkeypatch):
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.side_effect = [True, False]
+
+        _, sleeps, cancel, fake_time = self._run(monkeypatch, launch_thread)
+
+        assert not sleeps
+        assert fake_time.monotonic.call_count == 1
+        cancel.assert_not_called()
+
+
 def _record_launch(launched):
     """A _launch_replica side_effect that records the allocated replica id.
 
