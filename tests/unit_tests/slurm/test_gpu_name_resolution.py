@@ -1,16 +1,43 @@
 """Tests for Slurm GPU name canonicalization and resolution."""
 
+import pickle
 from unittest import mock
 
 import pytest
 
 from sky.adaptors.slurm import NodeInfo
 from sky.exceptions import ResourcesUnavailableError
+from sky.provision.slurm import utils as slurm_utils
 from sky.provision.slurm.utils import _accelerator_name_matches_slurm
+from sky.provision.slurm.utils import _is_segment_subsequence
 from sky.provision.slurm.utils import _normalize_gpu_name
 from sky.provision.slurm.utils import canonicalize_raw_gpu_name
 from sky.provision.slurm.utils import check_instance_fits
 from sky.provision.slurm.utils import resolve_gres_gpu_type
+
+
+@pytest.mark.parametrize('segments,source,expected', [
+    (['h100'], ['h100', '80gb', 's'], True),
+    (['a100', '80gb'], ['a100', 'sxm4', '80gb'], True),
+    (['v100', '32gb'], ['v100', 'pcie', '16gb'], False),
+    (['l4'], ['l40'], False),
+    ([], ['h100'], True),
+])
+def test_segment_subsequence_characterization(segments, source, expected):
+    assert _is_segment_subsequence(segments, source) is expected
+
+
+@pytest.mark.parametrize('symbol_name', [
+    'get_gpu_type_and_count',
+    '_normalize_gpu_name',
+    '_is_segment_subsequence',
+    '_accelerator_name_matches_slurm',
+    'canonicalize_raw_gpu_name',
+])
+def test_gpu_helper_facade_identity_is_pickle_stable(symbol_name):
+    symbol = getattr(slurm_utils, symbol_name)
+    assert symbol.__module__ == 'sky.provision.slurm.utils'
+    assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
 class TestNormalizeGpuName:
@@ -111,7 +138,7 @@ def _node(name: str,
 @mock.patch('sky.provision.slurm.utils.get_cluster_default_partition',
             return_value='gpu')
 @mock.patch('sky.provision.slurm.utils.get_slurm_nodes_info')
-class TestResolveGresGpuType:
+class TestResolveGresGpuType:  # pylint: disable=unused-argument
     """Tests for resolve_gres_gpu_type."""
 
     @pytest.mark.parametrize(
