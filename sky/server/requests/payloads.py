@@ -742,6 +742,7 @@ class ServeUpBody(RequestBody):
             dag.tasks) == 1, ('Must only specify one task in the DAG for '
                               'a service.', dag)
         kwargs['task'] = dag.tasks[0]
+        kwargs['submitted_yaml_content'] = self.task
         return kwargs
 
 
@@ -762,6 +763,7 @@ class ServeUpdateBody(RequestBody):
             dag.tasks) == 1, ('Must only specify one task in the DAG for '
                               'a service.', dag)
         kwargs['task'] = dag.tasks[0]
+        kwargs['submitted_yaml_content'] = self.task
         return kwargs
 
 

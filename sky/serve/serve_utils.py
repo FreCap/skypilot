@@ -1363,6 +1363,13 @@ def generate_remote_tmp_task_yaml_file_name(service_name: str,
     return os.path.join(dir_name, 'task.yaml.tmp')
 
 
+def generate_remote_tmp_submitted_task_yaml_file_name(service_name: str,
+                                                      resource_scope: str |
+                                                      None = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
+    return os.path.join(dir_name, 'submitted_task.yaml.tmp')
+
+
 def generate_task_yaml_file_name(service_name: str,
                                  version: int,
                                  expand_user: bool = True,
@@ -1371,6 +1378,17 @@ def generate_task_yaml_file_name(service_name: str,
     if expand_user:
         dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'task_v{version}.yaml')
+
+
+def generate_submitted_task_yaml_file_name(
+        service_name: str,
+        version: int,
+        expand_user: bool = True,
+        resource_scope: str | None = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
+    if expand_user:
+        dir_name = os.path.expanduser(dir_name)
+    return os.path.join(dir_name, f'submitted_task_v{version}.yaml')
 
 
 def generate_remote_config_yaml_file_name(service_name: str,
@@ -1570,7 +1588,8 @@ def update_service_encoded(service_name: str,
                            mode: str,
                            pool: bool,
                            expected_service_hash: str | None = None,
-                           expected_lifecycle_epoch: int | None = None) -> str:
+                           expected_lifecycle_epoch: int | None = None,
+                           has_submitted_yaml: bool = False) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
@@ -1595,6 +1614,8 @@ def update_service_encoded(service_name: str,
         request_body['service_hash'] = expected_service_hash
     if expected_lifecycle_epoch is not None:
         request_body['lifecycle_epoch'] = expected_lifecycle_epoch
+    if has_submitted_yaml:
+        request_body['has_submitted_yaml'] = True
     resp = _post_to_controller_with_retry(
         service_name,
         service_hash,

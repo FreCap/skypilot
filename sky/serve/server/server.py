@@ -19,6 +19,7 @@ from sky.users import permission
 from sky.users import rbac
 from sky.utils import common
 from sky.utils import debug_dump_helpers
+from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
@@ -36,6 +37,21 @@ def _require_admin(request: fastapi.Request) -> None:
             detail='Only admins can view or elect service versions.')
 
 
+def _redact_version_yaml(yaml_content: str | None,
+                         stable_order: bool = False) -> str | None:
+    if yaml_content is None:
+        return None
+    if stable_order:
+        try:
+            documents = list(yaml_utils.safe_load_all(yaml_content))
+            config = (documents[0] if len(documents) == 1 and
+                      isinstance(documents[0], dict) else documents)
+            yaml_content = yaml_utils.dump_yaml_str(config, sort_keys=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+    return debug_dump_helpers.redact_task_yaml(yaml_content)
+
+
 def _service_version_history(service_name: str) -> dict:
     """Return redacted immutable versions and current rollout state."""
     record = serve_state.get_service_from_name(service_name)
@@ -51,8 +67,10 @@ def _service_version_history(service_name: str) -> dict:
         spec = version_record['spec']
         versions.append({
             'version': version,
-            'yaml_content': debug_dump_helpers.redact_task_yaml(
-                version_record['yaml_content']),
+            'submitted_yaml_content': _redact_version_yaml(
+                version_record['submitted_yaml_content']),
+            'compiled_yaml_content': _redact_version_yaml(
+                version_record['yaml_content'], stable_order=True),
             'created_at': version_record['created_at'],
             'created_by': version_record['created_by'],
             'policy':

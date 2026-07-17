@@ -32,6 +32,9 @@ setup: |
 
 file_mounts:
   {{remote_task_yaml_path}}: {{local_task_yaml_path}}
+  {%- if local_submitted_task_yaml_path is not none %}
+  {{remote_submitted_task_yaml_path}}: {{local_submitted_task_yaml_path}}
+  {%- endif %}
   {%- if local_user_config_path is not none %}
   {{remote_user_config_path}}: {{local_user_config_path}}
   {%- endif %}
@@ -78,6 +81,9 @@ run: |
     --lifecycle-epoch {{lifecycle_epoch}} \
     {%- endif %}
     --task-yaml {{remote_task_yaml_path}} \
+    {%- if remote_submitted_task_yaml_path is not none %}
+    --submitted-task-yaml {{remote_submitted_task_yaml_path}} \
+    {%- endif %}
     --entrypoint {{entrypoint}} \
     {%- if consolidation_mode_job_id is not none %}
     --job-id {{consolidation_mode_job_id}} \

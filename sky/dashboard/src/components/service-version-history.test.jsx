@@ -40,7 +40,9 @@ const history = {
   versions: [
     {
       version: 3,
-      yaml_content: 'service:\n  min_replicas: 3\n  max_replicas: 10',
+      submitted_yaml_content: 'service:\n  min_replicas: 3\n  max_replicas: 10',
+      compiled_yaml_content:
+        'resources:\n  accelerators: L4\nservice:\n  max_replicas: 10\n  min_replicas: 3',
       created_at: 1784240584,
       created_by: 'test',
       policy: 'Autoscaling from 0 to 1000 replicas',
@@ -49,7 +51,9 @@ const history = {
     },
     {
       version: 1,
-      yaml_content: 'service:\n  min_replicas: 1\n  max_replicas: 10',
+      submitted_yaml_content: 'service:\n  min_replicas: 1\n  max_replicas: 10',
+      compiled_yaml_content:
+        'resources:\n  accelerators: A100\nservice:\n  max_replicas: 10\n  min_replicas: 1',
       created_at: null,
       created_by: null,
       policy: 'Fixed 1 replica',
@@ -90,7 +94,7 @@ it('reports when the selected and elected YAML are identical', async () => {
       history.versions[0],
       {
         ...history.versions[1],
-        yaml_content: history.versions[0].yaml_content,
+        submitted_yaml_content: history.versions[0].submitted_yaml_content,
       },
     ],
   });
@@ -100,6 +104,38 @@ it('reports when the selected and elected YAML are identical', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
 
   expect(screen.getByText('These versions have identical YAML.')).toBeTruthy();
+});
+
+it('compares submitted YAML by default and can compare compiled YAML', async () => {
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  expect(screen.getByTestId('diff-changed-row')).toHaveTextContent('3');
+
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(screen.getAllByTestId('diff-changed-row').length).toBeGreaterThan(0);
+  expect(screen.getByText(/L4/)).toBeTruthy();
+  expect(screen.getByText(/A100/)).toBeTruthy();
+});
+
+it('directs legacy versions without submitted YAML to compiled comparison', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    versions: history.versions.map((version) => ({
+      ...version,
+      submitted_yaml_content: null,
+    })),
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  expect(
+    screen.getByText(/Submitted YAML was not retained/)
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(screen.queryByText(/Submitted YAML was not retained/)).toBeNull();
 });
 
 it('does not offer comparison without an elected baseline', async () => {

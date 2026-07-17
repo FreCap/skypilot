@@ -264,13 +264,15 @@ class TestUpdateServiceStatusLookup:
             version=2,
             mode='rolling',
             pool=False,
-            expected_service_hash='incarnation-a')
+            expected_service_hash='incarnation-a',
+            has_submitted_yaml=True)
 
         get_status.assert_called_once_with('svc',
                                            pool=False,
                                            with_replica_info=False,
                                            with_yaml=False)
         post.assert_called_once()
+        assert post.call_args.kwargs['json']['has_submitted_yaml'] is True
 
 
 class TestGetServiceStatusPickledSummary:

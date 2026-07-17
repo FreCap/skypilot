@@ -23,6 +23,41 @@ from sky.serve import serve_utils
 from sky.utils import yaml_utils
 
 
+def test_update_ignores_stale_submitted_yaml_without_request_declaration():
+    with mock.patch('builtins.open') as open_file:
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {}, 'svc', 5, 'scope')
+
+    assert submitted is None
+    open_file.assert_not_called()
+
+
+def test_update_reads_submitted_yaml_declared_by_request():
+    with mock.patch.object(
+            controller.serve_utils,
+            'generate_submitted_task_yaml_file_name',
+            return_value='/tmp/submitted.yaml'), mock.patch(
+                'builtins.open',
+                mock.mock_open(read_data='service:\n  min_replicas: 2\n')):
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {'has_submitted_yaml': True}, 'svc', 5, 'scope')
+
+    assert submitted == 'service:\n  min_replicas: 2\n'
+
+
+def test_missing_declared_submitted_yaml_does_not_block_update(caplog):
+    with mock.patch.object(
+            controller.serve_utils,
+            'generate_submitted_task_yaml_file_name',
+            return_value='/tmp/missing-submitted.yaml'), mock.patch(
+                'builtins.open', side_effect=FileNotFoundError):
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {'has_submitted_yaml': True}, 'svc', 5, 'scope')
+
+    assert submitted is None
+    assert 'is unavailable' in caplog.text
+
+
 def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
     """The child override must not turn a remote-DB fence into a local one."""
     monkeypatch.delenv(controller.constants.OVERRIDE_CONSOLIDATION_MODE,
@@ -426,6 +461,7 @@ class TestServiceUpdateReconciler:
                                        2,
                                        mock.sentinel.spec,
                                        'service: changed',
+                                       submitted_yaml_content=None,
                                        expected_service_hash='incarnation-a',
                                        expected_lifecycle_epoch=7,
                                        expected_controller_owner=(123,

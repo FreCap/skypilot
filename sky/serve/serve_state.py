@@ -149,6 +149,9 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
     sqlalchemy.Column('yaml_content', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('submitted_yaml_content',
+                      sqlalchemy.Text,
+                      server_default=None),
     sqlalchemy.Column('created_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('created_by', sqlalchemy.Text, server_default=None),
 )
@@ -697,7 +700,8 @@ def add_service(name: str,
                 service_hash: str | None = None,
                 lifecycle_epoch: int | None = None,
                 resource_scope: str | None = None,
-                created_by: str | None = None) -> bool:
+                created_by: str | None = None,
+                submitted_yaml_content: str | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -839,6 +843,7 @@ def add_service(name: str,
                 version=constants.INITIAL_VERSION,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
+                submitted_yaml_content=submitted_yaml_content,
                 created_at=time.time(),
                 created_by=created_by)
             if lifecycle_epoch is None:
@@ -850,7 +855,9 @@ def add_service(name: str,
                     set_={
                         'spec': version_insert_stmt.excluded.spec,
                         'yaml_content':
-                            version_insert_stmt.excluded.yaml_content
+                            version_insert_stmt.excluded.yaml_content,
+                        'submitted_yaml_content':
+                            version_insert_stmt.excluded.submitted_yaml_content
                     })
             session.execute(version_insert_stmt)
             if resource_scope is not None and storage_generation is not None:
@@ -3020,6 +3027,7 @@ def add_or_update_version(
     version: int,
     spec: 'service_spec.SkyServiceSpec',
     yaml_content: str,
+    submitted_yaml_content: str | None = None,
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
@@ -3118,6 +3126,7 @@ def add_or_update_version(
                 version=version,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
+                submitted_yaml_content=submitted_yaml_content,
                 created_at=time.time()))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
@@ -3129,6 +3138,7 @@ def add_or_update_version(
                     version_specs_table.c.yaml_content.is_(None)).values(
                         spec=pickle.dumps(spec),
                         yaml_content=yaml_content,
+                        submitted_yaml_content=submitted_yaml_content,
                         created_at=time.time()))
         if (not identical_retry and semantics_row is not None and
                 uses_logical_replicas):
@@ -3241,6 +3251,7 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
                 version_specs_table.c.version,
                 version_specs_table.c.spec,
                 version_specs_table.c.yaml_content,
+                version_specs_table.c.submitted_yaml_content,
                 version_specs_table.c.created_at,
                 version_specs_table.c.created_by,
             ).where(
@@ -3251,6 +3262,7 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
         'version': row.version,
         'spec': pickle.loads(row.spec) if row.spec is not None else None,
         'yaml_content': row.yaml_content,
+        'submitted_yaml_content': row.submitted_yaml_content,
         'created_at': row.created_at,
         'created_by': row.created_by,
     } for row in rows]
@@ -3265,6 +3277,19 @@ def get_yaml_content(service_name: str, version: int) -> str | None:
                 sqlalchemy.and_(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version))).fetchone()
+    return result[0] if result else None
+
+
+def get_submitted_yaml_content(service_name: str, version: int) -> str | None:
+    """Gets the user-submitted YAML retained for a version."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.submitted_yaml_content).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version == version))).fetchone()
     return result[0] if result else None
 
 

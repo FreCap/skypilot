@@ -147,13 +147,19 @@ function InlineDiff({ baseText, comparisonText, side, wordDiff }) {
 }
 
 function SplitYamlDiff({ elected, selected, onClose }) {
+  const [yamlKind, setYamlKind] = useState('submitted');
+  const yamlField =
+    yamlKind === 'submitted'
+      ? 'submitted_yaml_content'
+      : 'compiled_yaml_content';
+  const yamlAvailable = Boolean(elected[yamlField] && selected[yamlField]);
   const base = useMemo(
-    () => formatYaml(elected.yaml_content),
-    [elected.yaml_content]
+    () => (yamlAvailable ? formatYaml(elected[yamlField]) : ''),
+    [elected, yamlAvailable, yamlField]
   );
   const comparison = useMemo(
-    () => formatYaml(selected.yaml_content),
-    [selected.yaml_content]
+    () => (yamlAvailable ? formatYaml(selected[yamlField]) : ''),
+    [selected, yamlAvailable, yamlField]
   );
   const rows = useMemo(() => {
     return buildSplitDiffRows(base, comparison).map((row) => ({
@@ -175,13 +181,32 @@ function SplitYamlDiff({ elected, selected, onClose }) {
   return (
     <div className="border-t px-3 py-3">
       <div className="mb-2 flex items-center justify-between gap-3 text-sm">
-        <div>
-          <span className="font-medium">
-            Changes from elected v{elected.version}
-          </span>
-          <span className="ml-2 text-gray-500">to v{selected.version}</span>
-          <span className="ml-3 text-green-700">+{additions}</span>
-          <span className="ml-2 text-red-700">-{deletions}</span>
+        <div className="flex items-center gap-3">
+          <div>
+            <span className="font-medium">
+              Changes from elected v{elected.version}
+            </span>
+            <span className="ml-2 text-gray-500">to v{selected.version}</span>
+            {yamlAvailable && (
+              <>
+                <span className="ml-3 text-green-700">+{additions}</span>
+                <span className="ml-2 text-red-700">-{deletions}</span>
+              </>
+            )}
+          </div>
+          <div className="flex rounded-md border p-0.5">
+            {['submitted', 'compiled'].map((kind) => (
+              <Button
+                key={kind}
+                variant={yamlKind === kind ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-6 px-2 text-xs capitalize"
+                onClick={() => setYamlKind(kind)}
+              >
+                {kind}
+              </Button>
+            ))}
+          </div>
         </div>
         <Button
           variant="ghost"
@@ -193,7 +218,13 @@ function SplitYamlDiff({ elected, selected, onClose }) {
         </Button>
       </div>
 
-      {changedRows.length === 0 ? (
+      {!yamlAvailable ? (
+        <div className="rounded-md border bg-gray-50 p-4 text-center text-sm text-gray-500">
+          {yamlKind === 'submitted'
+            ? 'Submitted YAML was not retained for one of these versions. Compare the compiled YAML instead.'
+            : 'Compiled YAML is unavailable for one of these versions.'}
+        </div>
+      ) : changedRows.length === 0 ? (
         <div className="rounded-md border bg-gray-50 p-4 text-center text-sm text-gray-500">
           These versions have identical YAML.
         </div>
@@ -488,6 +519,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
 
       {selected && elected && (
         <SplitYamlDiff
+          key={`${elected.version}-${selected.version}`}
           elected={elected}
           selected={selected}
           onClose={() => setSelectedVersion(null)}

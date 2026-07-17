@@ -513,21 +513,27 @@ def up(
     task: 'task_lib.Task',
     service_name: str | None = None,
     pool: bool = False,
+    submitted_yaml_content: str | None = None,
 ) -> tuple[str, str]:
     """Spins up a service or pool under the cross-pod name lifecycle lock."""
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
     lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
     with lifecycle_lock:
-        return _up_impl(task, service_name, pool, lifecycle_lock)
+        return _up_impl(task, service_name, pool, lifecycle_lock,
+                        submitted_yaml_content)
 
 
-def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
-             lifecycle_lock: Any) -> tuple[str, str]:
+def _up_impl(task: 'task_lib.Task',
+             service_name: str,
+             pool: bool,
+             lifecycle_lock: Any,
+             submitted_yaml_content: str | None = None) -> tuple[str, str]:
     """Run up and eagerly clean only this operation's uncommitted storage."""
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     try:
-        return _up_impl_body(task, service_name, pool, lifecycle_lock)
+        return _up_impl_body(task, service_name, pool, lifecycle_lock,
+                             submitted_yaml_content)
     except BaseException:
         # Non-consolidated pools keep their authoritative Serve DB on the
         # remote jobs controller. Never interpret API-local intents as owners
@@ -538,8 +544,11 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
         raise
 
 
-def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
-                  lifecycle_lock: Any) -> tuple[str, str]:
+def _up_impl_body(task: 'task_lib.Task',
+                  service_name: str,
+                  pool: bool,
+                  lifecycle_lock: Any,
+                  submitted_yaml_content: str | None = None) -> tuple[str, str]:
     """Spins up a service or a pool."""
 
     def _assert_lifecycle_lock(phase: str) -> None:
@@ -654,6 +663,9 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
             prefix=f'service-task-{service_name}-',
             mode='w',
     ) as service_file, tempfile.NamedTemporaryFile(
+            prefix=f'submitted-service-task-{service_name}-',
+            mode='w',
+    ) as submitted_service_file, tempfile.NamedTemporaryFile(
             prefix=f'controller-task-{service_name}-',
             mode='w',
     ) as controller_file:
@@ -661,9 +673,16 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
         controller_name = controller.value.cluster_name
         task_config = task.to_yaml_config()
         yaml_utils.dump_yaml(service_file.name, task_config)
+        if submitted_yaml_content is not None:
+            submitted_service_file.write(submitted_yaml_content)
+            submitted_service_file.flush()
         remote_tmp_task_yaml_path = (
             serve_utils.generate_remote_tmp_task_yaml_file_name(
                 service_name, resource_scope))
+        remote_submitted_task_yaml_path = (
+            serve_utils.generate_remote_tmp_submitted_task_yaml_file_name(
+                service_name, resource_scope)
+            if submitted_yaml_content is not None else None)
         remote_config_yaml_path = (
             serve_utils.generate_remote_config_yaml_file_name(
                 service_name, resource_scope))
@@ -684,6 +703,10 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
         vars_to_fill = {
             'remote_task_yaml_path': remote_tmp_task_yaml_path,
             'local_task_yaml_path': service_file.name,
+            'remote_submitted_task_yaml_path': remote_submitted_task_yaml_path,
+            'local_submitted_task_yaml_path':
+                (submitted_service_file.name
+                 if submitted_yaml_content is not None else None),
             'service_name': service_name,
             'service_incarnation': service_incarnation,
             'created_by': shlex.quote(common_utils.get_current_user_name()),
@@ -943,6 +966,7 @@ def update(
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
     workers: int | None = None,
+    submitted_yaml_content: str | None = None,
 ) -> None:
     """Updates an existing service or pool."""
     # The lifecycle lock is cross-pod on PostgreSQL and lives outside the
@@ -957,7 +981,8 @@ def update(
                          mode,
                          pool,
                          workers,
-                         lifecycle_lock=lifecycle_lock)
+                         lifecycle_lock=lifecycle_lock,
+                         submitted_yaml_content=submitted_yaml_content)
 
 
 def elect_version(service_name: str, version: int, expected_service_hash: str,
@@ -987,12 +1012,15 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
                     f'Committed version {version} does not exist for service '
                     f'{service_name!r}.')
             task = task_lib.Task.from_yaml_str(yaml_content)
+            submitted_yaml_content = serve_state.get_submitted_yaml_content(
+                service_name, version)
             _update_impl(task,
                          service_name,
                          serve_utils.UpdateMode.ROLLING,
                          pool=False,
                          lifecycle_lock=lifecycle_lock,
-                         reuse_task_storage_scope=True)
+                         reuse_task_storage_scope=True,
+                         submitted_yaml_content=submitted_yaml_content)
 
 
 def _assert_service_update_fence(service_name: str, pool: bool,
@@ -1026,6 +1054,7 @@ def _update_impl(
     workers: int | None = None,
     lifecycle_lock: Any | None = None,
     reuse_task_storage_scope: bool = False,
+    submitted_yaml_content: str | None = None,
 ) -> None:
     """Run update and eagerly clean only uncommitted storage generations."""
     if lifecycle_lock is None:
@@ -1033,7 +1062,8 @@ def _update_impl(
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     try:
         _update_impl_body(task, service_name, mode, pool, workers,
-                          lifecycle_lock, reuse_task_storage_scope)
+                          lifecycle_lock, reuse_task_storage_scope,
+                          submitted_yaml_content)
     except BaseException:
         if serve_utils.is_consolidation_mode(pool):
             _cleanup_provisional_storage_intents(service_name, lifecycle_epoch,
@@ -1049,6 +1079,7 @@ def _update_impl_body(
     workers: int | None = None,
     lifecycle_lock: Any | None = None,
     reuse_task_storage_scope: bool = False,
+    submitted_yaml_content: str | None = None,
 ) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
@@ -1253,22 +1284,38 @@ def _update_impl_body(
 
     with tempfile.NamedTemporaryFile(
             prefix=f'{service_name}-v{current_version}',
-            mode='w') as service_file:
+            mode='w') as service_file, tempfile.NamedTemporaryFile(
+                prefix=f'{service_name}-submitted-v{current_version}',
+                mode='w') as submitted_service_file:
         task_config = task.to_yaml_config()
         yaml_utils.dump_yaml(service_file.name, task_config)
+        should_sync_submitted_yaml = (consolidation_mode and
+                                      submitted_yaml_content is not None)
+        if should_sync_submitted_yaml:
+            assert submitted_yaml_content is not None
+            submitted_service_file.write(submitted_yaml_content)
+            submitted_service_file.flush()
         remote_task_yaml_path = serve_utils.generate_task_yaml_file_name(
             service_name,
             current_version,
             expand_user=False,
             resource_scope=service_record.get('resource_scope'))
+        remote_submitted_task_yaml_path = (
+            serve_utils.generate_submitted_task_yaml_file_name(
+                service_name,
+                current_version,
+                expand_user=False,
+                resource_scope=service_record.get('resource_scope')))
 
         with sky_logging.silent():
             _assert_service_update_fence(service_name, pool, handle, backend,
                                          expected_service_hash, lifecycle_lock,
                                          'syncing the update YAML')
-            backend.sync_file_mounts(handle,
-                                     {remote_task_yaml_path: service_file.name},
-                                     storage_mounts=None)
+            files_to_sync = {remote_task_yaml_path: service_file.name}
+            if should_sync_submitted_yaml:
+                files_to_sync[remote_submitted_task_yaml_path] = (
+                    submitted_service_file.name)
+            backend.sync_file_mounts(handle, files_to_sync, storage_mounts=None)
 
         if serve_utils.is_consolidation_mode(pool):
             # Route directly through the shared Serve DB/controller proxy so
@@ -1285,7 +1332,8 @@ def _update_impl_body(
                 pool=pool,
                 expected_service_hash=expected_service_hash,
                 expected_lifecycle_epoch=(
-                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock)))
+                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock)),
+                has_submitted_yaml=should_sync_submitted_yaml)
         else:
             use_legacy = not handle.is_grpc_enabled_with_flag
 

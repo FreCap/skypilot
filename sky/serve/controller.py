@@ -96,6 +96,24 @@ def _make_controller_owner_dependency(
     return _verify
 
 
+def _read_declared_submitted_yaml(request_data: dict[str, Any],
+                                  service_name: str, version: int,
+                                  resource_scope: str | None) -> str | None:
+    """Read only the submitted YAML declared by this update request."""
+    if request_data.get('has_submitted_yaml') is not True:
+        return None
+    path = serve_utils.generate_submitted_task_yaml_file_name(
+        service_name, version, resource_scope=resource_scope)
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except OSError as e:
+        logger.warning(
+            'Submitted YAML declared for service %r version %s '
+            'is unavailable at %s: %s', service_name, version, path, e)
+        return None
+
+
 class AutoscalerInfoFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -1897,11 +1915,15 @@ class SkyServeController:
         raise RuntimeError('Timed out waiting for the stable load balancer '
                            'selector mode transition to commit.')
 
-    def _commit_service_update(self, version: int, service: Any,
-                               yaml_content: str,
-                               update_mode: serve_utils.UpdateMode,
-                               requested_service_hash: str | None,
-                               lifecycle_epoch: int | None) -> fastapi.Response:
+    def _commit_service_update(
+            self,
+            version: int,
+            service: Any,
+            yaml_content: str,
+            update_mode: serve_utils.UpdateMode,
+            requested_service_hash: str | None,
+            lifecycle_epoch: int | None,
+            submitted_yaml_content: str | None = None) -> fastapi.Response:
         """Durably accept one immutable version and schedule its apply."""
         authoritative_retry_service = None
         persisted_yaml = serve_state.get_yaml_content(self._service_name,
@@ -1962,6 +1984,7 @@ class SkyServeController:
             version,
             service,
             yaml_content,
+            submitted_yaml_content=submitted_yaml_content,
             expected_service_hash=(requested_service_hash or
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
@@ -2460,6 +2483,9 @@ class SkyServeController:
                     resource_scope=self._resource_scope)
                 with open(latest_task_yaml, encoding='utf-8') as f:
                     yaml_content = f.read()
+                submitted_yaml_content = _read_declared_submitted_yaml(
+                    request_data, self._service_name, version,
+                    self._resource_scope)
                 service = self._load_service_for_update(version, yaml_content)
                 requested_service_hash = request_data.get('service_hash')
                 lifecycle_epoch = request_data.get('lifecycle_epoch')
@@ -2473,7 +2499,8 @@ class SkyServeController:
                 return self._commit_service_update(version, service,
                                                    yaml_content, update_mode,
                                                    requested_service_hash,
-                                                   lifecycle_epoch)
+                                                   lifecycle_epoch,
+                                                   submitted_yaml_content)
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')

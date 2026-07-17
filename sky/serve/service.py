@@ -1162,7 +1162,8 @@ def _start(service_name: str,
            entrypoint: str,
            requested_incarnation: str | None = None,
            lifecycle_epoch: int | None = None,
-           created_by: str | None = None):
+           created_by: str | None = None,
+           submitted_task_yaml: str | None = None):
     """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
@@ -1257,6 +1258,9 @@ def _start(service_name: str,
             yaml_content = _read_yaml_content(tmp_task_yaml)
     else:
         yaml_content = _read_yaml_content(tmp_task_yaml)
+    submitted_yaml_content = (_read_yaml_content(submitted_task_yaml)
+                              if not is_recovery and
+                              submitted_task_yaml is not None else None)
 
     # Initialize database record for the service.
     authoritative_service_spec = (recovery_snapshot[1]
@@ -1361,7 +1365,8 @@ def _start(service_name: str,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
-                    created_by=created_by)
+                    created_by=created_by,
+                    submitted_yaml_content=submitted_yaml_content)
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):
@@ -1831,6 +1836,9 @@ if __name__ == '__main__':
                         type=str,
                         help='Task YAML file',
                         required=True)
+    parser.add_argument('--submitted-task-yaml',
+                        type=str,
+                        help='User-submitted task YAML file')
     parser.add_argument('--job-id',
                         required=True,
                         type=int,
@@ -1844,4 +1852,5 @@ if __name__ == '__main__':
     # behaviors; 'spawn' is also cross-platform.
     multiprocessing.set_start_method('spawn', force=True)
     _start(args.service_name, args.task_yaml, args.job_id, args.entrypoint,
-           args.service_incarnation, args.lifecycle_epoch, args.created_by)
+           args.service_incarnation, args.lifecycle_epoch, args.created_by,
+           args.submitted_task_yaml)

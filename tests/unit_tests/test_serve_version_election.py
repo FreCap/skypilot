@@ -9,6 +9,7 @@ import pytest
 from sky.serve import serve_utils
 from sky.serve.server import impl
 from sky.serve.server import server
+from sky.server.requests import payloads
 
 
 def test_version_admin_api_rejects_non_admin():
@@ -28,6 +29,27 @@ def test_version_admin_api_allows_auth_disabled_local_server():
     server._require_admin(request)
 
 
+def test_serve_request_retains_submitted_yaml_before_api_processing():
+    task = mock.sentinel.task
+    body = payloads.ServeUpBody(task='service:\n  min_replicas: 2\n',
+                                service_name='svc')
+    with mock.patch.object(payloads.common,
+                           'process_mounts_in_task_on_api_server',
+                           return_value=types.SimpleNamespace(tasks=[task])):
+        kwargs = body.to_kwargs()
+
+    assert kwargs['task'] is task
+    assert kwargs['submitted_yaml_content'] == body.task
+
+
+def test_compiled_yaml_is_redacted_with_stable_key_order():
+    redacted = server._redact_version_yaml('z: value\na: value\n',
+                                           stable_order=True)
+
+    assert redacted is not None
+    assert redacted.index('a: value') < redacted.index('z: value')
+
+
 def test_version_history_marks_elected_and_active_versions():
     record = {
         'pool': False,
@@ -44,7 +66,9 @@ def test_version_history_marks_elected_and_active_versions():
                                'spec': mock.Mock(
                                    autoscaling_policy_str=mock.Mock(
                                        return_value=f'policy-{version}')),
-                               'yaml_content': f'yaml-{version}',
+                               'yaml_content': f'value: yaml-{version}',
+                               'submitted_yaml_content':
+                                   f'submitted-yaml-{version}',
                                'created_at': 1000.0 + version,
                                'created_by': f'user-{version}',
                            } for version in (1, 2, 3)]), \
@@ -57,7 +81,8 @@ def test_version_history_marks_elected_and_active_versions():
     assert history['active_versions'] == [2, 3]
     assert history['versions'] == [{
         'version': 3,
-        'yaml_content': 'redacted-yaml-3',
+        'submitted_yaml_content': 'redacted-submitted-yaml-3',
+        'compiled_yaml_content': 'redacted-value: yaml-3\n',
         'created_at': 1003.0,
         'created_by': 'user-3',
         'policy': 'policy-3',
@@ -65,7 +90,8 @@ def test_version_history_marks_elected_and_active_versions():
         'active': True,
     }, {
         'version': 2,
-        'yaml_content': 'redacted-yaml-2',
+        'submitted_yaml_content': 'redacted-submitted-yaml-2',
+        'compiled_yaml_content': 'redacted-value: yaml-2\n',
         'created_at': 1002.0,
         'created_by': 'user-2',
         'policy': 'policy-2',
@@ -73,7 +99,8 @@ def test_version_history_marks_elected_and_active_versions():
         'active': True,
     }, {
         'version': 1,
-        'yaml_content': 'redacted-yaml-1',
+        'submitted_yaml_content': 'redacted-submitted-yaml-1',
+        'compiled_yaml_content': 'redacted-value: yaml-1\n',
         'created_at': 1001.0,
         'created_by': 'user-1',
         'policy': 'policy-1',
@@ -102,6 +129,9 @@ def test_elect_version_reuses_safe_update_path():
          mock.patch.object(impl.serve_state,
                            'get_yaml_content',
                            return_value='service: old'), \
+         mock.patch.object(impl.serve_state,
+                           'get_submitted_yaml_content',
+                           return_value='service: submitted'), \
          mock.patch.object(impl.task_lib.Task,
                            'from_yaml_str',
                            return_value=task), \
@@ -113,7 +143,8 @@ def test_elect_version_reuses_safe_update_path():
                                    serve_utils.UpdateMode.ROLLING,
                                    pool=False,
                                    lifecycle_lock=lifecycle_lock,
-                                   reuse_task_storage_scope=True)
+                                   reuse_task_storage_scope=True,
+                                   submitted_yaml_content='service: submitted')
 
 
 def test_elect_version_rejects_stale_service_incarnation():
