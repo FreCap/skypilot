@@ -31,6 +31,39 @@ def _submission_files(tmp_path):
     return dag, user, env
 
 
+@pytest.mark.parametrize('idempotent', [False, True])
+def test_job_done_delegates_atomic_transition_without_preread(idempotent):
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_schedule_state',
+            side_effect=AssertionError('schedule state pre-read used')) as get_state, \
+            mock.patch.object(scheduler.state,
+                              'scheduler_set_done') as set_done:
+        scheduler.job_done(7, idempotent=idempotent)
+
+    get_state.assert_not_called()
+    set_done.assert_called_once_with(7, idempotent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('idempotent', [False, True])
+async def test_job_done_async_delegates_atomic_transition_without_preread(
+        idempotent):
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_schedule_state_async',
+            new_callable=mock.AsyncMock,
+            side_effect=AssertionError('schedule state pre-read used')) as get_state, \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_done_async',
+                new_callable=mock.AsyncMock) as set_done:
+        await scheduler.job_done_async(7, idempotent=idempotent)
+
+    get_state.assert_not_awaited()
+    set_done.assert_awaited_once_with(7, idempotent)
+
+
 @pytest.mark.asyncio
 async def test_scheduled_launch_records_backoff_and_releases_slot():
     starting: set[int] = set()
