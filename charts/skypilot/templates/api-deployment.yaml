@@ -234,6 +234,12 @@ spec:
         - name: SKYPILOT_SERVE_EXTERNAL_LB_ENABLED
           value: {{ ternary "true" "false" $externalLBEnabled | quote }}
         {{- if $externalLBEnabled }}
+        # Charts that emit this marker also install the PDB RBAC required by
+        # default-on two-slot Serve LBs. A newer image paired with an older
+        # chart fails before creating service state instead of failing during
+        # load-balancer boot.
+        - name: SKYPILOT_SERVE_LB_HA_RBAC_READY
+          value: "true"
         # Identity used to mirror the owning pod's image and selected Secret
         # projections onto each per-service external LB Deployment.
         - name: SKYPILOT_POD_NAME

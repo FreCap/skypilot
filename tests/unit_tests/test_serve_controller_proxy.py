@@ -177,6 +177,27 @@ def test_proxy_forwards_history_only_sync_to_distinct_controller_path(
     assert calls[0]['data'] == b'{"request_history": {}}'
 
 
+def test_proxy_forwards_role_heartbeat_to_distinct_controller_path(monkeypatch):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(body=b'{"role":"ACTIVE","generation":1}')
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+    path = '/api/internal/serve/svc/controller/load_balancer_role'
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_role(
+            'svc', _request(path, body=b'{"lb_slot":"a"}')))
+
+    assert response.status_code == 200
+    assert response.body == b'{"role":"ACTIVE","generation":1}'
+    assert len(calls) == 1
+    assert calls[0]['url'] == (
+        'http://10.2.3.4:20001/controller/load_balancer_role')
+    assert calls[0]['data'] == b'{"lb_slot":"a"}'
+
+
 def test_proxy_rejects_response_if_owner_changes(monkeypatch):
     _patch_owner_reads(monkeypatch, [
         _owner(),
@@ -305,11 +326,13 @@ def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
 
 @pytest.mark.parametrize('path,expected', [
     ('/api/internal/serve/svc/controller/load_balancer_sync', True),
+    ('/api/internal/serve/svc/controller/load_balancer_role', True),
     ('/api/internal/serve/svc/controller/'
      'load_balancer_request_history_sync', True),
     ('/api/internal/serve//controller/load_balancer_sync', False),
     ('/api/internal/serve//controller/'
      'load_balancer_request_history_sync', False),
+    ('/api/internal/serve//controller/load_balancer_role', False),
     ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
     ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
     ('/api/internal/serve/svc/controller/update_service', False),
@@ -322,6 +345,8 @@ def test_internal_route_is_hidden_from_openapi():
     app = fastapi.FastAPI()
     app.include_router(controller_proxy.router)
     assert controller_proxy.CONTROLLER_SYNC_ROUTE_PATH not in app.openapi(
+    )['paths']
+    assert controller_proxy.CONTROLLER_ROLE_ROUTE_PATH not in app.openapi(
     )['paths']
     assert (controller_proxy.CONTROLLER_HISTORY_SYNC_ROUTE_PATH
             not in app.openapi()['paths'])
@@ -389,6 +414,38 @@ def test_api_server_history_route_uses_sync_auth(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {'request_history_accepted': True}
+    assert len(calls) == 1
+
+
+def test_api_server_role_route_uses_sync_auth(monkeypatch):
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',))
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(body=b'{"role":"ACTIVE","generation":1}')
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+    path = '/api/internal/serve/svc/controller/load_balancer_role'
+    client = testclient.TestClient(server.app)
+
+    rejected = client.post(path,
+                           headers={'Authorization': 'Bearer wrong'},
+                           json={'lb_slot': 'a'})
+    assert rejected.status_code == 401
+    assert not calls
+
+    response = client.post(
+        path,
+        headers={
+            'Authorization': 'Bearer sync-token',
+            constants.SERVICE_HASH_HEADER: 'service-incarnation-a',
+        },
+        json={'lb_slot': 'a'})
+
+    assert response.status_code == 200
+    assert response.json() == {'role': 'ACTIVE', 'generation': 1}
     assert len(calls) == 1
 
 

@@ -524,7 +524,8 @@ class TestRunCleanupAndFinalizeDeletesLb:
             'svc',
             expected_service_hash='incarnation-a',
             require_runtime=True,
-            expected_api_deployment_uid='api-deployment-uid')
+            expected_api_deployment_uid='api-deployment-uid',
+            high_availability=False)
 
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
         with mock.patch('sky.serve.service._cleanup',
@@ -601,7 +602,8 @@ class TestRunCleanupAndFinalizeDeletesLb:
             'svc',
             expected_service_hash='incarnation-a',
             require_runtime=True,
-            expected_api_deployment_uid='api-deployment-uid')
+            expected_api_deployment_uid='api-deployment-uid',
+            high_availability=False)
 
 
 def test_stale_bootstrap_incarnation_is_rejected_before_file_or_lb_work():

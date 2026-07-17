@@ -227,12 +227,25 @@ SkyPilot uses a client-server model with API versioning:
 The central/API-server database is PostgreSQL-only. SQLite support for this
 database path is deprecated.
 
+- Do not consider SQLite as a design, implementation, migration, or test target
+  for central/API-server state when PostgreSQL is available. Avoid compatibility
+  branches, fallback behavior, and speculative SQLite coverage in that scope.
 - New central/API-server tables and migrations must target PostgreSQL. Do not
   add SQLite compatibility code or SQLite-specific tests for them.
 - Store centralized operational history, including minute-level Serve replica
   status snapshots, in PostgreSQL when that data is already collected.
 - Keep this scope distinct from local or controller databases that still
   officially support SQLite.
+
+### SkyServe External Load Balancer Policy
+
+- Warm-standby external load balancer high availability is the default for new
+  non-pool services. Do not introduce new opt-in-only paths for this topology.
+- Existing persisted services retain their durable load balancer mode until an
+  explicit update runs the PostgreSQL-backed migration or rollback protocol.
+  Unrelated updates and old pickles must not silently change that mode.
+- Pools have no inference endpoint and remain outside the two-slot load
+  balancer topology.
 
 ### Protobuf Regeneration
 

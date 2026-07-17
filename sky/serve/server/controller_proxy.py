@@ -9,12 +9,16 @@ from shared Serve state for every sync.
 
 import asyncio
 import ipaddress
+import json
+import time
+from typing import Any
 
 import aiohttp
 import fastapi
 
 from sky import sky_logging
 from sky.serve import constants
+from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -22,19 +26,19 @@ logger = sky_logging.init_logger(__name__)
 
 router = fastapi.APIRouter()
 
-CONTROLLER_SYNC_ROUTE_PATH = (
-    '/api/internal/serve/{service_name}/controller/load_balancer_sync')
-CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (
-    '/api/internal/serve/{service_name}/controller/'
-    'load_balancer_request_history_sync')
+_CONTROLLER_PROXY_ROUTE_PREFIX = '/api/internal/serve/{service_name}'
+CONTROLLER_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
+                              constants.LB_CONTROLLER_SYNC_PATH)
+CONTROLLER_ROLE_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
+                              constants.LB_CONTROLLER_ROLE_PATH)
+CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
+                                      constants.LB_CONTROLLER_HISTORY_SYNC_PATH)
 _CONTROLLER_SYNC_ROUTE_PREFIX = '/api/internal/serve/'
 _CONTROLLER_SYNC_ROUTE_SUFFIXES = (
-    '/controller/load_balancer_sync',
-    '/controller/load_balancer_request_history_sync',
+    constants.LB_CONTROLLER_SYNC_PATH,
+    constants.LB_CONTROLLER_ROLE_PATH,
+    constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
 )
-_CONTROLLER_SYNC_TARGET_PATH = '/controller/load_balancer_sync'
-_CONTROLLER_HISTORY_SYNC_TARGET_PATH = (
-    '/controller/load_balancer_request_history_sync')
 
 # (durable service incarnation, controller process, normalized IP, port).
 # Every member participates in the before/after comparison so same-name
@@ -99,9 +103,16 @@ def _controller_sync_url(owner: _ControllerOwner, target_path: str) -> str:
     return f'http://{host}:{controller_port}{target_path}'
 
 
-def _service_unavailable(detail: str) -> fastapi.responses.JSONResponse:
-    return fastapi.responses.JSONResponse(status_code=503,
-                                          content={'detail': detail})
+def _service_unavailable(
+        detail: str,
+        outcome: lb_ha_obs.LbRoleOutcome | None = None,
+        observability: dict | None = None) -> fastapi.responses.JSONResponse:
+    content: dict[str, Any] = {'detail': detail}
+    if outcome is not None:
+        content['outcome'] = outcome.value
+    if observability is not None:
+        content['proxy_observability'] = observability
+    return fastapi.responses.JSONResponse(status_code=503, content=content)
 
 
 async def _read_controller_owner(service_name: str) -> _ControllerOwner | None:
@@ -119,37 +130,69 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
     again after the response; a concurrent ownership transfer makes the result
     unusable even if the old owner replied.
     """
+    started_at = time.monotonic()
+    phases: dict[str, float] = {}
+    request_bytes: int | None = None
+    is_role_request = target_path == constants.LB_CONTROLLER_ROLE_PATH
+
+    def proxy_observability() -> dict:
+        return {
+            'total_seconds': max(0.0,
+                                 time.monotonic() - started_at),
+            'request_bytes': request_bytes,
+            'phases_seconds': dict(sorted(phases.items())),
+        }
+
+    def unavailable(
+            detail: str,
+            outcome: lb_ha_obs.LbRoleOutcome) -> fastapi.responses.JSONResponse:
+        return _service_unavailable(
+            detail, outcome if is_role_request else None,
+            proxy_observability() if is_role_request else None)
+
+    owner_read_started_at = time.monotonic()
     try:
         owner_before = await _read_controller_owner(service_name)
     except Exception as e:  # pylint: disable=broad-except
+        phases['owner_before'] = time.monotonic() - owner_read_started_at
         logger.warning('Failed to resolve the SkyServe controller owner for '
                        f'{service_name!r}: {e}')
-        return _service_unavailable('Controller owner is unavailable.')
+        return unavailable('Controller owner is unavailable.',
+                           lb_ha_obs.LbRoleOutcome.PROXY_OWNER_READ_FAILED)
+    phases['owner_before'] = time.monotonic() - owner_read_started_at
     if owner_before is None:
-        return _service_unavailable(
-            'Controller owner is missing or incomplete.')
+        return unavailable('Controller owner is missing or incomplete.',
+                           lb_ha_obs.LbRoleOutcome.PROXY_OWNER_MISSING)
 
     expected_service_hash = request.headers.get(constants.SERVICE_HASH_HEADER)
     if expected_service_hash != owner_before[0]:
-        return fastapi.responses.JSONResponse(
-            status_code=409,
-            content={'detail': 'Service incarnation mismatch.'})
+        content: dict[str, Any] = {'detail': 'Service incarnation mismatch.'}
+        if is_role_request:
+            content.update(outcome=lb_ha_obs.LbRoleOutcome.
+                           PROXY_INCARNATION_MISMATCH.value,
+                           proxy_observability=proxy_observability())
+        return fastapi.responses.JSONResponse(status_code=409, content=content)
 
     # The outer internal-auth middleware has already validated this header.
     # Forward the same credential to the controller's sync-only dependency.
     authorization = request.headers.get('authorization')
     if authorization is None:
-        return fastapi.responses.JSONResponse(
-            status_code=401,
-            content={'detail': 'Controller sync authentication required.'})
+        content = {'detail': 'Controller sync authentication required.'}
+        if is_role_request:
+            content.update(outcome=(
+                lb_ha_obs.LbRoleOutcome.PROXY_AUTHENTICATION_REQUIRED.value),
+                           proxy_observability=proxy_observability())
+        return fastapi.responses.JSONResponse(status_code=401, content=content)
 
     body = await request.body()
+    request_bytes = len(body)
     forwarded_headers = {
         'Authorization': authorization,
         'Content-Type': request.headers.get('content-type', 'application/json'),
         constants.CONTROLLER_OWNER_HEADER:
             serve_utils.make_controller_owner_fingerprint(*owner_before),
     }
+    forward_started_at = time.monotonic()
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -167,24 +210,35 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
                 response_content_type = controller_response.headers.get(
                     'Content-Type')
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        phases['controller_forward'] = time.monotonic() - forward_started_at
         logger.warning('Failed to connect to the SkyServe controller for '
                        f'{service_name!r}: {e}')
-        return _service_unavailable('Controller connection failed.')
+        return unavailable(
+            'Controller connection failed.',
+            lb_ha_obs.LbRoleOutcome.PROXY_CONTROLLER_CONNECTION_FAILED)
+    phases['controller_forward'] = time.monotonic() - forward_started_at
 
+    owner_verify_started_at = time.monotonic()
     try:
         owner_after = await _read_controller_owner(service_name)
     except Exception as e:  # pylint: disable=broad-except
+        phases['owner_after'] = time.monotonic() - owner_verify_started_at
         logger.warning('Failed to verify the SkyServe controller owner for '
                        f'{service_name!r}: {e}')
-        return _service_unavailable('Controller ownership could not be '
-                                    'verified.')
+        return unavailable(
+            'Controller ownership could not be verified.',
+            lb_ha_obs.LbRoleOutcome.PROXY_OWNER_VERIFICATION_FAILED)
+    phases['owner_after'] = time.monotonic() - owner_verify_started_at
     if owner_after != owner_before:
-        return _service_unavailable('Controller ownership changed during '
-                                    'the request.')
+        return unavailable('Controller ownership changed during the request.',
+                           lb_ha_obs.LbRoleOutcome.PROXY_OWNER_CHANGED)
 
     response_headers = {}
     if response_content_type is not None:
         response_headers['Content-Type'] = response_content_type
+    if is_role_request:
+        response_headers[constants.LB_ROLE_PROXY_OBSERVABILITY_HEADER] = (
+            json.dumps(proxy_observability(), separators=(',', ':')))
     return fastapi.Response(content=response_body,
                             status_code=response_status,
                             headers=response_headers)
@@ -194,11 +248,18 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
 async def proxy_load_balancer_sync(
         service_name: str, request: fastapi.Request) -> fastapi.Response:
     return await _proxy_controller_sync(service_name, request,
-                                        _CONTROLLER_SYNC_TARGET_PATH)
+                                        constants.LB_CONTROLLER_SYNC_PATH)
+
+
+@router.post(CONTROLLER_ROLE_ROUTE_PATH, include_in_schema=False)
+async def proxy_load_balancer_role(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    return await _proxy_controller_sync(service_name, request,
+                                        constants.LB_CONTROLLER_ROLE_PATH)
 
 
 @router.post(CONTROLLER_HISTORY_SYNC_ROUTE_PATH, include_in_schema=False)
 async def proxy_load_balancer_request_history_sync(
         service_name: str, request: fastapi.Request) -> fastapi.Response:
-    return await _proxy_controller_sync(service_name, request,
-                                        _CONTROLLER_HISTORY_SYNC_TARGET_PATH)
+    return await _proxy_controller_sync(
+        service_name, request, constants.LB_CONTROLLER_HISTORY_SYNC_PATH)

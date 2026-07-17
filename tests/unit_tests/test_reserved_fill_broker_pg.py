@@ -37,6 +37,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 # `broker_engine` defined here instead of the sqlite one).
 import test_reserved_fill_broker as sqlite_suite
 
+from sky.serve import lb_ha
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
@@ -320,6 +321,16 @@ class TestMigrationChainPG:
                     'lifecycle_epoch',
                     'resource_scope',
                     'logical_replica_semantics',
+                    'lb_ha_enabled',
+                    'lb_active_slot',
+                    'lb_cutover_generation',
+                    'lb_pending_slot',
+                    'lb_cutover_phase',
+                    'lb_drain_started_at',
+                    'lb_demand_handoff_generation',
+                    'lb_demand_handoff_snapshot',
+                    'lb_demand_handoff_complete_at',
+                    'lb_last_demand_snapshot',
                 }.issubset(service_columns)
                 version_columns = {
                     column['name']
@@ -346,6 +357,139 @@ class TestMigrationChainPG:
                 assert 'fence_pending' in columns, columns
         finally:
             engine.dispose()
+
+
+class TestLbCutoverAuthorityPG:
+    """The production-dialect CAS chain fences every phase transition."""
+
+    def test_cutover_cas_and_crash_recovery_states(self, broker_engine,
+                                                   monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(serve_state.services_table.insert().values(
+                name='ha-service',
+                controller_job_id=1,
+                status=serve_state.ServiceStatus.READY.value,
+                controller_pid=77,
+                controller_ip='10.0.0.7',
+                hash='incarnation',
+                lifecycle_epoch=11,
+                lb_ha_enabled=1,
+                lb_active_slot=lb_ha.LbSlot.A.value,
+                lb_cutover_generation=1,
+                lb_pending_slot=None,
+                lb_cutover_phase=lb_ha.LbCutoverPhase.STABLE.value))
+            session.commit()
+
+        owner = (77, '10.0.0.7')
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                            (78, '10.0.0.8'), 11,
+                                            lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation', owner,
+                                            12, lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        demand_snapshot = lb_ha.DemandSnapshot(
+            (10, 20),
+            4,
+            2,
+            in_flight={'http://replica': 1},
+            unknown_in_flight_urls=('http://unknown',))
+        assert serve_state.record_lb_active_demand_snapshot(
+            'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.A, 1,
+            demand_snapshot)
+        assert serve_state.get_lb_last_demand_snapshot(
+            'ha-service') == demand_snapshot
+        assert not serve_state.record_lb_active_demand_snapshot(
+            'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.B, 1,
+            demand_snapshot)
+        preparing = serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.A, 1,
+                                                 lb_ha.LbSlot.B)
+        assert preparing == lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=lb_ha.LbSlot.A,
+            generation=2,
+            pending_slot=lb_ha.LbSlot.B,
+            phase=lb_ha.LbCutoverPhase.PREPARING,
+            lifecycle_epoch=11)
+        assert serve_state.get_lb_demand_handoff('ha-service') == (
+            2, demand_snapshot, None)
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation', owner,
+                                            11, lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        assert not serve_state.commit_lb_cutover(
+            'ha-service', 'stale-incarnation', owner, 11, lb_ha.LbSlot.A,
+            lb_ha.LbSlot.B, 2)
+        assert serve_state.commit_lb_cutover('ha-service', 'incarnation', owner,
+                                             11, lb_ha.LbSlot.A, lb_ha.LbSlot.B,
+                                             2)
+        completed_at = serve_state.mark_lb_demand_handoff_complete(
+            'ha-service', 'incarnation', owner, 11, 2)
+        assert completed_at is not None
+        assert serve_state.mark_lb_demand_handoff_complete(
+            'ha-service', 'incarnation', owner, 11, 2) == completed_at
+        generation, restored, restored_at = serve_state.get_lb_demand_handoff(
+            'ha-service')
+        handoff = lb_ha.DemandHandoff(30)
+        handoff.restore(generation, restored, restored_at)
+        assert handoff.generation == 2
+        assert handoff.snapshot == demand_snapshot
+
+        draining = serve_state.get_lb_cutover_state('ha-service')
+        assert draining is not None
+        assert draining.active_slot is lb_ha.LbSlot.B
+        assert draining.pending_slot is lb_ha.LbSlot.A
+        assert draining.phase is lb_ha.LbCutoverPhase.DRAINING
+        assert serve_state.finish_lb_cutover_drain('ha-service', 'incarnation',
+                                                   owner, 11, lb_ha.LbSlot.B,
+                                                   lb_ha.LbSlot.A, 2)
+
+        preparing = serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.B, 2,
+                                                 lb_ha.LbSlot.A)
+        assert preparing is not None
+        assert serve_state.abort_lb_cutover_preparation('ha-service',
+                                                        'incarnation', owner,
+                                                        11, lb_ha.LbSlot.B,
+                                                        lb_ha.LbSlot.A, 3)
+        stable = serve_state.get_lb_cutover_state('ha-service')
+        assert stable is not None
+        assert stable.active_slot is lb_ha.LbSlot.B
+        assert stable.generation == 3
+        assert stable.pending_slot is None
+        assert stable.phase is lb_ha.LbCutoverPhase.STABLE
+        assert serve_state.get_lb_demand_handoff('ha-service') == (None, None,
+                                                                   None)
+
+        with serve_state.lb_cutover_kubernetes_guard(
+                'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.B, 3,
+                lb_ha.LbCutoverPhase.STABLE, None) as guarded:
+            assert guarded
+        with serve_state.lb_cutover_kubernetes_guard(
+                'ha-service', 'incarnation', owner, 12, lb_ha.LbSlot.B, 3,
+                lb_ha.LbCutoverPhase.STABLE, None) as guarded:
+            assert not guarded
+
+        assert serve_state.begin_lb_ha_rollback('ha-service', 'incarnation',
+                                                owner, 11, lb_ha.LbSlot.B, 3)
+        assert serve_state.finish_lb_ha_rollback('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.B, 3)
+        rolled_back = serve_state.get_lb_cutover_state('ha-service')
+        assert rolled_back is not None
+        assert not rolled_back.enabled
+        assert rolled_back.phase is lb_ha.LbCutoverPhase.STABLE
+        assert serve_state.get_lb_last_demand_snapshot('ha-service') is None
+
+        assert serve_state.begin_lb_ha_migration('ha-service', 'incarnation',
+                                                 owner, 11)
+        migrating = serve_state.get_lb_cutover_state('ha-service')
+        assert migrating is not None
+        assert migrating.enabled
+        assert migrating.phase is lb_ha.LbCutoverPhase.MIGRATING
+        assert serve_state.finish_lb_ha_migration('ha-service', 'incarnation',
+                                                  owner, 11)
 
 
 # =================== Aggregate Serve history on PG ====================

@@ -37,6 +37,9 @@ class SkyServiceSpec:
         lb_max_retries: int | None = None,
         lb_retry_initial_backoff_seconds: float | None = None,
         lb_request_queue: dict[str, Any] | None = None,
+        # New services use two warm LB slots by default. Old persisted specs
+        # are explicitly backfilled to False in __setstate__ below.
+        lb_high_availability: bool = True,
         max_replicas: int | None = None,
         num_overprovision: int | None = None,
         ports: str | None = None,
@@ -424,6 +427,11 @@ class SkyServiceSpec:
         self._lb_retry_initial_backoff_seconds: float | None = (
             lb_retry_initial_backoff_seconds)
         self._lb_request_queue: dict[str, Any] | None = lb_request_queue
+        self._lb_high_availability = bool(lb_high_availability)
+        # YAML parsing sets this marker after construction. A missing field is
+        # a creation default, not an instruction to migrate an existing
+        # service during its next ordinary update.
+        self._lb_high_availability_specified = False
         self._graceful_drain_seconds: int | None = graceful_drain_seconds
         # Declares fast-ack work whose lifetime outlives its HTTP envelope.
         # The LB must treat a missing occupancy sample as unknown from the
@@ -484,6 +492,8 @@ class SkyServiceSpec:
         state.setdefault('_lb_max_retries', None)
         state.setdefault('_lb_retry_initial_backoff_seconds', None)
         state.setdefault('_lb_request_queue', None)
+        state.setdefault('_lb_high_availability', False)
+        state.setdefault('_lb_high_availability_specified', False)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
@@ -551,6 +561,7 @@ class SkyServiceSpec:
             'graceful_drain_seconds', None)
         service_config['graceful_drain_async_occupancy'] = config.get(
             'graceful_drain_async_occupancy', None)
+        pool_config = config.get('pool', None)
         load_balancer_section = config.get('load_balancer', None)
         lb_stream_timeout_seconds = None
         if load_balancer_section is not None:
@@ -572,6 +583,17 @@ class SkyServiceSpec:
                                           None))
             service_config['lb_request_queue'] = load_balancer_section.get(
                 'request_queue', None)
+            if (pool_config is not None and
+                    load_balancer_section.get('high_availability') is True):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.high_availability is not supported for '
+                        'pools because pools have no inference endpoint.')
+            service_config['lb_high_availability'] = (
+                False if pool_config is not None else load_balancer_section.get(
+                    'high_availability', True))
+        else:
+            service_config['lb_high_availability'] = pool_config is None
         if isinstance(post_data, str):
             try:
                 post_data = json.loads(post_data)
@@ -592,7 +614,6 @@ class SkyServiceSpec:
                     raise ValueError('Port must be between 1 and 65535.')
         service_config['ports'] = str(ports) if ports is not None else None
 
-        pool_config = config.get('pool', None)
         if pool_config is not None:
             service_config['pool'] = pool_config
 
@@ -780,7 +801,11 @@ class SkyServiceSpec:
                 certfile=tls_section.get('certfile', None),
             )
 
-        return SkyServiceSpec(**service_config)
+        spec = SkyServiceSpec(**service_config)
+        spec._lb_high_availability_specified = (  # pylint: disable=protected-access
+            load_balancer_section is not None and
+            'high_availability' in load_balancer_section)
+        return spec
 
     @staticmethod
     def from_yaml_str(yaml_str: str) -> 'SkyServiceSpec':
@@ -873,6 +898,14 @@ class SkyServiceSpec:
         add_if_not_none('load_balancer', 'retry_initial_backoff_seconds',
                         self.lb_retry_initial_backoff_seconds)
         add_if_not_none('load_balancer', 'request_queue', self.lb_request_queue)
+        # HA is the default for newly parsed services. Preserve either an
+        # explicit opt-in or the legacy opt-out across the server-side update
+        # round trip; only an unspecified default stays omitted so unrelated
+        # updates inherit the service's durable mode.
+        if (self.lb_high_availability_specified or
+                not self.lb_high_availability):
+            add_if_not_none('load_balancer', 'high_availability',
+                            self.lb_high_availability)
         add_if_not_none('readiness_probe', 'headers', self._readiness_headers)
         add_if_not_none('replica_policy', 'min_replicas', self.min_replicas)
         add_if_not_none('replica_policy', 'max_replicas', self.max_replicas)
@@ -1059,6 +1092,16 @@ class SkyServiceSpec:
         return self._lb_request_queue
 
     @property
+    def lb_high_availability(self) -> bool:
+        """Whether the service uses two controller-fenced LB slots."""
+        return self._lb_high_availability
+
+    @property
+    def lb_high_availability_specified(self) -> bool:
+        """Whether YAML explicitly selected the HA mode."""
+        return self._lb_high_availability_specified
+
+    @property
     def min_replicas(self) -> int:
         return self._min_replicas
 
@@ -1235,6 +1278,8 @@ class SkyServiceSpec:
                 self._lb_retry_initial_backoff_seconds),
             lb_request_queue=override.pop('lb_request_queue',
                                           self._lb_request_queue),
+            lb_high_availability=override.pop('lb_high_availability',
+                                              self._lb_high_availability),
             graceful_drain_seconds=override.pop('graceful_drain_seconds',
                                                 self._graceful_drain_seconds),
             graceful_drain_async_occupancy=override.pop(
@@ -1282,4 +1327,6 @@ class SkyServiceSpec:
             # policy choice and keeps the constructor-derived semantics.
             copied._spot_placer = copied_spot_placer  # pylint: disable=protected-access
             copied._uses_logical_replicas = False  # pylint: disable=protected-access
+        copied._lb_high_availability_specified = (  # pylint: disable=protected-access
+            self._lb_high_availability_specified)
         return copied

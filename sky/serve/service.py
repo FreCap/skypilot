@@ -1028,6 +1028,9 @@ def _run_cleanup_and_finalize_locked(
     """Owner-fenced cleanup while holding the service lifecycle lock."""
     expected_owner = (controller_pid, controller_ip)
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
+    owner_state = serve_state.get_service_controller_owner(
+        service_name, include_lb_state=True)
+    durable_lb_ha = bool(owner_state and owner_state.get('lb_ha_enabled'))
 
     def _still_owns() -> bool:
         return (serve_utils.lifecycle_lock_is_valid(lifecycle_lock) and
@@ -1055,14 +1058,16 @@ def _run_cleanup_and_finalize_locked(
                     service_name,
                     expected_service_hash=service_hash,
                     require_runtime=True,
-                    expected_api_deployment_uid=(api_deployment_uid))
+                    expected_api_deployment_uid=(api_deployment_uid),
+                    high_availability=durable_lb_ha)
             else:
                 lb_k8s.delete_lb_objects(
                     service_name,
                     expected_service_hash=service_hash,
                     resource_scope=resource_scope,
                     require_runtime=True,
-                    expected_api_deployment_uid=(api_deployment_uid))
+                    expected_api_deployment_uid=(api_deployment_uid),
+                    high_availability=durable_lb_ha)
             lb_quiesced = True
         if not _still_owns():
             raise ServiceOwnershipLostError(
@@ -1114,13 +1119,15 @@ def _run_cleanup_and_finalize_locked(
                     lb_k8s.delete_lb_objects(
                         service_name,
                         expected_service_hash=service_hash,
-                        expected_api_deployment_uid=(api_deployment_uid))
+                        expected_api_deployment_uid=(api_deployment_uid),
+                        high_availability=durable_lb_ha)
                 else:
                     lb_k8s.delete_lb_objects(
                         service_name,
                         expected_service_hash=service_hash,
                         resource_scope=resource_scope,
-                        expected_api_deployment_uid=(api_deployment_uid))
+                        expected_api_deployment_uid=(api_deployment_uid),
+                        high_availability=durable_lb_ha)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to delete external LB objects for '
                              f'{service_name} during failed cleanup: {e}')
@@ -1304,6 +1311,10 @@ def _start(service_name: str,
         # would otherwise create a durable dead endpoint.
         serve_utils.validate_external_lb_service_spec(service_spec)
         lb_k8s.require_external_lb_runtime()
+        existing_lb_state = serve_state.get_lb_cutover_state(service_name)
+        if (service_spec.lb_high_availability or
+            (existing_lb_state is not None and existing_lb_state.enabled)):
+            lb_k8s.require_lb_ha_runtime()
         lb_termination_grace_seconds = (
             lb_k8s.lb_termination_grace_period_seconds(
                 service_spec.lb_stream_timeout_seconds,
@@ -1540,7 +1551,11 @@ def _start(service_name: str,
                     lb_termination_grace_seconds,
                     service_hash=service_incarnation,
                     resource_scope=resource_scope,
-                    continue_guard=_still_owns_lb)
+                    continue_guard=_still_owns_lb,
+                    high_availability=bool(
+                        (serve_state.get_service_controller_owner(
+                            service_name, include_lb_state=True) or
+                         {}).get('lb_ha_enabled')))
                 external_lb_healthy = True
             except Exception as boot_err:  # pylint: disable=broad-except
                 _bail_on_boot_failure(
@@ -1619,7 +1634,8 @@ def _start(service_name: str,
             # latency for legacy/local controllers.
             owner = None
             try:
-                owner = serve_state.get_service_controller_owner(service_name)
+                owner = serve_state.get_service_controller_owner(
+                    service_name, include_lb_state=True)
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(f'Failed to verify service owner before '
                                f'supervision tick: '
@@ -1676,7 +1692,8 @@ def _start(service_name: str,
                         lb_termination_grace_seconds,
                         service_hash=service_incarnation,
                         resource_scope=resource_scope,
-                        controller_ip=pod_ip)
+                        controller_ip=pod_ip,
+                        high_availability=bool(owner.get('lb_ha_enabled')))
                 except Exception as e:  # pylint: disable=broad-except
                     external_lb_healthy = False
                     logger.warning(

@@ -2454,11 +2454,13 @@ def _terminate_failed_services_locked(
     # top of every tick, kills and joins its child, then clears controller_port
     # before waiting for this same lifecycle lock. Do not down name-reused
     # replica clusters until that acknowledgement arrives.
-    owner = serve_state.get_service_controller_owner(service_name)
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
     if owner is None or owner.get('hash') != expected_service_hash:
         return _purge_ownership_failure(service_name,
                                         'owner disappeared before teardown')
     resource_scope = owner.get('resource_scope')
+    high_availability = bool(owner.get('lb_ha_enabled'))
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
         if recovery_script is None:
@@ -2537,14 +2539,16 @@ def _terminate_failed_services_locked(
                     service_name,
                     expected_service_hash=expected_service_hash,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=high_availability)
             else:
                 lb_k8s.delete_lb_objects(
                     service_name,
                     expected_service_hash=expected_service_hash,
                     resource_scope=resource_scope,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=high_availability)
         except Exception as e:  # pylint: disable=broad-except
             logger.error(
                 f'Failed to delete external LB objects for failed service '
@@ -2755,7 +2759,8 @@ def _terminate_orphaned_service_children_impl(
                     expected_service_hash=resource_scope,
                     resource_scope=resource_scope,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=True)
             except Exception as e:  # pylint: disable=broad-except
                 return (f'{colorama.Fore.YELLOW}orphaned service '
                         f'{service_name!r} could not be purged because scoped '

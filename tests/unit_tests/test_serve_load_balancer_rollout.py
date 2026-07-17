@@ -14,6 +14,7 @@ import pytest
 import uvicorn
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import load_balancer
 
 
@@ -78,6 +79,25 @@ def test_draining_rejects_new_inference_requests():
         asyncio.run(lb._proxy_with_retries(mock.MagicMock()))
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers['Retry-After']
+
+
+def test_ha_armed_slot_can_serve_immediately_after_selector_patch():
+    lb = load_balancer.SkyServeLoadBalancer(
+        controller_url='http://controller:8001',
+        load_balancer_port=30001,
+        lb_slot='b')
+    lb._lb_role = lb_ha.LbRole.ARMED
+    assert lb._accepts_new_requests()
+
+
+def test_ha_standby_and_draining_slots_reject_new_requests():
+    lb = load_balancer.SkyServeLoadBalancer(
+        controller_url='http://controller:8001',
+        load_balancer_port=30001,
+        lb_slot='b')
+    assert not lb._accepts_new_requests()
+    lb._lb_role = lb_ha.LbRole.DRAINING
+    assert not lb._accepts_new_requests()
 
 
 def test_drain_during_admission_rejects_before_recording_request():

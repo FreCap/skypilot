@@ -26,8 +26,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import load_balancer
 from sky.serve import serve_utils
+from sky.serve.server import controller_proxy
 
 
 @pytest.fixture(autouse=True)
@@ -360,6 +362,32 @@ def test_sync_sends_control_plane_bearer(monkeypatch, tmp_path):
         'Authorization': 'Bearer ctrl-tok',
         constants.SERVICE_HASH_HEADER: 'incarnation-a',
     }
+
+
+def test_role_heartbeat_client_url_matches_registered_proxy_route(monkeypatch):
+    controller_url = 'http://api/api/internal/serve/svc'
+    lb = load_balancer.SkyServeLoadBalancer(controller_url=controller_url,
+                                            load_balancer_port=8890,
+                                            service_hash='incarnation-a',
+                                            lb_slot='a')
+    captured = {
+        'response_json': {
+            'role': lb_ha.LbRole.ACTIVE.value,
+            'generation': 1,
+        }
+    }
+    monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession',
+                        lambda *a, **k: _FakeSession(200, captured))
+    monkeypatch.setattr(lb, '_ha_role_payload', lambda: {'lb_slot': 'a'})
+
+    _run(lb._sync_role_with_controller_once())
+
+    expected_path = controller_proxy.CONTROLLER_ROLE_ROUTE_PATH.replace(
+        '{service_name}', 'svc')
+    assert captured['url'] == f'http://api{expected_path}'
+    assert captured['url'] == (controller_url +
+                               constants.LB_CONTROLLER_ROLE_PATH)
+    assert lb._lb_role is lb_ha.LbRole.ACTIVE
 
 
 def test_sync_without_token_fails_before_http_request(monkeypatch):
