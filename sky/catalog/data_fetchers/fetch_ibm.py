@@ -112,6 +112,8 @@ def create_catalog(region_profile: dict[str, tuple[list, list]],
                 gpu_cnt: int | None = None
                 gpu_manufacturer: str | None = None
                 gpu_memory: int | None = None
+                vcpus = None
+                mem = None
                 if 'gpu_model' in profile:
                     gpu = profile['gpu_model']['values'][0]
                 if 'gpu_count' in profile:
@@ -124,6 +126,9 @@ def create_catalog(region_profile: dict[str, tuple[list, list]],
                     gpu_memory = int(profile['gpu_memory']['value'])
                 if 'gpu_manufacturer' in profile:
                     gpu_manufacturer = profile['gpu_manufacturer']['values'][0]
+                if vcpus is None or mem is None:
+                    raise ValueError(
+                        f'IBM profile {vm!r} is missing CPU or memory data.')
                 # TODO: How to fetch prices?
                 #       The pricing API doesn't return prices for instance.profile. # pylint: disable=line-too-long
                 #       https://cloud.ibm.com/docs/account?topic=account-getting-pricing-api # pylint: disable=line-too-long

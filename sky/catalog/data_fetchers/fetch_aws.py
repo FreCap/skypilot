@@ -101,6 +101,7 @@ def get_enabled_regions() -> set[str]:
     global regions_enabled
     if regions_enabled is None:
         aws_client = aws.client('ec2', region_name='us-east-1')
+        user_cloud_regions = None
         try:
             user_cloud_regions = aws_client.describe_regions()['Regions']
         except aws.botocore_exceptions().ClientError as e:
@@ -114,8 +115,11 @@ def get_enabled_regions() -> set[str]:
                     ) from None
             else:
                 raise
+        if user_cloud_regions is None:
+            raise RuntimeError('AWS region discovery produced no result.')
         regions_enabled = {r['RegionName'] for r in user_cloud_regions}
         regions_enabled = regions_enabled.intersection(set(ALL_REGIONS))
+    assert regions_enabled is not None
     return regions_enabled
 
 
