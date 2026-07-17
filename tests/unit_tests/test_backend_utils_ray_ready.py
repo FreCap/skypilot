@@ -50,7 +50,7 @@ def test_wait_until_ray_cluster_ready_returns_when_workers_ready(
 
     assert result == (True, None)
     ray_ready_dependencies.run.assert_called_once()
-    fake_time.monotonic.assert_called_once_with()
+    fake_time.monotonic.assert_not_called()
     fake_time.sleep.assert_not_called()
     fake_time.time.assert_not_called()
 
@@ -77,6 +77,44 @@ def test_wait_until_ray_cluster_ready_uses_monotonic_progress_timeout(
     fake_time.time.assert_not_called()
 
 
+def test_wait_until_ray_cluster_ready_clamps_final_progress_sleep(
+        monkeypatch, ray_ready_dependencies):
+    monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
+                        mock.MagicMock(return_value=(0, 0)))
+    fake_time = _fake_time(monotonic_values=[100.0, 100.25, 100.5, 100.75])
+    monkeypatch.setattr(backend_utils, 'time', fake_time)
+
+    result = backend_utils.wait_until_ray_cluster_ready(
+        '/tmp/cluster.yaml',
+        2,
+        '/tmp/launch.log',
+        nodes_launching_progress_timeout=0.5)
+
+    assert result == (False, None)
+    assert ray_ready_dependencies.run.call_count == 2
+    fake_time.sleep.assert_called_once_with(0.25)
+    fake_time.time.assert_not_called()
+
+
+def test_wait_until_ray_cluster_ready_accepts_ready_deadline_snapshot(
+        monkeypatch, ray_ready_dependencies):
+    monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
+                        mock.MagicMock(side_effect=[(0, 0), (1, 1)]))
+    fake_time = _fake_time(monotonic_values=[100.0, 100.25])
+    monkeypatch.setattr(backend_utils, 'time', fake_time)
+
+    result = backend_utils.wait_until_ray_cluster_ready(
+        '/tmp/cluster.yaml',
+        2,
+        '/tmp/launch.log',
+        nodes_launching_progress_timeout=0.5)
+
+    assert result == (True, None)
+    assert ray_ready_dependencies.run.call_count == 2
+    fake_time.sleep.assert_called_once_with(0.25)
+    fake_time.time.assert_not_called()
+
+
 def test_wait_until_ray_cluster_ready_resets_progress_timeout(
         monkeypatch, ray_ready_dependencies):
     monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
@@ -94,4 +132,23 @@ def test_wait_until_ray_cluster_ready_resets_progress_timeout(
     assert ray_ready_dependencies.run.call_count == 3
     assert fake_time.monotonic.call_count == 4
     assert fake_time.sleep.call_count == 2
+    assert [call.args[0] for call in fake_time.sleep.call_args_list] == [1, 0.5]
+    fake_time.time.assert_not_called()
+
+
+def test_wait_until_ray_cluster_ready_without_timeout_skips_clock(
+        monkeypatch, ray_ready_dependencies):
+    monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
+                        mock.MagicMock(side_effect=[(0, 0), (1, 1)]))
+    fake_time = _fake_time(
+        monotonic_values=AssertionError('read an unused progress clock'))
+    monkeypatch.setattr(backend_utils, 'time', fake_time)
+
+    result = backend_utils.wait_until_ray_cluster_ready('/tmp/cluster.yaml', 2,
+                                                        '/tmp/launch.log')
+
+    assert result == (True, None)
+    assert ray_ready_dependencies.run.call_count == 2
+    fake_time.monotonic.assert_not_called()
+    fake_time.sleep.assert_called_once_with(10)
     fake_time.time.assert_not_called()

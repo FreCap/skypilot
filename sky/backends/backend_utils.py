@@ -1794,7 +1794,10 @@ def wait_until_ray_cluster_ready(
 
     ssh_credentials = ssh_credential_from_yaml(cluster_config_file, docker_user)
     last_nodes_so_far = 0
-    last_progress_at = time.monotonic()
+    progress_deadline: float | None = None
+    if nodes_launching_progress_timeout is not None:
+        progress_deadline = (time.monotonic() +
+                             nodes_launching_progress_timeout)
     runner = command_runner.SSHCommandRunner(node=(head_ip, 22),
                                              **ssh_credentials)
     with rich_utils.safe_status(
@@ -1840,23 +1843,26 @@ def wait_until_ray_cluster_ready(
             # Check the number of nodes that are fetched. Timeout if no new
             # nodes fetched in a while (nodes_launching_progress_timeout),
             # though number of nodes_so_far is still not as expected.
+            remaining_progress_wait: float | None = None
             if nodes_so_far > last_nodes_so_far:
                 # Reset the progress timeout if the number of launching nodes
                 # changes, i.e. new nodes are launched.
                 logger.debug('Reset progress timeout, as new nodes are '
                              'launched. '
                              f'({last_nodes_so_far} -> {nodes_so_far})')
-                last_progress_at = time.monotonic()
                 last_nodes_so_far = nodes_so_far
-            elif (nodes_launching_progress_timeout is not None and
-                  time.monotonic() - last_progress_at
-                  > nodes_launching_progress_timeout and
-                  nodes_so_far != num_nodes):
-                logger.error(
-                    'Timed out: waited for more than '
-                    f'{nodes_launching_progress_timeout} seconds for new '
-                    'workers to be provisioned, but no progress.')
-                return False, None  # failed
+                if nodes_launching_progress_timeout is not None:
+                    progress_deadline = (time.monotonic() +
+                                         nodes_launching_progress_timeout)
+                    remaining_progress_wait = nodes_launching_progress_timeout
+            elif progress_deadline is not None:
+                remaining_progress_wait = (progress_deadline - time.monotonic())
+                if (remaining_progress_wait <= 0 and nodes_so_far != num_nodes):
+                    logger.error(
+                        'Timed out: waited '
+                        f'{nodes_launching_progress_timeout} seconds for new '
+                        'workers to be provisioned, but no progress.')
+                    return False, None  # failed
 
             if '(no pending nodes)' in output and '(no failures)' in output:
                 # Bug in ray autoscaler: e.g., on GCP, if requesting 2 nodes
@@ -1866,7 +1872,11 @@ def wait_until_ray_cluster_ready(
                     'Failed to launch multiple nodes on '
                     'GCP due to a nondeterministic bug in ray autoscaler.')
                 return False, None  # failed
-            time.sleep(10)
+            poll_interval = 10.0
+            if remaining_progress_wait is not None:
+                poll_interval = min(poll_interval,
+                                    max(0, remaining_progress_wait))
+            time.sleep(poll_interval)
     return True, docker_user  # success
 
 
