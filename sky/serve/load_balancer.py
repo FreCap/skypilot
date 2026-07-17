@@ -2250,6 +2250,17 @@ class SkyServeLoadBalancer:
         # permanently inflate this replica's load and skew routing away
         # from it (each retry then leaks another slot on another replica).
         released = False
+        client = None
+        client_refcount_dropped = False
+
+        def _drop_client_refcount():
+            nonlocal client_refcount_dropped
+            if client_refcount_dropped or client is None:
+                return
+            client_refcount_dropped = True
+            setattr(client, _INFLIGHT_ATTR,
+                    getattr(client, _INFLIGHT_ATTR, 1) - 1)
+
         try:
             # We defer the get of the client here on purpose, for case when the
             # replica is ready in `_proxy_with_retries` but refreshed before
@@ -2266,16 +2277,6 @@ class SkyServeLoadBalancer:
             # per request alongside the slot release below.
             setattr(client, _INFLIGHT_ATTR,
                     getattr(client, _INFLIGHT_ATTR, 0) + 1)
-            client_refcount_dropped = False
-
-            def _drop_client_refcount():
-                nonlocal client_refcount_dropped
-                if client_refcount_dropped:
-                    return
-                client_refcount_dropped = True
-                setattr(client, _INFLIGHT_ATTR,
-                        getattr(client, _INFLIGHT_ATTR, 1) - 1)
-
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             proxy_request = client.build_request(
@@ -2356,7 +2357,7 @@ class SkyServeLoadBalancer:
                 slot_policy.post_execute_hook(url, request, slot_token)
                 # Only defined once the client was checked out; exits
                 # before that (no client) have nothing to drop.
-                if 'client' in locals() and client is not None:
+                if client is not None:
                     _drop_client_refcount()
 
     async def _proxy_with_retries(
@@ -2484,6 +2485,7 @@ class SkyServeLoadBalancer:
                 })
 
         while True:
+            track_async_attempt = False
             if async_occupancy_request is None:
                 with self._client_pool_lock:
                     queue_tracks_occupancy = self._queue_uses_async_occupancy()

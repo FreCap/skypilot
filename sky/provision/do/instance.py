@@ -218,10 +218,14 @@ def get_cluster_info(
     for instance_name, instance_meta in running_instances.items():
         if instance_name.endswith('-head'):
             head_instance = instance_name
+        instance_ip = None
         for net in instance_meta['networks']['v4']:
             if net['type'] == 'public':
                 instance_ip = net['ip_address']
                 break
+        if instance_ip is None:
+            raise RuntimeError(
+                f'Instance {instance_name!r} has no public IPv4 address.')
         instances[instance_name] = [
             common.InstanceInfo(
                 instance_id=instance_meta['name'],

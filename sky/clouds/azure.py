@@ -362,10 +362,10 @@ class Azure(clouds.Cloud):
         custom_resources = resources_utils.make_ray_custom_resources_str(
             acc_dict)
 
+        # pylint: disable=import-outside-toplevel
+        from sky.catalog import azure_catalog
         cloud_image_id = resources.get_cloud_image_id()
         if cloud_image_id is None:
-            # pylint: disable=import-outside-toplevel
-            from sky.catalog import azure_catalog
             gen_version = azure_catalog.get_gen_version_from_instance_type(
                 resources.instance_type)
             image_id = self._get_default_image_tag(gen_version,

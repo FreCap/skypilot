@@ -323,6 +323,7 @@ def print_candidates(node_to_candidate_map: _TaskToPerCloudCandidates, *,
         if best_resources is None:
             best_resources = list(node.resources)[0]
         is_multi_instances = False
+        acc_name = None
         if best_resources.accelerators:
             acc_name, acc_count = list(best_resources.accelerators.items())[0]
             for cloud, candidate_list in candidate_set.items():
@@ -349,6 +350,7 @@ def print_candidates(node_to_candidate_map: _TaskToPerCloudCandidates, *,
                         f'among: {", ".join(instance_list)}.'
                         f'{colorama.Style.RESET_ALL}')
         if is_multi_instances:
+            assert acc_name is not None
             logger.info(
                 f'To list more details, run: sky gpus list {acc_name}\n')
 

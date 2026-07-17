@@ -507,6 +507,10 @@ def _execute_dag(
     requested_features |= task.get_required_cloud_features()
 
     backend = backend if backend is not None else backends.CloudVmRayBackend()
+    resources = list(task.resources)
+    idle_minutes_to_autostop: int | None = None
+    down = False
+    wait_for: autostop_lib.AutostopWaitFor | None = None
     # Figure out autostop config.
     # Note: Ideally this can happen after provisioning, so we can check the
     # autostop config from the launched resources. Before provisioning,
@@ -522,16 +526,12 @@ def _execute_dag(
         #   provisioning.
         # - Need to send info message about idle_minutes_to_autostop==0 here
         # - Need to check if autostop is supported by the backend.
-        resources = list(task.resources)
         for resource in resources:
             if resource.autostop_config != resources[0].autostop_config:
                 raise ValueError(
                     'All resources must have the same autostop config.')
         resource_autostop_config = resources[0].autostop_config
 
-        idle_minutes_to_autostop: int | None = None
-        down = False
-        wait_for: autostop_lib.AutostopWaitFor | None = None
         if resource_autostop_config is not None:
             if resource_autostop_config.enabled:
                 idle_minutes_to_autostop = (

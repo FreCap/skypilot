@@ -30,6 +30,21 @@ from sky.skylet import constants
 from sky.utils import context_utils
 
 
+def test_worker_preserves_executor_construction_error(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    monkeypatch.setattr(executor, '_get_queue', mock.MagicMock())
+    monkeypatch.setattr(
+        executor.process, 'BurstableExecutor',
+        mock.MagicMock(side_effect=RuntimeError('create failed')))
+
+    with pytest.raises(RuntimeError, match='create failed'):
+        worker.run()
+
+
 @pytest.fixture()
 def isolated_database(tmp_path):
     """Create an isolated DB and logs directory per-test."""

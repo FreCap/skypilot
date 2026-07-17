@@ -1418,6 +1418,7 @@ def create_lb_deployment_and_service(service_name: str,
                     })
                 break
             except kubernetes.api_exception() as e:
+                reconciliation_error = e
                 status = getattr(e, 'status', None)
                 if status not in (404, 409):
                     raise
@@ -1434,9 +1435,10 @@ def create_lb_deployment_and_service(service_name: str,
                     except kubernetes.api_exception() as create_error:
                         if getattr(create_error, 'status', None) != 409:
                             raise
-                        e = create_error
+                        reconciliation_error = create_error
                 _retry_reconciliation_or_raise('Service', service_name_k8s,
-                                               final_deadline, e)
+                                               final_deadline,
+                                               reconciliation_error)
 
     _wait_for_lb_service_endpoint(core_api,
                                   namespace,

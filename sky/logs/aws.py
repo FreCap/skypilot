@@ -82,9 +82,6 @@ class CloudwatchLoggingAgent(FluentbitAgent):
             The command to set up the CloudWatch logging agent.
         """
 
-        if self.config.credentials_file:
-            credential_path = self.config.credentials_file
-
         # Set AWS credentials and check whether credentials are valid.
         # CloudWatch plugin supports IAM roles, credentials file, and
         # environment variables. We prefer IAM roles when available
@@ -93,6 +90,7 @@ class CloudwatchLoggingAgent(FluentbitAgent):
         # the environment.
         pre_cmd = ''
         if self.config.credentials_file:
+            credential_path = self.config.credentials_file
             pre_cmd = (
                 f'export AWS_SHARED_CREDENTIALS_FILE={credential_path}; '
                 f'if [ ! -f {credential_path} ]; then '

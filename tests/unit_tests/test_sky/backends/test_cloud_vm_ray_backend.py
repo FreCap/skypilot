@@ -767,6 +767,63 @@ class TestCloudVmRayBackendTeardownNoLock:
         mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
 
 
+class TestCloudVmRayBackendLockedProvision:
+    """Regression tests for legacy provisioner result handling."""
+
+    def test_legacy_result_without_config_hash(self, monkeypatch):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        backend.log_dir = '/tmp/sky-test'
+        launched_resources = MagicMock(zone='us-east-1a')
+        handle = MagicMock(launched_resources=launched_resources,
+                           external_ips=MagicMock(return_value=['1.2.3.4']),
+                           external_ssh_ports=MagicMock(return_value=[22]))
+        to_provision_config = MagicMock(
+            resources=MagicMock(),
+            num_nodes=1,
+            prev_cluster_status=None,
+            prev_handle=None,
+        )
+        provisioner = MagicMock()
+        provisioner.provision_with_retries.return_value = {
+            'provisioning_skipped': False,
+            'ray': '/tmp/cluster.yaml',
+            'handle': handle,
+        }
+
+        monkeypatch.setattr(backend, '_check_existing_cluster',
+                            MagicMock(return_value=to_provision_config))
+        monkeypatch.setattr(backend, '_maybe_clear_external_cluster_failures',
+                            MagicMock())
+        monkeypatch.setattr(backend, 'check_skylet_running', MagicMock())
+        update_after_provisioned = MagicMock()
+        monkeypatch.setattr(backend, '_update_after_cluster_provisioned',
+                            update_after_provisioned)
+        monkeypatch.setattr(cloud_vm_ray_backend.wheel_utils, 'build_sky_wheel',
+                            MagicMock(return_value=('/tmp/sky.whl', 'hash')))
+        monkeypatch.setattr(cloud_vm_ray_backend, 'RetryingVmProvisioner',
+                            MagicMock(return_value=provisioner))
+        monkeypatch.setattr(cloud_vm_ray_backend.global_user_state,
+                            'get_cluster_yaml_dict',
+                            MagicMock(return_value={'provider': {}}))
+        monkeypatch.setattr(cloud_vm_ray_backend.rich_utils,
+                            'force_update_status', MagicMock())
+        monkeypatch.setattr(cloud_vm_ray_backend.lock_events,
+                            'DistributedLockEvent',
+                            MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(cloud_vm_ray_backend.usage_lib.messages.usage,
+                            'update_cluster_resources', MagicMock())
+        monkeypatch.setattr(cloud_vm_ray_backend.usage_lib.messages.usage,
+                            'update_cluster_status', MagicMock())
+
+        task_obj = MagicMock(resources={MagicMock()})
+        result = backend._locked_provision(  # pylint: disable=protected-access
+            'lock-id', task_obj, MagicMock(), False, False, 'test-cluster')
+
+        assert result == (handle, False)
+        update_after_provisioned.assert_called_once_with(
+            handle, None, task_obj, None, None)
+
+
 class TestPostTeardownCleanupYamlFetch:
     """The teardown double-check loop must not re-read the cluster YAML."""
 

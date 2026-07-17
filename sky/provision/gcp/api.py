@@ -18,6 +18,7 @@ def wait_for_crm_operation(operation, crm):
     logger.info('wait_for_crm_operation: '
                 f'Waiting for operation {operation} to finish...')
 
+    result = None
     for _ in range(constants.MAX_POLLS):
         result = crm.operations().get(name=operation['name']).execute()
         if 'error' in result:
@@ -29,6 +30,8 @@ def wait_for_crm_operation(operation, crm):
 
         time.sleep(constants.POLL_INTERVAL)
 
+    if result is None:
+        raise RuntimeError('Cloud resource manager polling did not run.')
     return result
 
 
@@ -38,6 +41,7 @@ def wait_for_compute_global_operation(project_name, operation, compute):
                 'Waiting for operation {} to finish...'.format(
                     operation['name']))
 
+    result = None
     for _ in range(constants.MAX_POLLS):
         result = (compute.globalOperations().get(
             project=project_name,
@@ -52,6 +56,8 @@ def wait_for_compute_global_operation(project_name, operation, compute):
 
         time.sleep(constants.POLL_INTERVAL)
 
+    if result is None:
+        raise RuntimeError('Global compute polling did not run.')
     return result
 
 
@@ -61,6 +67,7 @@ def wait_for_compute_region_operation(project_name, region, operation, compute):
                 'Waiting for operation {} to finish...'.format(
                     operation['name']))
 
+    result = None
     for _ in range(constants.MAX_POLLS):
         result = (compute.regionOperations().get(
             project=project_name,
@@ -76,6 +83,8 @@ def wait_for_compute_region_operation(project_name, region, operation, compute):
 
         time.sleep(constants.POLL_INTERVAL)
 
+    if result is None:
+        raise RuntimeError('Regional compute polling did not run.')
     return result
 
 

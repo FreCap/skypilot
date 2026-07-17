@@ -2039,10 +2039,9 @@ def get_allocated_resources_by_node(
         context = get_current_kube_config_context_name()
     non_included_pod_statuses = POD_STATUSES.copy()
     status_filters = ['Running', 'Pending']
-    if status_filters is not None:
-        non_included_pod_statuses -= set(status_filters)
-        field_selector = ','.join(
-            [f'status.phase!={status}' for status in non_included_pod_statuses])
+    non_included_pod_statuses -= set(status_filters)
+    field_selector = ','.join(
+        [f'status.phase!={status}' for status in non_included_pod_statuses])
 
     # Return raw urllib3.HTTPResponse object so that we can parse the json
     # more efficiently.
@@ -2950,6 +2949,8 @@ def get_endpoint_debug_message(context: str | None = None) -> str:
     elif port_mode == kubernetes_enums.KubernetesPortMode.PODIP:
         endpoint_type = 'PodIP'
         debug_cmd = 'kubectl describe pod'
+    else:
+        raise ValueError(f'Unsupported Kubernetes port mode: {port_mode}')
     return ENDPOINTS_DEBUG_MESSAGE.format(endpoint_type=endpoint_type,
                                           debug_cmd=debug_cmd)
 

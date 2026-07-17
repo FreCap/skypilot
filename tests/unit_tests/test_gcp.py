@@ -256,6 +256,58 @@ def test_gcp_config_gateway_polling_propagates_operation_error():
                                                      compute)
 
 
+def test_gcp_config_gateway_rejects_empty_poll_budget(monkeypatch):
+    monkeypatch.setattr(gcp_constants, 'MAX_POLLS', 0)
+
+    with pytest.raises(RuntimeError, match='polling did not run'):
+        gcp_config.wait_for_crm_operation({'name': 'create-project'},
+                                          MagicMock())
+
+
+def test_gcp_http_retry_rejects_empty_retry_budget():
+    wrapped = instance_utils._retry_on_gcp_http_exception(  # pylint: disable=protected-access
+        max_retries=0)(lambda: 'ok')
+
+    with pytest.raises(ValueError, match='max_retries must be at least 1'):
+        wrapped()
+
+
+def test_tpu_timeout_cancels_every_unfinished_operation(monkeypatch):
+    resource = MagicMock()
+    operations_api = resource.projects().locations().operations()
+    nodes_api = resource.projects().locations().nodes()
+
+    create_requests = [MagicMock(), MagicMock()]
+    create_requests[0].execute.return_value = {'name': 'operation-1'}
+    create_requests[1].execute.return_value = {'name': 'operation-2'}
+    nodes_api.create.side_effect = create_requests
+
+    cancel_requests = [MagicMock(), MagicMock()]
+    operations_api.cancel.side_effect = cancel_requests
+    monkeypatch.setattr(instance_utils.GCPTPUVMInstance, 'load_resource',
+                        MagicMock(return_value=resource))
+    monkeypatch.setattr(instance_utils, 'GCP_TIMEOUT', 0)
+    monkeypatch.setattr(instance_utils, '_format_and_log_message_from_errors',
+                        MagicMock())
+
+    errors, names = instance_utils.GCPTPUVMInstance._create_standard_instances(  # pylint: disable=protected-access
+        ['node-1', 'node-2'], 'project', 'zone', {'labels': {}})
+
+    assert names == ['node-1', 'node-2']
+    assert errors == [{
+        'code': 'TIMEOUT',
+        'message': 'Timeout waiting for creation operation',
+        'domain': 'create_instances'
+    }]
+    assert operations_api.cancel.call_count == 2
+    assert cancel_requests[0].http.timeout == 1
+    assert cancel_requests[1].http.timeout == 1
+    cancel_requests[0].execute.assert_called_once_with(
+        num_retries=instance_utils.GCP_CREATE_MAX_RETRIES)
+    cancel_requests[1].execute.assert_called_once_with(
+        num_retries=instance_utils.GCP_CREATE_MAX_RETRIES)
+
+
 def test_gcp_config_gateway_callables_keep_pickle_identity():
     gateway_names = (
         'wait_for_crm_operation',

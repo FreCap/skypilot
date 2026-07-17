@@ -281,6 +281,8 @@ class StoreType(enum.Enum):
         # pass these information to the store constructor.
         storage_account_name = None
         region = None
+        bucket_name = None
+        sub_path = None
         for store_type in StoreType:
             if store_type == StoreType.VOLUME:
                 continue
@@ -307,6 +309,8 @@ class StoreType(enum.Enum):
                         # If we get here, it's an unknown S3-compatible store
                         raise ValueError(
                             f'Unknown S3-compatible store type: {store_type}')
+                if bucket_name is None or sub_path is None:
+                    raise ValueError(f'Failed to parse store URL: {store_url}')
                 return store_type, bucket_name, \
                     sub_path, storage_account_name, region
         raise ValueError(f'Unknown store URL: {store_url}')
@@ -1303,7 +1307,7 @@ class Storage:
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSpecError(
                             'Storage source or storage name must be specified.')
-            assert name is not None, handle
+            assert name is not None, self
             validate_name(name)
             self.name = name
             return

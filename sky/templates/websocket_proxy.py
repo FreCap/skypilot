@@ -10,6 +10,8 @@ This script is useful for users who do not have local Kubernetes credentials.
 """
 
 import asyncio
+from collections.abc import Callable
+import functools
 import json
 import os
 import struct
@@ -66,14 +68,16 @@ async def main(
 async def run_websocket_proxy(websocket: ClientConnection,
                               timestamps_supported: bool,
                               first_message: bytes | None = None) -> None:
+    restore_terminal: Callable[[], None] | None = None
     if os.isatty(sys.stdin.fileno()):
         # pylint: disable=import-outside-toplevel
         import termios
         import tty
         old_settings = termios.tcgetattr(sys.stdin.fileno())
+        restore_terminal = functools.partial(termios.tcsetattr,
+                                             sys.stdin.fileno(),
+                                             termios.TCSADRAIN, old_settings)
         tty.setraw(sys.stdin.fileno())
-    else:
-        old_settings = None
 
     try:
         loop = asyncio.get_running_loop()
@@ -105,9 +109,8 @@ async def run_websocket_proxy(websocket: ClientConnection,
                             websocket_closed_event, websocket_lock),
             return_exceptions=True)
     finally:
-        if old_settings:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,
-                              old_settings)
+        if restore_terminal is not None:
+            restore_terminal()
 
 
 async def latency_monitor(websocket: ClientConnection,

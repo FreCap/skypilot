@@ -979,6 +979,7 @@ def maybe_translate_local_file_mounts_and_sync_up(
     file_mounts_tmp_subpath = _sub_path_join(
         sub_path, constants.FILE_MOUNTS_TMP_SUBPATH.format(run_id=run_id))
     base_tmp_dir = bs.get_blob_storage().file_mounts_tmp_dir()
+    src_to_file_id = {}
     os.makedirs(base_tmp_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=base_tmp_dir) as temp_path:
         local_fm_path = os.path.join(
@@ -987,7 +988,6 @@ def maybe_translate_local_file_mounts_and_sync_up(
         file_mount_remote_tmp_dir = constants.FILE_MOUNTS_REMOTE_TMP_DIR.format(
             task_type)
         if copy_mounts_with_file_in_src:
-            src_to_file_id = {}
             for i, src in enumerate(set(copy_mounts_with_file_in_src.values())):
                 src_to_file_id[src] = i
                 os.link(os.path.abspath(os.path.expanduser(src)),

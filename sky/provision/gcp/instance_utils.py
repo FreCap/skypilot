@@ -92,6 +92,9 @@ def _retry_on_gcp_http_exception(
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
 
+            if max_retries < 1:
+                raise ValueError('max_retries must be at least 1')
+
             def try_catch_exc():
                 try:
                     value = func(*args, **kwargs)
@@ -104,6 +107,7 @@ def _retry_on_gcp_http_exception(
                         return e
                     raise
 
+            ret = None
             for _ in range(max_retries):
                 ret = try_catch_exc()
                 if not isinstance(ret, Exception):
@@ -1235,12 +1239,17 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
             {provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name},
             # Find all provisioning and running instances.
             status_filters=cls.NEED_TO_STOP_STATES)
+        if not pending_running_instances:
+            raise RuntimeError(
+                f'No running instances found for cluster {cluster_name!r}.')
+        head_instance_name = None
         for running_instance_name in pending_running_instances.keys():
             if running_instance_name in potential_head_instances:
                 head_instance_name = running_instance_name
                 break
         else:
             head_instance_name = list(pending_running_instances.keys())[0]
+        assert head_instance_name is not None
         # We need to update the node's label if mig already exists, as the
         # config is not updated during the resize operation.
         for instance_name in pending_running_instances.keys():
@@ -1292,6 +1301,7 @@ class GCPTPUVMInstance(GCPInstance):
             return request.execute(num_retries=GCP_MAX_RETRIES)
 
         wait_start = time.time()
+        result = None
         while time.time() - wait_start < GCP_TIMEOUT:
             timeout = max(GCP_TIMEOUT - (time.time() - wait_start), 1)
             result = call_operation(
@@ -1302,6 +1312,10 @@ class GCPTPUVMInstance(GCPInstance):
             logger.debug('wait_for_tpu_operation: '
                          f'Waiting for operation {operation["name"]} to '
                          'finish ...')
+
+        if result is None or not result.get('done'):
+            raise TimeoutError(
+                f'Timed out waiting for TPU operation {operation["name"]!r}.')
 
         if 'error' in result:
             error = common.ProvisionerError('Operation failed')
@@ -1787,7 +1801,8 @@ class GCPTPUVMInstance(GCPInstance):
                 request = (
                     cls.load_resource().projects().locations().operations().get(
                         name=operation['name'],))
-                request.http.timeout = GCP_TIMEOUT - (time.time() - wait_start)
+                request.http.timeout = max(
+                    GCP_TIMEOUT - (time.time() - wait_start), 1)
                 result = request.execute(num_retries=GCP_CREATE_MAX_RETRIES)
                 results[i] = result
                 success[i] = result['done']
@@ -1804,8 +1819,9 @@ class GCPTPUVMInstance(GCPInstance):
                     continue
                 request = cls.load_resource().projects().locations().operations(
                 ).cancel(name=operation['name'],)
-            request.http.timeout = GCP_TIMEOUT - (time.time() - wait_start)
-            request.execute(num_retries=GCP_CREATE_MAX_RETRIES)
+                request.http.timeout = max(
+                    GCP_TIMEOUT - (time.time() - wait_start), 1)
+                request.execute(num_retries=GCP_CREATE_MAX_RETRIES)
             errors = [{
                 'code': 'TIMEOUT',
                 'message': 'Timeout waiting for creation operation',

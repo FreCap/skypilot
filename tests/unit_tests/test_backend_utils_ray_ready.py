@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 
+from sky import exceptions
 from sky.backends import backend_utils
 
 
@@ -36,6 +37,12 @@ def _fake_time(*, monotonic_values):
     fake.monotonic.side_effect = monotonic_values
     fake.time.side_effect = AssertionError('read wall time for an interval')
     return fake
+
+
+def test_query_head_ip_rejects_empty_retry_budget():
+    with pytest.raises(exceptions.FetchClusterInfoError):
+        backend_utils._query_head_ip_with_retries(  # pylint: disable=protected-access
+            '/tmp/cluster.yaml', 0)
 
 
 def test_wait_until_ray_cluster_ready_returns_when_workers_ready(

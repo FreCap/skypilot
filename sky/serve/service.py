@@ -1615,6 +1615,7 @@ def _start(service_name: str,
             # file or allowing another child tick. SHUTTING_DOWN in the DB is
             # the durable, cross-pod terminate signal; the file only reduces
             # latency for legacy/local controllers.
+            owner = None
             try:
                 owner = serve_state.get_service_controller_owner(service_name)
             except Exception as e:  # pylint: disable=broad-except

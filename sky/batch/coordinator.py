@@ -313,6 +313,7 @@ class BatchCoordinator:
                             worker_job_id = result
 
                 if worker_job_id is None:
+                    queued_jobs: list[Any] = []
                     within_deadline, queue_succeeded, queue_request_id = (
                         await _run_call('worker queue request',
                                         sdk.queue,
