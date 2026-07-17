@@ -448,19 +448,11 @@ def job_done(job_id: int, idempotent: bool = False) -> None:
 
     This is only called by utils.update_managed_jobs_statuses which is sync.
     """
-    if idempotent and (state.get_job_schedule_state(job_id)
-                       == state.ManagedJobScheduleState.DONE):
-        return
-
     state.scheduler_set_done(job_id, idempotent)
 
 
 async def job_done_async(job_id: int, idempotent: bool = False):
     """Async version of job_done."""
-    if idempotent and (await state.get_job_schedule_state_async(job_id)
-                       == state.ManagedJobScheduleState.DONE):
-        return
-
     await state.scheduler_set_done_async(job_id, idempotent)
 
 
