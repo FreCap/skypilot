@@ -124,6 +124,7 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> None:
 
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
     use_legacy = not handle.is_grpc_enabled_with_flag
+    stdout = None
 
     if not use_legacy:
         try:
@@ -154,6 +155,8 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> None:
         except exceptions.CommandError as e:
             raise RuntimeError(e.error_msg) from e
 
+    if stdout is None:
+        raise RuntimeError('Replica termination produced no output.')
     sky_logging.print(stdout)
 
 
