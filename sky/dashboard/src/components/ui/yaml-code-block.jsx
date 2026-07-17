@@ -30,6 +30,7 @@ export function YamlCodeBlock({
   maxHeight = '400px',
   readOnly = false,
   className,
+  onCreateEditor,
 }) {
   const fixed = !!height;
   return (
@@ -45,6 +46,7 @@ export function YamlCodeBlock({
       <CodeMirror
         value={value}
         onChange={onChange}
+        onCreateEditor={onCreateEditor}
         extensions={[
           yaml(),
           yamlGutterTheme,
