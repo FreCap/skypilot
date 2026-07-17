@@ -1508,6 +1508,53 @@ class TestGetServiceRuntimeSnapshot:
         assert counts['n'] == 1
 
 
+class TestGetServiceStatusSnapshot:
+    """Control paths read one slim, version-backed service row."""
+
+    def test_returns_status_fields_without_loading_spec(self, _mock_serve_db,
+                                                        monkeypatch):
+        _add_minimal_service('svc-status',
+                             controller_ip='10.4.10.10',
+                             resource_scope='scope-a')
+        serve_state.set_service_controller_port('svc-status', 20008)
+
+        def fail_if_spec_loaded(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError(
+                'status snapshot must not deserialize the latest spec')
+
+        monkeypatch.setattr(serve_state.pickle, 'loads', fail_if_spec_loaded)
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_status_snapshot(
+                'svc-status', require_version=True)
+
+        row = _read_row(_mock_serve_db, 'svc-status')
+        assert counts['n'] == 1, counts
+        assert record == {
+            'name': 'svc-status',
+            'controller_job_id': 1,
+            'controller_port': 20008,
+            'load_balancer_port': None,
+            'status': serve_state.ServiceStatus.CONTROLLER_INIT,
+            'pool': False,
+            'controller_pid': 12345,
+            'controller_ip': '10.4.10.10',
+            'hash': row['hash'],
+            'lifecycle_epoch': row['lifecycle_epoch'],
+            'resource_scope': 'scope-a',
+        }
+
+    def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_status_snapshot(
+                'svc-orphan', require_version=True)
+
+        assert record is None
+        assert counts['n'] == 1
+
+
 class TestUpdateServiceControllerPidIpAndPort:
     """The atomic update is the core of the HA-recovery DB flip — it must
     write pid, ip, AND port in a single transaction so clients never

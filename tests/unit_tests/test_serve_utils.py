@@ -1,3 +1,4 @@
+# pylint: disable=missing-module-docstring,protected-access,import-outside-toplevel,missing-class-docstring,unused-argument,redefined-outer-name,reimported,confusing-with-statement
 import contextlib
 import os
 import pathlib
@@ -271,7 +272,9 @@ def test_wait_registration_service_timeout_uses_monotonic_deadline():
 
     get_service_status.assert_called_once_with('svc',
                                                pool=False,
-                                               with_replica_info=False)
+                                               with_replica_info=False,
+                                               with_yaml=False,
+                                               status_snapshot_only=True)
     sleep.assert_not_called()
     clock.time.assert_not_called()
     assert clock.monotonic.call_count == 3
