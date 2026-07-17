@@ -182,23 +182,23 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
 @context.contextual
-def launch_cluster(
-        replica_id: int,
-        yaml_content: str,
-        cluster_name: str,
-        log_file: str,
-        replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
-        replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
-        resources_override: dict[str, Any] | None = None,
-        retry_until_up: bool = True,
-        max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-        availability_max_retry: int | None = None,
-        exact_resources_override: bool = False,
-        pre_launch_guard: Callable[[], bool] | None = None,
-        continue_guard: Callable[[], bool] | None = None,
-        launch_fence: dict[str, Any] | None = None,
-        service_spec: 'service_spec.SkyServiceSpec | None' = None,
-        workspace: str | None = None) -> None:
+def launch_cluster(replica_id: int,
+                   yaml_content: str,
+                   cluster_name: str,
+                   log_file: str,
+                   replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
+                   replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
+                       int, bool],
+                   resources_override: dict[str, Any] | None = None,
+                   retry_until_up: bool = True,
+                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+                   availability_max_retry: int | None = None,
+                   exact_resources_override: bool = False,
+                   pre_launch_guard: Callable[[], bool] | None = None,
+                   continue_guard: Callable[[], bool] | None = None,
+                   launch_fence: dict[str, Any] | None = None,
+                   service_spec: 'service_spec.SkyServiceSpec | None' = None,
+                   workspace: str | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
