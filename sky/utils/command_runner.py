@@ -540,6 +540,9 @@ class CommandRunner:
         # across many clusters (e.g. the debug dump).
         deadline = (time.monotonic() + timeout) if timeout is not None else None
         timed_out = False
+        returncode = 255
+        stdout = ''
+        stderr = 'rsync failed before command execution.'
         while max_retry >= 0:
             attempt_timeout: int | None = None
             if deadline is not None:
@@ -919,6 +922,7 @@ class CommandRunner:
 
         backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=5)
         assert max_retry > 0, f'max_retry {max_retry} must be positive.'
+        returncode = 255
         while max_retry >= 0:
             returncode = self.run(cmd,
                                   log_path=log_path,
