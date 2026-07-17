@@ -747,3 +747,55 @@ async def test_cancellation_during_budget_release_leaves_reconcilable_slot(
                                         running=0))
     assert router._children[0].reservations == {}
     assert await router._reserve(()) is not None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_retriable_rejection_releases_owner(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        reservation_grace_seconds=0,
+    )
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    router._last_probe_finished_at = float('inf')
+    request_started = asyncio.Event()
+    rejection_returned = asyncio.Event()
+    return_rejection = asyncio.Event()
+
+    async def _reject(*_args: Any,
+                      **_kwargs: Any) -> local_async_router._ChildResponse:
+        request_started.set()
+        await return_rejection.wait()
+        rejection_returned.set()
+        return local_async_router._ChildResponse(
+            429,
+            json.dumps({
+                'status': 'busy'
+            }).encode(), ())
+
+    monkeypatch.setattr(router, '_request_child', _reject)
+    request = test_utils.make_mocked_request('POST', _ASYNC_PATH)
+    payload = {
+        'action': 'async_predict',
+        'request_id': 'cancel-after-rejection',
+    }
+    task = asyncio.create_task(
+        router._dispatch_predict(request,
+                                 json.dumps(payload).encode(), payload))
+    await request_started.wait()
+
+    await router._state_lock.acquire()
+    try:
+        return_rejection.set()
+        await rejection_returned.wait()
+        task.cancel()
+    finally:
+        router._state_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await router._owner('cancel-after-rejection') is None
+    assert router._children[0].reservations == {}
