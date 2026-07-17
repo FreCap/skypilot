@@ -711,6 +711,8 @@ def update_managed_jobs_statuses(job_id: int | None = None):
                         pid=pid, started_at=pid_started_at)):
                 # The controller is still running, so this job is fine.
                 continue
+            logger.error(f'Controller process for {job_id} seems to be dead.')
+            failure_reason = 'Controller process is dead'
 
         # At this point, either pid is None or process is dead.
 
@@ -757,10 +759,6 @@ def update_managed_jobs_statuses(job_id: int | None = None):
                 logger.error(cleanup_error)
             scheduler.job_done(job_id, idempotent=True)
             continue
-
-        if pid is not None:
-            logger.error(f'Controller process for {job_id} seems to be dead.')
-            failure_reason = 'Controller process is dead'
 
         # The controller process for this managed job is not running: it must
         # have exited abnormally, and we should set the job status to
@@ -1826,6 +1824,7 @@ def stream_logs_by_id(job_id: int,
 
         while _should_keep_logging(managed_job_status):
             handle = None
+            cluster_name = None
             job_id_to_tail = None
             if task_id is not None:
                 pool = managed_job_state.get_pool_from_job_id(job_id)

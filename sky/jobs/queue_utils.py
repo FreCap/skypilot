@@ -356,6 +356,7 @@ def get_managed_job_queue(
         status_expr=status_expr,
     )
 
+    cluster_name_to_handle = {}
     if cluster_handle_required:
         # Fetch the cluster name to handle map for managed clusters only.
         cluster_name_to_handle = (
