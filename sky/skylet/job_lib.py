@@ -392,21 +392,19 @@ def add_job(job_name: str,
     job_submitted_at = time.time()
     # job_id will autoincrement with the null value
     if int(constants.SKYLET_VERSION) >= 28:
-        _DB.cursor.execute(
+        insert_cursor = _DB.cursor.execute(
             'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?, null)',  # pylint: disable=line-too-long
             (job_name, username, job_submitted_at, JobStatus.INIT.value,
              run_timestamp, None, resources_str, metadata))
     else:
-        _DB.cursor.execute(
+        insert_cursor = _DB.cursor.execute(
             'INSERT INTO jobs VALUES (null, ?, ?, ?, ?, ?, ?, null, ?, 0, null, ?)',  # pylint: disable=line-too-long
             (job_name, username, job_submitted_at, JobStatus.INIT.value,
              run_timestamp, None, resources_str, metadata))
-    _DB.conn.commit()
-    row = _DB.cursor.execute('SELECT job_id FROM jobs WHERE run_timestamp=(?)',
-                             (run_timestamp,)).fetchone()
-    if row is None:
+    job_id = insert_cursor.lastrowid
+    if job_id is None:
         raise RuntimeError('Failed to read the newly inserted job ID.')
-    job_id = row[0]
+    _DB.conn.commit()
     log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY, f'{job_id}-{job_name}')
     set_log_dir_no_lock(job_id, log_dir)
     return job_id, log_dir
