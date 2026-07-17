@@ -3,7 +3,6 @@
 import queue as queue_lib
 import subprocess
 import threading
-import time
 
 from sky import exceptions
 from sky import sky_logging
@@ -13,6 +12,29 @@ logger = sky_logging.init_logger(__name__)
 
 _ACK_MESSAGE = 'ack'
 _FORWARDING_FROM_MESSAGE = 'Forwarding from'
+_TUNNEL_START_TIMEOUT_SECONDS = 30
+_PROCESS_TERMINATION_TIMEOUT_SECONDS = 5
+
+
+def _terminate_process(process: subprocess.Popen) -> int:
+    """Terminate and reap a tunnel process, escalating when necessary."""
+    returncode = process.poll()
+    if returncode is not None:
+        return returncode
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        # The process exited between poll() and terminate(). It is still our
+        # child, so wait once to reap it and return its real status.
+        return process.wait()
+    try:
+        return process.wait(timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        return process.wait()
 
 
 def cluster_tunnel_lock_id(cluster_name: str) -> str:
@@ -51,66 +73,79 @@ def open_ssh_tunnel(head_runner: command_runner.SSHCommandRunner |
                                        stderr=subprocess.PIPE,
                                        start_new_session=True,
                                        text=True)
-    # Wait until we receive an ack from the remote cluster or
-    # the SSH connection times out.
-    queue: queue_lib.Queue = queue_lib.Queue()
-    stdout_thread = threading.Thread(
-        target=lambda queue, stdout: queue.put(stdout.readline()),
-        args=(queue, ssh_tunnel_proc.stdout),
-        daemon=True)
-    stdout_thread.start()
-    while ssh_tunnel_proc.poll() is None:
+    # Read through banners and other pre-readiness output in one daemon thread.
+    # The caller uses a single bounded blocking wait instead of waking every
+    # 100 ms to poll both the queue and subprocess.
+    readiness_queue: queue_lib.Queue[str | None] = queue_lib.Queue()
+
+    def _read_until_ready() -> None:
+        assert ssh_tunnel_proc.stdout is not None
         try:
-            ack = queue.get_nowait()
-        except queue_lib.Empty:
-            ack = None
-            time.sleep(0.1)
-            continue
-        assert ack is not None
-        if isinstance(
-                head_runner,
-                command_runner.SSHCommandRunner) and ack == f'{_ACK_MESSAGE}\n':
-            break
-        elif isinstance(head_runner, command_runner.KubernetesCommandRunner
-                       ) and _FORWARDING_FROM_MESSAGE in ack:
-            # On kind clusters, this error occurs if we make a request
-            # immediately after the port-forward is established on a new pod:
-            # "Unhandled Error" err="an error occurred forwarding ... -> 46590:
-            # failed to execute portforward in network namespace
-            # "/var/run/netns/cni-...": failed to connect to localhost:46590
-            # inside namespace "...", IPv4: dial tcp4 127.0.0.1:46590:
-            # connect: connection refused
-            # So we need to poll the port on the pod to check if it is open.
-            # We did not observe this with real Kubernetes clusters.
-            timeout = 5
-            port_check_cmd = (
-                # We install netcat in our ray-node container,
-                # so we can use it here.
-                # (See kubernetes-ray.yml.j2)
-                f'end=$((SECONDS+{timeout})); '
-                f'while ! nc -z -w 1 localhost {remote_port}; do '
-                'if (( SECONDS >= end )); then exit 1; fi; '
-                'sleep 0.1; '
-                'done')
-            returncode, stdout, stderr = head_runner.run(port_check_cmd,
-                                                         require_outputs=True,
-                                                         stream_logs=False)
-            if returncode != 0:
-                try:
-                    ssh_tunnel_proc.terminate()
-                    ssh_tunnel_proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    ssh_tunnel_proc.kill()
-                    ssh_tunnel_proc.wait()
-                finally:
-                    error_msg = (f'Failed to check remote port {remote_port}')
-                    if stdout:
-                        error_msg += f'\n-- stdout --\n{stdout}\n'
-                    raise exceptions.CommandError(returncode=returncode,
-                                                  command=cmd_str,
-                                                  error_msg=error_msg,
-                                                  detailed_reason=stderr)
-            break
+            for line in iter(ssh_tunnel_proc.stdout.readline, ''):
+                is_ready = (isinstance(head_runner,
+                                       command_runner.SSHCommandRunner) and
+                            line == f'{_ACK_MESSAGE}\n')
+                is_ready = is_ready or (isinstance(
+                    head_runner, command_runner.KubernetesCommandRunner) and
+                                        _FORWARDING_FROM_MESSAGE in line)
+                if is_ready:
+                    readiness_queue.put(line)
+                    return
+        except (OSError, ValueError):
+            # Process termination closes the pipe while the daemon may be
+            # blocked in readline(). The caller already owns error reporting.
+            pass
+        readiness_queue.put(None)
+
+    stdout_thread = threading.Thread(target=_read_until_ready, daemon=True)
+    stdout_thread.start()
+    try:
+        ack = readiness_queue.get(timeout=_TUNNEL_START_TIMEOUT_SECONDS)
+    except queue_lib.Empty as e:
+        returncode = _terminate_process(ssh_tunnel_proc)
+        assert ssh_tunnel_proc.stderr is not None
+        stderr = ssh_tunnel_proc.stderr.read()
+        if isinstance(head_runner, command_runner.SSHCommandRunner):
+            head_runner.note_transport_failure(returncode)
+        raise exceptions.CommandError(
+            returncode=returncode,
+            command=cmd_str,
+            error_msg=('Port forward did not become ready within '
+                       f'{_TUNNEL_START_TIMEOUT_SECONDS} seconds'),
+            detailed_reason=stderr) from e
+
+    if ack is None:
+        # EOF before readiness may race process exit. Reap a still-live process
+        # so a closed stdout pipe cannot be mistaken for a usable tunnel.
+        _terminate_process(ssh_tunnel_proc)
+
+    if (ack is not None and
+            isinstance(head_runner, command_runner.KubernetesCommandRunner)):
+        # On kind clusters, this error occurs if we make a request immediately
+        # after the port-forward is established on a new pod. Poll the remote
+        # port before returning; real Kubernetes clusters do not normally need
+        # the extra delay.
+        timeout = 5
+        port_check_cmd = (
+            # We install netcat in our ray-node container,
+            # so we can use it here. (See kubernetes-ray.yml.j2)
+            f'end=$((SECONDS+{timeout})); '
+            f'while ! nc -z -w 1 localhost {remote_port}; do '
+            'if (( SECONDS >= end )); then exit 1; fi; '
+            'sleep 0.1; '
+            'done')
+        returncode, stdout, stderr = head_runner.run(port_check_cmd,
+                                                     require_outputs=True,
+                                                     stream_logs=False)
+        if returncode != 0:
+            _terminate_process(ssh_tunnel_proc)
+            error_msg = f'Failed to check remote port {remote_port}'
+            if stdout:
+                error_msg += f'\n-- stdout --\n{stdout}\n'
+            raise exceptions.CommandError(returncode=returncode,
+                                          command=cmd_str,
+                                          error_msg=error_msg,
+                                          detailed_reason=stderr)
 
     if ssh_tunnel_proc.poll() is not None:
         stdout, stderr = ssh_tunnel_proc.communicate()
