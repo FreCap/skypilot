@@ -4666,6 +4666,41 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_infos = serve_state.get_replica_infos_from_ids(
             self._service_name,
             [replica_id for replica_id, _ in finished_launches])
+        finished_spot_locations: dict[int, spot_placer.Location] = {}
+        if self._spot_placer is not None:
+            for replica_id, t in finished_launches:
+                info = launch_infos.get(replica_id)
+                assert info is not None, replica_id
+                if info.status == serve_state.ReplicaStatus.PENDING:
+                    continue
+                location = info.get_spot_location()
+                if location is None:
+                    continue
+                resolved_location = self._spot_placer.resolve_location(location)
+                if resolved_location is not None:
+                    location = resolved_location
+                finished_spot_locations[replica_id] = location
+                if t.format_exc is not None:
+                    failed_spot_locations.add(location)
+                else:
+                    selected_at = getattr(info, 'created_at', None)
+                    if selected_at is not None:
+                        successful_spot_locations[location] = max(
+                            selected_at,
+                            successful_spot_locations.get(
+                                location, selected_at))
+
+            # Commit the placement evidence before the per-replica durable
+            # writes and teardown preparation below. Either can fail, but a
+            # failed launch must still bench its location so queued siblings
+            # cannot be admitted on the next refresh.
+            for location, selected_at in successful_spot_locations.items():
+                if location not in failed_spot_locations:
+                    self._spot_placer.set_active(location,
+                                                 selected_at=selected_at)
+            for location in failed_spot_locations:
+                self._spot_placer.set_preemptive(location)
+
         for replica_id, t in finished_launches:
             info = launch_infos.get(replica_id)
             assert info is not None, replica_id
@@ -4692,8 +4727,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             else:
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
-            if (self._spot_placer is not None and
-                    info.get_spot_location() is not None):
+            if replica_id in finished_spot_locations:
                 # TODO(tian): Currently, we set the location to
                 # preemptive if the launch thread failed. This is
                 # because if the error is not related to the
@@ -4703,21 +4737,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # locations would fail. We should implement a log parser
                 # to detect if the error is actually related to the
                 # availability of the location later.
-                location = info.get_spot_location()
-                assert location is not None
-                resolved_location = self._spot_placer.resolve_location(location)
-                if resolved_location is not None:
-                    location = resolved_location
                 if t.format_exc is not None:
-                    failed_spot_locations.add(location)
                     info.status_property.failed_spot_availability = True
-                else:
-                    selected_at = getattr(info, 'created_at', None)
-                    if selected_at is not None:
-                        successful_spot_locations[location] = max(
-                            selected_at,
-                            successful_spot_locations.get(
-                                location, selected_at))
             self._persist_replica(replica_id, info)
             if error_in_sky_launch:
                 # Teardown after update replica info since
@@ -4725,18 +4746,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
-
-        if self._spot_placer is not None:
-            # A mixed wave can consume the last available capacity while
-            # sibling launches fail. Make any failure authoritative for this
-            # refresh regardless of replica iteration order; a later TTL probe
-            # is the bounded path back to the cheaper location.
-            for location, selected_at in successful_spot_locations.items():
-                if location not in failed_spot_locations:
-                    self._spot_placer.set_active(location,
-                                                 selected_at=selected_at)
-            for location in failed_spot_locations:
-                self._spot_placer.set_preemptive(location)
 
         if pending_launches:
             # Queued launches for one service share the same controller-owner

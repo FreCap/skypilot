@@ -1426,6 +1426,60 @@ class TestLaunchOwnershipFence:
         placer.set_active.assert_called_once_with(location, selected_at=123.0)
         placer.set_preemptive.assert_not_called()
 
+    @pytest.mark.parametrize('failure_stage', ('persist', 'cleanup'))
+    def test_launch_failure_benches_before_fallible_cleanup(
+            self, failure_stage):
+        mgr, infos = self._queued_manager([1, 2])
+        failed_thread = mgr._launch_thread_pool[1]
+        failed_thread.format_exc = 'no capacity'
+        infos[
+            1].status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        location = mock.Mock()
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        mgr._spot_placer = placer
+        for info in infos.values():
+            info.get_spot_location.return_value = location
+
+        events = []
+        placer.set_preemptive.side_effect = lambda _location: events.append(
+            'bench')
+
+        def _persist(*_args, **_kwargs):
+            events.append('persist')
+            if failure_stage == 'persist':
+                raise RuntimeError('persist unavailable')
+
+        def _fail_cleanup(*_args, **_kwargs):
+            events.append('cleanup')
+            if failure_stage == 'cleanup':
+                raise RuntimeError('cleanup unavailable')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=lambda _svc, ids: {
+                    rid: infos[rid]
+                    for rid in ids
+                }), \
+             mock.patch.object(mgr,
+                               '_persist_replica',
+                               side_effect=_persist), \
+             mock.patch.object(mgr,
+                               '_terminate_replica',
+                               side_effect=_fail_cleanup), \
+             pytest.raises(RuntimeError,
+                           match=f'{failure_stage} unavailable'):
+            mgr._refresh_thread_pool()
+
+        expected = ['bench', 'persist']
+        if failure_stage == 'cleanup':
+            expected.append('cleanup')
+        assert events == expected
+        placer.set_preemptive.assert_called_once_with(location)
+        assert 2 in mgr._launch_thread_pool
+        mgr._launch_thread_pool[2].start.assert_not_called()
+
     def test_old_version_metadata_is_retained(self):
         mgr = _make_manager()
         mgr._is_pool = False
