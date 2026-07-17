@@ -99,28 +99,29 @@ regions_enabled: set[str] | None = None
 def get_enabled_regions() -> set[str]:
     # Should not be called concurrently.
     global regions_enabled
-    if regions_enabled is None:
-        aws_client = aws.client('ec2', region_name='us-east-1')
-        user_cloud_regions = None
-        try:
-            user_cloud_regions = aws_client.describe_regions()['Regions']
-        except aws.botocore_exceptions().ClientError as e:
-            if e.response['Error']['Code'] == 'UnauthorizedOperation':
-                with ux_utils.print_exception_no_traceback():
-                    raise RuntimeError(
-                        'Failed to retrieve AWS regions. '
-                        'Please ensure that the `ec2:DescribeRegions` action '
-                        'is enabled for your AWS account in IAM. '
-                        'Ref: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html'  # pylint: disable=line-too-long
-                    ) from None
-            else:
-                raise
-        if user_cloud_regions is None:
-            raise RuntimeError('AWS region discovery produced no result.')
-        regions_enabled = {r['RegionName'] for r in user_cloud_regions}
-        regions_enabled = regions_enabled.intersection(set(ALL_REGIONS))
-    assert regions_enabled is not None
-    return regions_enabled
+    if regions_enabled is not None:
+        return regions_enabled
+
+    aws_client = aws.client('ec2', region_name='us-east-1')
+    user_cloud_regions = None
+    try:
+        user_cloud_regions = aws_client.describe_regions()['Regions']
+    except aws.botocore_exceptions().ClientError as e:
+        if e.response['Error']['Code'] == 'UnauthorizedOperation':
+            with ux_utils.print_exception_no_traceback():
+                raise RuntimeError(
+                    'Failed to retrieve AWS regions. '
+                    'Please ensure that the `ec2:DescribeRegions` action '
+                    'is enabled for your AWS account in IAM. '
+                    'Ref: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html'  # pylint: disable=line-too-long
+                ) from None
+        raise
+    if user_cloud_regions is None:
+        raise RuntimeError('AWS region discovery produced no result.')
+    enabled_regions = {r['RegionName'] for r in user_cloud_regions}
+    enabled_regions.intersection_update(ALL_REGIONS)
+    regions_enabled = enabled_regions
+    return enabled_regions
 
 
 def _get_instance_types(region: str) -> 'pd.DataFrame':
