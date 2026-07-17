@@ -157,6 +157,7 @@ def apply(
         mutated_dag.set_execution(dag.execution)
 
     mutated_config = None
+    mutated_user_request = None
     for task in dag.tasks:
         user_request = admin_policy.UserRequest(
             task,
@@ -197,6 +198,7 @@ def apply(
                         'admin for details.')
         mutated_dag.add(mutated_user_request.task)
     assert mutated_config is not None, dag
+    assert mutated_user_request is not None, dag
 
     # Update the new_dag's graph with the old dag's graph
     for u, v in dag.graph.edges:

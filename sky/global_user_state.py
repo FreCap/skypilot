@@ -3462,10 +3462,13 @@ def get_cluster_from_name(
         row = query.filter_by(name=cluster_name).first()
     if row is None:
         return None
+    user_hash = None
+    user_name = None
     if include_user_info:
         user_hash = _get_user_hash_or_current_user(row.user_hash)
         user = get_user(user_hash)
         user_name = user.name if user is not None else None
+    last_event = None
     if not summary_response:
         last_event = get_terminal_or_last_status_change_event(row.cluster_hash)
     # TODO: use namedtuple instead of dict
@@ -3764,6 +3767,7 @@ def get_clusters(
         init_cluster_hashes, ClusterEventType.LAUNCH_PROGRESS)
 
     # get last cluster event for each row
+    last_cluster_event_dict = {}
     if not summary_response:
         last_cluster_event_dict = _get_last_or_terminal_cluster_event_multiple(
             cluster_hashes)

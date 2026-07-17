@@ -949,6 +949,7 @@ def launch(
         # externally reachable endpoint.
         any_api_access = any(task_.api_server_access for task_ in dag.tasks)
         inject_token = any_api_access
+        user_id = None
         if inject_token:
             sa_enabled = os.environ.get(
                 skylet_constants.ENV_VAR_ENABLE_SERVICE_ACCOUNTS,
@@ -1536,6 +1537,7 @@ def cancel(name: str | None = None,
         assert isinstance(backend, backends.CloudVmRayBackend)
 
         use_legacy = not handle.is_grpc_enabled_with_flag
+        stdout = None
 
         if not use_legacy:
             current_workspace = skypilot_config.get_active_workspace()
@@ -1578,6 +1580,8 @@ def cancel(name: str | None = None,
                 graceful_timeout=graceful_timeout,
             )
 
+        if stdout is None:
+            raise RuntimeError('Managed job cancellation produced no output.')
         logger.info(stdout)
         if 'Multiple jobs found with name' in stdout:
             with ux_utils.print_exception_no_traceback():

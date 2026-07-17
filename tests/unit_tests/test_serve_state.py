@@ -112,7 +112,8 @@ def _add_minimal_service(name: str,
                          workspace=None,
                          yaml_content='yaml: v1',
                          pool=False,
-                         spec=None):
+                         spec=None,
+                         created_by=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -136,6 +137,7 @@ def _add_minimal_service(name: str,
         service_hash=service_hash,
         lifecycle_epoch=lifecycle_epoch,
         resource_scope=resource_scope,
+        created_by=created_by,
     )
 
 
@@ -158,27 +160,48 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
         session.commit()
 
 
-def test_schema_015_preserves_legacy_workspace_as_null(tmp_path):
+@pytest.mark.parametrize('preview_workspace_015', [False, True])
+def test_schema_016_reconciles_conflicting_revision_015_layouts(
+        tmp_path, preview_workspace_015):
     engine = create_engine(f'sqlite:///{tmp_path / "legacy-serve.db"}')
     old_metadata = sqlalchemy.MetaData()
-    old_services = sqlalchemy.Table(
-        'services', old_metadata,
-        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
+    service_columns = [
+        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True)
+    ]
+    version_columns = [
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+    ]
+    if preview_workspace_015:
+        service_columns.append(sqlalchemy.Column('workspace', sqlalchemy.Text))
+    else:
+        version_columns.extend([
+            sqlalchemy.Column('created_at', sqlalchemy.Float),
+            sqlalchemy.Column('created_by', sqlalchemy.Text),
+        ])
+    old_services = sqlalchemy.Table('services', old_metadata, *service_columns)
+    sqlalchemy.Table('version_specs', old_metadata, *version_columns)
     old_metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(old_services.insert().values(name='legacy-svc'))
 
-    schema_015 = importlib.import_module(
-        'sky.schemas.db.serve_state.015_service_workspace')
+    schema_016 = importlib.import_module(
+        'sky.schemas.db.serve_state.016_service_workspace')
     with engine.connect() as connection:
         context = migration.MigrationContext.configure(connection)
         with operations.Operations.context(context):
-            schema_015.upgrade()
+            schema_016.upgrade()
 
-    workspace_column = next(
-        column for column in sqlalchemy.inspect(engine).get_columns('services')
-        if column['name'] == 'workspace')
+    inspector = sqlalchemy.inspect(engine)
+    service_columns = {
+        column['name']: column for column in inspector.get_columns('services')
+    }
+    version_columns = {
+        column['name'] for column in inspector.get_columns('version_specs')
+    }
+    workspace_column = service_columns['workspace']
     assert workspace_column['nullable']
+    assert {'created_at', 'created_by'} <= version_columns
     with engine.connect() as connection:
         workspace = connection.execute(
             sqlalchemy.text(
@@ -578,6 +601,37 @@ def test_elected_version_migration_backfills_latest_committed_version(
     serve_state.create_table(engine)
 
     assert _read_row(engine, 'svc')['current_version'] == 2
+
+
+def test_version_provenance_migration_adds_nullable_columns(
+        tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
+    legacy_metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'version_specs',
+        legacy_metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    legacy_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text('CREATE TABLE alembic_version_serve_state_db '
+                            '(version_num VARCHAR(32) NOT NULL)'))
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO alembic_version_serve_state_db VALUES ('014')"))
+
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '015')
+    serve_state.create_table(engine)
+
+    columns = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('version_specs')
+    }
+    assert {'created_at', 'created_by'} <= columns
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -2060,6 +2114,28 @@ class TestRecoveryVersionSelection:
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
+
+    def test_version_records_include_commit_provenance(self, _mock_serve_db,
+                                                       monkeypatch):
+        timestamps = iter([1001.0, 1002.0])
+        monkeypatch.setattr(serve_state.time, 'time', lambda: next(timestamps))
+        assert _add_minimal_service('svc', spec='spec-1', created_by='alice')
+        assert serve_state.add_version('svc', created_by='bob') == 2
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+
+        assert serve_state.get_version_records('svc') == [{
+            'version': 1,
+            'spec': 'spec-1',
+            'yaml_content': 'yaml: v1',
+            'created_at': 1001.0,
+            'created_by': 'alice',
+        }, {
+            'version': 2,
+            'spec': 'spec-2',
+            'yaml_content': 'yaml: v2',
+            'created_at': 1002.0,
+            'created_by': 'bob',
+        }]
 
     def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
         serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')

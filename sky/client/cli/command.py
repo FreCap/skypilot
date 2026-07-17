@@ -2172,6 +2172,10 @@ def status(verbose: bool,
 
     # Submit all requests in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        managed_jobs_request_future = None
+        services_request_future = None
+        pools_request_future = None
+        workspace_request_future = None
         if show_managed_jobs:
             managed_jobs_request_future = executor.submit(submit_managed_jobs)
         if show_services:
@@ -2189,13 +2193,17 @@ def status(verbose: bool,
 
         # Get the request IDs
         if show_managed_jobs:
+            assert managed_jobs_request_future is not None
             (managed_jobs_queue_request_id,
              queue_result_version) = managed_jobs_request_future.result()
         if show_services:
+            assert services_request_future is not None
             service_status_request_id = services_request_future.result()
         if show_pools:
+            assert pools_request_future is not None
             pool_status_request_id = pools_request_future.result()
         if needs_status_table:
+            assert workspace_request_future is not None
             workspace_request_id = workspace_request_future.result()
         enabled_clouds_request_id = enabled_clouds_request_future.result()
         if resolved_workspace_future is not None:

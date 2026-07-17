@@ -2248,8 +2248,7 @@ def _query_head_ip_with_retries(cluster_yaml: str,
                     f'\n== Output ends ==')
                 head_ip_list = head_ip_list[-1:]
             assert 1 == len(head_ip_list), (out, head_ip_list)
-            head_ip = head_ip_list[0]
-            break
+            return head_ip_list[0]
         except subprocess.CalledProcessError as e:
             if i == max_attempts - 1:
                 raise exceptions.FetchClusterInfoError(
@@ -2257,7 +2256,8 @@ def _query_head_ip_with_retries(cluster_yaml: str,
             # Retry if the cluster is not up yet.
             logger.debug('Retrying to get head ip.')
             time.sleep(backoff.current_backoff())
-    return head_ip
+    raise exceptions.FetchClusterInfoError(
+        reason=exceptions.FetchClusterInfoError.Reason.HEAD)
 
 
 @timeline.event
@@ -2322,6 +2322,7 @@ def get_node_ips(cluster_yaml: str,
     head_ip_list = [head_ip]
     if expected_num_nodes > 1:
         backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=5)
+        out = None
 
         for retry_cnt in range(worker_ip_max_attempts):
             try:
@@ -2342,6 +2343,12 @@ def get_node_ips(cluster_yaml: str,
                              f'[{retry_cnt}/{worker_ip_max_attempts}] in '
                              f'{backoff_time} seconds.')
                 time.sleep(backoff_time)
+        else:
+            raise exceptions.FetchClusterInfoError(
+                exceptions.FetchClusterInfoError.Reason.WORKER)
+        if out is None:
+            raise exceptions.FetchClusterInfoError(
+                exceptions.FetchClusterInfoError.Reason.WORKER)
         worker_ips = re.findall(IP_ADDR_REGEX, out)
         if len(worker_ips) != expected_num_nodes - 1:
             n = expected_num_nodes - 1
@@ -2504,7 +2511,7 @@ def _check_owner_identity_with_record(cluster_name: str,
         # Skip the check if the cloud does not support user identity.
         return
 
-    def _raise_identity_error():
+    def _raise_identity_error() -> typing.NoReturn:
         # Generate error message if no match found
         if len(user_identities) == 1:
             err_msg = f'the activated identity is {user_identities[0]!r}.'
@@ -3327,7 +3334,8 @@ def _update_cluster_status(
                     f'{len(abnormal_state_nodes)} of {handle.launched_nodes} '
                     f'node(s) in unexpected state: '
                     f'{", ".join(distinct_states)}')
-        elif some_nodes_not_stopped:
+        else:
+            assert some_nodes_not_stopped, node_statuses
             init_reason = 'some but not all nodes are stopped'
         logger.debug('The cluster is abnormal. Setting to INIT status. '
                      f'node_statuses: {node_statuses}')

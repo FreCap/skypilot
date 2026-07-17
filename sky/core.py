@@ -604,6 +604,7 @@ def _start(
 
     hook: str | None = None
     hook_timeout: int | None = None
+    controller_resources: set[resources_lib.Resources] | None = None
     if controller is not None:
         if down or idle_minutes_to_autostop:
             arguments = []

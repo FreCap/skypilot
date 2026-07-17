@@ -125,6 +125,8 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
     sqlalchemy.Column('yaml_content', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('created_at', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('created_by', sqlalchemy.Text, server_default=None),
 )
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
@@ -671,7 +673,8 @@ def add_service(name: str,
                 controller_ip: str | None = None,
                 service_hash: str | None = None,
                 lifecycle_epoch: int | None = None,
-                resource_scope: str | None = None) -> bool:
+                resource_scope: str | None = None,
+                created_by: str | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -796,7 +799,9 @@ def add_service(name: str,
                 service_name=name,
                 version=constants.INITIAL_VERSION,
                 spec=pickle.dumps(spec),
-                yaml_content=yaml_content)
+                yaml_content=yaml_content,
+                created_at=time.time(),
+                created_by=created_by)
             if lifecycle_epoch is None:
                 # Compatibility for legacy callers without the distributed
                 # name fence: overwrite v1 only, but never delete arbitrary
@@ -2362,7 +2367,8 @@ def _lock_service_for_version_mutation(session: orm.Session,
 
 def add_version(service_name: str,
                 expected_service_hash: str | None = None,
-                expected_lifecycle_epoch: int | None = None) -> int:
+                expected_lifecycle_epoch: int | None = None,
+                created_by: str | None = None) -> int:
     """Add a version, optionally fenced to one lifecycle/incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2409,7 +2415,8 @@ def add_version(service_name: str,
         insert_stmt = sqlalchemy.insert(version_specs_table).values(
             service_name=service_name,
             version=max_version_subquery,
-            spec=pickle.dumps(None)).returning(version_specs_table.c.version)
+            spec=pickle.dumps(None),
+            created_by=created_by).returning(version_specs_table.c.version)
 
         result = session.execute(insert_stmt)
         new_version = result.scalar()
@@ -2510,7 +2517,8 @@ def add_or_update_version(
                 service_name=service_name,
                 version=version,
                 spec=pickle.dumps(spec),
-                yaml_content=yaml_content))
+                yaml_content=yaml_content,
+                created_at=time.time()))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
             # lock above serializes the one transition that fills it.
@@ -2519,7 +2527,9 @@ def add_or_update_version(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version,
                     version_specs_table.c.yaml_content.is_(None)).values(
-                        spec=pickle.dumps(spec), yaml_content=yaml_content))
+                        spec=pickle.dumps(spec),
+                        yaml_content=yaml_content,
+                        created_at=time.time()))
         if (not identical_retry and semantics_row is not None and
                 uses_logical_replicas):
             session.execute(
@@ -2620,6 +2630,30 @@ def get_version_yaml_contents(service_name: str) -> dict[int, str]:
             where(version_specs_table.c.service_name == service_name).order_by(
                 version_specs_table.c.version)).fetchall()
     return {row[0]: row[1] for row in rows if row[1] is not None}
+
+
+def get_version_records(service_name: str) -> list[dict[str, Any]]:
+    """Gets committed version contents and provenance in one query."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.spec,
+                version_specs_table.c.yaml_content,
+                version_specs_table.c.created_at,
+                version_specs_table.c.created_by,
+            ).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.yaml_content.isnot(None),
+            ).order_by(version_specs_table.c.version)).fetchall()
+    return [{
+        'version': row.version,
+        'spec': pickle.loads(row.spec) if row.spec is not None else None,
+        'yaml_content': row.yaml_content,
+        'created_at': row.created_at,
+        'created_by': row.created_by,
+    } for row in rows]
 
 
 def get_yaml_content(service_name: str, version: int) -> str | None:

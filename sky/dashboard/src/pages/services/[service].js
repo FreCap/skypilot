@@ -201,6 +201,8 @@ export function useServiceDetails({ serviceName }) {
 
   useEffect(() => {
     if (!serviceName) return undefined;
+    let active = true;
+    let refreshInFlight = false;
     const historyArgs = [
       {
         serviceNames: [serviceName],
@@ -210,24 +212,34 @@ export function useServiceDetails({ serviceName }) {
       },
     ];
     const refreshHistory = async () => {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
       const requestVersion = requestVersionRef.current;
+      const isCurrentRequest = () =>
+        active && requestVersionRef.current === requestVersion;
       setHistoryLoading(true);
       dashboardCache.invalidate(getServices, historyArgs);
       try {
         const { services } = await dashboardCache.get(getServices, historyArgs);
-        if (requestVersionRef.current !== requestVersion) return;
+        if (!isCurrentRequest()) return;
         const found = (services || []).find((s) => s.name === serviceName);
         setReplicaHistory(found?.replicaHistory || null);
       } catch (error) {
-        console.error('Failed to refresh service history:', error);
+        if (isCurrentRequest()) {
+          console.error('Failed to refresh service history:', error);
+        }
       } finally {
-        if (requestVersionRef.current === requestVersion) {
+        refreshInFlight = false;
+        if (isCurrentRequest()) {
           setHistoryLoading(false);
         }
       }
     };
     const interval = setInterval(refreshHistory, 60 * 1000);
-    return () => clearInterval(interval);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, [serviceName]);
 
   const refreshData = useCallback(async () => {

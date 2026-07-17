@@ -2409,7 +2409,7 @@ class RetryingVmProvisioner:
                 logger.warning(common_utils.format_exception(e))
             else:
                 # Provisioning succeeded.
-                break
+                return config_dict
 
             if prev_cluster_status is None:
                 # Add failed resources to the blocklist, only when it
@@ -2467,7 +2467,6 @@ class RetryingVmProvisioner:
             assert task in self._dag.tasks, 'Internal logic error.'
             assert best_resources is not None, task
             to_provision = best_resources
-        return config_dict
 
 
 @dataclasses.dataclass
@@ -2960,14 +2959,15 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                          f'{self.cluster_name!r} on port {tunnel.port}')
 
         lock_id = backend_utils.cluster_tunnel_lock_id(self.cluster_name)
-        remaining_timeout = backend_utils.CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS
         start_time = time.perf_counter()
+        deadline = (start_time +
+                    backend_utils.CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS)
         attempt = 1
 
         def _get_remaining_timeout() -> float:
-            return max(0.0,
-                       remaining_timeout - (time.perf_counter() - start_time))
+            return max(0.0, deadline - time.perf_counter())
 
+        remaining_timeout = _get_remaining_timeout()
         while remaining_timeout > 0:
             logger.debug(
                 'Attempting to acquire exclusive lock for %s (attempt %d)',
@@ -3022,7 +3022,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
             # Add small jitter before probing to smoothen the effects
             # of many readers waking up simultaneously.
-            jitter = random.uniform(0.01, 0.05)
+            jitter = min(random.uniform(0.01, 0.05), _get_remaining_timeout())
             time.sleep(jitter)
 
             # Re-read the tunnel metadata and verify it's healthy.
@@ -3059,6 +3059,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         """Opens an SSH tunnel to the Skylet on the head node,
         updates the cluster handle, and persists it to the database."""
         max_attempts = 3
+        tunnel_info = None
         # There could be a race condition here, as multiple processes may
         # attempt to open the same port at the same time.
         for attempt in range(max_attempts):
@@ -3086,6 +3087,11 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             tunnel_info = SSHTunnelInfo(port=local_port,
                                         pid=ssh_tunnel_proc.pid)
             break
+        else:
+            raise RuntimeError('Failed to open an SSH tunnel after '
+                               f'{max_attempts} attempts.')
+        if tunnel_info is None:
+            raise RuntimeError('Failed to open an SSH tunnel.')
 
         try:
             grpc.channel_ready_future(
@@ -3247,6 +3253,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             state.pop('cluster_region', None)
         if version < 2:
             state['_cluster_yaml'] = state.pop('cluster_yaml')
+        head_ip = None
         if version < 3:
             head_ip = state.pop('head_ip', None)
             state['stable_internal_external_ips'] = None
@@ -3976,7 +3983,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         skip_unnecessary_provisioning)
                     break
                 except exceptions.ResourcesUnavailableError as e:
-                    log_path = retry_provisioner.log_dir + '/provision.log'
+                    log_path = os.path.join(self.log_dir, 'provision.log')
 
                     error_message = (
                         f'{colorama.Fore.RED}Failed to provision all '
@@ -4047,6 +4054,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 assert handle is not None, (cluster_name, handle)
                 return handle, True
 
+            config_hash = config_dict.get('config_hash')
             if 'provision_record' in config_dict:
                 # New provisioner is used here.
                 handle = config_dict['handle']
@@ -4054,8 +4062,6 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 runtime_metadata = provision_record.runtime_metadata
                 handle.provision_runtime_metadata = runtime_metadata
                 resources_vars = config_dict['resources_vars']
-                config_hash = config_dict.get('config_hash', None)
-
                 if runtime_metadata.runtime_setup_done:
                     logger.info('Skipping runtime setup: provisioner reported '
                                 'SkyPilot runtime is ready.')
@@ -4198,7 +4204,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self, handle: CloudVmRayResourceHandle,
             prev_handle: CloudVmRayResourceHandle | None, task: task_lib.Task,
             prev_cluster_status: status_lib.ClusterStatus | None,
-            config_hash: str) -> None:
+            config_hash: str | None) -> None:
         usage_lib.messages.usage.update_cluster_resources(
             handle.launched_nodes, handle.launched_resources)
         usage_lib.messages.usage.update_final_cluster_status(
@@ -4714,9 +4720,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def _add_job(self, handle: CloudVmRayResourceHandle, job_name: str | None,
                  resources_str: str, metadata: str) -> tuple[int, str]:
-        use_legacy = not handle.is_grpc_enabled_with_flag
-
-        if not use_legacy:
+        if handle.is_grpc_enabled_with_flag:
             try:
                 request = jobsv1_pb2.AddJobRequest(
                     job_name=job_name,
@@ -4732,47 +4736,43 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 return job_id, log_dir
             except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as e:
                 logger.debug(f'gRPC failed, falling back to SSH: {e}')
-                use_legacy = True
 
-        if use_legacy:
-            code = job_lib.JobLibCodeGen.add_job(
-                job_name=job_name,
-                username=common_utils.get_user_hash(),
-                run_timestamp=self.run_timestamp,
-                resources_str=resources_str,
-                metadata=metadata)
-            returncode, result_str, stderr = self.run_on_head(
-                handle,
-                code,
-                stream_logs=False,
-                require_outputs=True,
-                separate_stderr=True)
-            # Happens when someone calls `sky exec` but remote is outdated for
-            # adding a job. Necessitating calling `sky launch`.
-            backend_utils.check_stale_runtime_on_remote(returncode, stderr,
-                                                        handle.cluster_name)
-            # TODO(zhwu): this sometimes will unexpectedly fail, we can add
-            # retry for this, after we figure out the reason.
-            subprocess_utils.handle_returncode(returncode, code,
-                                               'Failed to fetch job id.',
-                                               stderr)
-            try:
-                job_id_match = _JOB_ID_PATTERN.search(result_str)
-                if job_id_match is not None:
-                    job_id = int(job_id_match.group(1))
-                else:
-                    # For backward compatibility.
-                    job_id = int(result_str)
-                log_dir_match = _LOG_DIR_PATTERN.search(result_str)
-                if log_dir_match is not None:
-                    log_dir = log_dir_match.group(1).strip()
-                else:
-                    # For backward compatibility, use the same log dir as local.
-                    log_dir = self.log_dir
-            except ValueError as e:
-                logger.error(stderr)
-                raise ValueError(f'Failed to parse job id: {result_str}; '
-                                 f'Returncode: {returncode}') from e
+        code = job_lib.JobLibCodeGen.add_job(
+            job_name=job_name,
+            username=common_utils.get_user_hash(),
+            run_timestamp=self.run_timestamp,
+            resources_str=resources_str,
+            metadata=metadata)
+        returncode, result_str, stderr = self.run_on_head(handle,
+                                                          code,
+                                                          stream_logs=False,
+                                                          require_outputs=True,
+                                                          separate_stderr=True)
+        # Happens when someone calls `sky exec` but remote is outdated for
+        # adding a job. Necessitating calling `sky launch`.
+        backend_utils.check_stale_runtime_on_remote(returncode, stderr,
+                                                    handle.cluster_name)
+        # TODO(zhwu): this sometimes will unexpectedly fail, we can add
+        # retry for this, after we figure out the reason.
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to fetch job id.', stderr)
+        try:
+            job_id_match = _JOB_ID_PATTERN.search(result_str)
+            if job_id_match is not None:
+                job_id = int(job_id_match.group(1))
+            else:
+                # For backward compatibility.
+                job_id = int(result_str)
+            log_dir_match = _LOG_DIR_PATTERN.search(result_str)
+            if log_dir_match is not None:
+                log_dir = log_dir_match.group(1).strip()
+            else:
+                # For backward compatibility, use the same log dir as local.
+                log_dir = self.log_dir
+        except ValueError as e:
+            logger.error(stderr)
+            raise ValueError(f'Failed to parse job id: {result_str}; '
+                             f'Returncode: {returncode}') from e
         return job_id, log_dir
 
     def set_job_info_without_job_id(
@@ -5093,6 +5093,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
         See `skylet.job_lib.cancel_jobs_encoded_results` for more details.
         """
+        cancelled_ids = None
         use_legacy = not handle.is_grpc_enabled_with_flag
 
         if not use_legacy:
@@ -5120,6 +5121,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'Failed to cancel jobs on cluster {handle.cluster_name}.',
                 stdout)
             cancelled_ids = message_utils.decode_payload(stdout)
+        if cancelled_ids is None:
+            raise RuntimeError('Job cancellation produced no result.')
         if cancelled_ids:
             logger.info(
                 f'Cancelled job ID(s): {", ".join(map(str, cancelled_ids))}')
@@ -5473,6 +5476,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # if job_name is None, get all job_ids
             # TODO: Only get the latest job_id, since that's the only one we use
 
+            job_ids = None
             use_legacy = not handle.is_grpc_enabled_with_flag
             logger.info(f'handle.is_grpc_enabled_with_flag: '
                         f'{handle.is_grpc_enabled_with_flag}')
@@ -5501,6 +5505,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                                                    'Failed to sync down logs.',
                                                    stderr)
                 job_ids = message_utils.decode_payload(job_ids_payload)
+            if job_ids is None:
+                raise RuntimeError('Managed job lookup produced no result.')
             if not job_ids:
                 logger.info(f'{colorama.Fore.YELLOW}'
                             'No matching job found'
@@ -5528,6 +5534,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         else:
             # get the run_timestamp
             # the function takes in [job_id]
+            run_timestamps = None
             use_legacy = not handle.is_grpc_enabled_with_flag
             if not use_legacy:
                 try:
@@ -5562,6 +5569,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # returns with a dict of {job_id: run_timestamp}
                 run_timestamps = message_utils.decode_payload(
                     run_timestamps_payload)
+            if run_timestamps is None:
+                raise RuntimeError('Managed job log lookup produced no result.')
         if not run_timestamps:
             logger.info(f'{colorama.Fore.YELLOW}'
                         'No matching log directories found'
@@ -5702,7 +5711,6 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 'Failed to kill other launch requests for the '
                 f'cluster {handle.cluster_name}: '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
-        cluster_status_fetched = False
         if refresh_cluster_status:
             try:
                 prev_cluster_status, refreshed_handle = (
@@ -5725,16 +5733,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     # Use the latest handle from status refresh to avoid acting
                     # on stale runtime metadata persisted earlier in launch.
                     handle = refreshed_handle
-                cluster_status_fetched = True
             except exceptions.ClusterStatusFetchingError:
                 logger.warning(
                     'Failed to fetch cluster status for '
                     f'{handle.cluster_name!r}. Assuming the cluster is still '
                     'up.')
-        if not cluster_status_fetched:
-            status = global_user_state.get_status_from_cluster_name(
-                handle.cluster_name)
-            prev_cluster_status = status if status is not None else None
+                prev_cluster_status = (
+                    global_user_state.get_status_from_cluster_name(
+                        handle.cluster_name))
+        else:
+            prev_cluster_status = (
+                global_user_state.get_status_from_cluster_name(
+                    handle.cluster_name))
         if prev_cluster_status is None:
             # When the cluster is not in the cluster table, we guarantee that
             # all related resources / cache / config are cleaned up, i.e. it

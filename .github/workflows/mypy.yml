@@ -42,3 +42,12 @@ jobs:
       run: |
         source ~/test-env/bin/activate
         mypy $(cat tests/mypy_files.txt)
+    - name: Check unresolved Python references with ty
+      run: |
+        # This file is a runtime template whose names are injected by Ray.
+        uvx ty@0.0.60 check \
+          --output-format github \
+          --ignore all \
+          --error unresolved-reference \
+          --exclude sky/backends/monkey_patches/monkey_patch_ray_up.py \
+          sky

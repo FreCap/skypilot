@@ -1,6 +1,12 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { CircularProgress } from '@mui/material';
 
 import { Button } from '@/components/ui/button';
@@ -20,6 +26,7 @@ import {
   getServiceVersions,
 } from '@/data/connectors/services';
 import { formatYaml } from '@/lib/yamlUtils';
+import { TimestampWithTooltip } from '@/components/utils';
 
 export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
   const [isAdmin, setIsAdmin] = useState(false);
@@ -28,6 +35,9 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
   const [selectedVersion, setSelectedVersion] = useState(null);
   const [electingVersion, setElectingVersion] = useState(null);
   const [error, setError] = useState(null);
+  const [selectedEditor, setSelectedEditor] = useState(null);
+  const [electedEditor, setElectedEditor] = useState(null);
+  const scrollSyncFrame = useRef(null);
 
   const loadHistory = useCallback(async () => {
     if (!serviceName) return;
@@ -71,6 +81,47 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
       ) || null,
     [history, selectedVersion]
   );
+
+  useEffect(() => {
+    if (!selectedEditor || !electedEditor) return undefined;
+
+    const selectedScroller = selectedEditor.scrollDOM;
+    const electedScroller = electedEditor.scrollDOM;
+    let synchronizing = false;
+
+    const synchronize = (source, target) => {
+      if (synchronizing) return;
+      synchronizing = true;
+      target.scrollTop = source.scrollTop;
+      target.scrollLeft = source.scrollLeft;
+      if (scrollSyncFrame.current !== null) {
+        cancelAnimationFrame(scrollSyncFrame.current);
+      }
+      scrollSyncFrame.current = requestAnimationFrame(() => {
+        synchronizing = false;
+        scrollSyncFrame.current = null;
+      });
+    };
+    const syncFromSelected = () =>
+      synchronize(selectedScroller, electedScroller);
+    const syncFromElected = () =>
+      synchronize(electedScroller, selectedScroller);
+
+    selectedScroller.addEventListener('scroll', syncFromSelected, {
+      passive: true,
+    });
+    electedScroller.addEventListener('scroll', syncFromElected, {
+      passive: true,
+    });
+    return () => {
+      selectedScroller.removeEventListener('scroll', syncFromSelected);
+      electedScroller.removeEventListener('scroll', syncFromElected);
+      if (scrollSyncFrame.current !== null) {
+        cancelAnimationFrame(scrollSyncFrame.current);
+        scrollSyncFrame.current = null;
+      }
+    };
+  }, [selectedEditor, electedEditor]);
 
   if (!isAdmin && !loading) return null;
 
@@ -123,6 +174,9 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Version</TableHead>
+                <TableHead>Committed</TableHead>
+                <TableHead>Deployed by</TableHead>
+                <TableHead>Scaling</TableHead>
                 <TableHead>State</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -132,6 +186,23 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                 <TableRow key={version.version}>
                   <TableCell className="font-medium">
                     {version.version}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {version.created_at ? (
+                      <TimestampWithTooltip
+                        date={new Date(version.created_at * 1000)}
+                      />
+                    ) : (
+                      <span className="text-gray-400">Unknown</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {version.created_by || (
+                      <span className="text-gray-400">Unknown</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="max-w-72 text-sm text-gray-600">
+                    {version.policy || '-'}
                   </TableCell>
                   <TableCell>
                     {version.elected && (
@@ -177,10 +248,13 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
 
       {selected && elected && (
         <div className="border-t p-4">
-          <h4 className="mb-3 font-medium">
-            Version {selected.version} compared with elected version{' '}
-            {elected.version}
-          </h4>
+          <div className="mb-3 flex items-center justify-between gap-4">
+            <h4 className="font-medium">
+              Version {selected.version} compared with elected version{' '}
+              {elected.version}
+            </h4>
+            <span className="text-xs text-gray-500">Scrolling is synced</span>
+          </div>
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <div>
               <div className="mb-2 text-sm font-medium text-gray-600">
@@ -190,6 +264,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                 value={formatYaml(selected.yaml_content)}
                 readOnly
                 height="420px"
+                onCreateEditor={setSelectedEditor}
               />
             </div>
             <div>
@@ -200,6 +275,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                 value={formatYaml(elected.yaml_content)}
                 readOnly
                 height="420px"
+                onCreateEditor={setElectedEditor}
               />
             </div>
           </div>

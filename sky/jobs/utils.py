@@ -711,6 +711,8 @@ def update_managed_jobs_statuses(job_id: int | None = None):
                         pid=pid, started_at=pid_started_at)):
                 # The controller is still running, so this job is fine.
                 continue
+            logger.error(f'Controller process for {job_id} seems to be dead.')
+            failure_reason = 'Controller process is dead'
 
         # At this point, either pid is None or process is dead.
 
@@ -757,10 +759,6 @@ def update_managed_jobs_statuses(job_id: int | None = None):
                 logger.error(cleanup_error)
             scheduler.job_done(job_id, idempotent=True)
             continue
-
-        if pid is not None:
-            logger.error(f'Controller process for {job_id} seems to be dead.')
-            failure_reason = 'Controller process is dead'
 
         # The controller process for this managed job is not running: it must
         # have exited abnormally, and we should set the job status to
@@ -1512,6 +1510,28 @@ def _provision_status_headline(provision_msg: str) -> str | None:
     return None
 
 
+def _should_keep_logging(status: managed_job_state.ManagedJobStatus) -> bool:
+    # If we see CANCELLING, just exit - we could miss some job logs but the
+    # job will be terminated momentarily anyway so we don't really care.
+    return (not status.is_terminal() and
+            status != managed_job_state.ManagedJobStatus.CANCELLING)
+
+
+def _wait_for_next_task(
+        job_id: int,
+        current_task_id: int) -> tuple[int, managed_job_state.ManagedJobStatus]:
+    """Wait until the next task starts or the job stops being followable."""
+    while True:
+        latest_task_id, status = (
+            managed_job_state.get_latest_task_id_status(job_id))
+        assert status is not None, (job_id, latest_task_id, status)
+        assert latest_task_id is not None, (job_id, latest_task_id)
+        if (latest_task_id != current_task_id or
+                not _should_keep_logging(status)):
+            return latest_task_id, status
+        time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
+
+
 def stream_logs_by_id(job_id: int,
                       follow: bool = True,
                       tail: int | None = None,
@@ -1608,12 +1628,6 @@ def stream_logs_by_id(job_id: int,
     watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
     watchdog.start()
 
-    def should_keep_logging(status: managed_job_state.ManagedJobStatus) -> bool:
-        # If we see CANCELLING, just exit - we could miss some job logs but the
-        # job will be terminated momentarily anyway so we don't really care.
-        return (not status.is_terminal() and
-                status != managed_job_state.ManagedJobStatus.CANCELLING)
-
     def matches_task_filter(task_id: int, task_name: str,
                             task_filter: str | int | None) -> bool:
         """Check if a task matches the task filter.
@@ -1682,7 +1696,7 @@ def stream_logs_by_id(job_id: int,
                   f'specific task (TASK can be task ID or name).'
                   f'{colorama.Style.RESET_ALL}')
 
-        if not should_keep_logging(managed_job_status):
+        if not _should_keep_logging(managed_job_status):
             job_msg = ''
             if managed_job_status.is_failed():
                 job_msg = ('\nFailure reason: '
@@ -1808,8 +1822,9 @@ def stream_logs_by_id(job_id: int,
         assert latest_task_id is not None, (job_id, latest_task_id)
         task_id = latest_task_id
 
-        while should_keep_logging(managed_job_status):
+        while _should_keep_logging(managed_job_status):
             handle = None
+            cluster_name = None
             job_id_to_tail = None
             if task_id is not None:
                 pool = managed_job_state.get_pool_from_job_id(job_id)
@@ -1987,18 +2002,8 @@ def stream_logs_by_id(job_id: int,
                         ux_utils.spinner_message(
                             f'Waiting for the next task: {task_id + 1}'))
                     status_display.start()
-                    original_task_id = task_id
-                    while True:
-                        latest_task_id, managed_job_status = (
-                            managed_job_state.get_latest_task_id_status(job_id))
-                        if original_task_id != latest_task_id:
-                            break
-                        time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
-                    assert managed_job_status is not None, (job_id,
-                                                            latest_task_id,
-                                                            managed_job_status)
-                    assert latest_task_id is not None, (job_id, latest_task_id)
-                    task_id = latest_task_id
+                    task_id, managed_job_status = _wait_for_next_task(
+                        job_id, task_id)
                     continue
 
                 # The job can be cancelled by the user or the controller (when
@@ -2014,7 +2019,7 @@ def stream_logs_by_id(job_id: int,
             # state.
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, job_id
-            if not should_keep_logging(managed_job_status):
+            if not _should_keep_logging(managed_job_status):
                 break
             logger.info(f'{colorama.Fore.YELLOW}The job cluster is preempted '
                         f'or failed.{colorama.Style.RESET_ALL}')
@@ -2037,7 +2042,7 @@ def stream_logs_by_id(job_id: int,
     wait_seconds = 0
     managed_job_status = managed_job_state.get_status(job_id)
     assert managed_job_status is not None, job_id
-    while (should_keep_logging(managed_job_status) and follow and
+    while (_should_keep_logging(managed_job_status) and follow and
            wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
         time.sleep(1)
         wait_seconds += 1

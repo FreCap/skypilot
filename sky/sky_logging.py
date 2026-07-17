@@ -178,6 +178,7 @@ def set_sky_logging_levels(level: int):
     """Set the logging level for all loggers."""
     # Turn off logger
     previous_levels = {}
+    previous_show_debug_info = False
     for logger_name in logging.Logger.manager.loggerDict:
         if logger_name.startswith('sky'):
             logger = logging.getLogger(logger_name)
@@ -200,7 +201,7 @@ def set_sky_logging_levels(level: int):
                     # no need to restore the level.
                     pass
         if level == logging.DEBUG and not previous_show_debug_info:
-            os.environ.pop(env_options.Options.SHOW_DEBUG_INFO.env_key)
+            os.environ.pop(env_options.Options.SHOW_DEBUG_INFO.env_key, None)
 
 
 def logging_enabled(logger: logging.Logger, level: int) -> bool:

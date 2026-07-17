@@ -45,6 +45,8 @@ def check_version_mismatch_and_non_terminal_jobs() -> None:
     assert isinstance(backend, backends.CloudVmRayBackend)
 
     use_legacy = not handle.is_grpc_enabled_with_flag
+    controller_version = None
+    jobs = None
 
     if not use_legacy:
         try:
@@ -111,6 +113,9 @@ def check_version_mismatch_and_non_terminal_jobs() -> None:
 
         jobs, _, _, _, _ = (
             managed_job_utils.load_managed_job_queue(job_table_payload))
+
+    if controller_version is None or jobs is None:
+        raise RuntimeError('Failed to load managed jobs controller state.')
 
     # Process locally: check version match and filter non-terminal jobs
     version_matches = (controller_version == local_version or

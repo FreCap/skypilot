@@ -886,6 +886,7 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         path = request.url.path
         logger.debug(f'PROM Middleware Request: {request}, {request.url.path}')
         streaming = _is_streaming_api(path)
+        start_time = None
         if not streaming:
             # Exclude streaming APIs, the duration is not meaningful.
             # TODO(aylei): measure the duration of async execution instead.
@@ -906,7 +907,7 @@ class PrometheusMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             user = _get_user_label(request)
             metrics_utils.SKY_APISERVER_REQUESTS_BY_USER_TOTAL.labels(
                 user=user, method=method, status=status_code_group).inc()
-            if not streaming:
+            if start_time is not None:
                 duration = time.time() - start_time
                 metrics_utils.SKY_APISERVER_REQUEST_DURATION_SECONDS.labels(
                     path=path, method=method,

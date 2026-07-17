@@ -1157,7 +1157,8 @@ def _start(service_name: str,
            entrypoint: str,
            requested_incarnation: str | None = None,
            lifecycle_epoch: int | None = None,
-           workspace: str | None = None):
+           workspace: str | None = None,
+           created_by: str | None = None):
     """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
@@ -1367,7 +1368,8 @@ def _start(service_name: str,
                     entrypoint=entrypoint,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
-                    resource_scope=resource_scope)
+                    resource_scope=resource_scope,
+                    created_by=created_by)
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):
@@ -1634,6 +1636,7 @@ def _start(service_name: str,
             # file or allowing another child tick. SHUTTING_DOWN in the DB is
             # the durable, cross-pod terminate signal; the file only reduces
             # latency for legacy/local controllers.
+            owner = None
             try:
                 owner = serve_state.get_service_controller_owner(service_name)
             except Exception as e:  # pylint: disable=broad-except
@@ -1826,6 +1829,9 @@ if __name__ == '__main__':
     parser.add_argument('--lifecycle-epoch',
                         type=int,
                         help='Durable lifecycle fencing token for fresh add')
+    parser.add_argument('--created-by',
+                        type=str,
+                        help='User that requested the initial version')
     parser.add_argument('--task-yaml',
                         type=str,
                         help='Task YAML file',
@@ -1853,4 +1859,5 @@ if __name__ == '__main__':
                args.entrypoint,
                args.service_incarnation,
                args.lifecycle_epoch,
-               workspace=cli_workspace)
+               workspace=cli_workspace,
+               created_by=args.created_by)

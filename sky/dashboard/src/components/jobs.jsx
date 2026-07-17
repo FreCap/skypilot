@@ -746,6 +746,7 @@ export function ManagedJobsTable({
 
   // Keep a ref to latest fetchData to avoid stale closures in interval
   const fetchDataRef = React.useRef(fetchData);
+  const automaticRefreshRef = React.useRef(null);
   React.useEffect(() => {
     fetchDataRef.current = fetchData;
   }, [fetchData]);
@@ -844,11 +845,23 @@ export function ManagedJobsTable({
         fetchDataRef.current &&
         window.document.visibilityState === 'visible'
       ) {
+        if (automaticRefreshRef.current) {
+          return;
+        }
         // Invalidate cache for fast refresh so we get fresh data
         if (hasRunningBatches) {
           jobsCacheManager.invalidateCache();
         }
-        fetchDataRef.current({ includeStatus: !hasRunningBatches });
+        const refresh = fetchDataRef.current({
+          includeStatus: !hasRunningBatches,
+        });
+        automaticRefreshRef.current = refresh;
+        const clearRefresh = () => {
+          if (automaticRefreshRef.current === refresh) {
+            automaticRefreshRef.current = null;
+          }
+        };
+        void refresh.then(clearRefresh, clearRefresh);
       }
     }, effectiveRefreshInterval);
 

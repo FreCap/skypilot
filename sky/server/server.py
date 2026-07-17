@@ -2122,6 +2122,7 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
             """
             try:
                 while True:
+                    data = b''
                     try:
                         data = await loop.run_in_executor(
                             None, os.read, master_fd, 4096)

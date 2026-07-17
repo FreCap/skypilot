@@ -1834,29 +1834,29 @@ class Resources:
                                  f' not for {self.cloud}.')
 
         need_region_or_zone = False
-        try:
-            for volume in self.volumes:
-                if ('name' in volume and volume['storage_type']
-                        == resources_utils.StorageType.NETWORK):
-                    need_region_or_zone = True
-                if 'disk_tier' not in volume:
-                    continue
-                # TODO(hailong): check instance local SSD
-                # support for instance_type.
-                # Refer to https://cloud.google.com/compute/docs/disks/local-ssd#machine-series-lssd # pylint: disable=line-too-long
+        for volume in self.volumes:
+            if ('name' in volume and volume['storage_type']
+                    == resources_utils.StorageType.NETWORK):
+                need_region_or_zone = True
+            disk_tier = volume.get('disk_tier')
+            if disk_tier is None:
+                continue
+            # TODO(hailong): check instance local SSD
+            # support for instance_type.
+            # Refer to https://cloud.google.com/compute/docs/disks/local-ssd#machine-series-lssd # pylint: disable=line-too-long
+            try:
                 self.cloud.check_disk_tier_enabled(self.instance_type,
-                                                   volume['disk_tier'])
-            if (need_region_or_zone and self._region is None and
-                    self._zone is None):
+                                                   disk_tier)
+            except exceptions.NotSupportedError:
                 with ux_utils.print_exception_no_traceback():
-                    raise ValueError('When specifying the volume name, please'
-                                     ' also specify the region or zone.')
-        except exceptions.NotSupportedError:
+                    raise ValueError(
+                        f'Disk tier {disk_tier.value} is not supported for '
+                        f'instance type {self.instance_type}.') from None
+        if (need_region_or_zone and self._region is None and
+                self._zone is None):
             with ux_utils.print_exception_no_traceback():
-                raise ValueError(
-                    f'Disk tier {volume["disk_tier"].value} is not '
-                    f'supported for instance type {self.instance_type}.'
-                ) from None
+                raise ValueError('When specifying the volume name, please'
+                                 ' also specify the region or zone.')
 
     def _try_validate_ports(self) -> None:
         """Try to validate the ports attribute.

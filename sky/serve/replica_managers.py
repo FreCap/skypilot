@@ -4468,11 +4468,18 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info('Discarding stale logical scale-down intent for '
                         f'replica {replica_id}.')
             return
-        # The capacity proof already needs the full fleet. Locate the victim
-        # in that same snapshot so a concurrent durable transition cannot
-        # leave us validating fleet capacity against a newer row while acting
-        # on an older point-read victim. This also removes one query and one
-        # replica unpickle from every logical retirement decision.
+        # Missing and terminal replica states do not become live again for the
+        # same replica id. Preserve their O(1) point-read fast path: a full
+        # fleet scan is unnecessary when no retirement can be accepted.
+        info = serve_state.get_replica_info_from_id(self._service_name,
+                                                    replica_id)
+        if info is None or info.is_terminal:
+            return
+
+        # A live victim still needs the full-fleet capacity proof. Locate it in
+        # that same snapshot so a concurrent durable transition cannot leave us
+        # validating fleet capacity against a newer row while acting on the
+        # older point-read victim above.
         replica_infos = serve_state.get_replica_infos(self._service_name)
         info = None
         ready_capacity = 0

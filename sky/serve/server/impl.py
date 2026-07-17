@@ -300,6 +300,7 @@ def _get_service_record(
         return service_record
 
     use_legacy = not handle.is_grpc_enabled_with_flag
+    service_statuses = None
 
     if not use_legacy:
         try:
@@ -334,6 +335,8 @@ def _get_service_record(
 
         service_statuses = serve_utils.load_service_status(serve_status_payload)
 
+    if service_statuses is None:
+        raise RuntimeError(f'Failed to get {noun} status.')
     assert len(service_statuses) <= 1, service_statuses
     if not service_statuses:
         return None
@@ -703,6 +706,7 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
             'local_task_yaml_path': service_file.name,
             'service_name': service_name,
             'service_incarnation': service_incarnation,
+            'created_by': shlex.quote(common_utils.get_current_user_name()),
             'lifecycle_epoch': controller_lifecycle_epoch,
             'controller_log_file': controller_log_file,
             'remote_user_config_path': remote_config_yaml_path,
@@ -1219,6 +1223,7 @@ def _update_impl_body(
     _persist_storage_intent(task)
 
     use_legacy = not handle.is_grpc_enabled_with_flag
+    current_version = None
 
     if consolidation_mode:
         # The API pod shares the durable Serve DB with the local controller.
@@ -1232,7 +1237,8 @@ def _update_impl_body(
             service_name,
             expected_service_hash=expected_service_hash,
             expected_lifecycle_epoch=serve_utils.get_service_lifecycle_epoch(
-                lifecycle_lock))
+                lifecycle_lock),
+            created_by=common_utils.get_current_user_name())
     else:
         if not use_legacy:
             _assert_service_update_fence(service_name, pool, handle, backend,
@@ -1273,6 +1279,9 @@ def _update_impl_body(
                     raise ValueError(
                         f'Failed to parse version: {version_string}; '
                         f'Returncode: {returncode}') from e
+
+    if current_version is None:
+        raise RuntimeError(f'Failed to add a version to {service_name!r}.')
 
     with tempfile.NamedTemporaryFile(
             prefix=f'{service_name}-v{current_version}',
@@ -1433,7 +1442,6 @@ def _terminate_services(handle: 'backends.CloudVmRayResourceHandle',
                         pool: bool, noun: str) -> str:
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
     use_legacy = not handle.is_grpc_enabled_with_flag
-
     if not use_legacy:
         try:
             return serve_rpc_utils.RpcRunner.terminate_services(
@@ -1593,6 +1601,7 @@ def _get_all_replica_targets(
     """Helper function to get targets for all live replicas."""
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
     use_legacy = not handle.is_grpc_enabled_with_flag
+    service_records = None
 
     if not use_legacy:
         try:
@@ -1622,6 +1631,8 @@ def _get_all_replica_targets(
 
         service_records = serve_utils.load_service_status(serve_status_payload)
 
+    if service_records is None:
+        raise RuntimeError('Failed to fetch service records.')
     if not service_records:
         raise ValueError(f'Service {service_name!r} not found.')
     assert len(service_records) == 1

@@ -263,10 +263,9 @@ def _create_instances(
     per_subnet_tries = max_tries // num_subnets
     errors: list[dict[str, str]] = []
     for i in range(max_tries):
+        # Try each subnet for per_subnet_tries times.
+        subnet_id = subnet_ids[i // per_subnet_tries]
         try:
-            # Try each subnet for per_subnet_tries times.
-            subnet_id = subnet_ids[i // per_subnet_tries]
-
             network_interfaces = [{
                 'SubnetId': subnet_id,
                 'DeviceIndex': 0,

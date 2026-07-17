@@ -16,6 +16,7 @@ from sky.clouds import Zone
 from sky.clouds.gcp import GCP
 from sky.clouds.utils import gcp_utils
 from sky.provision import common
+from sky.provision.gcp import api as gcp_api
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants as gcp_constants
 from sky.provision.gcp import instance_utils
@@ -202,6 +203,143 @@ def _make_provision_config(provider_config):
         resume_stopped_nodes=False,
         ports_to_open_on_launch=None,
     )
+
+
+def test_gcp_config_gateway_polling_shapes():
+    crm = MagicMock()
+    crm_request = MagicMock()
+    crm_request.execute.return_value = {'done': True}
+    crm.operations().get.return_value = crm_request
+    crm_operation = {'name': 'create-project'}
+
+    assert gcp_config.wait_for_crm_operation(crm_operation, crm) == {
+        'done': True
+    }
+    crm.operations().get.assert_called_once_with(name='create-project')
+
+    compute = MagicMock()
+    global_request = MagicMock()
+    global_request.execute.return_value = {'status': 'DONE'}
+    compute.globalOperations().get.return_value = global_request
+    global_operation = {'name': 'create-network'}
+    assert gcp_config.wait_for_compute_global_operation('project',
+                                                        global_operation,
+                                                        compute) == {
+                                                            'status': 'DONE'
+                                                        }
+    compute.globalOperations().get.assert_called_once_with(
+        project='project', operation='create-network')
+
+    region_request = MagicMock()
+    region_request.execute.return_value = {'status': 'DONE'}
+    compute.regionOperations().get.return_value = region_request
+    region_operation = {'name': 'create-subnet'}
+    assert gcp_config.wait_for_compute_region_operation('project',
+                                                        'us-central1',
+                                                        region_operation,
+                                                        compute) == {
+                                                            'status': 'DONE'
+                                                        }
+    compute.regionOperations().get.assert_called_once_with(
+        project='project', region='us-central1', operation='create-subnet')
+
+
+def test_gcp_config_gateway_polling_propagates_operation_error():
+    compute = MagicMock()
+    request = MagicMock()
+    request.execute.return_value = {'error': 'permission denied'}
+    compute.globalOperations().get.return_value = request
+
+    with pytest.raises(Exception, match='permission denied'):
+        gcp_config.wait_for_compute_global_operation('project',
+                                                     {'name': 'create-network'},
+                                                     compute)
+
+
+def test_gcp_config_gateway_rejects_empty_poll_budget(monkeypatch):
+    monkeypatch.setattr(gcp_constants, 'MAX_POLLS', 0)
+
+    with pytest.raises(RuntimeError, match='polling did not run'):
+        gcp_config.wait_for_crm_operation({'name': 'create-project'},
+                                          MagicMock())
+
+
+def test_gcp_http_retry_rejects_empty_retry_budget():
+    wrapped = instance_utils._retry_on_gcp_http_exception(  # pylint: disable=protected-access
+        max_retries=0)(lambda: 'ok')
+
+    with pytest.raises(ValueError, match='max_retries must be at least 1'):
+        wrapped()
+
+
+def test_tpu_timeout_cancels_every_unfinished_operation(monkeypatch):
+    resource = MagicMock()
+    operations_api = resource.projects().locations().operations()
+    nodes_api = resource.projects().locations().nodes()
+
+    create_requests = [MagicMock(), MagicMock()]
+    create_requests[0].execute.return_value = {'name': 'operation-1'}
+    create_requests[1].execute.return_value = {'name': 'operation-2'}
+    nodes_api.create.side_effect = create_requests
+
+    cancel_requests = [MagicMock(), MagicMock()]
+    operations_api.cancel.side_effect = cancel_requests
+    monkeypatch.setattr(instance_utils.GCPTPUVMInstance, 'load_resource',
+                        MagicMock(return_value=resource))
+    monkeypatch.setattr(instance_utils, 'GCP_TIMEOUT', 0)
+    monkeypatch.setattr(instance_utils, '_format_and_log_message_from_errors',
+                        MagicMock())
+
+    errors, names = instance_utils.GCPTPUVMInstance._create_standard_instances(  # pylint: disable=protected-access
+        ['node-1', 'node-2'], 'project', 'zone', {'labels': {}})
+
+    assert names == ['node-1', 'node-2']
+    assert errors == [{
+        'code': 'TIMEOUT',
+        'message': 'Timeout waiting for creation operation',
+        'domain': 'create_instances'
+    }]
+    assert operations_api.cancel.call_count == 2
+    assert cancel_requests[0].http.timeout == 1
+    assert cancel_requests[1].http.timeout == 1
+    cancel_requests[0].execute.assert_called_once_with(
+        num_retries=instance_utils.GCP_CREATE_MAX_RETRIES)
+    cancel_requests[1].execute.assert_called_once_with(
+        num_retries=instance_utils.GCP_CREATE_MAX_RETRIES)
+
+
+def test_gcp_config_gateway_callables_keep_pickle_identity():
+    gateway_names = (
+        'wait_for_crm_operation',
+        'wait_for_compute_global_operation',
+        'wait_for_compute_region_operation',
+        '_create_crm',
+        '_create_iam',
+        '_create_compute',
+        '_create_tpu',
+        '_delete_firewall_rule',
+        '_list_firewall_rules',
+        '_create_vpcnet',
+        '_list_vpcnets',
+        '_delete_vpcnet',
+        '_list_subnets',
+        '_network_interface_to_vpc_name',
+        '_get_project',
+        '_create_project',
+        '_get_service_account',
+        '_create_service_account',
+        '_add_iam_policy_binding',
+        '_create_subnet',
+        '_delete_subnet',
+        '_create_placement_policy',
+        '_get_placement_policy',
+    )
+
+    for gateway_name in gateway_names:
+        gateway_callable = getattr(gcp_config, gateway_name)
+        assert gateway_callable.__module__ == gcp_config.__name__
+        assert getattr(gcp_api, gateway_name) is gateway_callable
+        assert pickle.loads(pickle.dumps(gateway_callable)) is gateway_callable
 
 
 def test_gcp_get_usable_vpc_and_subnet_uses_specified_subnet(monkeypatch):

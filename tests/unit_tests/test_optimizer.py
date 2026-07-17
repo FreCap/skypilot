@@ -1,4 +1,5 @@
 """Unit tests for sky.optimizer."""
+import pickle
 import types
 from unittest import mock
 
@@ -59,6 +60,143 @@ def test_candidate_generation_compatibility_aliases():
         optimizer_candidate_generation.check_specified_regions)
     assert getattr(optimizer, '_fill_in_launchable_resources') is (
         optimizer_candidate_generation.fill_in_launchable_resources)
+
+
+def test_print_optimized_plan_preserves_facade_logging_and_egress_hook():
+    """The optimizer facade keeps its reporting output and egress hook."""
+    task = mock.Mock(spec=task_lib.Task)
+    task.name = 'training'
+    task.num_nodes = 1
+    task.time_estimator_func = None
+    task.resources = set()
+    task.get_inputs.return_value = None
+    task.get_outputs.return_value = None
+
+    cloud = mock.Mock(spec=clouds.AWS)
+    cloud.__str__ = mock.Mock(return_value='AWS')
+    cloud.get_vcpus_mem_from_instance_type.return_value = (4.0, 16.0)
+
+    resource = mock.Mock(spec=resources_lib.Resources)
+    resource.cloud = cloud
+    resource.instance_type = 'g5.xlarge'
+    resource.accelerators = {'A10G': 1}
+    resource.use_spot = False
+    resource.disk_tier = None
+    resource.get_accelerators_str.return_value = 'A10G:1'
+    resource.get_spot_str.return_value = ''
+    resource.assert_launchable.return_value = resource
+    resource.to_yaml_config.return_value = {'instance_type': 'g5.xlarge'}
+    resource.infra.formatted_str.return_value = 'AWS (us-east-1)'
+
+    graph = mock.Mock()
+    node_to_cost_map = {task: {resource: 1.25}}
+    plan = {task: resource}
+
+    with mock.patch.object(optimizer.Optimizer,
+                           '_print_egress_plan') as mock_print_egress, \
+            mock.patch.object(optimizer, 'logger') as mock_logger:
+        optimizer.Optimizer.print_optimized_plan(graph, [task], plan, 3600,
+                                                 1.25, node_to_cost_map, True)
+
+    mock_print_egress.assert_called_once_with(graph, plan, True)
+    messages = '\n'.join(
+        str(call.args[0]) for call in mock_logger.info.call_args_list)
+    assert 'Considered resources' in messages
+    assert 'g5.xlarge' in messages
+    assert 'A10G:1' in messages
+
+
+def test_reporting_facade_preserves_callable_identity():
+    """Historical optimizer reporting methods remain pickle-compatible."""
+    for name in ('_print_egress_plan', 'print_optimized_plan',
+                 '_print_candidates', '_print_job_group_plan'):
+        method = getattr(optimizer.Optimizer, name)
+        assert method.__module__ == optimizer.__name__
+        assert pickle.loads(pickle.dumps(method)) is method
+
+
+def test_print_egress_plan_preserves_facade_helpers_and_logging():
+    """Egress reporting keeps optimizer-owned calculation hooks."""
+    parent = mock.Mock(spec=task_lib.Task)
+    parent.name = 'producer'
+    parent.__str__ = mock.Mock(return_value='producer')
+    child = mock.Mock(spec=task_lib.Task)
+    child.__str__ = mock.Mock(return_value='consumer')
+    graph = mock.Mock()
+    graph.edges.return_value = [(parent, child)]
+    parent_resource = mock.Mock(spec=resources_lib.Resources)
+    child_resource = mock.Mock(spec=resources_lib.Resources)
+    plan = {parent: parent_resource, child: child_resource}
+
+    with mock.patch.object(optimizer.Optimizer,
+                           '_get_egress_info',
+                           return_value=(clouds.AWS(), clouds.GCP(), 2.5)), \
+            mock.patch.object(optimizer.Optimizer,
+                              '_egress_cost',
+                              return_value=0.25) as mock_egress_cost, \
+            mock.patch.object(optimizer, 'logger') as mock_logger:
+        optimizer.Optimizer._print_egress_plan(  # pylint: disable=protected-access
+            graph, plan, True)
+
+    mock_egress_cost.assert_called_once()
+    message = str(mock_logger.info.call_args.args[0])
+    assert 'Egress plan' in message
+    assert 'producer' in message
+    assert 'consumer' in message
+    assert '2.5' in message
+    assert '0.25' in message
+
+
+def test_print_egress_plan_preserves_zero_byte_return_value():
+    """The historical zero-byte short-circuit still returns zero."""
+    parent = mock.Mock(spec=task_lib.Task)
+    child = mock.Mock(spec=task_lib.Task)
+    graph = mock.Mock()
+    graph.edges.return_value = [(parent, child)]
+    plan = {
+        parent: mock.Mock(spec=resources_lib.Resources),
+        child: mock.Mock(spec=resources_lib.Resources),
+    }
+
+    with mock.patch.object(optimizer.Optimizer,
+                           '_get_egress_info',
+                           return_value=(None, None, 0)):
+        result = optimizer.Optimizer._print_egress_plan(  # pylint: disable=protected-access
+            graph, plan, True)
+
+    assert result == 0
+
+
+def test_print_candidates_preserves_facade_logging():
+    """Candidate reporting keeps the optimizer logger compatibility seam."""
+    node = mock.Mock(spec=task_lib.Task)
+    best_resource = mock.Mock(spec=resources_lib.Resources)
+    best_resource.accelerators = {'L4': 1}
+    best_resource.get_accelerators_str.return_value = 'L4:1'
+    node.best_resources = best_resource
+
+    first = mock.Mock(spec=resources_lib.Resources)
+    first.instance_type = 'g2-standard-4'
+    first.get_accelerators_str.return_value = 'L4:1'
+    second = mock.Mock(spec=resources_lib.Resources)
+    second.instance_type = 'g2-standard-8'
+    second.get_accelerators_str.return_value = 'L4:1'
+
+    with mock.patch.object(optimizer.optimizer_reporting.resources_utils,
+                           'format_resource',
+                           return_value=('L4:1', 'L4:1')), mock.patch.object(
+                               optimizer, 'logger') as mock_logger:
+        optimizer.Optimizer._print_candidates(  # pylint: disable=protected-access
+            {node: {
+                clouds.GCP(): [first, second]
+            }})
+
+    messages = '\n'.join(
+        str(call.args[0]) for call in mock_logger.info.call_args_list)
+    assert 'Multiple GCP instances satisfy L4:1' in messages
+    assert 'g2-standard-4' in messages
+    assert 'g2-standard-8' in messages
+    assert 'sky gpus list L4' in messages
 
 
 def test_check_specified_clouds_keeps_enabled_clouds():

@@ -76,12 +76,9 @@ export async function getCurrentUserRole() {
   currentUserPromise = (async () => {
     try {
       const baseUrl = window.location.origin;
-      const response = await trackedFetch(
-        `${baseUrl}/internal/dashboard/users/role`,
-        {
-          headers: withVersionHeader({}),
-        }
-      );
+      const response = await trackedFetch(`${baseUrl}${ENDPOINT}/users/role`, {
+        headers: withVersionHeader({}),
+      });
       if (response.ok) {
         const data = await response.json();
         return cacheCurrentUser(data);

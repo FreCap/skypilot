@@ -339,7 +339,7 @@ class DO(clouds.Cloud):
         except do.exceptions().HttpResponseError as err:
             raise do_utils.DigitalOceanError(
                 'HTTP error while retrieving size of '
-                f'image_id {response}: {err.error.message}') from err
+                f'image_id {image_id!r}: {err.error.message}') from err
         except KeyError as err:
             raise do_utils.DigitalOceanError(
                 f'No image_id `{image_id}` found') from err

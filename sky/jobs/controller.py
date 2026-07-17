@@ -2026,6 +2026,7 @@ class ControllerManager:
         def task_cleanup(task: 'sky.Task', job_id: int):
             assert task.name is not None, task
             error = None
+            cluster_name = None
 
             try:
                 if task.metadata.get('batch_coordinator'):
@@ -2059,8 +2060,9 @@ class ControllerManager:
                                         _try_cancel_if_cluster_is_init=True)
             except Exception as e:  # pylint: disable=broad-except
                 error = e
+                cluster_display_name = cluster_name or task.name
                 logger.warning(
-                    f'Failed to terminate cluster {cluster_name}: {e}')
+                    f'Failed to terminate cluster {cluster_display_name}: {e}')
                 # we continue to try cleaning up whatever else we can.
             # Clean up Storages with persistent=False.
             # TODO(zhwu): this assumes the specific backend.
@@ -2302,6 +2304,9 @@ class ControllerManager:
         cancelling = False
         superseded = False
         graceful, graceful_timeout = False, None
+        controller = None
+        task_id = None
+        dag = None
         try:
             controller = JobController(job_id, self.starting,
                                        self._job_tasks_lock,
@@ -2367,8 +2372,13 @@ class ControllerManager:
             # down, we skip gracefully.
             if active_task_ids:
                 try:
-                    await self._download_logs_for_cancelled_job(
-                        controller, job_id, active_task_ids, dag, pool)
+                    if controller is None:
+                        logger.warning('Skipping log download because the job '
+                                       'controller was not initialized before '
+                                       'cancellation.')
+                    else:
+                        await self._download_logs_for_cancelled_job(
+                            controller, job_id, active_task_ids, dag, pool)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(
                         f'Failed to download logs for cancelled job '
@@ -2409,6 +2419,7 @@ class ControllerManager:
                 if cancelling:
                     # Since it's set with cancelling
                     assert task_id is not None, job_id
+                    assert dag is not None, job_id
                     await managed_job_state.set_cancelled_async(
                         job_id=job_id,
                         callback_func=managed_job_utils.event_callback_func(
@@ -2679,6 +2690,7 @@ async def main(controller_uuid: str):
 
     # Increase number of files we can open
     soft = None
+    hard = None
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         logger.info(f'Current rlimits for NOFILE: soft={soft}, hard={hard}')

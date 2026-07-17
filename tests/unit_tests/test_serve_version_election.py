@@ -38,8 +38,16 @@ def test_version_history_marks_elected_and_active_versions():
                            'get_service_from_name',
                            return_value=record), \
          mock.patch.object(server.serve_state,
-                           'get_version_yaml_contents',
-                           return_value={1: 'yaml-1', 2: 'yaml-2', 3: 'yaml-3'}), \
+                           'get_version_records',
+                           return_value=[{
+                               'version': version,
+                               'spec': mock.Mock(
+                                   autoscaling_policy_str=mock.Mock(
+                                       return_value=f'policy-{version}')),
+                               'yaml_content': f'yaml-{version}',
+                               'created_at': 1000.0 + version,
+                               'created_by': f'user-{version}',
+                           } for version in (1, 2, 3)]), \
          mock.patch.object(server.debug_dump_helpers,
                            'redact_task_yaml',
                            side_effect=lambda yaml: f'redacted-{yaml}'):
@@ -50,16 +58,25 @@ def test_version_history_marks_elected_and_active_versions():
     assert history['versions'] == [{
         'version': 3,
         'yaml_content': 'redacted-yaml-3',
+        'created_at': 1003.0,
+        'created_by': 'user-3',
+        'policy': 'policy-3',
         'elected': True,
         'active': True,
     }, {
         'version': 2,
         'yaml_content': 'redacted-yaml-2',
+        'created_at': 1002.0,
+        'created_by': 'user-2',
+        'policy': 'policy-2',
         'elected': False,
         'active': True,
     }, {
         'version': 1,
         'yaml_content': 'redacted-yaml-1',
+        'created_at': 1001.0,
+        'created_by': 'user-1',
+        'policy': 'policy-1',
         'elected': False,
         'active': False,
     }]

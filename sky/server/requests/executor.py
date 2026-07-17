@@ -440,6 +440,7 @@ class RequestWorker:
         # We use executor instead of individual multiprocessing.Process to avoid
         # the overhead of forking a new process for each request, which can be
         # about 1s delay.
+        executor = None
         try:
             # Pass the main process's clean env snapshot so workers (incl.
             # lazy-spawned burst workers) record the same pre-pollution env
@@ -472,7 +473,8 @@ class RequestWorker:
             # OOM killer, crash the API server or recreate the worker process
             # to avoid broken state in such cases.
             logger.info(f'[{self}] Worker process interrupted')
-            executor.shutdown()
+            if executor is not None:
+                executor.shutdown()
 
 
 @annotations.lru_cache(scope='global', maxsize=None)

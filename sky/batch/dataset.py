@@ -48,6 +48,7 @@ def _wait_for_managed_job_completion(managed_job_id: int) -> None:
 
     try:
         while True:
+            record = None
             try:
                 record = _get_managed_job_record(managed_job_id)
             except Exception as e:  # pylint: disable=broad-except
@@ -56,6 +57,8 @@ def _wait_for_managed_job_completion(managed_job_id: int) -> None:
                 logger.debug('Transient error polling job %s: %s',
                              managed_job_id, e)
                 time.sleep(poll_interval)
+                continue
+            if record is None:
                 continue
             status = record.status
             if status is None:
