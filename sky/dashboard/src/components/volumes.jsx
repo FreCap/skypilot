@@ -48,7 +48,6 @@ const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
 export function Volumes() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
-  const refreshDataRef = useRef(null);
   const isMobile = useMobile();
   const [showDeleteConfirmDialog, setShowDeleteConfirmDialog] = useState(false);
   const [volumeToDelete, setVolumeToDelete] = useState(null);
@@ -62,6 +61,7 @@ export function Volumes() {
   const [activeTab, setActiveTab] = useState('volumes');
   const [volumesData, setVolumesData] = useState([]);
   const pluginTabs = usePluginComponents('volumes.tabs');
+  const requestVersionRef = useRef(0);
 
   const handleTabChange = useCallback(
     (tab) => {
@@ -81,21 +81,34 @@ export function Volumes() {
     }
   }, [router.isReady, router.query.tab]);
 
-  const handleRefresh = () => {
+  const runPreload = useCallback(async ({ force = false } = {}) => {
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
+
+    setPreloadingComplete(false);
+    try {
+      if (force) {
+        await cachePreloader.preloadForPage('volumes', { force: true });
+      } else {
+        await cachePreloader.preloadForPage('volumes');
+      }
+    } catch (error) {
+      if (isCurrentRequest()) {
+        console.error('Error preloading volumes data:', error);
+      }
+    }
+
+    if (!isCurrentRequest()) return;
+    setPreloadingComplete(true);
+    setLastFetchedTime(new Date());
+  }, []);
+
+  const handleRefresh = useCallback(() => {
     trackVolumeAction('refresh');
     dashboardCache.invalidate(getVolumes);
-    // Reset preloading state so VolumesTable can fetch fresh data immediately
-    setPreloadingComplete(false);
-    // Trigger a new preload cycle
-    cachePreloader.preloadForPage('volumes', { force: true }).then(() => {
-      setPreloadingComplete(true);
-      setLastFetchedTime(new Date());
-      // Call refresh after preloading is complete
-      if (refreshDataRef.current) {
-        refreshDataRef.current();
-      }
-    });
-  };
+    return runPreload({ force: true });
+  }, [runPreload]);
 
   const handleDeleteVolumeClick = (volume) => {
     trackVolumeAction('delete');
@@ -166,20 +179,11 @@ export function Volumes() {
   };
 
   useEffect(() => {
-    const preloadData = async () => {
-      try {
-        // Await cache preloading for volumes page
-        await cachePreloader.preloadForPage('volumes');
-      } catch (error) {
-        console.error('Error preloading volumes data:', error);
-      } finally {
-        // Signal completion even on error so the table can load
-        setPreloadingComplete(true);
-        setLastFetchedTime(new Date());
-      }
+    runPreload();
+    return () => {
+      requestVersionRef.current += 1;
     };
-    preloadData();
-  }, []);
+  }, [runPreload]);
 
   const hasPluginTabs = pluginTabs.length > 0;
 
@@ -251,7 +255,6 @@ export function Volumes() {
             key="volumes"
             refreshInterval={REFRESH_INTERVAL}
             setLoading={setLoading}
-            refreshDataRef={refreshDataRef}
             onDeleteVolume={handleDeleteVolumeClick}
             onDataChange={setVolumesData}
             preloadingComplete={preloadingComplete}
@@ -455,7 +458,6 @@ export function Volumes() {
 export function VolumesTable({
   refreshInterval,
   setLoading,
-  refreshDataRef,
   onDeleteVolume,
   onDataChange,
   preloadingComplete,
@@ -509,18 +511,6 @@ export function VolumesTable({
   const sortedData = useMemo(() => {
     return sortData(data, sortConfig.key, sortConfig.direction);
   }, [data, sortConfig]);
-
-  // Expose fetchData to parent component
-  useEffect(() => {
-    if (refreshDataRef) {
-      refreshDataRef.current = fetchData;
-    }
-    return () => {
-      if (refreshDataRef?.current === fetchData) {
-        refreshDataRef.current = null;
-      }
-    };
-  }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
     setData([]);
@@ -979,9 +969,6 @@ function UsedByCell({ clusters, pods }) {
 VolumesTable.propTypes = {
   refreshInterval: PropTypes.number.isRequired,
   setLoading: PropTypes.func.isRequired,
-  refreshDataRef: PropTypes.shape({
-    current: PropTypes.func,
-  }).isRequired,
   onDeleteVolume: PropTypes.func.isRequired,
   onDataChange: PropTypes.func,
   preloadingComplete: PropTypes.bool.isRequired,

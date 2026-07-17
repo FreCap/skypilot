@@ -1,5 +1,11 @@
 import React from 'react';
-import { act, render, screen } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 jest.mock('next/router', () => ({
   useRouter: () => ({
@@ -39,6 +45,7 @@ jest.mock('@/lib/cache', () => ({
 }));
 
 import { Volumes, VolumesTable } from '@/components/volumes';
+import { getVolumes } from '@/data/connectors/volumes';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 
@@ -114,6 +121,72 @@ describe('Volumes request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
+  it('lets a manual refresh own the only foreground fetch', async () => {
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+
+    render(<Volumes />);
+    await screen.findByText('current-volume');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    await waitFor(() => {
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    });
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      2,
+      'volumes',
+      { force: true }
+    );
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes);
+  });
+
+  it('does not let an initial preload republish after a manual refresh supersedes it', async () => {
+    const initialPreload = deferred();
+    const refreshPreload = deferred();
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    cachePreloader.preloadForPage
+      .mockReturnValueOnce(initialPreload.promise)
+      .mockReturnValueOnce(refreshPreload.promise);
+
+    render(<Volumes />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      2,
+      'volumes',
+      { force: true }
+    );
+
+    await act(async () => {
+      initialPreload.resolve();
+      await initialPreload.promise;
+    });
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+    });
+    await screen.findByText('current-volume');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not continue a preload that finishes after unmount', async () => {
+    const preload = deferred();
+    cachePreloader.preloadForPage.mockReturnValue(preload.promise);
+
+    const { unmount } = render(<Volumes />);
+
+    unmount();
+    await act(async () => {
+      preload.resolve();
+      await preload.promise;
+    });
+
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
   it('does not let an older failure erase a newer interval result', async () => {
     const oldRequest = deferred();
     const currentRequest = deferred();
@@ -147,21 +220,18 @@ describe('Volumes request ownership', () => {
     const pendingRequest = deferred();
     const setLoading = jest.fn();
     const onDataChange = jest.fn();
-    const refreshDataRef = { current: null };
     dashboardCache.get.mockReturnValueOnce(pendingRequest.promise);
 
     const { unmount } = render(
       <VolumesTable
         refreshInterval={30000}
         setLoading={setLoading}
-        refreshDataRef={refreshDataRef}
         onDeleteVolume={jest.fn()}
         onDataChange={onDataChange}
         preloadingComplete={true}
       />
     );
     expect(setLoading).toHaveBeenCalledWith(true);
-    expect(refreshDataRef.current).toEqual(expect.any(Function));
     setLoading.mockClear();
 
     unmount();
@@ -172,7 +242,6 @@ describe('Volumes request ownership', () => {
 
     expect(onDataChange).not.toHaveBeenCalled();
     expect(setLoading).not.toHaveBeenCalled();
-    expect(refreshDataRef.current).toBeNull();
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 });
