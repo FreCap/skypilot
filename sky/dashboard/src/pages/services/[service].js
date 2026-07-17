@@ -261,6 +261,7 @@ export function useServiceDetails({ serviceName }) {
 function ServiceDetails() {
   const router = useRouter();
   const { service: serviceName } = router.query;
+  const activeTab = router.query.tab === 'versions' ? 'versions' : 'overview';
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
@@ -339,36 +340,63 @@ function ServiceDetails() {
           </div>
         </div>
 
+        {serviceData && (
+          <div className="mb-4 flex border-b text-sm" role="tablist">
+            {[
+              { id: 'overview', label: 'Overview', suffix: '' },
+              { id: 'versions', label: 'Versions', suffix: '?tab=versions' },
+            ].map((tab) => (
+              <Link
+                key={tab.id}
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                href={`/services/${encodeURIComponent(serviceName)}${tab.suffix}`}
+                shallow
+                className={`border-b-2 px-4 py-2 font-medium ${
+                  activeTab === tab.id
+                    ? 'border-sky-blue text-sky-blue'
+                    : 'border-transparent text-gray-500 hover:text-gray-800'
+                }`}
+              >
+                {tab.label}
+              </Link>
+            ))}
+          </div>
+        )}
+
         {loading && isInitialLoad ? (
           <div className="flex justify-center items-center py-12">
             <CircularProgress size={24} className="mr-2" />
             <span className="text-gray-500">Loading service details...</span>
           </div>
         ) : serviceData ? (
-          <>
-            <ServiceDetailCard
-              serviceData={serviceData}
-              requestHistory={replicaHistory}
-              pricingLoading={replicasLoading && serviceData.summaryOnly}
-            />
+          activeTab === 'versions' ? (
             <ServiceVersionHistory
               serviceName={serviceName}
               onElectionComplete={refreshData}
             />
-            <ServeHistorySection
-              key={serviceName}
-              history={replicaHistory}
-              loading={historyLoading}
-            />
-            <ReplicaPlacementCard
-              replicas={serviceData.replicas}
-              loading={replicasLoading && serviceData.summaryOnly}
-            />
-            <ReplicasCard
-              replicas={serviceData.replicas}
-              loading={replicasLoading && serviceData.summaryOnly}
-            />
-          </>
+          ) : (
+            <>
+              <ServiceDetailCard
+                serviceData={serviceData}
+                requestHistory={replicaHistory}
+                pricingLoading={replicasLoading && serviceData.summaryOnly}
+              />
+              <ServeHistorySection
+                key={serviceName}
+                history={replicaHistory}
+                loading={historyLoading}
+              />
+              <ReplicaPlacementCard
+                replicas={serviceData.replicas}
+                loading={replicasLoading && serviceData.summaryOnly}
+              />
+              <ReplicasCard
+                replicas={serviceData.replicas}
+                loading={replicasLoading && serviceData.summaryOnly}
+              />
+            </>
+          )
         ) : (
           <div className="flex justify-center items-center py-12">
             <span className="text-gray-500">Service not found.</span>
@@ -419,6 +447,13 @@ export function ServiceDetailCard({
   if (serviceData.estimatedHourlyCost != null) {
     hourlyCostDetails.push('Current catalog, compute only');
   }
+
+  const excludedCostDetails = Object.entries(
+    serviceData.hourlyCostExclusionReasons || {}
+  ).map(([reason, count]) => {
+    const label = reason === 'kubernetes' ? 'Kubernetes' : reason;
+    return `${count} ${label} replica${count === 1 ? '' : 's'} excluded`;
+  });
 
   const requestDetails = [];
   const usesLogicalReplicas = serviceData.replicaUnit === 'logical';
@@ -573,15 +608,25 @@ export function ServiceDetailCard({
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Estimated compute / 1K requests
+                Known cloud compute / 1K requests
               </div>
               <div className="text-base mt-1">
                 {serviceData.costPerThousandRequests != null
-                  ? formatUsd(serviceData.costPerThousandRequests)
-                  : '-'}
+                  ? `${formatUsd(serviceData.costPerThousandRequests)}${
+                      serviceData.hourlyCostExcludedReplicaCount > 0 ? '+' : ''
+                    }`
+                  : serviceData.hourlyCostExcludedReplicaCount > 0
+                    ? 'Unknown'
+                    : '-'}
               </div>
               <div className="text-xs text-gray-500 mt-1">
-                Current fleet cost at the recent request rate
+                {excludedCostDetails.length > 0
+                  ? serviceData.costPerThousandRequests != null
+                    ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
+                    : serviceData.pricedReplicaCount > 0
+                      ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
+                      : `No pricing available · ${excludedCostDetails.join(' · ')}`
+                  : 'Current fleet cost at the recent request rate'}
               </div>
             </div>
             <div>

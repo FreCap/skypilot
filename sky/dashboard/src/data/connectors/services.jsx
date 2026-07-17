@@ -214,18 +214,27 @@ export function normalizeService(record) {
   const pricedReplicas = replicas.filter(
     (replica) => replica.hourlyCost !== null
   );
-  const estimatedHourlyCost = pricedReplicas.length
-    ? pricedReplicas.reduce((total, replica) => total + replica.hourlyCost, 0)
-    : null;
+  const excludedReplicas = replicas.filter(
+    (replica) => replica.hourlyCostExclusionReason
+  );
+  const hourlyCostExclusionReasons = {};
+  excludedReplicas.forEach((replica) => {
+    const reason = replica.hourlyCostExclusionReason;
+    hourlyCostExclusionReasons[reason] =
+      (hourlyCostExclusionReasons[reason] || 0) + 1;
+  });
+  const knownHourlyCost = pricedReplicas.reduce(
+    (total, replica) => total + replica.hourlyCost,
+    0
+  );
+  const estimatedHourlyCost = pricedReplicas.length ? knownHourlyCost : null;
   const spotHourlyCost = pricedReplicas
     .filter((replica) => replica.is_spot)
     .reduce((total, replica) => total + replica.hourlyCost, 0);
   const onDemandHourlyCost = pricedReplicas
     .filter((replica) => !replica.is_spot)
     .reduce((total, replica) => total + replica.hourlyCost, 0);
-  const hourlyCostExcludedReplicaCount = replicas.filter(
-    (replica) => replica.hourlyCostExclusionReason
-  ).length;
+  const hourlyCostExcludedReplicaCount = excludedReplicas.length;
   const rawRequestRate = record.requests_per_second;
   const requestRate =
     rawRequestRate === null || rawRequestRate === undefined
@@ -235,10 +244,10 @@ export function normalizeService(record) {
     ? requestRate
     : null;
   const costPerThousandRequests =
-    estimatedHourlyCost !== null &&
-    hourlyCostExcludedReplicaCount === 0 &&
-    normalizedRequestRate > 0
-      ? (estimatedHourlyCost * 1000) / (normalizedRequestRate * 3600)
+    pricedReplicas.length > 0 && normalizedRequestRate > 0
+      ? // Lower bound when replicas with unknown prices are excluded: known
+        // cloud spend divided by all requests served by the fleet.
+        (knownHourlyCost * 1000) / (normalizedRequestRate * 3600)
       : null;
 
   return {
@@ -281,6 +290,7 @@ export function normalizeService(record) {
     onDemandHourlyCost,
     pricedReplicaCount: pricedReplicas.length,
     hourlyCostExcludedReplicaCount,
+    hourlyCostExclusionReasons,
     recentRequestCount: record.recent_request_count ?? null,
     requestWindowSeconds: record.request_window_seconds ?? null,
     requestRate: normalizedRequestRate,
