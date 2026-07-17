@@ -34,7 +34,8 @@ def _require_admin(request: fastapi.Request) -> None:
     if rbac.RoleName.ADMIN.value not in roles:
         raise fastapi.HTTPException(
             status_code=403,
-            detail='Only admins can view or elect service versions.')
+            detail='Only admins can manage service versions and load '
+            'balancers.')
 
 
 def _redact_version_yaml(yaml_content: str | None,
@@ -158,6 +159,37 @@ async def elect_version(
             expected_service_hash=record['hash'],
             expected_elected_version=record.get('elected_version')),
         func=core.elect_version,
+        schedule_type=api_requests.ScheduleType.SHORT,
+        request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+        auth_user=request.state.auth_user,
+    )
+
+
+@router.post('/{service_name}/load-balancer/high-availability')
+async def set_load_balancer_high_availability(
+    request: fastapi.Request,
+    service_name: str,
+    body: payloads.ServeLoadBalancerHighAvailabilityBody,
+) -> None:
+    """Change only the external-LB topology for an existing service."""
+    await asyncio.to_thread(_require_admin, request)
+    record = await asyncio.to_thread(serve_state.get_service_from_name,
+                                     service_name)
+    if record is None or record.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if not record.get('hash'):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service has no durable incarnation identity.')
+    await executor.schedule_request_async(
+        request_id=request.state.request_id,
+        request_name=request_names.RequestName.SERVE_LB_HIGH_AVAILABILITY,
+        request_body=payloads.ServeSetLoadBalancerHighAvailabilityBody(
+            service_name=service_name,
+            enabled=body.enabled,
+            expected_service_hash=record['hash']),
+        func=core.set_load_balancer_high_availability,
         schedule_type=api_requests.ScheduleType.SHORT,
         request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         auth_user=request.state.auth_user,
