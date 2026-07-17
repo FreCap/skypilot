@@ -2616,9 +2616,10 @@ class ControllerManager:
                     pid=pid_str).set(controller_utils.LAUNCHES_PER_WORKER)
 
             if starting_count >= controller_utils.LAUNCHES_PER_WORKER:
-                # launching a job takes around 1 minute, so lets wait half that
-                # time
-                await asyncio.sleep(30)
+                logger.info('Too many jobs starting, waiting for a slot')
+                async with self._starting_signal:
+                    await self._starting_signal.wait_for(lambda: len(
+                        self.starting) < controller_utils.LAUNCHES_PER_WORKER)
                 continue
 
             # Normally, 200 jobs can run on each controller. But if we have a
