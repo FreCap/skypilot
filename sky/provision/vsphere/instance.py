@@ -228,7 +228,7 @@ def _create_instances(
     # 'cpu.xlarge' that starts with 'cpu.' TODO: add support for the cpu
     #  instances that are not started with 'cpu.'
     hosts_item = None
-    # gpu_item = None
+    selected_gpu = None
     if not gpu_instance:
         # Get the first host that has enough cpus
         hosts_item = hosts_df.iloc[0].to_dict()
@@ -247,7 +247,7 @@ def _create_instances(
                         if (vms_item['AcceleratorName'].lower()
                                 in gpu.get('DeviceName').lower()):
                             hosts_item = row.to_dict()
-                            # gpu_item = gpu
+                            selected_gpu = gpu
                             break
             if hosts_item:
                 break
@@ -264,9 +264,10 @@ def _create_instances(
     spec.numCPUs = cpus_needed
     spec.memoryAllocation = vsphere_adaptor.get_vim().ResourceAllocationInfo(
         reservation=spec.memoryMB)
-    if gpu_instance and gpu:
-        device_id = gpu.get('DeviceID')
-        vendor_id = gpu.get('VendorID')
+    if gpu_instance:
+        assert selected_gpu is not None
+        device_id = selected_gpu.get('DeviceID')
+        vendor_id = selected_gpu.get('VendorID')
         pci_device_spec = vsphere_adaptor.get_vim().vm.device.VirtualDeviceSpec(
         )
         pci_device_spec.operation = (

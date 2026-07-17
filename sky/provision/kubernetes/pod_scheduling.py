@@ -246,8 +246,8 @@ def _raise_pod_scheduling_errors(namespace, context, new_nodes):
                 event_message = event.message
                 break
         if event_message is not None:
+            out_of = {}
             if pod_status == 'Pending':
-                out_of = {}
                 # key: resource name, value: (extra message, nice name)
                 if 'Insufficient cpu' in event_message:
                     out_of['CPU'] = (': Run \'kubectl get nodes -o '

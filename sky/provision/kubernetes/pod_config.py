@@ -155,6 +155,7 @@ class PodValidator:
             return data
 
         kwargs = {}
+        current_key = None
         try:
             if (data is not None and klass.openapi_types is not None and
                     isinstance(data, (list, dict))):
@@ -164,6 +165,7 @@ class PodValidator:
                     v: k for k, v in klass.attribute_map.items()
                 }
                 for k, v in data.items():
+                    current_key = k
                     field_name = reverse_attribute_map.get(k, None)
                     if field_name is None:
                         raise ValueError(
@@ -175,10 +177,12 @@ class PodValidator:
                     kwargs[field_name] = cls.__validate(
                         v, klass.openapi_types[field_name])
         except exceptions.KubernetesValidationError as e:
-            raise exceptions.KubernetesValidationError([k] + e.path,
+            path = [] if current_key is None else [current_key]
+            raise exceptions.KubernetesValidationError(path + e.path,
                                                        str(e)) from e
         except Exception as e:
-            raise exceptions.KubernetesValidationError([k], str(e)) from e
+            path = [] if current_key is None else [current_key]
+            raise exceptions.KubernetesValidationError(path, str(e)) from e
 
         instance = klass(**kwargs)
 

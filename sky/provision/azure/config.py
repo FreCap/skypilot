@@ -200,6 +200,7 @@ def bootstrap_instances(
     get_deployment = get_azure_sdk_function(client=resource_client.deployments,
                                             function_name='get')
     deployment_exists = False
+    outputs = None
     if use_external_resource_group:
         deployment_name = (
             constants.EXTERNAL_RG_BOOTSTRAP_DEPLOYMENT_NAME.format(
@@ -236,6 +237,9 @@ def bootstrap_instances(
             deployment_name=deployment_name,
             parameters=parameters,
         ).result().properties.outputs
+
+    if outputs is None:
+        raise RuntimeError('Azure deployment returned no outputs.')
 
     # append output resource ids to be used with vm creation
     if custom_vnet is not None:
