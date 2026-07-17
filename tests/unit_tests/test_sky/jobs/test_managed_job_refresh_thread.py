@@ -189,21 +189,48 @@ class TestOuterLoopStopsAfterSuicide:
         def normal_return(thread_obj):  # pylint: disable=unused-argument
             call_count['n'] += 1
 
-        with mock.patch('sky.utils.locks.get_lock', return_value=lock), \
+        with mock.patch('sky.utils.locks.get_lock',
+                        return_value=lock) as get_lock, \
                 mock.patch.object(
                     mjrt.ManagedJobRefreshDaemonThread,
                     '_become_leader_and_run',
                     normal_return), \
-                mock.patch.object(mjrt.time, 'sleep'):
+                mock.patch.object(mjrt.time, 'sleep') as sleep:
             thread.run()
         assert call_count['n'] == 1, (
             'run() must not re-enter _become_leader_and_run after a '
             'normal return — that path can only follow a suicide.')
+        get_lock.assert_called_once_with(
+            mjrt.managed_job_constants.CONSOLIDATION_MODE_LOCK_ID)
+        sleep.assert_not_called()
 
 
 class TestOuterLoopExceptionHandling:
     """When _become_leader_and_run throws, decide between SIGTERM and retry
     based on whether we previously held a now-dead lock."""
+
+    def test_retries_when_lock_factory_raises(self):
+        """A transient factory failure must not permanently kill the thread."""
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        with mock.patch(
+                'sky.utils.locks.get_lock',
+                side_effect=[OSError('transient lock setup failure'),
+                             lock]) as get_lock, \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_become_leader_and_run') as become_leader, \
+                mock.patch.object(mjrt.ManagedJobRefreshDaemonThread,
+                                  '_suicide_on_lock_loss') as suicide, \
+                mock.patch.object(mjrt.time, 'sleep') as sleep:
+            thread.run()
+
+        assert get_lock.call_count == 2
+        become_leader.assert_called_once_with()
+        sleep.assert_called_once_with(mjrt._ACQUIRE_RETRY_INTERVAL_SECONDS)
+        suicide.assert_not_called()
 
     @staticmethod
     def _patches(is_locked: bool, session_alive: bool):
