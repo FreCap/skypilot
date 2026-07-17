@@ -8,6 +8,7 @@ Create Date: 2026-07-17
 # pylint: disable=invalid-name
 from collections.abc import Sequence
 
+from alembic import op
 import sqlalchemy as sa
 
 from sky.utils.db import db_utils
@@ -21,10 +22,14 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade():
     """Record when and by whom committed versions were created."""
-    db_utils.add_column_to_table_alembic('version_specs', 'created_at',
-                                         sa.Float())
-    db_utils.add_column_to_table_alembic('version_specs', 'created_by',
-                                         sa.Text())
+    # Base.metadata.create_all() may already have added these columns before
+    # Alembic reaches this revision. Keep duplicate-column failures outside a
+    # shared PostgreSQL transaction so one no-op does not poison the next.
+    with op.get_context().autocommit_block():
+        db_utils.add_column_to_table_alembic('version_specs', 'created_at',
+                                             sa.Float())
+        db_utils.add_column_to_table_alembic('version_specs', 'created_by',
+                                             sa.Text())
 
 
 def downgrade():
