@@ -1334,18 +1334,21 @@ class SkyServeController:
         except Exception as e:  # pylint: disable=broad-except
             exception_str = common_utils.format_exception(e)
             with self._update_condition:
-                if self._pending_update is update:
+                retry_same_update = self._pending_update is update
+                if retry_same_update:
                     self._update_apply_error = exception_str
                     self._update_apply_failures += 1
             # _apply_service_update clears the pending-version signal in a
             # finally block. Re-publish it while this durable version waits for
             # a retry, unless a newer commit has already replaced the signal.
             self._replica_manager.notify_version_pending(update.version)
+            retry_message = ('will retry'
+                             if retry_same_update else 'was superseded')
             logger.error(f'Failed to apply committed service version '
-                         f'{update.version}; will retry: {exception_str}')
+                         f'{update.version}; {retry_message}: {exception_str}')
             with ux_utils.enable_traceback():
                 logger.error(f'  Traceback: {traceback.format_exc()}')
-            return False
+            return not retry_same_update
 
         with self._update_condition:
             self._applied_version = max(self._applied_version, update.version)

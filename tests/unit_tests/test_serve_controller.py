@@ -649,7 +649,10 @@ class TestServiceUpdateReconciler:
         ctrl._record_committed_update(  # pylint: disable=protected-access
             2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
 
-        assert not ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        # The failed version vanished when version 3 replaced it, so the
+        # reconciler must loop immediately instead of sleeping before it can
+        # apply the newer committed version.
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
         status = ctrl._get_update_status()  # pylint: disable=protected-access
         assert status['committed_version'] == 3
         assert status['applied_version'] == 1
