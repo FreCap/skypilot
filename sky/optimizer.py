@@ -287,6 +287,7 @@ class Optimizer:
             do_print = node_i != len(topo_order) - 1
 
             fuzzy_candidates: list[str] = []
+            resource_hints: dict[resources_lib.Resources, list[str]] = {}
             if node_i < len(topo_order) - 1:
                 # Convert partial resource labels to launchable resources.
                 (launchable_resources, cloud_candidates, fuzzy_candidates,
@@ -450,6 +451,7 @@ class Optimizer:
             # FIXME: Account for egress costs for multi-node clusters
             for resources, execution_cost in node_to_cost_map[node].items():
                 min_pred_cost_plus_egress = np.inf
+                best_parent_hardware = None
                 for parent_resources, parent_cost in \
                     dp_best_objective[parent].items():
                     egress_cost = Optimizer._egress_cost_or_time(
@@ -460,6 +462,10 @@ class Optimizer:
                         min_pred_cost_plus_egress = parent_cost + egress_cost
                         best_parent_hardware = parent_resources
 
+                if best_parent_hardware is None:
+                    raise RuntimeError(
+                        f'Optimizer found no resource plan for parent task '
+                        f'{parent.name!r}.')
                 dp_point_backs[node][resources] = best_parent_hardware
                 dp_best_objective[node][resources] = \
                     execution_cost + min_pred_cost_plus_egress
@@ -1122,7 +1128,7 @@ class Optimizer:
                                                        local_best_plan)
 
         if local_best_plan is None:
-            error_msg = (f'No launchable resource found for task {task}. '
+            error_msg = ('No launchable resource found for one or more tasks. '
                          'To fix: relax its resource requirements.\n'
                          'Hint: \'sky gpus list --all\' '
                          'to list available accelerators.\n'
