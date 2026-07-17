@@ -80,8 +80,12 @@ def test_service_yaml_falls_back_to_rendered_and_redacts(monkeypatch):
 
 
 def test_service_yaml_skipped_when_not_requested(monkeypatch):
-    monkeypatch.setattr(serve_state, 'get_service_from_name',
-                        lambda name: _service_record(None))
+    get_snapshot = mock.Mock(return_value=_service_record(None))
+    get_full_record = mock.Mock(
+        side_effect=AssertionError('YAML-free status must use slim snapshot'))
+    monkeypatch.setattr(serve_state, 'get_service_status_snapshot',
+                        get_snapshot)
+    monkeypatch.setattr(serve_state, 'get_service_from_name', get_full_record)
     get_yaml = mock.Mock()
     monkeypatch.setattr(serve_utils, 'get_yaml_content', get_yaml)
 
@@ -89,6 +93,8 @@ def test_service_yaml_skipped_when_not_requested(monkeypatch):
 
     assert record is not None
     assert 'service_yaml' not in record
+    get_snapshot.assert_called_once_with('svc', require_version=True)
+    get_full_record.assert_not_called()
     get_yaml.assert_not_called()
 
 
@@ -114,6 +120,8 @@ def test_pickled_status_strips_raw_yaml_for_services(monkeypatch):
     monkeypatch.setattr(serve_state, 'get_service_from_name',
                         lambda name: _service_record(_RENDERED_YAML))
     monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: [])
+    monkeypatch.setattr(serve_state, 'get_replica_status_counts',
+                        lambda name: {})
 
     statuses = serve_utils.get_service_status_pickled(None,
                                                       pool=False,
@@ -142,6 +150,8 @@ def test_pickled_status_keeps_raw_yaml_for_pools(monkeypatch):
     monkeypatch.setattr(serve_state, 'get_service_from_name',
                         lambda name: _service_record(rendered_pool, pool=True))
     monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: [])
+    monkeypatch.setattr(serve_state, 'get_replica_status_counts',
+                        lambda name: {})
     monkeypatch.setattr(serve_utils, 'get_yaml_content',
                         lambda *args, **kwargs: rendered_pool)
 
