@@ -686,6 +686,7 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
             'local_task_yaml_path': service_file.name,
             'service_name': service_name,
             'service_incarnation': service_incarnation,
+            'created_by': shlex.quote(common_utils.get_current_user_name()),
             'lifecycle_epoch': controller_lifecycle_epoch,
             'controller_log_file': controller_log_file,
             'remote_user_config_path': remote_config_yaml_path,
@@ -1204,7 +1205,8 @@ def _update_impl_body(
             service_name,
             expected_service_hash=expected_service_hash,
             expected_lifecycle_epoch=serve_utils.get_service_lifecycle_epoch(
-                lifecycle_lock))
+                lifecycle_lock),
+            created_by=common_utils.get_current_user_name())
     else:
         if not use_legacy:
             _assert_service_update_fence(service_name, pool, handle, backend,

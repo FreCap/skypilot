@@ -15,9 +15,24 @@ jest.mock('@/data/connectors/services', () => ({
   electServiceVersion: jest.fn(),
   getServiceVersions: jest.fn(),
 }));
-jest.mock('@/components/ui/yaml-code-block', () => ({
-  YamlCodeBlock: ({ value }) => <pre>{value}</pre>,
-}));
+jest.mock('@/components/ui/yaml-code-block', () => {
+  const ReactModule = require('react');
+  return {
+    YamlCodeBlock: ({ value, onCreateEditor }) => {
+      const scrollRef = ReactModule.useRef(null);
+      const editorRef = ReactModule.useRef(null);
+      ReactModule.useEffect(() => {
+        editorRef.current = { scrollDOM: scrollRef.current };
+        onCreateEditor?.(editorRef.current);
+      }, [onCreateEditor]);
+      return (
+        <pre data-testid="yaml-pane" ref={scrollRef}>
+          {value}
+        </pre>
+      );
+    },
+  };
+});
 
 const history = {
   service_name: 'svc',
@@ -27,12 +42,18 @@ const history = {
     {
       version: 3,
       yaml_content: 'name: current',
+      created_at: 1784240584,
+      created_by: 'test',
+      policy: 'Autoscaling from 0 to 1000 replicas',
       elected: true,
       active: true,
     },
     {
       version: 1,
       yaml_content: 'name: old',
+      created_at: null,
+      created_by: null,
+      policy: 'Fixed 1 replica',
       elected: false,
       active: false,
     },
@@ -57,6 +78,29 @@ it('shows elected state and compares a stored version', async () => {
   ).toBeInTheDocument();
   expect(screen.getByText('name: old')).toBeInTheDocument();
   expect(screen.getByText('name: current')).toBeInTheDocument();
+  expect(screen.getByText('test')).toBeInTheDocument();
+  expect(
+    screen.getByText('Autoscaling from 0 to 1000 replicas')
+  ).toBeInTheDocument();
+  expect(screen.getAllByText('Unknown')).toHaveLength(2);
+});
+
+it('keeps both comparison panes on the same scroll position', async () => {
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected generation: 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  const panes = await screen.findAllByTestId('yaml-pane');
+  await waitFor(() =>
+    expect(screen.getByText('Scrolling is synced')).toBeInTheDocument()
+  );
+
+  panes[0].scrollTop = 96;
+  panes[0].scrollLeft = 24;
+  fireEvent.scroll(panes[0]);
+
+  expect(panes[1].scrollTop).toBe(96);
+  expect(panes[1].scrollLeft).toBe(24);
 });
 
 it('elects through the existing rolling update path and refreshes', async () => {

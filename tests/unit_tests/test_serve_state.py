@@ -108,7 +108,8 @@ def _add_minimal_service(name: str,
                          resource_scope=None,
                          yaml_content='yaml: v1',
                          pool=False,
-                         spec=None):
+                         spec=None,
+                         created_by=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -131,6 +132,7 @@ def _add_minimal_service(name: str,
         service_hash=service_hash,
         lifecycle_epoch=lifecycle_epoch,
         resource_scope=resource_scope,
+        created_by=created_by,
     )
 
 
@@ -543,6 +545,37 @@ def test_elected_version_migration_backfills_latest_committed_version(
     serve_state.create_table(engine)
 
     assert _read_row(engine, 'svc')['current_version'] == 2
+
+
+def test_version_provenance_migration_adds_nullable_columns(
+        tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
+    legacy_metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'version_specs',
+        legacy_metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    legacy_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text('CREATE TABLE alembic_version_serve_state_db '
+                            '(version_num VARCHAR(32) NOT NULL)'))
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO alembic_version_serve_state_db VALUES ('014')"))
+
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '015')
+    serve_state.create_table(engine)
+
+    columns = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('version_specs')
+    }
+    assert {'created_at', 'created_by'} <= columns
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -2018,6 +2051,28 @@ class TestRecoveryVersionSelection:
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
+
+    def test_version_records_include_commit_provenance(self, _mock_serve_db,
+                                                       monkeypatch):
+        timestamps = iter([1001.0, 1002.0])
+        monkeypatch.setattr(serve_state.time, 'time', lambda: next(timestamps))
+        assert _add_minimal_service('svc', spec='spec-1', created_by='alice')
+        assert serve_state.add_version('svc', created_by='bob') == 2
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+
+        assert serve_state.get_version_records('svc') == [{
+            'version': 1,
+            'spec': 'spec-1',
+            'yaml_content': 'yaml: v1',
+            'created_at': 1001.0,
+            'created_by': 'alice',
+        }, {
+            'version': 2,
+            'spec': 'spec-2',
+            'yaml_content': 'yaml: v2',
+            'created_at': 1002.0,
+            'created_by': 'bob',
+        }]
 
     def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
         serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')

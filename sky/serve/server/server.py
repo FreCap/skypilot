@@ -44,13 +44,22 @@ def _service_version_history(service_name: str) -> dict:
                                     detail='Service not found.')
     elected_version = record.get('elected_version')
     active_versions = record.get('active_versions', [])
-    versions = [{
-        'version': version,
-        'yaml_content': debug_dump_helpers.redact_task_yaml(yaml_content),
-        'elected': version == elected_version,
-        'active': version in active_versions,
-    } for version, yaml_content in reversed(
-        serve_state.get_version_yaml_contents(service_name).items())]
+    versions = []
+    for version_record in reversed(
+            serve_state.get_version_records(service_name)):
+        version = version_record['version']
+        spec = version_record['spec']
+        versions.append({
+            'version': version,
+            'yaml_content': debug_dump_helpers.redact_task_yaml(
+                version_record['yaml_content']),
+            'created_at': version_record['created_at'],
+            'created_by': version_record['created_by'],
+            'policy':
+                (spec.autoscaling_policy_str() if spec is not None else None),
+            'elected': version == elected_version,
+            'active': version in active_versions,
+        })
     return {
         'service_name': service_name,
         'elected_version': elected_version,
