@@ -9,6 +9,7 @@ import {
 } from '@testing-library/react';
 import {
   ManagedJobs,
+  ManagedJobsTable,
   useManagedJobsPageData,
   filterJobsByName,
   filterJobsByPool,
@@ -302,6 +303,97 @@ describe('managed jobs page initialization', () => {
       expect(screen.queryByText('stale-pool')).not.toBeInTheDocument();
     });
     expect(screen.getAllByText('fresh-pool')).not.toHaveLength(0);
+  });
+});
+
+describe('managed jobs automatic refresh', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('serializes background polls while manual refresh remains live', async () => {
+    jest.useFakeTimers();
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    const runningBatchResponse = {
+      jobs: [
+        {
+          id: 1,
+          task_id: 0,
+          task_job_id: '1-0',
+          name: 'batch-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+          batch_total_batches: 10,
+          batch_completed_batches: 1,
+        },
+      ],
+      total: 1,
+      totalNoFilter: 1,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    };
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue(runningBatchResponse);
+    const refreshDataRef = { current: null };
+    const { unmount } = render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={refreshDataRef}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+
+    await screen.findByText('batch-job');
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    jobsCacheManager.getPaginatedJobs.mockClear();
+    jobsCacheManager.invalidateCache.mockClear();
+
+    const pendingPoll = deferred();
+    jobsCacheManager.getPaginatedJobs.mockReturnValue(pendingPoll.promise);
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+    expect(jobsCacheManager.invalidateCache).toHaveBeenCalledTimes(1);
+
+    let manualRefresh;
+    act(() => {
+      manualRefresh = refreshDataRef.current({ includeStatus: false });
+    });
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      jest.advanceTimersByTime(2000);
+    });
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(2);
+    expect(jobsCacheManager.invalidateCache).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingPoll.resolve(runningBatchResponse);
+      await Promise.all([pendingPoll.promise, manualRefresh]);
+    });
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
+    expect(jobsCacheManager.invalidateCache).toHaveBeenCalledTimes(2);
+
+    unmount();
+    act(() => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
   });
 });
 
