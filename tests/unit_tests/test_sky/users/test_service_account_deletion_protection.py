@@ -5,10 +5,48 @@ import unittest.mock as mock
 import fastapi
 import pytest
 
-from sky import global_user_state
 from sky.server.requests import payloads
 from sky.users import server as users_server
-from sky.users.permission import permission_service
+
+
+def test_service_account_route_characterization():
+    """Keep the public users router and handler facade stable."""
+    expected_routes = [
+        ('/service-account-tokens', 'GET', 'get_service_account_tokens'),
+        ('/service-account-tokens', 'POST', 'create_service_account_token'),
+        ('/service-account-tokens/delete', 'POST',
+         'delete_service_account_token'),
+        ('/service-account-tokens/get-role', 'POST',
+         'get_service_account_role'),
+        ('/service-account-tokens/update-role', 'POST',
+         'update_service_account_role'),
+        ('/service-account-tokens/rotate', 'POST',
+         'rotate_service_account_token'),
+    ]
+
+    def iter_routes(routes):
+        for route in routes:
+            include_context = getattr(route, 'include_context', None)
+            included_router = getattr(include_context, 'included_router', None)
+            if included_router is not None:
+                yield from iter_routes(included_router.routes)
+                continue
+            nested = getattr(route, 'routes', None)
+            if nested is not None:
+                yield from iter_routes(nested)
+            else:
+                yield route
+
+    actual_routes = []
+    for route in iter_routes(users_server.router.routes):
+        if not route.path.startswith('/service-account-tokens'):
+            continue
+        method = next(iter(route.methods))
+        endpoint_name = route.endpoint.__name__
+        actual_routes.append((route.path, method, endpoint_name))
+        assert route.endpoint is getattr(users_server, endpoint_name)
+
+    assert set(actual_routes) == set(expected_routes)
 
 
 class TestServiceAccountDeletionProtection:
