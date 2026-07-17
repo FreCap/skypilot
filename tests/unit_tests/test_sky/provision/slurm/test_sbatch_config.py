@@ -1,5 +1,6 @@
 """Unit tests for sbatch_options support in Slurm provisioner."""
 
+import pickle
 import subprocess
 import unittest.mock as mock
 
@@ -8,11 +9,27 @@ import pytest
 
 from sky.adaptors import slurm as slurm_adaptor
 from sky.provision.slurm import instance as slurm_instance
+from sky.provision.slurm import sbatch_utils
 from sky.provision.slurm.instance import _build_custom_sbatch_directives
 from sky.provision.slurm.instance import _build_sbatch_directives
 from sky.provision.slurm.instance import _compute_time_directive
 from sky.provision.slurm.instance import _SBATCH_PROTECTED_OPTIONS
 from sky.utils.schemas import get_config_schema
+
+
+def test_sbatch_helpers_are_exposed_by_instance_facade():
+    """Characterize the historical helper import and module identities."""
+    helpers = (
+        _build_custom_sbatch_directives,
+        _compute_time_directive,
+        _build_sbatch_directives,
+    )
+    for helper in helpers:
+        assert getattr(slurm_instance, helper.__name__) is helper
+        assert helper.__module__ == slurm_instance.__name__
+        assert pickle.loads(pickle.dumps(helper)) is helper
+    assert (getattr(slurm_instance, '_SBATCH_PROTECTED_OPTIONS')
+            is _SBATCH_PROTECTED_OPTIONS)
 
 
 class TestBuildCustomSbatchDirectives:
@@ -230,7 +247,7 @@ class TestComputeTimeDirective:
         # The `sky` logger has propagate=False, so caplog cannot observe
         # it. Mock the module logger's `warning` directly.
         warning_mock = mock.MagicMock()
-        monkeypatch.setattr(slurm_instance.logger, 'warning', warning_mock)
+        monkeypatch.setattr(sbatch_utils.logger, 'warning', warning_mock)
         result = _compute_time_directive({}, partition, 'gpu')
         assert result == ''
         warning_mock.assert_called_once()
