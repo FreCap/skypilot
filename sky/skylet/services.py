@@ -608,6 +608,7 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
             context: grpc.ServicerContext
     ) -> managed_jobsv1_pb2.CancelJobsResponse:
         try:
+            message = None
             cancellation_criteria = request.WhichOneof('cancellation_criteria')
             if cancellation_criteria is None:
                 context.abort(
@@ -655,6 +656,9 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f'invalid cancellation criteria: {cancellation_criteria}')
+            if message is None:
+                context.abort(grpc.StatusCode.INTERNAL,
+                              'Job cancellation produced no result.')
             return managed_jobsv1_pb2.CancelJobsResponse(message=message)
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))

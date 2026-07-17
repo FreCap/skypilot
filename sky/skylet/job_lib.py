@@ -402,11 +402,11 @@ def add_job(job_name: str,
             (job_name, username, job_submitted_at, JobStatus.INIT.value,
              run_timestamp, None, resources_str, metadata))
     _DB.conn.commit()
-    rows = _DB.cursor.execute('SELECT job_id FROM jobs WHERE run_timestamp=(?)',
-                              (run_timestamp,))
-    for row in rows:
-        job_id = row[0]
-    assert job_id is not None
+    row = _DB.cursor.execute('SELECT job_id FROM jobs WHERE run_timestamp=(?)',
+                             (run_timestamp,)).fetchone()
+    if row is None:
+        raise RuntimeError('Failed to read the newly inserted job ID.')
+    job_id = row[0]
     log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY, f'{job_id}-{job_name}')
     set_log_dir_no_lock(job_id, log_dir)
     return job_id, log_dir
