@@ -355,6 +355,20 @@ class TestCloudVmRayBackendGetGrpcChannel:
     INITIAL_TUNNEL_PID = 12345
     PROCESS_JOIN_TIMEOUT_SECONDS = 30
 
+    class _FakeClock:
+        """Minimal monotonic clock for deterministic deadline tests."""
+
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def perf_counter(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
     def _simulate_process_get_grpc_channel(self, queue, tunnel_creation_count,
                                            tunnel_port, tunnel_pid,
                                            socket_connect_side_effect):
@@ -415,6 +429,103 @@ class TestCloudVmRayBackendGetGrpcChannel:
         if port == self.INITIAL_TUNNEL_PORT:
             raise socket.error("Connection error")
         return None
+
+    def test_get_grpc_channel_deadline_preserves_retry_budget(self):
+        """Each retry derives its timeout from one immutable deadline."""
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        clock = self._FakeClock()
+        lock_timeouts = []
+        open_attempts = 0
+
+        class _AcquiredLock:
+            """Context manager returned by an immediately acquired lock."""
+
+            def acquire(self, blocking):
+                assert not blocking
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+
+        def get_lock(lock_id, timeout, **kwargs):
+            del lock_id, kwargs
+            lock_timeouts.append(timeout)
+            return _AcquiredLock()
+
+        def open_tunnel():
+            nonlocal open_attempts
+            open_attempts += 1
+            clock.now += 1.0
+            raise RuntimeError('tunnel startup failed')
+
+        with patch.object(handle, '_get_skylet_ssh_tunnel',
+                          return_value=None), patch.object(
+                              handle,
+                              '_open_and_update_skylet_tunnel',
+                              side_effect=open_tunnel), patch.object(
+                                  cloud_vm_ray_backend.backend_utils,
+                                  'CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS',
+                                  3.0), patch.object(
+                                      cloud_vm_ray_backend, 'time',
+                                      clock), patch.object(
+                                          cloud_vm_ray_backend.locks,
+                                          'get_lock',
+                                          side_effect=get_lock):
+            with pytest.raises(RuntimeError,
+                               match='Timeout waiting for gRPC channel'):
+                handle.get_grpc_channel()
+
+        assert open_attempts == 3
+        assert lock_timeouts == [3.0, 2.0, 1.0]
+        assert clock.now == 3.0
+
+    def test_get_grpc_channel_deadline_clamps_reader_jitter(self):
+        """Reader jitter cannot oversleep the residual lock budget."""
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        clock = self._FakeClock()
+
+        class _ContendedLock:
+            """Exclusive lock held by another tunnel creator."""
+
+            def acquire(self, blocking):
+                assert not blocking
+                raise cloud_vm_ray_backend.locks.LockTimeout
+
+        class _SharedLock:
+            """Reader lock released with only a small budget remaining."""
+
+            def acquire(self, blocking):
+                assert blocking
+                clock.now += 0.98
+
+            def release(self):
+                pass
+
+        def get_lock(lock_id, timeout, *, shared_lock=False):
+            del lock_id, timeout
+            return _SharedLock() if shared_lock else _ContendedLock()
+
+        with patch.object(
+                handle, '_get_skylet_ssh_tunnel',
+                return_value=None), patch.object(
+                    cloud_vm_ray_backend.backend_utils,
+                    'CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS', 1.0), patch.object(
+                        cloud_vm_ray_backend, 'time',
+                        clock), patch.object(cloud_vm_ray_backend.random,
+                                             'uniform',
+                                             return_value=0.05), patch.object(
+                                                 cloud_vm_ray_backend.locks,
+                                                 'get_lock',
+                                                 side_effect=get_lock):
+            with pytest.raises(RuntimeError,
+                               match='Timeout waiting for gRPC channel'):
+                handle.get_grpc_channel()
+
+        assert clock.sleeps == pytest.approx([0.02])
+        assert clock.now == pytest.approx(1.0)
 
     def test_get_grpc_channel_multiprocess_race_condition(self):
         """Test get_grpc_channel with multiple processes racing for tunnel creation."""
