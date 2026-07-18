@@ -3672,17 +3672,13 @@ def check_cluster_available(
         exceptions.CloudUserIdentityError: if we fail to get the current user
           identity.
     """
-    record = global_user_state.get_cluster_from_name(cluster_name,
-                                                     include_user_info=False,
-                                                     summary_response=True)
     if dryrun:
+        record = global_user_state.get_cluster_from_name(
+            cluster_name, include_user_info=False, summary_response=True)
         assert record is not None, cluster_name
         return record['handle']
 
-    previous_cluster_status = None
-    if record is not None:
-        previous_cluster_status = record['status']
-
+    record = None
     try:
         cluster_status, handle = refresh_cluster_status_handle(cluster_name)
     except exceptions.ClusterStatusFetchingError as e:
@@ -3696,6 +3692,8 @@ def check_cluster_available(
         # understand, but it might be useful to allow the user to use
         # operations that only involve ssh (e.g., sky exec, sky logs, etc) even
         # if the user is not the owner of the cluster.
+        record = global_user_state.get_cluster_from_name(
+            cluster_name, include_user_info=False, summary_response=True)
         ux_utils.console_newline()
         logger.warning(
             f'Failed to refresh the status for cluster {cluster_name!r}. It is '
@@ -3709,12 +3707,11 @@ def check_cluster_available(
     bright = colorama.Style.BRIGHT
     reset = colorama.Style.RESET_ALL
     if handle is None:
-        if previous_cluster_status is None:
+        if record is None:
             error_msg = f'Cluster {cluster_name!r} does not exist.'
         else:
             error_msg = (f'Cluster {cluster_name!r} not found on the cloud '
                          'provider.')
-            assert record is not None, previous_cluster_status
             actions = []
             if record['handle'].launched_resources.use_spot:
                 actions.append('preempted')
