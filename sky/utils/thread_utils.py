@@ -96,6 +96,11 @@ class SafeThread(threading.Thread):
             return None
         return common_utils.format_exception(self._exc)
 
+    @property
+    def exception(self) -> BaseException | None:
+        """Return the captured exception for typed failure handling."""
+        return self._exc
+
 
 # pylint: disable=invalid-name
 KeyType = TypeVar('KeyType')

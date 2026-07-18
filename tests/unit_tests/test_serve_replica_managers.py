@@ -710,6 +710,18 @@ run: echo hi
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
+    def test_unfenced_external_lb_fails_once_before_api_request(self, tmp_path):
+        with mock.patch.object(replica_managers.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=True):
+            mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+                tmp_path, [None], launch_fence=None)
+
+        assert isinstance(raised,
+                          replica_managers._UnfencedExternalLbLaunchError)
+        mock_sdk.launch.assert_not_called()
+        mock_terminate.assert_not_called()
+
     def test_inflight_owner_watchdog_cancels_request(self, tmp_path):
         allowed = threading.Event()
         watchdog_observed_loss = threading.Event()
@@ -1395,6 +1407,101 @@ class TestLaunchOwnershipFence:
         assert len(mgr._replica_to_request_id) == 0
         assert len(mgr._replica_to_launch_cancelled) == 0
         persist.assert_not_called()
+
+    def test_unfenced_external_lb_failure_stops_replica_churn(self):
+        mgr, infos = self._queued_manager([1])
+        info = infos[1]
+        info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        launch_thread = mgr._launch_thread_pool[1]
+        launch_thread.format_exc = 'missing durable owner fence'
+        launch_thread.exception = (
+            replica_managers._UnfencedExternalLbLaunchError('unfenced'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             mock.patch.object(mgr, '_persist_replica') as persist, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        assert info.status_property.user_app_failed is True
+        assert (info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.FAILED)
+        persist.assert_called_once_with(1, info)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=True,
+                                          replica_drain_delay_seconds=0)
+
+        terminal = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.FAILED,
+            sky_down_status=common_utils.ProcessStatus.SUCCEEDED,
+            user_app_failed=True)
+        assert (terminal.to_replica_status() ==
+                replica_managers.serve_state.ReplicaStatus.FAILED)
+        assert terminal.unrecoverable_failure() is True
+
+    def test_unfenced_external_lb_failure_does_not_bench_spot_location(self):
+        mgr, infos = self._queued_manager([1])
+        info = infos[1]
+        info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        info.status_property.failed_spot_availability = False
+        location = mock.Mock()
+        info.get_spot_location.return_value = location
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        mgr._spot_placer = placer
+        launch_thread = mgr._launch_thread_pool[1]
+        launch_thread.format_exc = 'missing durable owner fence'
+        launch_thread.exception = (
+            replica_managers._UnfencedExternalLbLaunchError('unfenced'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             mock.patch.object(mgr, '_persist_replica'), \
+             mock.patch.object(mgr, '_terminate_replica'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        assert info.status_property.user_app_failed is True
+        assert info.status_property.failed_spot_availability is False
+        placer.set_active.assert_not_called()
+        placer.set_preemptive.assert_not_called()
+
+    def test_unrecoverable_failure_check_does_not_log_per_replica(self):
+        status = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.FAILED,
+            sky_down_status=common_utils.ProcessStatus.SUCCEEDED,
+            user_app_failed=True)
+
+        with mock.patch.object(replica_managers, 'logger') as logger:
+            results = [status.unrecoverable_failure() for _ in range(2_159)]
+
+        assert all(results)
+        assert logger.mock_calls == []
+
+    def test_safe_thread_exposes_captured_exception(self):
+        error = RuntimeError('typed failure')
+
+        def fail():
+            raise error
+
+        launch_thread = thread_utils.SafeThread(target=fail)
+        launch_thread.run()
+
+        assert launch_thread.exception is error
+        assert launch_thread.format_exc is not None
 
     def test_authorized_lookup_is_shared_across_queued_launches(self, tmp_path):
         mgr, infos = self._queued_manager([1, 2, 3])

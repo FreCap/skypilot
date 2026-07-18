@@ -2070,7 +2070,6 @@ class SkyServeLoadBalancer:
                         'the last applied routes and readiness state.')
                     return
                 self._routing_version = service_version
-                logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):
                     # Spurious empty sync: the controller still has READY
@@ -2582,7 +2581,6 @@ class SkyServeLoadBalancer:
             The response from the endpoint replica. Return the exception
             encountered if anything goes wrong.
         """
-        logger.info(f'Proxy request to {url}')
         # The token ties this request's release to the exact accounting
         # generation it incremented (see LoadBalancingPolicy hooks). Keep the
         # policy OBJECT too: a live routing-spec update may replace
