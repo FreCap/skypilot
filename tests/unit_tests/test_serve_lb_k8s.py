@@ -1668,7 +1668,9 @@ def test_pod_authority_missing_live_uid_fails_closed(monkeypatch):
     assert lb_k8s.get_lb_pod_authority('svc') is None
 
 
-def test_ha_pod_authority_keeps_terminating_legacy_migration_tail(monkeypatch):
+@pytest.mark.parametrize('deleting', [False, True])
+def test_ha_pod_authority_keeps_stable_legacy_migration_tail(
+        monkeypatch, deleting):
     _, core = _install(monkeypatch, db_service_names=('svc',))
     desired_revision = 'a' * 64
     monkeypatch.setattr(
@@ -1703,14 +1705,15 @@ def test_ha_pod_authority_keeps_terminating_legacy_migration_tail(monkeypatch):
                     lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
                 }),
         _lb_pod('legacy',
-                deleting=True,
+                deleting=deleting,
                 labels={
                     lb_k8s.APP_LABEL_KEY: lb_k8s.lb_deployment_name('svc'),
                 }),
     ])
 
     assert lb_k8s.get_lb_pod_authority('svc') == lb_k8s.LbPodAuthority(
-        ready_nonterminating_uids={'slot-a'},
+        ready_nonterminating_uids=({'slot-a'}
+                                   if deleting else {'slot-a', 'legacy'}),
         live_uids={'slot-a', 'legacy'},
         slot_by_uid={'slot-a': lb_ha.LbSlot.A},
         selected_slot=lb_ha.LbSlot.A,
@@ -1723,13 +1726,13 @@ def test_ha_pod_authority_keeps_terminating_legacy_migration_tail(monkeypatch):
             'legacy': None,
         },
         legacy_uids={'legacy'},
-        terminating_uids={'legacy'})
+        terminating_uids=({'legacy'} if deleting else set()))
 
-    # The stable-state exception is only for a real deletion tail. A live
-    # slotless Pod with the same legacy label is malformed and still fails
-    # closed instead of joining HA authority.
-    core.list_namespaced_pod.return_value.items[
-        1].metadata.deletion_timestamp = (None)
+    # A slotless Pod without the exact legacy Deployment label is malformed
+    # and still fails closed instead of joining HA authority.
+    core.list_namespaced_pod.return_value.items[1].metadata.labels = {
+        lb_k8s.APP_LABEL_KEY: 'unexpected-deployment',
+    }
     assert lb_k8s.get_lb_pod_authority('svc') is None
 
 

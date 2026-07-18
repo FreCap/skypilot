@@ -2512,16 +2512,23 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
                 labels = getattr(metadata, 'labels', {}) or {}
                 slot = lb_ha.parse_slot(labels.get(LB_SLOT_LABEL_KEY))
                 if slot is None:
-                    transitional = cutover_phase in (
-                        lb_ha.LbCutoverPhase.MIGRATING,
-                        lb_ha.LbCutoverPhase.ROLLING_BACK)
                     legacy_labeled = labels.get(
                         APP_LABEL_KEY) == lb_deployment_name(
                             service_name, resource_scope)
-                    if (not legacy_labeled or
-                        (not transitional and terminating is None)):
+                    if not legacy_labeled:
                         raise ValueError('live HA load balancer Pod is missing '
                                          'its slot label')
+                    # Migration commits the stable HA selector before the
+                    # parent supervisor asynchronously deletes the obsolete
+                    # legacy Deployment.  During that bounded cleanup window
+                    # its Pod is still Running and Ready without a slot label,
+                    # but the HA Service no longer selects it.  Keep it as a
+                    # legacy stream owner so drain evidence fails closed;
+                    # rejecting the whole authority snapshot would also fence
+                    # both valid HA slots from role heartbeats and syncs.
+                    # Outside a transition this exception is restricted to
+                    # the exact legacy Deployment label and incarnation-scoped
+                    # list above.  A different slotless Pod remains malformed.
                     legacy_uids.add(uid)
                 else:
                     slot_by_uid[uid] = slot
