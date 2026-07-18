@@ -223,7 +223,7 @@ describe('useManagedJobPools request ownership', () => {
   });
 });
 
-describe('useSingleManagedJob manual-refresh cache invalidation', () => {
+describe('useSingleManagedJob refresh ownership', () => {
   const jobId = '56164';
   const expectedArgs = [{ allUsers: true, allFields: true, jobIDs: [jobId] }];
 
@@ -235,62 +235,72 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
     });
   });
 
-  it('does not invalidate the cache on the initial load (refreshTrigger = 0)', async () => {
-    renderHook(() => useSingleManagedJob(jobId, 0));
+  it('does not invalidate the cache on the initial load', async () => {
+    renderHook(() => useSingleManagedJob(jobId));
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
     expect(dashboardCache.invalidate).not.toHaveBeenCalled();
   });
 
-  it('invalidates the cached entry before refetching when refreshTrigger increments', async () => {
-    const { rerender } = renderHook(
-      ({ trigger }) => useSingleManagedJob(jobId, trigger),
-      { initialProps: { trigger: 0 } }
-    );
+  it('owns the forced refresh until its exact-key read settles', async () => {
+    const refreshedRequest = deferred();
+    const { result } = renderHook(() => useSingleManagedJob(jobId));
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
     expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    dashboardCache.get.mockImplementationOnce(() => refreshedRequest.promise);
 
-    // Simulate clicking the detail-page Refresh button.
-    rerender({ trigger: 1 });
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshJobData();
+    });
 
-    await waitFor(() =>
-      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1)
-    );
-    // Must target the same function + args the fetch uses, otherwise the wrong
-    // cache key is cleared and the refresh stays stale.
+    expect(result.current.loading).toBe(true);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
     expect(dashboardCache.invalidate).toHaveBeenCalledWith(
       getManagedJobs,
       expectedArgs
     );
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
     expect(dashboardCache.get).toHaveBeenLastCalledWith(
       getManagedJobs,
       expectedArgs
     );
-  });
 
-  it('does not invalidate when navigating to a new job while refreshTrigger stays elevated', async () => {
-    // The parent keeps refreshTrigger state across jobId changes, so after a
-    // refresh the trigger remains > 0. Navigating to a different job must NOT
-    // invalidate the new job's cache on its initial load.
-    const { rerender } = renderHook(
-      ({ id, trigger }) => useSingleManagedJob(id, trigger),
-      { initialProps: { id: jobId, trigger: 1 } }
-    );
-
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
-    jest.clearAllMocks();
-    dashboardCache.get.mockResolvedValue({
-      jobs: [],
-      controllerStopped: false,
+    await act(async () => {
+      refreshedRequest.resolve({
+        jobs: [{ id: Number(jobId), status: 'RUNNING' }],
+        controllerStopped: false,
+      });
+      await refreshPromise;
     });
 
-    // Navigate to a different job; trigger is unchanged (no manual refresh).
-    rerender({ id: '56165', trigger: 1 });
+    expect(result.current.loading).toBe(false);
+    expect(result.current.jobData.jobs[0].status).toBe('RUNNING');
+  });
+
+  it('coalesces concurrent forced refreshes for the same job', async () => {
+    const refreshedRequest = deferred();
+    const { result } = renderHook(() => useSingleManagedJob(jobId));
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
-    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    dashboardCache.get.mockImplementationOnce(() => refreshedRequest.promise);
+
+    let firstRefresh;
+    let secondRefresh;
+    act(() => {
+      firstRefresh = result.current.refreshJobData();
+      secondRefresh = result.current.refreshJobData();
+    });
+
+    expect(secondRefresh).toBe(firstRefresh);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      refreshedRequest.resolve({ jobs: [], controllerStopped: false });
+      await Promise.all([firstRefresh, secondRefresh]);
+    });
   });
 
   it('ignores an earlier job response that resolves after navigation', async () => {
@@ -301,7 +311,7 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
       .mockImplementationOnce(() => secondRequest.promise);
 
     const { result, rerender } = renderHook(
-      ({ id }) => useSingleManagedJob(id, 0),
+      ({ id }) => useSingleManagedJob(id),
       { initialProps: { id: '56164' } }
     );
 
@@ -330,7 +340,66 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps a refreshed request loading when the superseded request fails', async () => {
+  it('does not reuse an old refresh after leaving and returning to a job', async () => {
+    const oldRefresh = deferred();
+    const newRefresh = deferred();
+    const { result, rerender } = renderHook(
+      ({ id }) => useSingleManagedJob(id),
+      { initialProps: { id: '56164' } }
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    dashboardCache.get.mockImplementationOnce(() => oldRefresh.promise);
+    let oldRefreshPromise;
+    act(() => {
+      oldRefreshPromise = result.current.refreshJobData();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    dashboardCache.get.mockResolvedValueOnce({
+      jobs: [{ id: 56165, status: 'RUNNING' }],
+      controllerStopped: false,
+    });
+    rerender({ id: '56165' });
+    await waitFor(() => expect(result.current.jobData.jobs[0].id).toBe(56165));
+
+    dashboardCache.get.mockResolvedValueOnce({
+      jobs: [{ id: 56164, status: 'RUNNING' }],
+      controllerStopped: false,
+    });
+    rerender({ id: '56164' });
+    await waitFor(() => expect(result.current.jobData.jobs[0].id).toBe(56164));
+
+    dashboardCache.get.mockImplementationOnce(() => newRefresh.promise);
+    let newRefreshPromise;
+    act(() => {
+      newRefreshPromise = result.current.refreshJobData();
+    });
+
+    expect(newRefreshPromise).not.toBe(oldRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+
+    await act(async () => {
+      newRefresh.resolve({
+        jobs: [{ id: 56164, status: 'SUCCEEDED' }],
+        controllerStopped: false,
+      });
+      await newRefreshPromise;
+    });
+    expect(result.current.jobData.jobs[0].status).toBe('SUCCEEDED');
+
+    await act(async () => {
+      oldRefresh.resolve({
+        jobs: [{ id: 56164, status: 'FAILED' }],
+        controllerStopped: false,
+      });
+      await oldRefreshPromise;
+    });
+    expect(result.current.jobData.jobs[0].status).toBe('SUCCEEDED');
+  });
+
+  it('keeps a refresh loading when the superseded initial request fails', async () => {
     const initialRequest = deferred();
     const refreshedRequest = deferred();
     const consoleError = jest
@@ -340,14 +409,14 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
       .mockImplementationOnce(() => initialRequest.promise)
       .mockImplementationOnce(() => refreshedRequest.promise);
 
-    const { result, rerender } = renderHook(
-      ({ trigger }) => useSingleManagedJob('56164', trigger),
-      { initialProps: { trigger: 0 } }
-    );
+    const { result } = renderHook(() => useSingleManagedJob('56164'));
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
-    rerender({ trigger: 1 });
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshJobData();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       initialRequest.reject(new Error('superseded request failed'));
@@ -362,7 +431,7 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
         jobs: [{ id: 56164, status: 'RUNNING' }],
         controllerStopped: false,
       });
-      await refreshedRequest.promise;
+      await refreshPromise;
     });
 
     expect(result.current.loading).toBe(false);
