@@ -308,7 +308,8 @@ def get_cluster_events(
     cluster_name: str | None = ...,
     cluster_hash: str | None = ...,
     event_type: str = ...,
-    include_timestamps: Literal[True] = ...,
+    *,
+    include_timestamps: Literal[True],
     limit: int | None = ...,
 ) -> list[dict[str, str | int]]:
     ...

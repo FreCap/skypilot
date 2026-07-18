@@ -172,7 +172,7 @@ def run_with_log(
     log_cmd: bool = False,
     timeout: int | None = None,
     **kwargs,
-) -> int | tuple[int, str, str] | tuple[int, int]:
+) -> int | tuple[int, str, str]:
     """Runs a command and logs its output to a file.
 
     Args:
