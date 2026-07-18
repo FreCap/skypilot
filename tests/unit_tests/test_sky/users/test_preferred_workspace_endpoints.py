@@ -444,14 +444,18 @@ class TestSetPreferredWorkspaceSdkVersionGate(unittest.TestCase):
         from sky.server import versions
 
         # Pin remote version to one less than the workspace-resolver
-        # introducing version. The decorator MUST fire and surface a
-        # clean APINotSupportedError before any HTTP attempt.
+        # introducing version. Bypass the outer health-check decorator so this
+        # test isolates the inner version gate instead of depending on a local
+        # API server being available.
         too_old = (server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION - 1)
         original = versions.get_remote_api_version
         versions.get_remote_api_version = lambda: too_old  # type: ignore
         try:
-            with self.assertRaises(exceptions.APINotSupportedError) as cm:
+            with mock.patch('sky.server.common.check_server_healthy_or_start_fn'
+                           ) as mock_health, self.assertRaises(
+                               exceptions.APINotSupportedError) as cm:
                 sdk.set_preferred_workspace('team-a')
+            mock_health.assert_called_once()
             self.assertIn('set_preferred_workspace', str(cm.exception))
         finally:
             versions.get_remote_api_version = original  # type: ignore

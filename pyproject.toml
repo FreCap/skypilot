@@ -23,6 +23,7 @@ asyncio_debug = true
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     "error::RuntimeWarning",
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
     "error::pytest.PytestUnraisableExceptionWarning",
 ]
 

@@ -1,5 +1,6 @@
 """Unit tests for database-backed managed job file storage."""
 
+import asyncio
 import contextlib
 import os
 from typing import Dict
@@ -35,7 +36,11 @@ def _mock_managed_jobs_db_conn(tmp_path, monkeypatch):
 
     state.create_table(engine)
 
-    yield engine
+    try:
+        yield engine
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 def _create_basic_job(tmp_path,
