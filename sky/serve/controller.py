@@ -1328,15 +1328,12 @@ class SkyServeController:
                             serve_state.get_lb_cutover_state,
                             self._service_name)
                         assert state is not None
-                        try:
-                            await trace.run_in_executor(
-                                loop, 'kubernetes_cleanup',
-                                lb_k8s.cleanup_lb_mode_transition,
-                                self._service_name, service_hash, True,
-                                self._resource_scope)
-                        except Exception as e:  # pylint: disable=broad-except
-                            logger.warning('Legacy LB cleanup after HA '
-                                           f'migration will retry: {e}')
+                        # Do not wait for foreground Deployment deletion while
+                        # holding the role lock. The terminating legacy Pod may
+                        # drain for the full grace period; blocking here makes
+                        # both HA slots time out their role heartbeats. Stable
+                        # parent-process supervision owns idempotent obsolete-
+                        # topology cleanup and retries it on every pass.
 
             rollback_view_published = False
             if state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK:
@@ -1376,15 +1373,10 @@ class SkyServeController:
                         self._lb_ha_enabled = False
                         self._lb_session_ledger = None
                         self._lb_last_demand_snapshot = None
-                        try:
-                            await trace.run_in_executor(
-                                loop, 'kubernetes_cleanup',
-                                lb_k8s.cleanup_lb_mode_transition,
-                                self._service_name, service_hash, False,
-                                self._resource_scope)
-                        except Exception as e:  # pylint: disable=broad-except
-                            logger.warning('HA slot cleanup after rollback '
-                                           f'will retry: {e}')
+                        # As above, the parent supervisor deletes obsolete HA
+                        # slots outside this role lock. Return the committed
+                        # role response immediately so remaining slots keep a
+                        # fresh controller heartbeat throughout their drain.
                         return role_response(
                             lb_ha_obs.LbRoleOutcome.SUCCESS, 200, {
                                 'role': lb_ha.LbRole.DRAINING.value,
