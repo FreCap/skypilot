@@ -1,6 +1,7 @@
 # Managed Container Image Distribution
 
-Status: control-plane implementation complete; production activation pending
+Status: control-plane implementation complete; infrastructure and provider
+activation pending
 
 Last updated: 2026-07-18
 
@@ -16,6 +17,12 @@ immutable image snapshot with every launched workload. VM, Kubernetes,
 managed-job recovery, and SkyServe updates then use the same verified artifact
 identity without storing registry credentials in durable state.
 
+Distribution must not make the normal deployment path wait for repository
+creation or image replication. Infrastructure is provisioned ahead of time,
+publication can warm routes asynchronously, and placement selects an already
+verified local route or immediately falls back to an immutable canonical/source
+route under the default policy.
+
 The control-plane contract and runtime integration are implemented. Production
 activation remains deliberately gated on repository and IAM bootstrap,
 cloud-provider operations, deployment of the copy worker, and canary evidence.
@@ -27,6 +34,8 @@ cloud-provider operations, deployment of the copy worker, and canary evidence.
   SkyServe versions while preserving workspace isolation.
 - Prefer a verified local registry copy without making locality a hard
   availability dependency unless policy explicitly requires it.
+- Add no synchronous repository provisioning, registry copy, or verification
+  work to placement or workload admission.
 - Keep registry profiles and durable records free of credential values.
 - Make publication, copying, verification, retry, lease recovery, reference
   tracking, and eviction durable and safe under concurrent workers.
@@ -40,6 +49,9 @@ cloud-provider operations, deployment of the copy worker, and canary evidence.
 - Automatically converting existing `image_id: docker:...` workloads.
 - Automatically deploying a copy-worker fleet or creating repositories and IAM
   in this implementation PR.
+- Treating a raw S3-compatible bucket, including Cloudflare R2, as an OCI
+  registry. An R2-backed service that implements the OCI Distribution API is a
+  registry; an R2 bucket containing image tarballs is not.
 - Reinterpreting the task-level `setup` command as image-build work.
 - Building ARM64 images or any unused platform proactively.
 - Starting one model process per GPU. SkyPilot shares one node image pull; the
@@ -75,8 +87,12 @@ Completed in PR #368:
 
 Required before production activation:
 
-- [ ] Bootstrap managed ECR, GAR, Nebius, or generic OCI repositories and the
-  required pull/copy IAM bindings, or register pre-created external locations.
+- [ ] Extract reusable AWS bootstrap modules from the current Boltz Platform
+  ECR, SkyPilot control-plane, and VM-pool Terraform without carrying over
+  Boltz-specific names, account topology, or retention policy.
+- [ ] Bootstrap managed ECR, GAR, Nebius, Cloudflare, or generic OCI targets and
+  the required pull/copy IAM bindings, or register pre-created external
+  locations.
 - [ ] Implement and validate provider operations for repository provisioning
   and short-lived, destination-scoped copy credentials.
 - [ ] Deploy a separately scaled, resource-bounded reconciliation/copy worker.
@@ -86,6 +102,9 @@ Required before production activation:
   registry throttling at the intended fleet scale.
 - [ ] Migrate `boltz-l4-fleet.serve.yaml` in a companion `boltz-platform` PR
   after the operational gates pass.
+- [ ] Canary external digest pulls, large model images, credential renewal, and
+  throttling against Cloudflare's managed R2-backed registry before adding a
+  native Cloudflare adapter.
 
 ## Public task contract
 
@@ -167,6 +186,51 @@ Profile revisions must increase when endpoints, identities, namespaces, or
 policy fields change. `ownership: managed` requires a workspace-partitioned
 namespace; `ownership: external` leaves repository lifecycle outside SkyPilot.
 
+The operational phase should extend a target with an explicit materialization
+strategy rather than pretending a lazy proxy is already a verified local copy:
+
+```yaml
+container_registries:
+  profiles:
+    production:
+      revision: 2
+      ownership: managed
+      realm: production
+      namespace: skypilot/{workspace}
+      require_digest_at_runtime: true
+      canonical:
+        provider: aws
+        account: '123456789012'
+        region: us-east-1
+        pull_auth: ecr_runtime_identity
+      targets:
+        - name: aws-us-west-2-cache
+          provider: aws
+          account: '210987654321'
+          region: us-west-2
+          pull_auth: ecr_runtime_identity
+          materialization: pull_through
+        - name: cloudflare-global
+          provider: cloudflare
+          registry: registry.cloudflare.com/0123456789abcdef
+          region: global
+          manager_identity: cloudflare-production
+          pull_auth: cloudflare_short_lived
+          materialization: copy
+          localities:
+            - {provider: nebius, region: eu-north1}
+```
+
+When introduced, `materialization` should default to `copy` for compatibility
+with the current contract.
+`pull_through` means the endpoint can proxy a cold immutable digest and lazily
+create its local repository. It is usable without a control-plane copy wait but
+must not be reported as a verified local copy until the digest has actually
+been observed there. `provider: cloudflare` and
+`cloudflare_short_lived` are planned contracts, not implemented by PR #368.
+The manager identity names the credential broker; generated credentials remain
+ephemeral and are never stored in the profile or catalog.
+
 Workspace policy has two activation modes:
 
 - `managed_preferred` uses a verified local or canonical copy when possible and
@@ -204,6 +268,78 @@ Task selector
 | Launcher | Pull the selected digest-pinned reference and run the task's runtime setup. |
 | Image builder | Future, separate producer; it is not part of distribution reconciliation. |
 
+## Deployment latency contract
+
+The fastest deployment path selects an existing `release` or `artifact_id`.
+That path performs PostgreSQL reads only before ordinary cloud provisioning. A
+new mutable `ref` still requires one bounded source-registry manifest lookup to
+establish immutable identity; build or release CI should publish the artifact
+first when even that lookup is undesirable.
+
+Placement and admission may read catalog state and enqueue an idempotent intent.
+They must not create a repository, copy layers, wait for reconciliation, or
+perform a cloud control-plane write. Copy workers, cache prewarming, digest
+verification, and retries run outside the request path and can overlap VM or
+Kubernetes provisioning.
+
+Route selection under `managed_preferred` and `locality: prefer` is ordered:
+
+1. Use a verified local copy.
+2. Use a verified canonical copy or authenticated digest-pinned source while
+   local warming continues.
+3. Use a cold pull-through route only when policy prefers lazy locality over the
+   lower-latency canonical/source fallback.
+
+The container runtime must still download missing layers. ECR pull-through
+cache removes a separate orchestration wait and creates repositories lazily, but
+its first pull can still pay the upstream transfer cost. Hot images should be
+prewarmed asynchronously by pulling their platform-specific digest through the
+cache while capacity is provisioning. `managed_required` and locality
+`require` may wait or fail intentionally and are opt-in only after readiness
+has been proven.
+
+The API server should expose timing for selector resolution, placement
+resolution, intent enqueue, copy queue delay, copy duration, and runtime pull.
+The regression gate is that managed-image placement adds no registry or cloud
+network write to the direct deployment critical path.
+
+## Infrastructure bootstrap
+
+Reusable infrastructure should live in a versioned
+`terraform-aws-skypilot` module repository, with one thin root composition and
+three independently consumable lifecycle boundaries:
+
+| Module | Responsibility |
+|---|---|
+| `modules/control-plane` | Deploy or configure the SkyPilot Helm release on an existing EKS cluster, bind Pod Identity, PostgreSQL, secrets, and worker configuration. |
+| `modules/vm-pool` | Register one target AWS account for direct EC2: provisioner role, instance profile, SSM access, and least-privilege ECR pull permissions. |
+| `modules/image-distribution` | Create canonical immutable ECR namespaces, cross-account/Region pull-through cache rules, repository-creation templates, copy/prewarm IAM, and registry-profile outputs. |
+
+An example composition can add optional VPC, EKS, and PostgreSQL modules, but
+the reusable modules should accept those resources rather than owning an entire
+AWS estate. Each account/Region instance receives a caller-supplied aliased AWS
+provider; credentials never become module inputs or outputs. Outputs are
+secret-free role ARNs, registry endpoints, instance-profile names, and a
+registry-profile fragment that can be merged into SkyPilot configuration.
+
+The starting point is Boltz Platform `origin/main` at
+`5331f1505c842bce9a45200d99cb49e358bd50f3`: `ecr-distribution`,
+`ecr-pull-through-cache`, `skypilot_control_plane`, and
+`skypilot_pool_aws_vm`. Extraction must parameterize Boltz-specific repository
+names, accounts, IAM boundaries, retention, and workspace wiring. Boltz
+Platform should then pin the reusable module and migrate existing resources
+with explicit `moved` or import guidance instead of remaining a forked source
+of truth.
+
+Cloudflare remains a separate optional module/provider boundary so AWS-only
+installations do not inherit Cloudflare credentials or Terraform dependencies.
+Cloudflare's managed registry is the preferred R2-backed OCI option if its
+canary passes. The current `cloudflare-r2` module and
+`images/<model>/<tag>.tar.zst` layout remain an archive/emergency path; they are
+not reused as the registry implementation. Self-hosting an OCI service on
+Workers plus R2 is a fallback only if the managed registry cannot satisfy the
+external-pull contract.
+
 ## Data and safety invariants
 
 - The central catalog is PostgreSQL-only and rejects non-PostgreSQL engines.
@@ -217,6 +353,9 @@ Task selector
 - Workers use expiring leases and fencing tokens; stale workers cannot commit a
   result after ownership changes.
 - A location is launchable only after its digest has been verified.
+- A cold pull-through endpoint is addressable but is not labeled as a verified
+  local location until the expected digest is observed at the downstream
+  endpoint.
 - SkyServe workspace backfill only fills null or empty values, validates the
   controller incarnation first, and fails closed on conflicting evidence.
 - One node-level pull serves all GPUs on a multi-GPU instance.
@@ -241,14 +380,15 @@ has been converted and rollback has been exercised.
 
 ## Rollout and rollback
 
-1. Provision or register the canonical repository, regional repositories, and
-   runtime identities in a staging workspace.
+1. Apply the reusable Terraform modules to provision the canonical repository,
+   AWS account/Region cache scaffolding, worker identity, VM pull identity, and
+   registry-profile outputs in a staging workspace.
 2. Deploy the reconciliation worker with bounded concurrency, rate limits,
    metrics, and dead-letter visibility.
 3. Configure a revisioned profile under `managed_preferred` and `locality:
    prefer`.
-4. Import a digest-pinned canary image and prove canonical and regional digest
-   verification.
+4. Import a digest-pinned canary image and prove canonical, copied regional,
+   and cold/warm pull-through behavior without making placement wait.
 5. Launch on one multi-GPU VM and one Kubernetes cluster. Prove one node pull,
    correct runtime identity, per-GPU workload startup, restart recovery, and
    safe fallback.
@@ -287,10 +427,13 @@ fallback under `managed_required`; change workspace policy first.
 ## Open decisions and follow-up plans
 
 - The provider bootstrap and worker deployment must receive their own finalized
-  implementation plan before production work begins.
+  implementation plan before production work begins. The AWS work should use
+  the module split above and begin from the current Boltz Platform resources.
 - The companion Boltz fleet conversion plan must specify the replacement for
   the current host-mode R2 tarball path and preserve the deliberate per-GPU
   process launcher.
+- A Cloudflare canary must decide whether the managed registry is promoted to a
+  native adapter. Raw R2 and a self-hosted Workers registry are not the default.
 - Image construction remains in the separate, unimplemented
   `sky/design_docs/proposals/managed_container_image_builder.md` proposal. If
   accepted, it must become its own feature plan rather than expanding this
@@ -298,6 +441,10 @@ fallback under `managed_required`; change workspace policy first.
 
 ## Change log
 
+- 2026-07-18: Defined raw R2 versus R2-backed OCI support, made deployment-path
+  non-blocking behavior an explicit invariant, modeled lazy pull-through routes
+  separately from verified copies, and specified reusable AWS Terraform module
+  boundaries based on current Boltz Platform infrastructure.
 - 2026-07-18: Scoped the controller process marker to each Serve-controller
   unit test after the exact-head full suite exposed a pytest-worker environment
   leak. Production controller behavior is unchanged.
