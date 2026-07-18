@@ -1,12 +1,8 @@
 """SSH-based Kubernetes Cluster Deployment Script"""
 # pylint: disable=line-too-long
-import base64
 import concurrent.futures as cf
 import os
-import re
 import shlex
-import shutil
-import tempfile
 
 import colorama
 import yaml
@@ -14,6 +10,7 @@ import yaml
 from sky import sky_logging
 from sky.ssh_node_pools import constants
 from sky.ssh_node_pools import utils as ssh_utils
+from sky.ssh_node_pools.deploy import kubeconfig
 from sky.ssh_node_pools.deploy import monitoring
 from sky.ssh_node_pools.deploy import tunnel_utils
 from sky.ssh_node_pools.deploy import utils as deploy_utils
@@ -659,255 +656,14 @@ def deploy_single_cluster(cluster_name,
 
     # Step 3: Configure local kubectl to connect to the cluster
     force_update_status(f'Setting up SkyPilot configuration [{cluster_name}]')
-
-    # Create temporary directory for kubeconfig operations
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_kubeconfig = os.path.join(temp_dir, 'kubeconfig')
-
-        # Get the kubeconfig from remote server
-        if head_use_ssh_config:
-            scp_cmd = ['scp', head_node + ':~/.kube/config', temp_kubeconfig]
-        else:
-            scp_cmd = [
-                'scp', '-o', 'StrictHostKeyChecking=no', '-o',
-                'IdentitiesOnly=yes', '-i', ssh_key,
-                f'{ssh_user}@{head_node}:~/.kube/config', temp_kubeconfig
-            ]
-        deploy_utils.run_command(scp_cmd, shell=False)
-
-        # Create the directory for the kubeconfig file if it doesn't exist
-        deploy_utils.ensure_directory_exists(kubeconfig_path)
-
-        # Create empty kubeconfig if it doesn't exist
-        if not os.path.isfile(kubeconfig_path):
-            open(kubeconfig_path, 'a', encoding='utf-8').close()
-
-        # Modify the temporary kubeconfig to update server address and context name
-        modified_config = os.path.join(temp_dir, 'modified_config')
-        with open(temp_kubeconfig, encoding='utf-8') as f_in:
-            with open(modified_config, 'w', encoding='utf-8') as f_out:
-                in_cluster = False
-                in_user = False
-                client_cert_data = None
-                client_key_data = None
-
-                for line in f_in:
-                    if 'clusters:' in line:
-                        in_cluster = True
-                        in_user = False
-                    elif 'users:' in line:
-                        in_cluster = False
-                        in_user = True
-                    elif 'contexts:' in line:
-                        in_cluster = False
-                        in_user = False
-
-                    # Skip certificate authority data in cluster section
-                    if in_cluster and 'certificate-authority-data:' in line:
-                        continue
-                    # Skip client certificate data in user section but extract it
-                    elif in_user and 'client-certificate-data:' in line:
-                        client_cert_data = line.split(':', 1)[1].strip()
-                        continue
-                    # Skip client key data in user section but extract it
-                    elif in_user and 'client-key-data:' in line:
-                        client_key_data = line.split(':', 1)[1].strip()
-                        continue
-                    elif in_cluster and 'server:' in line:
-                        # Initially just set to the effective master IP
-                        # (will be changed to localhost by setup_kubectl_ssh_tunnel later)
-                        f_out.write(
-                            f'    server: https://{effective_master_ip}:6443\n')
-                        f_out.write('    insecure-skip-tls-verify: true\n')
-                        continue
-
-                    # Replace default context names with user-provided context name
-                    line = line.replace('name: default',
-                                        f'name: {context_name}')
-                    line = line.replace('cluster: default',
-                                        f'cluster: {context_name}')
-                    line = line.replace('user: default',
-                                        f'user: {context_name}')
-                    line = line.replace('current-context: default',
-                                        f'current-context: {context_name}')
-
-                    f_out.write(line)
-
-                # Save certificate data if available
-
-                if client_cert_data:
-                    # Decode base64 data and save as PEM
-                    try:
-                        # Clean up the certificate data by removing whitespace
-                        clean_cert_data = ''.join(client_cert_data.split())
-                        cert_pem = base64.b64decode(clean_cert_data).decode(
-                            'utf-8')
-
-                        # Check if the data already looks like a PEM file
-                        has_begin = '-----BEGIN CERTIFICATE-----' in cert_pem
-                        has_end = '-----END CERTIFICATE-----' in cert_pem
-
-                        if not has_begin or not has_end:
-                            logger.debug(
-                                'Warning: Certificate data missing PEM markers, attempting to fix...'
-                            )
-                            # Add PEM markers if missing
-                            if not has_begin:
-                                cert_pem = f'-----BEGIN CERTIFICATE-----\n{cert_pem}'
-                            if not has_end:
-                                cert_pem = f'{cert_pem}\n-----END CERTIFICATE-----'
-
-                        # Write the certificate
-                        with open(cert_file_path, 'w',
-                                  encoding='utf-8') as cert_file:
-                            cert_file.write(cert_pem)
-
-                        # Verify the file was written correctly
-                        if os.path.getsize(cert_file_path) > 0:
-                            logger.debug(
-                                f'Successfully saved certificate data ({len(cert_pem)} bytes)'
-                            )
-
-                            # Quick validation of PEM format
-                            with open(cert_file_path, encoding='utf-8') as f:
-                                content = f.readlines()
-                                first_line = content[0].strip(
-                                ) if content else ''
-                                last_line = content[-1].strip(
-                                ) if content else ''
-
-                            if not first_line.startswith(
-                                    '-----BEGIN') or not last_line.startswith(
-                                        '-----END'):
-                                logger.debug(
-                                    'Warning: Certificate may not be in proper PEM format'
-                                )
-                        else:
-                            logger.error(
-                                f'{colorama.Fore.RED}Error: '
-                                f'Certificate file is empty{RESET_ALL}')
-                    except Exception as e:  # pylint: disable=broad-except
-                        logger.error(f'{colorama.Fore.RED}'
-                                     f'Error processing certificate data: {e}'
-                                     f'{RESET_ALL}')
-
-                if client_key_data:
-                    # Decode base64 data and save as PEM
-                    try:
-                        # Clean up the key data by removing whitespace
-                        clean_key_data = ''.join(client_key_data.split())
-                        key_pem = base64.b64decode(clean_key_data).decode(
-                            'utf-8')
-
-                        # Check if the data already looks like a PEM file
-
-                        # Check for EC key format
-                        if 'EC PRIVATE KEY' in key_pem:
-                            # Handle EC KEY format directly
-                            match_ec = re.search(
-                                r'-----BEGIN EC PRIVATE KEY-----(.*?)-----END EC PRIVATE KEY-----',
-                                key_pem, re.DOTALL)
-                            if match_ec:
-                                # Extract and properly format EC key
-                                key_content = match_ec.group(1).strip()
-                                key_pem = f'-----BEGIN EC PRIVATE KEY-----\n{key_content}\n-----END EC PRIVATE KEY-----'
-                            else:
-                                # Extract content and assume EC format
-                                key_content = re.sub(r'-----BEGIN.*?-----', '',
-                                                     key_pem)
-                                key_content = re.sub(r'-----END.*?-----.*', '',
-                                                     key_content).strip()
-                                key_pem = f'-----BEGIN EC PRIVATE KEY-----\n{key_content}\n-----END EC PRIVATE KEY-----'
-                        else:
-                            # Handle regular private key format
-                            has_begin = any(marker in key_pem for marker in [
-                                '-----BEGIN PRIVATE KEY-----',
-                                '-----BEGIN RSA PRIVATE KEY-----'
-                            ])
-                            has_end = any(marker in key_pem for marker in [
-                                '-----END PRIVATE KEY-----',
-                                '-----END RSA PRIVATE KEY-----'
-                            ])
-
-                            if not has_begin or not has_end:
-                                logger.debug(
-                                    'Warning: Key data missing PEM markers, attempting to fix...'
-                                )
-                                # Add PEM markers if missing
-                                if not has_begin:
-                                    key_pem = f'-----BEGIN PRIVATE KEY-----\n{key_pem}'
-                                if not has_end:
-                                    key_pem = f'{key_pem}\n-----END PRIVATE KEY-----'
-                                    # Remove any trailing characters after END marker
-                                    key_pem = re.sub(
-                                        r'(-----END PRIVATE KEY-----).*', r'\1',
-                                        key_pem)
-
-                        # Write the key
-                        with open(key_file_path, 'w',
-                                  encoding='utf-8') as key_file:
-                            key_file.write(key_pem)
-
-                        # Verify the file was written correctly
-                        if os.path.getsize(key_file_path) > 0:
-                            logger.debug(
-                                f'Successfully saved key data ({len(key_pem)} bytes)'
-                            )
-
-                            # Quick validation of PEM format
-                            with open(key_file_path, encoding='utf-8') as f:
-                                content = f.readlines()
-                                first_line = content[0].strip(
-                                ) if content else ''
-                                last_line = content[-1].strip(
-                                ) if content else ''
-
-                            if not first_line.startswith(
-                                    '-----BEGIN') or not last_line.startswith(
-                                        '-----END'):
-                                logger.debug(
-                                    'Warning: Key may not be in proper PEM format'
-                                )
-                        else:
-                            logger.error(f'{colorama.Fore.RED}Error: '
-                                         f'Key file is empty{RESET_ALL}')
-                    except Exception as e:  # pylint: disable=broad-except
-                        logger.error(f'{colorama.Fore.RED}'
-                                     f'Error processing key data: {e}'
-                                     f'{RESET_ALL}')
-
-        # First check if context name exists and delete it if it does
-        # TODO(romilb): Should we throw an error here instead?
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-context', context_name],
-            shell=False,
-            silent=True)
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-cluster', context_name],
-            shell=False,
-            silent=True)
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-user', context_name],
-            shell=False,
-            silent=True)
-
-        # Merge the configurations using kubectl
-        merged_config = os.path.join(temp_dir, 'merged_config')
-        os.environ['KUBECONFIG'] = f'{kubeconfig_path}:{modified_config}'
-        with open(merged_config, 'w', encoding='utf-8') as merged_file:
-            kubectl_cmd = ['kubectl', 'config', 'view', '--flatten']
-            result = deploy_utils.run_command(kubectl_cmd, shell=False)
-            if result:
-                merged_file.write(result)
-
-        # Replace the kubeconfig with the merged config
-        shutil.move(merged_config, kubeconfig_path)
-
-        # Set the new context as the current context
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'use-context', context_name],
-            shell=False,
-            silent=True)
+    kubeconfig.configure_local_kubeconfig(
+        head_node=head_node,
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        context_name=context_name,
+        effective_master_ip=effective_master_ip,
+        kubeconfig_path=kubeconfig_path,
+        use_ssh_config=head_use_ssh_config)
 
     # Always set up SSH tunnel since we assume only port 22 is accessible
     tunnel_utils.setup_kubectl_ssh_tunnel(head_node,

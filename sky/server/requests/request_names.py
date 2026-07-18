@@ -63,6 +63,7 @@ class RequestName(str, enum.Enum):
     # Serve requests
     SERVE_UP = 'serve.up'
     SERVE_UPDATE = 'serve.update'
+    SERVE_LB_HIGH_AVAILABILITY = 'serve.lb_high_availability'
     SERVE_DOWN = 'serve.down'
     SERVE_TERMINATE_REPLICA = 'serve.terminate_replica'
     SERVE_STATUS = 'serve.status'

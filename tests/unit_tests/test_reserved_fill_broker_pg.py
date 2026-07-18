@@ -37,6 +37,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 # `broker_engine` defined here instead of the sqlite one).
 import test_reserved_fill_broker as sqlite_suite
 
+from sky.serve import lb_ha
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
@@ -321,12 +322,26 @@ class TestMigrationChainPG:
                     'resource_scope',
                     'logical_replica_semantics',
                     'workspace',
+                    'lb_ha_enabled',
+                    'lb_active_slot',
+                    'lb_cutover_generation',
+                    'lb_pending_slot',
+                    'lb_cutover_phase',
+                    'lb_drain_started_at',
+                    'lb_demand_handoff_generation',
+                    'lb_demand_handoff_snapshot',
+                    'lb_demand_handoff_complete_at',
+                    'lb_last_demand_snapshot',
                 }.issubset(service_columns)
                 version_columns = {
                     column['name']
                     for column in inspector.get_columns('version_specs')
                 }
-                assert {'created_at', 'created_by'} <= version_columns
+                assert {
+                    'created_at',
+                    'created_by',
+                    'submitted_yaml_content',
+                } <= version_columns
                 cleanup_intent_columns = {
                     column['name'] for column in inspector.get_columns(
                         'ephemeral_storage_cleanup_intents')
@@ -348,6 +363,236 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
+    @pytest.mark.parametrize('preview_workspace_016', [False, True])
+    def test_revision_018_reconciles_conflicting_revision_016_layouts(
+            self, pg_server, preview_workspace_016):
+        """Both pre-merge revision 016 schemas converge on PostgreSQL."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        metadata = sqlalchemy.MetaData()
+        service_columns = [
+            sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True)
+        ]
+        if preview_workspace_016:
+            service_columns.append(
+                sqlalchemy.Column('workspace', sqlalchemy.Text))
+        else:
+            service_columns.extend([
+                sqlalchemy.Column('lb_ha_enabled',
+                                  sqlalchemy.Integer,
+                                  nullable=False,
+                                  server_default='0'),
+                sqlalchemy.Column('lb_active_slot', sqlalchemy.Text),
+                sqlalchemy.Column('lb_cutover_generation',
+                                  sqlalchemy.Integer,
+                                  nullable=False,
+                                  server_default='0'),
+                sqlalchemy.Column('lb_pending_slot', sqlalchemy.Text),
+                sqlalchemy.Column('lb_cutover_phase',
+                                  sqlalchemy.Text,
+                                  nullable=False,
+                                  server_default='STABLE'),
+                sqlalchemy.Column('lb_drain_started_at', sqlalchemy.Float),
+                sqlalchemy.Column('lb_demand_handoff_generation',
+                                  sqlalchemy.Integer),
+                sqlalchemy.Column('lb_demand_handoff_snapshot',
+                                  sqlalchemy.Text),
+                sqlalchemy.Column('lb_demand_handoff_complete_at',
+                                  sqlalchemy.Float),
+                sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
+            ])
+        services = sqlalchemy.Table('services', metadata, *service_columns)
+        sqlalchemy.Table(
+            'version_specs', metadata,
+            sqlalchemy.Column('service_name',
+                              sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+            sqlalchemy.Column('created_at', sqlalchemy.Float),
+            sqlalchemy.Column('created_by', sqlalchemy.Text))
+        metadata.create_all(engine)
+        try:
+            with engine.begin() as connection:
+                connection.execute(services.insert().values(name='legacy-svc'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'CREATE TABLE alembic_version_serve_state_db '
+                        '(version_num VARCHAR(32) NOT NULL)'))
+                connection.execute(
+                    sqlalchemy.text(
+                        "INSERT INTO alembic_version_serve_state_db "
+                        "VALUES ('016')"))
+
+            migration_utils.safe_alembic_upgrade(
+                engine, migration_utils.SERVE_DB_NAME,
+                migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            service_columns = {
+                column['name']: column
+                for column in inspector.get_columns('services')
+            }
+            assert service_columns['workspace']['nullable']
+            assert {
+                'lb_ha_enabled',
+                'lb_active_slot',
+                'lb_cutover_generation',
+                'lb_pending_slot',
+                'lb_cutover_phase',
+                'lb_drain_started_at',
+                'lb_demand_handoff_generation',
+                'lb_demand_handoff_snapshot',
+                'lb_demand_handoff_complete_at',
+                'lb_last_demand_snapshot',
+            } <= set(service_columns)
+            version_columns = {
+                column['name']
+                for column in inspector.get_columns('version_specs')
+            }
+            assert 'submitted_yaml_content' in version_columns
+            with engine.connect() as connection:
+                workspace = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT workspace FROM services WHERE name = :name'), {
+                            'name': 'legacy-svc'
+                        }).scalar_one()
+            assert workspace is None
+        finally:
+            engine.dispose()
+
+
+class TestLbCutoverAuthorityPG:
+    """The production-dialect CAS chain fences every phase transition."""
+
+    def test_cutover_cas_and_crash_recovery_states(self, broker_engine,
+                                                   monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(serve_state.services_table.insert().values(
+                name='ha-service',
+                controller_job_id=1,
+                status=serve_state.ServiceStatus.READY.value,
+                controller_pid=77,
+                controller_ip='10.0.0.7',
+                hash='incarnation',
+                lifecycle_epoch=11,
+                lb_ha_enabled=1,
+                lb_active_slot=lb_ha.LbSlot.A.value,
+                lb_cutover_generation=1,
+                lb_pending_slot=None,
+                lb_cutover_phase=lb_ha.LbCutoverPhase.STABLE.value))
+            session.commit()
+
+        owner = (77, '10.0.0.7')
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                            (78, '10.0.0.8'), 11,
+                                            lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation', owner,
+                                            12, lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        demand_snapshot = lb_ha.DemandSnapshot(
+            (10, 20),
+            4,
+            2,
+            in_flight={'http://replica': 1},
+            unknown_in_flight_urls=('http://unknown',))
+        assert serve_state.record_lb_active_demand_snapshot(
+            'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.A, 1,
+            demand_snapshot)
+        assert serve_state.get_lb_last_demand_snapshot(
+            'ha-service') == demand_snapshot
+        assert not serve_state.record_lb_active_demand_snapshot(
+            'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.B, 1,
+            demand_snapshot)
+        preparing = serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.A, 1,
+                                                 lb_ha.LbSlot.B)
+        assert preparing == lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=lb_ha.LbSlot.A,
+            generation=2,
+            pending_slot=lb_ha.LbSlot.B,
+            phase=lb_ha.LbCutoverPhase.PREPARING,
+            lifecycle_epoch=11)
+        assert serve_state.get_lb_demand_handoff('ha-service') == (
+            2, demand_snapshot, None)
+        assert serve_state.begin_lb_cutover('ha-service', 'incarnation', owner,
+                                            11, lb_ha.LbSlot.A, 1,
+                                            lb_ha.LbSlot.B) is None
+        assert not serve_state.commit_lb_cutover(
+            'ha-service', 'stale-incarnation', owner, 11, lb_ha.LbSlot.A,
+            lb_ha.LbSlot.B, 2)
+        assert serve_state.commit_lb_cutover('ha-service', 'incarnation', owner,
+                                             11, lb_ha.LbSlot.A, lb_ha.LbSlot.B,
+                                             2)
+        completed_at = serve_state.mark_lb_demand_handoff_complete(
+            'ha-service', 'incarnation', owner, 11, 2)
+        assert completed_at is not None
+        assert serve_state.mark_lb_demand_handoff_complete(
+            'ha-service', 'incarnation', owner, 11, 2) == completed_at
+        generation, restored, restored_at = serve_state.get_lb_demand_handoff(
+            'ha-service')
+        handoff = lb_ha.DemandHandoff(30)
+        handoff.restore(generation, restored, restored_at)
+        assert handoff.generation == 2
+        assert handoff.snapshot == demand_snapshot
+
+        draining = serve_state.get_lb_cutover_state('ha-service')
+        assert draining is not None
+        assert draining.active_slot is lb_ha.LbSlot.B
+        assert draining.pending_slot is lb_ha.LbSlot.A
+        assert draining.phase is lb_ha.LbCutoverPhase.DRAINING
+        assert serve_state.finish_lb_cutover_drain('ha-service', 'incarnation',
+                                                   owner, 11, lb_ha.LbSlot.B,
+                                                   lb_ha.LbSlot.A, 2)
+
+        preparing = serve_state.begin_lb_cutover('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.B, 2,
+                                                 lb_ha.LbSlot.A)
+        assert preparing is not None
+        assert serve_state.abort_lb_cutover_preparation('ha-service',
+                                                        'incarnation', owner,
+                                                        11, lb_ha.LbSlot.B,
+                                                        lb_ha.LbSlot.A, 3)
+        stable = serve_state.get_lb_cutover_state('ha-service')
+        assert stable is not None
+        assert stable.active_slot is lb_ha.LbSlot.B
+        assert stable.generation == 3
+        assert stable.pending_slot is None
+        assert stable.phase is lb_ha.LbCutoverPhase.STABLE
+        assert serve_state.get_lb_demand_handoff('ha-service') == (None, None,
+                                                                   None)
+
+        with serve_state.lb_cutover_kubernetes_guard(
+                'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.B, 3,
+                lb_ha.LbCutoverPhase.STABLE, None) as guarded:
+            assert guarded
+        with serve_state.lb_cutover_kubernetes_guard(
+                'ha-service', 'incarnation', owner, 12, lb_ha.LbSlot.B, 3,
+                lb_ha.LbCutoverPhase.STABLE, None) as guarded:
+            assert not guarded
+
+        assert serve_state.begin_lb_ha_rollback('ha-service', 'incarnation',
+                                                owner, 11, lb_ha.LbSlot.B, 3)
+        assert serve_state.finish_lb_ha_rollback('ha-service', 'incarnation',
+                                                 owner, 11, lb_ha.LbSlot.B, 3)
+        rolled_back = serve_state.get_lb_cutover_state('ha-service')
+        assert rolled_back is not None
+        assert not rolled_back.enabled
+        assert rolled_back.phase is lb_ha.LbCutoverPhase.STABLE
+        assert serve_state.get_lb_last_demand_snapshot('ha-service') is None
+
+        assert serve_state.begin_lb_ha_migration('ha-service', 'incarnation',
+                                                 owner, 11)
+        migrating = serve_state.get_lb_cutover_state('ha-service')
+        assert migrating is not None
+        assert migrating.enabled
+        assert migrating.phase is lb_ha.LbCutoverPhase.MIGRATING
+        assert serve_state.finish_lb_ha_migration('ha-service', 'incarnation',
+                                                  owner, 11)
+
 
 # =================== Aggregate Serve history on PG ====================
 
@@ -364,6 +609,31 @@ def history_engine(pg_server, monkeypatch):
 
 
 class TestServeStatusHistoryPG:
+
+    def test_snapshot_excludes_cleaned_retained_failure(self, history_engine):
+        services = serve_state.services_table
+        replicas = serve_state.replicas_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(services).values(name='svc',
+                                                   hash='hash-a',
+                                                   current_version=1,
+                                                   pool=0))
+            connection.execute(
+                sqlalchemy.insert(replicas).values(service_name='svc',
+                                                   replica_id=1,
+                                                   status='FAILED_PROBING',
+                                                   sky_down_status='SUCCEEDED',
+                                                   version=1))
+
+        timestamp = 1784207110.0
+        serve_history.record_status_snapshot(timestamp)
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 1)
+
+        assert len(history['samples']) == 1
+        assert history['samples'][0]['total_count'] == 0
+        assert history['samples'][0]['errored_count'] == 0
 
     def test_snapshot_groups_physical_rows_and_zero_capacity(
             self, history_engine):
@@ -460,6 +730,11 @@ class TestServeStatusHistoryPG:
         assert current['service_hash'] == 'new-hash'
         assert len(current['samples']) == 1
         assert current['samples'][0]['total_count'] == 0
+
+        stale = serve_history.get_status_history(
+            'svc', timestamp=timestamp + 71, expected_service_hash='old-hash')
+        assert stale['available'] is False
+        assert not stale['samples']
 
     def test_request_history_is_idempotent_additive_and_incarnation_scoped(
             self, history_engine):

@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import threading
@@ -18,6 +19,8 @@ import uvicorn
 
 from sky import sky_logging
 from sky.serve import constants
+from sky.serve import lb_ha
+from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import load_balancing_policies as lb_policies
 from sky.serve import serve_utils
 from sky.serve.load_balancer_http import _DrainableServer
@@ -177,6 +180,7 @@ class SkyServeLoadBalancer:
     # publishing a stale zero after that submit lands.
     _occupancy_dispatch_generation: dict[str, int] | None = None
     _occupancy_sample_generation: dict[str, int] | None = None
+    _occupancy_sample_time: dict[str, float] | None = None
     # Optimistic reservations bridge the interval between a fast async
     # acknowledgement and the first post-dispatch occupancy probe. The active
     # attempt count rejects a probe that overtakes an in-progress POST before
@@ -192,12 +196,14 @@ class SkyServeLoadBalancer:
     # admission correct even if scheduling changes or a test deliberately
     # pauses between admission and selection.
     _occupancy_unassigned_reservations: int = 0
+    _ha_runtime_stats: lb_ha_obs.LbHaRuntimeStats | None = None
 
     def __init__(
         self,
         controller_url: str,
         load_balancer_port: int,
         service_hash: str | None = None,
+        lb_slot: str | lb_ha.LbSlot | None = None,
     ) -> None:
         """Initialize the load balancer.
 
@@ -217,6 +223,18 @@ class SkyServeLoadBalancer:
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
         self._service_hash = service_hash
+        parsed_slot = (lb_slot if isinstance(lb_slot, lb_ha.LbSlot) else
+                       lb_ha.parse_slot(lb_slot))
+        if lb_slot is not None and parsed_slot is None:
+            raise ValueError(f'Invalid load balancer slot: {lb_slot!r}.')
+        self._lb_slot = parsed_slot
+        self._lb_role = (lb_ha.LbRole.ACTIVE
+                         if parsed_slot is None else lb_ha.LbRole.STANDBY)
+        self._lb_role_generation = 0
+        self._lb_ha_rollout_evidence: dict[str, Any] | None = None
+        self._ha_runtime_stats = lb_ha_obs.LbHaRuntimeStats()
+        self._armed_generation: int | None = None
+        self._routing_version: int | None = None
         # Strong references to fire-and-forget startup tasks (the event loop
         # only holds weak references to tasks).
         self._background_tasks: list[asyncio.Task] = []
@@ -334,6 +352,7 @@ class SkyServeLoadBalancer:
         self._replica_free_slots: dict[str, int] = {}
         self._occupancy_dispatch_generation = {}
         self._occupancy_sample_generation = {}
+        self._occupancy_sample_time = {}
         self._occupancy_pending_reservations = {}
         self._occupancy_active_attempts = {}
         self._occupancy_unassigned_reservations = 0
@@ -344,6 +363,14 @@ class SkyServeLoadBalancer:
         # Strong refs to in-progress drain-close tasks (see
         # _drain_and_close_client); a bare create_task result can be GCed.
         self._client_close_tasks: set[asyncio.Task] = set()
+
+    def _ha_stats(self) -> lb_ha_obs.LbHaRuntimeStats:
+        """Return process-local HA stats, including for partial test objects."""
+        stats = getattr(self, '_ha_runtime_stats', None)
+        if stats is None:
+            stats = lb_ha_obs.LbHaRuntimeStats()
+            self._ha_runtime_stats = stats
+        return stats
 
     def _quarantined_replicas(self) -> set[str]:
         """Replica URLs currently quarantined (TTL not yet expired).
@@ -640,15 +667,23 @@ class SkyServeLoadBalancer:
         return fastapi.HTTPException(
             status_code=503,
             detail='Load balancer is draining; retry another endpoint.',
-            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+            headers={
+                'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+                # A persistent connection may still be pinned to this pod
+                # after the Service selector has moved to the standby. Close
+                # it after the rejection so the retry reaches the new active
+                # slot instead of repeating 503s for the full drain grace.
+                'Connection': 'close',
+            })
 
     async def _acquire_request_slot(self, request: fastapi.Request) -> bool:
-        """Wait for bounded dispatch capacity. Returns False when disabled."""
+        """Acquire process-local admission, queueing when configured."""
         if self._draining:
             raise self._draining_request_error()
         config = self._request_queue_config
         if config is None:
-            return False
+            self._active_request_count += 1
+            return True
         condition = self._request_queue_condition
         if condition is None:
             condition = asyncio.Condition()
@@ -662,7 +697,8 @@ class SkyServeLoadBalancer:
             # dispatch instead of tripping the assert in
             # _request_queue_limits.
             if self._request_queue_config is None:
-                return False
+                self._active_request_count += 1
+                return True
             dispatch_limit, queue_size = self._request_queue_limits()
             if self._current_dispatch_load() < dispatch_limit:
                 self._active_request_count += 1
@@ -735,7 +771,8 @@ class SkyServeLoadBalancer:
                     if self._draining:
                         raise self._draining_request_error()
                     if self._request_queue_config is None:
-                        return False
+                        self._active_request_count += 1
+                        return True
                     dispatch_limit, _ = self._request_queue_limits()
                     if self._current_dispatch_load() < dispatch_limit:
                         self._active_request_count += 1
@@ -857,8 +894,32 @@ class SkyServeLoadBalancer:
                     0, self._waiting_request_body_bytes - reserved)
 
     def _is_ready_to_serve(self) -> bool:
-        """Readiness: true only once synced at least once and not draining."""
+        """Sync readiness is independent from HA Service traffic selection."""
         return self._ready and not self._draining
+
+    def _accepts_new_requests(self) -> bool:
+        """Admit traffic only when this synchronized slot can be selected."""
+        # ARMED is still outside the stable Service selector when granted.
+        # Letting it admit traffic closes the tiny selector-patch/heartbeat-
+        # response window: if Kubernetes starts routing immediately after the
+        # patch, the target is already able to serve. Direct Pod-IP access is
+        # unsupported, so this does not create a second supported authority.
+        return (not self._draining and
+                getattr(self, '_lb_role', lb_ha.LbRole.ACTIVE)
+                in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE))
+
+    def _inactive_role_request_error(self) -> fastapi.HTTPException:
+        role = getattr(self, '_lb_role', lb_ha.LbRole.STANDBY)
+        headers = {'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)}
+        if role is lb_ha.LbRole.DRAINING:
+            # Role-driven cutovers can fence the old active slot before its
+            # process receives SIGTERM. Release persistent clients in that
+            # interval for the same reason as process-local draining.
+            headers['Connection'] = 'close'
+        return fastapi.HTTPException(
+            status_code=503,
+            detail=f'Load balancer slot is {role.value.lower()}.',
+            headers=headers)
 
     def _begin_draining(self) -> None:
         """Start draining (idempotent): fail readiness + stop syncing."""
@@ -900,7 +961,8 @@ class SkyServeLoadBalancer:
                       request: fastapi.Request) -> fastapi.responses.Response:
         del request  # Unused.
         return fastapi.responses.Response(
-            status_code=200 if self._is_ready_to_serve() else 503)
+            status_code=200 if self._is_ready_to_serve() else 503,
+            headers={'Connection': 'close'} if self._draining else None)
 
     async def _liveness(self,
                         request: fastapi.Request) -> fastapi.responses.Response:
@@ -1412,15 +1474,45 @@ class SkyServeLoadBalancer:
             max_capacity = (max(max_replicas, current_capacity)
                             if max_replicas is not None and
                             max_capacity_is_usable else None)
+        role = getattr(self, '_lb_role', lb_ha.LbRole.ACTIVE)
+        if role not in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE):
+            # Direct Pod access is unsupported, but fail closed even if a
+            # caller bypasses the stable Service selector.
+            ready_replicas = 0
+            current_capacity = 0
+            max_capacity = 0
+            max_replicas = 0
+            request_queue_capacity = 0
+            request_queue_dispatch_limit = 0
+        slot: lb_ha.LbSlot | None = getattr(self, '_lb_slot', None)
         return fastapi.responses.JSONResponse({
+            'lb_role': role.value,
+            'lb_role_generation': getattr(self, '_lb_role_generation', 0),
+            'lb_slot': slot.value if slot is not None else None,
+            'lb_pod_uid': os.environ.get(constants.LB_POD_UID_ENV_VAR),
+            'lb_image_digest': os.environ.get(constants.LB_IMAGE_DIGEST_ENV_VAR
+                                             ),
+            'lb_ha_rollout': getattr(self, '_lb_ha_rollout_evidence', None),
             'replica_unit': replica_unit,
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
             'draining': self._draining,
             'synced': self._ready,
+            # Qualification-only aggregate truth, kept separate from the
+            # admission-facing ready_replicas field. A STANDBY deliberately
+            # publishes zero admission capacity but must retain a complete
+            # routing and occupancy snapshot to remain promotable.
+            'routing_backend_count': len(ready_set),
+            'occupancy_probed_backend_count': probed_backend_count,
             'last_sync_age_seconds': last_sync_age,
             'queue_depth': self._queue_depth,
+            # Process-local admission counters are required to prove that a
+            # legacy LB has no body-bearing work before selector migration.
+            # They remain behind the data-plane bearer like this entire
+            # endpoint and contain neither request identifiers nor payloads.
+            'local_in_flight': self._active_request_count,
             'request_queue_depth': self._waiting_request_count,
+            'waiting_request_body_bytes': self._waiting_request_body_bytes,
             'request_queue_capacity': request_queue_capacity,
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
@@ -1445,6 +1537,10 @@ class SkyServeLoadBalancer:
             'running_slots': running_slots,
             'free_slots': free_slots,
             'occupancy_probe_age_seconds': occupancy_probe_age,
+            # Bounded process-local counters and timings for HA load/chaos
+            # qualification. No service, Pod, URL, or request identifiers are
+            # retained, and these observations never participate in routing.
+            'ha_observability': self._ha_stats().snapshot(),
         })
 
     def _should_keep_ready_set_on_empty_sync(
@@ -1551,6 +1647,8 @@ class SkyServeLoadBalancer:
         out of the probe set once torn down (probe fails -> no occupancy
         -> pruned from the capable set below).
         """
+        round_started_at = time.monotonic()
+        connections_created = 0
         with self._client_pool_lock:
             ready_urls = list(self._load_balancing_policy.ready_replicas)
             probe_urls = list(
@@ -1570,6 +1668,7 @@ class SkyServeLoadBalancer:
                 self._occupancy_explicitly_disabled_urls = set()
                 self._occupancy_dispatch_generation = {}
                 self._occupancy_sample_generation = {}
+                self._occupancy_sample_time = {}
                 self._occupancy_pending_reservations = {}
                 self._occupancy_active_attempts = {}
                 self._occupancy_off_ready_since = {}
@@ -1577,6 +1676,11 @@ class SkyServeLoadBalancer:
                 self._last_occupancy_probe_time = time.monotonic()
                 self._load_balancing_policy.set_occupancy({})
             await self._notify_request_queue()
+            self._ha_stats().record_probe(total_seconds=time.monotonic() -
+                                          round_started_at,
+                                          attempted=0,
+                                          succeeded=0,
+                                          connections_created=0)
             return
         # aiohttp's default connector allows only 100 concurrent sockets. A
         # probe timeout covers the entire request, including time spent queued
@@ -1584,8 +1688,16 @@ class SkyServeLoadBalancer:
         # without ever being contacted on a large fleet. Match the connector
         # limit to this round's bounded controller-supplied fleet so every
         # replica gets the same timeout window.
+        async def connection_created(*_args: Any) -> None:
+            nonlocal connections_created
+            connections_created += 1
+
+        trace_config = aiohttp.TraceConfig()
+        trace_config.on_connection_create_end.append(connection_created)
         connector = aiohttp.TCPConnector(limit=len(probe_urls))
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector,
+                                         trace_configs=[trace_config
+                                                       ]) as session:
             results = await asyncio.gather(
                 *(self._fetch_replica_occupancy(session, url)
                   for url in probe_urls))
@@ -1620,6 +1732,7 @@ class SkyServeLoadBalancer:
             merged_free_slots = dict(self._replica_free_slots)
             merged_sample_generation = dict(self._occupancy_sample_generation or
                                             {})
+            merged_sample_time = dict(self._occupancy_sample_time or {})
             pending = dict(self._occupancy_pending_reservations or {})
             missed_urls = set(probe_urls) - set(occupancy)
             for url in missed_urls:
@@ -1627,6 +1740,7 @@ class SkyServeLoadBalancer:
                 merged_total_slots.pop(url, None)
                 merged_free_slots.pop(url, None)
                 merged_sample_generation.pop(url, None)
+                merged_sample_time.pop(url, None)
             for url in valid_sample_urls:
                 merged_occupancy[url] = occupancy[url]
                 merged_total_slots[url] = total_slots[url]
@@ -1635,6 +1749,7 @@ class SkyServeLoadBalancer:
                 else:
                     merged_free_slots.pop(url, None)
                 merged_sample_generation[url] = probe_generation.get(url, 0)
+                merged_sample_time[url] = time.monotonic()
                 # A probe begun after the trailing fence observes every
                 # accepted local-router reservation, so it becomes the new
                 # authoritative baseline.
@@ -1660,6 +1775,7 @@ class SkyServeLoadBalancer:
                 if url in ready_set and url in current_ready
             }
             self._occupancy_sample_generation = merged_sample_generation
+            self._occupancy_sample_time = merged_sample_time
             self._occupancy_pending_reservations = pending
             self._last_occupancy_probe_time = time.monotonic()
             # A url that EVER reported occupancy is occupancy-capable:
@@ -1744,6 +1860,10 @@ class SkyServeLoadBalancer:
                     self._occupancy_sample_generation or {}).items()
                 if url in keep
             }
+            self._occupancy_sample_time = {
+                url: sampled_at for url, sampled_at in (
+                    self._occupancy_sample_time or {}).items() if url in keep
+            }
             self._occupancy_pending_reservations = {
                 url: count
                 for url, count in (
@@ -1767,6 +1887,11 @@ class SkyServeLoadBalancer:
             self._load_balancing_policy.set_occupancy(
                 self._effective_occupancy_locked())
         await self._notify_request_queue()
+        self._ha_stats().record_probe(total_seconds=time.monotonic() -
+                                      round_started_at,
+                                      attempted=len(probe_urls),
+                                      succeeded=len(occupancy),
+                                      connections_created=connections_created)
 
     async def _probe_occupancy_loop(self) -> None:
         """Background occupancy prober, beside the controller-sync loop."""
@@ -1801,6 +1926,7 @@ class SkyServeLoadBalancer:
         routing_spec = None
         num_ready_replicas: int | None = None
         capacity_hint = None
+        service_version: int | None = None
 
         # Read the purpose-specific ring fresh for every sync. The primary is
         # tried first; overlap credentials are replayed only after a 401.
@@ -1879,7 +2005,7 @@ class SkyServeLoadBalancer:
                             self._service_hash)
                     async with session.post(
                             self._controller_url +
-                            '/controller/load_balancer_sync',
+                            constants.LB_CONTROLLER_SYNC_PATH,
                             json=sync_payload,
                             headers=sync_headers or None,
                             timeout=aiohttp.ClientTimeout(
@@ -1919,6 +2045,10 @@ class SkyServeLoadBalancer:
                         # [boltz fork] Provisioning/target counts for the
                         # /_lb/capacity read; absent on older controllers.
                         capacity_hint = response_json.get('capacity_hint')
+                        response_version = response_json.get('service_version')
+                        if (isinstance(response_version, int) and
+                                not isinstance(response_version, bool)):
+                            service_version = response_version
                         ready_replica_urls = list(replica_info.keys())
                         break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -1939,6 +2069,7 @@ class SkyServeLoadBalancer:
                         'Controller sync omitted the routing spec; retaining '
                         'the last applied routes and readiness state.')
                     return
+                self._routing_version = service_version
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):
@@ -2178,6 +2309,220 @@ class SkyServeLoadBalancer:
                 # controller creates a CPU/network/log hot loop.
                 await asyncio.sleep(retry_delay)
 
+    def _ha_role_payload(self) -> dict[str, Any]:
+        """Build a non-additive occupancy and additive HTTP role report."""
+        _, routing_urls, unknown_urls, sampled_urls = (
+            self._in_flight_with_draining())
+        with self._client_pool_lock:
+            http_in_flight = self._load_balancing_policy.snapshot_in_flight()
+            if http_in_flight is None:
+                http_in_flight = {}
+                unknown_urls = sorted(set(unknown_urls) | set(routing_urls))
+            else:
+                http_in_flight = dict(http_in_flight)
+            for url, clients in (self._draining_clients or {}).items():
+                count = sum(
+                    getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
+                if count > 0:
+                    http_in_flight[url] = http_in_flight.get(url, 0) + count
+            sampled_set = set(sampled_urls)
+            async_occupancy = {
+                url: int(count)
+                for url, count in self._replica_occupancy.items()
+                if url in sampled_set
+            }
+            sample_generations = {
+                url: int(generation)
+                for url, generation in (
+                    self._occupancy_sample_generation or {}).items()
+                if url in sampled_set
+            }
+            now = time.monotonic()
+            sample_ages = {
+                url: max(0.0, now - sampled_at)
+                for url, sampled_at in (
+                    self._occupancy_sample_time or {}).items()
+                if url in sampled_set
+            }
+        # Fail closed if an old/partial object has generation evidence but no
+        # per-url sample timestamp. The controller rejects unequal key sets.
+        reported_urls = (set(async_occupancy) | set(sample_generations) |
+                         set(sample_ages))
+        common_urls = (set(async_occupancy) & set(sample_generations) &
+                       set(sample_ages))
+        unknown_urls = sorted(set(unknown_urls) | (reported_urls - common_urls))
+        async_occupancy = {url: async_occupancy[url] for url in common_urls}
+        sample_generations = {
+            url: sample_generations[url] for url in common_urls
+        }
+        sample_ages = {url: sample_ages[url] for url in common_urls}
+        return {
+            'lb_session_id': self._get_lb_session_id(),
+            'lb_slot': self._lb_slot.value
+                       if self._lb_slot is not None else None,
+            'routing_version': self._routing_version,
+            'armed_generation': self._armed_generation,
+            # Echo only the role response already applied locally. The
+            # controller uses this acknowledgement to prove that a former
+            # active stopped admission before accepting its zero-work report.
+            'applied_role': self._lb_role.value,
+            'applied_generation': self._lb_role_generation,
+            # Process-local admissions include queued, dispatching, and
+            # streaming requests. Unlike backend async occupancy, this count
+            # belongs to exactly one LB session and is the authoritative
+            # bounded-drain signal for a former active slot.
+            'local_in_flight': self._active_request_count,
+            'http_in_flight': http_in_flight,
+            'async_occupancy': async_occupancy,
+            'occupancy_sample_generation': sample_generations,
+            'occupancy_sample_age_seconds': sample_ages,
+            'routing_urls': routing_urls,
+            'unknown_in_flight_urls': unknown_urls,
+            'draining_urls': list(self._draining_clients or {}),
+        }
+
+    async def _sync_role_with_controller_once(self) -> None:
+        if self._lb_slot is None:
+            return
+        payload = self._ha_role_payload()
+        payload_bytes = len(json.dumps(payload).encode('utf-8'))
+        started_at = time.monotonic()
+        status_code: int | None = None
+        outcome = lb_ha_obs.LbRoleOutcome.INVALID_RESPONSE.value
+        controller_observation: dict[str, Any] | None = None
+        sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
+        token_attempts: tuple[str | None,
+                              ...] = (sync_tokens if sync_tokens else (None,))
+        try:
+            async with aiohttp.ClientSession() as session:
+                for token_index, controller_token in enumerate(token_attempts):
+                    headers = {}
+                    if controller_token is not None:
+                        headers['Authorization'] = f'Bearer {controller_token}'
+                    if self._service_hash is not None:
+                        headers[constants.SERVICE_HASH_HEADER] = (
+                            self._service_hash)
+                    async with session.post(
+                            self._controller_url +
+                            constants.LB_CONTROLLER_ROLE_PATH,
+                            json=payload,
+                            headers=headers or None,
+                            timeout=aiohttp.ClientTimeout(
+                                constants.LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS),
+                    ) as response:
+                        status_code = response.status
+                        proxy_observation = None
+                        response_headers = getattr(response, 'headers', {})
+                        raw_proxy_observation = response_headers.get(
+                            constants.LB_ROLE_PROXY_OBSERVABILITY_HEADER)
+                        if raw_proxy_observation is not None:
+                            try:
+                                parsed_proxy_observation = json.loads(
+                                    raw_proxy_observation)
+                            except (TypeError, ValueError):
+                                parsed_proxy_observation = None
+                            if isinstance(parsed_proxy_observation, dict):
+                                proxy_observation = parsed_proxy_observation
+                        try:
+                            body = await response.json()
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError,
+                                ValueError):
+                            body = None
+                        if (response.status == 401 and
+                                token_index + 1 < len(token_attempts)):
+                            continue
+                        if isinstance(body, dict):
+                            body_outcome = body.get('outcome')
+                            if isinstance(body_outcome, str):
+                                outcome = body_outcome
+                            controller_observation = {
+                                'controller': body.get('observability'),
+                                'proxy': (proxy_observation or
+                                          body.get('proxy_observability')),
+                            }
+                        elif response.status < 400:
+                            outcome = lb_ha_obs.LbRoleOutcome.INVALID_RESPONSE.value
+                        if response.status >= 400:
+                            if outcome == lb_ha_obs.LbRoleOutcome.INVALID_RESPONSE.value:
+                                if response.status in (401, 403):
+                                    outcome = (lb_ha_obs.LbRoleOutcome.
+                                               HTTP_UNAUTHORIZED.value)
+                                elif response.status == 409:
+                                    outcome = (lb_ha_obs.LbRoleOutcome.
+                                               HTTP_CONFLICT.value)
+                                else:
+                                    outcome = lb_ha_obs.LbRoleOutcome.HTTP_ERROR.value
+                            response.raise_for_status()
+                        if not isinstance(body, dict):
+                            raise ValueError(
+                                'Controller returned a non-JSON HA '
+                                'role response.')
+                        # Mixed-version controllers do not report an outcome;
+                        # a validated 2xx role response is still a success.
+                        if body.get('outcome') is None:
+                            outcome = lb_ha_obs.LbRoleOutcome.SUCCESS.value
+                        role: lb_ha.LbRole | None = None
+                        try:
+                            role = lb_ha.LbRole(body.get('role'))
+                        except ValueError:
+                            outcome = (
+                                lb_ha_obs.LbRoleOutcome.INVALID_RESPONSE.value)
+                            raise
+                        assert role is not None
+                        generation = body.get('generation')
+                        if (not isinstance(generation, int) or
+                                isinstance(generation, bool) or generation < 1):
+                            outcome = (
+                                lb_ha_obs.LbRoleOutcome.INVALID_RESPONSE.value)
+                            raise ValueError(
+                                'Controller returned an invalid HA cutover '
+                                'generation.')
+                        self._lb_role = role
+                        self._lb_role_generation = generation
+                        rollout_evidence = body.get('ha_rollout')
+                        self._lb_ha_rollout_evidence = (
+                            rollout_evidence if isinstance(
+                                rollout_evidence, dict) else None)
+                        if role is lb_ha.LbRole.ARMED:
+                            self._armed_generation = generation
+                        else:
+                            self._armed_generation = None
+                        return
+        except asyncio.TimeoutError:
+            outcome = lb_ha_obs.LbRoleOutcome.CLIENT_TIMEOUT.value
+            raise
+        except aiohttp.ClientConnectionError:
+            outcome = lb_ha_obs.LbRoleOutcome.CLIENT_CONNECTION_ERROR.value
+            raise
+        except aiohttp.ClientResponseError:
+            raise
+        except aiohttp.ClientError:
+            outcome = lb_ha_obs.LbRoleOutcome.CLIENT_CONNECTION_ERROR.value
+            raise
+        finally:
+            self._ha_stats().record_role(
+                payload_bytes=payload_bytes,
+                total_seconds=time.monotonic() - started_at,
+                outcome=outcome,
+                status_code=status_code,
+                controller_observation=controller_observation)
+
+    async def _sync_role_with_controller(self) -> None:
+        """Keep slot roles current without coupling them to fleet resolution."""
+        if self._lb_slot is None:
+            return
+        while not self._draining:
+            try:
+                await self._sync_role_with_controller_once()
+            except Exception as e:  # pylint: disable=broad-except
+                # Preserve the last committed local role across an API-server
+                # restart. In particular, heartbeat loss alone must not demote
+                # a healthy Service-selected active.
+                logger.warning('HA role heartbeat failed; retaining role '
+                               f'{self._lb_role.value}: '
+                               f'{common_utils.format_exception(e)}')
+            await asyncio.sleep(constants.LB_ROLE_HEARTBEAT_INTERVAL_SECONDS)
+
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
         request_history = self._request_aggregator.request_history_snapshot()
@@ -2204,8 +2549,8 @@ class SkyServeLoadBalancer:
                         headers[constants.SERVICE_HASH_HEADER] = (
                             self._service_hash)
                     async with session.post(
-                            self._controller_url + '/controller/'
-                            'load_balancer_request_history_sync',
+                            self._controller_url +
+                            constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
                             json=payload,
                             headers=headers or None,
                             timeout=aiohttp.ClientTimeout(
@@ -2368,6 +2713,8 @@ class SkyServeLoadBalancer:
             # Kubernetes Service/ingress. Reject requests that arrive in that
             # window instead of starting new work while this Pod terminates.
             raise self._draining_request_error()
+        if not self._accepts_new_requests():
+            raise self._inactive_role_request_error()
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
         # The dispatched phase is deliberately excluded: the dispatch
@@ -2406,6 +2753,8 @@ class SkyServeLoadBalancer:
             # snapshot cannot miss a request that starts after draining.
             if self._draining:
                 raise self._draining_request_error()
+            if not self._accepts_new_requests():
+                raise self._inactive_role_request_error()
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
@@ -2691,6 +3040,8 @@ class SkyServeLoadBalancer:
             # Register controller synchronization task
             self._background_tasks.append(
                 asyncio.create_task(self._sync_with_controller()))
+            self._background_tasks.append(
+                asyncio.create_task(self._sync_role_with_controller()))
             # [boltz fork] Register the async-occupancy prober (no-op task
             # when disabled via env).
             self._background_tasks.append(
@@ -2715,6 +3066,7 @@ def run_load_balancer(
     controller_addr: str,
     load_balancer_port: int,
     service_hash: str | None = None,
+    lb_slot: str | None = None,
 ) -> None:
     """Run the load balancer.
 
@@ -2728,7 +3080,8 @@ def run_load_balancer(
     """
     load_balancer = SkyServeLoadBalancer(controller_url=controller_addr,
                                          load_balancer_port=load_balancer_port,
-                                         service_hash=service_hash)
+                                         service_hash=service_hash,
+                                         lb_slot=lb_slot)
     load_balancer.run()
 
 
@@ -2750,16 +3103,22 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--service-hash',
                         required=True,
                         help='The durable service incarnation to sync for.')
+    parser.add_argument('--lb-slot',
+                        choices=[slot.value for slot in lb_ha.LbSlot],
+                        help='Immutable HA traffic slot (a or b).')
     return parser
 
 
 def _resolve_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Translate the external LB CLI's infrastructure arguments."""
-    return dict(
+    kwargs = dict(
         controller_addr=args.controller_addr,
         load_balancer_port=args.load_balancer_port,
         service_hash=args.service_hash,
     )
+    if args.lb_slot is not None:
+        kwargs['lb_slot'] = args.lb_slot
+    return kwargs
 
 
 if __name__ == '__main__':

@@ -824,8 +824,8 @@ class JobController:
             callback_func = managed_job_utils.event_callback_func(
                 job_id=self._job_id, task_id=task_id, task=task)
 
-        transient_job_check_deadline = None
-        job_check_backoff = None
+        transient_job_check_retry: tuple[float,
+                                         common_utils.Backoff] | None = None
         not_up_debouncer = _ClusterNotUpDebouncer(task.num_nodes)
 
         while True:
@@ -877,16 +877,15 @@ class JobController:
                     f'status. Reason: {transient_job_check_error_reason}.\n'
                     'Check cluster status to determine if the job is '
                     'preempted or failed.')
-                if transient_job_check_deadline is None:
-                    transient_job_check_deadline = (
-                        time.monotonic() +
-                        managed_job_utils.JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS
+                if transient_job_check_retry is None:
+                    transient_job_check_retry = (
+                        time.monotonic() + managed_job_utils.
+                        JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS,
+                        common_utils.Backoff(initial_backoff=1,
+                                             max_backoff_factor=5),
                     )
-                    job_check_backoff = common_utils.Backoff(
-                        initial_backoff=1, max_backoff_factor=5)
             else:
-                transient_job_check_deadline = None
-                job_check_backoff = None
+                transient_job_check_retry = None
 
             # Handle success
             if job_status == job_lib.JobStatus.SUCCEEDED:
@@ -1143,11 +1142,10 @@ class JobController:
                     # job status. Try to recover the job (will not restart the
                     # cluster, if the cluster is healthy).
                     if transient_job_check_error_reason is not None:
-                        assert transient_job_check_deadline is not None, (
-                            transient_job_check_deadline,
+                        assert transient_job_check_retry is not None, (
                             transient_job_check_error_reason)
-                        assert job_check_backoff is not None, (
-                            job_check_backoff, transient_job_check_error_reason)
+                        (transient_job_check_deadline,
+                         job_check_backoff) = transient_job_check_retry
                         remaining_timeout = (transient_job_check_deadline -
                                              time.monotonic())
                         if remaining_timeout > 0:
@@ -1231,7 +1229,9 @@ class JobController:
 
             logger.info(f'Task {task.name} recovered, continuing monitoring')
 
-            # Reset force flag after first recovery
+            # Recovery starts a fresh monitoring epoch. Retry state from the
+            # old cluster must not shorten the next transient-error budget.
+            transient_job_check_retry = None
             force_transit_to_recovering = False
             # Observations accumulated against the old cluster must not count
             # toward recovering the fresh one.
@@ -1349,16 +1349,19 @@ class JobController:
             mapping — a recovered peer may have a new IP, so every
             task's /etc/hosts needs refreshing.
             """
-            updated_handles = []
+            task_clusters = []
             for t, _ in all_tasks_handles:
                 t_name = t.name
                 assert t_name is not None
                 # JobGroups don't support pools, cluster name is deterministic
                 t_cluster = managed_job_utils.generate_managed_job_cluster_name(
                     t_name, self._job_id)
-                t_handle = await asyncio.to_thread(
-                    global_user_state.get_handle_from_cluster_name, t_cluster)
-                updated_handles.append((t, t_handle))
+                task_clusters.append((t, t_cluster))
+            handles = await asyncio.to_thread(
+                global_user_state.get_handles_from_cluster_names,
+                {cluster_name for _, cluster_name in task_clusters})
+            updated_handles = [(t, handles.get(cluster_name))
+                               for t, cluster_name in task_clusters]
 
             await job_group_networking.setup_job_group_networking(
                 job_group_name, updated_handles)
@@ -1670,6 +1673,14 @@ class JobController:
             at: tid for tid, at in monitor_async_tasks.items()
         }
 
+        async def cancel_remaining_monitors() -> None:
+            """Cancel and join monitor tasks still owned by this scope."""
+            remaining_tasks = list(monitor_async_tasks.values())
+            for monitor_task in remaining_tasks:
+                monitor_task.cancel()
+            if remaining_tasks:
+                await asyncio.gather(*remaining_tasks, return_exceptions=True)
+
         try:
             # Monitor with primary/auxiliary termination logic
             while monitor_async_tasks:
@@ -1739,11 +1750,16 @@ class JobController:
                                 # All auxiliary jobs terminated, exit loop
                                 break
 
+        except asyncio.CancelledError:
+            # Monitor tasks are independent asyncio tasks, so cancelling this
+            # parent does not cancel them automatically. Join them before the
+            # controller manager starts tearing down their clusters; otherwise
+            # a child can keep polling or recover while cleanup is in progress.
+            await cancel_remaining_monitors()
+            raise
         except Exception as e:
             logger.error(f'Monitoring failed: {e}')
-            # Cancel all remaining tasks
-            for task_id, async_task in monitor_async_tasks.items():
-                async_task.cancel()
+            await cancel_remaining_monitors()
             await self._cleanup_job_group_clusters(cluster_names)
             raise
 
@@ -2616,9 +2632,10 @@ class ControllerManager:
                     pid=pid_str).set(controller_utils.LAUNCHES_PER_WORKER)
 
             if starting_count >= controller_utils.LAUNCHES_PER_WORKER:
-                # launching a job takes around 1 minute, so lets wait half that
-                # time
-                await asyncio.sleep(30)
+                logger.info('Too many jobs starting, waiting for a slot')
+                async with self._starting_signal:
+                    await self._starting_signal.wait_for(lambda: len(
+                        self.starting) < controller_utils.LAUNCHES_PER_WORKER)
                 continue
 
             # Normally, 200 jobs can run on each controller. But if we have a

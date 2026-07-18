@@ -1,3 +1,4 @@
+# pylint: disable=missing-module-docstring,protected-access,import-outside-toplevel,missing-class-docstring,unused-argument,redefined-outer-name,reimported,confusing-with-statement
 import contextlib
 import os
 import pathlib
@@ -271,7 +272,9 @@ def test_wait_registration_service_timeout_uses_monotonic_deadline():
 
     get_service_status.assert_called_once_with('svc',
                                                pool=False,
-                                               with_replica_info=False)
+                                               with_replica_info=False,
+                                               with_yaml=False,
+                                               status_snapshot_only=True)
     sleep.assert_not_called()
     clock.time.assert_not_called()
     assert clock.monotonic.call_count == 3
@@ -2280,7 +2283,8 @@ class TestTerminateFailedServices:
             'svc',
             expected_service_hash='incarnation-a',
             require_runtime=True,
-            expected_api_deployment_uid='api-deployment-uid')
+            expected_api_deployment_uid='api-deployment-uid',
+            high_availability=False)
         first_status.assert_called_once()
         assert (first_status.call_args.args[4] ==
                 serve_state.ServiceStatus.FAILED_CLEANUP)
@@ -2372,7 +2376,8 @@ class TestTerminateFailedServices:
             'svc',
             expected_service_hash='incarnation-a',
             require_runtime=True,
-            expected_api_deployment_uid='api-deployment-uid')
+            expected_api_deployment_uid='api-deployment-uid',
+            high_availability=False)
 
     def test_lb_delete_failure_retains_purge_row(self):
         # Never drop the service row while an old Ready LB may still hold
@@ -2416,7 +2421,7 @@ class TestTerminateFailedServices:
                  return_value=True), \
              mock.patch.object(serve_state,
                                'get_service_controller_owner',
-                               side_effect=lambda _name: dict(owner)), \
+                               side_effect=lambda _name, **_kwargs: dict(owner)), \
              mock.patch.object(serve_state,
                                'get_ha_recovery_script',
                                return_value=None), \

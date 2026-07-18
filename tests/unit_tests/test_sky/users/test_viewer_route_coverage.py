@@ -87,6 +87,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/terminate-replica', 'POST'),
     ('/serve/{service_name}/versions', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
+    ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
     # --- Managed container image writes ---
     ('/images/publish', 'POST'),
     ('/images/register', 'POST'),
@@ -96,6 +97,8 @@ _KNOWN_VIEWER_DENIED: set = {
     # capacity state and is never a viewer API.
     ('/api/internal/serve/{service_name}/controller/load_balancer_sync', 'POST'
     ),
+    ('/api/internal/serve/{service_name}/controller/load_balancer_role',
+     'POST'),
     ('/api/internal/serve/{service_name}/controller/'
      'load_balancer_request_history_sync', 'POST'),
     # --- Volumes writes ---

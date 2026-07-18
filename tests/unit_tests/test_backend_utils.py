@@ -671,6 +671,97 @@ def test_check_cluster_available_rejects_init(mock_refresh, mock_get_backend):
         pass
 
 
+def _available_cluster_record(handle, status=status_lib.ClusterStatus.UP):
+    return {
+        'status': status,
+        'handle': handle,
+        'autostop': -1,
+        'to_down': False,
+    }
+
+
+def test_check_cluster_available_uses_refresh_as_only_healthy_read(monkeypatch):
+    handle = mock.MagicMock()
+    get_record = mock.Mock(return_value=_available_cluster_record(handle))
+    refresh = mock.Mock(return_value=(status_lib.ClusterStatus.UP, handle))
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name', get_record)
+    monkeypatch.setattr(backend_utils, 'refresh_cluster_status_handle', refresh)
+    monkeypatch.setattr(backend_utils, 'get_backend_from_handle', mock.Mock())
+
+    result = backend_utils.check_cluster_available(
+        'test-cluster',
+        operation='test operation',
+        check_cloud_vm_ray_backend=False)
+
+    assert result is handle
+    refresh.assert_called_once_with('test-cluster')
+    get_record.assert_not_called()
+
+
+@pytest.mark.parametrize('removed', [False, True])
+def test_check_cluster_available_refresh_error_uses_current_record(
+        monkeypatch, removed):
+    stale_handle = mock.MagicMock()
+    current_handle = mock.MagicMock()
+    refresh_started = False
+
+    def get_record(*_args, **_kwargs):
+        if refresh_started:
+            if removed:
+                return None
+            return _available_cluster_record(
+                current_handle, status_lib.ClusterStatus.AUTOSTOPPING)
+        return _available_cluster_record(stale_handle)
+
+    def refresh(_cluster_name):
+        nonlocal refresh_started
+        refresh_started = True
+        raise exceptions.ClusterStatusFetchingError('provider unavailable')
+
+    get_record_mock = mock.Mock(side_effect=get_record)
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name', get_record_mock)
+    monkeypatch.setattr(backend_utils, 'refresh_cluster_status_handle', refresh)
+    monkeypatch.setattr(backend_utils, 'get_backend_from_handle', mock.Mock())
+
+    if removed:
+        with pytest.raises(exceptions.ClusterDoesNotExist):
+            backend_utils.check_cluster_available(
+                'test-cluster',
+                operation='test operation',
+                check_cloud_vm_ray_backend=False)
+    else:
+        result = backend_utils.check_cluster_available(
+            'test-cluster',
+            operation='test operation',
+            check_cloud_vm_ray_backend=False)
+        assert result is current_handle
+
+    get_record_mock.assert_called_once_with('test-cluster',
+                                            include_user_info=False,
+                                            summary_response=True)
+
+
+def test_check_cluster_available_dryrun_reads_once_without_refresh(monkeypatch):
+    handle = mock.MagicMock()
+    get_record = mock.Mock(return_value=_available_cluster_record(handle))
+    refresh = mock.Mock()
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name', get_record)
+    monkeypatch.setattr(backend_utils, 'refresh_cluster_status_handle', refresh)
+
+    result = backend_utils.check_cluster_available('test-cluster',
+                                                   operation='test operation',
+                                                   dryrun=True)
+
+    assert result is handle
+    get_record.assert_called_once_with('test-cluster',
+                                       include_user_info=False,
+                                       summary_response=True)
+    refresh.assert_not_called()
+
+
 def _k8s_owner_check_record(owner_identity):
     launchable = mock.MagicMock()
     launchable.cloud = clouds.Kubernetes()

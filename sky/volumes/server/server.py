@@ -23,6 +23,7 @@ router = fastapi.APIRouter()
 async def volume_list(
     request: fastapi.Request,
     refresh: bool = fastapi.Depends(role_filter.force_viewer_volume_refresh),
+    name: str | None = None,
 ) -> None:
     """Gets the volumes.
 
@@ -31,8 +32,9 @@ async def volume_list(
             If False (default), return cached data from the database.
             For viewer-role callers this is forced to False by
             `role_filter.force_viewer_volume_refresh`.
+        name: If set, return only the volume with this name.
     """
-    request_body = payloads.VolumeListBody(refresh=refresh)
+    request_body = payloads.VolumeListBody(refresh=refresh, name=name)
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.VOLUME_LIST,

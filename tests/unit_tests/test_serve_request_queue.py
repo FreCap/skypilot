@@ -113,7 +113,7 @@ def test_async_occupancy_defaults_per_replica_cap_to_global_cap():
         'max_request_body_bytes': 0
     },
     {
-        'max_size': 3001
+        'max_size': 10001
     },
     {
         'use_async_occupancy': 1
@@ -126,6 +126,12 @@ def test_async_occupancy_defaults_per_replica_cap_to_global_cap():
 def test_invalid_queue_config_rejected(queue):
     with pytest.raises(ValueError):
         _make_spec(lb_request_queue=queue)
+
+
+def test_queue_size_limit_accepts_ten_thousand():
+    spec = _make_spec(lb_request_queue={'max_size': 10000})
+    assert spec.lb_request_queue is not None
+    assert spec.lb_request_queue['max_size'] == 10000
 
 
 def test_dynamic_queue_size_is_capped():
@@ -166,7 +172,10 @@ def test_async_occupancy_sizes_queue_by_probed_slots():
     lb._replica_free_slots = {one_gpu: 1, four_gpu: 4}
 
     assert lb._request_queue_limits() == (5, 15)
-    lb._request_queue_config['max_concurrency_per_replica'] = 2
+    lb._request_queue_config = {
+        **(lb._request_queue_config or {}),
+        'max_concurrency_per_replica': 2,
+    }
     assert lb._request_queue_limits() == (3, 9)
 
 
@@ -541,9 +550,10 @@ def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
 
         async def _enable_queue(delay):
             del delay
-            # This request entered while the queue was disabled, so it does not
-            # own an outer admission slot. Enable occupancy-aware queueing in
-            # its retry gap to reproduce a live service update.
+            # This request entered while queueing was disabled, but still owns
+            # the process-local admission used for HA drain accounting. Enable
+            # occupancy-aware queueing in its retry gap to reproduce a live
+            # service update.
             assert lb._occupancy_unassigned_reservations == 0
             lb._apply_routing_spec({
                 'request_queue': _queue_config(min_size=0,
@@ -568,7 +578,6 @@ def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
         assert lb._occupancy_unassigned_reservations == 0
         assert not lb._has_unassigned_occupancy_admission(request)
         assert lb._active_request_count == 0
-        lb._notify_request_queue.assert_awaited_once()
 
     asyncio.run(_run())
 
@@ -730,7 +739,10 @@ def test_timeout_and_cancellation_remove_waiters():
         assert exc.value.status_code == 503
         assert lb._waiting_request_count == 0
 
-        lb._request_queue_config['timeout_seconds'] = 1
+        lb._request_queue_config = {
+            **(lb._request_queue_config or {}),
+            'timeout_seconds': 1,
+        }
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)
@@ -1043,8 +1055,11 @@ def test_disabling_queue_releases_existing_waiters():
             await asyncio.sleep(0)
         lb._apply_routing_spec({'request_queue': None})
         await lb._notify_request_queue()
-        assert await waiter is False
+        assert await waiter is True
         assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 1
+        await lb._release_request_slot(request)
+        assert lb._active_request_count == 0
 
     asyncio.run(_run())
 
@@ -1064,6 +1079,35 @@ def test_streaming_response_holds_admission_until_asgi_release():
         assert lb._active_request_count == 1
         await response._release()
         assert lb._active_request_count == 0
+        await response._release()
+        assert lb._active_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_queue_less_stream_holds_process_local_admission_until_release(
+        monkeypatch):
+
+    async def _run():
+        monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'queue-less-pod')
+        lb = load_balancer.SkyServeLoadBalancer('http://controller:8001',
+                                                8890,
+                                                lb_slot='a')
+        lb._lb_role = load_balancer.lb_ha.LbRole.ACTIVE
+        lb._lb_role_generation = 1
+        request = _request()
+
+        async def _upstream_release():
+            return None
+
+        async def _proxy(_request):
+            return load_balancer._ReleasingStreamingResponse(
+                content=iter(()), release=_upstream_release)
+
+        lb._proxy_with_retries_inner = _proxy
+        response = await lb._proxy_with_retries(request)
+        assert lb._active_request_count == 1
+        assert lb._ha_role_payload()['local_in_flight'] == 1
         await response._release()
         assert lb._active_request_count == 0
 
@@ -1192,7 +1236,7 @@ def test_queue_rejection_releases_buffered_body():
     asyncio.run(_run())
 
 
-def test_queue_disable_holds_body_budget_until_stream_release():
+def test_queue_disable_releases_body_budget_after_unqueued_admission():
 
     async def _run():
         lb = _make_lb(max_request_body_bytes=10)
@@ -1216,8 +1260,8 @@ def test_queue_disable_holds_body_budget_until_stream_release():
         lb._proxy_with_retries_inner = _proxy
         response = await lb._proxy_with_retries(  # type: ignore[arg-type]
             request)
-        assert lb._waiting_request_body_bytes == len(b'payload')
-        assert vars(request)['_skyserve_bounded_body'] == b'payload'
+        assert lb._waiting_request_body_bytes == 0
+        assert '_skyserve_bounded_body' not in vars(request)
 
         await response._release()
         assert lb._waiting_request_body_bytes == 0
@@ -1244,7 +1288,10 @@ def test_acquire_survives_config_disable_during_lock_wait():
         lb._request_queue_condition = _DisablingCondition()
         request = mock.MagicMock()
         request.headers = {}
-        assert await lb._acquire_request_slot(request) is False
+        assert await lb._acquire_request_slot(request) is True
+        assert lb._active_request_count == 1
+        await lb._release_request_slot(request)
+        assert lb._active_request_count == 0
 
     asyncio.run(_run())
 

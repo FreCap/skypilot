@@ -1,4 +1,5 @@
 """Focused hot-path tests for serve_utils owner lookups."""
+# pylint: disable=protected-access
 
 from unittest import mock
 
@@ -82,3 +83,51 @@ def test_versionless_nonnull_hash_row_is_rejected():
 
     full_read.assert_called_once_with('svc')
     set_st.assert_not_called()
+
+
+def test_health_check_prefers_controller_owner_lookup():
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'pool': False,
+    }
+
+    with mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record) as owner_lookup, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'health check should not load the full '
+                               'service row')), \
+         mock.patch.object(serve_utils.yaml_utils,
+                           'read_yaml_str',
+                           side_effect=AssertionError(
+                               'health check should not parse YAML')):
+        assert serve_utils._check_service_status_healthy('svc',
+                                                         pool=False) is None
+
+    owner_lookup.assert_called_once_with('svc', require_version=True)
+
+
+def test_health_check_rejects_pool_mismatch_without_full_service_read():
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'pool': True,
+    }
+
+    with mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record) as owner_lookup, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'pool mismatch should be detected from the '
+                               'owner lookup alone')), \
+         mock.patch.object(serve_utils.yaml_utils,
+                           'read_yaml_str',
+                           side_effect=AssertionError(
+                               'pool mismatch should not parse YAML')):
+        assert (serve_utils._check_service_status_healthy(
+            'svc', pool=False) == "Service 'svc' does not exist.")
+
+    owner_lookup.assert_called_once_with('svc', require_version=True)

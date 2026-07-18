@@ -74,6 +74,12 @@ def get_service_schema():
                 'required': [],
                 'additionalProperties': False,
                 'properties': {
+                    # Run two synchronized one-replica LB slots behind the
+                    # existing stable LoadBalancer Service. Only the selected
+                    # slot accepts new data-plane traffic.
+                    'high_availability': {
+                        'type': 'boolean',
+                    },
                     'stream_timeout_seconds': {
                         'type': 'number',
                     },
@@ -110,17 +116,17 @@ def get_service_schema():
                             'min_size': {
                                 'type': 'integer',
                                 'minimum': 0,
-                                'maximum': 3000,
+                                'maximum': 10000,
                             },
                             'size_per_replica': {
                                 'type': 'integer',
                                 'minimum': 0,
-                                'maximum': 3000,
+                                'maximum': 10000,
                             },
                             'max_size': {
                                 'type': 'integer',
                                 'minimum': 1,
-                                'maximum': 3000,
+                                'maximum': 10000,
                             },
                             'max_concurrency_per_replica': {
                                 'type': 'integer',

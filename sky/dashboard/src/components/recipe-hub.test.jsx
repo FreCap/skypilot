@@ -67,7 +67,12 @@ jest.mock('@/lib/analytics', () => ({
   trackFilterUsed: jest.fn(),
 }));
 
+jest.mock('@/data/connectors/client', () => ({
+  getCurrentUserRole: jest.fn(),
+}));
+
 import { createRecipe, getRecipes } from '@/data/connectors/recipes';
+import { getCurrentUserRole } from '@/data/connectors/client';
 import { RecipeHub } from '@/components/recipe-hub';
 
 describe('RecipeHub creation form', () => {
@@ -76,14 +81,11 @@ describe('RecipeHub creation form', () => {
     mockPluginRecipeTypes = [];
     getRecipes.mockResolvedValue([]);
     createRecipe.mockResolvedValue(undefined);
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: 'local' }),
+    getCurrentUserRole.mockResolvedValue({
+      id: 'local',
+      name: 'local',
+      role: null,
     });
-  });
-
-  afterEach(() => {
-    delete global.fetch;
   });
 
   async function openCreateForm() {
@@ -94,6 +96,7 @@ describe('RecipeHub creation form', () => {
   it('opens with the built-in cluster template and local owner field', async () => {
     await openCreateForm();
 
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
     expect(
       screen.getByRole('heading', { name: 'Create New Recipe' })
     ).toBeInTheDocument();

@@ -179,7 +179,8 @@ def dump_yaml(path: str,
         f.write(contents)
 
 
-def dump_yaml_str(config: list[dict[str, Any]] | dict[str, Any]) -> str:
+def dump_yaml_str(config: list[dict[str, Any]] | dict[str, Any],
+                  sort_keys: bool = False) -> str:
     """Dumps a YAML string.
     Args:
         config: the configuration to dump.
@@ -201,5 +202,5 @@ def dump_yaml_str(config: list[dict[str, Any]] | dict[str, Any]) -> str:
         dump_func = yaml.dump  # type: ignore
     return dump_func(config,
                      Dumper=LineBreakDumper,
-                     sort_keys=False,
+                     sort_keys=sort_keys,
                      default_flow_style=False)

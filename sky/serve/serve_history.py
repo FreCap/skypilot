@@ -9,6 +9,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky.serve import constants
 from sky.serve import serve_state
+from sky.utils import common_utils
 from sky.utils.db import db_utils
 
 DEFAULT_HISTORY_HOURS = 12
@@ -128,6 +129,12 @@ def _snapshot_query() -> sqlalchemy.Select:
     version = sqlalchemy.func.coalesce(replicas.c.version,
                                        services.c.current_version,
                                        constants.INITIAL_VERSION)
+    # Latest-version failures are retained for diagnostics after cleanup.
+    # Once teardown succeeds, the row no longer represents a physical machine.
+    live_replica = sqlalchemy.and_(
+        replicas.c.service_name == services.c.name,
+        replicas.c.sky_down_status.is_distinct_from(
+            common_utils.ProcessStatus.SUCCEEDED.value))
     return (sqlalchemy.select(
         services.c.name,
         services.c.hash,
@@ -135,13 +142,10 @@ def _snapshot_query() -> sqlalchemy.Select:
         replicas.c.status,
         sqlalchemy.func.count(  # pylint: disable=not-callable
             replicas.c.replica_id).label('count'),
-    ).select_from(
-        services.outerjoin(replicas,
-                           replicas.c.service_name == services.c.name)).where(
-                               services.c.pool == 0,
-                               services.c.hash.is_not(None)).group_by(
-                                   services.c.name, services.c.hash, version,
-                                   replicas.c.status))
+    ).select_from(services.outerjoin(replicas, live_replica)).where(
+        services.c.pool == 0,
+        services.c.hash.is_not(None)).group_by(services.c.name, services.c.hash,
+                                               version, replicas.c.status))
 
 
 def _build_history_rows(
@@ -329,10 +333,12 @@ def record_request_activity(
     return len(rows)
 
 
-def get_status_history(service_name: str,
-                       hours: int = DEFAULT_HISTORY_HOURS,
-                       version: int | None = None,
-                       timestamp: float | None = None) -> dict[str, Any]:
+def get_status_history(
+        service_name: str,
+        hours: int = DEFAULT_HISTORY_HOURS,
+        version: int | None = None,
+        timestamp: float | None = None,
+        expected_service_hash: str | None = None) -> dict[str, Any]:
     """Return ordered aggregate history for the current service incarnation."""
     if (not isinstance(hours, int) or isinstance(hours, bool) or hours < 1 or
             hours > RETENTION_HOURS):
@@ -342,6 +348,10 @@ def get_status_history(service_name: str,
                                 isinstance(version, bool) or version < 1):
         raise ValueError(f'version must be a positive integer, got '
                          f'{version!r}.')
+    if expected_service_hash is not None and (not isinstance(
+            expected_service_hash, str) or not expected_service_hash):
+        raise ValueError('expected_service_hash must be a non-empty string, '
+                         f'got {expected_service_hash!r}.')
 
     engine = _postgres_engine()
     if engine is None:
@@ -361,10 +371,15 @@ def get_status_history(service_name: str,
     services = serve_state.services_table
     history = serve_replica_status_history_table
     with orm.Session(engine) as session:
+        service_predicates = [
+            services.c.name == service_name,
+            services.c.pool == 0,
+        ]
+        if expected_service_hash is not None:
+            service_predicates.append(services.c.hash == expected_service_hash)
         service_hash = session.execute(
             sqlalchemy.select(services.c.hash).where(
-                services.c.name == service_name,
-                services.c.pool == 0)).scalar_one_or_none()
+                *service_predicates)).scalar_one_or_none()
         if service_hash is None:
             return {
                 'available': False,

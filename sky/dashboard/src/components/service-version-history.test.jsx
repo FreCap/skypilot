@@ -1,12 +1,30 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 
-import { ServiceVersionHistory } from './service-version-history';
+import {
+  buildSplitDiffRows,
+  ServiceVersionHistory,
+} from './service-version-history';
 import { getCurrentUserRole } from '@/data/connectors/client';
 import {
   electServiceVersion,
   getServiceVersions,
 } from '@/data/connectors/services';
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
 
 jest.mock('@/data/connectors/client', () => ({
   getCurrentUserRole: jest.fn(),
@@ -15,25 +33,6 @@ jest.mock('@/data/connectors/services', () => ({
   electServiceVersion: jest.fn(),
   getServiceVersions: jest.fn(),
 }));
-jest.mock('@/components/ui/yaml-code-block', () => {
-  const ReactModule = require('react');
-  return {
-    YamlCodeBlock: ({ value, onCreateEditor }) => {
-      const scrollRef = ReactModule.useRef(null);
-      const editorRef = ReactModule.useRef(null);
-      ReactModule.useEffect(() => {
-        editorRef.current = { scrollDOM: scrollRef.current };
-        onCreateEditor?.(editorRef.current);
-      }, [onCreateEditor]);
-      return (
-        <pre data-testid="yaml-pane" ref={scrollRef}>
-          {value}
-        </pre>
-      );
-    },
-  };
-});
-
 const history = {
   service_name: 'svc',
   elected_version: 3,
@@ -41,7 +40,9 @@ const history = {
   versions: [
     {
       version: 3,
-      yaml_content: 'name: current',
+      submitted_yaml_content: 'service:\n  min_replicas: 3\n  max_replicas: 10',
+      compiled_yaml_content:
+        'resources:\n  accelerators: L4\nservice:\n  max_replicas: 10\n  min_replicas: 3',
       created_at: 1784240584,
       created_by: 'test',
       policy: 'Autoscaling from 0 to 1000 replicas',
@@ -50,7 +51,9 @@ const history = {
     },
     {
       version: 1,
-      yaml_content: 'name: old',
+      submitted_yaml_content: 'service:\n  min_replicas: 1\n  max_replicas: 10',
+      compiled_yaml_content:
+        'resources:\n  accelerators: A100\nservice:\n  max_replicas: 10\n  min_replicas: 1',
       created_at: null,
       created_by: null,
       policy: 'Fixed 1 replica',
@@ -70,14 +73,13 @@ beforeEach(() => {
 it('shows elected state and compares a stored version', async () => {
   render(<ServiceVersionHistory serviceName="svc" />);
 
-  expect(await screen.findByText(/Elected generation: 3/)).toBeInTheDocument();
+  expect(await screen.findByText(/Elected 3/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
 
-  expect(
-    screen.getByText('Version 1 compared with elected version 3')
-  ).toBeInTheDocument();
-  expect(screen.getByText('name: old')).toBeInTheDocument();
-  expect(screen.getByText('name: current')).toBeInTheDocument();
+  expect(screen.getByText('Changes from elected v3')).toBeInTheDocument();
+  const changedRow = screen.getByTestId('diff-changed-row');
+  expect(within(changedRow).getByText('3')).toBeInTheDocument();
+  expect(within(changedRow).getByText('1')).toBeInTheDocument();
   expect(screen.getByText('test')).toBeInTheDocument();
   expect(
     screen.getByText('Autoscaling from 0 to 1000 replicas')
@@ -85,22 +87,135 @@ it('shows elected state and compares a stored version', async () => {
   expect(screen.getAllByText('Unknown')).toHaveLength(2);
 });
 
-it('keeps both comparison panes on the same scroll position', async () => {
+it('reports when the selected and elected YAML are identical', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    versions: [
+      history.versions[0],
+      {
+        ...history.versions[1],
+        submitted_yaml_content: history.versions[0].submitted_yaml_content,
+      },
+    ],
+  });
   render(<ServiceVersionHistory serviceName="svc" />);
 
-  await screen.findByText(/Elected generation: 3/);
+  await screen.findByText(/Elected 3/);
   fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
-  const panes = await screen.findAllByTestId('yaml-pane');
-  await waitFor(() =>
-    expect(screen.getByText('Scrolling is synced')).toBeInTheDocument()
+
+  expect(screen.getByText('These versions have identical YAML.')).toBeTruthy();
+});
+
+it('compares submitted YAML by default and can compare compiled YAML', async () => {
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  expect(screen.getByTestId('diff-changed-row')).toHaveTextContent('3');
+
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(screen.getAllByTestId('diff-changed-row').length).toBeGreaterThan(0);
+  expect(screen.getByText(/L4/)).toBeTruthy();
+  expect(screen.getByText(/A100/)).toBeTruthy();
+});
+
+it('directs legacy versions without submitted YAML to compiled comparison', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    versions: history.versions.map((version) => ({
+      ...version,
+      submitted_yaml_content: null,
+    })),
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  expect(
+    screen.getByText(/Submitted YAML was not retained/)
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(screen.queryByText(/Submitted YAML was not retained/)).toBeNull();
+});
+
+it('does not offer comparison without an elected baseline', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    elected_version: null,
+    versions: history.versions.map((version) => ({
+      ...version,
+      elected: false,
+    })),
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  expect(await screen.findByText(/Elected -/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Compare' })).toBeNull();
+});
+
+it('aligns changed lines and collapses distant unchanged context', () => {
+  const base = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
+  const comparison = [...base];
+  comparison[9] = 'line ten changed';
+
+  const rows = buildSplitDiffRows(base.join('\n'), comparison.join('\n'));
+  const changed = rows.find((row) => row.type === 'changed');
+
+  expect(changed).toMatchObject({
+    baseLine: 10,
+    comparisonLine: 10,
+    baseText: 'line 10',
+    comparisonText: 'line ten changed',
+  });
+  expect(rows.filter((row) => row.type === 'gap')).toHaveLength(2);
+  expect(rows[0]).toEqual({ type: 'gap', count: 6 });
+  expect(rows.at(-1)).toEqual({ type: 'gap', count: 7 });
+});
+
+it.each([
+  [
+    'addition',
+    'first\nthird',
+    'first\nsecond\nthird',
+    {
+      type: 'added',
+      baseLine: null,
+      comparisonLine: 2,
+      comparisonText: 'second',
+    },
+  ],
+  [
+    'removal',
+    'first\nsecond\nthird',
+    'first\nthird',
+    {
+      type: 'removed',
+      baseLine: 2,
+      comparisonLine: null,
+      baseText: 'second',
+    },
+  ],
+])(
+  'aligns a pure %s without shifting neighboring lines',
+  (_, base, next, row) => {
+    expect(buildSplitDiffRows(base, next)).toEqual(
+      expect.arrayContaining([expect.objectContaining(row)])
+    );
+  }
+);
+
+it('keeps line numbers aligned across multiple change hunks', () => {
+  const base = 'one\ntwo\nthree\nfour\nfive\nsix\nseven';
+  const comparison = 'one\nTWO\nthree\nfour\nfive\nSIX\nseven';
+
+  const changed = buildSplitDiffRows(base, comparison).filter(
+    (row) => row.type === 'changed'
   );
 
-  panes[0].scrollTop = 96;
-  panes[0].scrollLeft = 24;
-  fireEvent.scroll(panes[0]);
-
-  expect(panes[1].scrollTop).toBe(96);
-  expect(panes[1].scrollLeft).toBe(24);
+  expect(changed).toMatchObject([
+    { baseLine: 2, comparisonLine: 2, baseText: 'two', comparisonText: 'TWO' },
+    { baseLine: 6, comparisonLine: 6, baseText: 'six', comparisonText: 'SIX' },
+  ]);
 });
 
 it('elects through the existing rolling update path and refreshes', async () => {
@@ -113,21 +228,64 @@ it('elects through the existing rolling update path and refreshes', async () => 
     />
   );
 
-  await screen.findByText(/Elected generation: 3/);
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(screen.getByRole('button', { name: 'Compare' }));
+  expect(screen.getByText('Changes from elected v3')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Elect' }));
 
   await waitFor(() =>
     expect(electServiceVersion).toHaveBeenCalledWith('svc', 1)
   );
   await waitFor(() => expect(getServiceVersions).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(screen.queryByText('Changes from elected v3')).toBeNull()
+  );
   expect(onElectionComplete).toHaveBeenCalledTimes(1);
   window.confirm.mockRestore();
 });
 
-it('is hidden from non-admin users', async () => {
+it('explains that version history is admin-only', async () => {
   getCurrentUserRole.mockResolvedValue({ role: 'user' });
-  const { container } = render(<ServiceVersionHistory serviceName="svc" />);
+  render(<ServiceVersionHistory serviceName="svc" />);
 
-  await waitFor(() => expect(container).toBeEmptyDOMElement());
+  expect(
+    await screen.findByText('Version history is available to administrators.')
+  ).toBeTruthy();
   expect(getServiceVersions).not.toHaveBeenCalled();
+});
+
+it('does not stay loading before a service name is available', async () => {
+  render(<ServiceVersionHistory serviceName={undefined} />);
+
+  expect(await screen.findByText('Version history')).toBeTruthy();
+  expect(screen.queryByText('Loading versions...')).toBeNull();
+  expect(getServiceVersions).not.toHaveBeenCalled();
+});
+
+it('ignores a stale history response after the service changes', async () => {
+  const first = deferred();
+  const second = deferred();
+  getServiceVersions
+    .mockImplementationOnce(() => first.promise)
+    .mockImplementationOnce(() => second.promise);
+  const { rerender } = render(
+    <ServiceVersionHistory serviceName="first-service" />
+  );
+
+  await waitFor(() => expect(getServiceVersions).toHaveBeenCalledTimes(1));
+  rerender(<ServiceVersionHistory serviceName="second-service" />);
+  await waitFor(() => expect(getServiceVersions).toHaveBeenCalledTimes(2));
+
+  await act(async () => {
+    second.resolve(history);
+    await second.promise;
+  });
+  expect(await screen.findByText(/Elected 3/)).toBeTruthy();
+
+  await act(async () => {
+    first.resolve({ ...history, elected_version: 99 });
+    await first.promise;
+  });
+  expect(screen.queryByText(/Elected 99/)).toBeNull();
+  expect(screen.getByText(/Elected 3/)).toBeTruthy();
 });

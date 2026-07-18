@@ -1,5 +1,5 @@
 """Logic tests for the controller-owned external LB lifecycle."""
-# pylint: disable=protected-access
+# pylint: disable=protected-access,unexpected-keyword-arg
 import os
 import re
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import lb_k8s
 
 _RFC1123 = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
@@ -111,7 +112,8 @@ def _install(monkeypatch,
              api_deployment_uid='api-deployment-uid',
              release_name='skypilot',
              db_service_names=(),
-             patch_api=None):
+             patch_api=None,
+             policy_api=None):
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
@@ -173,6 +175,7 @@ def _install(monkeypatch,
     apps_api = apps_api or mock.MagicMock()
     core_api = core_api or mock.MagicMock()
     patch_api = patch_api or mock.MagicMock()
+    policy_api = policy_api or mock.MagicMock()
     effective_api_deployment_name = (
         api_deployment_name or
         (f'{release_name}-api-server' if release_name else None))
@@ -257,9 +260,14 @@ def _install(monkeypatch,
     monkeypatch.setattr(lb_k8s.kubernetes,
                         'api_client',
                         lambda unused_context=None: patch_api)
+    monkeypatch.setattr(lb_k8s.kubernetes,
+                        'policy_api',
+                        lambda unused_context=None: policy_api)
     if not wait_for_endpoint:
         monkeypatch.setattr(lb_k8s, '_wait_for_lb_service_endpoint',
                             lambda *unused_args, **unused_kwargs: None)
+    monkeypatch.setattr(lb_k8s, '_retry_obsolete_lb_topology_cleanup',
+                        lambda *unused_args, **unused_kwargs: None)
 
     volume_mounts = [
         _mount(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
@@ -305,7 +313,8 @@ def _install(monkeypatch,
             'hash': 'incarnation',
         } if name in live else None)
     monkeypatch.setattr(
-        lb_k8s.serve_state, 'get_service_controller_owner', lambda name: {
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda name, **_kwargs: {
             'controller_pid': os.getpid(),
             'controller_ip': None,
             'hash': 'incarnation',
@@ -313,6 +322,7 @@ def _install(monkeypatch,
             'status': None,
             'controller_port': None,
             'lifecycle_epoch': None,
+            'lb_ha_enabled': False,
         } if name in live else None)
     monkeypatch.setattr(lb_k8s.serve_state, 'get_service_hash',
                         lambda name: 'incarnation' if name in live else None)
@@ -415,6 +425,16 @@ def test_external_runtime_requires_owner_or_release_name(monkeypatch):
         lb_k8s.require_external_lb_runtime()
 
 
+def test_ha_runtime_requires_explicit_chart_rbac_marker(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.delenv(constants.LB_HA_RBAC_READY_ENV_VAR, raising=False)
+    with pytest.raises(RuntimeError, match='PodDisruptionBudget RBAC'):
+        lb_k8s.require_lb_ha_runtime()
+
+    monkeypatch.setenv(constants.LB_HA_RBAC_READY_ENV_VAR, 'true')
+    lb_k8s.require_lb_ha_runtime()
+
+
 def test_legacy_release_name_supports_preflight_and_owner_resolution(
         monkeypatch):
     apps, _ = _install(monkeypatch,
@@ -508,6 +528,225 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
     assert service['spec']['type'] == 'LoadBalancer'
     assert service['spec']['ports'][0]['port'] == \
         constants.LOAD_BALANCER_PORT_START
+
+
+def test_ha_create_builds_two_warm_slots_stable_service_and_pdb(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    policy = mock.MagicMock()
+
+    def _missing_slot_deployment(_name, _namespace):
+        raise _ApiException(404)
+
+    apps.read_namespaced_deployment.side_effect = _missing_slot_deployment
+    _install(monkeypatch, apps_api=apps, core_api=core, policy_api=policy)
+    state = lb_ha.LbCutoverState(enabled=True,
+                                 active_slot=lb_ha.LbSlot.A,
+                                 generation=1,
+                                 pending_slot=None,
+                                 phase=lb_ha.LbCutoverPhase.STABLE,
+                                 lifecycle_epoch=9)
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_lb_cutover_state',
+                        lambda _name: state)
+    monkeypatch.setattr(lb_k8s, '_wait_for_lb_deployment_ready',
+                        lambda *_args, **_kwargs: None)
+
+    lb_k8s.create_lb_deployment_and_service('svc',
+                                            225,
+                                            'incarnation',
+                                            high_availability=True)
+
+    deployments = [
+        call.args[1]
+        for call in apps.create_namespaced_deployment.call_args_list
+    ]
+    assert {
+        deployment['spec']['template']['metadata']['labels'][
+            lb_k8s.LB_SLOT_LABEL_KEY] for deployment in deployments
+    } == {'a', 'b'}
+    revisions = {
+        deployment['spec']['template']['metadata']['annotations'][
+            lb_k8s.LB_RUNTIME_REVISION_ANNOTATION] for deployment in deployments
+    }
+    assert len(revisions) == 1
+    for deployment in deployments:
+        required = deployment['spec']['template']['spec']['affinity'][
+            'podAntiAffinity']['requiredDuringSchedulingIgnoredDuringExecution']
+        assert required[-1]['topologyKey'] == 'kubernetes.io/hostname'
+
+    service = core.create_namespaced_service.call_args.args[1]
+    assert service['spec']['selector'] == {
+        lb_k8s.LB_SLOT_LABEL_KEY: 'a',
+        lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+    }
+    assert service['metadata']['annotations'][
+        lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY] in revisions
+    pdb = policy.create_namespaced_pod_disruption_budget.call_args.args[1]
+    assert pdb['spec']['minAvailable'] == 1
+    assert pdb['spec']['selector']['matchLabels'][
+        lb_k8s.SERVICE_HASH_LABEL_KEY] == 'incarnation'
+
+
+def test_ha_reconcile_self_heals_only_missing_standby(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    policy = mock.MagicMock()
+    active_name = lb_k8s.lb_slot_deployment_name('svc', lb_ha.LbSlot.A)
+
+    def _active_exists(name, _namespace):
+        if name == active_name:
+            return _owned_object('incarnation', object_name=name)
+        raise _ApiException(404)
+
+    apps.read_namespaced_deployment.side_effect = _active_exists
+    _install(monkeypatch, apps_api=apps, core_api=core, policy_api=policy)
+    state = lb_ha.LbCutoverState(enabled=True,
+                                 active_slot=lb_ha.LbSlot.A,
+                                 generation=4,
+                                 pending_slot=None,
+                                 phase=lb_ha.LbCutoverPhase.STABLE,
+                                 lifecycle_epoch=9)
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_lb_cutover_state',
+                        lambda _name: state)
+    monkeypatch.setattr(lb_k8s, '_wait_for_lb_deployment_ready',
+                        lambda *_args, **_kwargs: None)
+
+    lb_k8s.create_lb_deployment_and_service('svc',
+                                            225,
+                                            'incarnation',
+                                            high_availability=True)
+
+    created = [
+        call.args[1]['metadata']['name']
+        for call in apps.create_namespaced_deployment.call_args_list
+    ]
+    assert created == [lb_k8s.lb_slot_deployment_name('svc', lb_ha.LbSlot.B)]
+
+
+def test_supervision_service_reconcile_rejects_stale_cutover_snapshot():
+    state = lb_ha.LbCutoverState(enabled=True,
+                                 active_slot=lb_ha.LbSlot.A,
+                                 generation=4,
+                                 pending_slot=None,
+                                 phase=lb_ha.LbCutoverPhase.STABLE,
+                                 lifecycle_epoch=9)
+    guard = mock.MagicMock()
+    guard.return_value.__enter__.return_value = False
+    reconcile = mock.Mock(return_value=True)
+
+    with mock.patch.object(lb_k8s.serve_state, 'lb_cutover_kubernetes_guard',
+                           guard), pytest.raises(RuntimeError,
+                                                 match='authority changed'):
+        lb_k8s._run_ha_service_reconcile_guarded('svc', 'incarnation', state,
+                                                 (123, '10.0.0.1'), reconcile)
+
+    guard.assert_called_once_with('svc', 'incarnation', (123, '10.0.0.1'), 9,
+                                  lb_ha.LbSlot.A, 4,
+                                  lb_ha.LbCutoverPhase.STABLE, None)
+    reconcile.assert_not_called()
+
+
+def test_transition_reconcile_patches_only_desired_revision(monkeypatch):
+    core = mock.MagicMock()
+    patch_api = mock.MagicMock()
+    core.create_namespaced_service.side_effect = _ApiException(409)
+    core.read_namespaced_service.return_value = _owned_object(
+        'incarnation', rv='11', object_name=lb_k8s.lb_service_name('svc'))
+    _install(monkeypatch, core_api=core, patch_api=patch_api)
+    owner = {
+        'apiVersion': 'apps/v1',
+        'kind': 'Deployment',
+        'name': 'skypilot-api-server',
+        'uid': 'api-deployment-uid',
+        'controller': False,
+        'blockOwnerDeletion': False,
+    }
+    desired_revision = 'a' * 64
+    service = lb_k8s._build_service_dict(
+        'svc',
+        lb_k8s.lb_service_name('svc'),
+        lb_k8s.lb_slot_deployment_name('svc', lb_ha.LbSlot.A),
+        'incarnation',
+        owner,
+        active_slot=lb_ha.LbSlot.A,
+        cutover_generation=7,
+        desired_runtime_revision=desired_revision)
+
+    assert lb_k8s._reconcile_ha_service('in-cluster', 'skypilot', service,
+                                        owner, 'incarnation', True,
+                                        lambda _phase: None)
+
+    body = _patch_calls(patch_api, _SERVICE_PATCH_PATH)[0].kwargs['body']
+    assert body == {
+        'metadata': {
+            'resourceVersion': '11',
+            'annotations': {
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+        },
+    }
+
+
+def test_owned_pdb_spec_drift_fails_closed_without_patch(monkeypatch):
+    policy = mock.MagicMock()
+    policy.create_namespaced_pod_disruption_budget.side_effect = _ApiException(
+        409)
+    _install(monkeypatch, policy_api=policy)
+    owner = {
+        'apiVersion': 'apps/v1',
+        'kind': 'Deployment',
+        'name': 'skypilot-api-server',
+        'uid': 'api-deployment-uid',
+        'controller': False,
+        'blockOwnerDeletion': False,
+    }
+    desired = lb_k8s._build_pdb_dict('svc', 'svc-pdb', 'incarnation', owner)
+    existing = {
+        'metadata': {
+            'resourceVersion': '7',
+            'labels': desired['metadata']['labels'],
+            'ownerReferences': [owner],
+        },
+        'spec': {
+            **desired['spec'],
+            'minAvailable': 2,
+        },
+    }
+    policy.read_namespaced_pod_disruption_budget.return_value = existing
+
+    with pytest.raises(RuntimeError, match='immutable specification drift'):
+        lb_k8s._reconcile_owned_pdb('in-cluster', 'skypilot', desired, owner,
+                                    'incarnation', lambda _phase: None)
+
+
+def test_owned_pdb_ignores_server_defaults_when_contract_matches(monkeypatch):
+    policy = mock.MagicMock()
+    policy.create_namespaced_pod_disruption_budget.side_effect = _ApiException(
+        409)
+    _install(monkeypatch, policy_api=policy)
+    owner = {
+        'apiVersion': 'apps/v1',
+        'kind': 'Deployment',
+        'name': 'skypilot-api-server',
+        'uid': 'api-deployment-uid',
+        'controller': False,
+        'blockOwnerDeletion': False,
+    }
+    desired = lb_k8s._build_pdb_dict('svc', 'svc-pdb', 'incarnation', owner)
+    policy.read_namespaced_pod_disruption_budget.return_value = {
+        'metadata': {
+            'resourceVersion': '7',
+            'labels': desired['metadata']['labels'],
+            'ownerReferences': [owner],
+        },
+        'spec': {
+            **desired['spec'],
+            'unhealthyPodEvictionPolicy': None,
+        },
+    }
+
+    lb_k8s._reconcile_owned_pdb('in-cluster', 'skypilot', desired, owner,
+                                'incarnation', lambda _phase: None)
 
 
 def test_create_builds_provider_default_load_balancer_and_waits(monkeypatch):
@@ -973,6 +1212,7 @@ def test_same_name_recreation_fences_old_service_before_reconcile(monkeypatch):
     fence = service_patch_calls[0].kwargs['body']
     assert fence['spec'] == {
         'selector': {
+            '$patch': 'replace',
             'app': lb_k8s.lb_deployment_name('svc'),
             lb_k8s.SERVICE_HASH_LABEL_KEY: 'new-incarnation',
         }
@@ -1117,6 +1357,48 @@ def test_ensure_missing_object_is_ownership_fenced(monkeypatch):
     assert create.call_args.kwargs['continue_guard']()
 
 
+def test_ha_ensure_passes_parent_owner_to_selector_reconcile(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    policy = mock.MagicMock()
+    apps.read_namespaced_deployment.side_effect = _ApiException(404)
+    core.read_namespaced_service.side_effect = _ApiException(404)
+    policy.read_namespaced_pod_disruption_budget.side_effect = _ApiException(
+        404)
+    _install(monkeypatch,
+             apps_api=apps,
+             core_api=core,
+             policy_api=policy,
+             db_service_names=('svc',))
+    state = lb_ha.LbCutoverState(enabled=True,
+                                 active_slot=lb_ha.LbSlot.A,
+                                 generation=4,
+                                 pending_slot=None,
+                                 phase=lb_ha.LbCutoverPhase.STABLE,
+                                 lifecycle_epoch=9)
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_lb_cutover_state',
+                        lambda _name: state)
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'controller_pid': os.getpid(),
+            'controller_ip': '10.0.0.1',
+            'hash': 'incarnation',
+            'lifecycle_epoch': 9,
+            'lb_ha_enabled': True,
+        })
+
+    with mock.patch.object(lb_k8s, '_create_ha_lb_objects') as create:
+        assert lb_k8s.ensure_lb_objects_exist('svc',
+                                              225,
+                                              'incarnation',
+                                              controller_ip='10.0.0.1',
+                                              high_availability=True)
+
+    assert create.call_args.kwargs['expected_controller_owner'] == (os.getpid(),
+                                                                    '10.0.0.1')
+
+
 def test_ensure_reconciles_updated_termination_budget(monkeypatch):
     apps = mock.MagicMock()
     apps.read_namespaced_deployment.return_value = {
@@ -1204,11 +1486,134 @@ def test_ensure_requires_published_provider_endpoint(monkeypatch, ingress,
             is expected_healthy)
 
 
-def _lb_pod(uid, phase='Running', deleting=False, ready=True):
-    return SimpleNamespace(metadata=SimpleNamespace(
-        uid=uid, deletion_timestamp='now' if deleting else None),
-                           status=SimpleNamespace(
-                               phase=phase,
+def test_stable_legacy_ensure_retries_obsolete_ha_cleanup(monkeypatch):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(
+            replicas=1,
+            template=SimpleNamespace(
+                metadata=SimpleNamespace(
+                    labels={lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation'}),
+                spec=SimpleNamespace(termination_grace_period_seconds=225))),
+        status=SimpleNamespace(observed_generation=1,
+                               replicas=1,
+                               updated_replicas=1,
+                               available_replicas=1,
+                               unavailable_replicas=0))
+    _, core = _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        spec=SimpleNamespace(
+            type='LoadBalancer',
+            selector={
+                'app': lb_k8s.lb_deployment_name('svc'),
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            ports=[
+                SimpleNamespace(port=constants.LOAD_BALANCER_PORT_START,
+                                target_port=constants.LOAD_BALANCER_PORT_START,
+                                protocol='TCP')
+            ]),
+        status=SimpleNamespace(load_balancer=SimpleNamespace(
+            ingress=[SimpleNamespace(hostname='lb.example', ip=None)])))
+
+    with mock.patch.object(lb_k8s,
+                           '_retry_obsolete_lb_topology_cleanup') as cleanup:
+        assert lb_k8s.ensure_lb_objects_exist('svc', 225, 'incarnation')
+
+    cleanup.assert_called_once_with('svc', 'incarnation', False, None)
+
+
+def test_obsolete_topology_cleanup_failure_is_retried_not_raised(
+        monkeypatch, caplog):
+    monkeypatch.setattr(
+        lb_k8s, 'cleanup_lb_mode_transition',
+        mock.Mock(side_effect=RuntimeError('transient delete failure')))
+
+    lb_k8s._retry_obsolete_lb_topology_cleanup('svc', 'incarnation', True, None)
+
+    assert 'will retry' in caplog.text
+
+
+def test_migration_selector_patch_replaces_legacy_keys_and_is_rv_fenced(
+        monkeypatch):
+    _install(monkeypatch, db_service_names=('svc',))
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'hash': 'incarnation',
+            'resource_scope': None,
+            'lb_ha_enabled': True,
+        })
+    routing = lb_k8s.LbServiceTransitionRouting(None, True, None, 'rv-8')
+    guard = mock.MagicMock()
+    guard.return_value.__enter__.return_value = True
+    with mock.patch.object(lb_k8s.serve_state, 'lb_cutover_kubernetes_guard',
+                           guard), mock.patch.object(
+                               lb_k8s,
+                               'get_lb_service_transition_routing',
+                               return_value=routing), mock.patch.object(
+                                   lb_k8s, '_strategic_merge_patch') as patch:
+        assert lb_k8s.patch_lb_service_migration_to_slot(
+            'svc', 'incarnation', (7, '10.0.0.7'), 11)
+
+    body = patch.call_args.args[-1]
+    assert body['metadata']['resourceVersion'] == 'rv-8'
+    assert body['spec']['selector'] == {
+        '$patch': 'replace',
+        lb_k8s.LB_SLOT_LABEL_KEY: 'a',
+        lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+    }
+    assert lb_k8s.APP_LABEL_KEY not in body['spec']['selector']
+
+
+def test_selector_patch_conflict_and_failed_database_guard_do_not_commit(
+        monkeypatch):
+    _install(monkeypatch, db_service_names=('svc',))
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'hash': 'incarnation',
+            'resource_scope': None,
+            'lb_ha_enabled': True,
+        })
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1')
+    guard = mock.MagicMock()
+    guard.return_value.__enter__.return_value = False
+    with mock.patch.object(lb_k8s.serve_state, 'lb_cutover_kubernetes_guard',
+                           guard), mock.patch.object(
+                               lb_k8s, '_strategic_merge_patch') as patch:
+        assert not lb_k8s.patch_lb_service_active_slot(
+            'svc', 'incarnation',
+            (7, '10.0.0.7'), 11, lb_ha.LbSlot.A, 1, lb_ha.LbSlot.B, 2)
+    patch.assert_not_called()
+
+    guard.return_value.__enter__.return_value = True
+    with mock.patch.object(lb_k8s.serve_state, 'lb_cutover_kubernetes_guard',
+                           guard), mock.patch.object(
+                               lb_k8s,
+                               'get_lb_service_routing',
+                               return_value=routing), mock.patch.object(
+                                   lb_k8s,
+                                   '_strategic_merge_patch',
+                                   side_effect=_ApiException(409)):
+        assert not lb_k8s.patch_lb_service_active_slot(
+            'svc', 'incarnation',
+            (7, '10.0.0.7'), 11, lb_ha.LbSlot.A, 1, lb_ha.LbSlot.B, 2)
+
+
+def _lb_pod(uid,
+            phase='Running',
+            deleting=False,
+            ready=True,
+            labels=None,
+            annotations=None):
+    return SimpleNamespace(
+        metadata=SimpleNamespace(uid=uid,
+                                 deletion_timestamp='now' if deleting else None,
+                                 labels=labels or {},
+                                 annotations=annotations or {}),
+        status=SimpleNamespace(phase=phase,
                                conditions=[
                                    SimpleNamespace(
                                        type='Ready',
@@ -1260,6 +1665,74 @@ def test_pod_authority_missing_live_uid_fails_closed(monkeypatch):
         _lb_pod('known'),
         _lb_pod(None, ready=False),
     ])
+    assert lb_k8s.get_lb_pod_authority('svc') is None
+
+
+@pytest.mark.parametrize('deleting', [False, True])
+def test_ha_pod_authority_keeps_stable_legacy_migration_tail(
+        monkeypatch, deleting):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'a' * 64
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'hash': 'incarnation',
+            'resource_scope': None,
+            'lb_ha_enabled': True,
+            'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        })
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations={
+                lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '1',
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(
+            selector={
+                lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            }))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('slot-a',
+                labels={
+                    lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                }),
+        _lb_pod('legacy',
+                deleting=deleting,
+                labels={
+                    lb_k8s.APP_LABEL_KEY: lb_k8s.lb_deployment_name('svc'),
+                }),
+    ])
+
+    assert lb_k8s.get_lb_pod_authority('svc') == lb_k8s.LbPodAuthority(
+        ready_nonterminating_uids=({'slot-a'}
+                                   if deleting else {'slot-a', 'legacy'}),
+        live_uids={'slot-a', 'legacy'},
+        slot_by_uid={'slot-a': lb_ha.LbSlot.A},
+        selected_slot=lb_ha.LbSlot.A,
+        digest_by_uid={
+            'slot-a': None,
+            'legacy': None,
+        },
+        revision_by_uid={
+            'slot-a': None,
+            'legacy': None,
+        },
+        legacy_uids={'legacy'},
+        terminating_uids=({'legacy'} if deleting else set()))
+
+    # A slotless Pod without the exact legacy Deployment label is malformed
+    # and still fails closed instead of joining HA authority.
+    core.list_namespaced_pod.return_value.items[1].metadata.labels = {
+        lb_k8s.APP_LABEL_KEY: 'unexpected-deployment',
+    }
     assert lb_k8s.get_lb_pod_authority('svc') is None
 
 

@@ -124,22 +124,25 @@ def test_wait_until_ray_cluster_ready_accepts_ready_deadline_snapshot(
 
 def test_wait_until_ray_cluster_ready_resets_progress_timeout(
         monkeypatch, ray_ready_dependencies):
-    monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
-                        mock.MagicMock(side_effect=[(1, 0), (1, 0), (1, 0)]))
-    fake_time = _fake_time(monotonic_values=[100.0, 105.0, 105.5, 106.1])
+    monkeypatch.setattr(
+        backend_utils, '_count_healthy_nodes_from_ray',
+        mock.MagicMock(side_effect=[(1, 0), (1, 0), (1, 1), (1, 1), (1, 1)]))
+    fake_time = _fake_time(
+        monotonic_values=[100.0, 100.0, 100.8, 100.9, 101.5, 102.0])
     monkeypatch.setattr(backend_utils, 'time', fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready(
         '/tmp/cluster.yaml',
-        2,
+        4,
         '/tmp/launch.log',
         nodes_launching_progress_timeout=1)
 
     assert result == (False, None)
-    assert ray_ready_dependencies.run.call_count == 3
-    assert fake_time.monotonic.call_count == 4
-    assert fake_time.sleep.call_count == 2
-    assert [call.args[0] for call in fake_time.sleep.call_args_list] == [1, 0.5]
+    assert ray_ready_dependencies.run.call_count == 5
+    assert fake_time.monotonic.call_count == 6
+    assert fake_time.sleep.call_count == 4
+    assert [call.args[0] for call in fake_time.sleep.call_args_list
+           ] == pytest.approx([1, 0.2, 1, 0.4])
     fake_time.time.assert_not_called()
 
 

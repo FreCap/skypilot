@@ -586,6 +586,100 @@ class TestJobGroupRecovery:
         return job_controller
 
     @pytest.mark.asyncio
+    async def test_job_group_recovery_reads_one_ordered_handle_snapshot(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        executor = MagicMock()
+
+        async def monitor_task(**kwargs):
+            await kwargs['on_recovery']()
+            return True
+
+        executor.monitor_task = AsyncMock(side_effect=monitor_task)
+        old_handles = [MagicMock(name=f'old-{i}') for i in range(3)]
+        all_tasks_handles = list(zip(mock_dag.tasks, old_handles))
+        fresh_handles = {
+            'cluster-task-0': MagicMock(name='fresh-0'),
+            # A missing row must remain represented as a None handle so the
+            # networking layer can apply its existing failure semantics.
+            'cluster-task-2': MagicMock(name='fresh-2'),
+        }
+        batched_lookup = MagicMock(return_value=fresh_handles)
+        per_task_lookup = MagicMock(
+            side_effect=AssertionError('per-task handle lookup'))
+        setup_networking = AsyncMock()
+
+        with patch.object(
+                controller_lib.managed_job_utils,
+                'generate_managed_job_cluster_name',
+                side_effect=lambda task_name, _job_id:
+                f'cluster-{task_name}'), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', per_task_lookup), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'setup_job_group_networking', setup_networking):
+            result = await job_controller._monitor_job_group_task(
+                task_id=0,
+                task=mock_dag.tasks[0],
+                cluster_name='cluster-task-0',
+                executor=executor,
+                job_group_name='test-job-group',
+                all_tasks_handles=all_tasks_handles)
+
+        assert result is True
+        batched_lookup.assert_called_once_with(
+            {'cluster-task-0', 'cluster-task-1', 'cluster-task-2'})
+        per_task_lookup.assert_not_called()
+        setup_networking.assert_awaited_once_with('test-job-group', [
+            (mock_dag.tasks[0], fresh_handles['cluster-task-0']),
+            (mock_dag.tasks[1], None),
+            (mock_dag.tasks[2], fresh_handles['cluster-task-2']),
+        ])
+
+    @pytest.mark.asyncio
+    async def test_job_group_recovery_snapshot_failure_skips_networking(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        executor = MagicMock()
+
+        async def monitor_task(**kwargs):
+            await kwargs['on_recovery']()
+            return True
+
+        executor.monitor_task = AsyncMock(side_effect=monitor_task)
+        batched_lookup = MagicMock(
+            side_effect=RuntimeError('handle snapshot failed'))
+        setup_networking = AsyncMock()
+
+        with patch.object(
+                controller_lib.managed_job_utils,
+                'generate_managed_job_cluster_name',
+                side_effect=lambda task_name, _job_id:
+                f'cluster-{task_name}'), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'setup_job_group_networking', setup_networking), \
+                pytest.raises(RuntimeError, match='handle snapshot failed'):
+            await job_controller._monitor_job_group_task(
+                task_id=0,
+                task=mock_dag.tasks[0],
+                cluster_name='cluster-task-0',
+                executor=executor,
+                job_group_name='test-job-group',
+                all_tasks_handles=[
+                    (task, MagicMock()) for task in mock_dag.tasks
+                ])
+
+        batched_lookup.assert_called_once()
+        setup_networking.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_cleanup_job_group_clusters_runs_concurrently_and_isolates_failures(
             self, mock_dag, caplog):
         job_controller = self._make_controller(mock_dag)
@@ -653,6 +747,126 @@ class TestJobGroupRecovery:
 
         assert started == {'first', 'second'}
         assert cancelled == {'first', 'second'}
+
+    @pytest.mark.asyncio
+    async def test_job_group_parent_cancellation_joins_monitor_children(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        started = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model cancellation cleanup that must finish before the
+                # owning JobGroup coroutine may exit.
+                await asyncio.sleep(0)
+                cancelled.add(task_id)
+                raise
+
+        job_controller._monitor_job_group_task = monitor
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+        try:
+            assert cancelled == {0, 1}
+        finally:
+            # Keep the pre-fix regression run from leaking tasks into pytest's
+            # event loop when the assertion above fails.
+            leaked = [
+                task for task in asyncio.all_tasks()
+                if task.get_name().startswith('monitor_') and not task.done()
+            ]
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_job_group_monitor_failure_joins_children_before_cleanup(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        started = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                cancelled.add(task_id)
+                raise
+
+        async def fail_wait(*_args, **_kwargs):
+            await all_started.wait()
+            raise RuntimeError('monitor coordinator failed')
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0', 'cluster-1']
+            assert cancelled == {0, 1}
+
+        job_controller._monitor_job_group_task = monitor
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']), \
+                patch.object(controller_lib.asyncio,
+                             'wait', side_effect=fail_wait), pytest.raises(
+                                 RuntimeError,
+                                 match='monitor coordinator failed'):
+            await job_controller._run_job_group()
+
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0', 'cluster-1'])
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('statuses', 'expected'), [
@@ -1362,6 +1576,9 @@ class TestTransientJobStatusFetchDeadline:
     class ExpectedRecovery(Exception):
         """Stops the monitor immediately after it enters recovery."""
 
+    class ExpectedStop(Exception):
+        """Stops the monitor after exercising a completed recovery."""
+
     @staticmethod
     def _make_controller() -> JobController:
         controller = JobController.__new__(JobController)
@@ -1370,12 +1587,21 @@ class TestTransientJobStatusFetchDeadline:
         controller._backend = MagicMock()
         return controller
 
-    async def _run_until_recovery(self, statuses, monotonic_values):
+    async def _run_until_stopped(self,
+                                 statuses,
+                                 monotonic_values,
+                                 *,
+                                 recover_side_effect=None,
+                                 expected_exception=None):
         controller = self._make_controller()
         task = MagicMock(name='task')
         task.num_nodes = 1
         executor = MagicMock()
-        executor.recover = AsyncMock(side_effect=self.ExpectedRecovery)
+        if recover_side_effect is None:
+            recover_side_effect = self.ExpectedRecovery
+        if expected_exception is None:
+            expected_exception = self.ExpectedRecovery
+        executor.recover = AsyncMock(side_effect=recover_side_effect)
         get_status = AsyncMock(side_effect=statuses)
         refresh_cluster = MagicMock(return_value=(status_lib.ClusterStatus.UP,
                                                   None))
@@ -1387,22 +1613,29 @@ class TestTransientJobStatusFetchDeadline:
             'status-fetch retry window used wall-clock time'))
         fake_time = SimpleNamespace(monotonic=monotonic, time=wall_clock)
         set_recovering = AsyncMock()
+        set_recovered = AsyncMock()
 
         with patch.object(controller_lib, 'time', fake_time), patch.object(
                 controller_lib.asyncio, 'sleep', new=sleep), patch.object(
                     controller_lib.backend_utils,
-                    'async_check_network_connection', new=AsyncMock()
-                ), patch.object(
-                    controller_lib.managed_job_utils,
-                    'get_job_status', new=get_status), patch.object(
-                        controller_lib.backend_utils,
-                        'refresh_cluster_status_handle',
-                        new=refresh_cluster), patch.object(
-                            controller_lib.common_utils,
-                            'Backoff', return_value=backoff), patch.object(
-                                controller_lib.managed_job_state,
-                                'set_recovering_async', new=set_recovering), \
-                pytest.raises(self.ExpectedRecovery):
+                    'async_check_network_connection',
+                    new=AsyncMock()), patch.object(
+                        controller_lib.managed_job_utils,
+                        'get_job_status',
+                        new=get_status), patch.object(
+                            controller_lib.backend_utils,
+                            'refresh_cluster_status_handle',
+                            new=refresh_cluster), patch.object(
+                                controller_lib.common_utils,
+                                'Backoff',
+                                return_value=backoff), patch.object(
+                                    controller_lib.managed_job_state,
+                                    'set_recovering_async',
+                                    new=set_recovering), patch.object(
+                                        controller_lib.managed_job_state,
+                                        'set_recovered_async',
+                                        new=set_recovered), pytest.raises(
+                                            expected_exception):
             await controller._monitor_one_task(
                 task_id=0,
                 task=task,
@@ -1416,7 +1649,7 @@ class TestTransientJobStatusFetchDeadline:
 
     @pytest.mark.asyncio
     async def test_transient_status_fetch_uses_monotonic_deadline(self):
-        results = await self._run_until_recovery(
+        results = await self._run_until_stopped(
             statuses=[(None, 'transient'), (None, 'transient')],
             monotonic_values=[100.0, 100.0, 160.0],
         )
@@ -1437,7 +1670,7 @@ class TestTransientJobStatusFetchDeadline:
 
     @pytest.mark.asyncio
     async def test_transient_status_fetch_resets_deadline_after_success(self):
-        results = await self._run_until_recovery(
+        results = await self._run_until_stopped(
             statuses=[
                 (None, 'transient'),
                 (job_lib.JobStatus.RUNNING, None),
@@ -1460,6 +1693,34 @@ class TestTransientJobStatusFetchDeadline:
         assert get_status.await_count == 4
         assert refresh_cluster.call_count == 3
         assert monotonic.call_count == 5
+        wall_clock.assert_not_called()
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recovery_resets_transient_status_fetch_deadline(self):
+        results = await self._run_until_stopped(
+            statuses=[
+                (None, 'transient'),
+                (None, 'transient'),
+                self.ExpectedStop(),
+            ],
+            monotonic_values=[100.0, 160.0, 160.0, 160.0],
+            recover_side_effect=lambda: 123.0,
+            expected_exception=self.ExpectedStop,
+        )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        assert [call.args[0] for call in sleep.await_args_list] == [
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            10,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+        ]
+        assert get_status.await_count == 3
+        assert refresh_cluster.call_count == 2
+        assert monotonic.call_count == 4
         wall_clock.assert_not_called()
         set_recovering.assert_awaited_once()
         executor.recover.assert_awaited_once()
@@ -1729,6 +1990,57 @@ class TestCancelSignalScan:
         status_mock.assert_not_awaited()
         assert (signal_dir / 'unexpected').exists()
         assert (signal_dir / '9.lock').exists()
+
+
+class TestControllerManagerMonitorLoop:
+    """The controller monitor reacts to capacity changes without polling."""
+
+    @pytest.mark.asyncio
+    async def test_saturated_launch_slot_wakes_on_notification(self):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(1)
+        wait_started = asyncio.Event()
+        job_started = asyncio.Event()
+
+        class TrackingCondition(asyncio.Condition):
+
+            async def wait_for(self, predicate):
+                wait_started.set()
+                return await super().wait_for(predicate)
+
+        manager._starting_signal = TrackingCondition(manager._job_tasks_lock)
+
+        async def start_job(job_id, pool=None):
+            assert job_id == 2
+            assert pool is None
+            job_started.set()
+            raise asyncio.CancelledError
+
+        manager.start_job = AsyncMock(side_effect=start_job)
+
+        with patch('sky.jobs.controller.controller_utils.'
+                   'LAUNCHES_PER_WORKER', 1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async',
+                      new=AsyncMock(return_value={'job_id': 2})), \
+                patch('sky.jobs.controller.os.listdir', return_value=[]), \
+                patch('sky.jobs.controller.asyncio.sleep',
+                      new=AsyncMock(side_effect=AssertionError(
+                          'launch capacity must not use polling sleeps'))
+                     ) as sleep:
+            monitor = asyncio.create_task(manager.monitor_loop())
+            try:
+                await asyncio.wait_for(wait_started.wait(), timeout=1)
+                async with manager._starting_signal:
+                    manager.starting.remove(1)
+                    manager._starting_signal.notify()
+                await asyncio.wait_for(job_started.wait(), timeout=1)
+            finally:
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+
+        sleep.assert_not_awaited()
+        manager.start_job.assert_awaited_once_with(2, None)
 
 
 class TestRunJobLoopCancelInfoCleanup:

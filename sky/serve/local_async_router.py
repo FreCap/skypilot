@@ -304,9 +304,17 @@ class LocalAsyncRouter:
                     body, request.headers, self._request_timeout_seconds)
                 if (response is not None and
                         response.status in self._retriable_status_codes):
-                    await self._release(child_index, token)
-                    if isinstance(submitted_id, str):
-                        await self._forget_owner_if(submitted_id, child_index)
+                    try:
+                        await self._release_rejected_request(
+                            child_index, token, submitted_id)
+                    except asyncio.CancelledError:
+                        # A retriable response proves the worker did not accept
+                        # the request. Finish removing both local claims before
+                        # propagating cancellation, otherwise the stable ID can
+                        # remain blocked as ambiguously owned forever.
+                        await self._release_rejected_request(
+                            child_index, token, submitted_id)
+                        raise
                     reservation_finalized = True
                     last_rejection = response
                     continue
@@ -646,6 +654,15 @@ class LocalAsyncRouter:
     async def _release(self, child_index: int, token: int) -> None:
         async with self._state_lock:
             self._children[child_index].reservations.pop(token, None)
+
+    async def _release_rejected_request(self, child_index: int, token: int,
+                                        request_id: Any) -> None:
+        async with self._state_lock:
+            self._children[child_index].reservations.pop(token, None)
+            if isinstance(request_id, str):
+                owner = self._owners.get(request_id)
+                if owner is not None and owner.child_index == child_index:
+                    self._pop_owner(request_id)
 
     async def _settle(self, child_index: int, token: int) -> None:
         async with self._state_lock:

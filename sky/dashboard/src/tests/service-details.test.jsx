@@ -283,6 +283,75 @@ describe('ServiceDetailCard cost and request estimates', () => {
       )
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
+    expect(screen.getByText('Known cloud compute / 1K requests')).toBeTruthy();
+  });
+
+  it('shows known cloud cost while identifying excluded Kubernetes capacity', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          uptime: null,
+          replicasReady: 120,
+          replicasTotal: 120,
+          replicasFailed: 0,
+          targetReplicas: 120,
+          endpoint: null,
+          policy: 'autoscaling',
+          loadBalancingPolicy: 'least_load',
+          requestedResources: 'A100:1',
+          activeVersions: [1],
+          estimatedHourlyCost: null,
+          spotHourlyCost: 0,
+          onDemandHourlyCost: 0,
+          pricedReplicaCount: 0,
+          hourlyCostExcludedReplicaCount: 120,
+          hourlyCostExclusionReasons: { kubernetes: 120 },
+          requestRate: 0.5,
+          recentRequestCount: 30,
+          requestWindowSeconds: 60,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('Unknown')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'No pricing available · 120 Kubernetes replicas excluded'
+      )
+    ).toBeTruthy();
+  });
+
+  it('distinguishes missing request activity from missing pricing', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 2,
+          replicasTotal: 2,
+          replicasFailed: 0,
+          targetReplicas: 2,
+          activeVersions: [1],
+          estimatedHourlyCost: 1,
+          spotHourlyCost: 1,
+          onDemandHourlyCost: 0,
+          pricedReplicaCount: 1,
+          hourlyCostExcludedReplicaCount: 1,
+          hourlyCostExclusionReasons: { kubernetes: 1 },
+          requestRate: 0,
+          recentRequestCount: 0,
+          requestWindowSeconds: 60,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(
+      screen.getByText('No recent request rate · 1 Kubernetes replica excluded')
+    ).toBeTruthy();
   });
 
   it('labels logical replicas separately from physical backends', () => {

@@ -40,6 +40,7 @@ from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -48,6 +49,7 @@ logger = sky_logging.init_logger(__name__)
 # Pod-template annotation carrying the controller's resolved image digest —
 # the LB Deployment's rollout trigger (see _resolve_lb_image).
 CONTROLLER_DIGEST_ANNOTATION = 'skypilot.co/controller-image-digest'
+LB_RUNTIME_REVISION_ANNOTATION = 'skypilot.co/lb-runtime-revision'
 
 # Labels stamped on every LB object the controller owns.
 #   parent=skypilot                 -> ownership marker (shared convention).
@@ -57,6 +59,11 @@ PARENT_LABEL_KEY = 'parent'
 PARENT_LABEL_VALUE = 'skypilot'
 SERVE_LB_LABEL_KEY = 'skypilot-serve-lb'
 SERVICE_HASH_LABEL_KEY = 'skypilot-serve-incarnation'
+LB_SLOT_LABEL_KEY = 'skypilot-serve-lb-slot'
+ACTIVE_SLOT_ANNOTATION_KEY = 'skypilot.co/serve-lb-active-slot'
+CUTOVER_GENERATION_ANNOTATION_KEY = ('skypilot.co/serve-lb-cutover-generation')
+DESIRED_RUNTIME_REVISION_ANNOTATION_KEY = (
+    'skypilot.co/serve-lb-desired-runtime-revision')
 # Pod selector label: app=<lb_deployment_name>.
 APP_LABEL_KEY = 'app'
 # Label-key selector used by reconcile to list all LB Deployments.
@@ -80,6 +87,7 @@ _LB_OBJECT_DELETION_TIMEOUT_SECONDS = 60
 _LB_FOREGROUND_GC_MARGIN_SECONDS = 30
 _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS = 60
 _LB_OBJECT_RECONCILIATION_POLL_SECONDS = 0.2
+_LB_MIN_READY_SECONDS = 5
 _STRATEGIC_MERGE_PATCH_CONTENT_TYPE = ('application/strategic-merge-patch+json')
 
 # Stable projected-volume names rendered by the Helm chart. The LB receives
@@ -117,6 +125,31 @@ class LbPodAuthority(NamedTuple):
 
     ready_nonterminating_uids: set[str]
     live_uids: set[str]
+    slot_by_uid: dict[str, lb_ha.LbSlot] | None = None
+    selected_slot: lb_ha.LbSlot | None = None
+    digest_by_uid: dict[str, str | None] | None = None
+    revision_by_uid: dict[str, str | None] | None = None
+    legacy_uids: set[str] | None = None
+    terminating_uids: set[str] | None = None
+
+
+class LbServiceRouting(NamedTuple):
+    """Fenced routing state read from the stable Kubernetes Service."""
+
+    active_slot: lb_ha.LbSlot
+    generation: int
+    resource_version: str
+    desired_runtime_revision: str | None = None
+
+
+class LbServiceTransitionRouting(NamedTuple):
+    """Routing evidence while migrating between legacy and slot selectors."""
+
+    active_slot: lb_ha.LbSlot | None
+    legacy_selected: bool
+    generation: int | None
+    resource_version: str
+    desired_runtime_revision: str | None = None
 
 
 def _strategic_merge_patch(context: str, resource_path: str, response_type: str,
@@ -227,6 +260,19 @@ def lb_service_name(service_name: str,
     return lb_base_name(service_name, resource_scope)
 
 
+def lb_slot_deployment_name(service_name: str,
+                            slot: lb_ha.LbSlot,
+                            resource_scope: str | None = None) -> str:
+    """Incarnation-safe Deployment name for one immutable HA slot."""
+    slot_scope = f'{resource_scope or "legacy"}:lb-slot:{slot.value}'
+    return lb_base_name(service_name, slot_scope)
+
+
+def lb_pdb_name(service_name: str, resource_scope: str | None = None) -> str:
+    """Incarnation-safe PodDisruptionBudget name for both HA slots."""
+    return lb_base_name(service_name, f'{resource_scope or "legacy"}:lb-pdb')
+
+
 def _service_load_balancer_address(service: Any) -> str | None:
     """Return the first hostname/IP published on a LoadBalancer Service."""
     if isinstance(service, dict):
@@ -257,7 +303,7 @@ def _service_load_balancer_address(service: Any) -> str | None:
 def _controller_addr(service_name: str) -> str:
     """Stable API-service proxy base URL used by the external LB.
 
-    ``load_balancer.py`` appends ``/controller/load_balancer_sync``. Encoding
+    ``load_balancer.py`` appends a shared controller-path constant. Encoding
     the service name here keeps it a single path segment even if a legacy name
     contains punctuation.
     """
@@ -375,6 +421,16 @@ def require_external_lb_runtime() -> None:
         raise RuntimeError(
             'External SkyServe load balancers require '
             'serve.externalLoadBalancer.auth.lbDataPlane to be configured.')
+
+
+def require_lb_ha_runtime() -> None:
+    """Require the chart generation that installs per-service PDB RBAC."""
+    require_external_lb_runtime()
+    if os.environ.get(constants.LB_HA_RBAC_READY_ENV_VAR) != 'true':
+        raise RuntimeError(
+            'External load balancer high availability requires an updated '
+            'SkyPilot Helm chart with per-service PodDisruptionBudget RBAC. '
+            'Upgrade the chart before the API image or enabling HA.')
 
 
 def lb_service_endpoint_or_none(service_name: str,
@@ -542,6 +598,21 @@ def _serialize_k8s_object(obj):
         return [_serialize_k8s_object(item) for item in obj]
     return kubernetes.kubernetes.client.ApiClient().sanitize_for_serialization(
         obj)
+
+
+def _lb_runtime_revision(controller_image_digest: str | None,
+                         termination_grace_period_seconds: int,
+                         service_hash: str | None) -> str:
+    """Fingerprint the active-capable Pod fields that require slot rotation."""
+    payload = json.dumps(
+        {
+            'controller_image_digest': controller_image_digest,
+            'termination_grace_period_seconds': termination_grace_period_seconds,
+            'service_hash': service_hash,
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _metadata_value(obj, dict_key: str, attr_name: str):
@@ -872,6 +943,60 @@ def _lb_resources() -> dict:
     return resources
 
 
+def _lb_pod_runtime_fields(pod_runtime_fields: dict, service_name: str,
+                           service_hash: str | None,
+                           slot: lb_ha.LbSlot | None) -> dict:
+    """Merge LB placement without discarding controller runtime constraints."""
+    runtime_fields = copy.deepcopy(pod_runtime_fields)
+    selector_labels = {
+        SERVE_LB_LABEL_KEY: service_name,
+        **({
+            SERVICE_HASH_LABEL_KEY: service_hash
+        } if service_hash else {}),
+    }
+    runtime_fields['topologySpreadConstraints'] = [{
+        'maxSkew': 1,
+        'topologyKey': 'kubernetes.io/hostname',
+        'whenUnsatisfiable': 'ScheduleAnyway',
+        'labelSelector': {
+            'matchLabels': selector_labels,
+        },
+    }]
+    if slot is None:
+        return runtime_fields
+
+    affinity = copy.deepcopy(runtime_fields.get('affinity') or {})
+    pod_anti_affinity = copy.deepcopy(affinity.get('podAntiAffinity') or {})
+    required = list(
+        pod_anti_affinity.get('requiredDuringSchedulingIgnoredDuringExecution')
+        or [])
+    required.append({
+        'labelSelector': {
+            'matchLabels': selector_labels,
+        },
+        'topologyKey': 'kubernetes.io/hostname',
+    })
+    preferred = list(
+        pod_anti_affinity.get('preferredDuringSchedulingIgnoredDuringExecution')
+        or [])
+    preferred.append({
+        'weight': 100,
+        'podAffinityTerm': {
+            'labelSelector': {
+                'matchLabels': selector_labels,
+            },
+            'topologyKey': 'topology.kubernetes.io/zone',
+        },
+    })
+    pod_anti_affinity['requiredDuringSchedulingIgnoredDuringExecution'] = (
+        required)
+    pod_anti_affinity['preferredDuringSchedulingIgnoredDuringExecution'] = (
+        preferred)
+    affinity['podAntiAffinity'] = pod_anti_affinity
+    runtime_fields['affinity'] = affinity
+    return runtime_fields
+
+
 def _build_deployment_dict(service_name: str,
                            deployment_name: str,
                            image: str,
@@ -886,7 +1011,8 @@ def _build_deployment_dict(service_name: str,
                            controller_image_digest: str | None = None,
                            service_hash: str | None = None,
                            resources: dict | None = None,
-                           owner_reference: dict | None = None) -> dict:
+                           owner_reference: dict | None = None,
+                           slot: lb_ha.LbSlot | None = None) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -899,7 +1025,7 @@ def _build_deployment_dict(service_name: str,
             str(constants.LOAD_BALANCER_PORT_START),
             '--service-hash',
             service_hash,
-        ],
+        ] + (['--lb-slot', slot.value] if slot is not None else []),
         'ports': [{
             'containerPort': constants.LOAD_BALANCER_PORT_START
         }],
@@ -950,7 +1076,13 @@ def _build_deployment_dict(service_name: str,
                 }
             },
         },
-    ]
+    ] + ([{
+        'name': constants.LB_IMAGE_DIGEST_ENV_VAR,
+        'value': controller_image_digest,
+    }] if controller_image_digest is not None else []) + ([{
+        'name': constants.LB_SLOT_ENV_VAR,
+        'value': slot.value,
+    }] if slot is not None else [])
     container['volumeMounts'] = auth_volume_mounts
     container['resources'] = resources or _DEFAULT_LB_RESOURCES
     # The sanitized identity/filesystem context keeps projected 0400 auth files
@@ -961,13 +1093,22 @@ def _build_deployment_dict(service_name: str,
     # ingress/ALB (see the LB ingress+auth design), not at the LB pod.
     pod_labels = {APP_LABEL_KEY: deployment_name}
     pod_labels.update(_object_labels(service_name, service_hash))
+    if slot is not None:
+        pod_labels[LB_SLOT_LABEL_KEY] = slot.value
     template_metadata = {'labels': pod_labels}
+    template_annotations = {}
     if controller_image_digest:
-        template_metadata['annotations'] = {
-            CONTROLLER_DIGEST_ANNOTATION: controller_image_digest
-        }
+        template_annotations[
+            CONTROLLER_DIGEST_ANNOTATION] = controller_image_digest
+    if slot is not None:
+        template_annotations[LB_RUNTIME_REVISION_ANNOTATION] = (
+            _lb_runtime_revision(controller_image_digest,
+                                 termination_grace_period_seconds,
+                                 service_hash))
+    if template_annotations:
+        template_metadata['annotations'] = template_annotations
     pod_spec = {
-        **pod_runtime_fields,
+        **_lb_pod_runtime_fields(pod_runtime_fields, service_name, service_hash, slot),
         'terminationGracePeriodSeconds': termination_grace_period_seconds,
         # LB pods call only the stable HTTP controller proxy. They never need
         # Kubernetes credentials, so do not expose the namespace-scoped
@@ -994,13 +1135,18 @@ def _build_deployment_dict(service_name: str,
             # Roll the new LB pod up (Ready via the readinessProbe) before the
             # old one is torn down, so an image/arg bump never leaves a gap with
             # no LB pod backing the Service.
-            'strategy': {
+            'strategy': ({
+                'type': 'Recreate',
+            } if slot is not None else {
                 'type': 'RollingUpdate',
                 'rollingUpdate': {
                     'maxSurge': 1,
                     'maxUnavailable': 0,
                 },
-            },
+            }),
+            **({
+                'minReadySeconds': _LB_MIN_READY_SECONDS
+            } if slot is not None else {}),
             'selector': {
                 'matchLabels': {
                     APP_LABEL_KEY: deployment_name,
@@ -1020,7 +1166,32 @@ def _build_service_dict(service_name: str,
                         service_name_k8s: str,
                         deployment_name: str,
                         service_hash: str | None = None,
-                        owner_reference: dict | None = None) -> dict:
+                        owner_reference: dict | None = None,
+                        active_slot: lb_ha.LbSlot | None = None,
+                        cutover_generation: int | None = None,
+                        desired_runtime_revision: str | None = None) -> dict:
+    selector = ({
+        LB_SLOT_LABEL_KEY: active_slot.value,
+        **({
+            SERVICE_HASH_LABEL_KEY: service_hash
+        } if service_hash else {}),
+    } if active_slot is not None else {
+        APP_LABEL_KEY: deployment_name,
+        **({
+            SERVICE_HASH_LABEL_KEY: service_hash
+        } if service_hash else {}),
+    })
+    annotations = {}
+    if active_slot is not None:
+        if cutover_generation is None:
+            raise ValueError('HA LB Service requires a cutover generation.')
+        annotations = {
+            ACTIVE_SLOT_ANNOTATION_KEY: active_slot.value,
+            CUTOVER_GENERATION_ANNOTATION_KEY: str(cutover_generation),
+            **({
+                DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_runtime_revision,
+            } if desired_runtime_revision is not None else {}),
+        }
     return {
         'apiVersion': 'v1',
         'kind': 'Service',
@@ -1028,17 +1199,18 @@ def _build_service_dict(service_name: str,
             'name': service_name_k8s,
             'labels': _object_labels(service_name, service_hash),
             **({
+                'annotations': annotations
+            } if annotations else {}),
+            **({
                 'ownerReferences': [owner_reference]
             } if owner_reference else {}),
         },
         'spec': {
             'type': 'LoadBalancer',
-            'selector': {
-                APP_LABEL_KEY: deployment_name,
-                **({
-                    SERVICE_HASH_LABEL_KEY: service_hash
-                } if service_hash else {}),
-            },
+            # Selector-only cutover keeps the allocated ClusterIP and cloud NLB.
+            # Cluster policy is part of the qualified failover contract.
+            'externalTrafficPolicy': 'Cluster',
+            'selector': selector,
             'ports': [{
                 'port': constants.LOAD_BALANCER_PORT_START,
                 'targetPort': constants.LOAD_BALANCER_PORT_START,
@@ -1048,18 +1220,48 @@ def _build_service_dict(service_name: str,
     }
 
 
+def _build_pdb_dict(service_name: str, pdb_name: str, service_hash: str,
+                    owner_reference: dict) -> dict:
+    """Keep at least one synchronized LB slot during voluntary disruption."""
+    return {
+        'apiVersion': 'policy/v1',
+        'kind': 'PodDisruptionBudget',
+        'metadata': {
+            'name': pdb_name,
+            'labels': _object_labels(service_name, service_hash),
+            'ownerReferences': [owner_reference],
+        },
+        'spec': {
+            'minAvailable': 1,
+            'selector': {
+                'matchLabels': {
+                    SERVE_LB_LABEL_KEY: service_name,
+                    SERVICE_HASH_LABEL_KEY: service_hash,
+                },
+            },
+        },
+    }
+
+
 def _service_has_desired_routing(service, desired: dict) -> bool:
     """Whether mutable Service routing fields match the desired contract."""
     if isinstance(service, dict):
+        metadata = service.get('metadata', {}) or {}
         spec = service.get('spec', {})
         selector = spec.get('selector', {}) or {}
         ports = spec.get('ports', []) or []
         service_type = spec.get('type') or 'ClusterIP'
+        external_traffic_policy = spec.get('externalTrafficPolicy') or 'Cluster'
+        annotations = metadata.get('annotations', {}) or {}
     else:
+        metadata = getattr(service, 'metadata', None)
         spec = getattr(service, 'spec', None)
         selector = getattr(spec, 'selector', {}) or {}
         ports = getattr(spec, 'ports', None) or []
         service_type = getattr(spec, 'type', None) or 'ClusterIP'
+        external_traffic_policy = (getattr(spec, 'external_traffic_policy',
+                                           None) or 'Cluster')
+        annotations = getattr(metadata, 'annotations', {}) or {}
 
     def _port_tuple(port) -> tuple[Any, Any, Any]:
         if isinstance(port, dict):
@@ -1069,8 +1271,12 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
                 getattr(port, 'protocol', None) or 'TCP')
 
     desired_spec = desired['spec']
-    return (service_type == desired_spec['type'] and
-            selector == desired_spec['selector'] and
+    desired_annotations = desired.get('metadata', {}).get('annotations', {})
+    return (service_type == desired_spec['type'] and external_traffic_policy
+            == desired_spec.get('externalTrafficPolicy', 'Cluster') and
+            selector == desired_spec['selector'] and all(
+                annotations.get(key) == value
+                for key, value in desired_annotations.items()) and
             [_port_tuple(port) for port in ports
             ] == [_port_tuple(port) for port in desired_spec['ports']])
 
@@ -1163,12 +1369,388 @@ def _wait_for_lb_service_endpoint(
         'cloud load balancer controller logs.')
 
 
-def create_lb_deployment_and_service(service_name: str,
-                                     termination_grace_period_seconds: int,
-                                     service_hash: str,
-                                     continue_guard: Callable[[], bool] |
-                                     None = None,
-                                     resource_scope: str | None = None) -> None:
+def _deployment_patch_body(deployment_dict: dict,
+                           data_plane_auth_enabled: bool) -> dict:
+    """Return a create-compatible strategic patch for one LB Deployment."""
+    deployment_patch = copy.deepcopy(deployment_dict)
+    if data_plane_auth_enabled:
+        return deployment_patch
+    # Strategic-merge omission does not delete named list entries. Explicitly
+    # remove projections left by a prior auth-enabled Deployment.
+    container = deployment_patch['spec']['template']['spec']['containers'][0]
+    container['env'].append({
+        'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+        '$patch': 'delete',
+    })
+    container['volumeMounts'].append({
+        # volumeMounts uses mountPath, not name, as its merge key.
+        'mountPath': _LB_DATA_PLANE_AUTH_MOUNT_PATH,
+        '$patch': 'delete',
+    })
+    deployment_patch['spec']['template']['spec']['volumes'].append({
+        'name': LB_DATA_PLANE_AUTH_VOLUME_NAME,
+        '$patch': 'delete',
+    })
+    return deployment_patch
+
+
+def _reconcile_owned_deployment(
+    context: str,
+    namespace: str,
+    deployment_dict: dict,
+    deployment_patch: dict,
+    owner_reference: dict,
+    service_hash: str,
+    assert_continues: Callable[[str], None],
+) -> None:
+    """Create or fenced-patch one LB Deployment."""
+    deployment_name = deployment_dict['metadata']['name']
+    apps_api = kubernetes.apps_api(context)
+    deadline = time.monotonic() + _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS
+    while True:
+        assert_continues(f'creating LB Deployment {deployment_name!r}')
+        try:
+            apps_api.create_namespaced_deployment(namespace, deployment_dict)
+            return
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 409:
+                raise
+        try:
+            existing = apps_api.read_namespaced_deployment(
+                deployment_name, namespace)
+            metadata = (existing.get('metadata', {}) if isinstance(
+                existing, dict) else getattr(existing, 'metadata', None))
+            deletion_timestamp = (metadata.get('deletionTimestamp')
+                                  if isinstance(metadata, dict) else getattr(
+                                      metadata, 'deletion_timestamp', None))
+            if deletion_timestamp is not None:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f'LB Deployment {deployment_name!r} stayed '
+                        'terminating during reconciliation.')
+                time.sleep(_LB_OBJECT_RECONCILIATION_POLL_SECONDS)
+                continue
+            resource_version = _require_existing_lb_object_ownership(
+                context, namespace, deployment_name, existing, owner_reference,
+                service_hash)
+            desired_patch = copy.deepcopy(deployment_patch)
+            desired_patch['metadata'].pop('ownerReferences', None)
+            desired_patch['metadata']['resourceVersion'] = resource_version
+            _strategic_merge_patch(
+                context,
+                '/apis/apps/v1/namespaces/{namespace}/deployments/{name}',
+                'V1Deployment', deployment_name, namespace, desired_patch)
+            return
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) not in (404, 409):
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f'LB Deployment {deployment_name!r} stayed terminating '
+                    'or disappearing during reconciliation.') from e
+            time.sleep(_LB_OBJECT_RECONCILIATION_POLL_SECONDS)
+
+
+def _reconcile_owned_pdb(context: str, namespace: str, pdb_dict: dict,
+                         owner_reference: dict, service_hash: str,
+                         assert_continues: Callable[[str], None]) -> None:
+    """Create the HA PDB or validate its immutable owned specification."""
+    name = pdb_dict['metadata']['name']
+    policy_api = kubernetes.policy_api(context)
+    deadline = time.monotonic() + _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS
+    while True:
+        assert_continues(f'creating LB PodDisruptionBudget {name!r}')
+        try:
+            policy_api.create_namespaced_pod_disruption_budget(
+                namespace, pdb_dict)
+            return
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 409:
+                raise
+        try:
+            existing = policy_api.read_namespaced_pod_disruption_budget(
+                name, namespace)
+            _require_existing_lb_object_ownership(context, namespace, name,
+                                                  existing, owner_reference,
+                                                  service_hash)
+            existing_spec = _serialize_k8s_object(existing).get('spec', {})
+            existing_selector = existing_spec.get('selector', {})
+            existing_contract = {
+                'minAvailable': existing_spec.get(
+                    'minAvailable', existing_spec.get('min_available')),
+                'matchLabels': existing_selector.get(
+                    'matchLabels', existing_selector.get('match_labels')),
+            }
+            desired_contract = {
+                'minAvailable': pdb_dict['spec']['minAvailable'],
+                'matchLabels': pdb_dict['spec']['selector']['matchLabels'],
+            }
+            if existing_contract != desired_contract:
+                raise RuntimeError(
+                    f'Owned LB PodDisruptionBudget {name!r} has immutable '
+                    'specification drift; refusing an unsafe in-place patch.')
+            return
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) not in (404, 409):
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f'LB PodDisruptionBudget {name!r} stayed terminating or '
+                    'disappearing during reconciliation.') from e
+            time.sleep(_LB_OBJECT_RECONCILIATION_POLL_SECONDS)
+
+
+def _reconcile_ha_service(
+    context: str,
+    namespace: str,
+    service_dict: dict,
+    owner_reference: dict,
+    service_hash: str,
+    preserve_existing_selector: bool,
+    assert_continues: Callable[[str], None],
+) -> bool:
+    """Create the stable Service or patch its mutable routing in place."""
+    name = service_dict['metadata']['name']
+    core_api = kubernetes.core_api(context)
+    deadline = time.monotonic() + _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS
+    while True:
+        assert_continues(f'creating stable LB Service {name!r}')
+        try:
+            core_api.create_namespaced_service(namespace, service_dict)
+            return False
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 409:
+                raise
+        try:
+            existing = core_api.read_namespaced_service(name, namespace)
+            resource_version = _require_existing_lb_object_ownership(
+                context, namespace, name, existing, owner_reference,
+                service_hash)
+            if preserve_existing_selector:
+                desired_revision = service_dict['metadata'].get(
+                    'annotations',
+                    {}).get(DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+                if desired_revision is not None:
+                    body = {
+                        'metadata': {
+                            'resourceVersion': resource_version,
+                            'annotations': {
+                                DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+                            },
+                        },
+                    }
+                    _strategic_merge_patch(
+                        context,
+                        '/api/v1/namespaces/{namespace}/services/{name}',
+                        'V1Service', name, namespace, body)
+                return True
+            body = {
+                'metadata': {
+                    'labels': service_dict['metadata']['labels'],
+                    'annotations': service_dict['metadata'].get(
+                        'annotations', {}),
+                    'resourceVersion': resource_version,
+                },
+                'spec': {
+                    'type': service_dict['spec']['type'],
+                    'externalTrafficPolicy': service_dict['spec']
+                                             ['externalTrafficPolicy'],
+                    # A strategic merge recursively merges maps. Replace the
+                    # selector explicitly so a legacy ``app`` key cannot
+                    # survive migration and combine with the slot labels into
+                    # a selector that matches no Pod.
+                    'selector': {
+                        '$patch': 'replace',
+                        **service_dict['spec']['selector'],
+                    },
+                    'ports': service_dict['spec']['ports'],
+                },
+            }
+            _strategic_merge_patch(
+                context, '/api/v1/namespaces/{namespace}/services/{name}',
+                'V1Service', name, namespace, body)
+            return True
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) not in (404, 409):
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f'LB Service {name!r} stayed terminating or disappearing '
+                    'during reconciliation.') from e
+            time.sleep(_LB_OBJECT_RECONCILIATION_POLL_SECONDS)
+
+
+def _run_ha_service_reconcile_guarded(
+    service_name: str,
+    service_hash: str,
+    cutover_state: lb_ha.LbCutoverState,
+    expected_controller_owner: tuple[int | None, str | None],
+    reconcile: Callable[[], bool],
+) -> bool:
+    """Run one supervision Service reconcile under the durable row fence."""
+    if (cutover_state.active_slot is None or
+            cutover_state.lifecycle_epoch is None):
+        raise RuntimeError('HA LB state lacks selector fencing authority.')
+    with serve_state.lb_cutover_kubernetes_guard(
+            service_name, service_hash, expected_controller_owner,
+            cutover_state.lifecycle_epoch, cutover_state.active_slot,
+            cutover_state.generation, cutover_state.phase,
+            cutover_state.pending_slot) as guarded:
+        if not guarded:
+            raise RuntimeError(
+                f'HA LB selector authority changed before supervision could '
+                f'reconcile {service_name!r}; retrying from fresh state.')
+        return reconcile()
+
+
+def _create_ha_lb_objects(
+    service_name: str,
+    termination_grace_period_seconds: int,
+    service_hash: str,
+    cutover_state: lb_ha.LbCutoverState,
+    continue_guard: Callable[[], bool] | None,
+    resource_scope: str | None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> None:
+    """Reconcile two warm slots without rolling the selected active first."""
+    if cutover_state.active_slot is None:
+        raise RuntimeError('HA LB state has no active slot.')
+
+    def _assert_continues(phase: str) -> None:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(f'Lost service ownership before {phase} for '
+                               f'{service_name!r}; aborting LB reconciliation.')
+
+    context = kubernetes.in_cluster_context_name()
+    namespace = get_lb_namespace()
+    owner_reference = _api_deployment_owner_reference(context, namespace)
+    controller_pod = _read_controller_pod(namespace, context)
+    image, image_pull_policy, controller_digest = _resolve_lb_image(
+        namespace, context, pod=controller_pod)
+    desired_runtime_revision = _lb_runtime_revision(
+        controller_digest, termination_grace_period_seconds, service_hash)
+    (auth_envs, auth_volumes, auth_mounts, image_pull_secrets,
+     pod_runtime_fields, container_runtime_fields,
+     data_plane_auth_enabled) = _resolve_lb_auth_projection(namespace,
+                                                            context,
+                                                            pod=controller_pod)
+    resources = _lb_resources()
+
+    apps_api = kubernetes.apps_api(context)
+    existing_by_slot: dict[lb_ha.LbSlot, Any | None] = {}
+    for slot in lb_ha.LbSlot:
+        name = lb_slot_deployment_name(service_name, slot, resource_scope)
+        try:
+            existing_by_slot[slot] = apps_api.read_namespaced_deployment(
+                name, namespace)
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 404:
+                raise
+            existing_by_slot[slot] = None
+
+    # A new service has no selected workload yet, so both slots can be
+    # created. During recovery or software upgrades, mutate only the standby;
+    # the controller promotes it before the former active is rolled.
+    slots_to_reconcile = list(lb_ha.LbSlot)
+    if existing_by_slot[cutover_state.active_slot] is not None:
+        slots_to_reconcile.remove(cutover_state.active_slot)
+    for slot in slots_to_reconcile:
+        deployment_name = lb_slot_deployment_name(service_name, slot,
+                                                  resource_scope)
+        deployment_dict = _build_deployment_dict(
+            service_name,
+            deployment_name,
+            image,
+            auth_envs,
+            auth_volumes,
+            auth_mounts,
+            image_pull_secrets,
+            pod_runtime_fields,
+            container_runtime_fields,
+            image_pull_policy,
+            termination_grace_period_seconds,
+            controller_digest,
+            service_hash,
+            resources,
+            owner_reference,
+            slot=slot)
+        _reconcile_owned_deployment(
+            context, namespace, deployment_dict,
+            _deployment_patch_body(deployment_dict, data_plane_auth_enabled),
+            owner_reference, service_hash, _assert_continues)
+
+    service_name_k8s = lb_service_name(service_name, resource_scope)
+    service_dict = _build_service_dict(
+        service_name,
+        service_name_k8s,
+        lb_slot_deployment_name(service_name, cutover_state.active_slot,
+                                resource_scope),
+        service_hash,
+        owner_reference,
+        active_slot=cutover_state.active_slot,
+        cutover_generation=cutover_state.generation,
+        desired_runtime_revision=desired_runtime_revision)
+
+    def _reconcile_service() -> bool:
+        return _reconcile_ha_service(
+            context,
+            namespace,
+            service_dict,
+            owner_reference,
+            service_hash,
+            preserve_existing_selector=(cutover_state.phase
+                                        in (lb_ha.LbCutoverPhase.PREPARING,
+                                            lb_ha.LbCutoverPhase.MIGRATING,
+                                            lb_ha.LbCutoverPhase.ROLLING_BACK)),
+            assert_continues=_assert_continues)
+
+    if expected_controller_owner is None:
+        # Initial creation and explicit mode transitions either have no
+        # selected HA Service yet or preserve its existing selector. Periodic
+        # supervision supplies the durable owner fence below because it can
+        # race a live cutover from a stale state snapshot.
+        service_existed = _reconcile_service()
+    else:
+        service_existed = _run_ha_service_reconcile_guarded(
+            service_name, service_hash, cutover_state,
+            expected_controller_owner, _reconcile_service)
+    _reconcile_owned_pdb(
+        context, namespace,
+        _build_pdb_dict(service_name, lb_pdb_name(service_name, resource_scope),
+                        service_hash, owner_reference), owner_reference,
+        service_hash, _assert_continues)
+
+    _wait_for_lb_deployment_ready(context,
+                                  namespace,
+                                  lb_slot_deployment_name(
+                                      service_name, cutover_state.active_slot,
+                                      resource_scope),
+                                  continue_guard=continue_guard)
+    # Initial publication waits for the standby too. A later bad standby image
+    # must not take down an already selected known-good active.
+    if (not service_existed or
+            cutover_state.phase is lb_ha.LbCutoverPhase.MIGRATING):
+        _wait_for_lb_deployment_ready(context,
+                                      namespace,
+                                      lb_slot_deployment_name(
+                                          service_name,
+                                          cutover_state.active_slot.other,
+                                          resource_scope),
+                                      continue_guard=continue_guard)
+    _wait_for_lb_service_endpoint(kubernetes.core_api(context),
+                                  namespace,
+                                  service_name_k8s,
+                                  continue_guard=continue_guard)
+
+
+def create_lb_deployment_and_service(
+        service_name: str,
+        termination_grace_period_seconds: int,
+        service_hash: str,
+        continue_guard: Callable[[], bool] | None = None,
+        resource_scope: str | None = None,
+        high_availability: bool = False,
+        preserve_existing_service_selector: bool = False) -> None:
     """Create the per-service LB Deployment + Service (idempotent).
 
     New objects are created with the stable Helm API Deployment as their
@@ -1181,6 +1763,18 @@ def create_lb_deployment_and_service(service_name: str,
         return
     if not service_hash:
         raise RuntimeError('External load balancer requires a service hash.')
+    cutover_state = (serve_state.get_lb_cutover_state(service_name)
+                     if high_availability else None)
+    if high_availability and (cutover_state is None or
+                              not cutover_state.enabled):
+        raise RuntimeError(
+            f'Service {service_name!r} requested HA LB objects without '
+            'durable HA cutover authority.')
+    if cutover_state is not None:
+        _create_ha_lb_objects(service_name, termination_grace_period_seconds,
+                              service_hash, cutover_state, continue_guard,
+                              resource_scope)
+        return
 
     def _assert_continues(phase: str) -> None:
         if continue_guard is not None and not continue_guard():
@@ -1355,7 +1949,10 @@ def create_lb_deployment_and_service(service_name: str,
                             'resourceVersion': resource_version,
                         },
                         'spec': {
-                            'selector': service_dict['spec']['selector'],
+                            'selector': {
+                                '$patch': 'replace',
+                                **service_dict['spec']['selector'],
+                            },
                         },
                     })
             except kubernetes.api_exception() as e:
@@ -1378,6 +1975,12 @@ def create_lb_deployment_and_service(service_name: str,
                                   deployment_name,
                                   continue_guard=continue_guard)
     if service_existed:
+        if preserve_existing_service_selector:
+            _wait_for_lb_service_endpoint(core_api,
+                                          namespace,
+                                          service_name_k8s,
+                                          continue_guard=continue_guard)
+            return
         logger.debug(f'LB Service {service_name_k8s} already exists; '
                      f'reconciling it after the desired rollout is ready '
                      f'(fenced={service_was_fenced}).')
@@ -1412,7 +2015,12 @@ def create_lb_deployment_and_service(service_name: str,
                         },
                         'spec': {
                             'type': service_dict['spec']['type'],
-                            'selector': service_dict['spec']['selector'],
+                            'externalTrafficPolicy': service_dict['spec']
+                                                     ['externalTrafficPolicy'],
+                            'selector': {
+                                '$patch': 'replace',
+                                **service_dict['spec']['selector'],
+                            },
                             'ports': service_dict['spec']['ports'],
                         },
                     })
@@ -1446,11 +2054,97 @@ def create_lb_deployment_and_service(service_name: str,
                                   continue_guard=continue_guard)
 
 
+def prepare_lb_mode_transition(
+    service_name: str,
+    termination_grace_period_seconds: int,
+    service_hash: str,
+    enable_ha: bool,
+    continue_guard: Callable[[], bool] | None = None,
+    resource_scope: str | None = None,
+) -> None:
+    """Create the unselected target topology and wait for sync readiness."""
+    if enable_ha:
+        create_lb_deployment_and_service(service_name,
+                                         termination_grace_period_seconds,
+                                         service_hash,
+                                         continue_guard=continue_guard,
+                                         resource_scope=resource_scope,
+                                         high_availability=True)
+        return
+    create_lb_deployment_and_service(service_name,
+                                     termination_grace_period_seconds,
+                                     service_hash,
+                                     continue_guard=continue_guard,
+                                     resource_scope=resource_scope,
+                                     high_availability=False,
+                                     preserve_existing_service_selector=True)
+
+
+def cleanup_lb_mode_transition(service_name: str,
+                               service_hash: str,
+                               enabled_ha: bool,
+                               resource_scope: str | None = None) -> None:
+    """Remove only the obsolete workload after stable-Service cutover."""
+    context = kubernetes.in_cluster_context_name()
+    namespace = get_lb_namespace()
+    expected_api_deployment_name = _api_deployment_name()
+    expected_api_deployment_uid = get_api_deployment_owner_uid(
+        require_runtime=True)
+    if expected_api_deployment_uid is None:
+        raise RuntimeError('LB transition cleanup requires API owner UID.')
+    errors: list[Exception] = []
+    apps_api = kubernetes.apps_api(context)
+    if enabled_ha:
+        deployment_names = [lb_deployment_name(service_name, resource_scope)]
+    else:
+        deployment_names = [
+            lb_slot_deployment_name(service_name, slot, resource_scope)
+            for slot in lb_ha.LbSlot
+        ]
+    for deployment_name in deployment_names:
+        try:
+            _delete_lb_object_if_owned(apps_api.read_namespaced_deployment,
+                                       apps_api.delete_namespaced_deployment,
+                                       deployment_name, namespace, service_hash,
+                                       expected_api_deployment_name,
+                                       expected_api_deployment_uid, context,
+                                       'Deployment')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+    if not enabled_ha:
+        try:
+            policy_api = kubernetes.policy_api(context)
+            _delete_lb_object_if_owned(
+                policy_api.read_namespaced_pod_disruption_budget,
+                policy_api.delete_namespaced_pod_disruption_budget,
+                lb_pdb_name(service_name, resource_scope), namespace,
+                service_hash, expected_api_deployment_name,
+                expected_api_deployment_uid, context, 'PodDisruptionBudget')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+    if errors:
+        raise errors[0]
+
+
+def _retry_obsolete_lb_topology_cleanup(service_name: str, service_hash: str,
+                                        enabled_ha: bool,
+                                        resource_scope: str | None) -> None:
+    """Best-effort cleanup retried by every stable supervision pass."""
+    try:
+        cleanup_lb_mode_transition(service_name, service_hash, enabled_ha,
+                                   resource_scope)
+    except Exception as e:  # pylint: disable=broad-except
+        obsolete = 'legacy deployment' if enabled_ha else 'HA slot topology'
+        logger.warning(f'Failed to clean obsolete {obsolete} for '
+                       f'{service_name!r}; will retry: {e}')
+
+
 def ensure_lb_objects_exist(service_name: str,
                             termination_grace_period_seconds: int,
                             service_hash: str,
                             controller_ip: str | None = None,
-                            resource_scope: str | None = None) -> bool:
+                            resource_scope: str | None = None,
+                            high_availability: bool = False) -> bool:
     """Recreate the per-service LB Deployment + Service if either is missing.
 
     Self-heal for out-of-band deletion: the k8s Deployment only heals its own
@@ -1470,6 +2164,144 @@ def ensure_lb_objects_exist(service_name: str,
         raise RuntimeError('External load balancer requires a service hash.')
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
+
+    cutover_state = (serve_state.get_lb_cutover_state(service_name)
+                     if high_availability else None)
+    if high_availability and (cutover_state is None or
+                              not cutover_state.enabled):
+        raise RuntimeError(
+            f'Service {service_name!r} requested HA LB supervision without '
+            'durable HA cutover authority.')
+    if cutover_state is not None:
+        if cutover_state.active_slot is None:
+            raise RuntimeError('HA LB state has no active slot.')
+        if cutover_state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK:
+            prepare_lb_mode_transition(
+                service_name,
+                termination_grace_period_seconds,
+                service_hash,
+                False,
+                continue_guard=lambda: serve_state.service_owner_matches(
+                    service_name, service_hash, (os.getpid(), controller_ip)),
+                resource_scope=resource_scope)
+
+        def _read_or_missing_ha(read_fn, name: str):
+            try:
+                return read_fn(name, namespace), False
+            except kubernetes.api_exception() as e:
+                if getattr(e, 'status', None) != 404:
+                    raise
+                return None, True
+
+        deployments: dict[lb_ha.LbSlot, Any] = {}
+        digest_by_slot: dict[lb_ha.LbSlot, str | None] = {}
+        missing_slots: list[lb_ha.LbSlot] = []
+        grace_or_hash_drifted = False
+        for slot in lb_ha.LbSlot:
+            deployment, missing = _read_or_missing_ha(
+                kubernetes.apps_api(context).read_namespaced_deployment,
+                lb_slot_deployment_name(service_name, slot, resource_scope))
+            if missing:
+                missing_slots.append(slot)
+                continue
+            deployments[slot] = deployment
+            if isinstance(deployment, dict):
+                pod_spec = deployment.get('spec', {}).get('template', {})
+                pod_metadata = pod_spec.get('metadata', {}) or {}
+                pod_spec = pod_spec.get('spec', {}) or {}
+                existing_grace = pod_spec.get('terminationGracePeriodSeconds')
+                labels = pod_metadata.get('labels', {}) or {}
+                annotations = pod_metadata.get('annotations', {}) or {}
+            else:
+                template = getattr(getattr(deployment, 'spec', None),
+                                   'template', None)
+                existing_grace = getattr(getattr(template, 'spec', None),
+                                         'termination_grace_period_seconds',
+                                         None)
+                labels = getattr(getattr(template, 'metadata', None), 'labels',
+                                 {}) or {}
+                annotations = getattr(getattr(template, 'metadata', None),
+                                      'annotations', {}) or {}
+            digest_by_slot[slot] = annotations.get(CONTROLLER_DIGEST_ANNOTATION)
+            grace_or_hash_drifted = grace_or_hash_drifted or (
+                existing_grace != termination_grace_period_seconds or
+                labels.get(SERVICE_HASH_LABEL_KEY) != service_hash or
+                labels.get(LB_SLOT_LABEL_KEY) != slot.value)
+
+        service, service_missing = _read_or_missing_ha(
+            kubernetes.core_api(context).read_namespaced_service,
+            lb_service_name(service_name, resource_scope))
+        _, pdb_missing = _read_or_missing_ha(
+            kubernetes.policy_api(
+                context).read_namespaced_pod_disruption_budget,
+            lb_pdb_name(service_name, resource_scope))
+        desired_service = _build_service_dict(
+            service_name,
+            lb_service_name(service_name, resource_scope),
+            lb_slot_deployment_name(service_name, cutover_state.active_slot,
+                                    resource_scope),
+            service_hash,
+            active_slot=cutover_state.active_slot,
+            cutover_generation=cutover_state.generation)
+        routing_drifted = (
+            service is not None and
+            cutover_state.phase is not lb_ha.LbCutoverPhase.PREPARING and
+            not _service_has_desired_routing(service, desired_service))
+        active = deployments.get(cutover_state.active_slot)
+        standby = deployments.get(cutover_state.active_slot.other)
+        active_digest = digest_by_slot.get(cutover_state.active_slot)
+        standby_digest = digest_by_slot.get(cutover_state.active_slot.other)
+        digest_drifted = (cutover_state.phase is lb_ha.LbCutoverPhase.STABLE and
+                          active_digest is not None and
+                          standby_digest != active_digest)
+        if (not missing_slots and not service_missing and not pdb_missing and
+                not grace_or_hash_drifted and not digest_drifted and
+                not routing_drifted):
+            assert service is not None
+            ready = (active is not None and standby is not None and
+                     _lb_deployment_is_ready(active) and
+                     _lb_deployment_is_ready(standby) and
+                     _service_load_balancer_address(service) is not None)
+            if (ready and cutover_state.phase is lb_ha.LbCutoverPhase.STABLE):
+                _retry_obsolete_lb_topology_cleanup(service_name, service_hash,
+                                                    True, resource_scope)
+            return ready
+
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
+        if (owner is None or owner.get('controller_pid') != os.getpid() or
+                owner.get('hash') != service_hash or
+            (controller_ip and owner.get('controller_ip') != controller_ip)):
+            logger.info(
+                f'HA LB objects for {service_name!r} require repair '
+                'but this process no longer owns the service; skipping.')
+            return False
+        logger.warning(
+            f'HA LB objects for {service_name!r} require reconciliation '
+            f'(missing_slots={[slot.value for slot in missing_slots]}, '
+            f'service_missing={service_missing}, pdb_missing={pdb_missing}, '
+            f'grace_or_hash_drifted={grace_or_hash_drifted}, '
+            f'digest_drifted={digest_drifted}, '
+            f'routing_drifted={routing_drifted}).')
+
+        def _still_owns_ha() -> bool:
+            return serve_state.service_owner_matches(
+                service_name, service_hash, (os.getpid(), controller_ip))
+
+        expected_controller_owner = (owner.get('controller_pid'),
+                                     owner.get('controller_ip'))
+        _create_ha_lb_objects(
+            service_name,
+            termination_grace_period_seconds,
+            service_hash,
+            cutover_state,
+            _still_owns_ha,
+            resource_scope,
+            expected_controller_owner=expected_controller_owner)
+        if cutover_state.phase is lb_ha.LbCutoverPhase.STABLE:
+            _retry_obsolete_lb_topology_cleanup(service_name, service_hash,
+                                                True, resource_scope)
+        return True
 
     def _read_or_missing(read_fn, name: str):
         try:
@@ -1519,7 +2351,11 @@ def ensure_lb_objects_exist(service_name: str,
         assert service is not None
         deployment_ready = _lb_deployment_is_ready(deployment)
         endpoint_ready = _service_load_balancer_address(service) is not None
-        return deployment_ready and endpoint_ready
+        ready = deployment_ready and endpoint_ready
+        if ready:
+            _retry_obsolete_lb_topology_cleanup(service_name, service_hash,
+                                                False, resource_scope)
+        return ready
     # The objects may be missing because the service is being torn down or
     # taken over concurrently. Re-check OWNERSHIP (not mere row existence)
     # right before mutating -- the create-time mirror of reconcile's
@@ -1535,7 +2371,8 @@ def ensure_lb_objects_exist(service_name: str,
     # window, and is bounded: the next recovery's reconcile reaps a dead
     # service's LB, and the live owner's own ensure/recovery converges a
     # same-name successor's objects.
-    owner = serve_state.get_service_controller_owner(service_name)
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
     if (owner is None or owner.get('controller_pid') != os.getpid() or
         (service_hash and owner.get('hash') != service_hash) or
         (controller_ip and owner.get('controller_ip') != controller_ip)):
@@ -1559,7 +2396,10 @@ def ensure_lb_objects_exist(service_name: str,
                                      termination_grace_period_seconds,
                                      service_hash,
                                      continue_guard=_still_owns,
-                                     resource_scope=resource_scope)
+                                     resource_scope=resource_scope,
+                                     high_availability=False)
+    _retry_obsolete_lb_topology_cleanup(service_name, service_hash, False,
+                                        resource_scope)
     return True
 
 
@@ -1578,19 +2418,67 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
     try:
         context = kubernetes.in_cluster_context_name()
         namespace = get_lb_namespace()
-        owner = serve_state.get_service_controller_owner(service_name)
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
         service_hash = owner.get('hash') if owner else None
         resource_scope = owner.get('resource_scope') if owner else None
+        ha_enabled = bool(owner and owner.get('lb_ha_enabled'))
+        cutover_phase = (lb_ha.parse_phase(owner.get('lb_cutover_phase'))
+                         if owner else None)
         if not service_hash:
             logger.warning(f'Cannot determine the active incarnation for '
                            f'{service_name!r}; load balancer reports will '
                            'fail closed.')
             return None
-        label_selector = (f'{APP_LABEL_KEY}='
-                          f'{lb_deployment_name(service_name, resource_scope)},'
-                          f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
-        pods = kubernetes.core_api(context).list_namespaced_pod(
-            namespace, label_selector=label_selector)
+        core_api = kubernetes.core_api(context)
+        if ha_enabled:
+            label_selector = (f'{SERVE_LB_LABEL_KEY}={service_name},'
+                              f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
+        else:
+            label_selector = (
+                f'{APP_LABEL_KEY}='
+                f'{lb_deployment_name(service_name, resource_scope)},'
+                f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
+        pods = core_api.list_namespaced_pod(namespace,
+                                            label_selector=label_selector)
+        selected_slot: lb_ha.LbSlot | None = None
+        legacy_selected = False
+        if ha_enabled:
+            service_name_k8s = lb_service_name(service_name, resource_scope)
+            service = core_api.read_namespaced_service(service_name_k8s,
+                                                       namespace)
+            owner_reference = _api_deployment_owner_reference(
+                context, namespace)
+            _require_existing_lb_object_ownership(context, namespace,
+                                                  service_name_k8s, service,
+                                                  owner_reference, service_hash)
+            if isinstance(service, dict):
+                selector = service.get('spec', {}).get('selector', {}) or {}
+                annotations = service.get('metadata', {}).get(
+                    'annotations', {}) or {}
+            else:
+                selector = getattr(service.spec, 'selector', {}) or {}
+                annotations = getattr(service.metadata, 'annotations', {}) or {}
+            selected_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
+            legacy_selected = selector.get(APP_LABEL_KEY) == lb_deployment_name(
+                service_name, resource_scope)
+            annotated_slot = lb_ha.parse_slot(
+                annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
+            generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
+            desired_runtime_revision = annotations.get(
+                DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+            transitional_legacy = (cutover_phase
+                                   in (lb_ha.LbCutoverPhase.MIGRATING,
+                                       lb_ha.LbCutoverPhase.ROLLING_BACK) and
+                                   legacy_selected and selected_slot is None)
+            if (not isinstance(desired_runtime_revision, str) or
+                    not re.fullmatch(r'[0-9a-f]{64}',
+                                     desired_runtime_revision)):
+                raise ValueError('malformed desired LB runtime revision')
+            if (not transitional_legacy and
+                (selected_slot is None or selected_slot != annotated_slot or
+                 generation is None or not str(generation).isdigit())):
+                raise ValueError('malformed HA Service selector or annotations')
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(f'Failed to list load balancer pods for '
                        f'{service_name!r}: {e}; load balancer reports will '
@@ -1598,6 +2486,11 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
         return None
     live_uids: set[str] = set()
     ready_nonterminating_uids: set[str] = set()
+    slot_by_uid: dict[str, lb_ha.LbSlot] = {}
+    digest_by_uid: dict[str, str | None] = {}
+    revision_by_uid: dict[str, str | None] = {}
+    legacy_uids: set[str] = set()
+    terminating_uids: set[str] = set()
     try:
         for pod in pods.items:
             metadata = getattr(pod, 'metadata', None)
@@ -1613,6 +2506,39 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
             uid = str(uid)
             live_uids.add(uid)
             terminating = getattr(metadata, 'deletion_timestamp', None)
+            if terminating is not None:
+                terminating_uids.add(uid)
+            if ha_enabled:
+                labels = getattr(metadata, 'labels', {}) or {}
+                slot = lb_ha.parse_slot(labels.get(LB_SLOT_LABEL_KEY))
+                if slot is None:
+                    legacy_labeled = labels.get(
+                        APP_LABEL_KEY) == lb_deployment_name(
+                            service_name, resource_scope)
+                    if not legacy_labeled:
+                        raise ValueError('live HA load balancer Pod is missing '
+                                         'its slot label')
+                    # Migration commits the stable HA selector before the
+                    # parent supervisor asynchronously deletes the obsolete
+                    # legacy Deployment.  During that bounded cleanup window
+                    # its Pod is still Running and Ready without a slot label,
+                    # but the HA Service no longer selects it.  Keep it as a
+                    # legacy stream owner so drain evidence fails closed;
+                    # rejecting the whole authority snapshot would also fence
+                    # both valid HA slots from role heartbeats and syncs.
+                    # Outside a transition this exception is restricted to
+                    # the exact legacy Deployment label and incarnation-scoped
+                    # list above.  A different slotless Pod remains malformed.
+                    legacy_uids.add(uid)
+                else:
+                    slot_by_uid[uid] = slot
+                annotations = getattr(metadata, 'annotations', {}) or {}
+                digest = annotations.get(CONTROLLER_DIGEST_ANNOTATION)
+                digest_by_uid[uid] = (str(digest)
+                                      if digest is not None else None)
+                revision = annotations.get(LB_RUNTIME_REVISION_ANNOTATION)
+                revision_by_uid[uid] = (str(revision)
+                                        if revision is not None else None)
             conditions = getattr(status, 'conditions', None) or []
             ready = any(
                 getattr(condition, 'type', None) == 'Ready' and
@@ -1625,7 +2551,341 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
                        f'{service_name!r}: {e}; load balancer reports will '
                        'fail closed.')
         return None
-    return LbPodAuthority(ready_nonterminating_uids, live_uids)
+    return LbPodAuthority(ready_nonterminating_uids, live_uids,
+                          slot_by_uid if ha_enabled else None, selected_slot,
+                          digest_by_uid if ha_enabled else None,
+                          revision_by_uid if ha_enabled else None,
+                          legacy_uids if ha_enabled else None,
+                          terminating_uids if ha_enabled else None)
+
+
+def get_lb_service_routing(service_name: str) -> LbServiceRouting:
+    """Read the exact stable-Service selector authority for an HA service."""
+    if not _lb_mode_active():
+        raise RuntimeError('External load balancer runtime is unavailable.')
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
+    if owner is None or not owner.get('lb_ha_enabled') or not owner.get('hash'):
+        raise RuntimeError(f'Service {service_name!r} is not HA-enabled.')
+    context = kubernetes.in_cluster_context_name()
+    namespace = get_lb_namespace()
+    name = lb_service_name(service_name, owner.get('resource_scope'))
+    service = kubernetes.core_api(context).read_namespaced_service(
+        name, namespace)
+    owner_reference = _api_deployment_owner_reference(context, namespace)
+    resource_version = _require_existing_lb_object_ownership(
+        context, namespace, name, service, owner_reference, owner['hash'])
+    if isinstance(service, dict):
+        spec = service.get('spec', {}) or {}
+        annotations = service.get('metadata', {}).get('annotations', {}) or {}
+    else:
+        spec = service.spec
+        annotations = getattr(service.metadata, 'annotations', {}) or {}
+    selector = (spec.get('selector', {}) if isinstance(spec, dict) else
+                getattr(spec, 'selector', {}) or {})
+    traffic_policy = (spec.get('externalTrafficPolicy') if isinstance(
+        spec, dict) else getattr(spec, 'external_traffic_policy', None))
+    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
+    annotated_slot = lb_ha.parse_slot(
+        annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
+    raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
+    desired_runtime_revision = annotations.get(
+        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+    try:
+        generation = int(str(raw_generation))
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            'HA LB Service has a malformed cutover generation.') from e
+    if (traffic_policy != 'Cluster' or active_slot is None or
+            active_slot != annotated_slot or generation < 1):
+        raise RuntimeError(
+            'HA LB Service routing authority is malformed or unsupported.')
+    if (not isinstance(desired_runtime_revision, str) or
+            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
+        raise RuntimeError('HA LB Service has a malformed desired runtime '
+                           'revision.')
+    return LbServiceRouting(active_slot, generation, resource_version,
+                            desired_runtime_revision)
+
+
+def get_lb_service_transition_routing(
+        service_name: str) -> LbServiceTransitionRouting:
+    """Read either the exact legacy selector or a valid HA slot selector."""
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
+    if owner is None or not owner.get('hash'):
+        raise RuntimeError(f'Service {service_name!r} has no LB authority.')
+    service_hash = str(owner['hash'])
+    resource_scope = owner.get('resource_scope')
+    context = kubernetes.in_cluster_context_name()
+    namespace = get_lb_namespace()
+    name = lb_service_name(service_name, resource_scope)
+    service = kubernetes.core_api(context).read_namespaced_service(
+        name, namespace)
+    owner_reference = _api_deployment_owner_reference(context, namespace)
+    resource_version = _require_existing_lb_object_ownership(
+        context, namespace, name, service, owner_reference, service_hash)
+    if isinstance(service, dict):
+        spec = service.get('spec', {}) or {}
+        annotations = service.get('metadata', {}).get('annotations', {}) or {}
+    else:
+        spec = service.spec
+        annotations = getattr(service.metadata, 'annotations', {}) or {}
+    selector = (spec.get('selector', {}) if isinstance(spec, dict) else
+                getattr(spec, 'selector', {}) or {})
+    desired_runtime_revision = annotations.get(
+        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+    if (not isinstance(desired_runtime_revision, str) or
+            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
+        raise RuntimeError('LB Service has a malformed desired runtime '
+                           'revision.')
+    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
+    legacy_selected = selector == {
+        APP_LABEL_KEY: lb_deployment_name(service_name, resource_scope),
+        SERVICE_HASH_LABEL_KEY: service_hash,
+    }
+    generation = None
+    if active_slot is not None:
+        annotated_slot = lb_ha.parse_slot(
+            annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
+        raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
+        try:
+            generation = int(str(raw_generation))
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(
+                'HA LB Service has a malformed cutover generation.') from e
+        if (active_slot is not annotated_slot or generation < 1 or selector != {
+                LB_SLOT_LABEL_KEY: active_slot.value,
+                SERVICE_HASH_LABEL_KEY: service_hash,
+        }):
+            raise RuntimeError('HA LB Service routing authority is malformed.')
+    if active_slot is None and not legacy_selected:
+        raise RuntimeError('LB Service has neither an exact legacy nor HA '
+                           'selector.')
+    return LbServiceTransitionRouting(active_slot, legacy_selected, generation,
+                                      resource_version,
+                                      desired_runtime_revision)
+
+
+def patch_lb_service_active_slot(service_name: str, expected_service_hash: str,
+                                 expected_controller_owner: tuple[int | None,
+                                                                  str | None],
+                                 expected_lifecycle_epoch: int,
+                                 expected_active_slot: lb_ha.LbSlot,
+                                 expected_generation: int,
+                                 target_slot: lb_ha.LbSlot,
+                                 target_generation: int) -> bool:
+    """Atomically move only the stable Service selector to an armed slot."""
+    if target_slot is not expected_active_slot.other:
+        raise ValueError('HA Service target must be the opposite slot.')
+    if target_generation != expected_generation + 1:
+        raise ValueError('HA Service cutover generation must increase by one.')
+    with serve_state.lb_cutover_kubernetes_guard(
+            service_name, expected_service_hash, expected_controller_owner,
+            expected_lifecycle_epoch, expected_active_slot, target_generation,
+            lb_ha.LbCutoverPhase.PREPARING, target_slot) as guarded:
+        if not guarded:
+            return False
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
+        if (owner is None or owner.get('hash') != expected_service_hash or
+                not owner.get('lb_ha_enabled')):
+            return False
+        routing = get_lb_service_routing(service_name)
+        if (routing.active_slot is not expected_active_slot or
+                routing.generation != expected_generation):
+            return False
+        context = kubernetes.in_cluster_context_name()
+        namespace = get_lb_namespace()
+        name = lb_service_name(service_name, owner.get('resource_scope'))
+        try:
+            _strategic_merge_patch(
+                context, '/api/v1/namespaces/{namespace}/services/{name}',
+                'V1Service', name, namespace, {
+                    'metadata': {
+                        'annotations': {
+                            ACTIVE_SLOT_ANNOTATION_KEY: target_slot.value,
+                            CUTOVER_GENERATION_ANNOTATION_KEY:
+                                str(target_generation),
+                        },
+                        'resourceVersion': routing.resource_version,
+                    },
+                    'spec': {
+                        'externalTrafficPolicy': 'Cluster',
+                        'selector': {
+                            '$patch': 'replace',
+                            LB_SLOT_LABEL_KEY: target_slot.value,
+                            SERVICE_HASH_LABEL_KEY: expected_service_hash,
+                        },
+                    },
+                })
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) == 409:
+                return False
+            raise
+    return True
+
+
+def patch_lb_service_aborted_generation(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    target_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Advance Service evidence before aborting an unselected generation."""
+    with serve_state.lb_cutover_kubernetes_guard(
+            service_name, expected_service_hash, expected_controller_owner,
+            expected_lifecycle_epoch, active_slot, generation,
+            lb_ha.LbCutoverPhase.PREPARING, target_slot) as guarded:
+        if not guarded:
+            return False
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
+        if owner is None or owner.get('hash') != expected_service_hash:
+            return False
+        routing = get_lb_service_routing(service_name)
+        if (routing.active_slot is not active_slot or
+                routing.generation != generation - 1):
+            return False
+        context = kubernetes.in_cluster_context_name()
+        namespace = get_lb_namespace()
+        name = lb_service_name(service_name, owner.get('resource_scope'))
+        try:
+            _strategic_merge_patch(
+                context, '/api/v1/namespaces/{namespace}/services/{name}',
+                'V1Service', name, namespace, {
+                    'metadata': {
+                        'annotations': {
+                            ACTIVE_SLOT_ANNOTATION_KEY: active_slot.value,
+                            CUTOVER_GENERATION_ANNOTATION_KEY: str(generation),
+                        },
+                        'resourceVersion': routing.resource_version,
+                    },
+                    'spec': {
+                        'externalTrafficPolicy': 'Cluster',
+                        'selector': {
+                            '$patch': 'replace',
+                            LB_SLOT_LABEL_KEY: active_slot.value,
+                            SERVICE_HASH_LABEL_KEY: expected_service_hash,
+                        },
+                    },
+                })
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) == 409:
+                return False
+            raise
+    return True
+
+
+def patch_lb_service_migration_to_slot(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> bool:
+    """Move the stable legacy Service to the prepared slot A."""
+    active_slot = lb_ha.LbSlot.A
+    with serve_state.lb_cutover_kubernetes_guard(
+            service_name, expected_service_hash, expected_controller_owner,
+            expected_lifecycle_epoch, active_slot, 1,
+            lb_ha.LbCutoverPhase.MIGRATING, None) as guarded:
+        if not guarded:
+            return False
+        routing = get_lb_service_transition_routing(service_name)
+        if not routing.legacy_selected:
+            return routing.active_slot is active_slot and routing.generation == 1
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
+        if owner is None:
+            return False
+        context = kubernetes.in_cluster_context_name()
+        namespace = get_lb_namespace()
+        name = lb_service_name(service_name, owner.get('resource_scope'))
+        try:
+            _strategic_merge_patch(
+                context, '/api/v1/namespaces/{namespace}/services/{name}',
+                'V1Service', name, namespace, {
+                    'metadata': {
+                        'annotations': {
+                            ACTIVE_SLOT_ANNOTATION_KEY: active_slot.value,
+                            CUTOVER_GENERATION_ANNOTATION_KEY: '1',
+                        },
+                        'resourceVersion': routing.resource_version,
+                    },
+                    'spec': {
+                        'externalTrafficPolicy': 'Cluster',
+                        'selector': {
+                            '$patch': 'replace',
+                            LB_SLOT_LABEL_KEY: active_slot.value,
+                            SERVICE_HASH_LABEL_KEY: expected_service_hash,
+                        },
+                    },
+                })
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) == 409:
+                return False
+            raise
+    return True
+
+
+def patch_lb_service_rollback_to_legacy(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Move the stable Service to a synchronized legacy deployment."""
+    with serve_state.lb_cutover_kubernetes_guard(
+            service_name, expected_service_hash, expected_controller_owner,
+            expected_lifecycle_epoch, active_slot, generation,
+            lb_ha.LbCutoverPhase.ROLLING_BACK, None) as guarded:
+        if not guarded:
+            return False
+        routing = get_lb_service_transition_routing(service_name)
+        if routing.legacy_selected:
+            return True
+        if (routing.active_slot is not active_slot or
+                routing.generation != generation):
+            return False
+        owner = serve_state.get_service_controller_owner(service_name,
+                                                         include_lb_state=True)
+        if owner is None:
+            return False
+        resource_scope = owner.get('resource_scope')
+        context = kubernetes.in_cluster_context_name()
+        namespace = get_lb_namespace()
+        name = lb_service_name(service_name, resource_scope)
+        try:
+            _strategic_merge_patch(
+                context, '/api/v1/namespaces/{namespace}/services/{name}',
+                'V1Service', name, namespace, {
+                    'metadata': {
+                        'annotations': {
+                            ACTIVE_SLOT_ANNOTATION_KEY: None,
+                            CUTOVER_GENERATION_ANNOTATION_KEY: None,
+                        },
+                        'resourceVersion': routing.resource_version,
+                    },
+                    'spec': {
+                        'externalTrafficPolicy': 'Cluster',
+                        'selector': {
+                            '$patch': 'replace',
+                            APP_LABEL_KEY: lb_deployment_name(
+                                service_name, resource_scope),
+                            SERVICE_HASH_LABEL_KEY: expected_service_hash,
+                        },
+                    },
+                })
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) == 409:
+                return False
+            raise
+    return True
 
 
 def stream_lb_logs(service_name: str, follow: bool, tail: int | None) -> str:
@@ -1639,21 +2899,34 @@ def stream_lb_logs(service_name: str, follow: bool, tail: int | None) -> str:
     require_external_lb_runtime()
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
-    owner = serve_state.get_service_controller_owner(service_name)
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
     service_hash = owner.get('hash') if owner else None
     resource_scope = owner.get('resource_scope') if owner else None
+    ha_enabled = bool(owner and owner.get('lb_ha_enabled'))
     if not service_hash:
         return (f'Cannot determine the active service incarnation for '
                 f'{service_name!r}.')
+    selector = (f'{SERVE_LB_LABEL_KEY}={service_name},'
+                f'{SERVICE_HASH_LABEL_KEY}={service_hash}'
+                if ha_enabled else f'{APP_LABEL_KEY}='
+                f'{lb_deployment_name(service_name, resource_scope)},'
+                f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
     pods = kubernetes.core_api(context).list_namespaced_pod(
-        namespace,
-        label_selector=
-        (f'{APP_LABEL_KEY}={lb_deployment_name(service_name, resource_scope)},'
-         f'{SERVICE_HASH_LABEL_KEY}={service_hash}'))
+        namespace, label_selector=selector)
     candidates = [
         pod for pod in pods.items
         if getattr(pod.status, 'phase', None) not in ('Succeeded', 'Failed')
     ]
+    if ha_enabled:
+        authority = get_lb_pod_authority(service_name)
+        if authority is None or authority.selected_slot is None:
+            return f'Cannot determine the active LB slot for {service_name!r}.'
+        candidates = [
+            pod for pod in candidates
+            if lb_ha.parse_slot((getattr(pod.metadata, 'labels', {}) or {}).get(
+                LB_SLOT_LABEL_KEY)) == authority.selected_slot
+        ]
     if not candidates:
         return f'No live external load balancer pod found for {service_name!r}.'
     # During maxSurge overlap the newest Pod is the replacement/current one.
@@ -1834,7 +3107,8 @@ def delete_lb_objects(service_name: str,
                       expected_service_hash: str,
                       resource_scope: str | None = None,
                       require_runtime: bool = False,
-                      expected_api_deployment_uid: str | None = None) -> None:
+                      expected_api_deployment_uid: str | None = None,
+                      high_availability: bool = False) -> None:
     """Delete one incarnation's LB objects with Kubernetes preconditions.
 
     No-op outside in-cluster mode. Cleanup deliberately does not consult the
@@ -1883,15 +3157,36 @@ def delete_lb_objects(service_name: str,
             expected_api_deployment_uid, context, 'Service')
     except Exception as e:  # pylint: disable=broad-except
         errors.append(e)
-    try:
-        apps_api = kubernetes.apps_api(context)
-        _delete_lb_object_if_owned(
-            apps_api.read_namespaced_deployment,
-            apps_api.delete_namespaced_deployment, deployment_name, namespace,
-            expected_service_hash, expected_api_deployment_name,
-            expected_api_deployment_uid, context, 'Deployment')
-    except Exception as e:  # pylint: disable=broad-except
-        errors.append(e)
+    # Remove the disruption guard before deleting either slot. The stable
+    # Service is already gone, so no new request can enter while Pods drain.
+    if high_availability:
+        try:
+            policy_api = kubernetes.policy_api(context)
+            _delete_lb_object_if_owned(
+                policy_api.read_namespaced_pod_disruption_budget,
+                policy_api.delete_namespaced_pod_disruption_budget,
+                lb_pdb_name(service_name, resource_scope), namespace,
+                expected_service_hash, expected_api_deployment_name,
+                expected_api_deployment_uid, context, 'PodDisruptionBudget')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+    apps_api = kubernetes.apps_api(context)
+    deployment_names: list[str] = []
+    if high_availability:
+        deployment_names.extend(
+            lb_slot_deployment_name(service_name, slot, resource_scope)
+            for slot in lb_ha.LbSlot)
+    # Also remove the pre-HA Deployment during migration/rollback cleanup.
+    deployment_names.append(lb_deployment_name(service_name, resource_scope))
+    for deployment_name in deployment_names:
+        try:
+            _delete_lb_object_if_owned(
+                apps_api.read_namespaced_deployment,
+                apps_api.delete_namespaced_deployment, deployment_name,
+                namespace, expected_service_hash, expected_api_deployment_name,
+                expected_api_deployment_uid, context, 'Deployment')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
     if errors:
         raise errors[0]
 
@@ -1932,8 +3227,20 @@ def reconcile_lb_objects(live_service_names: set[str]) -> None:
         namespace, label_selector=LB_SELECTOR_LABEL)
     services = kubernetes.core_api(context).list_namespaced_service(
         namespace, label_selector=LB_SELECTOR_LABEL)
-    owning_services = set()
-    for lb_object in list(deployments.items) + list(services.items):
+    try:
+        pdbs = kubernetes.policy_api(
+            context).list_namespaced_pod_disruption_budget(
+                namespace, label_selector=LB_SELECTOR_LABEL)
+        pdb_items = list(pdbs.items)
+    except Exception as e:  # pylint: disable=broad-except
+        # Orphan cleanup is best-effort and repeats on every recovery. Do not
+        # make a transient policy API failure prevent reaping Services and
+        # Deployments, but preserve the failure in logs.
+        logger.warning('Failed to list orphan LB PodDisruptionBudgets: %s', e)
+        pdb_items = []
+    ha_by_incarnation: dict[tuple[str, str, str | None], bool] = {}
+    for lb_object in (list(deployments.items) + list(services.items) +
+                      pdb_items):
         labels = lb_object.metadata.labels or {}
         owning_service = labels.get(SERVE_LB_LABEL_KEY)
         service_hash = labels.get(SERVICE_HASH_LABEL_KEY)
@@ -1956,23 +3263,43 @@ def reconcile_lb_objects(live_service_names: set[str]) -> None:
                 # real API objects always have it. Preserve legacy behavior
                 # for those fixtures.
                 resource_scope = None
-            elif object_name == lb_base_name(owning_service, service_hash):
-                resource_scope = service_hash
-            elif object_name == lb_base_name(owning_service):
-                resource_scope = None
             else:
-                logger.warning(
-                    f'Refusing to reap LB object {object_name!r} for '
-                    f'{owning_service!r}: name matches neither its legacy nor '
-                    'incarnation-scoped identity.')
-                continue
-            owning_services.add((owning_service, service_hash, resource_scope))
+                matched_scope: str | None = None
+                matched = False
+                for candidate_scope in (service_hash, None):
+                    candidate_names = {
+                        lb_base_name(owning_service, candidate_scope),
+                        lb_pdb_name(owning_service, candidate_scope),
+                        *(lb_slot_deployment_name(owning_service, slot,
+                                                  candidate_scope)
+                          for slot in lb_ha.LbSlot),
+                    }
+                    if object_name in candidate_names:
+                        matched_scope = candidate_scope
+                        matched = True
+                        break
+                if matched:
+                    resource_scope = matched_scope
+                else:
+                    logger.warning(
+                        f'Refusing to reap LB object {object_name!r} for '
+                        f'{owning_service!r}: name matches neither its legacy '
+                        'nor incarnation-scoped identity.')
+                    continue
+            key = (owning_service, service_hash, resource_scope)
+            ha_names = {
+                lb_pdb_name(owning_service, resource_scope),
+                *(lb_slot_deployment_name(owning_service, slot, resource_scope)
+                  for slot in lb_ha.LbSlot),
+            }
+            ha_by_incarnation[key] = (ha_by_incarnation.get(key, False) or
+                                      object_name in ha_names)
         elif owning_service is not None:
             logger.warning(f'Refusing to reap legacy LB objects for '
                            f'{owning_service!r} without an incarnation label.')
 
-    for (owning_service, expected_service_hash,
-         resource_scope) in owning_services:
+    for ((owning_service, expected_service_hash, resource_scope),
+         high_availability) in ha_by_incarnation.items():
         # Name reuse can leave A's scoped objects beside live successor B's.
         # Protect only the exact live incarnation; a different current hash is
         # positive proof that this object belongs to the predecessor and is
@@ -1981,13 +3308,17 @@ def reconcile_lb_objects(live_service_names: set[str]) -> None:
         if current_hash == expected_service_hash:
             continue
         if resource_scope is None:
-            delete_lb_objects(
-                owning_service,
-                expected_service_hash,
-                expected_api_deployment_uid=expected_api_deployment_uid)
+            kwargs: dict[str, Any] = {
+                'expected_api_deployment_uid': expected_api_deployment_uid,
+            }
+            if high_availability:
+                kwargs['high_availability'] = True
+            delete_lb_objects(owning_service, expected_service_hash, **kwargs)
         else:
-            delete_lb_objects(
-                owning_service,
-                expected_service_hash,
-                resource_scope=resource_scope,
-                expected_api_deployment_uid=(expected_api_deployment_uid))
+            kwargs = {
+                'resource_scope': resource_scope,
+                'expected_api_deployment_uid': expected_api_deployment_uid,
+            }
+            if high_availability:
+                kwargs['high_availability'] = True
+            delete_lb_objects(owning_service, expected_service_hash, **kwargs)

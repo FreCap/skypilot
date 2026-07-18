@@ -161,8 +161,10 @@ def status(
 
     if history_hours is not None and service_records:
         service_records[0]['replica_status_history'] = (
-            serve_history.get_status_history(service_records[0]['name'],
-                                             hours=history_hours))
+            serve_history.get_status_history(
+                service_records[0]['name'],
+                hours=history_hours,
+                expected_service_hash=service_records[0].get('hash')))
 
     return service_records
 

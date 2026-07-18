@@ -104,10 +104,13 @@ LB_AUTHORIZATION_HEADER_BYTES = LB_AUTHORIZATION_HEADER.lower().encode('ascii')
 # between the Helm values that create RBAC/Secret projections and a separate
 # persisted SkyPilot config flag.
 EXTERNAL_LB_ENABLED_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_LB_ENABLED'
+LB_HA_RBAC_READY_ENV_VAR = 'SKYPILOT_SERVE_LB_HA_RBAC_READY'
 
 # Downward-API-injected UID of the external LB pod. Unlike a process-local
 # UUID, this survives controller restarts as the durable LB incarnation key.
 LB_POD_UID_ENV_VAR = 'SKYPILOT_SERVE_LB_POD_UID'
+LB_SLOT_ENV_VAR = 'SKYPILOT_SERVE_LB_SLOT'
+LB_IMAGE_DIGEST_ENV_VAR = 'SKYPILOT_SERVE_LB_IMAGE_DIGEST'
 LB_RESOURCES_ENV_VAR = 'SKYPILOT_SERVE_LB_RESOURCES_JSON'
 
 # The load balancer's readiness route; exempt from inbound bearer auth so the
@@ -143,6 +146,20 @@ UPDATE_SERVICE_TIMEOUT_SECONDS = 600
 # replica ips for each service, also send the number of requests in last query
 # interval.
 LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
+LB_ROLE_HEARTBEAT_INTERVAL_SECONDS = 2
+LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS = 5
+LB_ROLE_REPORT_MAX_AGE_SECONDS = 3 * LB_ROLE_HEARTBEAT_INTERVAL_SECONDS
+LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS = 15
+LB_DEMAND_HANDOFF_SECONDS = 60
+
+# Keep the external LB client, stable API-server proxy, and controller child
+# routes on one shared contract. A route added to only one layer makes the
+# control channel fail at runtime even when each layer's unit tests pass.
+LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
+LB_CONTROLLER_ROLE_PATH = '/controller/load_balancer_role'
+LB_CONTROLLER_HISTORY_SYNC_PATH = (
+    '/controller/load_balancer_request_history_sync')
+LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
 
 # [boltz fork] The timeout in seconds for the load balancer to sync with the
 # controller (raised from the previous inline 5s). A cold 215-replica routing
@@ -238,9 +255,10 @@ LB_REQUEST_QUEUE_MAX_BODY_BYTES = 1 * 1024 * 1024
 # max_request_body_bytes. Bodies read before admission share a separate runtime
 # budget based on their actual sizes, preserving large queues of small requests
 # without allowing worst-case payloads to exhaust the process.
-# 3,000 supports a three-deep waiting room at the 1,000-replica service ceiling
-# while remaining a finite operator-set bound.
-LB_REQUEST_QUEUE_MAX_SIZE_LIMIT = 3000
+# 10,000 supports the shared-fleet policy of ten waiting requests per machine
+# at the 1,000-replica service ceiling. Actual queued body bytes remain capped
+# independently by LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES.
+LB_REQUEST_QUEUE_MAX_SIZE_LIMIT = 10000
 LB_REQUEST_QUEUE_MAX_CONCURRENCY_LIMIT = 128
 LB_REQUEST_QUEUE_MAX_BODY_BYTES_LIMIT = 16 * 1024 * 1024
 LB_REQUEST_QUEUE_BODY_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024

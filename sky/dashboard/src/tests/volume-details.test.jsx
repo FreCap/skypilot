@@ -5,6 +5,7 @@ jest.mock('@/lib/cache', () => ({
   default: {
     get: jest.fn(),
     invalidate: jest.fn(),
+    invalidateFunction: jest.fn(),
   },
 }));
 
@@ -51,6 +52,12 @@ describe('useVolumeDetails request ownership', () => {
     expect(result.current.volumeData).toBeNull();
     expect(result.current.loading).toBe(true);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(1, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-b' },
+    ]);
   });
 
   it('drops a stale result from the previous route target', async () => {
@@ -161,8 +168,9 @@ describe('useVolumeDetails request ownership', () => {
 
     expect(result.current.volumeData.status).toBe('NEW');
     expect(result.current.loading).toBe(false);
-    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
-    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(getVolumes);
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 });

@@ -9,6 +9,7 @@ from sky import check as sky_check
 from sky import clouds as sky_clouds
 from sky import sky_logging
 from sky.catalog import common
+from sky.catalog import pricing as pricing_utils
 from sky.clouds import cloud
 from sky.provision.slurm import utils as slurm_utils
 from sky.utils import resources_utils
@@ -205,7 +206,7 @@ def list_accelerators_realtime(
         if node_total_gpus > 0:
             pricing = _get_pricing(region=node_info['slurm_cluster_name'],
                                    zone=partition)
-            per_accel = common.get_hourly_cost_from_pricing(
+            per_accel = pricing_utils.get_hourly_cost_from_pricing(
                 pricing,
                 cpus=0,
                 memory=0,
@@ -281,7 +282,7 @@ def _get_pricing(region: str | None, zone: str | None = None) -> dict:
     if region is not None and zone is not None:
         paths.append(('slurm', 'cluster_configs', region, 'partition_configs',
                       zone, 'pricing'))
-    return common.resolve_pricing_config(*paths)
+    return pricing_utils.resolve_pricing_config(*paths)
 
 
 def get_hourly_cost(instance_type: str,
@@ -295,7 +296,7 @@ def get_hourly_cost(instance_type: str,
     """
     del use_spot  # Slurm has no spot pricing.
     instance = slurm_utils.SlurmInstanceType.from_instance_type(instance_type)
-    return common.get_hourly_cost_from_pricing(
+    return pricing_utils.get_hourly_cost_from_pricing(
         _get_pricing(region, zone),
         cpus=instance.cpus,
         memory=instance.memory,

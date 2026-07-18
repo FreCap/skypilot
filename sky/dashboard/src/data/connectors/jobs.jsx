@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { showToast } from '@/data/connectors/toast';
 import {
   API_VERSION_HEADER,
@@ -421,10 +421,13 @@ export async function getManagedJobsWithClientPagination(options) {
   }
 }
 
-export async function getPoolStatus() {
+export async function getPoolStatus({
+  poolNames = null,
+  includeJobCounts = true,
+} = {}) {
   try {
     const response = await apiClient.post(`/jobs/pool_status`, {
-      pool_names: null, // null means get all pools
+      pool_names: poolNames,
     });
     if (!response.ok) {
       const msg = `Initial API request to get pool status failed with status ${response.status}`;
@@ -475,6 +478,13 @@ export async function getPoolStatus() {
     // job counts it computes have nothing to attach to.
     if (poolData.length === 0) {
       return { pools: [], controllerStopped: false };
+    }
+
+    if (!includeJobCounts) {
+      return {
+        pools: poolData.map((pool) => ({ ...pool, jobCounts: {} })),
+        controllerStopped: false,
+      };
     }
 
     // Also fetch managed jobs to get job counts by pool
@@ -532,6 +542,56 @@ export async function getPoolStatus() {
     console.error('Error fetching pools:', error);
     throw error;
   }
+}
+
+// Read only the pool rows needed to validate links on a managed-job detail
+// route. The stable name key prevents unrelated job polling updates from
+// repeating the request, while effect cleanup keeps a superseded route from
+// publishing its result or error.
+export function useManagedJobPools(jobs, jobId) {
+  const poolNamesKey = useMemo(() => {
+    const poolNames = new Set();
+    for (const job of jobs || []) {
+      if (String(job.id) === String(jobId) && job.pool) {
+        poolNames.add(job.pool);
+      }
+    }
+    return JSON.stringify(Array.from(poolNames).sort());
+  }, [jobs, jobId]);
+  const [snapshot, setSnapshot] = useState({ key: null, pools: [] });
+
+  useEffect(() => {
+    let isCurrentRequest = true;
+    const poolNames = JSON.parse(poolNamesKey);
+    if (poolNames.length === 0) {
+      return () => {
+        isCurrentRequest = false;
+      };
+    }
+
+    async function fetchPoolsData() {
+      try {
+        const poolsResponse = await dashboardCache.get(getPoolStatus, [
+          { poolNames, includeJobCounts: false },
+        ]);
+        if (isCurrentRequest) {
+          setSnapshot({ key: poolNamesKey, pools: poolsResponse.pools || [] });
+        }
+      } catch (error) {
+        if (isCurrentRequest) {
+          console.error('Error fetching pools data:', error);
+          setSnapshot({ key: poolNamesKey, pools: [] });
+        }
+      }
+    }
+    fetchPoolsData();
+
+    return () => {
+      isCurrentRequest = false;
+    };
+  }, [poolNamesKey]);
+
+  return snapshot.key === poolNamesKey ? snapshot.pools : [];
 }
 
 // Hook for individual job details that reuses the main jobs cache

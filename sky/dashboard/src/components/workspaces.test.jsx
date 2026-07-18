@@ -14,7 +14,7 @@ import {
   getEnabledCloudsBatch,
   getWorkspaces,
 } from '@/data/connectors/workspaces';
-import { apiClient } from '@/data/connectors/client';
+import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import cachePreloader from '@/lib/cache-preloader';
 import dashboardCache from '@/lib/cache';
 
@@ -65,6 +65,7 @@ jest.mock('@/data/connectors/client', () => ({
     fetch: jest.fn().mockResolvedValue({}),
     get: jest.fn(),
   },
+  getCurrentUserRole: jest.fn(),
 }));
 
 function deferred() {
@@ -105,6 +106,11 @@ describe('Workspaces request lifecycle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     cachePreloader.preloadForPage.mockResolvedValue(undefined);
+    getCurrentUserRole.mockResolvedValue({
+      role: 'admin',
+      name: 'Admin',
+      id: 'admin-id',
+    });
   });
 
   it('runs exactly one aggregation sweep on mount', async () => {
@@ -125,10 +131,6 @@ describe('Workspaces request lifecycle', () => {
   });
 
   it('preserves workspace table filtering, labels, and protected actions', async () => {
-    apiClient.get.mockResolvedValue({
-      ok: true,
-      json: async () => ({ role: 'admin', name: 'Admin' }),
-    });
     dashboardCache.get.mockImplementation((fetcher) => {
       if (fetcher === getWorkspaces) {
         return Promise.resolve({ default: { private: true }, beta: {} });
@@ -153,6 +155,7 @@ describe('Workspaces request lifecycle', () => {
     render(<Workspaces />);
 
     await screen.findByRole('button', { name: 'default' });
+    expect(getCurrentUserRole).not.toHaveBeenCalled();
     expect(screen.getByText('Private')).toBeInTheDocument();
     expect(screen.getByText('Public')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Kubernetes' })).toHaveAttribute(
@@ -189,6 +192,7 @@ describe('Workspaces request lifecycle', () => {
     await waitFor(() => {
       expect(mockRouterPush).toHaveBeenCalledWith('/workspaces/beta');
     });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('columnheader', { name: 'Workspace ↑' }));
     expect(
       screen.getByRole('columnheader', { name: 'Workspace ↓' })
@@ -196,6 +200,7 @@ describe('Workspaces request lifecycle', () => {
 
     fireEvent.click(screen.getByTitle('Delete workspace'));
     expect(await screen.findByText('Delete Workspace')).toBeInTheDocument();
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
   });
 
   it('does not start a request when preload finishes after unmount', async () => {

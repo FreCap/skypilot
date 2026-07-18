@@ -27,6 +27,9 @@ def _make_balancer(policy):
     balancer._last_sync_time = time.monotonic() - 4.0
     # Demand-feed + occupancy state (normally set in __init__).
     balancer._queue_depth = 0
+    balancer._active_request_count = 0
+    balancer._waiting_request_count = 0
+    balancer._waiting_request_body_bytes = 0
     balancer._reject_last_seen = {}
     balancer._reject_fallback_seq = 0
     balancer._capacity_hint = None
@@ -49,7 +52,12 @@ class TestCapacityEndpoint(unittest.TestCase):
         response = asyncio.run(balancer._capacity(mock.MagicMock()))
         body = json.loads(response.body)
         self.assertEqual(body['ready_replicas'], 2)
+        self.assertEqual(body['routing_backend_count'], 2)
+        self.assertEqual(body['occupancy_probed_backend_count'], 0)
         self.assertEqual(body['in_flight'], 3)
+        self.assertEqual(body['local_in_flight'], 0)
+        self.assertEqual(body['request_queue_depth'], 0)
+        self.assertEqual(body['waiting_request_body_bytes'], 0)
         self.assertEqual(body['current_capacity'], 2)
         self.assertEqual(body['in_flight_capacity'], 3)
         self.assertIsNone(body['max_capacity'])
@@ -97,6 +105,9 @@ class TestCapacityEndpoint(unittest.TestCase):
         policy.set_ready_replicas(['http://a:8080'])
         balancer = _make_balancer(policy)
         balancer._queue_depth = 3
+        balancer._active_request_count = 2
+        balancer._waiting_request_count = 1
+        balancer._waiting_request_body_bytes = 4096
         balancer._reject_last_seen = {'job-1': time.monotonic()}
         balancer._capacity_hint = {
             'provisioning_replicas': 4,
@@ -106,6 +117,9 @@ class TestCapacityEndpoint(unittest.TestCase):
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['queue_depth'], 3)
+        self.assertEqual(body['local_in_flight'], 2)
+        self.assertEqual(body['request_queue_depth'], 1)
+        self.assertEqual(body['waiting_request_body_bytes'], 4096)
         self.assertEqual(body['rejected_in_window'], 1)
         self.assertEqual(body['provisioning_replicas'], 4)
         self.assertEqual(body['target_replicas'], 12)
@@ -155,6 +169,8 @@ class TestCapacityEndpoint(unittest.TestCase):
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['probed_replicas'], 2)
+        self.assertEqual(body['routing_backend_count'], 3)
+        self.assertEqual(body['occupancy_probed_backend_count'], 2)
         self.assertEqual(body['busy_replicas'], 1)
         self.assertEqual(body['total_slots'], 2)
         self.assertEqual(body['running_slots'], 1)
@@ -238,6 +254,10 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['max_capacity'], body['max_replicas'])
         self.assertEqual(body['in_flight_capacity'], body['in_flight'])
         self.assertEqual(body['probed_replicas'], 4)
+        # Qualification counts stay in physical backend units even when
+        # admission-facing replica fields switch to logical slot units.
+        self.assertEqual(body['routing_backend_count'], 1)
+        self.assertEqual(body['occupancy_probed_backend_count'], 1)
         self.assertEqual(body['busy_replicas'], 2)
 
     def test_logical_bridge_ignores_routed_physical_backend_capacity(self):

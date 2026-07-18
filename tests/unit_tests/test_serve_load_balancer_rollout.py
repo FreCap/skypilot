@@ -14,6 +14,7 @@ import pytest
 import uvicorn
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import load_balancer
 
 
@@ -78,6 +79,38 @@ def test_draining_rejects_new_inference_requests():
         asyncio.run(lb._proxy_with_retries(mock.MagicMock()))
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers['Retry-After']
+    assert exc_info.value.headers['Connection'] == 'close'
+
+
+def test_ha_armed_slot_can_serve_immediately_after_selector_patch():
+    lb = load_balancer.SkyServeLoadBalancer(
+        controller_url='http://controller:8001',
+        load_balancer_port=30001,
+        lb_slot='b')
+    lb._lb_role = lb_ha.LbRole.ARMED
+    assert lb._accepts_new_requests()
+
+
+def test_ha_standby_and_draining_slots_reject_new_requests():
+    lb = load_balancer.SkyServeLoadBalancer(
+        controller_url='http://controller:8001',
+        load_balancer_port=30001,
+        lb_slot='b')
+    assert not lb._accepts_new_requests()
+    lb._lb_role = lb_ha.LbRole.DRAINING
+    assert not lb._accepts_new_requests()
+
+
+def test_role_draining_closes_rejected_connection():
+    lb = load_balancer.SkyServeLoadBalancer(
+        controller_url='http://controller:8001',
+        load_balancer_port=30001,
+        lb_slot='b')
+    standby_error = lb._inactive_role_request_error()
+    assert 'Connection' not in standby_error.headers
+    lb._lb_role = lb_ha.LbRole.DRAINING
+    draining_error = lb._inactive_role_request_error()
+    assert draining_error.headers['Connection'] == 'close'
 
 
 def test_drain_during_admission_rejects_before_recording_request():
@@ -121,12 +154,18 @@ def test_session_id_missing_fails_closed(monkeypatch):
 def test_health_endpoint_status_codes():
     lb = _make_lb()
     # Cold (not yet synced) -> 503 so k8s readiness holds traffic off.
-    assert asyncio.run(lb._health(None)).status_code == 503
+    response = asyncio.run(lb._health(None))
+    assert response.status_code == 503
+    assert 'connection' not in response.headers
     lb._ready = True
-    assert asyncio.run(lb._health(None)).status_code == 200
+    response = asyncio.run(lb._health(None))
+    assert response.status_code == 200
+    assert 'connection' not in response.headers
     # Draining -> 503 so k8s pulls it from the Service endpoints.
     lb._begin_draining()
-    assert asyncio.run(lb._health(None)).status_code == 503
+    response = asyncio.run(lb._health(None))
+    assert response.status_code == 503
+    assert response.headers['connection'] == 'close'
 
 
 # --- H1 fix: _DrainableServer must suppress uvicorn's own signal handlers when

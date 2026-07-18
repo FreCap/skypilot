@@ -9,6 +9,7 @@ pruned when a replica leaves the ready set.
 # pylint: disable=missing-class-docstring,protected-access
 import asyncio
 import json
+import os
 import threading
 import types
 from typing import Dict, Optional
@@ -19,6 +20,42 @@ import pytest
 from sky.serve import controller
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.utils import yaml_utils
+
+
+def test_update_ignores_stale_submitted_yaml_without_request_declaration():
+    with mock.patch('builtins.open') as open_file:
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {}, 'svc', 5, 'scope')
+
+    assert submitted is None
+    open_file.assert_not_called()
+
+
+def test_update_reads_submitted_yaml_declared_by_request():
+    with mock.patch.object(
+            controller.serve_utils,
+            'generate_submitted_task_yaml_file_name',
+            return_value='/tmp/submitted.yaml'), mock.patch(
+                'builtins.open',
+                mock.mock_open(read_data='service:\n  min_replicas: 2\n')):
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {'has_submitted_yaml': True}, 'svc', 5, 'scope')
+
+    assert submitted == 'service:\n  min_replicas: 2\n'
+
+
+def test_missing_declared_submitted_yaml_does_not_block_update(caplog):
+    with mock.patch.object(
+            controller.serve_utils,
+            'generate_submitted_task_yaml_file_name',
+            return_value='/tmp/missing-submitted.yaml'), mock.patch(
+                'builtins.open', side_effect=FileNotFoundError):
+        submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access
+            {'has_submitted_yaml': True}, 'svc', 5, 'scope')
+
+    assert submitted is None
+    assert 'is unavailable' in caplog.text
 
 
 def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
@@ -37,6 +74,46 @@ def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
 
     assert constructor.call_args.args[-1] is False
     controller_instance.run.assert_called_once_with()
+
+
+def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
+    """The child fence must compare the durable parent owner, not its PID."""
+    actual_controller_class = controller.SkyServeController
+    parent_pid = os.getpid() + 1000
+    observed = {}
+
+    class _WiredController:
+
+        def __init__(self, service_name, _spec, _version, _host, _port,
+                     _fingerprint, _scope, service_hash, controller_pid,
+                     controller_ip, _enforce_launch_fence):
+            self.actual = actual_controller_class.__new__(
+                actual_controller_class)
+            self.actual._service_name = service_name
+            self.actual._service_hash = service_hash
+            self.actual._controller_owner = (controller_pid, controller_ip)
+
+        def run(self):
+            observed['fence'] = self.actual._lb_cutover_fence()
+
+    monkeypatch.setattr(controller, 'SkyServeController', _WiredController)
+    monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
+                        mock.Mock())
+    monkeypatch.setattr(
+        controller.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'hash': 'incarnation-a',
+            'controller_pid': parent_pid,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 7,
+            'lb_ha_enabled': True,
+        })
+
+    controller.run_controller('svc', mock.Mock(), 1, '127.0.0.1', 20001,
+                              'fingerprint', None, 'incarnation-a', parent_pid,
+                              '10.0.0.1', False)
+
+    assert observed['fence'] == ('incarnation-a', (parent_pid, '10.0.0.1'), 7)
 
 
 class _FakeHandle:
@@ -292,6 +369,211 @@ def _make_update_controller() -> controller.SkyServeController:
 
 class TestServiceUpdateReconciler:
 
+    @pytest.mark.parametrize(('explicit', 'expected_transition'),
+                             [(True, True), (None, False)])
+    def test_ha_update_round_trip_preserves_explicit_migration_only(
+            self, explicit, expected_transition):
+        service_config = {}
+        if explicit is not None:
+            service_config['load_balancer'] = {
+                'high_availability': explicit,
+            }
+        original = controller.serve.SkyServiceSpec.from_yaml_config(
+            service_config)
+        yaml_content = yaml_utils.dump_yaml_str(
+            {'service': original.to_yaml_config()})
+        round_tripped = controller.serve.SkyServiceSpec.from_yaml_str(
+            yaml_content)
+        ctrl = _make_update_controller()
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        ctrl._transition_load_balancer_mode = mock.Mock()  # pylint: disable=protected-access
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), mock.patch.object(
+                                   controller.serve_state,
+                                   'add_or_update_version',
+                                   return_value=serve_state.VersionCommitResult.
+                                   COMMITTED) as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, round_tripped, yaml_content, serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
+
+        assert response.status_code == 200
+        if expected_transition:
+            ctrl._transition_load_balancer_mode.assert_called_once_with(  # pylint: disable=protected-access
+                True,
+                round_tripped,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=7)
+            assert commit.call_args.args[2].lb_high_availability
+        else:
+            ctrl._transition_load_balancer_mode.assert_not_called()  # pylint: disable=protected-access
+            assert not commit.call_args.args[2].lb_high_availability
+
+    def test_lb_only_admin_change_reuses_current_committed_spec(self):
+        ctrl = _make_update_controller()
+        current_spec = mock.sentinel.current_spec
+        ctrl._transition_load_balancer_mode = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=current_spec):
+            ctrl._set_load_balancer_high_availability(  # pylint: disable=protected-access
+                True, 'incarnation-a', 7)
+
+        ctrl._transition_load_balancer_mode.assert_called_once_with(  # pylint: disable=protected-access
+            True,
+            current_spec,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=7)
+
+    def test_lb_mode_retry_resumes_interrupted_migration(self):
+        ctrl = _make_update_controller()
+        ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
+        ctrl._lb_session_ledger = mock.Mock()  # pylint: disable=protected-access
+        ctrl._lb_occupancy_contract_known = True  # pylint: disable=protected-access
+        ctrl._lb_last_demand_snapshot = None  # pylint: disable=protected-access
+        ctrl._resource_scope = None  # pylint: disable=protected-access
+        ctrl._owns_current_service = mock.Mock(  # pylint: disable=protected-access
+            return_value=True)
+        target_spec = types.SimpleNamespace(lb_stream_timeout_seconds=30,
+                                            graceful_drain_seconds=60)
+        migrating = controller.lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=controller.lb_ha.LbSlot.A,
+            generation=1,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.MIGRATING,
+            lifecycle_epoch=7)
+        stable = controller.lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=controller.lb_ha.LbSlot.A,
+            generation=1,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.STABLE,
+            lifecycle_epoch=7)
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 7,
+        }
+
+        with mock.patch.object(controller.serve_state,
+                               'get_lb_cutover_state',
+                               side_effect=[migrating, stable]), \
+             mock.patch.object(controller.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(controller.serve_state,
+                               'begin_lb_ha_migration') as begin, \
+             mock.patch.object(controller.lb_k8s,
+                               'require_lb_ha_runtime'), \
+             mock.patch.object(controller.lb_k8s,
+                               'lb_termination_grace_period_seconds',
+                               return_value=90), \
+             mock.patch.object(controller.lb_k8s,
+                               'prepare_lb_mode_transition') as prepare:
+            ctrl._transition_load_balancer_mode(  # pylint: disable=protected-access
+                True,
+                target_spec,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=7)
+
+        begin.assert_not_called()
+        prepare.assert_called_once()
+
+    def test_lb_mode_change_rejects_stale_lifecycle_before_mutation(self):
+        ctrl = _make_update_controller()
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        state = controller.lb_ha.LbCutoverState(
+            enabled=False,
+            active_slot=None,
+            generation=0,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.STABLE,
+            lifecycle_epoch=8)
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 8,
+        }
+
+        with mock.patch.object(controller.serve_state,
+                               'get_lb_cutover_state',
+                               return_value=state), \
+             mock.patch.object(controller.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(controller.serve_state,
+                               'begin_lb_ha_migration') as begin, \
+             pytest.raises(RuntimeError, match='lifecycle changed'):
+            ctrl._transition_load_balancer_mode(  # pylint: disable=protected-access
+                True,
+                mock.Mock(),
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=7)
+
+        begin.assert_not_called()
+
+    def test_lb_mode_retry_resumes_interrupted_rollback(self):
+        ctrl = _make_update_controller()
+        ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
+        ctrl._lb_session_ledger = mock.Mock()  # pylint: disable=protected-access
+        ctrl._lb_last_demand_snapshot = mock.Mock()  # pylint: disable=protected-access
+        ctrl._resource_scope = None  # pylint: disable=protected-access
+        ctrl._owns_current_service = mock.Mock(  # pylint: disable=protected-access
+            return_value=True)
+        target_spec = types.SimpleNamespace(lb_stream_timeout_seconds=30,
+                                            graceful_drain_seconds=60)
+        rolling_back = controller.lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=controller.lb_ha.LbSlot.A,
+            generation=2,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.ROLLING_BACK,
+            lifecycle_epoch=7)
+        stable = controller.lb_ha.LbCutoverState(
+            enabled=False,
+            active_slot=None,
+            generation=0,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.STABLE,
+            lifecycle_epoch=7)
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 7,
+        }
+
+        with mock.patch.object(controller.serve_state,
+                               'get_lb_cutover_state',
+                               side_effect=[rolling_back, stable]), \
+             mock.patch.object(controller.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(controller.serve_state,
+                               'begin_lb_ha_rollback') as begin, \
+             mock.patch.object(controller.lb_k8s,
+                               'lb_termination_grace_period_seconds',
+                               return_value=90), \
+             mock.patch.object(controller.lb_k8s,
+                               'prepare_lb_mode_transition') as prepare:
+            ctrl._transition_load_balancer_mode(  # pylint: disable=protected-access
+                False,
+                target_spec,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=7)
+
+        begin.assert_not_called()
+        prepare.assert_called_once()
+        assert ctrl._lb_ha_enabled is False  # pylint: disable=protected-access
+        assert ctrl._lb_session_ledger is None  # pylint: disable=protected-access
+
     def test_per_gpu_service_rejects_update_to_physical_semantics(self):
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
@@ -344,6 +626,7 @@ class TestServiceUpdateReconciler:
                                        2,
                                        mock.sentinel.spec,
                                        'service: changed',
+                                       submitted_yaml_content=None,
                                        expected_service_hash='incarnation-a',
                                        expected_lifecycle_epoch=7,
                                        expected_controller_owner=(123,
@@ -1312,6 +1595,56 @@ class TestUnknownAsyncOccupancy:
             }, report_is_authoritative)
         assert in_flight == {'http://1.1.1.1:8080': 0}
         assert routing_urls == []
+
+    def test_sole_selected_legacy_pod_retains_migration_stream_authority(self):
+        ctrl = _make_controller()
+        ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
+        authority = controller.lb_k8s.LbPodAuthority(
+            ready_nonterminating_uids={'legacy', 'slot-a', 'slot-b'},
+            live_uids={'legacy', 'slot-a', 'slot-b'},
+            slot_by_uid={
+                'slot-a': controller.lb_ha.LbSlot.A,
+                'slot-b': controller.lb_ha.LbSlot.B,
+            },
+            selected_slot=None,
+            legacy_uids={'legacy'})
+        state = controller.lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=controller.lb_ha.LbSlot.A,
+            generation=1,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.MIGRATING,
+            lifecycle_epoch=9)
+
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               return_value=authority), \
+             mock.patch.object(controller.serve_state,
+                               'get_lb_cutover_state',
+                               return_value=state):
+            assert ctrl._lb_report_authority('legacy') == (True, True, True)
+            assert ctrl._lb_report_authority('slot-a') == (True, False, False)
+
+    def test_ha_apply_preserves_selected_legacy_drain_report(self):
+        ctrl = _make_controller()
+        ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        request = {
+            'lb_session_id': 'legacy',
+            'in_flight': {
+                'http://replica': 3,
+            },
+            'routing_urls': ['http://replica'],
+            'unknown_in_flight_urls': [],
+            'draining_urls': [],
+        }
+
+        accepted = ctrl._apply_load_balancer_report(request, [], {},
+                                                    (True, False, True), {})
+
+        assert accepted
+        ctrl._replica_manager.update_lb_in_flight.assert_called_once_with(
+            {'http://replica': 3}, ['http://replica'], [], [], 'legacy')
 
 
 class _StatefulDemandAutoscaler:

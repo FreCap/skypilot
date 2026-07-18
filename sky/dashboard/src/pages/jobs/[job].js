@@ -19,7 +19,7 @@ import {
 } from '@/components/ui/select';
 import {
   useSingleManagedJob,
-  getPoolStatus,
+  useManagedJobPools,
   computeJobGroupStatus,
 } from '@/data/connectors/jobs';
 import Link from 'next/link';
@@ -47,7 +47,6 @@ import { NonCapitalizedTooltip } from '@/components/utils';
 import { formatJobYaml } from '@/lib/yamlUtils';
 import { UserDisplay } from '@/components/elements/UserDisplay';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
-import dashboardCache from '@/lib/cache';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { usePluginComponents } from '@/plugins/PluginProvider';
 import { checkGrafanaAvailability } from '@/utils/grafana';
@@ -63,7 +62,7 @@ function JobDetails() {
   const { job: jobId, tab } = router.query;
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const { jobData, loading } = useSingleManagedJob(jobId, refreshTrigger);
-  const [poolsData, setPoolsData] = useState([]);
+  const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
@@ -116,20 +115,6 @@ function JobDetails() {
       setIsInitialLoad(false);
     }
   }, [loading, isInitialLoad]);
-
-  // Fetch pools data for hash comparison
-  useEffect(() => {
-    async function fetchPoolsData() {
-      try {
-        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
-        setPoolsData(poolsResponse.pools || []);
-      } catch (error) {
-        console.error('Error fetching pools data:', error);
-        setPoolsData([]);
-      }
-    }
-    fetchPoolsData();
-  }, []);
 
   // Check Grafana availability on mount
   useEffect(() => {

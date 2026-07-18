@@ -879,6 +879,36 @@ class TestCollectDebugDumpManifestParallel:
             'handle': None,
         }
 
+    def test_collection_uses_late_bound_facade_helpers(self):
+        """Facade helper patches continue to control manifest collection."""
+
+        def collect_job(job_id):
+            return ([{
+                'relative_path': f'managed_jobs/{job_id}/job_info.json',
+                'content': str(job_id),
+            }], [], [], 'shared-cluster', {f'controller-{job_id}'})
+
+        with (mock.patch.object(utils,
+                                '_collect_job_debug_manifest',
+                                side_effect=collect_job) as mock_collect_job,
+              mock.patch.object(utils, '_collect_cluster_debug_manifest') as
+              mock_collect_cluster,
+              mock.patch.object(utils, '_collect_controller_system_log_paths')
+              as mock_collect_controller_logs):
+            result = utils.collect_debug_dump_manifest([1, 2])
+
+        assert [item['content'] for item in result['inline_data']] == ['1', '2']
+        assert not result['file_paths']
+        assert not result['errors']
+        assert mock_collect_job.call_args_list == [mock.call(1), mock.call(2)]
+        mock_collect_cluster.assert_called_once_with('shared-cluster',
+                                                     'managed_jobs/1',
+                                                     result['inline_data'],
+                                                     result['errors'])
+        mock_collect_controller_logs.assert_called_once_with(
+            result['file_paths'], result['errors'],
+            {'controller-1', 'controller-2'})
+
     @mock.patch('sky.jobs.utils.debug_dump_helpers.get_cluster_events_data')
     @mock.patch('sky.jobs.utils.debug_dump_helpers.serialize_cluster_record')
     @mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name')

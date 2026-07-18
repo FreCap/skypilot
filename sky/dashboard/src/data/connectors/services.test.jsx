@@ -558,8 +558,30 @@ describe('normalizeService / normalizeReplica', () => {
     expect(service.onDemandHourlyCost).toBe(4);
     expect(service.pricedReplicaCount).toBe(2);
     expect(service.hourlyCostExcludedReplicaCount).toBe(1);
-    // A partial fleet price must not produce an understated per-request cost.
+    expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
+    // Report measurable cloud spend while keeping the excluded capacity
+    // explicit in the UI.
+    expect(service.costPerThousandRequests).toBe(3.0555555555555554);
+  });
+
+  it('does not price an all-Kubernetes fleet without cost data', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        requests_per_second: 0.5,
+        replica_info: [
+          {
+            replica_id: 1,
+            status: 'READY',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+        ],
+      })
+    );
+
+    expect(service.estimatedHourlyCost).toBeNull();
     expect(service.costPerThousandRequests).toBeNull();
+    expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
   });
 
   it('handles a service with no replica_info', () => {

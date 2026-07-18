@@ -33,8 +33,25 @@ def patched_state(monkeypatch):
         # branch off the storage-read fallback.
         'yaml_content': 'run: echo hi\n',
     }
+    minimal_record = {
+        'name': record['name'],
+        'controller_job_id': None,
+        'controller_port': record['controller_port'],
+        'load_balancer_port': None,
+        'status': serve_state.ServiceStatus.READY,
+        'pool': record['pool'],
+        'controller_pid': None,
+        'controller_ip': None,
+        'hash': record['hash'],
+        'lifecycle_epoch': None,
+        'resource_scope': None,
+    }
     monkeypatch.setattr(serve_state, 'get_service_from_name',
                         lambda name: dict(record))
+    monkeypatch.setattr(
+        serve_state,
+        'get_service_status_snapshot',
+        lambda name, require_version=False: dict(minimal_record))
     replicas = [
         _fake_replica(serve_state.ReplicaStatus.READY),
         _fake_replica(serve_state.ReplicaStatus.READY),
@@ -104,8 +121,25 @@ class TestGetServiceStatusSummary:
             'version': 1,
             'hash': 'incarnation-a',
         }
+        minimal_record = {
+            'name': 'pool-a',
+            'controller_job_id': None,
+            'controller_port': 30001,
+            'load_balancer_port': None,
+            'status': serve_state.ServiceStatus.READY,
+            'pool': True,
+            'controller_pid': None,
+            'controller_ip': None,
+            'hash': 'incarnation-a',
+            'lifecycle_epoch': None,
+            'resource_scope': None,
+        }
         monkeypatch.setattr(serve_state, 'get_service_from_name',
                             lambda name: dict(record))
+        monkeypatch.setattr(
+            serve_state,
+            'get_service_status_snapshot',
+            lambda name, require_version=False: dict(minimal_record))
         get_yaml = mock.Mock(return_value='pool: yaml')
         read_yaml = mock.Mock()
         monkeypatch.setattr(serve_utils, 'get_yaml_content', get_yaml)
@@ -236,6 +270,71 @@ class TestGetServiceStatusSummary:
         autoscaler.assert_not_called()
         assert 'target_num_replicas' not in record
 
+    def test_minimal_status_uses_slim_snapshot(self, monkeypatch):
+        snapshot = {
+            'name': 'svc',
+            'controller_job_id': 7,
+            'controller_port': 30001,
+            'load_balancer_port': 8080,
+            'status': serve_state.ServiceStatus.READY,
+            'pool': False,
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'hash': 'incarnation-a',
+            'lifecycle_epoch': 3,
+            'resource_scope': 'scope-a',
+        }
+        get_snapshot = mock.Mock(return_value=dict(snapshot))
+        monkeypatch.setattr(serve_state, 'get_service_status_snapshot',
+                            get_snapshot)
+        monkeypatch.setattr(
+            serve_state, 'get_service_from_name', lambda name:
+            (_ for _ in ()).throw(
+                AssertionError('minimal path must not join latest spec')))
+
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_yaml=False,
+            with_target_num_replicas=False,
+            status_snapshot_only=True)
+
+        get_snapshot.assert_called_once_with('svc', require_version=True)
+        assert record == snapshot
+
+    def test_status_snapshot_rejects_enrichment(self):
+        with pytest.raises(ValueError, match='cannot include service'):
+            serve_utils._get_service_status(  # pylint: disable=protected-access
+                'svc',
+                pool=False,
+                status_snapshot_only=True)
+
+    def test_yaml_free_status_keeps_latest_spec_by_default(self, monkeypatch):
+        full_record = {
+            'name': 'svc',
+            'pool': False,
+            'hash': 'incarnation-a',
+            'yaml_content': None,
+        }
+        get_full_record = mock.Mock(return_value=dict(full_record))
+        get_snapshot = mock.Mock(
+            side_effect=AssertionError('slim snapshots must be explicit'))
+        monkeypatch.setattr(serve_state, 'get_service_from_name',
+                            get_full_record)
+        monkeypatch.setattr(serve_state, 'get_service_status_snapshot',
+                            get_snapshot)
+
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_yaml=False)
+
+        assert record == full_record
+        get_full_record.assert_called_once_with('svc')
+        get_snapshot.assert_not_called()
+
     def test_full_status_unaffected(self, patched_state, monkeypatch):
         # with_replica_info=True keeps the original full contract.
         monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: [])
@@ -264,13 +363,15 @@ class TestUpdateServiceStatusLookup:
             version=2,
             mode='rolling',
             pool=False,
-            expected_service_hash='incarnation-a')
+            expected_service_hash='incarnation-a',
+            has_submitted_yaml=True)
 
         get_status.assert_called_once_with('svc',
                                            pool=False,
                                            with_replica_info=False,
                                            with_yaml=False)
         post.assert_called_once()
+        assert post.call_args.kwargs['json']['has_submitted_yaml'] is True
 
 
 class TestGetServiceStatusPickledSummary:

@@ -1,9 +1,10 @@
 import { apiClient } from '@/data/connectors/client';
 import { getErrorMessageFromResponse } from '@/data/utils';
 
-export async function getVolumes() {
+export async function getVolumes({ name } = {}) {
   try {
-    const data = await apiClient.fetch('/volumes', {}, 'GET');
+    const query = name ? `?name=${encodeURIComponent(name)}` : '';
+    const data = await apiClient.fetch(`/volumes${query}`, {}, 'GET');
     // Transform the data to match the expected format
     const transformedData =
       data.map((volume) => {

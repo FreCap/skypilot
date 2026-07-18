@@ -28,6 +28,7 @@ logger = sky_logging.init_logger(__name__)
 def up(
     task: 'sky.Task',
     service_name: str | None = None,
+    submitted_yaml_content: str | None = None,
 ) -> tuple[str, str]:
     """Spins up a service.
 
@@ -42,14 +43,18 @@ def up(
             argument.
         endpoint: str; The service endpoint.
     """
-    return impl.up(task, service_name, pool=False)
+    return impl.up(task,
+                   service_name,
+                   pool=False,
+                   submitted_yaml_content=submitted_yaml_content)
 
 
 @usage_lib.entrypoint
 def update(task: Optional['sky.Task'],
            service_name: str,
            mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
-           workers: int | None = None) -> None:
+           workers: int | None = None,
+           submitted_yaml_content: str | None = None) -> None:
     """Updates an existing service.
 
     Please refer to the sky.cli.serve_update for the document.
@@ -62,7 +67,12 @@ def update(task: Optional['sky.Task'],
         workers: Number of workers/replicas to set for the service when
             task is None.
     """
-    return impl.update(task, service_name, mode, pool=False, workers=workers)
+    return impl.update(task,
+                       service_name,
+                       mode,
+                       pool=False,
+                       workers=workers,
+                       submitted_yaml_content=submitted_yaml_content)
 
 
 @usage_lib.entrypoint
@@ -71,6 +81,14 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
     """Roll out a new generation from an immutable stored version."""
     return impl.elect_version(service_name, version, expected_service_hash,
                               expected_elected_version)
+
+
+@usage_lib.entrypoint
+def set_load_balancer_high_availability(service_name: str, enabled: bool,
+                                        expected_service_hash: str) -> None:
+    """Change a service's external-LB topology without a model rollout."""
+    return impl.set_load_balancer_high_availability(service_name, enabled,
+                                                    expected_service_hash)
 
 
 @usage_lib.entrypoint

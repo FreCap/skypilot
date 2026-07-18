@@ -391,6 +391,13 @@ def apps_api(context: str | None = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
+def policy_api(context: str | None = None):
+    return kubernetes.client.PolicyV1Api(api_client=_get_api_client(context))
+
+
+@_api_logging_decorator('urllib3', logging.ERROR)
+@annotations.lru_cache(scope='request')
+@_retryable_kubernetes_client
 def batch_api(context: str | None = None):
     return kubernetes.client.BatchV1Api(api_client=_get_api_client(context))
 

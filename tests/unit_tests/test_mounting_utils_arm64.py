@@ -1,5 +1,7 @@
 """Unit tests for ARM64 mounting utilities in sky.data.mounting_utils."""
 
+# pylint: disable=protected-access
+
 import unittest
 from unittest import mock
 
@@ -230,6 +232,53 @@ class TestMountingUtilsArm64(unittest.TestCase):
         self.assertIn('MOUNT_BINARY=goofys', script)
         # Should check for goofys installation
         self.assertIn('[ -x "$(command -v goofys)" ]', script)
+
+    def test_mounting_command_uses_public_script_renderer(self):
+        """The command wrapper keeps the historical facade patch point."""
+        with mock.patch.object(
+                mounting_utils,
+                'get_mounting_script',
+                return_value='characterized mounting script') as renderer:
+            with mock.patch.object(mounting_utils.random,
+                                   'randint',
+                                   return_value=123456):
+                command = mounting_utils.get_mounting_command(
+                    self.mount_path, 'install command', 'rclone mount command',
+                    'version check')
+
+        renderer.assert_called_once_with(self.mount_path,
+                                         'rclone mount command',
+                                         'install command', 'version check')
+        self.assertEqual(
+            command, "echo 'characterized mounting script' > "
+            '~/.sky/mount_123456.sh && chmod +x '
+            '~/.sky/mount_123456.sh && bash ~/.sky/mount_123456.sh && '
+            'rm ~/.sky/mount_123456.sh')
+
+    def test_mounting_facade_owns_public_function_identities(self):
+        """Public and historically patchable functions remain on the facade."""
+        self.assertEqual(mounting_utils._get_mount_binary.__module__,
+                         'sky.data.mounting_utils')
+        self.assertEqual(mounting_utils.get_mounting_script.__module__,
+                         'sky.data.mounting_utils')
+        self.assertEqual(mounting_utils.get_mounting_command.__module__,
+                         'sky.data.mounting_utils')
+
+    def test_mount_script_preserves_lifecycle_order_and_version_check(self):
+        script = mounting_utils.get_mounting_script(
+            self.mount_path, 'rclone mount :s3:bucket /mnt/test --daemon',
+            'install rclone', 'rclone --version | grep expected-version')
+
+        lifecycle_markers = [
+            'findmnt -rn -T "$MOUNT_PATH"',
+            '[ -x "$(command -v rclone)" ] && rclone --version',
+            'sudo mkdir -p "$MOUNT_PATH"',
+            'rclone mount :s3:bucket /mnt/test --daemon',
+            'MOUNT_EXIT_CODE=$?',
+            'exit $MOUNT_EXIT_CODE',
+        ]
+        positions = [script.index(marker) for marker in lifecycle_markers]
+        self.assertEqual(positions, sorted(positions))
 
     def test_architecture_specific_package_selection(self):
         """Test that ARM and x86_64 use different package suffixes."""

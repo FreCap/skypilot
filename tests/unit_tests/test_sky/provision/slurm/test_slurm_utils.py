@@ -1,8 +1,62 @@
 """Unit tests for sky.provision.slurm.utils."""
 
+import pickle
+
 import pytest
 
 from sky.provision.slurm import utils
+
+
+class TestSlurmInstanceType:
+    """Characterize the public virtual instance type value model."""
+
+    @pytest.mark.parametrize('name,expected', [
+        ('4CPU--16GB', (4.0, 16.0, None, None)),
+        ('0.5CPU--1.5GB', (0.5, 1.5, None, None)),
+        ('4CPU--16GB--A100-80GB:2', (4.0, 16.0, 2, 'A100-80GB')),
+    ])
+    def test_parse_and_render(self, name, expected):
+        instance_type = utils.SlurmInstanceType.from_instance_type(name)
+
+        assert (instance_type.cpus, instance_type.memory,
+                instance_type.accelerator_count,
+                instance_type.accelerator_type) == expected
+        assert instance_type.name == name
+        assert str(instance_type) == name
+
+    @pytest.mark.parametrize('name', [
+        '',
+        '4CPU',
+        '4CPU--16GB--H100:1.5',
+        '4CPU--16GB--H100',
+    ])
+    def test_rejects_invalid_names(self, name):
+        assert not utils.SlurmInstanceType.is_valid_instance_type(name)
+        with pytest.raises(ValueError, match='Invalid instance name'):
+            utils.SlurmInstanceType.from_instance_type(name)
+
+    def test_from_resources_rounds_accelerators_and_preserves_repr(self):
+        instance_type = utils.SlurmInstanceType.from_resources(
+            cpus=1.5,
+            memory=3.25,
+            accelerator_count=1.2,
+            accelerator_type='H100',
+        )
+
+        assert instance_type.name == '1.5CPU--3.2GB--H100:2'
+        assert repr(instance_type) == (
+            "SlurmInstanceType(cpus=1.5, memory=3.25, "
+            "accelerator_count=2, accelerator_type='H100')")
+
+    def test_historical_module_and_pickle_identity(self):
+        instance_type = utils.SlurmInstanceType.from_instance_type(
+            '4CPU--16GB--H100:1')
+
+        assert utils.SlurmInstanceType.__module__ == (
+            'sky.provision.slurm.utils')
+        restored = pickle.loads(pickle.dumps(instance_type))
+        assert type(restored) is utils.SlurmInstanceType
+        assert restored.name == instance_type.name
 
 
 class TestFormatSlurmDuration:

@@ -1,4 +1,5 @@
 import os
+import pickle
 import tempfile
 import time
 from unittest import mock
@@ -370,6 +371,16 @@ def test_filter_with_local_disk_instance_sets(local_disk, expected_instances):
 # -- get_hourly_cost_from_pricing (common function, dict-based) ------------
 
 
+def test_common_preserves_pricing_entrypoints():
+    for function in (
+            catalog_common.merge_pricing_dicts,
+            catalog_common.resolve_pricing_config,
+            catalog_common.get_hourly_cost_from_pricing,
+    ):
+        assert function.__module__ == 'sky.catalog.common'
+        assert pickle.loads(pickle.dumps(function)) is function
+
+
 def test_cpu_only_instance_uses_cpu_memory_pricing():
     """CPU-only: 4CPU--16GB with rates 0.05/0.01 -> $0.36/hr."""
     pricing = {'cpu': 0.05, 'memory': 0.01}
@@ -589,6 +600,47 @@ def _mock_get_nested(config):
         return obj
 
     return _get
+
+
+@mock.patch('sky.skypilot_config.get_nested')
+def test_resolve_pricing_config_preserves_path_priority(mock_nested):
+    """Later config paths override earlier paths without losing siblings."""
+    paths = (
+        ('slurm', 'pricing'),
+        ('slurm', 'cluster_configs', 'cluster', 'pricing'),
+        ('slurm', 'cluster_configs', 'cluster', 'partition_configs',
+         'partition', 'pricing'),
+    )
+    mock_nested.side_effect = [
+        {
+            'cpu': 0.04,
+            'memory': 0.01,
+            'accelerators': {
+                'V100': 2.5
+            },
+        },
+        None,
+        {
+            'cpu': 0.08,
+            'accelerators': {
+                'A100': 5.0
+            },
+        },
+    ]
+
+    pricing = catalog_common.resolve_pricing_config(*paths)
+
+    assert pricing == {
+        'cpu': 0.08,
+        'memory': 0.01,
+        'accelerators': {
+            'V100': 2.5,
+            'A100': 5.0,
+        },
+    }
+    assert mock_nested.call_args_list == [
+        mock.call(path, default_value=None) for path in paths
+    ]
 
 
 @mock.patch('sky.skypilot_config.get_nested')

@@ -25,6 +25,8 @@ from sky import sky_logging
 from sky import task as task_lib
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
+from sky.serve import lb_ha
+from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
@@ -92,6 +94,24 @@ def _make_controller_owner_dependency(
                 status_code=409, detail='Controller owner identity mismatch.')
 
     return _verify
+
+
+def _read_declared_submitted_yaml(request_data: dict[str, Any],
+                                  service_name: str, version: int,
+                                  resource_scope: str | None) -> str | None:
+    """Read only the submitted YAML declared by this update request."""
+    if request_data.get('has_submitted_yaml') is not True:
+        return None
+    path = serve_utils.generate_submitted_task_yaml_file_name(
+        service_name, version, resource_scope=resource_scope)
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except OSError as e:
+        logger.warning(
+            'Submitted YAML declared for service %r version %s '
+            'is unavailable at %s: %s', service_name, version, path, e)
+        return None
 
 
 class AutoscalerInfoFilter(logging.Filter):
@@ -164,6 +184,31 @@ class SkyServeController:
         # construction fails if an earlier asyncio.run() closed the thread's
         # current loop.
         self._lb_sync_lock: asyncio.Lock | None = None
+        self._lb_role_lock: asyncio.Lock | None = None
+        durable_lb_state = (serve_state.get_lb_cutover_state(service_name)
+                            if service_hash is not None else None)
+        self._lb_ha_enabled = (
+            durable_lb_state.enabled if durable_lb_state is not None else
+            getattr(service_spec, 'lb_high_availability', False) is True)
+        self._lb_session_ledger = (lb_ha.LbSessionLedger(
+            serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
+            serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+                                   if self._lb_ha_enabled else None)
+        self._lb_expected_occupancy_urls: set[str] = set()
+        # An empty set means "synchronous service" only after one complete
+        # routing sync. Before that, it means "contract unknown" and must not
+        # make promotion vacuously safe after a controller restart.
+        self._lb_occupancy_contract_known = False
+        self._lb_last_demand_snapshot = (
+            serve_state.get_lb_last_demand_snapshot(service_name)
+            if self._lb_ha_enabled else None)
+        self._lb_demand_handoff = lb_ha.DemandHandoff(
+            serve_constants.LB_DEMAND_HANDOFF_SECONDS)
+        self._lb_drain_timeout_seconds = (
+            lb_k8s.lb_termination_grace_period_seconds(
+                service_spec.lb_stream_timeout_seconds,
+                service_spec.graceful_drain_seconds)
+            if self._lb_ha_enabled else 0)
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
@@ -618,6 +663,40 @@ class SkyServeController:
         if session_id is None or pod_authority is None:
             return False, False, False
         reporter_is_live = session_id in pod_authority.live_uids
+        if pod_authority.slot_by_uid is not None:
+            reporter_slot = pod_authority.slot_by_uid.get(session_id)
+            try:
+                state = serve_state.get_lb_cutover_state(self._service_name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Failed to read HA load balancer authority: '
+                               f'{common_utils.format_exception(e)}')
+                return False, False, False
+            coherent = (state is not None and state.enabled and
+                        state.active_slot is not None and
+                        state.active_slot == pod_authority.selected_slot)
+            active_slot = state.active_slot if state is not None else None
+            reporter_ready = (reporter_is_live and session_id
+                              in pod_authority.ready_nonterminating_uids)
+            legacy_selected = (state is not None and state.phase
+                               in (lb_ha.LbCutoverPhase.MIGRATING,
+                                   lb_ha.LbCutoverPhase.ROLLING_BACK) and
+                               pod_authority.selected_slot is None and
+                               pod_authority.legacy_uids is not None and
+                               session_id in pod_authority.legacy_uids)
+            live_slot_uids = (set(pod_authority.slot_by_uid) &
+                              pod_authority.live_uids)
+            legacy_drain_authoritative = (
+                legacy_selected and
+                pod_authority.legacy_uids == {session_id} and
+                state is not None and
+                (state.phase is lb_ha.LbCutoverPhase.MIGRATING or
+                 not live_slot_uids))
+            demand_authoritative = reporter_ready and (
+                (coherent and reporter_slot == active_slot) or legacy_selected)
+            # HA drain authority is service-wide and comes from the bounded
+            # ACTIVE+DRAINING session ledger, never a single Pod report.
+            return (reporter_is_live, demand_authoritative,
+                    legacy_drain_authoritative)
         demand_authoritative = (pod_authority.ready_nonterminating_uids == {
             session_id
         })
@@ -719,6 +798,7 @@ class SkyServeController:
         """Synchronously mutate runtime state from one prepared LB report."""
         (reporter_is_live, demand_authoritative,
          drain_authoritative) = authority
+        ha_enabled = getattr(self, '_lb_ha_enabled', False)
         if not reporter_is_live:
             logger.warning('Ignoring non-authoritative load balancer demand '
                            'and drain report for service '
@@ -730,22 +810,74 @@ class SkyServeController:
             return True
 
         if demand_authoritative:
+            effective_request_data = request_data
+            if ha_enabled:
+                state = serve_state.get_lb_cutover_state(self._service_name)
+                if (state is not None and
+                        state.phase is not lb_ha.LbCutoverPhase.PREPARING):
+                    self._restore_lb_demand_handoff(state.generation)
+                    sampled_urls = set(
+                        request_data.get('occupancy_sampled_urls', []))
+                    complete_report = bool(
+                        getattr(self, '_lb_occupancy_contract_known',
+                                False)) and getattr(
+                                    self, '_lb_expected_occupancy_urls',
+                                    set()).issubset(sampled_urls)
+                    handoff = getattr(self, '_lb_demand_handoff', None)
+                    if handoff is not None:
+                        if (complete_report and
+                                handoff.complete_report_at is None and
+                                handoff.generation == state.generation):
+                            fence = self._lb_cutover_fence()
+                            if fence is not None:
+                                service_hash, owner, lifecycle_epoch = fence
+                                complete_at = (
+                                    serve_state.mark_lb_demand_handoff_complete(
+                                        self._service_name, service_hash, owner,
+                                        lifecycle_epoch, state.generation))
+                                handoff.restore(handoff.generation,
+                                                handoff.snapshot, complete_at)
+                        handoff_generation = handoff.generation
+                        effective_request_data = handoff.apply(
+                            state.generation, request_data, complete_report)
+                        if (handoff_generation is not None and
+                                handoff.generation is None):
+                            fence = self._lb_cutover_fence()
+                            if fence is not None:
+                                service_hash, owner, lifecycle_epoch = fence
+                                serve_state.clear_lb_demand_handoff(
+                                    self._service_name, service_hash, owner,
+                                    lifecycle_epoch, handoff_generation)
+                demand_snapshot = lb_ha.DemandSnapshot.from_request(
+                    request_data)
+                self._lb_last_demand_snapshot = demand_snapshot
+                if (state is not None and state.active_slot is not None and
+                        state.phase in (lb_ha.LbCutoverPhase.STABLE,
+                                        lb_ha.LbCutoverPhase.DRAINING)):
+                    fence = self._lb_cutover_fence()
+                    if fence is not None:
+                        service_hash, owner, lifecycle_epoch = fence
+                        serve_state.record_lb_active_demand_snapshot(
+                            self._service_name, service_hash, owner,
+                            lifecycle_epoch, state.active_slot,
+                            state.generation, demand_snapshot)
             # Parse reporter-controlled demand only after its dedicated gate.
             # Besides preventing state mutation, this keeps a stale/wrong Pod
             # from making the controller reject a useful routing response with
             # a malformed demand-only field.
-            request_aggregator: dict[str, Any] = request_data.get(
+            request_aggregator: dict[str, Any] = effective_request_data.get(
                 'request_aggregator', {})
             timestamps: list[int] = request_aggregator.get('timestamps', [])
             logger.info(f'Received {len(timestamps)} inflight requests.')
             translated_in_flight = self._translate_in_flight(
-                request_data.get('in_flight'))
+                effective_request_data.get('in_flight'))
             unknown_replica_ids = self._unknown_async_replica_ids(
                 replica_infos,
                 async_occupancy_by_version,
-                request_data.get('occupancy_sampled_urls', []),
-                request_data.get('unknown_in_flight_urls', []),
-                force_all_live_unknown=not drain_authoritative)
+                effective_request_data.get('occupancy_sampled_urls', []),
+                effective_request_data.get('unknown_in_flight_urls', []),
+                force_all_live_unknown=(not drain_authoritative and
+                                        not ha_enabled))
             self._reconcile_generation = getattr(self, '_reconcile_generation',
                                                  0) + 1
             reconcile_generation = self._reconcile_generation
@@ -760,11 +892,12 @@ class SkyServeController:
                 # be finishing a long stream. Replacement becomes eligible
                 # only from a sole-live authoritative reporter's real probe
                 # miss.
-                'unknown_capacity_replica_ids':
-                    list(unknown_replica_ids if drain_authoritative else ()),
+                'unknown_capacity_replica_ids': list(unknown_replica_ids if (
+                    drain_authoritative or ha_enabled) else ()),
                 'reconcile_generation': reconcile_generation,
-                'queue_depth': request_data.get('queue_depth'),
-                'rejected_in_window': request_data.get('rejected_in_window'),
+                'queue_depth': effective_request_data.get('queue_depth'),
+                'rejected_in_window':
+                    effective_request_data.get('rejected_in_window'),
             })
             if (translated_in_flight is not None and getattr(
                     self._autoscaler, 'replica_unit', None) == 'logical'):
@@ -775,6 +908,12 @@ class SkyServeController:
                     in_flight_by_replica_id=translated_in_flight,
                     unknown_replica_ids=unknown_replica_ids)
 
+        if ha_enabled and not drain_authoritative:
+            # The fast role channel aggregates ACTIVE and DRAINING sessions.
+            # A slot sync must never overwrite that service-wide view. During
+            # legacy-selected migration/rollback, the sole legacy Pod remains
+            # the stream authority until the stable selector actually moves.
+            return True
         if drain_authoritative:
             drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
                 request_data, report_is_authoritative=True)
@@ -824,6 +963,12 @@ class SkyServeController:
             lb_replica_info, num_ready = await loop.run_in_executor(
                 None, self._get_lb_replica_info, replica_infos,
                 async_occupancy_by_version)
+            if isinstance(lb_replica_info, dict):
+                self._lb_expected_occupancy_urls = {
+                    url for url, info in lb_replica_info.items()
+                    if str(info.get('async_occupancy', '')).lower() == 'true'
+                }
+                self._lb_occupancy_contract_known = True
             # History is incarnation-scoped and never changes runtime state,
             # so it may finish before the final ownership fence even if this
             # controller loses the service mid-write.
@@ -850,15 +995,553 @@ class SkyServeController:
             )
             self._replica_counts_snapshot = self._get_replica_counts(
                 replica_infos)
-            return responses.JSONResponse(content={
+            response_content = {
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
                 'capacity_hint': self._get_capacity_hint(
                     replica_infos, logical_versions),
                 'request_history_accepted': request_history_accepted,
-            },
+            }
+            if getattr(self, '_lb_ha_enabled', False):
+                response_content['service_version'] = self._applied_version
+            return responses.JSONResponse(content=response_content,
                                           status_code=200)
+
+    def _lb_cutover_fence(
+        self,) -> tuple[str, tuple[int | None, str | None], int] | None:
+        """Return the current incarnation/owner/epoch fence or fail closed."""
+        owner = serve_state.get_service_controller_owner(self._service_name,
+                                                         include_lb_state=True)
+        if (owner is None or not owner.get('lb_ha_enabled') or
+                not owner.get('hash') or owner.get('lifecycle_epoch') is None):
+            return None
+        expected_owner = self._controller_owner
+        actual_owner = (owner.get('controller_pid'), owner.get('controller_ip'))
+        if expected_owner is None or actual_owner != expected_owner:
+            return None
+        return (str(owner['hash']), actual_owner, int(owner['lifecycle_epoch']))
+
+    def _lb_promotion_report_is_current(self, request_data: dict[str,
+                                                                 Any]) -> bool:
+        if not getattr(self, '_lb_occupancy_contract_known', False):
+            return False
+        routing_version = request_data.get('routing_version')
+        if (not isinstance(routing_version, int) or
+                isinstance(routing_version, bool) or
+                routing_version != self._applied_version):
+            return False
+        sample_generations = request_data.get('occupancy_sample_generation', {})
+        sample_ages = request_data.get('occupancy_sample_age_seconds', {})
+        if not isinstance(sample_generations, dict) or not isinstance(
+                sample_ages, dict):
+            return False
+        return lb_ha.occupancy_samples_are_promotable(
+            self._lb_expected_occupancy_urls, sample_generations, sample_ages,
+            serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+
+    def _restore_lb_demand_handoff(self, generation: int) -> None:
+        handoff = self._lb_demand_handoff
+        if handoff.generation == generation:
+            return
+        durable_generation, snapshot, complete_at = (
+            serve_state.get_lb_demand_handoff(self._service_name))
+        handoff.restore(durable_generation, snapshot, complete_at)
+
+    def _publish_ha_drain_view(self,
+                               authority: lb_k8s.LbPodAuthority,
+                               state: lb_ha.LbCutoverState,
+                               legacy_selected: bool = False) -> None:
+        """Publish one service-wide ACTIVE+DRAINING drain snapshot."""
+        if (legacy_selected and state.phase is lb_ha.LbCutoverPhase.MIGRATING):
+            # The selected legacy Pod publishes the only authoritative drain
+            # view through the regular sync path. Idle warm slots must not
+            # overwrite it before migration.
+            return
+        ledger = self._lb_session_ledger
+        if ledger is None or authority.slot_by_uid is None:
+            return
+        ledger.discard_dead(authority.live_uids)
+        stream_owner_slots = {state.active_slot}
+        if (state.phase is lb_ha.LbCutoverPhase.DRAINING and
+                state.pending_slot is not None):
+            stream_owner_slots.add(state.pending_slot)
+        stream_owner_ids = {
+            session_id for session_id, slot in authority.slot_by_uid.items()
+            if session_id in authority.live_uids and slot in stream_owner_slots
+        }
+        legacy_stream_owner_ids = ((authority.legacy_uids or set()) &
+                                   authority.live_uids)
+        if (state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK and
+                not legacy_selected):
+            # A terminating migration tail can still own streams when an
+            # immediate rollback enters ROLLING_BACK but cannot yet create or
+            # select the replacement legacy Deployment. A fresh unselected
+            # legacy candidate has never received traffic and is excluded.
+            legacy_stream_owner_ids &= authority.terminating_uids or set()
+        if legacy_stream_owner_ids:
+            # A legacy Pod remains a possible stream owner after the migration
+            # selector moves and throughout its termination grace. During
+            # rollback, it becomes a possible owner as soon as the selector
+            # moves back. Legacy processes do not use the role ledger, so
+            # including their UID deliberately makes the aggregate incomplete
+            # and blocks backend drain decisions until the topology settles.
+            stream_owner_ids.update(legacy_stream_owner_ids)
+        report = ledger.aggregate(stream_owner_ids)
+        if report.complete:
+            in_flight = report.in_flight
+            routing_urls = report.routing_urls
+            unknown_urls = report.unknown_urls
+            draining_urls = report.draining_urls
+        else:
+            # A missing stream-owner report is not evidence of idleness.
+            in_flight, routing_urls, unknown_urls, draining_urls = {}, None, [], []
+        self._replica_manager.update_lb_in_flight(
+            in_flight, routing_urls, unknown_urls, draining_urls,
+            f'ha-generation-{state.generation}')
+
+    def _rollback_active_slot_is_drained(self, authority: lb_k8s.LbPodAuthority,
+                                         state: lb_ha.LbCutoverState) -> bool:
+        """Return whether rollback may retire the formerly active slot."""
+        if (state.phase is not lb_ha.LbCutoverPhase.ROLLING_BACK or
+                state.active_slot is None or authority.slot_by_uid is None):
+            return False
+        active_ids = {
+            session_id for session_id, slot in authority.slot_by_uid.items()
+            if session_id in authority.live_uids and slot is state.active_slot
+        }
+        if not active_ids:
+            return True
+        ledger = self._lb_session_ledger
+        if ledger is None:
+            return False
+        ledger.discard_dead(authority.live_uids)
+        report = ledger.aggregate(active_ids,
+                                  required_applied_role=lb_ha.LbRole.DRAINING,
+                                  required_applied_generation=state.generation)
+        # Only process-local work belongs to the retiring LB. Replica-global
+        # async occupancy continues to be sampled by the selected legacy LB.
+        return report.complete and report.local_in_flight == 0
+
+    def _finish_ha_drain_if_safe(
+            self, authority: lb_k8s.LbPodAuthority, state: lb_ha.LbCutoverState,
+            fence: tuple[str, tuple[int | None, str | None], int]) -> bool:
+        if (state.phase is not lb_ha.LbCutoverPhase.DRAINING or
+                state.active_slot is None or state.pending_slot is None or
+                authority.slot_by_uid is None):
+            return False
+        draining_ids = {
+            session_id for session_id, slot in authority.slot_by_uid.items()
+            if session_id in authority.live_uids and slot == state.pending_slot
+        }
+        clean = not draining_ids
+        if draining_ids and self._lb_session_ledger is not None:
+            report = self._lb_session_ledger.aggregate(
+                draining_ids,
+                required_applied_role=lb_ha.LbRole.DRAINING,
+                required_applied_generation=state.generation)
+            # Backend async occupancy is replica-global and continues to be
+            # sampled by the new active. It is not work owned by the former
+            # LB process and must not pin DRAINING forever. The process-local
+            # admission count includes unqueued and queued dispatches as well
+            # as returned streams. Requiring the LB to acknowledge DRAINING
+            # also closes the admission window between the selector move and
+            # the first role response applied by the former active.
+            clean = report.complete and report.local_in_flight == 0
+        drain_started_at = state.drain_started_at
+        timed_out = (drain_started_at is not None and
+                     time.time() - drain_started_at >= getattr(
+                         self, '_lb_drain_timeout_seconds',
+                         serve_constants.LB_DRAIN_CLOSE_GRACE_SECONDS))
+        if timed_out and not clean:
+            logger.warning('Finishing HA LB drain after the bounded Pod '
+                           f'termination budget for {self._service_name!r}.')
+            clean = True
+        if not clean:
+            return False
+        service_hash, owner, lifecycle_epoch = fence
+        return serve_state.finish_lb_cutover_drain(
+            self._service_name, service_hash, owner, lifecycle_epoch,
+            state.active_slot, state.pending_slot, state.generation)
+
+    @staticmethod
+    def _lb_ha_rollout_evidence(
+            authority: lb_k8s.LbPodAuthority, state: lb_ha.LbCutoverState,
+            desired_runtime_revision: str | None) -> dict[str, Any]:
+        """Return role-channel evidence that both slots share one revision."""
+        revisions = authority.revision_by_uid or {}
+        slot_by_uid = authority.slot_by_uid or {}
+        slots: dict[str, dict[str, Any]] = {}
+        all_revisions: set[str] = set()
+        for slot in lb_ha.LbSlot:
+            ready_ids = {
+                uid for uid in authority.ready_nonterminating_uids
+                if slot_by_uid.get(uid) is slot
+            }
+            slot_revisions = sorted({
+                revision for uid in ready_ids
+                if (revision := revisions.get(uid)) is not None
+            })
+            all_revisions.update(slot_revisions)
+            slots[slot.value] = {
+                'ready': bool(ready_ids),
+                'revisions': slot_revisions,
+            }
+        converged = (desired_runtime_revision is not None and
+                     state.phase is lb_ha.LbCutoverPhase.STABLE and
+                     all(slot['ready'] and len(slot['revisions']) == 1
+                         for slot in slots.values()) and
+                     all_revisions == {desired_runtime_revision})
+        return {
+            'phase': state.phase.value,
+            'selected_slot': (state.active_slot.value
+                              if state.active_slot is not None else None),
+            'generation': state.generation,
+            'desired_revision': desired_runtime_revision,
+            'slots': slots,
+            'slots_converged': converged,
+        }
+
+    async def _handle_load_balancer_role(
+            self, request_data: dict[str, Any]) -> fastapi.Response:
+        """Ingest a fast HA report and advance the recoverable cutover saga."""
+        trace = lb_ha_obs.RoleRequestTrace()
+
+        def role_response(
+                outcome: lb_ha_obs.LbRoleOutcome,
+                status_code: int,
+                content: dict[str, Any] | None = None
+        ) -> responses.JSONResponse:
+            response_content = dict(content or {})
+            response_content['outcome'] = outcome.value
+            response_content['observability'] = trace.snapshot()
+            return responses.JSONResponse(content=response_content,
+                                          status_code=status_code)
+
+        if not self._lb_ha_enabled:
+            return role_response(
+                lb_ha_obs.LbRoleOutcome.LEGACY_MODE, 200, {
+                    'role': lb_ha.LbRole.ACTIVE.value,
+                    'generation': 0,
+                    'selected_slot': None,
+                    'promotable': True,
+                })
+        session_id = request_data.get('lb_session_id')
+        slot = lb_ha.parse_slot(request_data.get('lb_slot'))
+        if not isinstance(session_id, str) or slot is None:
+            return role_response(lb_ha_obs.LbRoleOutcome.INVALID_REPORT, 503)
+        loop = asyncio.get_running_loop()
+        if not await trace.run_in_executor(loop, 'postgresql_owner_read',
+                                           self._owns_current_service):
+            return role_response(lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER,
+                                 503)
+        role_lock = self._lb_role_lock
+        if role_lock is None:
+            role_lock = asyncio.Lock()
+            self._lb_role_lock = role_lock
+        lock_wait_started_at = time.monotonic()
+        async with role_lock:
+            trace.lock_acquired(lock_wait_started_at)
+            authority = await trace.run_in_executor(loop,
+                                                    'kubernetes_pod_authority',
+                                                    lb_k8s.get_lb_pod_authority,
+                                                    self._service_name)
+            if authority is None or authority.slot_by_uid is None:
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+            if (session_id not in authority.live_uids or
+                    authority.slot_by_uid.get(session_id) is not slot):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_NOT_AUTHORITATIVE, 503)
+            fence = await trace.run_in_executor(loop, 'postgresql_fence_read',
+                                                self._lb_cutover_fence)
+            state = await trace.run_in_executor(
+                loop, 'postgresql_cutover_state_read',
+                serve_state.get_lb_cutover_state, self._service_name)
+            if (fence is None or state is None or not state.enabled or
+                    state.active_slot is None):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            promotable = self._lb_promotion_report_is_current(request_data)
+            role = state.role_for(slot)
+            ledger = self._lb_session_ledger
+            if ledger is None or not ledger.update(
+                    session_id, slot, role, state.generation, request_data):
+                return role_response(lb_ha_obs.LbRoleOutcome.REPORT_REJECTED,
+                                     503)
+            try:
+                routing: (lb_k8s.LbServiceRouting |
+                          lb_k8s.LbServiceTransitionRouting)
+                if state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                                   lb_ha.LbCutoverPhase.ROLLING_BACK):
+                    routing = await trace.run_in_executor(
+                        loop, 'kubernetes_service_routing_read',
+                        lb_k8s.get_lb_service_transition_routing,
+                        self._service_name)
+                else:
+                    routing = await trace.run_in_executor(
+                        loop, 'kubernetes_service_routing_read',
+                        lb_k8s.get_lb_service_routing, self._service_name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Cannot reconcile HA LB Service routing: '
+                               f'{common_utils.format_exception(e)}')
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
+
+            service_hash, expected_owner, lifecycle_epoch = fence
+            transition_legacy_selected = bool(
+                state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                                lb_ha.LbCutoverPhase.ROLLING_BACK) and
+                getattr(routing, 'legacy_selected', False))
+            ready_by_slot = {
+                candidate_slot: {
+                    uid
+                    for uid in authority.ready_nonterminating_uids
+                    if authority.slot_by_uid.get(uid) is candidate_slot
+                } for candidate_slot in lb_ha.LbSlot
+            }
+            if state.phase is lb_ha.LbCutoverPhase.MIGRATING:
+                assert state.active_slot is lb_ha.LbSlot.A
+                if transition_legacy_selected:
+                    if (slot is lb_ha.LbSlot.A and
+                            session_id in ready_by_slot[lb_ha.LbSlot.A] and
+                            bool(ready_by_slot[lb_ha.LbSlot.B]) and promotable):
+                        patched = await trace.run_in_executor(
+                            loop, 'kubernetes_selector_patch',
+                            lb_k8s.patch_lb_service_migration_to_slot,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch)
+                        if patched:
+                            # The old routing snapshot still says legacy, but
+                            # the successful resourceVersion-fenced patch is
+                            # enough to block drain decisions immediately.
+                            transition_legacy_selected = False
+                elif (routing.active_slot is lb_ha.LbSlot.A and
+                      routing.generation == 1):
+                    migrated = await trace.run_in_executor(
+                        loop, 'postgresql_cutover_write',
+                        serve_state.finish_lb_ha_migration, self._service_name,
+                        service_hash, expected_owner, lifecycle_epoch)
+                    if migrated:
+                        state = await trace.run_in_executor(
+                            loop, 'postgresql_cutover_state_read',
+                            serve_state.get_lb_cutover_state,
+                            self._service_name)
+                        assert state is not None
+                        # Do not wait for foreground Deployment deletion while
+                        # holding the role lock. The terminating legacy Pod may
+                        # drain for the full grace period; blocking here makes
+                        # both HA slots time out their role heartbeats. Stable
+                        # parent-process supervision owns idempotent obsolete-
+                        # topology cleanup and retries it on every pass.
+
+            rollback_view_published = False
+            if state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK:
+                rollback_active_slot = state.active_slot
+                assert rollback_active_slot is not None
+                legacy_ready = bool((authority.legacy_uids or set()) &
+                                    authority.ready_nonterminating_uids)
+                if (not transition_legacy_selected and legacy_ready and
+                        routing.active_slot is rollback_active_slot and
+                        routing.generation == state.generation):
+                    patched = await trace.run_in_executor(
+                        loop, 'kubernetes_selector_patch',
+                        lb_k8s.patch_lb_service_rollback_to_legacy,
+                        self._service_name, service_hash, expected_owner,
+                        lifecycle_epoch, rollback_active_slot, state.generation)
+                    if patched:
+                        transition_legacy_selected = True
+                if transition_legacy_selected:
+                    # Publish a blocking drain view before the database leaves
+                    # HA mode. The legacy Pod may already be accepting new
+                    # streams, while the former active slot may still be
+                    # finishing old ones.
+                    self._publish_ha_drain_view(authority, state, True)
+                    rollback_view_published = True
+                    slot_drained = await trace.run_in_executor(
+                        loop, 'drain_evidence_read',
+                        self._rollback_active_slot_is_drained, authority, state)
+                    rolled_back = False
+                    if slot_drained:
+                        rolled_back = await trace.run_in_executor(
+                            loop, 'postgresql_cutover_write',
+                            serve_state.finish_lb_ha_rollback,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch, rollback_active_slot,
+                            state.generation)
+                    if rolled_back:
+                        self._lb_ha_enabled = False
+                        self._lb_session_ledger = None
+                        self._lb_last_demand_snapshot = None
+                        # As above, the parent supervisor deletes obsolete HA
+                        # slots outside this role lock. Return the committed
+                        # role response immediately so remaining slots keep a
+                        # fresh controller heartbeat throughout their drain.
+                        return role_response(
+                            lb_ha_obs.LbRoleOutcome.SUCCESS, 200, {
+                                'role': lb_ha.LbRole.DRAINING.value,
+                                'generation': state.generation,
+                                'selected_slot': None,
+                                'promotable': False,
+                                'phase':
+                                    lb_ha.LbCutoverPhase.ROLLING_BACK.value,
+                            })
+
+            if state.phase is lb_ha.LbCutoverPhase.STABLE:
+                stable_active_slot = state.active_slot
+                assert stable_active_slot is not None
+                if (routing.active_slot is not stable_active_slot or
+                        routing.generation != state.generation):
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.ROUTING_NOT_CONVERGED, 503)
+                target = stable_active_slot.other
+                selected_ready = bool(ready_by_slot[stable_active_slot])
+                target_ready = session_id in ready_by_slot[target]
+                planned_upgrade = False
+                if selected_ready and target_ready:
+                    revisions = authority.revision_by_uid or {}
+                    target_revision = revisions.get(session_id)
+                    desired_revision = routing.desired_runtime_revision
+                    active_revisions = {
+                        revisions.get(uid)
+                        for uid in ready_by_slot[stable_active_slot]
+                    }
+                    planned_upgrade = (desired_revision is not None and
+                                       target_revision == desired_revision and
+                                       desired_revision not in active_revisions)
+                if (slot is target and target_ready and promotable and
+                    (not selected_ready or planned_upgrade)):
+                    next_state = await trace.run_in_executor(
+                        loop, 'postgresql_cutover_write',
+                        serve_state.begin_lb_cutover, self._service_name,
+                        service_hash, expected_owner, lifecycle_epoch,
+                        stable_active_slot, state.generation, target,
+                        self._lb_last_demand_snapshot)
+                    if next_state is not None:
+                        self._lb_demand_handoff.begin(
+                            next_state.generation,
+                            self._lb_last_demand_snapshot)
+                        state = next_state
+
+            if state.phase is lb_ha.LbCutoverPhase.PREPARING:
+                assert state.pending_slot is not None
+                assert state.active_slot is not None
+                target = state.pending_slot
+                preparing_active_slot = state.active_slot
+                # Crash recovery: the selector moved but the DB commit did not.
+                if (routing.active_slot is target and
+                        routing.generation == state.generation):
+                    committed = await trace.run_in_executor(
+                        loop, 'postgresql_cutover_write',
+                        serve_state.commit_lb_cutover, self._service_name,
+                        service_hash, expected_owner, lifecycle_epoch,
+                        preparing_active_slot, target, state.generation)
+                    if committed:
+                        state = await trace.run_in_executor(
+                            loop, 'postgresql_cutover_state_read',
+                            serve_state.get_lb_cutover_state,
+                            self._service_name)
+                        assert state is not None
+                elif (routing.active_slot is preparing_active_slot and
+                      routing.generation == state.generation - 1):
+                    target_ready = session_id in ready_by_slot[target]
+                    armed_generation = request_data.get('armed_generation')
+                    if (slot is target and target_ready and promotable and
+                            armed_generation == state.generation):
+                        patched = await trace.run_in_executor(
+                            loop, 'kubernetes_selector_patch',
+                            lb_k8s.patch_lb_service_active_slot,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch, preparing_active_slot,
+                            state.generation - 1, target, state.generation)
+                        if patched:
+                            committed = await trace.run_in_executor(
+                                loop, 'postgresql_cutover_write',
+                                serve_state.commit_lb_cutover,
+                                self._service_name, service_hash,
+                                expected_owner, lifecycle_epoch,
+                                preparing_active_slot, target, state.generation)
+                            if committed:
+                                state = await trace.run_in_executor(
+                                    loop, 'postgresql_cutover_state_read',
+                                    serve_state.get_lb_cutover_state,
+                                    self._service_name)
+                                assert state is not None
+                    elif not ready_by_slot[target]:
+                        advanced = await trace.run_in_executor(
+                            loop, 'kubernetes_selector_patch',
+                            lb_k8s.patch_lb_service_aborted_generation,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch, preparing_active_slot, target,
+                            state.generation)
+                        if advanced:
+                            aborted = await trace.run_in_executor(
+                                loop, 'postgresql_cutover_write',
+                                serve_state.abort_lb_cutover_preparation,
+                                self._service_name, service_hash,
+                                expected_owner, lifecycle_epoch,
+                                preparing_active_slot, target, state.generation)
+                            if aborted:
+                                self._lb_demand_handoff.restore(
+                                    None, None, None)
+                                state = await trace.run_in_executor(
+                                    loop, 'postgresql_cutover_state_read',
+                                    serve_state.get_lb_cutover_state,
+                                    self._service_name)
+                                assert state is not None
+                elif (routing.active_slot is preparing_active_slot and
+                      routing.generation == state.generation):
+                    # Crash recovery after the Service generation was
+                    # advanced but before the database abort committed.
+                    aborted = await trace.run_in_executor(
+                        loop, 'postgresql_cutover_write',
+                        serve_state.abort_lb_cutover_preparation,
+                        self._service_name, service_hash, expected_owner,
+                        lifecycle_epoch, preparing_active_slot, target,
+                        state.generation)
+                    if aborted:
+                        self._lb_demand_handoff.restore(None, None, None)
+                        state = await trace.run_in_executor(
+                            loop, 'postgresql_cutover_state_read',
+                            serve_state.get_lb_cutover_state,
+                            self._service_name)
+                        assert state is not None
+                else:
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.TRANSITION_INCONSISTENT, 503)
+
+            legacy_selected = bool(
+                state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                                lb_ha.LbCutoverPhase.ROLLING_BACK) and
+                transition_legacy_selected)
+            if not rollback_view_published:
+                self._publish_ha_drain_view(authority, state, legacy_selected)
+            if state.phase is lb_ha.LbCutoverPhase.DRAINING:
+                finished = await trace.run_in_executor(
+                    loop, 'drain_evidence_write', self._finish_ha_drain_if_safe,
+                    authority, state, fence)
+                if finished:
+                    state = await trace.run_in_executor(
+                        loop, 'postgresql_cutover_state_read',
+                        serve_state.get_lb_cutover_state, self._service_name)
+                    assert state is not None
+            assert state.active_slot is not None
+            role = state.role_for(slot)
+            if (state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK and
+                    legacy_selected and slot is state.active_slot):
+                # Once traffic has moved to legacy, stop admission on the
+                # former active before waiting for its process-local count.
+                role = lb_ha.LbRole.DRAINING
+            return role_response(
+                lb_ha_obs.LbRoleOutcome.SUCCESS, 200, {
+                    'role': role.value,
+                    'generation': state.generation,
+                    'selected_slot': state.active_slot.value,
+                    'promotable': promotable,
+                    'phase': state.phase.value,
+                    'ha_rollout': self._lb_ha_rollout_evidence(
+                        authority, state, routing.desired_runtime_revision),
+                })
 
     async def _handle_load_balancer_request_history_sync(
             self, request_data: dict[str, Any]) -> fastapi.Response:
@@ -1147,11 +1830,143 @@ class SkyServeController:
             return persisted
         return serve.SkyServiceSpec.from_yaml_str(yaml_content)
 
-    def _commit_service_update(self, version: int, service: Any,
-                               yaml_content: str,
-                               update_mode: serve_utils.UpdateMode,
-                               requested_service_hash: str | None,
-                               lifecycle_epoch: int | None) -> fastapi.Response:
+    def _transition_load_balancer_mode(
+            self,
+            enable_ha: bool,
+            target_spec: serve.SkyServiceSpec,
+            expected_service_hash: str | None = None,
+            expected_lifecycle_epoch: int | None = None) -> None:
+        """Run an explicit stable-Service-preserving HA migration/rollback."""
+        state = serve_state.get_lb_cutover_state(self._service_name)
+        if state is None:
+            raise RuntimeError('Service LB cutover state is missing.')
+        owner_record = serve_state.get_service_controller_owner(
+            self._service_name, include_lb_state=True)
+        actual_owner = ((owner_record.get('controller_pid'),
+                         owner_record.get('controller_ip'))
+                        if owner_record is not None else None)
+        if (owner_record is None or not owner_record.get('hash') or
+                owner_record.get('lifecycle_epoch') is None or
+                actual_owner != self._controller_owner):
+            raise RuntimeError('Service ownership changed before LB migration.')
+        if (expected_service_hash is not None and
+                owner_record['hash'] != expected_service_hash):
+            raise RuntimeError(
+                'Service incarnation changed before LB migration.')
+        if (expected_lifecycle_epoch is not None and
+                owner_record.get('lifecycle_epoch')
+                != expected_lifecycle_epoch):
+            raise RuntimeError('Service lifecycle changed before LB migration.')
+        service_hash = str(owner_record['hash'])
+        assert actual_owner is not None
+        owner = actual_owner
+        lifecycle_epoch = int(owner_record['lifecycle_epoch'])
+        resuming = False
+        if enable_ha and state.enabled:
+            if state.phase is lb_ha.LbCutoverPhase.STABLE:
+                self._lb_ha_enabled = True
+                return
+            if state.phase is not lb_ha.LbCutoverPhase.MIGRATING:
+                raise RuntimeError(
+                    'Load balancer mode cannot change while another cutover '
+                    f'is {state.phase.value}.')
+            resuming = True
+        elif not enable_ha and not state.enabled:
+            if state.phase is not lb_ha.LbCutoverPhase.STABLE:
+                raise RuntimeError(
+                    'Disabled load balancer HA has an invalid non-stable '
+                    f'cutover phase {state.phase.value}.')
+            self._lb_ha_enabled = False
+            return
+        elif not enable_ha and state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK:
+            resuming = True
+        elif state.phase is not lb_ha.LbCutoverPhase.STABLE:
+            raise RuntimeError('Load balancer mode cannot change while another '
+                               f'cutover is {state.phase.value}.')
+        if enable_ha:
+            lb_k8s.require_lb_ha_runtime()
+        if enable_ha and not resuming:
+            started = serve_state.begin_lb_ha_migration(self._service_name,
+                                                        service_hash, owner,
+                                                        lifecycle_epoch)
+            if started:
+                self._lb_session_ledger = lb_ha.LbSessionLedger(
+                    serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
+                    serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+                self._lb_occupancy_contract_known = False
+                self._lb_last_demand_snapshot = None
+        elif not enable_ha and not resuming:
+            if state.active_slot is None:
+                raise RuntimeError('HA rollback has no committed active slot.')
+            started = serve_state.begin_lb_ha_rollback(self._service_name,
+                                                       service_hash, owner,
+                                                       lifecycle_epoch,
+                                                       state.active_slot,
+                                                       state.generation)
+        else:
+            started = True
+        if not started:
+            raise RuntimeError('LB mode transition lost its durable CAS fence.')
+        if enable_ha:
+            self._lb_ha_enabled = True
+            if self._lb_session_ledger is None:
+                self._lb_session_ledger = lb_ha.LbSessionLedger(
+                    serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
+                    serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+                self._lb_occupancy_contract_known = False
+                self._lb_last_demand_snapshot = None
+        termination_grace = lb_k8s.lb_termination_grace_period_seconds(
+            target_spec.lb_stream_timeout_seconds,
+            target_spec.graceful_drain_seconds)
+        lb_k8s.prepare_lb_mode_transition(
+            self._service_name,
+            termination_grace,
+            service_hash,
+            enable_ha,
+            continue_guard=self._owns_current_service,
+            resource_scope=self._resource_scope)
+        deadline = (time.monotonic() +
+                    serve_constants.LB_DEPLOYMENT_READY_TIMEOUT_SECONDS)
+        while time.monotonic() < deadline:
+            current = serve_state.get_lb_cutover_state(self._service_name)
+            if (current is not None and current.enabled == enable_ha and
+                    current.phase is lb_ha.LbCutoverPhase.STABLE):
+                self._lb_ha_enabled = enable_ha
+                self._lb_drain_timeout_seconds = termination_grace
+                if not enable_ha:
+                    self._lb_session_ledger = None
+                    self._lb_last_demand_snapshot = None
+                return
+            if not self._owns_current_service():
+                raise RuntimeError('Service ownership changed during LB mode '
+                                   'transition.')
+            time.sleep(1)
+        raise RuntimeError('Timed out waiting for the stable load balancer '
+                           'selector mode transition to commit.')
+
+    def _set_load_balancer_high_availability(
+            self, enabled: bool, expected_service_hash: str,
+            expected_lifecycle_epoch: int) -> None:
+        """Apply one fenced LB-only topology update."""
+        target_spec = serve_state.get_spec(self._service_name,
+                                           self._committed_version)
+        if target_spec is None:
+            raise RuntimeError('Current service spec is missing.')
+        self._transition_load_balancer_mode(
+            enabled,
+            target_spec,
+            expected_service_hash=expected_service_hash,
+            expected_lifecycle_epoch=expected_lifecycle_epoch)
+
+    def _commit_service_update(
+            self,
+            version: int,
+            service: Any,
+            yaml_content: str,
+            update_mode: serve_utils.UpdateMode,
+            requested_service_hash: str | None,
+            lifecycle_epoch: int | None,
+            submitted_yaml_content: str | None = None) -> fastapi.Response:
         """Durably accept one immutable version and schedule its apply."""
         authoritative_retry_service = None
         persisted_yaml = serve_state.get_yaml_content(self._service_name,
@@ -1160,6 +1975,23 @@ class SkyServeController:
             authoritative_retry_service = serve_state.get_spec(
                 self._service_name, version)
         validation_service = authoritative_retry_service or service
+        if (authoritative_retry_service is None and
+                isinstance(validation_service, serve.SkyServiceSpec) and
+                not validation_service.lb_high_availability_specified):
+            # Default-on applies when a service is created. An existing
+            # service whose YAML predates this field inherits its durable mode
+            # until a dedicated selector migration is requested explicitly.
+            service = service.copy(lb_high_availability=self._lb_ha_enabled)
+            validation_service = service
+        if (authoritative_retry_service is None and
+                isinstance(validation_service, serve.SkyServiceSpec) and
+                validation_service.lb_high_availability_specified and
+                validation_service.lb_high_availability != self._lb_ha_enabled):
+            self._transition_load_balancer_mode(
+                validation_service.lb_high_availability,
+                validation_service,
+                expected_service_hash=requested_service_hash,
+                expected_lifecycle_epoch=lifecycle_epoch)
         current_autoscaler = getattr(self, '_autoscaler', None)
         if (authoritative_retry_service is None and getattr(
                 current_autoscaler, 'replica_unit', None) == 'logical' and
@@ -1198,6 +2030,7 @@ class SkyServeController:
             version,
             service,
             yaml_content,
+            submitted_yaml_content=submitted_yaml_content,
             expected_service_hash=(requested_service_hash or
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
@@ -1213,6 +2046,14 @@ class SkyServeController:
                 'message': 'An existing dynamic_fallback_per_gpu service '
                            'cannot switch in place to physical-backend replica '
                            'semantics. Create a new service for that migration.'
+            },
+                                          status_code=400)
+        if result is serve_state.VersionCommitResult.LB_HA_CONFLICT:
+            return responses.JSONResponse(content={
+                'message':
+                    'load_balancer.high_availability changed concurrently '
+                    'with this update. Re-read service status and retry the '
+                    'explicit migration or rollback.'
             },
                                           status_code=400)
         if result is serve_state.VersionCommitResult.CONTENT_CONFLICT:
@@ -1625,7 +2466,7 @@ class SkyServeController:
             return responses.JSONResponse(content=info, status_code=200)
 
         @self._app.post(
-            '/controller/load_balancer_sync',
+            serve_constants.LB_CONTROLLER_SYNC_PATH,
             dependencies=[sync_auth_dependency, controller_owner_dependency])
         async def load_balancer_sync(
                 request: fastapi.Request) -> fastapi.Response:
@@ -1633,7 +2474,15 @@ class SkyServeController:
             return await self._handle_load_balancer_sync(request_data)
 
         @self._app.post(
-            '/controller/load_balancer_request_history_sync',
+            serve_constants.LB_CONTROLLER_ROLE_PATH,
+            dependencies=[sync_auth_dependency, controller_owner_dependency])
+        async def load_balancer_role(
+                request: fastapi.Request) -> fastapi.Response:
+            request_data = await request.json()
+            return await self._handle_load_balancer_role(request_data)
+
+        @self._app.post(
+            serve_constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
             dependencies=[sync_auth_dependency, controller_owner_dependency])
         async def load_balancer_request_history_sync(
                 request: fastapi.Request) -> fastapi.Response:
@@ -1680,6 +2529,9 @@ class SkyServeController:
                     resource_scope=self._resource_scope)
                 with open(latest_task_yaml, encoding='utf-8') as f:
                     yaml_content = f.read()
+                submitted_yaml_content = _read_declared_submitted_yaml(
+                    request_data, self._service_name, version,
+                    self._resource_scope)
                 service = self._load_service_for_update(version, yaml_content)
                 requested_service_hash = request_data.get('service_hash')
                 lifecycle_epoch = request_data.get('lifecycle_epoch')
@@ -1693,10 +2545,55 @@ class SkyServeController:
                 return self._commit_service_update(version, service,
                                                    yaml_content, update_mode,
                                                    requested_service_hash,
-                                                   lifecycle_epoch)
+                                                   lifecycle_epoch,
+                                                   submitted_yaml_content)
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')
+                return responses.JSONResponse(content={
+                    'message': 'Error',
+                    'exception': exception_str,
+                    'traceback': traceback.format_exc()
+                },
+                                              status_code=500)
+
+        @self._app.post(
+            '/controller/set_load_balancer_high_availability',
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @_serialize_update
+        def set_load_balancer_high_availability(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            try:
+                enabled = request_data.get('enabled')
+                if not isinstance(enabled, bool):
+                    return responses.JSONResponse(
+                        content={'message': 'enabled must be a boolean.'},
+                        status_code=400)
+                expected_service_hash = request_data.get('service_hash')
+                expected_lifecycle_epoch = request_data.get('lifecycle_epoch')
+                if (not isinstance(expected_service_hash, str) or
+                        not expected_service_hash or
+                        not isinstance(expected_lifecycle_epoch, int) or
+                        isinstance(expected_lifecycle_epoch, bool)):
+                    return responses.JSONResponse(content={
+                        'message': 'Service incarnation and lifecycle '
+                                   'fences are required.'
+                    },
+                                                  status_code=400)
+                self._set_load_balancer_high_availability(
+                    enabled, expected_service_hash, expected_lifecycle_epoch)
+                return responses.JSONResponse(
+                    content={
+                        'message': 'Load balancer high availability is '
+                                   f'{"enabled" if enabled else "disabled"}.'
+                    })
+            except RuntimeError as e:
+                return responses.JSONResponse(content={'message': str(e)},
+                                              status_code=409)
+            except Exception as e:  # pylint: disable=broad-except
+                exception_str = common_utils.format_exception(e)
+                logger.error('Error changing load balancer high '
+                             f'availability: {exception_str}')
                 return responses.JSONResponse(content={
                     'message': 'Error',
                     'exception': exception_str,

@@ -1384,6 +1384,13 @@ def generate_remote_tmp_task_yaml_file_name(service_name: str,
     return os.path.join(dir_name, 'task.yaml.tmp')
 
 
+def generate_remote_tmp_submitted_task_yaml_file_name(service_name: str,
+                                                      resource_scope: str |
+                                                      None = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
+    return os.path.join(dir_name, 'submitted_task.yaml.tmp')
+
+
 def generate_task_yaml_file_name(service_name: str,
                                  version: int,
                                  expand_user: bool = True,
@@ -1392,6 +1399,17 @@ def generate_task_yaml_file_name(service_name: str,
     if expand_user:
         dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'task_v{version}.yaml')
+
+
+def generate_submitted_task_yaml_file_name(
+        service_name: str,
+        version: int,
+        expand_user: bool = True,
+        resource_scope: str | None = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
+    if expand_user:
+        dir_name = os.path.expanduser(dir_name)
+    return os.path.join(dir_name, f'submitted_task_v{version}.yaml')
 
 
 def generate_remote_config_yaml_file_name(service_name: str,
@@ -1591,7 +1609,8 @@ def update_service_encoded(service_name: str,
                            mode: str,
                            pool: bool,
                            expected_service_hash: str | None = None,
-                           expected_lifecycle_epoch: int | None = None) -> str:
+                           expected_lifecycle_epoch: int | None = None,
+                           has_submitted_yaml: bool = False) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
@@ -1616,6 +1635,8 @@ def update_service_encoded(service_name: str,
         request_body['service_hash'] = expected_service_hash
     if expected_lifecycle_epoch is not None:
         request_body['lifecycle_epoch'] = expected_lifecycle_epoch
+    if has_submitted_yaml:
+        request_body['has_submitted_yaml'] = True
     resp = _post_to_controller_with_retry(
         service_name,
         service_hash,
@@ -1650,6 +1671,51 @@ def update_service_encoded(service_name: str,
 
     service_msg = resp.json()['message']
     return message_utils.encode_payload(service_msg)
+
+
+def set_load_balancer_high_availability_encoded(
+        service_name: str, enabled: bool, expected_service_hash: str,
+        expected_lifecycle_epoch: int) -> None:
+    """Submit a lifecycle-fenced, LB-only topology transition."""
+    service_status = _get_service_status(service_name,
+                                         pool=False,
+                                         with_replica_info=False,
+                                         with_yaml=False)
+    if service_status is None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(f'Service {service_name!r} does not exist.')
+    service_hash = service_status['hash']
+    if service_hash != expected_service_hash:
+        raise RuntimeError(f'Service {service_name!r} was replaced before '
+                           'the load balancer update was submitted.')
+    resp = _post_to_controller_with_retry(
+        service_name,
+        service_hash,
+        '/controller/set_load_balancer_high_availability',
+        json={
+            'enabled': enabled,
+            'service_hash': expected_service_hash,
+            'lifecycle_epoch': expected_lifecycle_epoch,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
+    if resp.status_code == 404:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'The service controller does not support load balancer '
+                'topology updates. Upgrade the API server and retry.')
+    if resp.status_code == 400:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'Invalid load balancer topology update: {resp.text}')
+    if resp.status_code == 409:
+        raise RuntimeError(
+            f'Stale load balancer topology update rejected: {resp.text}')
+    if resp.status_code == 500:
+        raise RuntimeError(f'Load balancer topology update failed: {resp.text}')
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f'Failed to update the load balancer topology: {resp.text}')
 
 
 def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
@@ -1735,7 +1801,8 @@ def _get_service_status(
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
-        with_target_num_replicas: bool = False) -> dict[str, Any] | None:
+        with_target_num_replicas: bool = False,
+        status_snapshot_only: bool = False) -> dict[str, Any] | None:
     """Get the status dict of the service.
 
     Args:
@@ -1757,12 +1824,23 @@ def _get_service_status(
             registration polling) must never block on a possibly-dead
             controller's connect timeout for fields they do not read. Only
             user-facing status rendering should pass True.
+        status_snapshot_only: Whether to read only lifecycle fields from the
+            services table. Callers must opt in explicitly because some
+            YAML-free lifecycle paths still inspect latest-version metadata.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
         Otherwise, return None.
     """
-    record = serve_state.get_service_from_name(service_name)
+    if status_snapshot_only:
+        if (with_replica_info or with_replica_counts or with_yaml or
+                with_target_num_replicas):
+            raise ValueError('A status-only snapshot cannot include service '
+                             'enrichment.')
+        record = serve_state.get_service_status_snapshot(service_name,
+                                                         require_version=True)
+    else:
+        record = serve_state.get_service_from_name(service_name)
     if record is None:
         return None
     if record['pool'] != pool:
@@ -2192,7 +2270,9 @@ def get_next_cluster_name(
     # Check if service exists
     service_status = _get_service_status(service_name,
                                          pool=True,
-                                         with_replica_info=False)
+                                         with_replica_info=False,
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
     if service_status is None:
         logger.error(f'Service {service_name!r} does not exist.')
         return None
@@ -2475,11 +2555,13 @@ def _terminate_failed_services_locked(
     # top of every tick, kills and joins its child, then clears controller_port
     # before waiting for this same lifecycle lock. Do not down name-reused
     # replica clusters until that acknowledgement arrives.
-    owner = serve_state.get_service_controller_owner(service_name)
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
     if owner is None or owner.get('hash') != expected_service_hash:
         return _purge_ownership_failure(service_name,
                                         'owner disappeared before teardown')
     resource_scope = owner.get('resource_scope')
+    high_availability = bool(owner.get('lb_ha_enabled'))
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
         if recovery_script is None:
@@ -2558,14 +2640,16 @@ def _terminate_failed_services_locked(
                     service_name,
                     expected_service_hash=expected_service_hash,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=high_availability)
             else:
                 lb_k8s.delete_lb_objects(
                     service_name,
                     expected_service_hash=expected_service_hash,
                     resource_scope=resource_scope,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=high_availability)
         except Exception as e:  # pylint: disable=broad-except
             logger.error(
                 f'Failed to delete external LB objects for failed service '
@@ -2776,7 +2860,8 @@ def _terminate_orphaned_service_children_impl(
                     expected_service_hash=resource_scope,
                     resource_scope=resource_scope,
                     require_runtime=True,
-                    expected_api_deployment_uid=api_deployment_uid)
+                    expected_api_deployment_uid=api_deployment_uid,
+                    high_availability=True)
             except Exception as e:  # pylint: disable=broad-except
                 return (f'{colorama.Fore.YELLOW}orphaned service '
                         f'{service_name!r} could not be purged because scoped '
@@ -3055,7 +3140,9 @@ def wait_service_registration(
 
         record = _get_service_status(service_name,
                                      pool=pool,
-                                     with_replica_info=False)
+                                     with_replica_info=False,
+                                     with_yaml=False,
+                                     status_snapshot_only=True)
         if record is not None:
             if (expected_resource_scope is not None and
                     record.get('resource_scope') != expected_resource_scope):
@@ -3116,10 +3203,22 @@ def load_service_initialization_result(payload: str) -> int:
     return message_utils.decode_payload(payload)
 
 
+def _get_service_log_owner_record(service_name: str,
+                                  pool: bool) -> dict[str, Any] | None:
+    """Read the slim service row used by log/liveness helpers.
+
+    These paths only need status and resource-scope metadata, so they must
+    stay off the joined latest-spec read and never parse YAML.
+    """
+    record = serve_state.get_service_controller_owner(service_name,
+                                                      require_version=True)
+    if record is None or record.get('pool') != pool:
+        return None
+    return record
+
+
 def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
-    service_record = _get_service_status(service_name,
-                                         pool,
-                                         with_replica_info=False)
+    service_record = _get_service_log_owner_record(service_name, pool)
     capnoun = 'Service' if not pool else 'Pool'
     if service_record is None:
         return f'{capnoun} {service_name!r} does not exist.'
@@ -3309,7 +3408,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     caprepnoun = repnoun.capitalize()
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
-    record = serve_state.get_service_from_name(service_name)
+    record = _get_service_log_owner_record(service_name, pool)
     resource_scope = record.get('resource_scope') if record else None
     log_file_name = generate_replica_log_file_name(service_name, replica_id,
                                                    resource_scope)
@@ -3455,15 +3554,13 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
         # legacy controller-local load_balancer.log file.
         from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
         return lb_k8s.stream_lb_logs(service_name, follow, tail)
-    record = serve_state.get_service_from_name(service_name)
+    record = _get_service_log_owner_record(service_name, pool)
     resource_scope = record.get('resource_scope') if record else None
     log_file = generate_remote_controller_log_file_name(service_name,
                                                         resource_scope)
 
     def _service_is_terminal() -> bool:
-        record = _get_service_status(service_name,
-                                     pool,
-                                     with_replica_info=False)
+        record = _get_service_log_owner_record(service_name, pool)
         if record is None:
             return True
         return record['status'] in serve_state.ServiceStatus.failed_statuses()

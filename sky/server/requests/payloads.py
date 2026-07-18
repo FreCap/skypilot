@@ -1004,6 +1004,7 @@ class VolumeDeleteBody(RequestBody):
 class VolumeListBody(RequestBody):
     """The request body for the volume list endpoint."""
     refresh: bool = False
+    name: str | None = None
 
 
 class VolumeValidateBody(RequestBody):
@@ -1350,6 +1351,7 @@ class ServeUpBody(RequestBody):
             dag.tasks) == 1, ('Must only specify one task in the DAG for '
                               'a service.', dag)
         kwargs['task'] = dag.tasks[0]
+        kwargs['submitted_yaml_content'] = self.task
         return kwargs
 
 
@@ -1375,6 +1377,7 @@ class ServeUpdateBody(RequestBody):
             dag.tasks) == 1, ('Must only specify one task in the DAG for '
                               'a service.', dag)
         kwargs['task'] = dag.tasks[0]
+        kwargs['submitted_yaml_content'] = self.task
         return kwargs
 
 
@@ -1389,6 +1392,18 @@ class ServeElectVersionBody(RequestBody):
     version: int
     expected_service_hash: str
     expected_elected_version: int | None
+
+
+class ServeLoadBalancerHighAvailabilityBody(BasePayload):
+    """The public admin request for changing a service's LB topology."""
+    enabled: pydantic.StrictBool
+
+
+class ServeSetLoadBalancerHighAvailabilityBody(RequestBody):
+    """Internal queued request for a fenced LB topology transition."""
+    service_name: str
+    enabled: pydantic.StrictBool
+    expected_service_hash: str
 
 
 class ServeDownBody(RequestBody):

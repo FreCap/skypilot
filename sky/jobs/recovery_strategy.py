@@ -444,20 +444,23 @@ class StrategyExecutor:
 
             # Check the job status until it is not in initialized status
             if status is not None and status > job_lib.JobStatus.INIT:
-                if managed_job_runtime.is_registered():
+                try:
                     handle = await asyncio.to_thread(
                         global_user_state.get_handle_from_cluster_name,
                         self.cluster_name)
-                    runtime_submitted_at = await asyncio.to_thread(
-                        managed_job_runtime.get_job_submitted_at, handle,
-                        self.cluster_name)
-                    if runtime_submitted_at is not None:
-                        return runtime_submitted_at
-                try:
+                    if managed_job_runtime.is_registered():
+                        runtime_submitted_at = await asyncio.to_thread(
+                            managed_job_runtime.get_job_submitted_at, handle,
+                            self.cluster_name)
+                        if runtime_submitted_at is not None:
+                            return runtime_submitted_at
+                    assert handle is not None, (
+                        f'handle for cluster {self.cluster_name!r} should not '
+                        'be None')
                     job_submitted_at = await asyncio.to_thread(
                         managed_job_utils.get_job_timestamp,
                         self.backend,
-                        self.cluster_name,
+                        handle,
                         self.job_id_on_pool_cluster,
                         get_end_time=False)
                     return job_submitted_at

@@ -10,11 +10,15 @@ Also covers the federation observability helpers: FederationStats.summary()
 (the per-context success/timeout/error classification).
 """
 import asyncio
+from unittest import mock
 
 import pytest
 
+from sky import core
+from sky import skypilot_config
 from sky.metrics import utils as metrics_utils
 from sky.server import metrics as server_metrics
+from sky.utils import annotations
 
 _MIB = 2**20
 
@@ -50,6 +54,109 @@ def test_endpoint_metrics_route_registered():
     assert '/endpoints-metrics' in paths
     assert '/gpu-metrics' in paths
     assert hasattr(metrics_utils, 'get_endpoint_metrics_for_context')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('handler_name', 'fetch_name', 'route'),
+    [
+        ('gpu_metrics', 'get_metrics_for_context', 'gpu-metrics'),
+        ('endpoint_metrics', 'get_endpoint_metrics_for_context',
+         'endpoints-metrics'),
+    ],
+)
+async def test_federation_handlers_preserve_order_and_facade(
+        handler_name, fetch_name, route):
+    handler = getattr(server_metrics, handler_name)
+    fetch = mock.AsyncMock(
+        side_effect=lambda context, **_: f'metric{{context="{context}"}} 1')
+
+    with mock.patch.object(skypilot_config, 'reload_config') as reload_config, \
+         mock.patch.object(annotations,
+                           'clear_request_level_cache') as clear_cache, \
+         mock.patch.object(core,
+                           'get_all_contexts',
+                           return_value=['in-cluster', 'ctx-b', 'ctx-a']), \
+         mock.patch.object(metrics_utils, fetch_name, fetch), \
+         mock.patch.object(metrics_utils,
+                           'record_federation_outcome') as record_outcome:
+        response = await handler()
+
+    assert response.body.decode() == (
+        'metric{context="ctx-b"} 1\n\nmetric{context="ctx-a"} 1')
+    assert [call.args[0] for call in fetch.await_args_list
+           ] == ['ctx-b', 'ctx-a']
+    assert all('stats' in call.kwargs for call in fetch.await_args_list)
+    assert record_outcome.call_args_list == [
+        mock.call('ctx-b', route, 'success'),
+        mock.call('ctx-a', route, 'success'),
+    ]
+    reload_config.assert_called_once_with()
+    clear_cache.assert_called_once_with()
+
+    registered = [
+        candidate for candidate in server_metrics.metrics_app.routes
+        if getattr(candidate, 'path', None) == f'/{route}'
+    ]
+    assert len(registered) == 1
+    assert registered[0].endpoint is handler
+    assert handler.__module__ == 'sky.server.metrics'
+
+
+@pytest.mark.asyncio
+async def test_gpu_metrics_debug_preserves_facade_and_cache_refresh(
+        tmp_path, monkeypatch):
+    kubeconfig = tmp_path / 'kubeconfig'
+    kubeconfig.write_text('apiVersion: v1\n')
+    monkeypatch.setenv('KUBECONFIG', str(kubeconfig))
+
+    with mock.patch.object(
+            core,
+            'get_all_contexts',
+            side_effect=[['before'], ['after']]) as get_contexts, \
+         mock.patch.object(annotations,
+                           'clear_request_level_cache') as clear_cache:
+        result = await server_metrics.gpu_metrics_debug()
+
+    assert result['KUBECONFIG'] == str(kubeconfig)
+    assert result['kubeconfig_paths'][str(kubeconfig)] == {
+        'exists': True,
+        'size': len('apiVersion: v1\n'),
+    }
+    assert result['contexts_before_cache_clear'] == ['before']
+    assert result['contexts_after_cache_clear'] == ['after']
+    assert get_contexts.call_count == 2
+    clear_cache.assert_called_once_with()
+
+    registered = [
+        candidate for candidate in server_metrics.metrics_app.routes
+        if getattr(candidate, 'path', None) == '/debug-gpu-metrics'
+    ]
+    assert len(registered) == 1
+    assert registered[0].endpoint is server_metrics.gpu_metrics_debug
+    assert server_metrics.gpu_metrics_debug.__module__ == 'sky.server.metrics'
+
+
+@pytest.mark.asyncio
+async def test_gpu_metrics_preserves_result_handler_patch_point():
+    fetch = mock.AsyncMock(return_value='metric 1')
+
+    def append_result(_context, _route, result, _stats, all_metrics):
+        all_metrics.append(result)
+
+    with mock.patch.object(skypilot_config, 'reload_config'), \
+         mock.patch.object(annotations, 'clear_request_level_cache'), \
+         mock.patch.object(core,
+                           'get_all_contexts',
+                           return_value=['ctx']), \
+         mock.patch.object(metrics_utils, 'get_metrics_for_context', fetch), \
+         mock.patch.object(server_metrics,
+                           '_handle_federation_result',
+                           side_effect=append_result) as handle_result:
+        response = await server_metrics.gpu_metrics()
+
+    assert response.body == b'metric 1'
+    handle_result.assert_called_once()
 
 
 # --- FederationStats.summary() ---

@@ -1,14 +1,34 @@
 """Unit tests for SSH node pool deployment."""
 # pylint: disable=protected-access
 
+import base64
+import os
+from pathlib import Path
 import pickle
 
+import pytest
+
 from sky.ssh_node_pools.deploy import deploy
+from sky.ssh_node_pools.deploy import kubeconfig
 
 
-def _run_single_cluster(monkeypatch, tmp_path, *, monitoring_failures=False):
+def _run_single_cluster(monkeypatch,
+                        tmp_path,
+                        *,
+                        monitoring_failures=False,
+                        use_ssh_config=False):
     remote_calls = []
     local_calls = []
+    local_state = {}
+
+    certificate = ('-----BEGIN CERTIFICATE-----\n'
+                   'test-certificate\n'
+                   '-----END CERTIFICATE-----')
+    private_key = ('-----BEGIN PRIVATE KEY-----\n'
+                   'test-private-key\n'
+                   '-----END PRIVATE KEY-----')
+    certificate_data = base64.b64encode(certificate.encode()).decode()
+    private_key_data = base64.b64encode(private_key.encode()).decode()
 
     def fake_run_remote(node, command, user, ssh_key, **kwargs):
         del node, user, ssh_key
@@ -30,14 +50,17 @@ def _run_single_cluster(monkeypatch, tmp_path, *, monitoring_failures=False):
         local_calls.append((command, kwargs))
         if command[0] == 'scp':
             with open(command[-1], 'w', encoding='utf-8') as file:
-                file.write('''apiVersion: v1
+                file.write(f'''apiVersion: v1
 clusters:
 - cluster:
+    certificate-authority-data: ignored
     server: https://127.0.0.1:6443
   name: default
 users:
 - name: default
-  user: {}
+  user:
+    client-certificate-data: {certificate_data}
+    client-key-data: {private_key_data}
 contexts:
 - context:
     cluster: default
@@ -46,6 +69,9 @@ contexts:
 current-context: default
 ''')
         if command[:4] == ['kubectl', 'config', 'view', '--flatten']:
+            _, modified_config = os.environ['KUBECONFIG'].split(':', 1)
+            local_state['modified_config'] = Path(modified_config).read_text(
+                encoding='utf-8')
             return 'apiVersion: v1\n'
         return ''
 
@@ -55,8 +81,16 @@ current-context: default
                         lambda *args, **kwargs: True)
     monkeypatch.setattr(deploy.deploy_utils, 'ensure_directory_exists',
                         lambda path: None)
+    monkeypatch.setattr(deploy.deploy_utils, 'get_effective_host_ip',
+                        lambda host: '10.0.0.2')
+
+    def fake_setup_kubectl_ssh_tunnel(*args, **kwargs):
+        del args, kwargs
+        local_state['kubeconfig_env_after_configure'] = os.environ['KUBECONFIG']
+
     monkeypatch.setattr(deploy.tunnel_utils, 'setup_kubectl_ssh_tunnel',
-                        lambda *args, **kwargs: None)
+                        fake_setup_kubectl_ssh_tunnel)
+    monkeypatch.setattr(deploy.constants, 'NODE_POOLS_INFO_DIR', str(tmp_path))
 
     kubeconfig_path = str(tmp_path / 'kubeconfig')
     result = deploy.deploy_single_cluster(cluster_name='test-pool',
@@ -66,12 +100,20 @@ current-context: default
                                           ssh_key='key',
                                           context_name='ssh-test-pool',
                                           password=None,
-                                          head_use_ssh_config=False,
+                                          head_use_ssh_config=use_ssh_config,
                                           worker_use_ssh_config=[],
                                           kubeconfig_path=kubeconfig_path,
                                           cleanup=False,
                                           worker_hosts=[])
-    return result, remote_calls, local_calls
+    local_state['kubeconfig'] = Path(kubeconfig_path).read_text(
+        encoding='utf-8')
+    local_state['certificate'] = (tmp_path /
+                                  'ssh-test-pool-cert.pem').read_text(
+                                      encoding='utf-8')
+    local_state['private_key'] = (tmp_path / 'ssh-test-pool-key.pem').read_text(
+        encoding='utf-8')
+    local_state['kubeconfig_env'] = os.environ['KUBECONFIG']
+    return result, remote_calls, local_calls, local_state
 
 
 def test_prometheus_install_cmd_contains_required_fields():
@@ -149,7 +191,7 @@ def test_monitoring_command_builders_keep_facade_and_pickle_identity():
 
 def test_deploy_single_cluster_monitoring_remote_call_order(
         monkeypatch, tmp_path):
-    result, remote_calls, local_calls = _run_single_cluster(
+    result, remote_calls, local_calls, _ = _run_single_cluster(
         monkeypatch, tmp_path)
 
     assert not result
@@ -169,7 +211,7 @@ def test_deploy_single_cluster_monitoring_remote_call_order(
 
 def test_deploy_single_cluster_monitoring_failures_are_best_effort(
         monkeypatch, tmp_path):
-    result, remote_calls, local_calls = _run_single_cluster(
+    result, remote_calls, local_calls, _ = _run_single_cluster(
         monkeypatch, tmp_path, monitoring_failures=True)
 
     assert not result
@@ -180,3 +222,134 @@ def test_deploy_single_cluster_monitoring_failures_are_best_effort(
     assert any('helm upgrade --install skypilot-prometheus' in command
                for command in commands)
     assert any(command == ['sky', 'check', 'ssh'] for command, _ in local_calls)
+
+
+def test_deploy_single_cluster_materializes_local_kubeconfig(
+        monkeypatch, tmp_path):
+    result, _, local_calls, local_state = _run_single_cluster(
+        monkeypatch, tmp_path)
+
+    assert not result
+    assert local_state['modified_config'] == '''apiVersion: v1
+clusters:
+- cluster:
+    server: https://head:6443
+    insecure-skip-tls-verify: true
+  name: ssh-test-pool
+users:
+- name: ssh-test-pool
+  user:
+contexts:
+- context:
+    cluster: ssh-test-pool
+    user: ssh-test-pool
+  name: ssh-test-pool
+current-context: ssh-test-pool
+'''
+    assert local_state['certificate'] == ('-----BEGIN CERTIFICATE-----\n'
+                                          'test-certificate\n'
+                                          '-----END CERTIFICATE-----')
+    assert local_state['private_key'] == ('-----BEGIN PRIVATE KEY-----\n'
+                                          'test-private-key\n'
+                                          '-----END PRIVATE KEY-----')
+    assert local_state['kubeconfig'] == 'apiVersion: v1\n'
+    assert local_state['kubeconfig_env_after_configure'] == str(tmp_path /
+                                                                'kubeconfig')
+    assert local_state['kubeconfig_env'] == str(tmp_path / 'kubeconfig')
+
+    commands = [command for command, _ in local_calls]
+    assert commands[-6:] == [
+        ['kubectl', 'config', 'delete-context', 'ssh-test-pool'],
+        ['kubectl', 'config', 'delete-cluster', 'ssh-test-pool'],
+        ['kubectl', 'config', 'delete-user', 'ssh-test-pool'],
+        ['kubectl', 'config', 'view', '--flatten'],
+        ['kubectl', 'config', 'use-context', 'ssh-test-pool'],
+        ['sky', 'check', 'ssh'],
+    ]
+    assert len(commands) == 7
+
+
+@pytest.mark.parametrize('failed_command', ['view', 'use-context'])
+@pytest.mark.parametrize('had_previous_environment', [False, True])
+def test_failed_kubeconfig_command_preserves_file_and_environment(
+        monkeypatch, tmp_path, failed_command, had_previous_environment):
+    kubeconfig_path = tmp_path / 'kubeconfig'
+    kubeconfig_path.write_text('existing: config\n', encoding='utf-8')
+    if had_previous_environment:
+        monkeypatch.setenv('KUBECONFIG', str(kubeconfig_path))
+    else:
+        monkeypatch.delenv('KUBECONFIG', raising=False)
+    commands = []
+
+    def fake_run_command(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        if command[0] == 'scp':
+            Path(command[-1]).write_text('''apiVersion: v1
+clusters:
+- cluster:
+    server: https://127.0.0.1:6443
+  name: default
+users:
+- name: default
+  user: {}
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+''',
+                                         encoding='utf-8')
+            return ''
+        if command[:4] == ['kubectl', 'config', 'view', '--flatten']:
+            if failed_command == 'view':
+                return None
+            return 'apiVersion: v1\n'
+        if command[:3] == ['kubectl', 'config', 'use-context']:
+            if failed_command == 'use-context':
+                return None
+            return ''
+        if command[1:3] in (["config",
+                             "delete-context"], ["config", "delete-cluster"],
+                            ["config", "delete-user"]):
+            Path(os.environ['KUBECONFIG']).write_text('mutated: config\n',
+                                                      encoding='utf-8')
+        return ''
+
+    monkeypatch.setattr(kubeconfig.deploy_utils, 'run_command',
+                        fake_run_command)
+    monkeypatch.setattr(kubeconfig.constants, 'NODE_POOLS_INFO_DIR',
+                        str(tmp_path))
+
+    with pytest.raises(RuntimeError, match='Failed to (merge|select)'):
+        kubeconfig.configure_local_kubeconfig(
+            head_node='head',
+            ssh_user='user',
+            ssh_key='key',
+            context_name='ssh-test-pool',
+            effective_master_ip='head',
+            kubeconfig_path=str(kubeconfig_path),
+            use_ssh_config=True)
+
+    assert kubeconfig_path.read_text(encoding='utf-8') == 'existing: config\n'
+    if had_previous_environment:
+        assert os.environ['KUBECONFIG'] == str(kubeconfig_path)
+    else:
+        assert 'KUBECONFIG' not in os.environ
+    expected_last_command = (
+        ['kubectl', 'config', 'view', '--flatten'] if failed_command == 'view'
+        else ['kubectl', 'config', 'use-context', 'ssh-test-pool'])
+    assert commands[-1] == expected_last_command
+    assert len(commands) == (5 if failed_command == 'view' else 6)
+
+
+def test_deploy_single_cluster_uses_ssh_config_for_kubeconfig_scp(
+        monkeypatch, tmp_path):
+    result, _, local_calls, _ = _run_single_cluster(monkeypatch,
+                                                    tmp_path,
+                                                    use_ssh_config=True)
+
+    assert not result
+    assert local_calls[0][0][:2] == ['scp', 'head:~/.kube/config']
+    assert '-i' not in local_calls[0][0]

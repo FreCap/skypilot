@@ -1,5 +1,6 @@
 """The database for services information."""
 import collections
+import contextlib
 import enum
 import json
 import pickle
@@ -18,6 +19,7 @@ from sqlalchemy.ext import declarative
 
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.utils import common_utils
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
@@ -96,6 +98,31 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('logical_replica_semantics',
                       sqlalchemy.Integer,
                       server_default='0'),
+    # Controller-fenced warm-standby authority. External LB HA is supported
+    # only on the central PostgreSQL Serve database. Existing service rows keep
+    # the disabled default until an explicit migration enables the new mode.
+    sqlalchemy.Column('lb_ha_enabled',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('lb_active_slot', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('lb_cutover_generation',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('lb_pending_slot', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('lb_cutover_phase',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default=lb_ha.LbCutoverPhase.STABLE.value),
+    sqlalchemy.Column('lb_drain_started_at', sqlalchemy.Float),
+    sqlalchemy.Column('lb_demand_handoff_generation', sqlalchemy.Integer),
+    sqlalchemy.Column('lb_demand_handoff_snapshot', sqlalchemy.Text),
+    sqlalchemy.Column('lb_demand_handoff_complete_at', sqlalchemy.Float),
+    # Latest demand reported by the selected ACTIVE slot. This is independent
+    # from an in-progress handoff so a controller restart before PREPARING
+    # cannot erase the scale-down floor copied into the next cutover.
+    sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
 )
 
 replicas_table = sqlalchemy.Table(
@@ -125,6 +152,9 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
     sqlalchemy.Column('yaml_content', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('submitted_yaml_content',
+                      sqlalchemy.Text,
+                      server_default=None),
     sqlalchemy.Column('created_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('created_by', sqlalchemy.Text, server_default=None),
 )
@@ -674,7 +704,8 @@ def add_service(name: str,
                 service_hash: str | None = None,
                 lifecycle_epoch: int | None = None,
                 resource_scope: str | None = None,
-                created_by: str | None = None) -> bool:
+                created_by: str | None = None,
+                submitted_yaml_content: str | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -691,6 +722,12 @@ def add_service(name: str,
         exists.
     """
     engine = _db_manager.get_engine()
+    lb_ha_enabled = bool(spec is not None and
+                         getattr(spec, 'lb_high_availability', False))
+    if (lb_ha_enabled and
+            engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError('External load balancer high availability requires '
+                           'the central PostgreSQL Serve database.')
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     try:
         with orm.Session(engine) as session:
@@ -794,12 +831,24 @@ def add_service(name: str,
                     resource_scope=resource_scope,
                     entrypoint=entrypoint,
                     logical_replica_semantics=int(
-                        getattr(spec, 'uses_logical_replicas', False) is True)))
+                        getattr(spec, 'uses_logical_replicas', False) is True),
+                    lb_ha_enabled=int(lb_ha_enabled),
+                    lb_active_slot=(lb_ha.LbSlot.A.value
+                                    if lb_ha_enabled else None),
+                    lb_cutover_generation=1 if lb_ha_enabled else 0,
+                    lb_pending_slot=None,
+                    lb_cutover_phase=lb_ha.LbCutoverPhase.STABLE.value,
+                    lb_drain_started_at=None,
+                    lb_demand_handoff_generation=None,
+                    lb_demand_handoff_snapshot=None,
+                    lb_demand_handoff_complete_at=None,
+                    lb_last_demand_snapshot=None))
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
                 version=constants.INITIAL_VERSION,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
+                submitted_yaml_content=submitted_yaml_content,
                 created_at=time.time(),
                 created_by=created_by)
             if lifecycle_epoch is None:
@@ -811,7 +860,9 @@ def add_service(name: str,
                     set_={
                         'spec': version_insert_stmt.excluded.spec,
                         'yaml_content':
-                            version_insert_stmt.excluded.yaml_content
+                            version_insert_stmt.excluded.yaml_content,
+                        'submitted_yaml_content':
+                            version_insert_stmt.excluded.submitted_yaml_content
                     })
             session.execute(version_insert_stmt)
             if resource_scope is not None and storage_generation is not None:
@@ -1449,6 +1500,11 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
         'resource_scope': r['resource_scope'],
         'entrypoint': r['entrypoint'],
         'logical_replica_semantics': bool(r['logical_replica_semantics']),
+        'lb_ha_enabled': bool(r['lb_ha_enabled']),
+        'lb_active_slot': r['lb_active_slot'],
+        'lb_cutover_generation': r['lb_cutover_generation'],
+        'lb_pending_slot': r['lb_pending_slot'],
+        'lb_cutover_phase': r['lb_cutover_phase'],
         'yaml_content': r.get('yaml_content'),
     }
     latest_spec = pickle.loads(r['spec']) if r.get('spec') is not None else None
@@ -1596,27 +1652,28 @@ def get_service_runtime_snapshot(
     }
 
 
-def get_service_controller_owner(
+def get_service_status_snapshot(
         service_name: str,
         require_version: bool = False) -> dict[str, Any] | None:
-    """Get only the fields needed to route to a service controller.
+    """Read the slim status fields used by control and liveness helpers.
 
-    Unlike :func:`get_service_from_name`, this hot-path lookup does not join
-    ``version_specs``, deserialize the latest spec, or issue a second query.
-    The service hash distinguishes a same-name successor from the row read
-    before a proxied request; status lets the proxy reject terminal rows.
-    ``require_version`` preserves callers whose old joined read treated an
-    orphan/versionless service row as missing, using an indexed existence
-    check without loading version metadata.
+    Unlike :func:`get_service_from_name`, this helper stays on the
+    ``services`` table: no ``version_specs`` join and no latest-spec
+    deserialization. ``require_version`` preserves callers whose old joined
+    read treated an orphan/versionless service row as missing.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = sqlalchemy.select(
-            services_table.c.hash,
+            services_table.c.name,
+            services_table.c.controller_job_id,
+            services_table.c.controller_port,
+            services_table.c.load_balancer_port,
             services_table.c.status,
+            services_table.c.pool,
             services_table.c.controller_pid,
             services_table.c.controller_ip,
-            services_table.c.controller_port,
+            services_table.c.hash,
             services_table.c.lifecycle_epoch,
             services_table.c.resource_scope,
         ).where(services_table.c.name == service_name)
@@ -1628,14 +1685,609 @@ def get_service_controller_owner(
         return None
     mapping = row._mapping  # pylint: disable=protected-access
     return {
+        'name': mapping['name'],
+        'controller_job_id': mapping['controller_job_id'],
+        'controller_port': mapping['controller_port'],
+        'load_balancer_port': mapping['load_balancer_port'],
+        'status': ServiceStatus[mapping['status']],
+        'pool': bool(mapping['pool']),
+        'controller_pid': mapping['controller_pid'],
+        'controller_ip': mapping['controller_ip'],
+        'hash': mapping['hash'],
+        'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'resource_scope': mapping['resource_scope'],
+    }
+
+
+def get_service_controller_owner(
+        service_name: str,
+        require_version: bool = False,
+        include_lb_state: bool = False) -> dict[str, Any] | None:
+    """Get only the fields needed to route to a service controller.
+
+    Unlike :func:`get_service_from_name`, this hot-path lookup does not join
+    ``version_specs``, deserialize the latest spec, or issue a second query.
+    The service hash distinguishes a same-name successor from the row read
+    before a proxied request; status lets the proxy reject terminal rows.
+    ``require_version`` preserves callers whose old joined read treated an
+    orphan/versionless service row as missing, using an indexed existence
+    check without loading version metadata. ``include_lb_state`` adds the
+    cutover fields only for HA lifecycle callers, keeping the routing identity
+    contract small for all other hot paths.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = sqlalchemy.select(
+            services_table.c.hash,
+            services_table.c.status,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.controller_port,
+            services_table.c.lifecycle_epoch,
+            services_table.c.pool,
+            services_table.c.resource_scope,
+            services_table.c.lb_ha_enabled,
+            services_table.c.lb_active_slot,
+            services_table.c.lb_cutover_generation,
+            services_table.c.lb_pending_slot,
+            services_table.c.lb_cutover_phase,
+        ).where(services_table.c.name == service_name)
+        if require_version:
+            query = query.where(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == services_table.c.name))
+        row = session.execute(query).fetchone()
+    if row is None:
+        return None
+    mapping = row._mapping  # pylint: disable=protected-access
+    record = {
         'hash': mapping['hash'],
         'status': ServiceStatus[mapping['status']],
         'controller_pid': mapping['controller_pid'],
         'controller_ip': mapping['controller_ip'],
         'controller_port': mapping['controller_port'],
         'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'pool': bool(mapping['pool']),
         'resource_scope': mapping['resource_scope'],
     }
+    if include_lb_state:
+        record.update({
+            'lb_ha_enabled': bool(mapping['lb_ha_enabled']),
+            'lb_active_slot': mapping['lb_active_slot'],
+            'lb_cutover_generation': mapping['lb_cutover_generation'],
+            'lb_pending_slot': mapping['lb_pending_slot'],
+            'lb_cutover_phase': mapping['lb_cutover_phase'],
+        })
+    return record
+
+
+def _require_postgresql_lb_cutover(engine: sqlalchemy.engine.Engine) -> None:
+    if (engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError('External load balancer HA cutover state is '
+                           'supported only on PostgreSQL.')
+
+
+def get_lb_cutover_state(service_name: str) -> lb_ha.LbCutoverState | None:
+    """Read and validate one service's durable LB authority state."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.lb_ha_enabled,
+                services_table.c.lb_active_slot,
+                services_table.c.lb_cutover_generation,
+                services_table.c.lb_pending_slot,
+                services_table.c.lb_cutover_phase,
+                services_table.c.lb_drain_started_at,
+                services_table.c.lifecycle_epoch,
+            ).where(services_table.c.name == service_name)).fetchone()
+    if row is None:
+        return None
+    enabled = bool(row.lb_ha_enabled)
+    if enabled:
+        _require_postgresql_lb_cutover(engine)
+    active_slot = lb_ha.parse_slot(row.lb_active_slot)
+    pending_slot = lb_ha.parse_slot(row.lb_pending_slot)
+    phase = lb_ha.parse_phase(row.lb_cutover_phase)
+    generation = row.lb_cutover_generation
+    if (phase is None or not isinstance(generation, int) or generation < 0 or
+        (enabled and (active_slot is None or generation < 1)) or
+        (not enabled and
+         (active_slot is not None or generation != 0 or pending_slot is not None
+          or phase is not lb_ha.LbCutoverPhase.STABLE)) or
+        (phase is lb_ha.LbCutoverPhase.PREPARING and pending_slot is None) or
+        (phase is lb_ha.LbCutoverPhase.DRAINING and pending_slot is None)):
+        raise RuntimeError(f'Malformed LB cutover state for {service_name!r}.')
+    return lb_ha.LbCutoverState(enabled=enabled,
+                                active_slot=active_slot,
+                                generation=generation,
+                                pending_slot=pending_slot,
+                                phase=phase,
+                                lifecycle_epoch=row.lifecycle_epoch,
+                                drain_started_at=row.lb_drain_started_at)
+
+
+def _lb_cutover_owner_predicates(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> list[Any]:
+    return [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_controller_owner[0],
+        services_table.c.controller_ip == expected_controller_owner[1],
+        services_table.c.lifecycle_epoch == expected_lifecycle_epoch,
+        services_table.c.lb_ha_enabled == 1,
+    ]
+
+
+def begin_lb_ha_migration(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> bool:
+    """Durably enter legacy-to-two-slot migration without moving traffic."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_owner[0],
+            services_table.c.controller_ip == expected_controller_owner[1],
+            services_table.c.lifecycle_epoch == expected_lifecycle_epoch,
+            services_table.c.lb_ha_enabled == 0,
+            services_table.c.lb_active_slot.is_(None),
+            services_table.c.lb_cutover_generation == 0,
+            services_table.c.lb_pending_slot.is_(None),
+            services_table.c.lb_cutover_phase ==
+            lb_ha.LbCutoverPhase.STABLE.value,
+        ).update({
+            services_table.c.lb_ha_enabled: 1,
+            services_table.c.lb_active_slot: lb_ha.LbSlot.A.value,
+            services_table.c.lb_cutover_generation: 1,
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.MIGRATING.value,
+        })
+        session.commit()
+    return count == 1
+
+
+def finish_lb_ha_migration(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> bool:
+    """Commit slot A after the stable Service selector has moved to it."""
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == lb_ha.LbSlot.A.value,
+        services_table.c.lb_cutover_generation == 1,
+        services_table.c.lb_pending_slot.is_(None),
+        services_table.c.lb_cutover_phase ==
+        lb_ha.LbCutoverPhase.MIGRATING.value,
+    ])
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.STABLE.value,
+        })
+        session.commit()
+    return count == 1
+
+
+def begin_lb_ha_rollback(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Durably enter two-slot-to-legacy rollback without moving traffic."""
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == active_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_pending_slot.is_(None),
+        services_table.c.lb_cutover_phase == lb_ha.LbCutoverPhase.STABLE.value,
+    ])
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.ROLLING_BACK.value,
+        })
+        session.commit()
+    return count == 1
+
+
+def finish_lb_ha_rollback(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Disable HA after the stable Service selector has moved to legacy."""
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == active_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_pending_slot.is_(None),
+        services_table.c.lb_cutover_phase ==
+        lb_ha.LbCutoverPhase.ROLLING_BACK.value,
+    ])
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_ha_enabled: 0,
+            services_table.c.lb_active_slot: None,
+            services_table.c.lb_cutover_generation: 0,
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.STABLE.value,
+            services_table.c.lb_drain_started_at: None,
+            services_table.c.lb_demand_handoff_generation: None,
+            services_table.c.lb_demand_handoff_snapshot: None,
+            services_table.c.lb_demand_handoff_complete_at: None,
+            services_table.c.lb_last_demand_snapshot: None,
+        })
+        session.commit()
+    return count == 1
+
+
+def begin_lb_cutover(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    expected_active_slot: lb_ha.LbSlot,
+    expected_generation: int,
+    target_slot: lb_ha.LbSlot,
+    demand_snapshot: lb_ha.DemandSnapshot | None = None,
+) -> lb_ha.LbCutoverState | None:
+    """CAS STABLE N to PREPARING N+1 for the opposite slot."""
+    if target_slot is not expected_active_slot.other:
+        raise ValueError('LB cutover target must be the opposite slot.')
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    next_generation = expected_generation + 1
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == expected_active_slot.value,
+        services_table.c.lb_cutover_generation == expected_generation,
+        services_table.c.lb_pending_slot.is_(None),
+        services_table.c.lb_cutover_phase == lb_ha.LbCutoverPhase.STABLE.value,
+    ])
+    with orm.Session(engine) as session:
+        serialized_snapshot = (json.dumps(demand_snapshot.to_dict())
+                               if demand_snapshot is not None else
+                               services_table.c.lb_last_demand_snapshot)
+        row = session.execute(
+            sqlalchemy.update(services_table).where(*predicates).values(
+                lb_pending_slot=target_slot.value,
+                lb_cutover_generation=next_generation,
+                lb_cutover_phase=lb_ha.LbCutoverPhase.PREPARING.value,
+                lb_demand_handoff_generation=next_generation,
+                lb_demand_handoff_snapshot=serialized_snapshot,
+                lb_demand_handoff_complete_at=None).returning(
+                    services_table.c.lifecycle_epoch)).fetchone()
+        session.commit()
+    if row is None:
+        return None
+    return lb_ha.LbCutoverState(enabled=True,
+                                active_slot=expected_active_slot,
+                                generation=next_generation,
+                                pending_slot=target_slot,
+                                phase=lb_ha.LbCutoverPhase.PREPARING,
+                                lifecycle_epoch=row.lifecycle_epoch)
+
+
+def record_lb_active_demand_snapshot(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    generation: int,
+    demand_snapshot: lb_ha.DemandSnapshot,
+) -> bool:
+    """Persist demand only while the reporter remains the selected ACTIVE."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == active_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_cutover_phase.in_((
+            lb_ha.LbCutoverPhase.STABLE.value,
+            lb_ha.LbCutoverPhase.DRAINING.value,
+        )),
+    ])
+    serialized_snapshot = json.dumps(demand_snapshot.to_dict())
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_last_demand_snapshot: serialized_snapshot,
+        })
+        session.commit()
+    return count == 1
+
+
+def get_lb_last_demand_snapshot(
+        service_name: str) -> lb_ha.DemandSnapshot | None:
+    """Read the restart-safe latest demand from the selected ACTIVE slot."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(services_table.c.lb_last_demand_snapshot).where(
+                services_table.c.name == service_name)).fetchone()
+    if row is None or row.lb_last_demand_snapshot is None:
+        return None
+    try:
+        return lb_ha.DemandSnapshot.from_dict(
+            json.loads(row.lb_last_demand_snapshot))
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError('Malformed durable LB demand snapshot.') from e
+
+
+def commit_lb_cutover(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    previous_slot: lb_ha.LbSlot,
+    target_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Commit a selector-switched target and retain the old slot as DRAINING."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == previous_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_pending_slot == target_slot.value,
+        services_table.c.lb_cutover_phase ==
+        lb_ha.LbCutoverPhase.PREPARING.value,
+    ])
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_active_slot: target_slot.value,
+            services_table.c.lb_pending_slot: previous_slot.value,
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.DRAINING.value,
+            services_table.c.lb_drain_started_at: time.time(),
+        })
+        session.commit()
+    return count == 1
+
+
+def finish_lb_cutover_drain(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    draining_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """CAS DRAINING to STABLE after every former stream owner is clean/gone."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == active_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_pending_slot == draining_slot.value,
+        services_table.c.lb_cutover_phase ==
+        lb_ha.LbCutoverPhase.DRAINING.value,
+    ])
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_pending_slot: None,
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.STABLE.value,
+            services_table.c.lb_drain_started_at: None,
+        })
+        session.commit()
+    return count == 1
+
+
+def get_lb_demand_handoff(
+    service_name: str,
+) -> tuple[int | None, lb_ha.DemandSnapshot | None, float | None]:
+    """Read the restart-safe demand floor for the current promotion."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.lb_demand_handoff_generation,
+                services_table.c.lb_demand_handoff_snapshot,
+                services_table.c.lb_demand_handoff_complete_at,
+            ).where(services_table.c.name == service_name)).fetchone()
+    if row is None:
+        return None, None, None
+    snapshot = None
+    if row.lb_demand_handoff_snapshot is not None:
+        try:
+            snapshot = lb_ha.DemandSnapshot.from_dict(
+                json.loads(row.lb_demand_handoff_snapshot))
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            raise RuntimeError('Malformed durable LB demand handoff.') from e
+    return (row.lb_demand_handoff_generation, snapshot,
+            row.lb_demand_handoff_complete_at)
+
+
+def mark_lb_demand_handoff_complete(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    generation: int,
+) -> float | None:
+    """Record the first complete report from the promoted active."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_demand_handoff_generation == generation,
+    ])
+    completed_at = time.time()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.update(services_table).where(
+                *predicates,
+                services_table.c.lb_demand_handoff_complete_at.is_(None)).
+            values(lb_demand_handoff_complete_at=completed_at).returning(
+                services_table.c.lb_demand_handoff_complete_at)).fetchone()
+        if row is None:
+            existing = session.execute(
+                sqlalchemy.select(
+                    services_table.c.lb_demand_handoff_complete_at).where(
+                        *predicates)).scalar_one_or_none()
+            session.rollback()
+            return existing
+        session.commit()
+    return float(row.lb_demand_handoff_complete_at)
+
+
+def clear_lb_demand_handoff(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    generation: int,
+) -> bool:
+    """Clear an expired demand floor without touching cutover authority."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.append(
+        services_table.c.lb_demand_handoff_generation == generation)
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_demand_handoff_generation: None,
+            services_table.c.lb_demand_handoff_snapshot: None,
+            services_table.c.lb_demand_handoff_complete_at: None,
+        })
+        session.commit()
+    return count == 1
+
+
+@contextlib.contextmanager
+def lb_cutover_kubernetes_guard(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    expected_active_slot: lb_ha.LbSlot,
+    expected_generation: int,
+    expected_phase: lb_ha.LbCutoverPhase,
+    expected_pending_slot: lb_ha.LbSlot | None,
+):
+    """Hold the service row lock across one external Kubernetes mutation.
+
+    Controller ownership updates write the same PostgreSQL row and therefore
+    wait for this transaction. This closes the otherwise unavoidable window
+    in which a stale controller could pass a DB check and patch the Service
+    selector after its successor took ownership.
+    """
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == expected_active_slot.value,
+        services_table.c.lb_cutover_generation == expected_generation,
+        services_table.c.lb_cutover_phase == expected_phase.value,
+        (services_table.c.lb_pending_slot.is_(None)
+         if expected_pending_slot is None else services_table.c.lb_pending_slot
+         == expected_pending_slot.value),
+    ])
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(services_table.c.name).where(
+                *predicates).with_for_update()).fetchone()
+        try:
+            yield row is not None
+        finally:
+            session.rollback()
+
+
+def abort_lb_cutover_preparation(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+    active_slot: lb_ha.LbSlot,
+    target_slot: lb_ha.LbSlot,
+    generation: int,
+) -> bool:
+    """Abort an unselected armed target without reusing its generation."""
+    engine = _db_manager.get_engine()
+    _require_postgresql_lb_cutover(engine)
+    predicates = _lb_cutover_owner_predicates(service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              expected_lifecycle_epoch)
+    predicates.extend([
+        services_table.c.lb_active_slot == active_slot.value,
+        services_table.c.lb_cutover_generation == generation,
+        services_table.c.lb_pending_slot == target_slot.value,
+        services_table.c.lb_cutover_phase ==
+        lb_ha.LbCutoverPhase.PREPARING.value,
+    ])
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(*predicates).update({
+            services_table.c.lb_pending_slot: None,
+            services_table.c.lb_cutover_phase:
+                lb_ha.LbCutoverPhase.STABLE.value,
+            services_table.c.lb_demand_handoff_generation: None,
+            services_table.c.lb_demand_handoff_snapshot: None,
+            services_table.c.lb_demand_handoff_complete_at: None,
+        })
+        session.commit()
+    return count == 1
 
 
 def get_service_hash(service_name: str) -> str | None:
@@ -2338,6 +2990,7 @@ class VersionCommitResult(enum.Enum):
     REJECTED = 'rejected'
     CONTENT_CONFLICT = 'content_conflict'
     SEMANTIC_CONFLICT = 'semantic_conflict'
+    LB_HA_CONFLICT = 'lb_ha_conflict'
     STALE_VERSION = 'stale_version'
 
     def __bool__(self) -> bool:
@@ -2429,6 +3082,7 @@ def add_or_update_version(
     version: int,
     spec: 'service_spec.SkyServiceSpec',
     yaml_content: str,
+    submitted_yaml_content: str | None = None,
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
@@ -2503,21 +3157,31 @@ def add_or_update_version(
         uses_logical_replicas = (getattr(spec, 'uses_logical_replicas', False)
                                  is True)
         semantics_row = session.execute(
-            sqlalchemy.select(services_table.c.logical_replica_semantics).where(
-                services_table.c.name ==
-                service_name).with_for_update()).fetchone()
+            sqlalchemy.select(services_table.c.logical_replica_semantics,
+                              services_table.c.lb_ha_enabled).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
         # The fence applies to new commits, not to lost-response retries of a
         # version that was already committed before logical activation.
         if (not identical_retry and semantics_row is not None and
                 bool(semantics_row[0]) and not uses_logical_replicas):
             session.rollback()
             return VersionCommitResult.SEMANTIC_CONFLICT
+        requested_lb_ha = bool(getattr(spec, 'lb_high_availability', False))
+        if (not identical_retry and semantics_row is not None and
+                bool(semantics_row[1]) != requested_lb_ha):
+            # Enabling and disabling HA move Kubernetes traffic authority and
+            # therefore require the dedicated selector saga. A normal Serve
+            # version commit cannot safely perform that cross-store mutation.
+            session.rollback()
+            return VersionCommitResult.LB_HA_CONFLICT
         if existing is None:
             session.execute(version_specs_table.insert().values(
                 service_name=service_name,
                 version=version,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
+                submitted_yaml_content=submitted_yaml_content,
                 created_at=time.time()))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
@@ -2529,6 +3193,7 @@ def add_or_update_version(
                     version_specs_table.c.yaml_content.is_(None)).values(
                         spec=pickle.dumps(spec),
                         yaml_content=yaml_content,
+                        submitted_yaml_content=submitted_yaml_content,
                         created_at=time.time()))
         if (not identical_retry and semantics_row is not None and
                 uses_logical_replicas):
@@ -2641,6 +3306,7 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
                 version_specs_table.c.version,
                 version_specs_table.c.spec,
                 version_specs_table.c.yaml_content,
+                version_specs_table.c.submitted_yaml_content,
                 version_specs_table.c.created_at,
                 version_specs_table.c.created_by,
             ).where(
@@ -2651,6 +3317,7 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
         'version': row.version,
         'spec': pickle.loads(row.spec) if row.spec is not None else None,
         'yaml_content': row.yaml_content,
+        'submitted_yaml_content': row.submitted_yaml_content,
         'created_at': row.created_at,
         'created_by': row.created_by,
     } for row in rows]
@@ -2665,6 +3332,19 @@ def get_yaml_content(service_name: str, version: int) -> str | None:
                 sqlalchemy.and_(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version))).fetchone()
+    return result[0] if result else None
+
+
+def get_submitted_yaml_content(service_name: str, version: int) -> str | None:
+    """Gets the user-submitted YAML retained for a version."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.submitted_yaml_content).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version == version))).fetchone()
     return result[0] if result else None
 
 
