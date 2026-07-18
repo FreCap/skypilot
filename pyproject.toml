@@ -44,6 +44,12 @@ allow_redefinition = true
 check_untyped_defs = true
 enable_error_code = ["possibly-undefined"]
 
+[[tool.mypy.overrides]]
+# Lock-event transitions depend on before/after state predicates. Catch
+# predicate methods accidentally treated as truthy objects.
+module = "sky.utils.lock_events"
+warn_unreachable = true
+
 [tool.basedpyright]
 # A focused complement to mypy. Keep high-signal coroutine, control-flow, and
 # interface-contract checks enabled while the broader type baseline is noisy.
