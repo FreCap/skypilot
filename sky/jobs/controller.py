@@ -1670,6 +1670,14 @@ class JobController:
             at: tid for tid, at in monitor_async_tasks.items()
         }
 
+        async def cancel_remaining_monitors() -> None:
+            """Cancel and join monitor tasks still owned by this scope."""
+            remaining_tasks = list(monitor_async_tasks.values())
+            for monitor_task in remaining_tasks:
+                monitor_task.cancel()
+            if remaining_tasks:
+                await asyncio.gather(*remaining_tasks, return_exceptions=True)
+
         try:
             # Monitor with primary/auxiliary termination logic
             while monitor_async_tasks:
@@ -1739,11 +1747,16 @@ class JobController:
                                 # All auxiliary jobs terminated, exit loop
                                 break
 
+        except asyncio.CancelledError:
+            # Monitor tasks are independent asyncio tasks, so cancelling this
+            # parent does not cancel them automatically. Join them before the
+            # controller manager starts tearing down their clusters; otherwise
+            # a child can keep polling or recover while cleanup is in progress.
+            await cancel_remaining_monitors()
+            raise
         except Exception as e:
             logger.error(f'Monitoring failed: {e}')
-            # Cancel all remaining tasks
-            for task_id, async_task in monitor_async_tasks.items():
-                async_task.cancel()
+            await cancel_remaining_monitors()
             await self._cleanup_job_group_clusters(cluster_names)
             raise
 
