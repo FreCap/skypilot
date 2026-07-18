@@ -2123,6 +2123,40 @@ class TestControllerManagerMonitorLoop:
     """The controller monitor reacts to capacity changes without polling."""
 
     @pytest.mark.asyncio
+    async def test_capacity_snapshot_uses_one_lock_acquisition(self):
+        manager = ControllerManager('test-uuid')
+
+        class CountingLock:
+            """Count async context entries around a real lock."""
+
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self.acquisitions = 0
+
+            async def __aenter__(self):
+                self.acquisitions += 1
+                await self._lock.acquire()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                self._lock.release()
+
+        capacity_lock = CountingLock()
+        manager._job_tasks_lock = capacity_lock
+
+        with patch('sky.jobs.controller.controller_utils.'
+                   'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async',
+                      new=AsyncMock(side_effect=asyncio.CancelledError)
+                     ) as get_waiting:
+            with pytest.raises(asyncio.CancelledError):
+                await manager.monitor_loop()
+
+        assert capacity_lock.acquisitions == 1
+        get_waiting.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_running_limit_wakes_when_tracked_job_finishes(self):
         manager = ControllerManager('test-uuid')
         release_job = asyncio.Event()

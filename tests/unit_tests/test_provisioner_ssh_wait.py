@@ -6,8 +6,6 @@ polling every second, and directly-reachable targets must be verified with
 a proxy-less handshake (which authorizes the SSM bypass in ssm_direct).
 Quota-free transports keep the tight 1s cadence.
 """
-from typing import Optional
-
 import pytest
 
 from sky.provision import common as provision_common
@@ -20,6 +18,34 @@ FULL_SSM_PROXY = (
     'aws ssm start-session --target "$(aws ec2 describe-instances)" '
     '--region us-east-1 --document-name AWS-StartSSHSession '
     '--parameters portNumber=%p')
+
+
+def test_provisioner_facade_owns_ssh_wait_callables():
+    # pylint: disable=protected-access
+    assert provisioner.wait_for_ssh.__module__ == 'sky.provision.provisioner'
+    assert (provisioner._wait_ssh_connection_direct.__module__ ==
+            'sky.provision.provisioner')
+    assert (provisioner._wait_ssh_connection_indirect.__module__ ==
+            'sky.provision.provisioner')
+
+
+def test_ssh_probe_command_projection():
+    # pylint: disable=protected-access
+    command = provisioner._ssh_probe_command(ip='10.0.0.1',
+                                             ssh_port=2222,
+                                             ssh_user='ubuntu',
+                                             ssh_private_key='/tmp/test-key',
+                                             ssh_probe_timeout=17,
+                                             ssh_proxy_command='proxy %h %p')
+
+    assert command == [
+        'ssh', '-T', '-i', '/tmp/test-key', 'ubuntu@10.0.0.1', '-p', '2222',
+        '-o', 'StrictHostKeyChecking=no', '-o', 'PasswordAuthentication=no',
+        '-o', 'ConnectTimeout=17s', '-o', 'UserKnownHostsFile=/dev/null', '-o',
+        'IdentitiesOnly=yes', '-o', 'AddKeysToAgent=yes', '-o',
+        'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=5', '-o',
+        'ServerAliveCountMax=3', '-o', 'ProxyCommand=proxy %h %p', 'uptime'
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +69,7 @@ def _fake_cluster_info(monkeypatch) -> provision_common.ClusterInfo:
 
 
 def _run_wait_for_ssh(monkeypatch,
-                      ssh_proxy_command: Optional[str],
+                      ssh_proxy_command: str | None,
                       failures_before_success: int,
                       tcp_reachable: bool = False,
                       waiter=None):
@@ -105,7 +131,7 @@ def test_no_sleep_after_success(monkeypatch):
     sleeps, _ = _run_wait_for_ssh(monkeypatch,
                                   ssh_proxy_command=None,
                                   failures_before_success=0)
-    assert sleeps == []
+    assert not sleeps
 
 
 def test_direct_probe_verifies_and_marks_ok(monkeypatch):
