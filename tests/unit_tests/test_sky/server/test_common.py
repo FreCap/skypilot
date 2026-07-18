@@ -1,10 +1,8 @@
 """Unit tests for the SkyPilot API server common module."""
 from http.cookiejar import Cookie
 from http.cookiejar import MozillaCookieJar
-import os
 import pathlib
 import sys
-import tempfile
 import time
 from unittest import mock
 
@@ -303,12 +301,9 @@ def test_get_dashboard_url():
         server_url='http://example.com') == 'http://example.com/dashboard'
 
 
-def test_cookies_get_no_file(monkeypatch):
+def test_cookies_get_no_file(monkeypatch, tmp_path: pathlib.Path):
     """Test getting cookies from local file."""
-
-    # make a up a temporary cookie file
-    temp_cookie_dir = tempfile.TemporaryDirectory(prefix='sky_cookies')
-    temp_cookie_path = pathlib.Path(temp_cookie_dir.name) / 'cookies.txt'
+    temp_cookie_path = tmp_path / 'cookies.txt'
 
     monkeypatch.setattr('sky.server.common.get_api_cookie_jar_path',
                         lambda: temp_cookie_path)
@@ -319,12 +314,9 @@ def test_cookies_get_no_file(monkeypatch):
     assert isinstance(test_cookie_jar, requests.cookies.RequestsCookieJar)
 
 
-def test_cookies_get_with_file(monkeypatch):
+def test_cookies_get_with_file(monkeypatch, tmp_path: pathlib.Path):
     """Test getting cookies from local file."""
-
-    # make a up a temporary cookie file
-    temp_cookie_dir = tempfile.TemporaryDirectory(prefix='sky_cookies')
-    temp_cookie_path = pathlib.Path(temp_cookie_dir.name) / 'cookies.txt'
+    temp_cookie_path = tmp_path / 'cookies.txt'
 
     test_cookie = _create_test_cookie()
     cookie_jar = MozillaCookieJar(temp_cookie_path)
@@ -340,17 +332,13 @@ def test_cookies_get_with_file(monkeypatch):
     assert len(test_cookie_jar) == 1
     assert test_cookie_jar['test-cookie'] == test_cookie.value
 
-    temp_cookie_dir.cleanup()
 
-
-def test_cookies_set_with_no_file(monkeypatch):
+def test_cookies_set_with_no_file(monkeypatch, tmp_path: pathlib.Path):
     """Test setting cookies to local file.
     No file exists, so a new file is created.
     """
 
-    # make a up a temporary cookie file
-    temp_cookie_dir = tempfile.TemporaryDirectory(prefix='sky_cookies')
-    temp_cookie_path = pathlib.Path(temp_cookie_dir.name) / 'cookies.txt'
+    temp_cookie_path = tmp_path / 'cookies.txt'
 
     monkeypatch.setattr('sky.server.common.get_api_cookie_jar_path',
                         lambda: temp_cookie_path)
@@ -361,13 +349,10 @@ def test_cookies_set_with_no_file(monkeypatch):
 
     assert temp_cookie_path.exists()
 
-    temp_cookie_dir.cleanup()
 
-
-def test_cookies_set_empty(monkeypatch):
+def test_cookies_set_empty(monkeypatch, tmp_path: pathlib.Path):
     """Test setting an empty cookie should be a no-op."""
-    temp_cookie_dir = tempfile.TemporaryDirectory(prefix='sky_cookies')
-    temp_cookie_path = pathlib.Path(temp_cookie_dir.name) / 'cookies.txt'
+    temp_cookie_path = tmp_path / 'cookies.txt'
 
     monkeypatch.setattr('sky.server.common.get_api_cookie_jar_path',
                         lambda: temp_cookie_path)
@@ -377,14 +362,12 @@ def test_cookies_set_empty(monkeypatch):
     assert not temp_cookie_path.exists()
 
 
-def test_cookies_set_with_file(monkeypatch):
+def test_cookies_set_with_file(monkeypatch, tmp_path: pathlib.Path):
     """Test setting cookies to local file.
     A file exists, so the cookies are added to the file.
     """
 
-    # make a up a temporary cookie file
-    temp_cookie_dir = tempfile.TemporaryDirectory(prefix='sky_cookies')
-    temp_cookie_path = pathlib.Path(temp_cookie_dir.name) / 'cookies.txt'
+    temp_cookie_path = tmp_path / 'cookies.txt'
 
     monkeypatch.setattr('sky.server.common.get_api_cookie_jar_path',
                         lambda: temp_cookie_path)
@@ -415,8 +398,6 @@ def test_cookies_set_with_file(monkeypatch):
     assert len(found_cookie_jar) == 2
     assert found_cookie_jar['test-cookie'] == cookie.value
     assert found_cookie_jar['test-cookie-2'] == expected_cookie.value
-
-    temp_cookie_dir.cleanup()
 
 
 def test_process_mounts_removes_file_mounts_mapping(tmp_path, monkeypatch):
