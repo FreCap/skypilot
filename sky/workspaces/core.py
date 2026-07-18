@@ -24,6 +24,7 @@ from sky.utils import locks
 from sky.utils import resource_checker
 from sky.utils import schemas
 from sky.workspaces import constants as workspace_constants
+from sky.workspaces import resolution as workspace_resolution
 from sky.workspaces import utils as workspaces_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -1089,22 +1090,7 @@ def workspaces_for_user(user_id: str) -> dict[str, Any]:
 # = Per-user default workspace
 # ===========================
 
-
-@dataclass
-class WorkspaceResolution:
-    """Outcome of resolve_workspace_for_user().
-
-    workspace: the resolved workspace name to use.
-    source: where it came from — one of WORKSPACE_SOURCE_*. Surfaced by
-        server logs, and the dashboard so users see why the
-        chosen workspace landed where it did.
-    note: optional human-readable explanation (e.g. "preferred 'team-a' not
-        accessible") used when there is drift between what the user set and
-        what we resolved.
-    """
-    workspace: str
-    source: str
-    note: str | None = None
+WorkspaceResolution = workspace_resolution.WorkspaceResolution
 
 
 def set_user_preferred_workspace(user: models.User,
@@ -1181,40 +1167,4 @@ def resolve_workspace_for_user(user: models.User,
     accessible = sorted(
         _accessible_workspace_names_for_user(user.id,
                                              set(_load_workspaces().keys())))
-
-    # Read preferred from the User dataclass: it is populated by
-    # global_user_state.add_or_update_user(return_user=True), which the
-    # executor already calls upstream for every request. Re-querying the
-    # users table per request would be redundant on the hot path.
-    preferred = user.preferred_workspace
-    if preferred is not None and preferred in accessible:
-        return WorkspaceResolution(
-            workspace=preferred,
-            source=workspace_constants.WORKSPACE_SOURCE_PREFERRED)
-
-    drift_note: str | None = None
-    if preferred is not None and preferred not in accessible:
-        # The preference was set in the past but the user no longer has
-        # access (RBAC drift). Surface this in the source note so users
-        # understand why their preference wasn't honored.
-        drift_note = f'preferred {preferred!r} not accessible'
-
-    if constants.SKYPILOT_DEFAULT_WORKSPACE in accessible:
-        # Default-fallback: don't break legacy multi-workspace users and
-        # admins who used to land on 'default' implicitly.
-        return WorkspaceResolution(
-            workspace=constants.SKYPILOT_DEFAULT_WORKSPACE,
-            source=workspace_constants.WORKSPACE_SOURCE_DEFAULT_FALLBACK,
-            note=drift_note)
-
-    if len(accessible) == 1:
-        return WorkspaceResolution(
-            workspace=accessible[0],
-            source=workspace_constants.WORKSPACE_SOURCE_SINGLE_MEMBERSHIP,
-            note=drift_note)
-
-    if not accessible:
-        raise exceptions.NoWorkspaceAccessError(
-            f'User {user.name} ({user.id}) has no accessible workspaces.')
-
-    raise exceptions.WorkspaceAmbiguousError(accessible, note=drift_note)
+    return workspace_resolution.resolve_automatic_workspace(user, accessible)
