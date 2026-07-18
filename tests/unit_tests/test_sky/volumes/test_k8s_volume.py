@@ -1,4 +1,5 @@
 """Unit tests for Kubernetes volume provisioning."""
+import pickle
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ import pytest
 from sky import global_user_state
 from sky import models
 from sky.provision import constants
+from sky.provision import kubernetes as kubernetes_provision
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import volume as k8s_volume
@@ -1729,6 +1731,15 @@ class TestRefreshVolumeConfig:
 
 class TestGetAllVolumesErrors:
     """Tests for get_all_volumes_errors function."""
+
+    def test_public_facade_pickle_identity(self):
+        assert kubernetes_provision.get_all_volumes_errors is (
+            k8s_volume.get_all_volumes_errors)
+        assert k8s_volume.get_all_volumes_errors.__module__ == (
+            'sky.provision.kubernetes.volume')
+        assert pickle.loads(pickle.dumps(
+            k8s_volume.get_all_volumes_errors)) is (
+                k8s_volume.get_all_volumes_errors)
 
     @patch('sky.provision.kubernetes.volume._get_context_namespace')
     @patch('sky.adaptors.kubernetes.core_api')
