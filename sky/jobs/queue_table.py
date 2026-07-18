@@ -1,5 +1,6 @@
 """Managed-jobs queue table presentation."""
 import collections
+import itertools
 from typing import Any
 
 from sky.jobs import state as managed_job_state
@@ -197,14 +198,7 @@ def format_job_table(
             if not task['status'].is_terminal():
                 status_counts[task['status'].value] += 1
 
-    all_tasks = tasks
-    if max_jobs is not None:
-        all_tasks = tasks[:max_jobs]
-    jobs = collections.defaultdict(list)
-    for task in all_tasks:
-        # The tasks within the same job_id are already sorted
-        # by the task_id.
-        jobs[get_hash(task)].append(task)
+    jobs_to_show = itertools.islice(jobs.items(), max_jobs)
 
     def generate_details(details: str | None,
                          failure_reason: str | None) -> str:
@@ -235,7 +229,7 @@ def format_job_table(
 
         return user_values
 
-    for job_hash, job_tasks in jobs.items():
+    for job_hash, job_tasks in jobs_to_show:
         if show_all:
             schedule_state = job_tasks[0]['schedule_state']
         workspace = job_tasks[0].get('workspace',

@@ -127,6 +127,50 @@ class TestFormatJobTable:
         assert rows[1][2] == 'primary [P]'
         assert rows[2][2] == 'auxiliary'
 
+    def test_max_jobs_preserves_complete_job_group(self, monkeypatch):
+        monkeypatch.setattr(queue_utils.log_utils, 'readable_time_duration',
+                            lambda *args, **kwargs: 'duration')
+        completed = self._task(
+            status=managed_job_state.ManagedJobStatus.SUCCEEDED,
+            is_primary_in_job_group=True)
+        running = self._task(task_id=1,
+                             status=managed_job_state.ManagedJobStatus.RUNNING,
+                             is_primary_in_job_group=True)
+        next_job = self._task(job_id=8,
+                              status=managed_job_state.ManagedJobStatus.PENDING)
+
+        rows = jobs_utils.format_job_table([completed, running, next_job],
+                                           show_all=False,
+                                           show_user=False,
+                                           return_rows=True,
+                                           max_jobs=1)
+
+        assert rows[0][8] == (
+            managed_job_state.ManagedJobStatus.RUNNING.colored_str() +
+            ' (task: 1)')
+        assert [row[1] for row in rows[1:3]] == [0, 1]
+
+    @pytest.mark.parametrize('max_jobs, expected_job_ids', [
+        (0, []),
+        (1, [7]),
+        (2, [7, 8]),
+    ])
+    def test_max_jobs_counts_job_identities(self, max_jobs, expected_job_ids):
+        tasks = [
+            self._task(),
+            self._task(task_id=1),
+            self._task(job_id=8),
+        ]
+
+        rows = jobs_utils.format_job_table(tasks,
+                                           show_all=False,
+                                           show_user=False,
+                                           return_rows=True,
+                                           max_jobs=max_jobs)
+
+        assert [row[0] for row in rows if isinstance(row[0], int)
+               ] == expected_job_ids
+
 
 class TestJobTimestampHandleSnapshot:
     """Timestamp fallback stays on one immutable cluster-handle snapshot."""
