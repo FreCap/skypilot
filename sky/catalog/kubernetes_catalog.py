@@ -15,6 +15,7 @@ from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes
 from sky.catalog import CloudFilter
 from sky.catalog import common
+from sky.catalog import pricing as pricing_utils
 from sky.clouds import cloud
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.utils import annotations
@@ -335,7 +336,7 @@ def _list_accelerators(
     result = []
     for accelerator_name, accelerator_count in accelerators_qtys:
         # CPU/memory cost excluded: instance type is unknown at listing time.
-        accel_price = common.get_hourly_cost_from_pricing(
+        accel_price = pricing_utils.get_hourly_cost_from_pricing(
             pricing,
             cpus=0,
             memory=0,
@@ -372,7 +373,7 @@ def _get_pricing(region: str | None) -> dict:
     paths: list[tuple[str, ...]] = [('kubernetes', 'pricing')]
     if region is not None:
         paths.append(('kubernetes', 'context_configs', region, 'pricing'))
-    return common.resolve_pricing_config(*paths)
+    return pricing_utils.resolve_pricing_config(*paths)
 
 
 def get_hourly_cost(instance_type: str,
@@ -387,7 +388,7 @@ def get_hourly_cost(instance_type: str,
     del use_spot, zone  # K8s has no spot/zone pricing.
     instance = kubernetes_utils.KubernetesInstanceType.from_instance_type(
         instance_type)
-    return common.get_hourly_cost_from_pricing(
+    return pricing_utils.get_hourly_cost_from_pricing(
         _get_pricing(region),
         cpus=instance.cpus,
         memory=instance.memory,
