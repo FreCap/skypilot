@@ -3083,9 +3083,20 @@ def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
     # exact UID is gone; otherwise a successor can 409 against a terminating
     # object and accidentally adopt or patch the old incarnation.
     deadline = time.monotonic() + deletion_timeout_seconds
+
+    def _remaining_seconds() -> float:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise TimeoutError(
+                f'Timed out waiting for LB {kind} {name!r} UID {uid!r} to '
+                'be deleted.')
+        return remaining_seconds
+
     while True:
         try:
-            remaining = read_fn(name, namespace)
+            remaining = read_fn(name,
+                                namespace,
+                                _request_timeout=_remaining_seconds())
         except kubernetes.api_exception() as e:
             if getattr(e, 'status', None) == 404:
                 return
@@ -3095,12 +3106,7 @@ def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
             raise RuntimeError(
                 f'LB {kind} {name!r} was replaced while waiting for exact '
                 f'UID {uid!r} to disappear (found {remaining_uid!r}).')
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise TimeoutError(
-                f'Timed out waiting for LB {kind} {name!r} UID {uid!r} to '
-                'be deleted.')
-        time.sleep(min(0.2, remaining_seconds))
+        time.sleep(min(0.2, _remaining_seconds()))
 
 
 def delete_lb_objects(service_name: str,
