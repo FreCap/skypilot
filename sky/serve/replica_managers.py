@@ -4611,20 +4611,25 @@ class SkyPilotReplicaManager(ReplicaManager):
         handle = global_user_state.get_handle_from_cluster_name(
             info.cluster_name)
         if handle is None:
-            logger.error(f'Cannot find cluster {info.cluster_name} for '
-                         f'replica {info.replica_id} in the cluster table. '
-                         'Skipping preemption handling.')
-            return False
-        assert isinstance(handle, backends.CloudVmRayResourceHandle)
-        # Pull the actual cluster status from the provider to distinguish an
-        # infrastructure interruption from an application readiness failure.
-        cluster_status, _ = backend_utils.refresh_cluster_status_handle(
-            info.cluster_name,
-            force_refresh_statuses=set(status_lib.ClusterStatus))
+            # A missing global-state row after a failed probe is conclusive for
+            # a successfully launched interruptible replica: forced status
+            # refresh removes terminated clusters before this handler can run.
+            logger.warning(f'Cannot find cluster {info.cluster_name} for '
+                           f'replica {info.replica_id} in the cluster table; '
+                           'treating it as interrupted.')
+            cluster_status = None
+        else:
+            assert isinstance(handle, backends.CloudVmRayResourceHandle)
+            # Pull the actual cluster status from the provider to distinguish
+            # an infrastructure interruption from an application readiness
+            # failure.
+            cluster_status, _ = backend_utils.refresh_cluster_status_handle(
+                info.cluster_name,
+                force_refresh_statuses=set(status_lib.ClusterStatus))
 
-        if cluster_status in (status_lib.ClusterStatus.UP,
-                              status_lib.ClusterStatus.AUTOSTOPPING):
-            return False
+            if cluster_status in (status_lib.ClusterStatus.UP,
+                                  status_lib.ClusterStatus.AUTOSTOPPING):
+                return False
         # The cluster is partially or fully interrupted. It can be down, INIT
         # or STOPPED, based on the provider's interruption behavior.
         cluster_status_str = ('' if cluster_status is None else

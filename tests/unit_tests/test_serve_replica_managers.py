@@ -1921,6 +1921,35 @@ class TestInfrastructureInterruptionRecovery:
         persist.assert_not_called()
         terminate.assert_not_called()
 
+    @pytest.mark.parametrize('is_spot', [False, True])
+    def test_missing_handle_recovers_interrupted_replica(self, is_spot):
+        research = self._location()
+        manager = self._manager(research)
+        location = (self._location(cloud='AWS',
+                                   region='us-east-1',
+                                   use_spot=True) if is_spot else research)
+        info = self._info(location, is_spot=is_spot, ready=True)
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_handle_from_cluster_name',
+                return_value=None), \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_terminate_replica') as terminate:
+            assert manager._handle_preemption(info) is True
+
+        assert info.status_property.preempted is True
+        persist.assert_called_once_with(1, info)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True)
+        if is_spot:
+            manager._spot_placer.set_preemptive.assert_called_once_with(
+                location)
+        else:
+            manager._spot_placer.set_preemptive.assert_not_called()
+
     def test_spot_interruption_still_benches_location(self):
         research = self._location()
         spot = self._location(cloud='AWS', region='us-east-1', use_spot=True)
