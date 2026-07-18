@@ -6,6 +6,21 @@ import functools
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _handle_background_task_done(task: asyncio.Task) -> None:
+    """Removes a completed task from ownership and reports its failure."""
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+
+    exception = task.exception()
+    if exception is not None:
+        task.get_loop().call_exception_handler({
+            'message': 'Exception in shielded background task',
+            'exception': exception,
+            'task': task,
+        })
+
+
 def shield(func):
     """Shield the decorated async function from cancellation.
 
@@ -71,7 +86,7 @@ def shield(func):
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             _background_tasks.add(task)
-            task.add_done_callback(lambda _: _background_tasks.discard(task))
+            task.add_done_callback(_handle_background_task_done)
             raise
 
     return async_wrapper
