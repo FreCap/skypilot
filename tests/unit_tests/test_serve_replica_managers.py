@@ -1479,6 +1479,18 @@ class TestLaunchOwnershipFence:
         placer.set_active.assert_not_called()
         placer.set_preemptive.assert_not_called()
 
+    def test_unrecoverable_failure_check_does_not_log_per_replica(self):
+        status = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.FAILED,
+            sky_down_status=common_utils.ProcessStatus.SUCCEEDED,
+            user_app_failed=True)
+
+        with mock.patch.object(replica_managers, 'logger') as logger:
+            results = [status.unrecoverable_failure() for _ in range(2_159)]
+
+        assert all(results)
+        assert logger.mock_calls == []
+
     def test_safe_thread_exposes_captured_exception(self):
         error = RuntimeError('typed failure')
 

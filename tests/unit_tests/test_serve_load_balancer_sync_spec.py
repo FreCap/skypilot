@@ -320,6 +320,38 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
             lb._sync_with_controller_once())
 
 
+def test_large_ready_set_is_not_emitted_to_info_logs():
+    lb = _make_lb()
+    urls = [f'http://replica-{index}:8080' for index in range(2_159)]
+    body = {
+        'replica_info': {
+            url: {} for url in urls
+        },
+        'num_ready_replicas': len(urls),
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load',
+            'stream_timeout_seconds': 90,
+        },
+    }
+
+    with mock.patch.object(load_balancer.logger, 'info') as info:
+        _run_one_sync(lb, body)
+
+    info.assert_not_called()
+
+
+def test_request_routing_does_not_emit_per_attempt_logs():
+    policy = lb_policies.RoundRobinPolicy()
+    policy.set_ready_replicas(['http://replica:8080'])
+    request = mock.Mock()
+
+    with mock.patch.object(lb_policies, 'logger') as logger:
+        selected = [policy.select_replica(request) for _ in range(2_159)]
+
+    assert selected == ['http://replica:8080'] * 2_159
+    assert logger.mock_calls == []
+
+
 class TestSyncOnceEmptyMapWiring:
     """Integration coverage for the empty-sync guard inside
     _sync_with_controller_once: the pure predicate is proven elsewhere; these
