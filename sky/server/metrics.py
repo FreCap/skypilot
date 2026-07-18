@@ -18,15 +18,11 @@ import psutil
 import starlette.middleware.base
 import uvicorn
 
-from sky import core
 from sky import global_user_state
 from sky import sky_logging
-from sky import skypilot_config
-from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.metrics import utils as metrics_utils
-from sky.utils import annotations
+from sky.server import metrics_federation
 from sky.utils import common
-from sky.utils import common_utils
 from sky.utils import status_lib
 
 logger = sky_logging.init_logger(__name__)
@@ -645,74 +641,10 @@ def metrics() -> fastapi.Response:
                             headers={'Cache-Control': 'no-cache'})
 
 
-# Per-context timeout for metrics collection. Must be shorter than the
-# Prometheus scrape_timeout configured on the upstream Prometheus that
-# scrapes this endpoint so the response arrives before that scrape times
-# out and marks the target down. Operators federating from a Prometheus
-# with a non-default scrape_timeout should adjust both together; see
-# docs/source/reference/api-server/examples/api-server-gpu-metrics-setup.rst.
-#
-# Without a per-context timeout, a single hanging port-forward (e.g. 30s
-# httpx timeout) would block the entire /gpu-metrics response.
-#
-# 30s accommodates large compute clusters where federate latency plus
-# port-forward setup can run 5-10s warm and longer cold.
-_PER_CONTEXT_TIMEOUT_SECONDS = 30
-
-_CREDENTIAL_MANAGER_KUBECONFIG_PATH = (
-    '/var/skypilot/credentials/kubeconfig/kubeconfig')
-
-
 @metrics_app.get('/debug-gpu-metrics')
 async def gpu_metrics_debug() -> dict:
     """Debug endpoint for diagnosing GPU metrics collection issues."""
-    kubeconfig_env = os.environ.get('KUBECONFIG', 'NOT_SET')
-    default_path = os.path.expanduser('~/.kube/config')
-
-    # Check what contexts are visible before and after cache clear
-    pre_clear_contexts = core.get_all_contexts()
-    annotations.clear_request_level_cache()
-    post_clear_contexts = core.get_all_contexts()
-
-    # Check kubeconfig file existence
-    if kubeconfig_env != 'NOT_SET':
-        kubeconfig_paths = kubeconfig_env.split(os.pathsep)
-    else:
-        kubeconfig_paths = [default_path]
-    path_info = {}
-    for p in kubeconfig_paths:
-        expanded = os.path.expanduser(p)
-        try:
-            st = os.stat(expanded)
-            path_info[p] = {'exists': True, 'size': st.st_size}
-        except OSError:
-            path_info[p] = {'exists': False, 'size': 0}
-
-    # Check credential manager kubeconfig separately
-    cred_mgr_exists = os.path.exists(_CREDENTIAL_MANAGER_KUBECONFIG_PATH)
-    cred_mgr_contexts = []
-    if cred_mgr_exists:
-        try:
-            ctxs, _ = (
-                kubernetes_adaptor.kubernetes.config.list_kube_config_contexts(
-                    config_file=_CREDENTIAL_MANAGER_KUBECONFIG_PATH))
-            cred_mgr_contexts = [c['name'] for c in ctxs]
-        except Exception as e:  # pylint: disable=broad-except
-            cred_mgr_contexts = [f'error: {e}']
-
-    return {
-        'pid': os.getpid(),
-        'thread': threading.current_thread().name,
-        'KUBECONFIG': kubeconfig_env,
-        'kubeconfig_paths': path_info,
-        'credential_manager_kubeconfig': {
-            'path': _CREDENTIAL_MANAGER_KUBECONFIG_PATH,
-            'exists': cred_mgr_exists,
-            'contexts': cred_mgr_contexts,
-        },
-        'contexts_before_cache_clear': pre_clear_contexts,
-        'contexts_after_cache_clear': post_clear_contexts,
-    }
+    return await metrics_federation.gpu_metrics_debug()
 
 
 def _handle_federation_result(context: str, route: str, result: object,
@@ -729,78 +661,14 @@ def _handle_federation_result(context: str, route: str, result: object,
     All work here is synchronous and non-blocking — no awaits, no I/O beyond
     logging — so it cannot hang the gather loop.
     """
-    # asyncio.TimeoutError is an Exception subclass, so check it first.
-    if isinstance(result, asyncio.TimeoutError):
-        metrics_utils.record_federation_outcome(context, route, 'timeout')
-        logger.error(
-            f'Failed to get metrics for context {context} (route {route}): '
-            f'timed out after {_PER_CONTEXT_TIMEOUT_SECONDS}s '
-            f'({stats.summary()}); kubectl port-forward + /federate exceeded '
-            f'the per-context budget; series for this cluster are omitted from '
-            f'this scrape')
-        return
-    if isinstance(result, Exception):
-        metrics_utils.record_federation_outcome(context, route, 'error')
-        # format_exception already renders as '<ClassName>: <message>'.
-        logger.error(
-            f'Failed to get metrics for context {context} (route {route}): '
-            f'{common_utils.format_exception(result)} ({stats.summary()})')
-        return
-    if isinstance(result, BaseException):
-        # Avoid changing behavior for non-Exception BaseExceptions like
-        # KeyboardInterrupt/SystemExit: re-raise them.
-        raise result
-    metrics_utils.record_federation_outcome(context, route, 'success')
-    # debug: one line per context per scrape; the timeout/error paths above
-    # log at error level, and the Prometheus metrics capture this regardless.
-    logger.debug(f'Federated metrics for context {context} (route {route}): '
-                 f'{stats.summary()}')
-    # The three guards above leave only the success case: a metrics-text str.
-    assert isinstance(result, str)
-    all_metrics.append(result)
+    metrics_federation.handle_federation_result(context, route, result, stats,
+                                                all_metrics)
 
 
 @metrics_app.get('/gpu-metrics')
 async def gpu_metrics() -> fastapi.Response:
     """Gets the GPU metrics from multiple external k8s clusters"""
-    # The metrics server runs as a daemon thread, not as a normal request
-    # handler, so:
-    # 1. The global config context (allowed_contexts, etc.) is a snapshot
-    #    from startup. Reload it from the DB to pick up config changes.
-    # 2. Request-scoped caches (kubernetes API clients, context names) are
-    #    never cleared automatically. Clear them to pick up new kubeconfigs.
-    skypilot_config.reload_config()
-    annotations.clear_request_level_cache()
-    contexts = core.get_all_contexts()
-    all_metrics: list[str] = []
-
-    remote_contexts = [
-        context for context in contexts if context != 'in-cluster'
-    ]
-    # One stats record per context, filled in by get_metrics_for_context even
-    # if the task is later cancelled by the wait_for timeout — so the timeout
-    # log can report how far the attempt got (port-forward vs. federate).
-    stats_list = [metrics_utils.FederationStats() for _ in remote_contexts]
-    tasks = [
-        asyncio.create_task(
-            asyncio.wait_for(
-                metrics_utils.get_metrics_for_context(context, stats=stats),
-                timeout=_PER_CONTEXT_TIMEOUT_SECONDS,
-            )) for context, stats in zip(remote_contexts, stats_list)
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(results):
-        _handle_federation_result(remote_contexts[i], 'gpu-metrics', result,
-                                  stats_list[i], all_metrics)
-
-    combined_metrics = '\n\n'.join(all_metrics)
-
-    # Return as plain text for Prometheus compatibility
-    return fastapi.Response(
-        content=combined_metrics,
-        media_type='text/plain; version=0.0.4; charset=utf-8')
+    return await metrics_federation.gpu_metrics(_handle_federation_result)
 
 
 @metrics_app.get('/endpoints-metrics')
@@ -812,38 +680,7 @@ async def endpoint_metrics() -> fastapi.Response:
     DCGM/node metrics. The cluster= label is injected so the Grafana
     serving dashboards can filter by cluster.
     """
-    # Same daemon-thread caveats as /gpu-metrics: reload config from the DB
-    # (allowed_contexts etc. are a startup snapshot) and clear request-scoped
-    # caches so new kubeconfigs are picked up.
-    skypilot_config.reload_config()
-    annotations.clear_request_level_cache()
-    contexts = core.get_all_contexts()
-    all_metrics: list[str] = []
-
-    remote_contexts = [
-        context for context in contexts if context != 'in-cluster'
-    ]
-    stats_list = [metrics_utils.FederationStats() for _ in remote_contexts]
-    tasks = [
-        asyncio.create_task(
-            asyncio.wait_for(
-                metrics_utils.get_endpoint_metrics_for_context(context,
-                                                               stats=stats),
-                timeout=_PER_CONTEXT_TIMEOUT_SECONDS,
-            )) for context, stats in zip(remote_contexts, stats_list)
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(results):
-        _handle_federation_result(remote_contexts[i], 'endpoints-metrics',
-                                  result, stats_list[i], all_metrics)
-
-    combined_metrics = '\n\n'.join(all_metrics)
-
-    return fastapi.Response(
-        content=combined_metrics,
-        media_type='text/plain; version=0.0.4; charset=utf-8')
+    return await metrics_federation.endpoint_metrics(_handle_federation_result)
 
 
 def build_metrics_server(host: str, port: int) -> uvicorn.Server:
