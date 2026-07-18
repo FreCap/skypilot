@@ -1609,17 +1609,13 @@ class ReplicaManager:
         self._next_replica_id: int = 1
         self._service_name: str = service_name
         service_record = serve_state.get_service_from_name(service_name)
-        stored_workspace = (service_record.get('workspace')
-                            if service_record is not None else None)
-        if service_record is not None and (
-                not isinstance(stored_workspace, str) or not stored_workspace):
-            raise RuntimeError(
-                f'Refusing replica recovery for legacy service '
-                f'{service_name!r} without a durable workspace. Recreate it '
-                'in the intended workspace.')
-        self._workspace = (stored_workspace or
-                           skypilot_config.get_active_workspace() or
-                           constants.SKYPILOT_DEFAULT_WORKSPACE)
+        if service_record is not None:
+            self._workspace = serve_utils.resolve_service_workspace(
+                service_name, service_record,
+                skypilot_config.get_active_workspace())
+        else:
+            self._workspace = (skypilot_config.get_active_workspace() or
+                               constants.SKYPILOT_DEFAULT_WORKSPACE)
         self._resource_scope = resource_scope
         self._service_hash = service_hash
         self._controller_owner = ((controller_pid,

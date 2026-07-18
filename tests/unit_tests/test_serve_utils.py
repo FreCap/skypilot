@@ -74,6 +74,96 @@ def test_lifecycle_lock_detection_failure_is_fail_closed():
     get_lock.assert_not_called()
 
 
+def test_resolve_legacy_service_workspace_from_replica_evidence():
+    replicas = [
+        types.SimpleNamespace(cluster_name='svc-r1'),
+        types.SimpleNamespace(cluster_name='svc-r2'),
+    ]
+    cluster_records = {
+        'svc-r1': {
+            'workspace': 'research'
+        },
+        'svc-r2': {
+            'workspace': 'research'
+        },
+    }
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=replicas), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=cluster_records) as get_clusters, \
+         mock.patch.object(serve_state,
+                           'set_service_workspace_if_owner',
+                           return_value=True) as set_workspace:
+        workspace = serve_utils.resolve_service_workspace(
+            'svc', {
+                'workspace': None,
+                'hash': 'incarnation-a'
+            }, 'research')
+
+    assert workspace == 'research'
+    get_clusters.assert_called_once_with(['svc-r1', 'svc-r2'])
+    set_workspace.assert_called_once_with('svc', 'research', 'incarnation-a')
+
+
+def test_resolve_legacy_service_workspace_rejects_conflicting_evidence():
+    replicas = [
+        types.SimpleNamespace(cluster_name='svc-r1'),
+        types.SimpleNamespace(cluster_name='svc-r2'),
+    ]
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=replicas), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             return_value={
+                 'svc-r1': {
+                     'workspace': 'research'
+                 },
+                 'svc-r2': {
+                     'workspace': 'production'
+                 },
+             }), \
+         mock.patch.object(serve_state,
+                           'set_service_workspace_if_owner') as set_workspace, \
+         pytest.raises(RuntimeError, match='multiple workspaces'):
+        serve_utils.resolve_service_workspace('svc', {
+            'workspace': None,
+            'hash': 'incarnation-a'
+        })
+    set_workspace.assert_not_called()
+
+
+def test_resolve_legacy_service_workspace_requires_trusted_empty_hint():
+    record = {'workspace': None, 'hash': 'incarnation-a'}
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[]), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'set_service_workspace_if_owner',
+                           return_value=True) as set_workspace:
+        with pytest.raises(RuntimeError, match='replica-cluster'):
+            serve_utils.resolve_service_workspace('svc', record, 'research')
+        workspace = serve_utils.resolve_service_workspace(
+            'svc', record, 'research', trusted_recovery_hint=True)
+
+    assert workspace == 'research'
+    set_workspace.assert_called_once_with('svc', 'research', 'incarnation-a')
+
+
+def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
+    with pytest.raises(RuntimeError, match="belongs to workspace 'research'"):
+        serve_utils.resolve_service_workspace('svc', {
+            'workspace': 'research',
+            'hash': 'incarnation-a'
+        }, 'production')
+
+
 def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
     replica = mock.Mock(cluster_name='svc-a-r1')
     launch_request = mock.Mock(request_id='launch-request')

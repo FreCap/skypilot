@@ -1173,21 +1173,16 @@ def _start(service_name: str,
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
-    stored_workspace = service.get('workspace') if service is not None else None
-    if service is not None and (not isinstance(stored_workspace, str) or
-                                not stored_workspace):
-        raise RuntimeError(
-            f'Refusing recovery for legacy service {service_name!r} without '
-            'a durable workspace. Recreate it in the intended workspace.')
-    if (stored_workspace is not None and workspace is not None and
-            stored_workspace != workspace):
-        raise RuntimeError(
-            f'Refusing service recovery for {service_name!r} in workspace '
-            f'{workspace!r}; the durable service workspace is '
-            f'{stored_workspace!r}.')
-    workspace = (stored_workspace or workspace or
-                 skypilot_config.get_active_workspace() or
-                 skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
+    if service is not None:
+        workspace_hint = workspace
+        if (workspace_hint is None and
+                skypilot_config.is_active_workspace_set()):
+            workspace_hint = skypilot_config.get_active_workspace()
+        workspace = serve_utils.resolve_service_workspace(
+            service_name, service, workspace_hint, trusted_recovery_hint=True)
+    else:
+        workspace = (workspace or skypilot_config.get_active_workspace() or
+                     skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
     # This bit comes from the API-side topology that allocated the lifecycle
     # epoch. It cannot be re-derived in the controller child: run_controller
     # sets OVERRIDE_CONSOLIDATION_MODE for unrelated controller behavior.
@@ -1874,6 +1869,19 @@ if __name__ == '__main__':
     # behaviors; 'spawn' is also cross-platform.
     multiprocessing.set_start_method('spawn', force=True)
     cli_workspace = args.workspace
+    service_record = serve_state.get_service_from_name(args.service_name)
+    if service_record is not None:
+        cli_workspace_hint = cli_workspace
+        if (cli_workspace_hint is None and
+                skypilot_config.is_active_workspace_set()):
+            cli_workspace_hint = skypilot_config.get_active_workspace()
+        cli_workspace = serve_utils.resolve_service_workspace(
+            args.service_name,
+            service_record,
+            cli_workspace_hint,
+            trusted_recovery_hint=True)
+    elif cli_workspace is None:
+        cli_workspace = skypilot_config.get_active_workspace()
     workspace_context = (
         skypilot_config.local_active_workspace_ctx(cli_workspace)
         if cli_workspace is not None else contextlib.nullcontext())

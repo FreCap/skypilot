@@ -889,6 +889,26 @@ def add_service(name: str,
     return True
 
 
+def set_service_workspace_if_owner(service_name: str, workspace: str,
+                                   expected_service_hash: str) -> bool:
+    """Backfills one legacy service workspace under an incarnation fence."""
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError('Service workspace must be a non-empty string.')
+    if (not isinstance(expected_service_hash, str) or
+            not expected_service_hash):
+        raise ValueError('Expected service hash must be a non-empty string.')
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            sqlalchemy.or_(services_table.c.workspace.is_(None),
+                           services_table.c.workspace == '')).update(
+                               {services_table.c.workspace: workspace})
+        session.commit()
+    return count > 0
+
+
 def update_service_controller_pid_if_owner(service_name: str,
                                            expected_service_hash: str | None,
                                            expected_controller_pid: int | None,

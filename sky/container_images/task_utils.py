@@ -40,25 +40,27 @@ def snapshot_task_container_images(
             image is not None and resource.container_image_from_legacy_image_id
             and image.distribution is None
             for resource, image in zip(resources, images))
-        if any(image is None for image in images) or (any(legacy_direct) and
-                                                      not all(legacy_direct)):
+        # Legacy image_id candidates historically support heterogeneous task
+        # shapes: for example, Kubernetes placements may run in a Docker image
+        # while VM placements use the host image and launch Docker from `run`.
+        # They also support different direct images by placement. Keep that
+        # behavior outside the managed catalog until the task explicitly opts
+        # in with resources.container_image.
+        if all(image is None or legacy
+               for image, legacy in zip(images, legacy_direct)):
+            continue
+        if any(image is None for image in images) or any(legacy_direct):
             raise ValueError(
                 'All resource candidates in one workload version must '
                 'resolve to the same immutable container artifact. Use one '
                 'managed artifact across placements or one identical direct '
                 'image.')
         concrete_images = typing.cast(tuple[models.ContainerImage, ...], images)
-        if all(legacy_direct):
-            if len(set(concrete_images)) != 1:
-                raise ValueError(
-                    'All resource candidates in one workload version must '
-                    'resolve to the same immutable container artifact. Use '
-                    'one managed artifact across placements or one identical '
-                    'direct image.')
-            continue
         groups.append(
             _TaskSnapshotGroup(task, resource_type, resources, concrete_images))
 
+    if not groups:
+        return []
     snapshots_by_group = core.snapshot_for_deployment_groups(
         [group.images for group in groups], workspace)
     artifact_ids: list[str] = []

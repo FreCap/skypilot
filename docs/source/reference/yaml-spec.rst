@@ -44,6 +44,7 @@ Below is the configuration syntax and some example values.  See details under ea
     :ref:`max_hourly_cost <yaml-spec-resources-max-hourly-cost>`: 10.0
 
     # Config.
+    :ref:`container_image <yaml-spec-resources-container-image>`: ghcr.io/my-org/model:2026-07-18
     :ref:`image_id <yaml-spec-resources-image-id>`: ami-0868a20f5a3bf9702
     :ref:`ports <yaml-spec-resources-ports>`: 8081
     :ref:`labels <yaml-spec-resources-labels>`:
@@ -740,6 +741,63 @@ OR
       - 10022-10040
 
 
+.. _yaml-spec-resources-container-image:
+
+``resources.container_image``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+OCI container image to use as the task runtime (optional, advanced).
+
+Use the scalar form for an OCI source reference:
+
+.. code-block:: yaml
+
+  resources:
+    container_image: ghcr.io/my-org/model:2026-07-18
+
+Use the object form to bind a human-readable release or select a registry
+distribution profile:
+
+.. code-block:: yaml
+
+  resources:
+    container_image:
+      ref: ghcr.io/my-org/model:2026-07-18
+      release: model-production-2026-07-18
+      distribution: production
+
+The supported fields are:
+
+- ``ref``: an OCI image reference. When a managed distribution is selected,
+  SkyPilot resolves mutable tags to an immutable digest before persisting the
+  workload.
+- ``release``: a workspace-scoped, human-readable immutable alias. Combine it
+  with ``ref`` to bind the alias on first use, or use it alone after the image
+  has been published.
+- ``artifact_id``: the SkyPilot-generated UUID for an exact catalog artifact.
+  It cannot be combined with ``ref`` or ``release``.
+- ``distribution``: an administrator-configured registry profile. Use
+  ``direct`` to bypass managed distribution in a ``managed_preferred``
+  workspace. ``direct`` is rejected in a ``managed_required`` workspace.
+
+If ``distribution`` is omitted, SkyPilot uses the workspace default profile,
+then the API server default profile. If no profile is configured, a ``ref``
+keeps the direct-pull behavior. ``release`` and ``artifact_id`` require a
+managed profile because they do not identify a physical registry reference on
+their own.
+
+For a managed workload, all ``any_of`` or ``ordered`` resource candidates must
+resolve to the same immutable artifact. One node pull is shared by all GPUs on
+a multi-GPU VM; starting one model process per GPU remains the task's
+responsibility.
+
+The legacy ``image_id: docker:<image>`` syntax remains supported with its
+existing direct-pull and heterogeneous-candidate behavior, but is deprecated.
+It does not opt a task into managed distribution. See
+:ref:`container_registries <config-yaml-container-registries>` for the API
+server and workspace configuration.
+
+
 .. _yaml-spec-resources-image-id:
 
 ``resources.image_id``
@@ -752,7 +810,11 @@ If not specified, SkyPilot will use the default debian-based image suitable for 
 
 **Docker support**
 
-You can specify docker image to use by setting the image_id to ``docker:<image name>`` for Azure, AWS, GCP, and RunPod. For example,
+You can specify a Docker image by setting ``image_id`` to
+``docker:<image name>`` for Azure, AWS, GCP, and RunPod. This form is
+deprecated for container runtimes; use
+:ref:`resources.container_image <yaml-spec-resources-container-image>` for new
+workloads. Existing workloads retain their direct-pull behavior. For example,
 
 .. code-block:: yaml
 

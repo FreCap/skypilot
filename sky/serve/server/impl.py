@@ -346,12 +346,21 @@ def _get_service_record(
 def _require_service_update_workspace(service_record: dict[str, Any],
                                       service_name: str, noun: str) -> str:
     """Returns the durable workspace after fencing the request scope."""
+    active_workspace = skypilot_config.get_active_workspace()
     stored_workspace = service_record.get('workspace')
-    if not isinstance(stored_workspace, str) or not stored_workspace:
-        raise RuntimeError(
-            f'Cannot safely update legacy {noun} {service_name!r} without a '
-            'durable workspace. Recreate it in the intended workspace.')
-    if skypilot_config.get_active_workspace() != stored_workspace:
+    if isinstance(stored_workspace, str) and stored_workspace:
+        if active_workspace != stored_workspace:
+            raise RuntimeError(
+                f'Cannot update {noun} {service_name!r} from a different '
+                'workspace than the one that owns it.')
+        return stored_workspace
+    try:
+        stored_workspace = serve_utils.resolve_service_workspace(
+            service_name, service_record, active_workspace)
+    except RuntimeError as e:
+        raise RuntimeError(f'Cannot safely update legacy {noun} '
+                           f'{service_name!r}: {e}') from e
+    if active_workspace != stored_workspace:
         raise RuntimeError(
             f'Cannot update {noun} {service_name!r} from a different '
             'workspace than the one that owns it.')

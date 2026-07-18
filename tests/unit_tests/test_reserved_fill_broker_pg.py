@@ -254,6 +254,44 @@ class TestServiceLivenessSnapshotPG:
         assert records[0]['status'] == serve_state.ServiceStatus.READY
 
 
+class TestServiceWorkspaceBackfillPG:
+    """Legacy workspace adoption is a production-dialect fenced write."""
+
+    def test_backfill_is_null_only_and_incarnation_fenced(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        assert serve_state.add_service(name='svc-legacy',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=None,
+                                       yaml_content='service: {}',
+                                       workspace=None,
+                                       service_hash='incarnation-a')
+
+        assert not serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'research', 'incarnation-b')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] is None
+
+        assert serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'research', 'incarnation-a')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] == 'research'
+
+        assert not serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'other', 'incarnation-a')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] == 'research'
+
+
 # TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
 # sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
 # SHARE row lock instead of returning False).
@@ -404,8 +442,7 @@ class TestMigrationChainPG:
         services = sqlalchemy.Table('services', metadata, *service_columns)
         sqlalchemy.Table(
             'version_specs', metadata,
-            sqlalchemy.Column('service_name',
-                              sqlalchemy.Text,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
                               primary_key=True),
             sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
             sqlalchemy.Column('created_at', sqlalchemy.Float),
@@ -423,9 +460,9 @@ class TestMigrationChainPG:
                         "INSERT INTO alembic_version_serve_state_db "
                         "VALUES ('016')"))
 
-            migration_utils.safe_alembic_upgrade(
-                engine, migration_utils.SERVE_DB_NAME,
-                migration_utils.SERVE_VERSION)
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
 
             inspector = sqlalchemy.inspect(engine)
             service_columns = {

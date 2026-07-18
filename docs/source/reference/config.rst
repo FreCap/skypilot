@@ -57,6 +57,20 @@ Below is the configuration syntax and some example values. See detailed explanat
       - -v /var/run/docker.sock:/var/run/docker.sock
       - --shm-size=2g
 
+  :ref:`container_registries <config-yaml-container-registries>`:
+    default_profile: production
+    profiles:
+      production:
+        revision: 1
+        ownership: managed
+        realm: production
+        namespace: skypilot/{workspace}
+        canonical:
+          provider: aws
+          account: '123456789012'
+          region: us-east-1
+          pull_auth: ecr_runtime_identity
+
   :ref:`nvidia_gpus <config-yaml-nvidia-gpus>`:
     :ref:`disable_ecc <config-yaml-nvidia-gpus-disable-ecc>`: false
 
@@ -587,7 +601,8 @@ Default: ``null`` (use all supported clouds).
 
 Additional Docker run options (optional).
 
-When ``image_id: docker:<docker_image>`` is used in a task YAML, additional
+When ``resources.container_image`` or the legacy
+``image_id: docker:<docker_image>`` syntax is used in a task YAML, additional
 run options for starting the Docker container can be specified here.
 These options will be passed directly as command line args to ``docker run``,
 see: https://docs.docker.com/reference/cli/docker/container/run/
@@ -618,6 +633,105 @@ Example:
     run_options:
       - -v /var/run/docker.sock:/var/run/docker.sock
       - --shm-size=2g
+
+
+.. _config-yaml-container-registries:
+
+``container_registries``
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Registry profiles used by
+:ref:`resources.container_image <yaml-spec-resources-container-image>`
+(optional, API server administrator configuration).
+
+A profile is an atomic, secret-free description of one canonical registry and
+zero or more locality targets. Tasks refer to the profile by name; they never
+embed registry credentials. ``revision`` is a positive, monotonically
+increasing integer. Increment it whenever an endpoint, identity, namespace, or
+policy field changes so in-flight materializations cannot be reinterpreted
+under a new configuration.
+
+.. code-block:: yaml
+
+  container_registries:
+    default_profile: production
+    profiles:
+      production:
+        revision: 1
+        ownership: managed
+        realm: production
+        namespace: skypilot/{workspace}
+        require_digest_at_runtime: true
+        canonical:
+          provider: aws
+          account: '123456789012'
+          region: us-east-1
+          pull_auth: ecr_runtime_identity
+        targets:
+          - name: aws-us-west-2
+            provider: aws
+            account: '123456789012'
+            region: us-west-2
+            pull_auth: ecr_runtime_identity
+          - name: gcp-us-central1
+            provider: gcp
+            project: my-gcp-project
+            region: us-central1
+            pull_auth: gar_runtime_identity
+
+  workspaces:
+    research:
+      container_images:
+        mode: managed_required
+        default_profile: production
+        allowed_profiles: [production]
+        locality: prefer
+        regional_cache_retention_weeks: 8
+
+``ownership`` is ``managed`` for repositories in a namespace exclusively
+owned by SkyPilot, or ``external`` for pre-created repositories whose lifecycle
+remains outside SkyPilot. A managed namespace must contain ``{workspace}`` so
+one workspace cannot evict another workspace's content. ``realm`` prevents
+accidental reuse of a profile name across environments such as staging and
+production.
+
+Workspace policy controls activation:
+
+- ``managed_preferred`` uses a verified local or canonical copy when available
+  and may use an authenticated source fallback. A task can explicitly request
+  ``distribution: direct``.
+- ``managed_required`` rejects direct and legacy ``image_id: docker:...``
+  pulls. Tasks must use ``resources.container_image`` and a configured profile.
+- ``locality: prefer`` allows safe canonical or source fallback,
+  ``locality: require`` requires a verified local target, and
+  ``locality: canonical`` always uses the canonical target.
+
+Kubernetes pull identity is an explicit context binding. It asserts that the
+cluster's node or kubelet identity is already authorized; no credential value
+is stored in SkyPilot state:
+
+.. code-block:: yaml
+
+  container_registries:
+    kubernetes_contexts:
+      prod-research-cluster:
+        registry_provider: aws
+        registry_region: us-east-1
+        registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+        auth_strategy: node_identity
+
+Adding this configuration does not mutate existing legacy task YAML. Existing
+``image_id: docker:...`` workloads keep direct-pull behavior under
+``managed_preferred``. To opt in, migrate the task to
+``resources.container_image``; use ``managed_required`` only after every task
+in that workspace has been migrated.
+
+.. note::
+
+  Registry profiles describe and validate the distribution topology. This
+  release does not automatically deploy a copy worker or bootstrap cloud
+  repositories and IAM. Install those operational components, or pre-create
+  and register external locations, before enabling ``managed_required``.
 
 .. _config-yaml-nvidia-gpus:
 

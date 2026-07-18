@@ -32,7 +32,16 @@ from sky.utils import thread_utils
 def test_replica_manager_rejects_legacy_service_without_workspace():
     with mock.patch.object(replica_managers.serve_state,
                            'get_service_from_name',
-                           return_value={'workspace': None}), \
+                           return_value={
+                               'workspace': None,
+                               'hash': 'incarnation-a'
+                           }), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[]), \
+         mock.patch.object(replica_managers.serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value={}), \
          pytest.raises(RuntimeError, match='durable workspace'):
         replica_managers.ReplicaManager('legacy-service',
                                         mock.MagicMock(),

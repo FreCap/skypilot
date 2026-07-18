@@ -870,7 +870,11 @@ class TestLifecycleLocking:
             'status': serve_state.ServiceStatus.READY,
             'workspace': stored_workspace,
         }
-        with pytest.raises(RuntimeError, match='durable workspace'):
+        with mock.patch.object(
+                impl.serve_utils,
+                'resolve_service_workspace',
+                side_effect=RuntimeError('without a durable workspace')), \
+             pytest.raises(RuntimeError, match='durable workspace'):
             impl._require_service_update_workspace(record, 'svc', 'service')
 
     def test_update_rejects_caller_from_different_workspace_before_mutation(

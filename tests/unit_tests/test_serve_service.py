@@ -673,6 +673,10 @@ def test_legacy_service_without_workspace_fails_recovery_closed():
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
                            return_value=record), \
+         mock.patch.object(
+             service.serve_utils,
+             'resolve_service_workspace',
+             side_effect=RuntimeError('without a durable workspace')), \
          pytest.raises(RuntimeError, match='durable workspace'):
         service._start('svc', '/does/not/exist', 1, 'sky serve up')
 

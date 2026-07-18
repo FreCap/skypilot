@@ -1408,12 +1408,17 @@ def test_resources_container_image_round_trip_and_legacy_normalization():
                                         image_id='ami-123',
                                         container_image={
                                             'ref': _SOURCE,
-                                            'profile': 'managed',
-                                            'version': 'boltz-2.1.0',
+                                            'distribution': 'managed',
+                                            'release': 'boltz-2.1.0',
                                         })
     assert resources.image_id == {None: 'ami-123'}
     assert resources.extract_docker_image() == _SOURCE
-    assert resources.container_image.version == 'boltz-2.1.0'
+    assert resources.container_image.release == 'boltz-2.1.0'
+    assert resources.to_yaml_config()['container_image'] == {
+        'ref': _SOURCE,
+        'release': 'boltz-2.1.0',
+        'distribution': 'managed',
+    }
     loaded = list(
         resources_lib.Resources.from_yaml_config(resources.to_yaml_config()))[0]
     assert loaded.container_image == resources.container_image
@@ -2280,6 +2285,48 @@ def test_managed_job_snapshot_survives_controller_serialization(
         resource.container_image.artifact_id for resource in task.resources
     } for task in restored.tasks]
     assert restored_ids == [{first.id}, {second.id}]
+
+
+def test_legacy_heterogeneous_candidates_bypass_managed_snapshot():
+    """Existing mixed image_id/host-image workloads keep their semantics."""
+    task = task_lib.Task().set_resources([
+        resources_lib.Resources(cloud='kubernetes',
+                                image_id='docker:registry.example/model-a'),
+        resources_lib.Resources(cloud='aws'),
+        resources_lib.Resources(cloud='kubernetes',
+                                image_id='docker:registry.example/model-b'),
+    ])
+    before = [resource.to_yaml_config() for resource in task.resources]
+
+    with mock.patch.object(core,
+                           'snapshot_for_deployment_groups') as snapshot_groups:
+        artifact_ids = (
+            container_image_task_utils.snapshot_task_container_images(
+                [task], 'research'))
+
+    assert not artifact_ids
+    snapshot_groups.assert_not_called()
+    assert [resource.to_yaml_config() for resource in task.resources] == before
+
+
+@pytest.mark.parametrize('other', [
+    resources_lib.Resources(cloud='aws'),
+    resources_lib.Resources(cloud='kubernetes',
+                            image_id='docker:registry.example/legacy'),
+])
+def test_explicit_container_image_rejects_unmanaged_candidate(other):
+    task = task_lib.Task().set_resources([
+        resources_lib.Resources(cloud='aws',
+                                container_image={
+                                    'ref': _SOURCE,
+                                    'distribution': 'managed',
+                                }),
+        other,
+    ])
+
+    with pytest.raises(ValueError, match='same immutable container artifact'):
+        container_image_task_utils.snapshot_task_container_images([task],
+                                                                  'research')
 
 
 def test_service_same_digest_sources_publish_one_atomic_snapshot(
