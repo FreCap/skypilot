@@ -289,6 +289,29 @@ When updating dependencies:
 | `sky/provision/provisioner.py` | Resource provisioning |
 | `sky/jobs/` | Managed jobs with recovery and scheduling |
 
+## Feature Plans
+
+Final implementation plans for non-trivial features must be checked into
+`agent/feature-plans/` as Markdown files. Use a descriptive kebab-case filename
+such as `agent/feature-plans/managed-container-image-distribution.md`.
+
+- Add the finalized plan before or with the implementation it describes. Draft
+  exploration can live elsewhere, but the accepted implementation plan belongs
+  in this directory.
+- Treat the checked-in plan as a living source of truth. Update it in the same
+  change whenever scope, architecture, public interfaces, compatibility,
+  migrations, rollout steps, or verification status changes.
+- Distinguish completed work from pending operational or follow-up work. Do not
+  mark a feature complete while its plan still describes stale behavior or
+  unfinished required gates.
+- Include, at minimum, status and last-updated metadata, goals and non-goals,
+  the public contract, architecture and invariants, implementation phases,
+  deployment and rollback behavior, verification evidence, and open gates.
+- Record intentional implementation departures and their rationale in the
+  plan instead of letting code and plan silently diverge.
+- When a plan is superseded, mark it as superseded and link to its replacement;
+  do not silently delete historical design context.
+
 ## Pull Request Guidelines
 
 1. **Branch from master**, create descriptive branch name
