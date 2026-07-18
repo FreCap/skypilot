@@ -50,8 +50,10 @@ def _patch_common(monkeypatch, events, replicas):
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas))
     cluster_names = {replica.cluster_name for replica in replicas}
-    monkeypatch.setattr(service.global_user_state, 'cluster_with_name_exists',
-                        lambda name: name in cluster_names)
+    monkeypatch.setattr(
+        service.serve_utils, 'get_existing_replica_cluster_names',
+        lambda replica_infos: cluster_names.intersection(
+            replica.cluster_name for replica in replica_infos))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)

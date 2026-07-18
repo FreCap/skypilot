@@ -2583,6 +2583,7 @@ def get_service_pool_from_db(service_name: str) -> bool | None:
 # rounded down for headroom.
 _REPLICA_UPSERT_CHUNK_SIZE = 90
 _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE = 300
+_REPLICA_DELETE_CHUNK_SIZE = 500
 _REPLICA_STATE_VERSION = 1
 
 
@@ -2798,6 +2799,60 @@ def remove_replica(
     # Once exact ownership is proven, an already-absent child is the desired
     # idempotent cleanup state, not evidence of ownership loss.
     return expected_service_hash is not None or result.rowcount > 0
+
+
+def remove_replicas(
+    service_name: str,
+    replica_ids: list[int],
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> bool:
+    """Atomically remove replicas fenced to one service incarnation.
+
+    Large failed-launch inventories can contain thousands of replicas whose
+    clusters were never created. Removing those rows one transaction at a
+    time makes teardown scale with retained history. This helper proves the
+    service hash, lifecycle epoch, and optional controller owner once, then
+    deletes the requested children in bounded chunks within that transaction.
+
+    An already-absent child is the desired idempotent state. No history table
+    is touched; aggregate Serve history has its own retention policy.
+    """
+    if not expected_service_hash:
+        return False
+    replica_ids = list(dict.fromkeys(replica_ids))
+    if not replica_ids:
+        return True
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        owner = session.execute(
+            sqlalchemy.select(services_table.c.hash,
+                              services_table.c.lifecycle_epoch,
+                              services_table.c.controller_pid,
+                              services_table.c.controller_ip).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
+        if (owner is None or owner[0] != expected_service_hash or
+            (expected_lifecycle_epoch is not None and
+             owner[1] != expected_lifecycle_epoch) or
+            (expected_controller_owner is not None and
+             (owner[2], owner[3]) != expected_controller_owner)):
+            session.rollback()
+            return False
+        for start in range(0, len(replica_ids), _REPLICA_DELETE_CHUNK_SIZE):
+            chunk = replica_ids[start:start + _REPLICA_DELETE_CHUNK_SIZE]
+            session.execute(
+                sqlalchemy.delete(replicas_table).where(
+                    replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id.in_(chunk)))
+        session.commit()
+    return True
 
 
 def get_replica_info_from_id(

@@ -2439,16 +2439,25 @@ def quiesce_service_replica_launch_requests(
 
     launch_request_name = (server_constants.REQUEST_NAME_PREFIX +
                            request_names.RequestName.CLUSTER_LAUNCH.value)
-    cluster_names = sorted({info.cluster_name for info in replica_infos})
+    cluster_names = {info.cluster_name for info in replica_infos}
 
     def _active_launch_request_ids() -> set[str]:
-        active_request_ids: set[str] = set()
-        for cluster_name in cluster_names:
-            for request in sdk.api_status(all_status=False,
-                                          cluster_name=cluster_name):
-                if request.name == launch_request_name:
-                    active_request_ids.add(request.request_id)
-        return active_request_ids
+        if not cluster_names:
+            return set()
+        # The service is already durably terminal, so the controller cannot
+        # schedule more launches. A launch request racing this snapshot is
+        # caught by the next cancellation round. Return only the three small
+        # fields needed for that convergence proof. This is bounded by the
+        # API's active queue rather than by retained replica history (2,159
+        # stale rows previously meant 2,159 HTTP requests per round).
+        active_requests = sdk.api_status(
+            all_status=False, fields=['request_id', 'name', 'cluster_name'])
+        return {
+            request.request_id
+            for request in active_requests
+            if request.name == launch_request_name and
+            request.cluster_name in cluster_names
+        }
 
     try:
         # A completed cancellation request makes the target terminal before it
@@ -2478,6 +2487,17 @@ def quiesce_service_replica_launch_requests(
                      f'{service_name!r}: '
                      f'{common_utils.format_exception(e)}')
         return False
+
+
+def get_existing_replica_cluster_names(
+    replica_infos: list['replica_managers.ReplicaInfo'],) -> set[str]:
+    """Return one batched snapshot of replica names in the cluster table."""
+    cluster_names = list(
+        dict.fromkeys(info.cluster_name for info in replica_infos))
+    if not cluster_names:
+        return set()
+    return set(
+        global_user_state.get_cluster_status_fields(cluster_names).keys())
 
 
 def _terminate_failed_services(service_name: str,
@@ -2656,9 +2676,23 @@ def _terminate_failed_services_locked(
     # the rows first (the old behavior) permanently orphaned any cluster
     # that still existed -- nothing referenced it anymore, so it kept
     # billing until manually downed.
+    try:
+        existing_cluster_names = get_existing_replica_cluster_names(
+            replica_infos)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to prove replica cluster inventory for failed '
+                     f'service {service_name!r}: '
+                     f'{common_utils.format_exception(e)}')
+        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                'could not be purged because its replica cluster inventory '
+                'could not be verified; durable cleanup inventory was '
+                f'retained for retry.{colorama.Style.RESET_ALL}')
+    if not _still_owns():
+        return _purge_ownership_failure(
+            service_name, 'ownership lost after cluster inventory snapshot')
     to_terminate = [
         info for info in replica_infos
-        if global_user_state.cluster_with_name_exists(info.cluster_name)
+        if info.cluster_name in existing_cluster_names
     ]
     if to_terminate:
         # Imported here to break the circular dependency: replica_managers
@@ -2854,8 +2888,25 @@ def _terminate_orphaned_service_children_impl(
                         f'{common_utils.format_exception(e)}.'
                         f'{colorama.Style.RESET_ALL}')
 
+        try:
+            existing_cluster_names = get_existing_replica_cluster_names(
+                replica_infos)
+        except Exception as e:  # pylint: disable=broad-except
+            return (f'{colorama.Fore.YELLOW}orphaned service '
+                    f'{service_name!r} could not be purged because its '
+                    'replica cluster inventory could not be verified: '
+                    f'{common_utils.format_exception(e)}.'
+                    f'{colorama.Style.RESET_ALL}')
+        if not _still_orphaned():
+            return _purge_ownership_failure(
+                service_name,
+                'ownership lost after orphan cluster inventory snapshot')
+        to_terminate = [
+            info for info in replica_infos
+            if info.cluster_name in existing_cluster_names
+        ]
         termination_failures = []
-        for info in replica_infos:
+        for info in to_terminate:
             if not _still_orphaned():
                 return _purge_ownership_failure(
                     service_name,
