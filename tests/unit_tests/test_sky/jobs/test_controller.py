@@ -749,6 +749,127 @@ class TestJobGroupRecovery:
         assert cancelled == {'first', 'second'}
 
     @pytest.mark.asyncio
+    async def test_job_group_barrier_reads_one_ordered_handle_snapshot(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        terminal_task = MagicMock()
+        terminal_task.name = 'task-3'
+        terminal_task.envs = {}
+        mock_dag.tasks.append(terminal_task)
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock(), MagicMock()]
+        for executor in executors:
+            executor.launch = AsyncMock()
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), (
+                'cluster-1', executors[1]), ('cluster-2', executors[2])])
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        job_controller._cleanup_job_group_clusters = AsyncMock()
+        statuses = AsyncMock(return_value=[
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+            (2, managed_job_state.ManagedJobStatus.RECOVERING),
+            (3, managed_job_state.ManagedJobStatus.SUCCEEDED),
+        ])
+        set_started = AsyncMock()
+        first_handle = MagicMock(name='first-handle')
+        third_handle = MagicMock(name='third-handle')
+
+        def snapshot(cluster_names):
+            # The complete barrier snapshot owns the read epoch: no task may
+            # publish STARTED while it is still being assembled.
+            assert set_started.await_count == 0
+            assert cluster_names == {'cluster-0', 'cluster-1', 'cluster-2'}
+            # Deliberately omit cluster-1 to cover concurrent row removal.
+            # Return the survivors in reverse order to prove DAG-order rebuild.
+            return {
+                'cluster-2': third_handle,
+                'cluster-0': first_handle,
+            }
+
+        batched_lookup = MagicMock(side_effect=snapshot)
+        per_task_lookup = MagicMock(
+            side_effect=AssertionError('per-task handle lookup'))
+        setup_networking = AsyncMock(return_value=True)
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.managed_job_state, 'set_started_async',
+                    set_started), patch.object(
+                        controller_lib.global_user_state,
+                        'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', per_task_lookup), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=None), patch.object(
+                        controller_lib.job_group_networking,
+                        'setup_job_group_networking', setup_networking):
+            result = await job_controller._run_job_group()
+
+        assert result is True
+        batched_lookup.assert_called_once_with(
+            {'cluster-0', 'cluster-1', 'cluster-2'})
+        per_task_lookup.assert_not_called()
+        executors[0].launch.assert_awaited_once_with()
+        executors[1].launch.assert_not_awaited()
+        executors[2].launch.assert_not_awaited()
+        set_started.assert_awaited_once()
+        assert set_started.await_args.kwargs['task_id'] == 0
+        setup_networking.assert_awaited_once_with(
+            mock_dag.name, [(mock_dag.tasks[0], first_handle),
+                            (mock_dag.tasks[2], third_handle)])
+        assert [
+            call.args[0]
+            for call in job_controller._monitor_job_group_task.await_args_list
+        ] == [0, 1, 2]
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0', 'cluster-1', 'cluster-2', None])
+
+    @pytest.mark.asyncio
+    async def test_job_group_barrier_snapshot_failure_fences_state(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        executors[0].launch = AsyncMock()
+        executors[1].launch = AsyncMock()
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+        set_started = AsyncMock()
+        snapshot_error = RuntimeError('barrier snapshot failed')
+        batched_lookup = MagicMock(side_effect=snapshot_error)
+        setup_networking = AsyncMock()
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.managed_job_state, 'set_started_async',
+                    set_started), patch.object(
+                        controller_lib.global_user_state,
+                        'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'setup_job_group_networking', setup_networking), \
+                pytest.raises(RuntimeError, match='barrier snapshot failed'):
+            await job_controller._run_job_group()
+
+        batched_lookup.assert_called_once_with({'cluster-0', 'cluster-1'})
+        set_started.assert_not_awaited()
+        setup_networking.assert_not_awaited()
+        job_controller._monitor_job_group_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_group_parent_cancellation_joins_monitor_children(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
@@ -786,7 +907,10 @@ class TestJobGroupRecovery:
                 controller_lib.managed_job_state,
                 'get_all_task_ids_statuses_async', statuses), patch.object(
                     controller_lib.global_user_state,
-                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                    'get_handles_from_cluster_names', return_value={
+                        'cluster-0': MagicMock(),
+                        'cluster-1': MagicMock(),
+                    }), \
                 patch.object(
                     controller_lib.job_group_networking,
                     'dns_addresses_for_task', return_value=['127.0.0.1']):
@@ -855,7 +979,10 @@ class TestJobGroupRecovery:
                 controller_lib.managed_job_state,
                 'get_all_task_ids_statuses_async', statuses), patch.object(
                     controller_lib.global_user_state,
-                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                    'get_handles_from_cluster_names', return_value={
+                        'cluster-0': MagicMock(),
+                        'cluster-1': MagicMock(),
+                    }), \
                 patch.object(
                     controller_lib.job_group_networking,
                     'dns_addresses_for_task', return_value=['127.0.0.1']), \

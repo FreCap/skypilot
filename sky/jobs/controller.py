@@ -1544,33 +1544,7 @@ class JobController:
         # Phase 2: Barrier sync - collect handles and set RUNNING state
         logger.info('Phase 2: Waiting for all clusters to be ready...')
 
-        async def sync_task_state(
-            task_id: int, task: 'task_lib.Task', cluster_name: str,
-            is_resuming: bool
-        ) -> 'cloud_vm_ray_backend.CloudVmRayResourceHandle':
-            """Sync state for a single task (parallel execution).
-
-            JobGroups don't support pools, so cluster_name is always
-            deterministic and provided by the caller.
-            """
-            handle = await asyncio.to_thread(
-                global_user_state.get_handle_from_cluster_name, cluster_name)
-
-            # Only set STARTED state if not resuming (already started before)
-            if not is_resuming:
-                callback_func = managed_job_utils.event_callback_func(
-                    job_id=self._job_id, task_id=task_id, task=task)
-                await managed_job_state.set_started_async(
-                    job_id=self._job_id,
-                    task_id=task_id,
-                    start_time=time.time(),
-                    callback_func=callback_func)
-
-            return handle
-
-        # Execute all state syncs in parallel (only for non-terminal tasks)
-        sync_coros = []
-        sync_task_ids = []
+        active_tasks: list[tuple[int, sky.Task, str, bool]] = []
         for task_id, task in enumerate(tasks):
             if is_terminal(task_id):
                 continue
@@ -1580,19 +1554,30 @@ class JobController:
             task_cluster_name = cluster_names[task_id]
             assert task_cluster_name is not None, (
                 f'cluster_name should be set for non-terminal task {task_id}')
-            sync_coros.append(
-                sync_task_state(task_id, task, task_cluster_name,
-                                task_is_resuming))
-            sync_task_ids.append(task_id)
+            active_tasks.append(
+                (task_id, task, task_cluster_name, task_is_resuming))
 
-        sync_results = await asyncio.gather(*sync_coros)
-
-        # Build handles list from sync results
+        handle_snapshot = await asyncio.to_thread(
+            global_user_state.get_handles_from_cluster_names,
+            {cluster_name for _, _, cluster_name, _ in active_tasks})
         handles: list[cloud_vm_ray_backend.CloudVmRayResourceHandle |
                       None] = [None] * len(tasks)
-        for i, handle in enumerate(sync_results):
-            task_id = sync_task_ids[i]
-            handles[task_id] = handle
+        start_coros = []
+        for task_id, task, active_cluster_name, is_resuming in active_tasks:
+            handles[task_id] = typing.cast(
+                cloud_vm_ray_backend.CloudVmRayResourceHandle | None,
+                handle_snapshot.get(active_cluster_name))
+            if not is_resuming:
+                callback_func = managed_job_utils.event_callback_func(
+                    job_id=self._job_id, task_id=task_id, task=task)
+                start_coros.append(
+                    managed_job_state.set_started_async(
+                        job_id=self._job_id,
+                        task_id=task_id,
+                        start_time=time.time(),
+                        callback_func=callback_func))
+        if start_coros:
+            await asyncio.gather(*start_coros)
 
         # Phase 3: Set up networking
         logger.info('Phase 3: Setting up JobGroup networking...')
