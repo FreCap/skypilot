@@ -1584,6 +1584,17 @@ unknown, including the interval before the first successful probe after a load
 balancer restart. Set a positive ``min_size`` to let arrivals wait through that
 interval.
 
+Inference requests may set ``X-SkyServe-Priority`` to an integer from 0 to 100.
+Higher-priority queued requests are dispatched first, with first-in-first-out
+ordering among requests at the same priority. Scheduling is non-preemptive: a
+request that has already been dispatched continues running. Missing headers
+default to priority 0. Malformed, duplicate, or out-of-range priority headers
+receive HTTP 400. The load balancer consumes this header and does not forward it
+to replicas. Priority is validated even when ``request_queue`` is disabled, but
+without a queue it does not otherwise delay dispatch. Strict priority can starve
+lower-priority requests under sustained higher-priority load, and a full queue
+rejects new arrivals rather than evicting an existing lower-priority request.
+
 The queue accepts at most 3,000 waiting requests, 128 concurrent requests,
 and 16 MiB per request body. The product of ``max_concurrency`` and
 ``max_request_body_bytes`` must stay within a 128 MiB active-request buffering
