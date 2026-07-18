@@ -299,12 +299,11 @@ class SkyDockerCommandRunner(DockerCommandRunner):
         # `mesg: ttyname failed: inappropriate ioctl for device`.
         # see https://www.educative.io/answers/error-mesg-ttyname-failed-inappropriate-ioctl-for-device  # pylint: disable=line-too-long
         port = constants.DEFAULT_DOCKER_PORT
-        # pylint: disable=anomalous-backslash-in-string
         self.run(f'sudo sed -i "s/#Port 22/Port {port}/" /etc/ssh/sshd_config;'
                  'mkdir -p ~/.ssh;'
                  'cat /tmp/host_ssh_authorized_keys >> ~/.ssh/authorized_keys;'
                  'sudo service ssh start;'
-                 'sudo sed -i "s/mesg n/tty -s \&\& mesg n/" ~/.profile;')
+                 'sudo sed -i "s/mesg n/tty -s \\&\\& mesg n/" ~/.profile;')
 
         # SkyPilot: End of Setup Commands.
 
