@@ -5,6 +5,7 @@ import functools
 import os
 import pathlib
 import queue as queue_lib
+import threading
 import time
 from typing import List
 from unittest import mock
@@ -142,9 +143,16 @@ def hijacked_sys_attrs():
     setattr(sys, 'stderr', original_stderr)
 
 
+_SLOW_ENTRYPOINT_STARTED = threading.Event()
+_SLOW_ENTRYPOINT_RELEASE = threading.Event()
+_SLOW_ENTRYPOINT_FINISHED = threading.Event()
+
+
 def slow_entrypoint():
     """Dummy entrypoint function for testing."""
-    time.sleep(2)
+    _SLOW_ENTRYPOINT_STARTED.set()
+    _SLOW_ENTRYPOINT_RELEASE.wait(timeout=5)
+    _SLOW_ENTRYPOINT_FINISHED.set()
     return 'success'
 
 
@@ -153,6 +161,10 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         isolated_database):
     """Test that context is always cancelled when execute_request_coroutine
     is cancelled."""
+    _SLOW_ENTRYPOINT_STARTED.clear()
+    _SLOW_ENTRYPOINT_RELEASE.clear()
+    _SLOW_ENTRYPOINT_FINISHED.clear()
+
     # Create a mock request
     request = requests_lib.Request(
         request_id='test-request-id',
@@ -169,14 +181,16 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
     mock_ctx = mock.Mock()
     mock_ctx.vars = {}
     mock_ctx.is_canceled.return_value = False
+    mock_ctx.cancel.side_effect = _SLOW_ENTRYPOINT_RELEASE.set
 
     with mock.patch('sky.utils.context.initialize'), \
          mock.patch('sky.utils.context.get', return_value=mock_ctx):
 
         task = executor.execute_request_in_coroutine(request)
 
-        await asyncio.sleep(0.1)
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_STARTED.wait, 1)
         await task.cancel()
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_FINISHED.wait, 1)
         # Verify the context is actually cancelled
         mock_ctx.cancel.assert_called()
 
