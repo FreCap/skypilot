@@ -19,7 +19,7 @@ import {
 import { Layout } from '@/components/elements/layout';
 import { useMobile } from '@/hooks/useMobile';
 import { useSidebar } from '@/components/elements/sidebar';
-import { apiClient } from '@/data/connectors/client';
+import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import {
   Dialog,
   DialogContent,
@@ -68,17 +68,6 @@ const PROPERTY_OPTIONS = [
 ];
 
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
-
-async function checkIsAdmin() {
-  try {
-    const response = await apiClient.get('/users/role');
-    if (!response.ok) return false;
-    const data = await response.json();
-    return data.role === 'admin';
-  } catch {
-    return false;
-  }
-}
 
 // Success display component
 const SuccessDisplay = ({ message, onDismiss }) => {
@@ -152,7 +141,7 @@ export function Users() {
     message: '',
     userName: '',
   });
-  const [userRoleCache, setUserRoleCache] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showImportExportDialog, setShowImportExportDialog] = useState(false);
@@ -318,32 +307,18 @@ export function Users() {
   }, []);
 
   const getUserRole = useCallback(async () => {
-    if (userRoleCache && Date.now() - userRoleCache.timestamp < 5 * 60 * 1000) {
-      return userRoleCache;
-    }
-
     setRoleLoading(true);
     try {
-      const response = await apiClient.get(`/users/role`);
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to get user role');
+      const roleData = await getCurrentUserRole();
+      if (roleData.roleFetchFailed) {
+        throw new Error('Failed to get user role');
       }
-      const data = await response.json();
-      const roleData = {
-        role: data.role,
-        name: data.name,
-        id: data.id,
-        timestamp: Date.now(),
-      };
-      setUserRoleCache(roleData);
-      setRoleLoading(false);
+      setCurrentUser(roleData);
       return roleData;
-    } catch (error) {
+    } finally {
       setRoleLoading(false);
-      throw error;
     }
-  }, [userRoleCache]);
+  }, []);
 
   useEffect(() => {
     getUserRole().catch(() => {
@@ -652,7 +627,7 @@ export function Users() {
           )}
           {activeMainTab === 'users' &&
             basicAuthEnabled &&
-            userRoleCache?.role === 'admin' && (
+            currentUser?.role === 'admin' && (
               <button
                 onClick={async () => {
                   await checkPermissionAndAct('cannot create users', () => {
@@ -667,7 +642,7 @@ export function Users() {
             )}
           {activeMainTab === 'users' &&
             basicAuthEnabled &&
-            userRoleCache?.role === 'admin' && (
+            currentUser?.role === 'admin' && (
               <button
                 onClick={async () => {
                   await checkPermissionAndAct('cannot import users', () => {
@@ -844,8 +819,8 @@ export function Users() {
           basicAuthEnabled={basicAuthEnabled}
           ingressBasicAuthEnabled={ingressBasicAuthEnabled}
           externalProxyAuthEnabled={externalProxyAuthEnabled}
-          currentUserRole={userRoleCache?.role}
-          currentUserId={userRoleCache?.id}
+          currentUserRole={currentUser?.role}
+          currentUserId={currentUser?.id}
           filters={filters}
           setValueList={setValueList}
           deduplicateUsers={deduplicateUsers}
@@ -856,7 +831,7 @@ export function Users() {
         serviceAccountTokenEnabled && (
           <ServiceAccountTokensView
             checkPermissionAndAct={checkPermissionAndAct}
-            userRoleCache={userRoleCache}
+            userRoleCache={currentUser}
             setCreateSuccess={setCreateSuccess}
             setCreateError={setCreateError}
             showCreateDialog={showCreateDialog}
