@@ -751,14 +751,12 @@ def _validate_consolidation_mode_config(current_is_consolidation_mode: bool,
                 f'{colorama.Style.RESET_ALL}')
     else:
         noun = 'pool' if pool else 'service'
-        all_services = [
-            svc for svc in serve_state.get_services() if svc['pool'] == pool
-        ]
-        if all_services:
+        num_services = serve_state.get_num_services(pool=pool)
+        if num_services:
             logger.warning(
                 f'{colorama.Fore.RED}Consolidation mode for '
                 f'{controller.controller_type} is disabled, but there are '
-                f'still {len(all_services)} {noun}s running. Please terminate '
+                f'still {num_services} {noun}s running. Please terminate '
                 f'those {noun}s first.{colorama.Style.RESET_ALL}')
 
 
