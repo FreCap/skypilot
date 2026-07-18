@@ -52,6 +52,7 @@ import {
   NonCapitalizedTooltip,
 } from '@/components/utils';
 import { showToast } from '@/data/connectors/toast';
+import { getCurrentUserRole } from '@/data/connectors/client';
 
 import { trackRecipeAction, trackFilterUsed } from '@/lib/analytics';
 import {
@@ -876,18 +877,14 @@ export function RecipeHub() {
   // Fetch current user ID
   const fetchCurrentUser = useCallback(async () => {
     try {
-      const response = await fetch(
-        `${window.location.origin}/internal/dashboard/users/role`
-      );
-      if (response.ok) {
-        const data = await response.json();
-        setCurrentUserId(data.id || 'local');
-        // Check if user is authenticated (not 'local')
-        setIsAuthenticated(data.id && data.id !== 'local');
-      } else {
+      const currentUser = await getCurrentUserRole();
+      if (currentUser.roleFetchFailed) {
         setCurrentUserId('local');
         setIsAuthenticated(false);
+        return;
       }
+      setCurrentUserId(currentUser.id || 'local');
+      setIsAuthenticated(currentUser.id && currentUser.id !== 'local');
     } catch (error) {
       console.error('Failed to get user info:', error);
       setCurrentUserId('local');

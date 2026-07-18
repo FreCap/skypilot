@@ -32,7 +32,7 @@ import { statusGroups } from './job-domain';
 import dashboardCache from '@/lib/cache';
 import { REFRESH_INTERVALS } from '@/lib/config';
 import cachePreloader from '@/lib/cache-preloader';
-import { apiClient } from '@/data/connectors/client';
+import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import { trackWorkspaceAction } from '@/lib/analytics';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
@@ -245,8 +245,7 @@ export function Workspaces() {
     userName: '',
   });
 
-  // User role cache
-  const [userRoleCache, setUserRoleCache] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
   // Top-level error and success states
@@ -256,61 +255,54 @@ export function Workspaces() {
   const router = useRouter();
   const isMobile = useMobile();
 
-  // Function to get user role with caching
-  const getUserRole = async () => {
-    // Return cached result if available and less than 5 minutes old
-    if (userRoleCache && Date.now() - userRoleCache.timestamp < 5 * 60 * 1000) {
-      return userRoleCache;
-    }
-
+  const getUserRole = useCallback(async () => {
     setRoleLoading(true);
     try {
-      const response = await apiClient.get(`/users/role`);
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to get user role');
+      const roleData = await getCurrentUserRole();
+      if (roleData.roleFetchFailed) {
+        throw new Error('Failed to get user role');
       }
-      const data = await response.json();
-      const roleData = {
-        role: data.role,
-        name: data.name,
-        timestamp: Date.now(),
-      };
-      setUserRoleCache(roleData);
-      setRoleLoading(false);
+      setCurrentUser(roleData);
       return roleData;
-    } catch (error) {
+    } finally {
       setRoleLoading(false);
-      throw error;
     }
-  };
+  }, []);
 
-  // Function to handle permission check with smooth UX
-  const checkPermissionAndAct = async (action, actionCallback) => {
-    try {
-      const roleData = await getUserRole();
+  const checkPermissionAndAct = useCallback(
+    async (action, actionCallback) => {
+      try {
+        const roleData = await getUserRole();
 
-      if (roleData.role !== 'admin') {
+        if (roleData.role !== 'admin') {
+          setPermissionDenialState({
+            open: true,
+            message: action,
+            userName: roleData.name.toLowerCase(),
+          });
+          return false;
+        }
+
+        actionCallback();
+        return true;
+      } catch (error) {
+        console.error('Failed to check user role:', error);
         setPermissionDenialState({
           open: true,
-          message: action,
-          userName: roleData.name.toLowerCase(),
+          message: `Error: ${error.message}`,
+          userName: '',
         });
         return false;
       }
+    },
+    [getUserRole]
+  );
 
-      actionCallback();
-      return true;
-    } catch (error) {
-      console.error('Failed to check user role:', error);
-      setPermissionDenialState({
-        open: true,
-        message: `Error: ${error.message}`,
-        userName: '',
-      });
-      return false;
-    }
-  };
+  useEffect(() => {
+    getUserRole().catch(() => {
+      console.error('Failed to get user role');
+    });
+  }, [getUserRole]);
 
   // Fetch clusters independently and update state progressively
   const fetchClustersData = useCallback(

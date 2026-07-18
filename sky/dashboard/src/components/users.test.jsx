@@ -9,7 +9,7 @@ import {
 } from '@/data/connectors/users';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
-import { apiClient } from '@/data/connectors/client';
+import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import { ServiceAccountTokensView } from '@/components/service-account-tokens';
 import {
   aggregateUserUsage,
@@ -18,6 +18,7 @@ import {
 import {
   buildUsersWithUsage,
   getJobGpuCount,
+  Users,
   UsersTable,
 } from '@/components/users';
 import {
@@ -61,6 +62,24 @@ jest.mock('@/data/connectors/client', () => ({
     get: jest.fn(),
     post: jest.fn(),
   },
+  getCurrentUserRole: jest.fn(),
+}));
+
+jest.mock('next/router', () => ({
+  useRouter: () => ({
+    isReady: true,
+    query: {},
+    pathname: '/users',
+    replace: jest.fn(),
+  }),
+}));
+
+jest.mock('@/hooks/useMobile', () => ({
+  useMobile: () => false,
+}));
+
+jest.mock('@/components/elements/sidebar', () => ({
+  useSidebar: () => ({ userEmail: null }),
 }));
 
 const deferred = () => {
@@ -124,6 +143,11 @@ describe('UsersTable refresh lifecycle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     cachePreloader.preloadForPage.mockResolvedValue();
+    getCurrentUserRole.mockResolvedValue({
+      role: 'admin',
+      name: 'admin',
+      id: 'admin-id',
+    });
   });
 
   it('preserves the users module exports as direct aliases', () => {
@@ -278,6 +302,36 @@ describe('UsersTable refresh lifecycle', () => {
 
     expect(props.refreshDataRef.current).toBeNull();
     expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+});
+
+describe('Users page role lookup', () => {
+  beforeEach(() => {
+    getUsers.mockResolvedValue([
+      {
+        userId: 'alice-id',
+        username: 'alice@example.com',
+        role: 'user',
+        userType: 'sso',
+      },
+    ]);
+    getClusters.mockResolvedValue([]);
+    getManagedJobs.mockResolvedValue({ jobs: [] });
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        basic_auth_enabled: false,
+        service_account_token_enabled: false,
+        ingress_basic_auth_enabled: false,
+        external_proxy_auth_enabled: false,
+      }),
+    });
+  });
+
+  it('hydrates the page from the shared current-user helper', async () => {
+    render(<Users />);
+
+    await waitFor(() => expect(getCurrentUserRole).toHaveBeenCalledTimes(1));
   });
 });
 
