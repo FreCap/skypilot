@@ -42,6 +42,16 @@ jobs:
             test-name: "No Parallel Tests"
           - test-path: tests/test_ssh_proxy_lag.py
             test-name: "Event Loop Lag Tests"
+          - python-version: "3.14"
+            test-path: >-
+              tests/unit_tests/test_asyncio_utils.py
+              tests/unit_tests/test_sky/skylet/test_managed_jobs_service.py
+              tests/unit_tests/test_sky/server/test_common.py
+              tests/unit_tests/test_sky/skylet/test_log_lib.py
+              tests/unit_tests/test_sky/utils/test_subprocess_utils.py
+              tests/unit_tests/test_serve_load_balancer_sync_spec.py
+              tests/unit_tests/test_sky/storage/test_storage_utils.py
+            test-name: "Resource Lifetime"
     runs-on: ubuntu-latest
     name: "Python Tests - ${{ matrix.test-name }}"
     steps:
