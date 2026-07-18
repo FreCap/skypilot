@@ -1,3 +1,4 @@
+# pyright: reportCallInDefaultInitializer=error
 """Common utilities for the client."""
 
 from collections.abc import Generator
@@ -67,8 +68,7 @@ API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS = 5
 
 def download_logs_from_api_server(
         paths_on_api_server: Iterable[str],
-        remote_machine_prefix: str = str(
-            server_common.api_server_user_logs_dir_prefix()),
+        remote_machine_prefix: str | None = None,
         local_machine_prefix: str = constants.SKY_LOGS_DIRECTORY
 ) -> dict[str, str]:
     """Downloads the logs from the API server.
@@ -82,6 +82,11 @@ def download_logs_from_api_server(
     Returns:
         A dictionary mapping the remote path on API server to the local path.
     """
+    if remote_machine_prefix is None:
+        # API login can update the local user hash after this module is
+        # imported, so resolve the per-user API-server path for each call.
+        remote_machine_prefix = str(
+            server_common.api_server_user_logs_dir_prefix())
     remote2local_path_dict = {
         remote_path: remote_path.replace(
             # TODO(zhwu): handling the replacement locally is not stable, and
