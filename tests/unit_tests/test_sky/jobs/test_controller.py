@@ -2123,6 +2123,105 @@ class TestControllerManagerMonitorLoop:
     """The controller monitor reacts to capacity changes without polling."""
 
     @pytest.mark.asyncio
+    async def test_running_limit_wakes_when_tracked_job_finishes(self):
+        manager = ControllerManager('test-uuid')
+        release_job = asyncio.Event()
+        tracked_job = asyncio.create_task(release_job.wait())
+        manager.job_tasks[1] = tracked_job
+        wait_started = asyncio.Event()
+        scheduler_queried = asyncio.Event()
+        original_wait = asyncio.wait
+
+        async def wait_for_completion(*args, **kwargs):
+            wait_started.set()
+            return await original_wait(*args, **kwargs)
+
+        async def get_waiting_job(**_kwargs):
+            scheduler_queried.set()
+            raise asyncio.CancelledError
+
+        sleep = AsyncMock(side_effect=AssertionError(
+            'running capacity must not use polling sleeps'))
+        wait = AsyncMock(side_effect=wait_for_completion)
+        with patch('sky.jobs.controller.controller_utils.'
+                   'MAX_JOBS_PER_WORKER', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'MAX_TOTAL_RUNNING_JOBS', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async', side_effect=get_waiting_job
+                     ) as get_waiting, \
+                patch('sky.jobs.controller.asyncio.wait', new=wait), \
+                patch('sky.jobs.controller.asyncio.sleep', new=sleep):
+            monitor = asyncio.create_task(manager.monitor_loop())
+            await asyncio.wait_for(wait_started.wait(), timeout=1)
+            monitor.cancel()
+            monitor_result, = await asyncio.gather(monitor,
+                                                   return_exceptions=True)
+            assert isinstance(monitor_result, asyncio.CancelledError)
+            assert not tracked_job.done()
+            assert not tracked_job.cancelled()
+
+            wait_started.clear()
+            monitor = asyncio.create_task(manager.monitor_loop())
+            try:
+                await asyncio.wait_for(wait_started.wait(), timeout=1)
+                get_waiting.assert_not_awaited()
+                release_job.set()
+                await asyncio.wait_for(scheduler_queried.wait(), timeout=1)
+                await asyncio.gather(monitor, return_exceptions=True)
+            finally:
+                monitor.cancel()
+                release_job.set()
+                await asyncio.gather(monitor,
+                                     tracked_job,
+                                     return_exceptions=True)
+
+        sleep.assert_not_awaited()
+        assert wait.await_count == 2
+        for wait_call in wait.await_args_list:
+            assert wait_call.kwargs == {
+                'timeout': 60,
+                'return_when': asyncio.FIRST_COMPLETED,
+            }
+        assert tracked_job.done()
+        assert not tracked_job.cancelled()
+        get_waiting.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_zero_running_limit_retains_topology_recheck(self):
+        manager = ControllerManager('test-uuid')
+        sleep_started = asyncio.Event()
+
+        async def sleep_for_recheck(delay):
+            assert delay == 60
+            sleep_started.set()
+            raise asyncio.CancelledError
+
+        sleep = AsyncMock(side_effect=sleep_for_recheck)
+        wait = AsyncMock(side_effect=AssertionError(
+            'asyncio.wait rejects an empty task set'))
+        with patch('sky.jobs.controller.controller_utils.'
+                   'MAX_JOBS_PER_WORKER', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'MAX_TOTAL_RUNNING_JOBS', 0), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async', new_callable=AsyncMock
+                     ) as get_waiting, \
+                patch('sky.jobs.controller.asyncio.wait', new=wait), \
+                patch('sky.jobs.controller.asyncio.sleep', new=sleep):
+            monitor = asyncio.create_task(manager.monitor_loop())
+            await asyncio.wait_for(sleep_started.wait(), timeout=1)
+            await asyncio.gather(monitor, return_exceptions=True)
+
+        sleep.assert_awaited_once_with(60)
+        wait.assert_not_awaited()
+        get_waiting.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_saturated_launch_slot_wakes_on_notification(self):
         manager = ControllerManager('test-uuid')
         manager.starting.add(1)

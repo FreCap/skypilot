@@ -2636,8 +2636,19 @@ class ControllerManager:
                     pid=pid_str).set(max_jobs)
 
             if len(running_tasks) >= max_jobs:
-                logger.info('Too many jobs running, waiting for 60 seconds')
-                await asyncio.sleep(60)
+                logger.info('Too many jobs running, waiting for capacity')
+                if running_tasks:
+                    # Recheck immediately when a task that contributed to the
+                    # limit finishes. Keep the timeout because max_jobs can
+                    # change when the controller process count changes.
+                    await asyncio.wait(running_tasks,
+                                       timeout=60,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    # max_jobs may be zero when the controller process count
+                    # exceeds MAX_TOTAL_RUNNING_JOBS. asyncio.wait() rejects
+                    # an empty task set, so retain the topology recheck here.
+                    await asyncio.sleep(60)
                 continue
 
             # Check if there are any jobs that are waiting to launch
