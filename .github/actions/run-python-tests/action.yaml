@@ -78,7 +78,9 @@ runs:
         BUILDKITE_ANALYTICS_TOKEN: ${{ inputs.buildkite-analytics-token }}
       run: |
         source ~/test-env/bin/activate
-        if [[ "$TEST_NAME" == "No Parallel Tests" || "$TEST_NAME" == "Event Loop Lag Tests" ]]; then
+        if [[ "$TEST_NAME" == "Resource Lifetime" ]]; then
+          PYTHONTRACEMALLOC=10 SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 0 --dist no -W error::ResourceWarning $TEST_PATH"
+        elif [[ "$TEST_NAME" == "No Parallel Tests" || "$TEST_NAME" == "Event Loop Lag Tests" ]]; then
           SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 0 --dist no $TEST_PATH"
         else
           SKYPILOT_DISABLE_USAGE_COLLECTION=1 SKYPILOT_SKIP_CLOUD_IDENTITY_CHECK=1 eval "pytest -n 4 --dist worksteal $TEST_PATH"

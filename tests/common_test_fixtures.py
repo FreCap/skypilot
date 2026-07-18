@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import collections
 import os
@@ -742,22 +741,6 @@ def reset_global_state():
     # an int (e.g. test_sky/server/test_sdk.py::test_api_login_*).
     versions.set_remote_api_version(None)
     versions.set_remote_version('unknown')
-    # Ensure a usable event loop is installed on the main thread.
-    # Python 3.9 + xdist sometimes leaves a worker process with no
-    # current event loop after pytest-asyncio (or any test that calls
-    # `asyncio.set_event_loop(None)` or closes a loop) tears it down.
-    # Subsequent tests that still use the legacy
-    # `asyncio.get_event_loop().run_until_complete(...)` pattern
-    # (e.g. tests/unit_tests/test_sky/skylet/test_managed_jobs_service.py)
-    # then hit ``RuntimeError: There is no current event loop in
-    # thread 'MainThread'``. Installing a fresh loop here makes the
-    # legacy pattern safe regardless of what the prior test did.
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            asyncio.set_event_loop(asyncio.new_event_loop())
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
     # Reload config from default paths to reset any in-memory config changes
     # from previous tests that might have modified the config.
     _safe_reload_config()

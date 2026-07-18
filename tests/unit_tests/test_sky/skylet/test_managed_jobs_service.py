@@ -160,7 +160,7 @@ def _seed_test_jobs(_mock_managed_jobs_db_conn, _mock_global_user_state_db):
             'job_id4': job_id4,
         }
 
-    return asyncio.get_event_loop().run_until_complete(create_job_states())
+    return asyncio.run(create_job_states())
 
 
 class TestGetVersion:

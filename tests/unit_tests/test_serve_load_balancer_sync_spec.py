@@ -316,8 +316,7 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
          mock.patch.object(lb,
                            '_get_lb_session_id',
                            return_value='test-pod-uid'):
-        asyncio.new_event_loop().run_until_complete(
-            lb._sync_with_controller_once())
+        asyncio.run(lb._sync_with_controller_once())
 
 
 def test_large_ready_set_is_not_emitted_to_info_logs():

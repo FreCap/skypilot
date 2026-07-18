@@ -80,12 +80,6 @@ def _get_context():
 
 def _handle_io_stream(io_stream, out_stream, args: _ProcessingArgs):
     """Process the stream of a process."""
-    out_io = io.TextIOWrapper(io_stream,
-                              encoding='utf-8',
-                              newline='',
-                              errors='replace',
-                              write_through=True)
-
     start_streaming_flag = False
     end_streaming_flag = False
     streaming_prefix = args.streaming_prefix if args.streaming_prefix else ''
@@ -93,7 +87,12 @@ def _handle_io_stream(io_stream, out_stream, args: _ProcessingArgs):
                       if args.line_processor is None else args.line_processor)
 
     out = []
-    with open(args.log_path, 'a', encoding='utf-8') as fout:
+    with io.TextIOWrapper(io_stream,
+                          encoding='utf-8',
+                          newline='',
+                          errors='replace',
+                          write_through=True) as out_io, open(
+                              args.log_path, 'a', encoding='utf-8') as fout:
         with line_processor:
             while True:
                 ctx = _get_context()
