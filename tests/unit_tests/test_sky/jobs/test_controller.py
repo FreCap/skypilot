@@ -655,6 +655,126 @@ class TestJobGroupRecovery:
         assert cancelled == {'first', 'second'}
 
     @pytest.mark.asyncio
+    async def test_job_group_parent_cancellation_joins_monitor_children(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        started = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model cancellation cleanup that must finish before the
+                # owning JobGroup coroutine may exit.
+                await asyncio.sleep(0)
+                cancelled.add(task_id)
+                raise
+
+        job_controller._monitor_job_group_task = monitor
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+        try:
+            assert cancelled == {0, 1}
+        finally:
+            # Keep the pre-fix regression run from leaking tasks into pytest's
+            # event loop when the assertion above fails.
+            leaked = [
+                task for task in asyncio.all_tasks()
+                if task.get_name().startswith('monitor_') and not task.done()
+            ]
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_job_group_monitor_failure_joins_children_before_cleanup(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        started = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                cancelled.add(task_id)
+                raise
+
+        async def fail_wait(*_args, **_kwargs):
+            await all_started.wait()
+            raise RuntimeError('monitor coordinator failed')
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0', 'cluster-1']
+            assert cancelled == {0, 1}
+
+        job_controller._monitor_job_group_task = monitor
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', return_value=MagicMock()), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']), \
+                patch.object(controller_lib.asyncio,
+                             'wait', side_effect=fail_wait), pytest.raises(
+                                 RuntimeError,
+                                 match='monitor coordinator failed'):
+            await job_controller._run_job_group()
+
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0', 'cluster-1'])
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(('statuses', 'expected'), [
         ([managed_job_state.ManagedJobStatus.SUCCEEDED] * 3, True),
         ([
