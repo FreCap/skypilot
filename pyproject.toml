@@ -62,6 +62,10 @@ reportInvalidCast = "error"
 reportOverlappingOverload = "error"
 reportInvalidStringEscapeSequence = "error"
 reportMatchNotExhaustive = "error"
+# Keep abstract declarations backed by runtime ABC machinery and prevent
+# abstract base classes from being instantiated internally.
+reportAbstractUsage = "error"
+reportInvalidAbstractMethod = "error"
 
 [tool.isort]
 profile = "google"
