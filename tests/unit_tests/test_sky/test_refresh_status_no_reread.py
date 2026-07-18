@@ -173,6 +173,286 @@ def test_autostopping_patches_record_without_reread(to_down, summary_response,
         assert result['last_event'] == expected_last_event
 
 
+def test_stable_up_refresh_only_advances_status_timestamp():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record['status_updated_at'] = 100
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.is_definitely_autostopping.return_value = False
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status',
+                           return_value=12345) as set_status, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(
+             backend_utils.global_user_state, 'get_cluster_from_name',
+             side_effect=AssertionError(
+                 'stable status must not re-read the full record')) as full_read:
+        result = backend_utils._update_cluster_status('test-cluster',
+                                                      record,
+                                                      retry_if_missing=False)
+
+    assert result is record
+    assert result['status'] == status_lib.ClusterStatus.UP
+    assert result['status_updated_at'] == 12345
+    set_status.assert_called_once_with('test-cluster',
+                                       status_lib.ClusterStatus.UP)
+    add_event.assert_not_called()
+    full_write.assert_not_called()
+    full_read.assert_not_called()
+
+
+def test_stable_init_refresh_only_advances_status_timestamp():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record.update({
+        'status': status_lib.ClusterStatus.INIT,
+        'status_updated_at': 100,
+        'autostop': -1,
+        'last_event': 'Cluster is abnormal because provisioning stalled.',
+    })
+    node_statuses = {
+        'pod-0': (status_lib.ClusterStatus.INIT, 'provisioning stalled')
+    }
+
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status',
+                           return_value=12345) as set_status, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(
+             backend_utils.global_user_state, 'get_cluster_from_name',
+             side_effect=AssertionError(
+                 'stable status must not re-read the full record')) as full_read:
+        result = backend_utils._update_cluster_status('test-cluster',
+                                                      record,
+                                                      retry_if_missing=False)
+
+    assert result is record
+    assert result['status'] == status_lib.ClusterStatus.INIT
+    assert result['status_updated_at'] == 12345
+    assert result['last_event'].endswith('provisioning stalled.')
+    set_status.assert_called_once_with('test-cluster',
+                                       status_lib.ClusterStatus.INIT)
+    add_event.assert_not_called()
+    full_write.assert_not_called()
+    full_read.assert_not_called()
+
+
+def test_up_transition_keeps_full_writer():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record['status'] = status_lib.ClusterStatus.INIT
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+    persisted = dict(record,
+                     status=status_lib.ClusterStatus.UP,
+                     status_updated_at=12345)
+
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.is_definitely_autostopping.return_value = False
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status') as set_status, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=persisted) as full_read:
+        result = backend_utils._update_cluster_status('test-cluster',
+                                                      record,
+                                                      retry_if_missing=False)
+
+    assert result is persisted
+    set_status.assert_not_called()
+    add_event.assert_called_once()
+    full_write.assert_called_once_with('test-cluster',
+                                       handle,
+                                       requested_resources=None,
+                                       ready=True,
+                                       is_launch=False,
+                                       existing_cluster_hash='fake-hash')
+    full_read.assert_called_once_with('test-cluster',
+                                      include_user_info=True,
+                                      summary_response=False)
+
+
+def test_init_transition_keeps_full_writer():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record['autostop'] = -1
+    node_statuses = {
+        'pod-0': (status_lib.ClusterStatus.INIT, 'provisioning stalled')
+    }
+    persisted = dict(record,
+                     status=status_lib.ClusterStatus.INIT,
+                     status_updated_at=12345)
+
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status') as set_status, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=persisted) as full_read:
+        result = backend_utils._update_cluster_status('test-cluster',
+                                                      record,
+                                                      retry_if_missing=False)
+
+    assert result is persisted
+    set_status.assert_not_called()
+    add_event.assert_called_once()
+    full_write.assert_called_once_with('test-cluster',
+                                       handle,
+                                       requested_resources=None,
+                                       ready=False,
+                                       is_launch=False,
+                                       existing_cluster_hash='fake-hash')
+    full_read.assert_called_once_with('test-cluster',
+                                      include_user_info=True,
+                                      summary_response=False)
+
+
+def test_stable_init_with_autostop_keeps_full_writer():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record.update({
+        'status': status_lib.ClusterStatus.INIT,
+        'status_updated_at': 100,
+        'autostop': 10,
+        'to_down': True,
+    })
+    node_statuses = {
+        'pod-0': (status_lib.ClusterStatus.INIT, 'provisioning stalled')
+    }
+    persisted = dict(record,
+                     status=status_lib.ClusterStatus.INIT,
+                     status_updated_at=12345)
+
+    cluster_info = mock.Mock()
+    cluster_info.get_head_instance.return_value = object()
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.is_definitely_autostopping.return_value = False
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils,
+                           '_query_cluster_info_via_cloud_api',
+                           return_value=cluster_info), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_yaml_dict',
+                           return_value={'provider': {}}), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status') as set_status, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_or_update_cluster') as full_write, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=persisted) as full_read:
+        result = backend_utils._update_cluster_status('test-cluster',
+                                                      record,
+                                                      retry_if_missing=False)
+
+    assert result is persisted
+    set_status.assert_not_called()
+    add_event.assert_not_called()
+    full_write.assert_called_once_with('test-cluster',
+                                       handle,
+                                       requested_resources=None,
+                                       ready=False,
+                                       is_launch=False,
+                                       existing_cluster_hash='fake-hash')
+    full_read.assert_called_once_with('test-cluster',
+                                      include_user_info=True,
+                                      summary_response=False)
+
+
+def test_stable_status_write_failure_does_not_publish_timestamp():
+    handle = _make_handle()
+    record = _make_record(handle)
+    record['status_updated_at'] = 100
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.is_definitely_autostopping.return_value = False
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses), \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'set_cluster_status',
+                           side_effect=OSError('database unavailable')), \
+         mock.patch.object(
+             backend_utils.global_user_state, 'add_or_update_cluster',
+             side_effect=AssertionError(
+                 'stable status must not use the full writer')):
+        with pytest.raises(OSError, match='database unavailable'):
+            backend_utils._update_cluster_status('test-cluster',
+                                                 record,
+                                                 retry_if_missing=False)
+
+    assert record['status_updated_at'] == 100
+
+
 def _make_refreshable_record(handle):
     record = _make_record(handle)
     record['status_updated_at'] = int(time.time()) - 3600

@@ -2977,6 +2977,15 @@ def _update_cluster_status(
             cluster_name, status_lib.ClusterStatus.AUTOSTOPPING)
         return record
 
+    def _refresh_stable_status(
+            stable_status: status_lib.ClusterStatus) -> dict[str, Any]:
+        """Advance freshness without running the launch/history writer."""
+        assert status == stable_status, (status, stable_status)
+        written_at = global_user_state.set_cluster_status(
+            cluster_name, stable_status)
+        record['status_updated_at'] = written_at
+        return record
+
     # Determining if the cluster is healthy (UP):
     #
     # For non-spot clusters: If ray status shows all nodes are healthy, it is
@@ -3008,6 +3017,9 @@ def _update_cluster_status(
         if isinstance(backend, backends.CloudVmRayBackend):
             if backend.is_definitely_autostopping(handle, stream_logs=False):
                 return _handle_autostopping_cluster(print_newline=False)
+
+        if status == status_lib.ClusterStatus.UP:
+            return _refresh_stable_status(status_lib.ClusterStatus.UP)
 
         record['status'] = status_lib.ClusterStatus.UP
         # Add cluster event for instance status check.
@@ -3307,7 +3319,10 @@ def _update_cluster_status(
             log_message += f' ({status_reason})'
         log_message += '. Transitioned to INIT.'
         # Do not add event if the cluster is already in INIT status.
-        if status != status_lib.ClusterStatus.INIT:
+        if status == status_lib.ClusterStatus.INIT:
+            if record['autostop'] < 0:
+                return _refresh_stable_status(status_lib.ClusterStatus.INIT)
+        else:
             global_user_state.add_cluster_event(
                 cluster_name,
                 status_lib.ClusterStatus.INIT,
