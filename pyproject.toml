@@ -66,6 +66,13 @@ reportMatchNotExhaustive = "error"
 # abstract base classes from being instantiated internally.
 reportAbstractUsage = "error"
 reportInvalidAbstractMethod = "error"
+# Preserve structural invariants that are otherwise easy for dynamic Python to
+# accept until the affected path executes.
+reportInconsistentConstructor = "error"
+reportInvalidTypeVarUse = "error"
+reportAssertAlwaysTrue = "error"
+reportUnhashable = "error"
+reportUnsafeMultipleInheritance = "error"
 
 [tool.isort]
 profile = "google"
