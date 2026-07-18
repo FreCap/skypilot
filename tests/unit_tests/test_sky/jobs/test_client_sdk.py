@@ -12,16 +12,29 @@ from sky.jobs.client import sdk_async as jobs_sdk_async
 class _Response:
     """Minimal streaming response used by log download tests."""
 
-    def __init__(self, *, chunks=(), headers=None, ok=True, status_code=200):
+    def __init__(self,
+                 *,
+                 chunks=(),
+                 headers=None,
+                 ok=True,
+                 status_code=200,
+                 iter_error=None):
         self._chunks = chunks
         self.headers = headers or {}
         self.ok = ok
         self.status_code = status_code
+        self.iter_error = iter_error
         self.chunk_sizes = []
+        self.close_calls = 0
 
     def iter_content(self, *, chunk_size):
         self.chunk_sizes.append(chunk_size)
         yield from self._chunks
+        if self.iter_error is not None:
+            raise self.iter_error
+
+    def close(self):
+        self.close_calls += 1
 
 
 class _ImmediateThread:
@@ -129,7 +142,7 @@ def test_download_logs_streaming_decompresses_and_preserves_layout(tmp_path):
                            'make_authenticated_request',
                            side_effect=(dispatch, stream)) as mock_request, \
          mock.patch.object(jobs_sdk.log_download.threading, 'Thread',
-                           _ImmediateThread):
+                           side_effect=_ImmediateThread) as mock_thread:
         result = raw_download(name='training',
                               job_id=7,
                               refresh=True,
@@ -142,6 +155,9 @@ def test_download_logs_streaming_decompresses_and_preserves_layout(tmp_path):
             'controller.log').read_bytes() == (b'first line\nsecond line\n')
     assert dispatch.chunk_sizes == [64 * 1024]
     assert stream.chunk_sizes == [64 * 1024]
+    assert dispatch.close_calls == 1
+    assert stream.close_calls == 1
+    mock_thread.assert_called_once_with(target=mock.ANY, daemon=True)
     assert mock_request.call_count == 2
     dispatch_call, stream_call = mock_request.call_args_list
     assert dispatch_call.args == ('POST', '/jobs/logs')
@@ -185,11 +201,14 @@ def test_download_logs_streaming_plain_latest_and_empty_cleanup(tmp_path):
                                side_effect=(dispatch, stream)), \
              mock.patch.object(jobs_sdk.log_download.threading, 'Thread',
                                _ImmediateThread):
-            return raw_download(name=None,
-                                job_id=None,
-                                refresh=False,
-                                controller=False,
-                                local_dir=str(tmp_path))
+            result = raw_download(name=None,
+                                  job_id=None,
+                                  refresh=False,
+                                  controller=False,
+                                  local_dir=str(tmp_path))
+        assert dispatch.close_calls == 1
+        assert stream.close_calls == 1
+        return result
 
     expected_dir = tmp_path / 'managed_jobs' / 'managed-job-latest'
     assert run((b'plain log\n',)) == {0: str(expected_dir)}
@@ -219,13 +238,88 @@ def test_download_logs_streaming_transport_errors(tmp_path, dispatch, stream,
                            'make_authenticated_request',
                            side_effect=responses), \
          mock.patch.object(jobs_sdk.log_download.threading, 'Thread',
-                           _ImmediateThread), \
+                           side_effect=_ImmediateThread) as mock_thread, \
          pytest.raises(RuntimeError, match=message):
         raw_download(name='job',
                      job_id=1,
                      refresh=False,
                      controller=False,
                      local_dir=str(tmp_path))
+    assert dispatch.close_calls == 1
+    if stream is not None:
+        assert stream.close_calls == 1
+    mock_thread.assert_not_called()
+
+
+def test_download_logs_streaming_attach_error_cancels_dispatch(tmp_path):
+    raw_download = jobs_sdk.download_logs_streaming.__wrapped__.__wrapped__
+    dispatch = _Response(
+        headers={'X-SkyPilot-Request-ID': 'request-attach-error'})
+
+    with mock.patch.object(jobs_sdk.server_common,
+                           'make_authenticated_request',
+                           side_effect=(dispatch, OSError('attach failed'))), \
+         mock.patch.object(jobs_sdk.log_download.threading,
+                           'Thread') as mock_thread, \
+         pytest.raises(OSError, match='attach failed'):
+        raw_download(name='job',
+                     job_id=1,
+                     refresh=False,
+                     controller=False,
+                     local_dir=str(tmp_path))
+
+    assert dispatch.close_calls == 1
+    mock_thread.assert_not_called()
+
+
+def test_download_logs_streaming_thread_start_error_closes_responses(tmp_path):
+    raw_download = jobs_sdk.download_logs_streaming.__wrapped__.__wrapped__
+    dispatch = _Response(
+        headers={'X-SkyPilot-Request-ID': 'request-thread-error'})
+    stream = _Response(headers={'Content-Type': 'text/plain'})
+    thread = mock.Mock()
+    thread.start.side_effect = RuntimeError('thread start failed')
+
+    with mock.patch.object(jobs_sdk.server_common,
+                           'make_authenticated_request',
+                           side_effect=(dispatch, stream)) as mock_request, \
+         mock.patch.object(jobs_sdk.log_download.threading,
+                           'Thread', return_value=thread), \
+         pytest.raises(RuntimeError, match='thread start failed'):
+        raw_download(name='job',
+                     job_id=1,
+                     refresh=False,
+                     controller=False,
+                     local_dir=str(tmp_path))
+
+    assert mock_request.call_count == 2
+    assert dispatch.close_calls == 1
+    assert stream.close_calls == 1
+
+
+def test_download_logs_streaming_failure_removes_partial_file(tmp_path):
+    raw_download = jobs_sdk.download_logs_streaming.__wrapped__.__wrapped__
+    dispatch = _Response(headers={'X-SkyPilot-Request-ID': 'request-partial'})
+    stream = _Response(chunks=(b'partial log\n',),
+                       headers={'Content-Type': 'text/plain'},
+                       iter_error=OSError('stream interrupted'))
+
+    with mock.patch.object(jobs_sdk.server_common,
+                           'make_authenticated_request',
+                           side_effect=(dispatch, stream)), \
+         mock.patch.object(jobs_sdk.log_download.threading, 'Thread',
+                           _ImmediateThread), \
+         pytest.raises(OSError, match='stream interrupted'):
+        raw_download(name='job',
+                     job_id=1,
+                     refresh=False,
+                     controller=False,
+                     local_dir=str(tmp_path))
+
+    job_dir = tmp_path / 'managed_jobs' / 'managed-job-1'
+    assert not job_dir.exists()
+    assert dispatch.close_calls == 1
+    assert stream.close_calls == 1
 
 
 def test_download_logs_maps_remote_paths_to_local_paths():
