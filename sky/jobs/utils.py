@@ -808,12 +808,10 @@ def update_managed_jobs_statuses(job_id: int | None = None):
         scheduler.job_done(job_id, idempotent=True)
 
 
-def get_job_timestamp(backend: 'backends.CloudVmRayBackend', cluster_name: str,
+def get_job_timestamp(backend: 'backends.CloudVmRayBackend',
+                      handle: 'backends.CloudVmRayResourceHandle',
                       job_id: int | None, get_end_time: bool) -> float:
-    """Get the submitted/ended time of the job."""
-    handle = global_user_state.get_handle_from_cluster_name(cluster_name)
-    assert handle is not None, (
-        f'handle for cluster {cluster_name!r} should not be None')
+    """Get the submitted/ended time using one cluster-handle snapshot."""
     if handle.is_grpc_enabled_with_flag:
         try:
             if get_end_time:
@@ -855,15 +853,17 @@ def try_to_get_job_end_time(backend: 'backends.CloudVmRayBackend',
     If the job is preempted or we can't connect to the instance for whatever
     reason, fall back to the current time.
     """
+    handle = global_user_state.get_handle_from_cluster_name(cluster_name)
     if managed_job_runtime.is_registered():
-        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
         runtime_ended_at = managed_job_runtime.get_job_ended_at(
             handle, cluster_name)
         if runtime_ended_at is not None:
             return runtime_ended_at
     try:
+        assert handle is not None, (
+            f'handle for cluster {cluster_name!r} should not be None')
         return get_job_timestamp(backend,
-                                 cluster_name,
+                                 handle,
                                  job_id=job_id,
                                  get_end_time=True)
     except (exceptions.CommandError, grpc.RpcError,

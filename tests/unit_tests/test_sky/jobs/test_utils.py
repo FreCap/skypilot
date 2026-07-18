@@ -1,6 +1,7 @@
 """Unit tests for sky.jobs.utils functions."""
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+from unittest import mock
 
 import pytest
 
@@ -9,6 +10,7 @@ from sky.jobs import naming as job_naming
 from sky.jobs import queue_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
+from sky.utils import message_utils as message_utils_lib
 
 
 class TestFacadeReexports:
@@ -23,6 +25,79 @@ class TestFacadeReexports:
     def test_utils_reexports_naming_helper(self):
         assert jobs_utils.generate_managed_job_cluster_name is (
             job_naming.generate_managed_job_cluster_name)
+
+
+class TestJobTimestampHandleSnapshot:
+    """Timestamp fallback stays on one immutable cluster-handle snapshot."""
+
+    @staticmethod
+    def _handle():
+        handle = mock.MagicMock()
+        handle.is_grpc_enabled_with_flag = False
+        return handle
+
+    @staticmethod
+    def _backend(timestamp: float = 123.5):
+        backend = mock.MagicMock()
+        backend.run_on_head.return_value = (0,
+                                            message_utils_lib.encode_payload(
+                                                str(timestamp)), '')
+        return backend
+
+    def test_runtime_end_time_fallback_survives_concurrent_cleanup(
+            self, monkeypatch):
+        handle = self._handle()
+        backend = self._backend()
+        lookup = mock.Mock(side_effect=[handle, None])
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: True)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'get_job_ended_at',
+                            lambda selected, _: None)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+
+        assert jobs_utils.try_to_get_job_end_time(backend, 'cluster',
+                                                  7) == 123.5
+
+        lookup.assert_called_once_with('cluster')
+        backend.run_on_head.assert_called_once_with(handle,
+                                                    mock.ANY,
+                                                    stream_logs=False,
+                                                    require_outputs=True)
+
+    def test_runtime_owned_end_time_skips_default_remote_lookup(
+            self, monkeypatch):
+        handle = self._handle()
+        backend = self._backend()
+        lookup = mock.Mock(return_value=handle)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: True)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'get_job_ended_at',
+                            lambda selected, _: 456.0)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+
+        assert jobs_utils.try_to_get_job_end_time(backend, 'cluster',
+                                                  7) == 456.0
+
+        lookup.assert_called_once_with('cluster')
+        backend.run_on_head.assert_not_called()
+
+    def test_default_end_time_keeps_one_handle_and_remote_lookup(
+            self, monkeypatch):
+        handle = self._handle()
+        backend = self._backend()
+        lookup = mock.Mock(return_value=handle)
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            lambda: False)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+
+        assert jobs_utils.try_to_get_job_end_time(backend, 'cluster',
+                                                  7) == 123.5
+
+        lookup.assert_called_once_with('cluster')
+        backend.run_on_head.assert_called_once()
 
 
 class TestClusterHandleNotRequired:

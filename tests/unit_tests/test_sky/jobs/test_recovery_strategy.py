@@ -1,6 +1,13 @@
 """Unit tests for sky.jobs.recovery_strategy helpers."""
+from unittest import mock
+
+import pytest
 
 from sky.jobs import recovery_strategy
+from sky.jobs import runtime as managed_job_runtime
+from sky.jobs import utils as managed_job_utils
+from sky.skylet import job_lib
+from sky.utils import status_lib
 
 
 def test_is_oom_failure_detects_oomkilled():
@@ -23,3 +30,81 @@ def test_is_oom_failure_is_case_insensitive():
 def test_is_oom_failure_false_for_unrelated():
     assert recovery_strategy._is_oom_failure(
         RuntimeError('/bin/bash: line 1: conda: command not found')) is False
+
+
+class TestSubmittedTimestampHandleSnapshot:
+    """Submitted-at runtime fallback cannot mix cluster-handle epochs."""
+
+    @staticmethod
+    def _executor():
+        executor = recovery_strategy.StrategyExecutor.__new__(
+            recovery_strategy.StrategyExecutor)
+        executor.cluster_name = 'cluster'
+        executor.backend = mock.MagicMock()
+        executor.job_id_on_pool_cluster = 7
+        return executor
+
+    @staticmethod
+    def _patch_running_job(monkeypatch):
+        refresh = mock.Mock(return_value=(status_lib.ClusterStatus.UP, None))
+        get_status = mock.AsyncMock(return_value=(job_lib.JobStatus.RUNNING,
+                                                  None))
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+        monkeypatch.setattr(managed_job_utils, 'get_job_status', get_status)
+        monkeypatch.setattr(recovery_strategy.asyncio, 'sleep',
+                            mock.AsyncMock())
+        return refresh, get_status
+
+    @pytest.mark.asyncio
+    async def test_runtime_fallback_reuses_one_handle(self, monkeypatch):
+        executor = self._executor()
+        handle = mock.MagicMock()
+        lookup = mock.Mock(return_value=handle)
+
+        def timestamp_for_handle(_backend, selected, _job_id, **_):
+            assert selected is handle
+            return 123.0
+
+        get_timestamp = mock.Mock(side_effect=timestamp_for_handle)
+        refresh, get_status = self._patch_running_job(monkeypatch)
+        monkeypatch.setattr(managed_job_runtime, 'is_registered', lambda: True)
+        monkeypatch.setattr(managed_job_runtime, 'get_job_submitted_at',
+                            lambda selected, _: None)
+        monkeypatch.setattr(recovery_strategy.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+        monkeypatch.setattr(managed_job_utils, 'get_job_timestamp',
+                            get_timestamp)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result == 123.0
+        lookup.assert_called_once_with('cluster')
+        get_timestamp.assert_called_once_with(executor.backend,
+                                              handle,
+                                              7,
+                                              get_end_time=False)
+        refresh.assert_called_once()
+        get_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_handle_retries_whole_snapshot(self, monkeypatch):
+        executor = self._executor()
+        lookup = mock.Mock(return_value=None)
+        get_timestamp = mock.Mock(return_value=123.0)
+        refresh, get_status = self._patch_running_job(monkeypatch)
+        monkeypatch.setattr(managed_job_runtime, 'is_registered', lambda: True)
+        monkeypatch.setattr(managed_job_runtime, 'get_job_submitted_at',
+                            lambda selected, _: None)
+        monkeypatch.setattr(recovery_strategy.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+        monkeypatch.setattr(managed_job_utils, 'get_job_timestamp',
+                            get_timestamp)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result is None
+        assert lookup.call_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
+        get_timestamp.assert_not_called()
+        assert refresh.call_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
+        assert get_status.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
