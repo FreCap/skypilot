@@ -750,6 +750,12 @@ export async function streamManagedJobLogs({
         'POST',
         { signal: requestController.signal }
       );
+      // The API client performs preflight work before starting fetch. If that
+      // work ignored the abort and completed late, do not consume its body.
+      if (requestController.signal.aborted) {
+        await response.body?.cancel?.();
+        return { timeout: false };
+      }
 
       // Stream the logs
       const reader = response.body.getReader();
@@ -815,10 +821,15 @@ export async function streamManagedJobLogs({
     }
   }
 
-  // If inactivity wins, stop and join the losing request before returning.
+  // If inactivity wins, stop and observe the losing request before returning.
   if (result.timeout) {
     requestController.abort();
-    await fetchPromise;
+    // Do not await cleanup here: fetchImmediate can still be blocked in
+    // preflight work that does not observe the request signal. Observe a late
+    // non-abort failure without making the public timeout unbounded.
+    void fetchPromise.catch((error) => {
+      console.warn('Error finishing timed-out log request:', error);
+    });
     showToast(
       `Log request for job ${jobId} timed out after ${inactivityTimeout / 1000}s of inactivity`,
       'warning'
