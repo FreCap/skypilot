@@ -36,6 +36,20 @@ allow_redefinition = true
 check_untyped_defs = true
 enable_error_code = ["possibly-undefined"]
 
+[tool.basedpyright]
+# A focused complement to mypy. Keep the high-signal coroutine and
+# control-flow checks enabled while the broader type baseline remains noisy.
+include = ["sky"]
+exclude = ["sky/schemas/generated", "sky/dashboard"]
+pythonVersion = "3.14"
+pythonPlatform = "Linux"
+typeCheckingMode = "off"
+reportUnusedCoroutine = "error"
+reportUnboundVariable = "error"
+reportPossiblyUnboundVariable = "error"
+reportGeneralTypeIssues = "error"
+reportReturnType = "error"
+
 [tool.isort]
 profile = "google"
 line_length = 80
