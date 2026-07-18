@@ -79,6 +79,36 @@ def _watch_observation(outcome='success', covered=True):
     }
 
 
+def test_ha_inventory_ignores_legacy_services_in_shared_namespace():
+    inventory = {
+        'items': [{
+            'metadata': {
+                'labels': {
+                    'skypilot-serve-lb': 'legacy',
+                },
+            },
+            'spec': {
+                'selector': {
+                    'app': 'legacy-deployment',
+                },
+            },
+        }, {
+            'metadata': {
+                'labels': {
+                    'skypilot-serve-lb': 'ha-service',
+                },
+            },
+            'spec': {
+                'selector': {
+                    'skypilot-serve-lb-slot': 'a',
+                },
+            },
+        }]
+    }
+
+    assert qualify_cluster._ha_inventory_names(inventory) == {'ha-service'}
+
+
 def test_planned_gate_requires_every_traffic_sample_to_succeed():
     before = {'a:a': _snapshot(), 'b:a': _snapshot()}
     after = {

@@ -250,6 +250,19 @@ def _load_targets(path: pathlib.Path, expected_services: int) -> list[Target]:
     return targets
 
 
+def _ha_inventory_names(inventory: dict[str, Any]) -> set[str]:
+    """Return only services whose stable selector is in two-slot HA mode."""
+    names = set()
+    for item in inventory.get('items', []):
+        selector = item.get('spec', {}).get('selector', {})
+        if selector.get(_SLOT_LABEL) not in ('a', 'b'):
+            continue
+        name = item.get('metadata', {}).get('labels', {}).get(_LB_LABEL)
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
 async def _discover_service(kubectl: KubectlRecorder,
                             target: Target) -> dict[str, Any]:
     selector = f'{_LB_LABEL}={target.name}'
@@ -717,10 +730,7 @@ async def run(args: argparse.Namespace,
     kubectl = KubectlRecorder(args.namespace, args.context)
     inventory = await kubectl.json('ha-services:inventory', 'get', 'services',
                                    '-l', _LB_LABEL)
-    inventory_names = {
-        item.get('metadata', {}).get('labels', {}).get(_LB_LABEL)
-        for item in inventory.get('items', [])
-    }
+    inventory_names = _ha_inventory_names(inventory)
     target_names = {target.name for target in targets}
     if inventory_names != target_names:
         raise RuntimeError(

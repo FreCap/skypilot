@@ -780,6 +780,18 @@ class ServeElectVersionBody(RequestBody):
     expected_elected_version: int | None
 
 
+class ServeLoadBalancerHighAvailabilityBody(BasePayload):
+    """The public admin request for changing a service's LB topology."""
+    enabled: pydantic.StrictBool
+
+
+class ServeSetLoadBalancerHighAvailabilityBody(RequestBody):
+    """Internal queued request for a fenced LB topology transition."""
+    service_name: str
+    enabled: pydantic.StrictBool
+    expected_service_hash: str
+
+
 class ServeDownBody(RequestBody):
     """The request body for the serve down endpoint."""
     service_names: str | list[str] | None

@@ -1652,6 +1652,51 @@ def update_service_encoded(service_name: str,
     return message_utils.encode_payload(service_msg)
 
 
+def set_load_balancer_high_availability_encoded(
+        service_name: str, enabled: bool, expected_service_hash: str,
+        expected_lifecycle_epoch: int) -> None:
+    """Submit a lifecycle-fenced, LB-only topology transition."""
+    service_status = _get_service_status(service_name,
+                                         pool=False,
+                                         with_replica_info=False,
+                                         with_yaml=False)
+    if service_status is None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(f'Service {service_name!r} does not exist.')
+    service_hash = service_status['hash']
+    if service_hash != expected_service_hash:
+        raise RuntimeError(f'Service {service_name!r} was replaced before '
+                           'the load balancer update was submitted.')
+    resp = _post_to_controller_with_retry(
+        service_name,
+        service_hash,
+        '/controller/set_load_balancer_high_availability',
+        json={
+            'enabled': enabled,
+            'service_hash': expected_service_hash,
+            'lifecycle_epoch': expected_lifecycle_epoch,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
+    if resp.status_code == 404:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'The service controller does not support load balancer '
+                'topology updates. Upgrade the API server and retry.')
+    if resp.status_code == 400:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'Invalid load balancer topology update: {resp.text}')
+    if resp.status_code == 409:
+        raise RuntimeError(
+            f'Stale load balancer topology update rejected: {resp.text}')
+    if resp.status_code == 500:
+        raise RuntimeError(f'Load balancer topology update failed: {resp.text}')
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f'Failed to update the load balancer topology: {resp.text}')
+
+
 def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
     # TODO(tian): Currently pool does not support terminating replica.
     # Only existence is consumed here; skip the YAML render.

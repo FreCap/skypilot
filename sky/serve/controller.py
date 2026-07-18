@@ -1839,19 +1839,15 @@ class SkyServeController:
         return serve.SkyServiceSpec.from_yaml_str(yaml_content)
 
     def _transition_load_balancer_mode(
-            self, enable_ha: bool, target_spec: serve.SkyServiceSpec) -> None:
+            self,
+            enable_ha: bool,
+            target_spec: serve.SkyServiceSpec,
+            expected_service_hash: str | None = None,
+            expected_lifecycle_epoch: int | None = None) -> None:
         """Run an explicit stable-Service-preserving HA migration/rollback."""
         state = serve_state.get_lb_cutover_state(self._service_name)
         if state is None:
             raise RuntimeError('Service LB cutover state is missing.')
-        if state.enabled == enable_ha:
-            self._lb_ha_enabled = enable_ha
-            return
-        if enable_ha:
-            lb_k8s.require_lb_ha_runtime()
-        if state.phase is not lb_ha.LbCutoverPhase.STABLE:
-            raise RuntimeError('Load balancer mode cannot change while another '
-                               f'cutover is {state.phase.value}.')
         owner_record = serve_state.get_service_controller_owner(
             self._service_name, include_lb_state=True)
         actual_owner = ((owner_record.get('controller_pid'),
@@ -1861,22 +1857,53 @@ class SkyServeController:
                 owner_record.get('lifecycle_epoch') is None or
                 actual_owner != self._controller_owner):
             raise RuntimeError('Service ownership changed before LB migration.')
+        if (expected_service_hash is not None and
+                owner_record['hash'] != expected_service_hash):
+            raise RuntimeError(
+                'Service incarnation changed before LB migration.')
+        if (expected_lifecycle_epoch is not None and
+                owner_record.get('lifecycle_epoch')
+                != expected_lifecycle_epoch):
+            raise RuntimeError('Service lifecycle changed before LB migration.')
         service_hash = str(owner_record['hash'])
         assert actual_owner is not None
         owner = actual_owner
         lifecycle_epoch = int(owner_record['lifecycle_epoch'])
+        resuming = False
+        if enable_ha and state.enabled:
+            if state.phase is lb_ha.LbCutoverPhase.STABLE:
+                self._lb_ha_enabled = True
+                return
+            if state.phase is not lb_ha.LbCutoverPhase.MIGRATING:
+                raise RuntimeError(
+                    'Load balancer mode cannot change while another cutover '
+                    f'is {state.phase.value}.')
+            resuming = True
+        elif not enable_ha and not state.enabled:
+            if state.phase is not lb_ha.LbCutoverPhase.STABLE:
+                raise RuntimeError(
+                    'Disabled load balancer HA has an invalid non-stable '
+                    f'cutover phase {state.phase.value}.')
+            self._lb_ha_enabled = False
+            return
+        elif not enable_ha and state.phase is lb_ha.LbCutoverPhase.ROLLING_BACK:
+            resuming = True
+        elif state.phase is not lb_ha.LbCutoverPhase.STABLE:
+            raise RuntimeError('Load balancer mode cannot change while another '
+                               f'cutover is {state.phase.value}.')
         if enable_ha:
+            lb_k8s.require_lb_ha_runtime()
+        if enable_ha and not resuming:
             started = serve_state.begin_lb_ha_migration(self._service_name,
                                                         service_hash, owner,
                                                         lifecycle_epoch)
             if started:
-                self._lb_ha_enabled = True
                 self._lb_session_ledger = lb_ha.LbSessionLedger(
                     serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
                     serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
                 self._lb_occupancy_contract_known = False
                 self._lb_last_demand_snapshot = None
-        else:
+        elif not enable_ha and not resuming:
             if state.active_slot is None:
                 raise RuntimeError('HA rollback has no committed active slot.')
             started = serve_state.begin_lb_ha_rollback(self._service_name,
@@ -1884,8 +1911,18 @@ class SkyServeController:
                                                        lifecycle_epoch,
                                                        state.active_slot,
                                                        state.generation)
+        else:
+            started = True
         if not started:
             raise RuntimeError('LB mode transition lost its durable CAS fence.')
+        if enable_ha:
+            self._lb_ha_enabled = True
+            if self._lb_session_ledger is None:
+                self._lb_session_ledger = lb_ha.LbSessionLedger(
+                    serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
+                    serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+                self._lb_occupancy_contract_known = False
+                self._lb_last_demand_snapshot = None
         termination_grace = lb_k8s.lb_termination_grace_period_seconds(
             target_spec.lb_stream_timeout_seconds,
             target_spec.graceful_drain_seconds)
@@ -1914,6 +1951,20 @@ class SkyServeController:
             time.sleep(1)
         raise RuntimeError('Timed out waiting for the stable load balancer '
                            'selector mode transition to commit.')
+
+    def _set_load_balancer_high_availability(
+            self, enabled: bool, expected_service_hash: str,
+            expected_lifecycle_epoch: int) -> None:
+        """Apply one fenced LB-only topology update."""
+        target_spec = serve_state.get_spec(self._service_name,
+                                           self._committed_version)
+        if target_spec is None:
+            raise RuntimeError('Current service spec is missing.')
+        self._transition_load_balancer_mode(
+            enabled,
+            target_spec,
+            expected_service_hash=expected_service_hash,
+            expected_lifecycle_epoch=expected_lifecycle_epoch)
 
     def _commit_service_update(
             self,
@@ -1945,7 +1996,10 @@ class SkyServeController:
                 validation_service.lb_high_availability_specified and
                 validation_service.lb_high_availability != self._lb_ha_enabled):
             self._transition_load_balancer_mode(
-                validation_service.lb_high_availability, validation_service)
+                validation_service.lb_high_availability,
+                validation_service,
+                expected_service_hash=requested_service_hash,
+                expected_lifecycle_epoch=lifecycle_epoch)
         current_autoscaler = getattr(self, '_autoscaler', None)
         if (authoritative_retry_service is None and getattr(
                 current_autoscaler, 'replica_unit', None) == 'logical' and
@@ -2504,6 +2558,50 @@ class SkyServeController:
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')
+                return responses.JSONResponse(content={
+                    'message': 'Error',
+                    'exception': exception_str,
+                    'traceback': traceback.format_exc()
+                },
+                                              status_code=500)
+
+        @self._app.post(
+            '/controller/set_load_balancer_high_availability',
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @_serialize_update
+        def set_load_balancer_high_availability(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            try:
+                enabled = request_data.get('enabled')
+                if not isinstance(enabled, bool):
+                    return responses.JSONResponse(
+                        content={'message': 'enabled must be a boolean.'},
+                        status_code=400)
+                expected_service_hash = request_data.get('service_hash')
+                expected_lifecycle_epoch = request_data.get('lifecycle_epoch')
+                if (not isinstance(expected_service_hash, str) or
+                        not expected_service_hash or
+                        not isinstance(expected_lifecycle_epoch, int) or
+                        isinstance(expected_lifecycle_epoch, bool)):
+                    return responses.JSONResponse(content={
+                        'message': 'Service incarnation and lifecycle '
+                                   'fences are required.'
+                    },
+                                                  status_code=400)
+                self._set_load_balancer_high_availability(
+                    enabled, expected_service_hash, expected_lifecycle_epoch)
+                return responses.JSONResponse(
+                    content={
+                        'message': 'Load balancer high availability is '
+                                   f'{"enabled" if enabled else "disabled"}.'
+                    })
+            except RuntimeError as e:
+                return responses.JSONResponse(content={'message': str(e)},
+                                              status_code=409)
+            except Exception as e:  # pylint: disable=broad-except
+                exception_str = common_utils.format_exception(e)
+                logger.error('Error changing load balancer high '
+                             f'availability: {exception_str}')
                 return responses.JSONResponse(content={
                     'message': 'Error',
                     'exception': exception_str,

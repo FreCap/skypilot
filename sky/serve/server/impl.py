@@ -1023,6 +1023,45 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
                          submitted_yaml_content=submitted_yaml_content)
 
 
+def set_load_balancer_high_availability(service_name: str, enabled: bool,
+                                        expected_service_hash: str) -> None:
+    """Change only one service's external-LB topology under lifecycle lock."""
+    with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        with lifecycle_lock:
+            record = serve_state.get_service_from_name(service_name)
+            if (record is None or record.get('pool') or
+                    record.get('hash') != expected_service_hash):
+                raise RuntimeError(
+                    f'Service {service_name!r} changed before its load '
+                    'balancer topology could be updated.')
+            service_status = record.get('status')
+            if (not isinstance(service_status, serve_state.ServiceStatus) or
+                    service_status
+                    in serve_state.ServiceStatus.terminal_statuses() or
+                    service_status
+                    == serve_state.ServiceStatus.CONTROLLER_INIT):
+                status_text = getattr(service_status, 'value',
+                                      str(service_status))
+                raise RuntimeError(
+                    f'Service {service_name!r} is not ready for a load '
+                    f'balancer topology change (status={status_text}).')
+            if not serve_utils.is_consolidation_mode(pool=False):
+                raise RuntimeError(
+                    'External load balancer topology changes require '
+                    'consolidation mode.')
+            if not serve_utils.lifecycle_lock_is_valid(lifecycle_lock):
+                raise RuntimeError(
+                    f'Lost lifecycle ownership before updating the load '
+                    f'balancer for {service_name!r}.')
+            serve_utils.set_load_balancer_high_availability_encoded(
+                service_name,
+                enabled,
+                expected_service_hash=expected_service_hash,
+                expected_lifecycle_epoch=(
+                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock)))
+
+
 def _assert_service_update_fence(service_name: str, pool: bool,
                                  handle: 'backends.CloudVmRayResourceHandle',
                                  backend: 'backends.CloudVmRayBackend',

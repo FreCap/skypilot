@@ -84,6 +84,14 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
 
 
 @usage_lib.entrypoint
+def set_load_balancer_high_availability(service_name: str, enabled: bool,
+                                        expected_service_hash: str) -> None:
+    """Change a service's external-LB topology without a model rollout."""
+    return impl.set_load_balancer_high_availability(service_name, enabled,
+                                                    expected_service_hash)
+
+
+@usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def down(
     service_names: str | list[str] | None = None,
