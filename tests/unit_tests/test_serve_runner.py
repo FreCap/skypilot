@@ -355,6 +355,7 @@ class TestStatusDelegatesToRunner:
     def test_status_attaches_postgres_history_to_named_service(self):
         records = [{
             'name': 'svc',
+            'hash': 'hash-a',
             'load_balancer_port': None,
             'tls_encrypted': False,
         }]
@@ -379,7 +380,9 @@ class TestStatusDelegatesToRunner:
                                  summary_only=True,
                                  history_hours=12)
 
-        get_history.assert_called_once_with('svc', hours=12)
+        get_history.assert_called_once_with('svc',
+                                            hours=12,
+                                            expected_service_hash='hash-a')
         assert result[0]['replica_status_history'] == history_payload
 
     @pytest.mark.parametrize('tls_encrypted', [False, True])

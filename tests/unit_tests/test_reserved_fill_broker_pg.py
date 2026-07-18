@@ -508,6 +508,31 @@ def history_engine(pg_server, monkeypatch):
 
 class TestServeStatusHistoryPG:
 
+    def test_snapshot_excludes_cleaned_retained_failure(self, history_engine):
+        services = serve_state.services_table
+        replicas = serve_state.replicas_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(services).values(name='svc',
+                                                   hash='hash-a',
+                                                   current_version=1,
+                                                   pool=0))
+            connection.execute(
+                sqlalchemy.insert(replicas).values(service_name='svc',
+                                                   replica_id=1,
+                                                   status='FAILED_PROBING',
+                                                   sky_down_status='SUCCEEDED',
+                                                   version=1))
+
+        timestamp = 1784207110.0
+        serve_history.record_status_snapshot(timestamp)
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 1)
+
+        assert len(history['samples']) == 1
+        assert history['samples'][0]['total_count'] == 0
+        assert history['samples'][0]['errored_count'] == 0
+
     def test_snapshot_groups_physical_rows_and_zero_capacity(
             self, history_engine):
         services = serve_state.services_table
@@ -603,6 +628,11 @@ class TestServeStatusHistoryPG:
         assert current['service_hash'] == 'new-hash'
         assert len(current['samples']) == 1
         assert current['samples'][0]['total_count'] == 0
+
+        stale = serve_history.get_status_history(
+            'svc', timestamp=timestamp + 71, expected_service_hash='old-hash')
+        assert stale['available'] is False
+        assert not stale['samples']
 
     def test_request_history_is_idempotent_additive_and_incarnation_scoped(
             self, history_engine):

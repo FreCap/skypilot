@@ -66,6 +66,8 @@ def test_snapshot_query_uses_normalized_columns_only():
         compile_kwargs={'literal_binds': True})).lower()
     assert 'replicas.status' in sql
     assert 'replicas.version' in sql
+    assert 'replicas.sky_down_status is distinct from' in sql
+    assert "'succeeded'" in sql
     assert 'replica_state' not in sql
     assert 'replica_info' not in sql
 
