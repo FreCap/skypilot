@@ -261,12 +261,17 @@ class TestRolloutBlockedNotifications(unittest.TestCase):
         return autoscalers.RequestRateAutoscaler('svc', spec, version=2)
 
     @staticmethod
-    def _failed_replica(*, unrecoverable: bool):
+    def _failed_replica(*,
+                        unrecoverable: bool,
+                        status=serve_state.ReplicaStatus.FAILED_PROVISION,
+                        is_scale_down: bool = False):
         info = mock.Mock()
         info.replica_id = 2
         info.version = 2
         info.is_ready = False
         info.is_terminal = True
+        info.status = status
+        info.status_property.is_scale_down = is_scale_down
         info.status_property.unrecoverable_failure.return_value = unrecoverable
         return info
 
@@ -299,6 +304,32 @@ class TestRolloutBlockedNotifications(unittest.TestCase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].operator,
                          autoscalers.AutoscalerDecisionOperator.SCALE_UP)
+
+    def test_transient_terminal_replicas_retry_without_blocked_notification(
+            self):
+        cases = (
+            (serve_state.ReplicaStatus.PREEMPTED, False),
+            (serve_state.ReplicaStatus.SHUTTING_DOWN, False),
+            (serve_state.ReplicaStatus.UNKNOWN, True),
+        )
+        for status, is_scale_down in cases:
+            with self.subTest(status=status, is_scale_down=is_scale_down):
+                autoscaler = self._autoscaler()
+                info = self._failed_replica(unrecoverable=False,
+                                            status=status,
+                                            is_scale_down=is_scale_down)
+
+                with mock.patch.object(
+                        autoscalers.operator_notifications,
+                        'record_notification') as record_notification:
+                    decisions = autoscaler.generate_scaling_decisions([info],
+                                                                      [1])
+
+                record_notification.assert_not_called()
+                self.assertEqual(len(decisions), 1)
+                self.assertEqual(
+                    decisions[0].operator,
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP)
 
 
 class TestAutoscalerInfo(unittest.TestCase):

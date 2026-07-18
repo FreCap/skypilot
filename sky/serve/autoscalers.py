@@ -1219,7 +1219,11 @@ class Autoscaler:
                     # and restart.
                     return []
             if (previous_versions and latest_replicas and
-                    all(info.is_terminal for info in latest_replicas)):
+                    all(info.is_terminal for info in latest_replicas) and
+                    any(info.status in
+                        serve_state.ReplicaStatus.failed_statuses() and
+                        not info.status_property.is_scale_down
+                        for info in latest_replicas)):
                 self._notify_rollout_blocked(max(previous_versions))
 
         scaling_decisions = []
