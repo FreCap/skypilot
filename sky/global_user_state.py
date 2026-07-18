@@ -1694,6 +1694,7 @@ def get_handle_from_cluster_name(
     return pickle.loads(row.handle)
 
 
+@db_retries.retry
 @metrics_lib.time_me
 def get_handles_from_cluster_names(
         cluster_names: set[str]

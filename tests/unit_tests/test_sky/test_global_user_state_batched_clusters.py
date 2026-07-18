@@ -5,6 +5,7 @@ replicas) can avoid the per-name DB round-trip that would otherwise show up
 as a double N+1 inside ReplicaInfo.to_info_dict.
 """
 # pylint: disable=protected-access
+import sqlalchemy
 from sqlalchemy import event
 
 from sky import global_user_state
@@ -97,16 +98,56 @@ def test_get_handles_from_cluster_names_chunks_large_input(
     names = [f'c-{i}' for i in range(5)]
     for name in names:
         _add_cluster(name)
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
     # Missing names just don't appear in the result (this helper doesn't
     # None-fill, matching its existing contract).
-    result = global_user_state.get_handles_from_cluster_names(
-        set(names) | {'missing'})
+    try:
+        result = global_user_state.get_handles_from_cluster_names(
+            set(names) | {'missing'})
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
 
     assert set(result.keys()) == set(names)
     for name in names:
         # Each handle round-trips through pickle.loads, so we only assert it
         # came back as the right type rather than identity.
         assert isinstance(result[name], _MinimalHandle), name
+    assert len(select_statements) == 3
+
+
+def test_get_handles_from_cluster_names_retries_transient_db_failure(
+        tmp_path, monkeypatch):
+    """JobGroup recovery must not lose the single-row helper's retry budget
+    when it switches to the batched handle snapshot."""
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('alive-1')
+    real_session = global_user_state.orm.Session
+    attempts = 0
+
+    def flaky_session(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlalchemy.exc.OperationalError(statement='SELECT handle',
+                                                  params={},
+                                                  orig=Exception('db blip'))
+        return real_session(*args, **kwargs)
+
+    monkeypatch.setattr(global_user_state.orm, 'Session', flaky_session)
+    monkeypatch.setattr(global_user_state.db_retries.time, 'sleep',
+                        lambda _delay: None)
+
+    result = global_user_state.get_handles_from_cluster_names({'alive-1'})
+
+    assert attempts == 2
+    assert isinstance(result['alive-1'], _MinimalHandle)
 
 
 def test_get_clusters_from_names_chunks_large_input(tmp_path, monkeypatch):

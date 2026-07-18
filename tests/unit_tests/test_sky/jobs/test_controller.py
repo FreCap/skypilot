@@ -586,6 +586,100 @@ class TestJobGroupRecovery:
         return job_controller
 
     @pytest.mark.asyncio
+    async def test_job_group_recovery_reads_one_ordered_handle_snapshot(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        executor = MagicMock()
+
+        async def monitor_task(**kwargs):
+            await kwargs['on_recovery']()
+            return True
+
+        executor.monitor_task = AsyncMock(side_effect=monitor_task)
+        old_handles = [MagicMock(name=f'old-{i}') for i in range(3)]
+        all_tasks_handles = list(zip(mock_dag.tasks, old_handles))
+        fresh_handles = {
+            'cluster-task-0': MagicMock(name='fresh-0'),
+            # A missing row must remain represented as a None handle so the
+            # networking layer can apply its existing failure semantics.
+            'cluster-task-2': MagicMock(name='fresh-2'),
+        }
+        batched_lookup = MagicMock(return_value=fresh_handles)
+        per_task_lookup = MagicMock(
+            side_effect=AssertionError('per-task handle lookup'))
+        setup_networking = AsyncMock()
+
+        with patch.object(
+                controller_lib.managed_job_utils,
+                'generate_managed_job_cluster_name',
+                side_effect=lambda task_name, _job_id:
+                f'cluster-{task_name}'), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.global_user_state,
+                    'get_handle_from_cluster_name', per_task_lookup), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'setup_job_group_networking', setup_networking):
+            result = await job_controller._monitor_job_group_task(
+                task_id=0,
+                task=mock_dag.tasks[0],
+                cluster_name='cluster-task-0',
+                executor=executor,
+                job_group_name='test-job-group',
+                all_tasks_handles=all_tasks_handles)
+
+        assert result is True
+        batched_lookup.assert_called_once_with(
+            {'cluster-task-0', 'cluster-task-1', 'cluster-task-2'})
+        per_task_lookup.assert_not_called()
+        setup_networking.assert_awaited_once_with('test-job-group', [
+            (mock_dag.tasks[0], fresh_handles['cluster-task-0']),
+            (mock_dag.tasks[1], None),
+            (mock_dag.tasks[2], fresh_handles['cluster-task-2']),
+        ])
+
+    @pytest.mark.asyncio
+    async def test_job_group_recovery_snapshot_failure_skips_networking(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        executor = MagicMock()
+
+        async def monitor_task(**kwargs):
+            await kwargs['on_recovery']()
+            return True
+
+        executor.monitor_task = AsyncMock(side_effect=monitor_task)
+        batched_lookup = MagicMock(
+            side_effect=RuntimeError('handle snapshot failed'))
+        setup_networking = AsyncMock()
+
+        with patch.object(
+                controller_lib.managed_job_utils,
+                'generate_managed_job_cluster_name',
+                side_effect=lambda task_name, _job_id:
+                f'cluster-{task_name}'), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', batched_lookup), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'setup_job_group_networking', setup_networking), \
+                pytest.raises(RuntimeError, match='handle snapshot failed'):
+            await job_controller._monitor_job_group_task(
+                task_id=0,
+                task=mock_dag.tasks[0],
+                cluster_name='cluster-task-0',
+                executor=executor,
+                job_group_name='test-job-group',
+                all_tasks_handles=[
+                    (task, MagicMock()) for task in mock_dag.tasks
+                ])
+
+        batched_lookup.assert_called_once()
+        setup_networking.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_cleanup_job_group_clusters_runs_concurrently_and_isolates_failures(
             self, mock_dag, caplog):
         job_controller = self._make_controller(mock_dag)
