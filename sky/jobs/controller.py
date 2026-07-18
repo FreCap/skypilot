@@ -2138,36 +2138,6 @@ class ControllerManager:
             # some data here.
             raise error
 
-    async def _download_log_from_cluster(
-            self,
-            controller: JobController,
-            job_id: int,
-            task_id: int,
-            cluster_name: str,
-            job_id_on_cluster: int | None = None) -> None:
-        """Download logs for a single task from its cluster.
-
-        Looks up the cluster by name and downloads logs via the controller's
-        download_log_and_stream method. Skips gracefully if the cluster is
-        not found.
-        """
-        clusters = await asyncio.to_thread(
-            backend_utils.get_clusters,
-            cluster_names=[cluster_name],
-            refresh=common.StatusRefreshMode.NONE,
-            all_users=True,
-            _include_is_managed=True)
-
-        if not clusters:
-            logger.info(f'Cluster {cluster_name} not found for job {job_id}, '
-                        f'task {task_id}. Skipping log download.')
-            return
-
-        assert len(clusters) == 1, (clusters, cluster_name)
-        handle = clusters[0].get('handle')
-        await asyncio.to_thread(controller.download_log_and_stream, task_id,
-                                handle, job_id_on_cluster)
-
     async def _download_logs_for_cancelled_job(self, controller: JobController,
                                                job_id: int, task_ids: list[int],
                                                dag: 'sky.Dag',
@@ -2196,6 +2166,7 @@ class ControllerManager:
         logger.info(f'Downloading logs for cancelled job {job_id}, '
                     f'task_ids {task_ids}')
 
+        task_clusters: list[tuple[int, str, int | None]] = []
         if pool is not None:
             # Pool jobs are single-task; job groups don't support pools.
             cluster_name, job_id_on_pool_cluster = (
@@ -2206,22 +2177,58 @@ class ControllerManager:
                             'Skipping log download.')
                 return
 
-            await self._download_log_from_cluster(controller, job_id,
-                                                  task_ids[0], cluster_name,
-                                                  job_id_on_pool_cluster)
+            task_clusters.append(
+                (task_ids[0], cluster_name, job_id_on_pool_cluster))
+        else:
+            for task_id in task_ids:
+                try:
+                    task = dag.tasks[task_id]
+                    assert task.name is not None, task
+                    cluster_name = (
+                        managed_job_utils.generate_managed_job_cluster_name(
+                            task.name, job_id))
+                    task_clusters.append((task_id, cluster_name, None))
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f'Failed to resolve cluster for job {job_id}, '
+                        f'task {task_id}: '
+                        f'{common_utils.format_exception(e)}')
+
+        if not task_clusters:
             return
 
-        # Non-pool path: download logs for each active task.
-        for task_id in task_ids:
+        cluster_names = [cluster_name for _, cluster_name, _ in task_clusters]
+        try:
+            clusters = await asyncio.to_thread(
+                backend_utils.get_clusters,
+                cluster_names=cluster_names,
+                refresh=common.StatusRefreshMode.NONE,
+                all_users=True,
+                _include_is_managed=True)
+        except Exception as e:  # pylint: disable=broad-except
+            if pool is not None:
+                raise
+            logger.warning(
+                f'Failed to resolve clusters for cancelled job {job_id}: '
+                f'{common_utils.format_exception(e)}')
+            return
+        handles_by_cluster = {
+            cluster['name']: cluster.get('handle') for cluster in clusters
+        }
+
+        for task_id, cluster_name, job_id_on_cluster in task_clusters:
+            handle = handles_by_cluster.get(cluster_name)
+            if handle is None:
+                logger.info(
+                    f'Cluster {cluster_name} not found for job {job_id}, '
+                    f'task {task_id}. Skipping log download.')
+                continue
             try:
-                task = dag.tasks[task_id]
-                assert task.name is not None, task
-                cluster_name = (
-                    managed_job_utils.generate_managed_job_cluster_name(
-                        task.name, job_id))
-                await self._download_log_from_cluster(controller, job_id,
-                                                      task_id, cluster_name)
+                await asyncio.to_thread(controller.download_log_and_stream,
+                                        task_id, handle, job_id_on_cluster)
             except Exception as e:  # pylint: disable=broad-except
+                if pool is not None:
+                    raise
                 logger.warning(
                     f'Failed to download logs for job {job_id}, '
                     f'task {task_id}: {common_utils.format_exception(e)}')
