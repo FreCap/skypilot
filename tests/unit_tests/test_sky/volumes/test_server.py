@@ -53,6 +53,26 @@ class TestVolumeServer:
             assert isinstance(request_body, payloads.VolumeListBody)
             assert request_body.refresh is False
 
+    def test_volume_list_forwards_name_filter(self, monkeypatch):
+        """Test a targeted list request carries its name to the worker."""
+        mock_schedule_async = mock.AsyncMock()
+        monkeypatch.setattr(executor, 'schedule_request_async',
+                            mock_schedule_async)
+        app = fastapi.FastAPI()
+        app.include_router(server.router, prefix='/volumes')
+        client = TestClient(app)
+
+        with mock.patch.object(fastapi.Request, 'state') as mock_state:
+            mock_state.request_id = 'test-request-id'
+            mock_state.auth_user = None
+            response = client.get('/volumes?name=target-volume')
+
+        assert response.status_code == 200
+        request_body = mock_schedule_async.call_args.kwargs['request_body']
+        assert isinstance(request_body, payloads.VolumeListBody)
+        assert request_body.name == 'target-volume'
+        assert request_body.refresh is False
+
     def test_volume_delete_success(self, monkeypatch):
         """Test volume_delete endpoint with successful request."""
         # Mock executor.schedule_request

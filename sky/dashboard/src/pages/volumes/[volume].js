@@ -36,10 +36,11 @@ export function useVolumeDetails({ volumeName }) {
     setLoading(true);
     setVolumeData((current) => (current?.name === volumeName ? current : null));
     try {
-      const volumes = await dashboardCache.get(getVolumes);
+      const volumes = await dashboardCache.get(getVolumes, [
+        { name: volumeName },
+      ]);
       if (!isCurrentRequest()) return;
-      const found = volumes.find((v) => v.name === volumeName);
-      setVolumeData(found || null);
+      setVolumeData(volumes[0] || null);
     } catch (error) {
       if (!isCurrentRequest()) return;
       console.error('Failed to fetch volume details:', error);
@@ -59,7 +60,7 @@ export function useVolumeDetails({ volumeName }) {
   }, [fetchData]);
 
   const refreshData = useCallback(async () => {
-    dashboardCache.invalidate(getVolumes);
+    dashboardCache.invalidateFunction(getVolumes);
     await fetchData();
   }, [fetchData]);
 

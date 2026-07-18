@@ -3137,14 +3137,17 @@ def get_volume_names_start_with(starts_with: str) -> list[str]:
 
 
 @metrics_lib.time_me
-def get_volumes(is_ephemeral: bool | None = None) -> list[dict[str, Any]]:
+def get_volumes(is_ephemeral: bool | None = None,
+                name: str | None = None) -> list[dict[str, Any]]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        if is_ephemeral is None:
-            rows = session.query(volume_table).all()
-        else:
-            rows = session.query(volume_table).filter_by(
-                is_ephemeral=int(is_ephemeral)).all()
+        filters: dict[str, Any] = {}
+        if name is not None:
+            filters['name'] = name
+        if is_ephemeral is not None:
+            filters['is_ephemeral'] = int(is_ephemeral)
+        query = session.query(volume_table)
+        rows = query.filter_by(**filters).all() if filters else query.all()
     records = []
     for row in rows:
         # Decode JSON-encoded usedby fields

@@ -582,6 +582,7 @@ class VolumeDeleteBody(RequestBody):
 class VolumeListBody(RequestBody):
     """The request body for the volume list endpoint."""
     refresh: bool = False
+    name: str | None = None
 
 
 class VolumeValidateBody(RequestBody):

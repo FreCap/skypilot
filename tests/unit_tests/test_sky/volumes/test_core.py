@@ -17,6 +17,17 @@ from sky.volumes.server import core
 class TestVolumeCore:
     """Test cases for volume core functions."""
 
+    def test_volume_list_scopes_database_read_by_name(self, monkeypatch):
+        """A detail read does not materialize every volume."""
+        mock_get_volumes = mock.MagicMock(return_value=[])
+        monkeypatch.setattr(global_user_state, 'get_volumes', mock_get_volumes)
+        monkeypatch.setattr(global_user_state, 'get_all_users',
+                            mock.MagicMock(return_value=[]))
+
+        assert not core.volume_list(name='target-volume')
+        mock_get_volumes.assert_called_once_with(is_ephemeral=None,
+                                                 name='target-volume')
+
     def test_volume_refresh_success(self, monkeypatch):
         """Test volume_refresh with successful status updates."""
         # Mock volume data

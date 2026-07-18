@@ -171,12 +171,14 @@ def volume_refresh() -> None:
 def volume_list(
     is_ephemeral: bool | None = None,
     refresh: bool = False,
+    name: str | None = None,
 ) -> list[responses.VolumeRecord]:
     """Gets volumes from the database.
 
     Args:
         is_ephemeral: Whether to include ephemeral volumes.
         refresh: If True, refresh volume state from cloud APIs before returning.
+        name: If set, return only the volume with this name.
 
     Returns:
         [
@@ -206,7 +208,8 @@ def volume_list(
     if refresh:
         volume_refresh()
     with rich_utils.safe_status(ux_utils.spinner_message('Listing volumes')):
-        volumes = global_user_state.get_volumes(is_ephemeral=is_ephemeral)
+        volumes = global_user_state.get_volumes(is_ephemeral=is_ephemeral,
+                                                name=name)
         all_users = global_user_state.get_all_users()
         user_map = {user.id: user.name for user in all_users}
 
