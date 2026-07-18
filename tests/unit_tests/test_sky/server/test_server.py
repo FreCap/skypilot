@@ -277,6 +277,8 @@ def test_server_run_uses_uvloop(mock_asyncio_run, mock_hijack_sys_attrs):
         server_instance.run()
 
     mock_asyncio_run.assert_called_once()
+    # asyncio.run() is mocked, so explicitly close the coroutine passed to it.
+    mock_asyncio_run.call_args.args[0].close()
     threads_after = len(threading.enumerate())
     assert threads_after == threads_before
 

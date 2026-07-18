@@ -401,6 +401,9 @@ async def test_get_raises_typed_error_from_500_detail():
             'make_authenticated_request_async',
             new=mock.AsyncMock(return_value=response)), \
          mock.patch(
+             'sky.client.sdk_async.server_common.'
+             'check_server_healthy_or_start_fn'), \
+         mock.patch(
              'sky.client.sdk_async.requests_lib.Request.decode',
              return_value=decoded) as mock_decode:
         with pytest.raises(exceptions.StorageSpecError, match='bad storage'):
@@ -425,6 +428,9 @@ async def test_get_success_still_decodes_top_level_payload():
             'sky.client.sdk_async.server_common.'
             'make_authenticated_request_async',
             new=mock.AsyncMock(return_value=response)), \
+         mock.patch(
+             'sky.client.sdk_async.server_common.'
+             'check_server_healthy_or_start_fn'), \
          mock.patch(
              'sky.client.sdk_async.requests_lib.Request.decode',
              return_value=decoded) as mock_decode:

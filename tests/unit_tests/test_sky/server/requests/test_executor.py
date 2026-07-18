@@ -5,6 +5,7 @@ import functools
 import os
 import pathlib
 import queue as queue_lib
+import threading
 import time
 from typing import List
 from unittest import mock
@@ -142,9 +143,16 @@ def hijacked_sys_attrs():
     setattr(sys, 'stderr', original_stderr)
 
 
-def dummy_entrypoint(*args, **kwargs):
+_SLOW_ENTRYPOINT_STARTED = threading.Event()
+_SLOW_ENTRYPOINT_RELEASE = threading.Event()
+_SLOW_ENTRYPOINT_FINISHED = threading.Event()
+
+
+def slow_entrypoint():
     """Dummy entrypoint function for testing."""
-    time.sleep(2)
+    _SLOW_ENTRYPOINT_STARTED.set()
+    _SLOW_ENTRYPOINT_RELEASE.wait(timeout=5)
+    _SLOW_ENTRYPOINT_FINISHED.set()
     return 'success'
 
 
@@ -153,6 +161,10 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         isolated_database):
     """Test that context is always cancelled when execute_request_coroutine
     is cancelled."""
+    _SLOW_ENTRYPOINT_STARTED.clear()
+    _SLOW_ENTRYPOINT_RELEASE.clear()
+    _SLOW_ENTRYPOINT_FINISHED.clear()
+
     # Create a mock request
     request = requests_lib.Request(
         request_id='test-request-id',
@@ -160,23 +172,25 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         status=requests_lib.RequestStatus.PENDING,
         created_at=time.time(),
         user_id='test-user-id',
-        entrypoint=dummy_entrypoint,
+        entrypoint=slow_entrypoint,
         request_body=payloads.RequestBody(),
     )
     await requests_lib.create_if_not_exists_async(request)
 
     # Mock the context and its methods
     mock_ctx = mock.Mock()
+    mock_ctx.vars = {}
     mock_ctx.is_canceled.return_value = False
+    mock_ctx.cancel.side_effect = _SLOW_ENTRYPOINT_RELEASE.set
 
     with mock.patch('sky.utils.context.initialize'), \
          mock.patch('sky.utils.context.get', return_value=mock_ctx):
 
         task = executor.execute_request_in_coroutine(request)
 
-        await asyncio.sleep(0.1)
-        task.cancel()
-        await task.task
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_STARTED.wait, 1)
+        await task.cancel()
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_FINISHED.wait, 1)
         # Verify the context is actually cancelled
         mock_ctx.cancel.assert_called()
 
@@ -184,7 +198,7 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
 CALLED_FLAG = [False]
 
 
-def dummy_entrypoint(called_flag):
+def flag_entrypoint():
     CALLED_FLAG[0] = True
     return 'ok'
 
@@ -195,7 +209,7 @@ async def test_api_cancel_race_condition(isolated_database):
     CALLED_FLAG[0] = False
     req = requests_lib.Request(request_id='race-cancel-before',
                                name='test-request',
-                               entrypoint=dummy_entrypoint,
+                               entrypoint=flag_entrypoint,
                                request_body=payloads.RequestBody(),
                                status=requests_lib.RequestStatus.PENDING,
                                created_at=0.0,

@@ -374,13 +374,15 @@ async def _tail_log_file(
     # Read file in chunks instead of line-by-line for better performance
     incomplete_line = b''  # Buffer for incomplete lines across chunks
 
-    async def flush_buffer() -> AsyncGenerator[str, None]:
+    def flush_buffer() -> str | None:
         nonlocal buffer, buffer_bytes, last_flush_time
         if buffer:
-            yield ''.join(buffer)
+            chunk = ''.join(buffer)
             buffer.clear()
             buffer_bytes = 0
             last_flush_time = asyncio.get_event_loop().time()
+            return chunk
+        return None
 
     while True:
         # Sleep 0 to yield control to allow other coroutines to run,
@@ -391,7 +393,8 @@ async def _tail_log_file(
         # flush timeout is reached.
         if buffer and (buffer_bytes >= _BUFFER_SIZE or
                        (current_time - last_flush_time) >= _BUFFER_TIMEOUT):
-            async for chunk in flush_buffer():
+            chunk = flush_buffer()
+            if chunk is not None:
                 yield chunk
 
         if log_path is not None:
@@ -401,7 +404,8 @@ async def _tail_log_file(
             if lost_prefix:
                 # Preserve complete output before the gap, but never join a
                 # partial discarded line to the retained generation.
-                async for chunk in flush_buffer():
+                chunk = flush_buffer()
+                if chunk is not None:
                     yield chunk
                 incomplete_line = b''
         else:
@@ -445,7 +449,8 @@ async def _tail_log_file(
                             await
                             _read_request_log_chunk(f, log_marker, log_path))
                         if lost_prefix:
-                            async for chunk in flush_buffer():
+                            chunk = flush_buffer()
+                            if chunk is not None:
                                 yield chunk
                             incomplete_line = b''
                     else:
@@ -555,7 +560,8 @@ async def _tail_log_file(
             buffer_bytes += len(line_str.encode('utf-8'))
 
     # Flush remaining lines in the buffer.
-    async for chunk in flush_buffer():
+    chunk = flush_buffer()
+    if chunk is not None:
         yield chunk
 
 
