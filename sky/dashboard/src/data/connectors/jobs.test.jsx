@@ -27,6 +27,7 @@ import { apiClient } from '@/data/connectors/client';
 import {
   getManagedJobs,
   getPoolStatus,
+  useManagedJobPools,
   useSingleManagedJob,
 } from '@/data/connectors/jobs';
 
@@ -71,6 +72,154 @@ describe('getPoolStatus request scope', () => {
     expect(apiClient.post).toHaveBeenCalledWith('/jobs/pool_status', {
       pool_names: null,
     });
+  });
+
+  it('skips the active-jobs query when only pool identity is needed', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ return_value: '[{"name":"pool-a"}]' }),
+    });
+
+    const result = await getPoolStatus({
+      poolNames: ['pool-a'],
+      includeJobCounts: false,
+    });
+
+    expect(result).toEqual({
+      pools: [{ name: 'pool-a', jobCounts: {} }],
+      controllerStopped: false,
+    });
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+});
+
+describe('useManagedJobPools request ownership', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('skips pool status for loading and non-pool jobs', async () => {
+    const { result, rerender } = renderHook(
+      ({ jobs, jobId }) => useManagedJobPools(jobs, jobId),
+      { initialProps: { jobs: null, jobId: '42' } }
+    );
+
+    expect(result.current).toEqual([]);
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+
+    rerender({ jobs: [{ id: 42, pool: null }], jobId: '42' });
+
+    expect(result.current).toEqual([]);
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
+  it('fetches the current job unique pools once across unrelated refreshes', async () => {
+    dashboardCache.get.mockResolvedValue({
+      pools: [{ name: 'pool-a' }, { name: 'pool-b' }],
+    });
+    const initialJobs = [
+      { id: 42, pool: 'pool-b', status: 'PENDING' },
+      { id: 42, pool: 'pool-a', status: 'PENDING' },
+      { id: 42, pool: 'pool-b', status: 'PENDING' },
+      { id: 43, pool: 'pool-z', status: 'RUNNING' },
+    ];
+    const { result, rerender } = renderHook(
+      ({ jobs }) => useManagedJobPools(jobs, '42'),
+      { initialProps: { jobs: initialJobs } }
+    );
+
+    await waitFor(() => expect(result.current).toHaveLength(2));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getPoolStatus, [
+      {
+        poolNames: ['pool-a', 'pool-b'],
+        includeJobCounts: false,
+      },
+    ]);
+
+    rerender({
+      jobs: initialJobs.map((job) => ({ ...job, status: 'RUNNING' })).reverse(),
+    });
+
+    expect(result.current).toEqual([{ name: 'pool-a' }, { name: 'pool-b' }]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a stale pool result after the job pool set changes', async () => {
+    const poolA = deferred();
+    const poolB = deferred();
+    dashboardCache.get
+      .mockImplementationOnce(() => poolA.promise)
+      .mockImplementationOnce(() => poolB.promise);
+    const { result, rerender } = renderHook(
+      ({ jobs }) => useManagedJobPools(jobs, '42'),
+      { initialProps: { jobs: [{ id: 42, pool: 'pool-a' }] } }
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    rerender({ jobs: [{ id: 42, pool: 'pool-b' }] });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(result.current).toEqual([]);
+
+    await act(async () => {
+      poolB.resolve({ pools: [{ name: 'pool-b' }] });
+      await poolB.promise;
+    });
+    expect(result.current).toEqual([{ name: 'pool-b' }]);
+
+    await act(async () => {
+      poolA.resolve({ pools: [{ name: 'pool-a' }] });
+      await poolA.promise;
+    });
+    expect(result.current).toEqual([{ name: 'pool-b' }]);
+  });
+
+  it('ignores a stale failure after the current pool request succeeds', async () => {
+    const poolA = deferred();
+    const poolB = deferred();
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    dashboardCache.get
+      .mockImplementationOnce(() => poolA.promise)
+      .mockImplementationOnce(() => poolB.promise);
+    const { result, rerender } = renderHook(
+      ({ jobs }) => useManagedJobPools(jobs, '42'),
+      { initialProps: { jobs: [{ id: 42, pool: 'pool-a' }] } }
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    rerender({ jobs: [{ id: 42, pool: 'pool-b' }] });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      poolB.resolve({ pools: [{ name: 'pool-b' }] });
+      await poolB.promise;
+    });
+    await act(async () => {
+      poolA.reject(new Error('stale pool failure'));
+      await poolA.promise.catch(() => {});
+    });
+
+    expect(result.current).toEqual([{ name: 'pool-b' }]);
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('publishes an empty snapshot when the current pool request fails', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    dashboardCache.get.mockRejectedValue(new Error('pool status unavailable'));
+    const { result } = renderHook(() =>
+      useManagedJobPools([{ id: 42, pool: 'pool-a' }], '42')
+    );
+
+    await waitFor(() => expect(errorSpy).toHaveBeenCalledTimes(1));
+    expect(result.current).toEqual([]);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Error fetching pools data:',
+      expect.objectContaining({ message: 'pool status unavailable' })
+    );
+    errorSpy.mockRestore();
   });
 });
 

@@ -2,7 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import { Card } from '@/components/ui/card';
-import { useSingleManagedJob, getPoolStatus } from '@/data/connectors/jobs';
+import {
+  useManagedJobPools,
+  useSingleManagedJob,
+} from '@/data/connectors/jobs';
 import Link from 'next/link';
 import {
   RotateCwIcon,
@@ -26,7 +29,6 @@ import { useMobile } from '@/hooks/useMobile';
 import Head from 'next/head';
 import { NonCapitalizedTooltip } from '@/components/utils';
 import { UserDisplay } from '@/components/elements/UserDisplay';
-import dashboardCache from '@/lib/cache';
 import { useLogStreamer } from '@/hooks/useLogStreamer';
 import { checkGrafanaAvailability } from '@/utils/grafana';
 import { TelemetrySection } from '@/components/TelemetrySection';
@@ -38,7 +40,7 @@ function TaskDetails() {
   const { job: jobId, task: taskIndex } = router.query;
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const { jobData, loading } = useSingleManagedJob(jobId, refreshTrigger);
-  const [poolsData, setPoolsData] = useState([]);
+  const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
@@ -56,20 +58,6 @@ function TaskDetails() {
       setIsInitialLoad(false);
     }
   }, [loading, isInitialLoad]);
-
-  // Fetch pools data for hash comparison
-  useEffect(() => {
-    async function fetchPoolsData() {
-      try {
-        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
-        setPoolsData(poolsResponse.pools || []);
-      } catch (error) {
-        console.error('Error fetching pools data:', error);
-        setPoolsData([]);
-      }
-    }
-    fetchPoolsData();
-  }, []);
 
   // Check Grafana availability on mount
   useEffect(() => {
