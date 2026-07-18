@@ -45,7 +45,11 @@ def _mock_managed_jobs_db_conn(tmp_path, monkeypatch):
     # Create schema
     state.create_table(engine)
 
-    yield engine
+    try:
+        yield engine
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 @pytest.fixture
@@ -70,7 +74,11 @@ def _mock_global_user_state_db(tmp_path, monkeypatch):
 
     global_user_state.create_table(engine)
 
-    yield engine
+    try:
+        yield engine
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 @pytest.fixture
