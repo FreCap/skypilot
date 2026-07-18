@@ -1,7 +1,10 @@
 """Characterization tests for the S3-compatible storage family."""
 # pylint: disable=protected-access
 
+import inspect
 import pickle
+
+import pytest
 
 from sky.data import storage as storage_lib
 from sky.data import storage_s3
@@ -13,6 +16,15 @@ _PUBLIC_STORE_CONFIGS = {
     'CoreWeaveStore': ('COREWEAVE', 'cw://', 'CoreWeave', 'US-EAST-01A'),
     'VastDataStore': ('VASTDATA', 'vastdata://', 'VastData', 'auto'),
 }
+
+
+def test_s3_compatible_base_enforces_provider_config_contract():
+    assert inspect.isabstract(storage_lib.S3CompatibleStore)
+    with pytest.raises(TypeError, match='abstract class'):
+        storage_lib.S3CompatibleStore(  # pylint: disable=abstract-class-instantiated
+            'bucket', 's3://bucket')
+    for store_name in _PUBLIC_STORE_CONFIGS:
+        assert not inspect.isabstract(getattr(storage_lib, store_name))
 
 
 def test_public_classes_preserve_identity_and_pickle_paths():
