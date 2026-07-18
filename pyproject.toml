@@ -45,8 +45,8 @@ check_untyped_defs = true
 enable_error_code = ["possibly-undefined"]
 
 [tool.basedpyright]
-# A focused complement to mypy. Keep the high-signal coroutine and
-# control-flow checks enabled while the broader type baseline remains noisy.
+# A focused complement to mypy. Keep high-signal coroutine, control-flow, and
+# interface-contract checks enabled while the broader type baseline is noisy.
 include = ["sky"]
 exclude = ["sky/schemas/generated", "sky/dashboard"]
 pythonVersion = "3.14"
@@ -58,6 +58,7 @@ reportPossiblyUnboundVariable = "error"
 reportGeneralTypeIssues = "error"
 reportReturnType = "error"
 reportIncompatibleMethodOverride = "error"
+reportInvalidCast = "error"
 
 [tool.isort]
 profile = "google"
