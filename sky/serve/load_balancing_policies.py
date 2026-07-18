@@ -78,22 +78,10 @@ class LoadBalancingPolicy:
             if filtered:
                 candidates = filtered
         replica = self._select_replica(request, candidates)
-        # NOTE: this runs on the per-request routing hot path, inside the load
-        # balancer's client-pool lock on the uvicorn event-loop thread, so log
-        # only the cheap method + url. The previous code formatted a full
-        # request dump (``dict(request.headers)`` + the query params) as an
-        # f-string argument on *every* request, which (a) added per-
-        # request CPU on the lock-held routing path and (b) leaked auth headers
-        # into the LB log. ``request.url`` already includes the path + query.
-        # A DEBUG gate would not help: SkyPilot sets the logger level to DEBUG
-        # (the default *handler* filters at INFO), so ``isEnabledFor(DEBUG)`` is
-        # True and the dump would still be built every request.
-        if replica is not None:
-            logger.info('Selected replica %s for request %s %s', replica,
-                        request.method, request.url)
-        else:
-            logger.warning('No replica selected for request %s %s',
-                           request.method, request.url)
+        # Keep the lock-held request hot path free of per-attempt logs. Access
+        # logs and bounded aggregate telemetry cover request outcomes; logging
+        # every selection scales with traffic (and retries) and can expose URL
+        # query parameters.
         return replica
 
     # TODO(tian): We should have an abstract class for Request to

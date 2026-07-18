@@ -165,15 +165,19 @@ def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
 
 
 def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
-    replica = mock.Mock(cluster_name='svc-a-r1')
+    replicas = [
+        mock.Mock(cluster_name='svc-a-r1'),
+        mock.Mock(cluster_name='svc-a-r2'),
+    ]
     launch_request = mock.Mock(request_id='launch-request')
     launch_request.name = 'sky.launch'
+    launch_request.cluster_name = 'svc-a-r1'
     cancellation_completed = False
     events = []
 
-    def _status(*, all_status, cluster_name):
+    def _status(*, all_status, fields):
         assert all_status is False
-        assert cluster_name == 'svc-a-r1'
+        assert fields == ['request_id', 'name', 'cluster_name']
         return [] if cancellation_completed else [launch_request]
 
     def _cancel(request_ids, *, all_users, silent):
@@ -189,22 +193,44 @@ def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
         cancellation_completed = True
 
     with mock.patch.object(serve_utils.sdk,
-                           'api_status', side_effect=_status), \
+                           'api_status', side_effect=_status) as status, \
          mock.patch.object(serve_utils.sdk,
                            'api_cancel', side_effect=_cancel), \
          mock.patch.object(serve_utils.sdk,
                            'stream_and_get', side_effect=_await):
         quiesced = serve_utils.quiesce_service_replica_launch_requests(
-            'svc', [replica], continue_guard=lambda: True)
+            'svc', replicas, continue_guard=lambda: True)
 
     assert quiesced
     assert events == ['cancel-enqueued', 'cancel-awaited']
+    assert status.call_count == 2
+
+
+def test_launch_quiesce_large_inventory_uses_one_active_request_snapshot():
+    replicas = [
+        mock.Mock(cluster_name=f'svc-a-r{replica_id}')
+        for replica_id in range(2159)
+    ]
+    unrelated = mock.Mock(request_id='other-launch',
+                          name='sky.launch',
+                          cluster_name='another-service-r1')
+    with mock.patch.object(serve_utils.sdk,
+                           'api_status', return_value=[unrelated]) as status, \
+         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel:
+        quiesced = serve_utils.quiesce_service_replica_launch_requests(
+            'svc', replicas, continue_guard=lambda: True)
+
+    assert quiesced
+    status.assert_called_once_with(
+        all_status=False, fields=['request_id', 'name', 'cluster_name'])
+    cancel.assert_not_called()
 
 
 def test_launch_quiesce_failure_retains_cleanup_inventory():
     replica = mock.Mock(cluster_name='svc-a-r1')
     launch_request = mock.Mock(request_id='launch-request')
     launch_request.name = 'sky.launch'
+    launch_request.cluster_name = 'svc-a-r1'
     with mock.patch.object(serve_utils.sdk,
                            'api_status', return_value=[launch_request]), \
          mock.patch.object(serve_utils.sdk,
@@ -1056,6 +1082,97 @@ def test_child_only_purge_mode_mismatch_is_not_reported_as_completed():
     assert 'belongs to a pool, not a service' in message
     assert 'No service to terminate.' in message
     assert 'scheduled to be terminated' not in message
+    remove.assert_not_called()
+
+
+def test_child_only_purge_skips_absent_clusters_with_one_inventory_snapshot():
+    lifecycle_lock = mock.MagicMock(epoch=9)
+    replica_infos = [
+        mock.Mock(replica_id=replica_id, cluster_name=f'orphan-r{replica_id}')
+        for replica_id in range(2159)
+    ]
+    with mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hash', return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_orphaned_service_child_mode',
+                           return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=replica_infos), \
+         mock.patch.object(
+             serve_utils,
+             'quiesce_service_replica_launch_requests', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_ephemeral_storage_cleanup_intents',
+                           return_value=[]), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_cluster_status_fields', return_value={}
+                          ) as cluster_snapshot, \
+         mock.patch('sky.serve.replica_managers.terminate_cluster'
+                   ) as terminate, \
+         mock.patch.object(serve_state,
+                           'remove_orphaned_service_children',
+                           return_value=True) as remove:
+        message = serve_utils._terminate_orphaned_service_children_impl(
+            'orphan', True)
+
+    assert message is None
+    cluster_snapshot.assert_called_once()
+    assert cluster_snapshot.call_args.args[0] == [
+        info.cluster_name for info in replica_infos
+    ]
+    terminate.assert_not_called()
+    remove.assert_called_once_with('orphan', 9)
+
+
+def test_child_only_purge_termination_failure_retains_inventory():
+    lifecycle_lock = mock.MagicMock(epoch=9)
+    replica_infos = [
+        mock.Mock(replica_id=1, cluster_name='orphan-r1'),
+        mock.Mock(replica_id=2, cluster_name='orphan-r2'),
+    ]
+
+    def _terminate(cluster_name, _log_file, **_kwargs):
+        if cluster_name == 'orphan-r2':
+            raise RuntimeError('down failed')
+
+    with mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hash', return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_orphaned_service_child_mode',
+                           return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=replica_infos), \
+         mock.patch.object(
+             serve_utils,
+             'quiesce_service_replica_launch_requests', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_ephemeral_storage_cleanup_intents',
+                           return_value=[]), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_cluster_status_fields',
+             return_value={
+                 info.cluster_name: (None, None) for info in replica_infos
+             }), \
+         mock.patch('sky.serve.replica_managers.terminate_cluster',
+                    side_effect=_terminate) as terminate, \
+         mock.patch.object(serve_state,
+                           'remove_orphaned_service_children') as remove:
+        message = serve_utils._terminate_orphaned_service_children_impl(
+            'orphan', True)
+
+    assert message is not None and 'cluster termination failed' in message
+    assert terminate.call_count == 2
     remove.assert_not_called()
 
 
@@ -2206,6 +2323,16 @@ class TestTerminateFailedServices:
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
 
+        self.cluster_snapshot_calls = []
+
+        def _cluster_snapshot(cluster_names):
+            self.cluster_snapshot_calls.append(list(cluster_names))
+            return {
+                cluster_name: (None, None)
+                for cluster_name in cluster_names
+                if exists(cluster_name)
+            }
+
         lifecycle_lock = mock.MagicMock()
         lifecycle_lock.epoch = 17
         with mock.patch(
@@ -2217,8 +2344,8 @@ class TestTerminateFailedServices:
                  return_value=True), \
              mock.patch(
                  'sky.serve.serve_utils.global_user_state.'
-                 'cluster_with_name_exists',
-                 side_effect=exists), \
+                 'get_cluster_status_fields',
+                 side_effect=_cluster_snapshot), \
              mock.patch('sky.serve.replica_managers.terminate_cluster',
                         side_effect=_terminate), \
              mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
@@ -2271,10 +2398,39 @@ class TestTerminateFailedServices:
         # Only the still-existing cluster is downed; both rows are removed
         # and the service row is cleared.
         assert terminated == ['svc-1']
+        assert self.cluster_snapshot_calls == [['svc-1', 'svc-2']]
         remove_service.assert_called_once_with('svc',
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_large_absent_inventory_uses_one_cluster_snapshot(self):
+        infos = [
+            self._replica(replica_id, f'svc-{replica_id}')
+            for replica_id in range(2159)
+        ]
+        terminated, remove_service, _, message, _, _ = self._run(
+            infos, exists=lambda _name: False)
+
+        assert not terminated
+        assert self.cluster_snapshot_calls == [[
+            info.cluster_name for info in infos
+        ]]
+        remove_service.assert_called_once()
+        assert message is None
+
+    def test_cluster_inventory_uncertainty_retains_cleanup_rows(self):
+
+        def _inventory_failure(_name):
+            raise RuntimeError('cluster DB unavailable')
+
+        infos = [self._replica(1, 'svc-1')]
+        terminated, remove_service, _, message, _, _ = self._run(
+            infos, exists=_inventory_failure)
+
+        assert not terminated
+        remove_service.assert_not_called()
+        assert message is not None and 'could not be verified' in message
 
     def test_unquiesced_launch_keeps_rows_and_clusters_for_retry(self):
         info = self._replica(1, 'svc-1')

@@ -67,6 +67,8 @@ Completed in PR #368:
 - [x] Make existing SkyServe workspace adoption null-only, evidence-based, and
   fenced by the exact service incarnation.
 - [x] Document the task and administrator configuration contracts.
+- [x] Reconcile the feature with the current `improvements` base and review the
+  async-lifecycle baseline shifts introduced by the feature's added lines.
 - [x] Verify the implementation with targeted local tests and all 20 GitHub
   checks on code-bearing implementation head
   `62cd18974af18b34c8e5c3846fc1010ed0257e40`.
@@ -270,8 +272,9 @@ fallback under `managed_required`; change workspace policy first.
   preview layouts.
 - The exact latest Boltz L4 fleet YAML parses all 254 candidates unchanged and
   produces `artifact_ids=[]`.
-- YAPF, isort, mypy, Pylint, Ruff, dashboard lint, Prettier, Python compilation,
-  and `git diff --check` pass.
+- YAPF, isort, mypy, Pylint, Ruff, BasedPyright, the flake8 async-lifecycle
+  ratchet, dashboard lint, Prettier, Python compilation, and `git diff --check`
+  pass.
 - All 20 visible GitHub checks passed on code-bearing implementation head
   `62cd18974af18b34c8e5c3846fc1010ed0257e40` before this plan-only update.
   The PR check rollup is authoritative for the latest exact-head status, and
@@ -291,6 +294,9 @@ fallback under `managed_required`; change workspace policy first.
 
 ## Change log
 
+- 2026-07-18: Merged the current `improvements` base and refreshed only shifted
+  line numbers in the new async-lifecycle baseline after confirming identical
+  files, rules, columns, and findings.
 - 2026-07-18: Recorded the implemented control-plane contract, compatibility
   behavior, exact-head verification, and outstanding production activation
   gates for PR #368.

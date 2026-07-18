@@ -17,6 +17,13 @@ mypy==1.19.1
 ruff==0.15.21
 # Enforces the import contracts in pyproject [tool.importlinter].
 import-linter==2.13
+# Focused coroutine/control-flow type ratchet. Keep in sync with
+# static-analysis.yml.
+basedpyright==1.39.9
+# Cancellation and async-resource lifecycle ratchet. flake8 is pinned because
+# flake8-async is loaded as its plugin. Keep both in sync with CI.
+flake8==7.3.0
+flake8-async==27.7.1
 types-PyYAML
 types-paramiko
 # 2.31 requires urlib3>2, which is incompatible with IBM and

@@ -8,6 +8,7 @@ from unittest import mock
 
 import fastapi
 import pytest
+from starlette import datastructures
 
 from sky.serve import constants
 from sky.serve import load_balancer
@@ -41,6 +42,13 @@ def _request() -> mock.MagicMock:
     request.method = 'POST'
     request.headers = {}
     request.is_disconnected = mock.AsyncMock(return_value=False)
+    return request
+
+
+def _request_with_headers(
+        raw_headers: list[tuple[bytes, bytes]]) -> mock.MagicMock:
+    request = _request()
+    request.headers = datastructures.Headers(raw=raw_headers)
     return request
 
 
@@ -662,6 +670,236 @@ def test_dispatch_concurrency_has_absolute_cap():
     assert lb._request_queue_limits()[0] == 7
 
 
+@pytest.mark.parametrize(('raw_headers', 'expected'), [
+    ([], 0),
+    ([(b'x-skyserve-priority', b'0')], 0),
+    ([(b'X-SkyServe-Priority', b'37')], 37),
+    ([(b'x-skyserve-priority', b'100')], 100),
+    ([(b'x-skyserve-priority', b'007')], 7),
+    ([(b'x-skyserve-priority', b'0100')], 100),
+    ([(b'x-skyserve-priority', b'0' * 5000)], 0),
+])
+def test_request_priority_header_parsing(raw_headers, expected):
+    request = _request_with_headers(raw_headers)
+    assert (load_balancer.SkyServeLoadBalancer._parse_request_priority(request)
+            == expected)
+
+
+@pytest.mark.parametrize('raw_headers', [
+    [(b'x-skyserve-priority', b'')],
+    [(b'x-skyserve-priority', b'-1')],
+    [(b'x-skyserve-priority', b' 1')],
+    [(b'x-skyserve-priority', b'1.0')],
+    [(b'x-skyserve-priority', b'101')],
+    [(b'x-skyserve-priority', b'1' * 5000)],
+    [(b'x-skyserve-priority', b'\xff')],
+    [(b'x-skyserve-priority', b'1'), (b'X-SkyServe-Priority', b'2')],
+])
+def test_invalid_request_priority_header_returns_400(raw_headers):
+    request = _request_with_headers(raw_headers)
+    with pytest.raises(fastapi.HTTPException) as exc:
+        load_balancer.SkyServeLoadBalancer._parse_request_priority(request)
+    assert exc.value.status_code == 400
+
+
+def test_request_priority_header_is_consumed_before_proxying():
+    request = _request_with_headers([
+        (b'x-duplicate', b'first'),
+        (b'X-SkyServe-Priority', b'99'),
+        (b'x-duplicate', b'second'),
+        (b'x-skyserve-priority', b'1'),
+    ])
+    assert (load_balancer.SkyServeLoadBalancer.
+            _headers_without_request_priority(request) == [
+                (b'x-duplicate', b'first'),
+                (b'x-duplicate', b'second'),
+            ])
+
+
+def test_queue_disabled_still_validates_request_priority():
+
+    async def _run():
+        lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
+        lb._proxy_with_retries_inner = mock.AsyncMock(
+            return_value=fastapi.responses.Response(status_code=200))
+        invalid = _request_with_headers([(b'x-skyserve-priority', b'101')])
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._proxy_with_retries(invalid)
+        assert exc.value.status_code == 400
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._active_request_count == 0
+
+        valid = _request_with_headers([(b'x-skyserve-priority', b'91')])
+        response = await lb._proxy_with_retries(valid)
+        assert response.status_code == 200
+        assert vars(valid)['_skyserve_request_priority'] == 91
+        assert lb._active_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_strict_priority_with_fifo_ties():
+
+    async def _run():
+        lb = _make_lb(min_size=4,
+                      size_per_replica=0,
+                      max_size=4,
+                      timeout_seconds=5)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        queued: list[tuple[str, asyncio.Task]] = []
+
+        async def _enqueue(name: str, priority: int) -> None:
+            task = asyncio.create_task(
+                lb._acquire_request_slot(_request(), priority))
+            queued.append((name, task))
+            while lb._waiting_request_count != len(queued):
+                await asyncio.sleep(0)
+
+        await _enqueue('low', 1)
+        await _enqueue('high-first', 100)
+        await _enqueue('high-second', 100)
+        await _enqueue('medium', 50)
+
+        order = []
+        await lb._release_request_slot()
+        for _ in queued:
+            while True:
+                completed = [(name, task)
+                             for name, task in queued
+                             if task.done() and name not in order]
+                if completed:
+                    assert len(completed) == 1
+                    name, task = completed[0]
+                    assert await task is True
+                    order.append(name)
+                    await lb._release_request_slot()
+                    break
+                await asyncio.sleep(0)
+
+        assert order == ['high-first', 'high-second', 'medium', 'low']
+        assert lb._active_request_count == 0
+        assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_late_higher_priority_registration_uses_existing_capacity():
+
+    async def _run():
+        lb = _make_lb(min_size=2,
+                      size_per_replica=0,
+                      max_size=2,
+                      timeout_seconds=5)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        low = asyncio.create_task(lb._acquire_request_slot(_request(), 1))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+
+        # Model capacity becoming available immediately before registration,
+        # while its normal notification is still waiting to take the scheduler
+        # lock. Registration itself must run the central dispatcher and select
+        # the new highest-priority head.
+        lb._active_request_count = 0
+        high = asyncio.create_task(lb._acquire_request_slot(_request(), 100))
+        assert await high is True
+        assert not low.done()
+        assert lb._active_request_count == 1
+        assert lb._waiting_request_count == 1
+
+        await lb._release_request_slot()
+        assert await low is True
+        await lb._release_request_slot()
+
+    asyncio.run(_run())
+
+
+def test_priority_is_non_preemptive():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      timeout_seconds=5)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        low_request = _request()
+        assert await lb._acquire_request_slot(low_request, 1) is True
+        high = asyncio.create_task(lb._acquire_request_slot(_request(), 100))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        assert not high.done()
+        await lb._release_request_slot(low_request)
+        assert await high is True
+        await lb._release_request_slot()
+
+    asyncio.run(_run())
+
+
+def test_full_queue_does_not_evict_lower_priority_waiter():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      timeout_seconds=5)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        low = asyncio.create_task(lb._acquire_request_slot(_request(), 1))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._acquire_request_slot(_request(), 100)
+        assert exc.value.status_code == 503
+        assert not low.done()
+        assert lb._waiting_request_count == 1
+
+        await lb._release_request_slot()
+        assert await low is True
+        await lb._release_request_slot()
+
+    asyncio.run(_run())
+
+
+def test_dispatch_resolves_only_newly_granted_waiters_at_scale():
+
+    async def _run():
+        lb = _make_lb(min_size=10000,
+                      size_per_replica=0,
+                      max_size=10000,
+                      max_concurrency_per_replica=1,
+                      max_concurrency=128)
+        lb._load_balancing_policy.set_ready_replicas(
+            [f'http://worker-{index}:8000' for index in range(128)])
+        loop = asyncio.get_running_loop()
+        waiters = []
+        for sequence in range(10000):
+            waiter = load_balancer._RequestQueueWaiter(
+                request=_request(),
+                priority=sequence % 101,
+                sequence=sequence,
+                future=loop.create_future())
+            lb._request_queue_waiters.setdefault(waiter.priority,
+                                                 {})[sequence] = waiter
+            waiters.append(waiter)
+        lb._request_queue_sequence = len(waiters)
+        lb._waiting_request_count = len(waiters)
+
+        async with lb._request_queue_condition:
+            lb._dispatch_request_queue_locked()
+
+        granted = [waiter for waiter in waiters if waiter.future.done()]
+        assert len(granted) == 128
+        assert all(waiter.granted for waiter in granted)
+        assert min(waiter.priority for waiter in granted) == 99
+        assert all(waiter.priority >= 99 for waiter in granted)
+        assert lb._active_request_count == 128
+        assert lb._waiting_request_count == 9872
+
+    asyncio.run(_run())
+
+
 def test_full_queue_rejects_without_growing_waiter_count():
 
     async def _run():
@@ -809,6 +1047,40 @@ def test_disconnect_racing_slot_notification_does_not_dispatch():
         assert lb._waiting_request_count == 0
         assert lb._active_request_count == 0
         assert lb._queue_depth == 0
+
+    asyncio.run(_run())
+
+
+def test_cancellation_after_grant_reclaims_slot():
+
+    async def _run():
+        lb = _make_lb(timeout_seconds=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        request = _request()
+        disconnect_check_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _is_disconnected():
+            disconnect_check_started.set()
+            await never.wait()
+            raise AssertionError('unreachable')
+
+        request.is_disconnected.side_effect = _is_disconnected
+        waiter = asyncio.create_task(lb._acquire_request_slot(request, 100))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+
+        await lb._release_request_slot()
+        await disconnect_check_started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert lb._active_request_count == 0
+        assert lb._waiting_request_count == 0
+        assert lb._occupancy_unassigned_reservations == 0
+        assert not lb._background_tasks
 
     asyncio.run(_run())
 

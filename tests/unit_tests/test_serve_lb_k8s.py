@@ -235,7 +235,7 @@ def _install(monkeypatch,
                                                   available_replicas=1,
                                                   unavailable_replicas=0))
 
-    def _read_deployment(name, unused_namespace):
+    def _read_deployment(name, unused_namespace, **kwargs):
         if name == effective_api_deployment_name:
             return SimpleNamespace(metadata=SimpleNamespace(
                 uid=api_deployment_uid))
@@ -244,7 +244,7 @@ def _install(monkeypatch,
         if isinstance(original_side_effect, BaseException):
             raise original_side_effect
         if callable(original_side_effect):
-            return original_side_effect(name, unused_namespace)
+            return original_side_effect(name, unused_namespace, **kwargs)
         result = next(original_side_effect)
         if isinstance(result, BaseException):
             raise result
@@ -2043,8 +2043,6 @@ def test_delete_wait_timeout_uses_monotonic_deadline(monkeypatch):
     apps = mock.MagicMock()
     core = mock.MagicMock()
     apps.read_namespaced_deployment.side_effect = _ApiException(404)
-    core.read_namespaced_service.return_value = _owned_object(
-        'incarnation-a', 'service-a', '9')
     _install(monkeypatch, apps_api=apps, core_api=core)
     monkeypatch.setattr(lb_k8s, '_lb_object_deletion_timeout_seconds',
                         lambda obj, kind: 0.3)
@@ -2052,12 +2050,21 @@ def test_delete_wait_timeout_uses_monotonic_deadline(monkeypatch):
         side_effect=AssertionError('elapsed timeout consulted wall clock'))
     monotonic_clock = [10.0]
     sleeps = []
+    poll_timeouts = []
     monotonic = mock.Mock(side_effect=lambda: monotonic_clock[0])
+
+    def _read_service(name, namespace, **kwargs):
+        del name, namespace
+        if core.read_namespaced_service.call_count > 1:
+            poll_timeouts.append(kwargs.get('_request_timeout'))
+            monotonic_clock[0] += 0.15
+        return _owned_object('incarnation-a', 'service-a', '9')
 
     def _sleep(delay):
         sleeps.append(delay)
         monotonic_clock[0] += delay
 
+    core.read_namespaced_service.side_effect = _read_service
     monkeypatch.setattr(
         lb_k8s, 'time',
         SimpleNamespace(time=wall_clock, monotonic=monotonic, sleep=_sleep))
@@ -2068,8 +2075,10 @@ def test_delete_wait_timeout_uses_monotonic_deadline(monkeypatch):
     wall_clock.assert_not_called()
     assert monotonic.call_count == 4
     core.delete_namespaced_service.assert_called_once()
-    assert core.read_namespaced_service.call_count == 4
-    assert sleeps == pytest.approx([0.2, 0.1])
+    assert core.read_namespaced_service.call_count == 2
+    assert poll_timeouts == pytest.approx([0.3])
+    assert sleeps == pytest.approx([0.15])
+    assert monotonic_clock[0] == pytest.approx(10.3)
 
 
 def test_reaper_db_null_then_successor_appears_fails_closed(monkeypatch):

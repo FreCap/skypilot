@@ -1177,6 +1177,10 @@ class TestServiceLifecycleEpoch:
             1,
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch_delete)
+        assert not serve_state.remove_replicas(
+            'svc', [1],
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch_delete)
         replica = serve_state.get_replica_info_from_id('svc', 1)
         assert replica is not None
         assert replica.cluster_name == 'replica-b'
@@ -1193,6 +1197,47 @@ class TestServiceLifecycleEpoch:
                                           99,
                                           expected_service_hash='incarnation-a',
                                           expected_lifecycle_epoch=epoch)
+
+    def test_exact_owner_bulk_replica_cleanup_is_atomic_and_idempotent(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch,
+                                    resource_scope='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1])
+        for replica_id in range(1200):
+            assert serve_state.add_or_update_replica(
+                'svc',
+                replica_id,
+                _replica(replica_id),
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=epoch)
+
+        assert not serve_state.remove_replicas(
+            'svc',
+            list(range(1200)),
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch,
+            expected_controller_owner=(456, '10.0.0.2'))
+        assert len(serve_state.get_replica_infos('svc')) == 1200
+        assert serve_state.remove_replicas(
+            'svc',
+            list(range(1200)),
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch,
+            expected_controller_owner=owner)
+        assert serve_state.get_replica_infos('svc') == []
+        assert _read_row(_mock_serve_db, 'svc') is not None
+        assert _read_version_row(_mock_serve_db, 'svc', 1) is not None
+        assert serve_state.remove_replicas(
+            'svc',
+            list(range(1200)),
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch,
+            expected_controller_owner=owner)
 
     def test_stale_recovery_script_and_version_claims_fail(
             self, _mock_serve_db):

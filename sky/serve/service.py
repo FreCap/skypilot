@@ -22,7 +22,6 @@ from typing import Any, NoReturn, TYPE_CHECKING
 import filelock
 
 from sky import exceptions
-from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
@@ -416,26 +415,39 @@ def _cleanup(service_name: str,
     # after it has durably published FAILED_CLEANUP.
     failed = False
     replica_infos = serve_state.get_replica_infos(service_name)
+    existing_cluster_names = serve_utils.get_existing_replica_cluster_names(
+        replica_infos)
+    # Cluster inventory and Serve metadata live in separate tables, so this
+    # is not an atomic cross-table snapshot. Launch quiescence prevents this
+    # controller from registering a new cluster, while the owner check and
+    # the fenced delete below reject a successor service or controller.
+    _assert_owner('after cluster inventory snapshot')
+    absent_replica_infos = [
+        info for info in replica_infos
+        if info.cluster_name not in existing_cluster_names
+    ]
+    if absent_replica_infos:
+        removed = serve_state.remove_replicas(
+            service_name, [info.replica_id for info in absent_replica_infos],
+            expected_service_hash=service_hash,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=expected_owner)
+        if not removed:
+            raise ServiceOwnershipLostError(
+                'Lost lifecycle ownership while bulk-removing absent '
+                'replicas.')
+        logger.info(f'Removed {len(absent_replica_infos)} replica records '
+                    'whose clusters are absent from the cluster inventory.')
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
     for info in replica_infos:
+        if info.cluster_name not in existing_cluster_names:
+            continue
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         # Use the durable exact cluster identity from the replica row. New
         # incarnation-scoped names truncate long service prefixes to stay
         # within the 63-character cloud/Kubernetes ceiling, so a prefix query
         # with the full service name can miss a live, billable cluster.
-        if not global_user_state.cluster_with_name_exists(info.cluster_name):
-            logger.info(f'Cluster {info.cluster_name} for replica '
-                        f'{info.replica_id} not found. Might be a failed '
-                        'cluster. Removing replica from database.')
-            try:
-                _remove_replica(info.replica_id)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning(f'Failed to remove replica {info.replica_id} '
-                               f'from database: {e}')
-                failed = True
-            continue
-
         log_file_name = serve_utils.generate_replica_log_file_name(
             service_name, info.replica_id, resource_scope)
         t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,

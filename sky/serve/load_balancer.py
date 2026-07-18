@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ _OCCUPANCY_ADMISSION_ATTR = '_sky_occupancy_admission_unassigned'
 # succeeds; the active-concurrency budget covers it from that point onward.
 _BOUNDED_REQUEST_BODY_ATTR = '_skyserve_bounded_body'
 _WAITING_REQUEST_BODY_BYTES_ATTR = '_skyserve_waiting_body_bytes'
+_REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
 # transport failure cannot create a second logical operation. POST/PATCH are
@@ -83,6 +85,20 @@ class _RetriableStatusError(Exception):
 
 class _PreDispatchError(RuntimeError):
     """A proxy attempt failed before an upstream request could be sent."""
+
+
+@dataclasses.dataclass
+class _RequestQueueWaiter:
+    """One queued request and its targeted scheduler notification."""
+
+    request: fastapi.Request
+    priority: int
+    sequence: int
+    future: asyncio.Future
+    granted: bool = False
+    consumed: bool = False
+    abandoned: bool = False
+    terminal_error: fastapi.HTTPException | None = None
 
 
 def _is_dead_connection_error(exc: Exception) -> bool:
@@ -143,6 +159,9 @@ class SkyServeLoadBalancer:
     _active_request_count: int = 0
     _waiting_request_count: int = 0
     _waiting_request_body_bytes: int = 0
+    _request_queue_waiters: dict[int, dict[int,
+                                           _RequestQueueWaiter]] | None = None
+    _request_queue_sequence: int = 0
     _draining: bool = False
     _reject_last_seen: dict[str, float] | None = None
     _reject_fallback_seq: int = 0
@@ -278,6 +297,8 @@ class SkyServeLoadBalancer:
         self._active_request_count = 0
         self._waiting_request_count = 0
         self._waiting_request_body_bytes = 0
+        self._request_queue_waiters = {}
+        self._request_queue_sequence = 0
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -655,12 +676,166 @@ class SkyServeLoadBalancer:
         # awaits, and returned streams exactly once.
         return self._active_request_count
 
+    @staticmethod
+    def _priority_header_error(detail: str) -> fastapi.HTTPException:
+        return fastapi.HTTPException(
+            status_code=400,
+            detail=f'{constants.LB_REQUEST_PRIORITY_HEADER} {detail}')
+
+    @classmethod
+    def _parse_request_priority(cls, request: fastapi.Request) -> int:
+        """Parse the scheduling priority without coalescing duplicate headers."""
+        headers = request.headers
+        raw_headers = getattr(headers, 'raw', None)
+        values: list[bytes | str] = []
+        if isinstance(raw_headers, (list, tuple)):
+            for name, value in raw_headers:
+                normalized_name = (name.lower() if isinstance(name, bytes) else
+                                   str(name).lower().encode('ascii'))
+                if normalized_name == constants.LB_REQUEST_PRIORITY_HEADER_BYTES:
+                    values.append(value)
+        else:
+            # Starlette always exposes raw headers. This fallback keeps direct
+            # unit-test requests and compatible ASGI request implementations
+            # working without weakening duplicate detection on the real path.
+            for name, value in headers.items():
+                if str(name).lower() == (
+                        constants.LB_REQUEST_PRIORITY_HEADER.lower()):
+                    values.append(value)
+        if not values:
+            return constants.LB_REQUEST_PRIORITY_MIN
+        if len(values) != 1:
+            raise cls._priority_header_error('must appear at most once.')
+        value = values[0]
+        try:
+            text = (value.decode('ascii')
+                    if isinstance(value, bytes) else str(value))
+        except UnicodeDecodeError:
+            raise cls._priority_header_error(
+                'must be an integer from 0 to 100.') from None
+        if not text or any(
+                character < '0' or character > '9' for character in text):
+            raise cls._priority_header_error(
+                'must be an integer from 0 to 100.')
+        # Strip leading zeroes before bounding the conversion. This preserves
+        # the public integer contract while preventing Python's decimal-string
+        # conversion limit from escaping as HTTP 500 on a very long header.
+        normalized_text = text.lstrip('0') or '0'
+        if len(normalized_text) > len(str(constants.LB_REQUEST_PRIORITY_MAX)):
+            raise cls._priority_header_error(
+                'must be an integer from 0 to 100.')
+        priority = int(normalized_text)
+        if not (constants.LB_REQUEST_PRIORITY_MIN <= priority <=
+                constants.LB_REQUEST_PRIORITY_MAX):
+            raise cls._priority_header_error(
+                'must be an integer from 0 to 100.')
+        return priority
+
+    @staticmethod
+    def _headers_without_request_priority(request: fastapi.Request) -> Any:
+        """Return upstream headers with every scheduling header removed."""
+        headers = request.headers
+        raw_headers = getattr(headers, 'raw', None)
+        if isinstance(raw_headers, (list, tuple)):
+            return [(name, value) for name, value in raw_headers if (
+                name.lower() if isinstance(name, bytes) else str(name).lower().
+                encode('ascii')) != constants.LB_REQUEST_PRIORITY_HEADER_BYTES]
+        return [(name, value) for name, value in headers.items() if str(
+            name).lower() != constants.LB_REQUEST_PRIORITY_HEADER.lower()]
+
+    def _request_queue_waiters_for_instance(
+            self) -> dict[int, dict[int, _RequestQueueWaiter]]:
+        waiters = self._request_queue_waiters
+        if waiters is None:
+            waiters = {}
+            self._request_queue_waiters = waiters
+        return waiters
+
+    def _remove_request_queue_waiter_locked(
+            self, waiter: _RequestQueueWaiter) -> bool:
+        waiters = self._request_queue_waiters_for_instance()
+        bucket = waiters.get(waiter.priority)
+        if bucket is None or bucket.pop(waiter.sequence, None) is None:
+            return False
+        if not bucket:
+            del waiters[waiter.priority]
+        self._waiting_request_count = max(0, self._waiting_request_count - 1)
+        return True
+
+    def _pop_request_queue_waiter_locked(self) -> _RequestQueueWaiter | None:
+        waiters = self._request_queue_waiters_for_instance()
+        while waiters:
+            priority = max(waiters)
+            bucket = waiters[priority]
+            sequence = next(iter(bucket))
+            waiter = bucket[sequence]
+            self._remove_request_queue_waiter_locked(waiter)
+            if waiter.abandoned:
+                if not waiter.future.done():
+                    waiter.future.set_result(None)
+                continue
+            return waiter
+        return None
+
+    @staticmethod
+    def _resolve_request_queue_waiter_locked(
+            waiter: _RequestQueueWaiter) -> None:
+        if not waiter.future.done():
+            waiter.future.set_result(None)
+
+    def _grant_request_queue_waiter_locked(self,
+                                           waiter: _RequestQueueWaiter) -> None:
+        self._active_request_count += 1
+        if self._queue_uses_async_occupancy():
+            with self._client_pool_lock:
+                self._record_unassigned_occupancy_admission_locked(
+                    waiter.request)
+        waiter.granted = True
+        self._resolve_request_queue_waiter_locked(waiter)
+
+    def _reclaim_request_queue_grant_locked(
+            self, waiter: _RequestQueueWaiter) -> bool:
+        if not waiter.granted or waiter.consumed:
+            return False
+        waiter.granted = False
+        self._active_request_count = max(0, self._active_request_count - 1)
+        with self._client_pool_lock:
+            self._release_unassigned_occupancy_admission_locked(waiter.request)
+        return True
+
+    def _dispatch_request_queue_locked(self) -> None:
+        """Grant available slots by strict priority and FIFO within a tie."""
+        if self._waiting_request_count <= 0:
+            return
+        if self._draining or not self._accepts_new_requests():
+            while True:
+                waiter = self._pop_request_queue_waiter_locked()
+                if waiter is None:
+                    return
+                waiter.terminal_error = (self._draining_request_error()
+                                         if self._draining else
+                                         self._inactive_role_request_error())
+                self._resolve_request_queue_waiter_locked(waiter)
+
+        if self._request_queue_config is None:
+            # A live update disabled queueing. Preserve the existing unbounded
+            # semantics by releasing all already-queued requests at once.
+            available = self._waiting_request_count
+        else:
+            dispatch_limit, _ = self._request_queue_limits()
+            available = max(0, dispatch_limit - self._current_dispatch_load())
+        for _ in range(available):
+            waiter = self._pop_request_queue_waiter_locked()
+            if waiter is None:
+                break
+            self._grant_request_queue_waiter_locked(waiter)
+
     async def _notify_request_queue(self) -> None:
         condition = self._request_queue_condition
         if condition is None:
             return
         async with condition:
-            condition.notify_all()
+            self._dispatch_request_queue_locked()
 
     @staticmethod
     def _draining_request_error() -> fastapi.HTTPException:
@@ -676,111 +851,166 @@ class SkyServeLoadBalancer:
                 'Connection': 'close',
             })
 
-    async def _acquire_request_slot(self, request: fastapi.Request) -> bool:
+    @staticmethod
+    def _queue_timeout_error() -> fastapi.HTTPException:
+        return fastapi.HTTPException(
+            status_code=503,
+            detail='Timed out waiting in the load balancer request queue.',
+            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+
+    @staticmethod
+    def _queue_disconnect_error() -> fastapi.HTTPException:
+        return fastapi.HTTPException(
+            status_code=499,
+            detail=('Client disconnected while waiting in the load balancer '
+                    'request queue.'))
+
+    def _retain_background_task(self, task: asyncio.Task) -> None:
+        """Keep a fire-and-forget task alive and consume its final result."""
+        self._background_tasks.append(task)
+
+        def _forget(done: asyncio.Task) -> None:
+            with contextlib.suppress(ValueError):
+                self._background_tasks.remove(done)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done.result()
+
+        task.add_done_callback(_forget)
+
+    async def _cleanup_request_queue_waiter(
+            self, waiter: _RequestQueueWaiter) -> None:
+        condition = self._request_queue_condition
+        if condition is None:
+            return
+        async with condition:
+            waiter.abandoned = True
+            self._remove_request_queue_waiter_locked(waiter)
+            self._reclaim_request_queue_grant_locked(waiter)
+            self._resolve_request_queue_waiter_locked(waiter)
+            self._dispatch_request_queue_locked()
+
+    async def _acquire_request_slot(self,
+                                    request: fastapi.Request,
+                                    priority: int | None = None) -> bool:
         """Acquire process-local admission, queueing when configured."""
         if self._draining:
             raise self._draining_request_error()
+        if not self._accepts_new_requests():
+            raise self._inactive_role_request_error()
         config = self._request_queue_config
         if config is None:
             self._active_request_count += 1
             return True
+        if priority is None:
+            priority = getattr(request, _REQUEST_PRIORITY_ATTR,
+                               constants.LB_REQUEST_PRIORITY_MIN)
         condition = self._request_queue_condition
         if condition is None:
             condition = asyncio.Condition()
             self._request_queue_condition = condition
         deadline = time.monotonic() + config['timeout_seconds']
-        async with condition:
-            if self._draining:
-                raise self._draining_request_error()
-            # A controller sync may disable the queue while this coroutine
-            # was waiting for the condition lock. Fall back to unqueued
-            # dispatch instead of tripping the assert in
-            # _request_queue_limits.
-            if self._request_queue_config is None:
-                self._active_request_count += 1
-                return True
-            dispatch_limit, queue_size = self._request_queue_limits()
-            if self._current_dispatch_load() < dispatch_limit:
-                self._active_request_count += 1
-                if self._queue_uses_async_occupancy():
-                    self._record_unassigned_occupancy_admission(request)
-                return True
-            if self._waiting_request_count >= queue_size:
-                self._record_rejection(request)
-                raise fastapi.HTTPException(
-                    status_code=503,
-                    detail=(f'Load balancer request queue is full '
-                            f'({queue_size} waiting request(s)).'),
-                    headers={
-                        'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
-                    })
-            self._waiting_request_count += 1
-            try:
-                while True:
-                    if self._draining:
-                        raise self._draining_request_error()
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._record_rejection(request)
-                        raise fastapi.HTTPException(
-                            status_code=503,
-                            detail='Timed out waiting in the load balancer '
-                            'request queue.',
-                            headers={
-                                'Retry-After': str(
-                                    constants.LB_503_RETRY_AFTER_SECONDS)
-                            })
+        waiter: _RequestQueueWaiter | None = None
+        try:
+            async with condition:
+                if self._draining:
+                    raise self._draining_request_error()
+                if not self._accepts_new_requests():
+                    raise self._inactive_role_request_error()
+                # A controller sync may disable the queue while this coroutine
+                # was waiting for the scheduler lock.
+                if self._request_queue_config is None:
+                    self._active_request_count += 1
+                    return True
+                dispatch_limit, queue_size = self._request_queue_limits()
+                if (self._waiting_request_count == 0 and
+                        self._current_dispatch_load() < dispatch_limit):
+                    self._active_request_count += 1
+                    if self._queue_uses_async_occupancy():
+                        self._record_unassigned_occupancy_admission(request)
+                    return True
+                if self._waiting_request_count >= queue_size:
+                    self._record_rejection(request)
+                    raise fastapi.HTTPException(
+                        status_code=503,
+                        detail=(f'Load balancer request queue is full '
+                                f'({queue_size} waiting request(s)).'),
+                        headers={
+                            'Retry-After': str(
+                                constants.LB_503_RETRY_AFTER_SECONDS)
+                        })
+                sequence = self._request_queue_sequence
+                self._request_queue_sequence += 1
+                waiter = _RequestQueueWaiter(
+                    request=request,
+                    priority=priority,
+                    sequence=sequence,
+                    future=asyncio.get_running_loop().create_future())
+                waiters = self._request_queue_waiters_for_instance()
+                waiters.setdefault(priority, {})[sequence] = waiter
+                self._waiting_request_count += 1
+                self._dispatch_request_queue_locked()
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
                     try:
                         await asyncio.wait_for(
-                            condition.wait(),
+                            asyncio.shield(waiter.future),
                             min(remaining,
                                 _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS))
                     except asyncio.TimeoutError:
+                        pass
+                disconnected = await request.is_disconnected()
+                async with condition:
+                    if waiter.terminal_error is not None:
+                        raise waiter.terminal_error
+                    if waiter.granted:
                         if self._draining:
-                            raise self._draining_request_error() from None
-                        if await request.is_disconnected():
-                            raise fastapi.HTTPException(
-                                status_code=499,
-                                detail='Client disconnected while waiting in '
-                                'the load balancer request queue.') from None
-                        if time.monotonic() >= deadline:
-                            self._record_rejection(request)
-                            raise fastapi.HTTPException(
-                                status_code=503,
-                                detail='Timed out waiting in the load '
-                                'balancer request queue.',
-                                headers={
-                                    'Retry-After': str(
-                                        constants.LB_503_RETRY_AFTER_SECONDS)
-                                }) from None
-                        continue
-                    if self._draining:
-                        raise self._draining_request_error()
-                    # A slot notification can race with the downstream
-                    # disconnect. Check before transferring the newly free
-                    # capacity to this waiter, rather than waiting for the
-                    # next polling interval after it has already dispatched.
-                    if await request.is_disconnected():
-                        raise fastapi.HTTPException(
-                            status_code=499,
-                            detail='Client disconnected while waiting in the '
-                            'load balancer request queue.')
-                    # is_disconnected() yields to the event loop. SIGTERM can
-                    # begin draining during that await, so fence admission
-                    # again immediately before the non-yielding slot transfer.
-                    if self._draining:
-                        raise self._draining_request_error()
-                    if self._request_queue_config is None:
-                        self._active_request_count += 1
+                            self._reclaim_request_queue_grant_locked(waiter)
+                            self._dispatch_request_queue_locked()
+                            raise self._draining_request_error()
+                        if not self._accepts_new_requests():
+                            self._reclaim_request_queue_grant_locked(waiter)
+                            self._dispatch_request_queue_locked()
+                            raise self._inactive_role_request_error()
+                        if disconnected:
+                            self._reclaim_request_queue_grant_locked(waiter)
+                            self._dispatch_request_queue_locked()
+                            raise self._queue_disconnect_error()
+                        waiter.consumed = True
                         return True
-                    dispatch_limit, _ = self._request_queue_limits()
-                    if self._current_dispatch_load() < dispatch_limit:
-                        self._active_request_count += 1
-                        if self._queue_uses_async_occupancy():
-                            self._record_unassigned_occupancy_admission(request)
+                    if disconnected:
+                        self._remove_request_queue_waiter_locked(waiter)
+                        self._resolve_request_queue_waiter_locked(waiter)
+                        self._dispatch_request_queue_locked()
+                        raise self._queue_disconnect_error()
+                    if time.monotonic() >= deadline:
+                        self._remove_request_queue_waiter_locked(waiter)
+                        self._resolve_request_queue_waiter_locked(waiter)
+                        self._record_rejection(request)
+                        self._dispatch_request_queue_locked()
+                        raise self._queue_timeout_error()
+                    # A missed capacity signal is repaired by the bounded
+                    # disconnect poll without broadcasting to other waiters.
+                    self._dispatch_request_queue_locked()
+                    if waiter.granted:
+                        waiter.consumed = True
                         return True
-            finally:
-                self._waiting_request_count -= 1
+        except asyncio.CancelledError:
+            if waiter is not None:
+                # Synchronous fencing makes a grant ineligible before cleanup
+                # waits for the scheduler lock.
+                waiter.abandoned = True
+            raise
+        finally:
+            if waiter is not None and not waiter.consumed:
+                cleanup = asyncio.create_task(
+                    self._cleanup_request_queue_waiter(waiter))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    self._retain_background_task(cleanup)
+                    raise
 
     async def _release_request_slot(self,
                                     request: fastapi.Request | None = None
@@ -803,8 +1033,7 @@ class SkyServeLoadBalancer:
             # waiter still needs the wakeup because it has no occupancy probe
             # to provide a later one.
             async def _notify() -> None:
-                async with condition:
-                    condition.notify_all()
+                await self._notify_request_queue()
 
             try:
                 await _notify()
@@ -813,15 +1042,7 @@ class SkyServeLoadBalancer:
                 # The event loop only keeps weak task references. Retain this
                 # rare cancellation fallback until its condition notification
                 # finishes, then consume any shutdown-time exception.
-                self._background_tasks.append(notification)
-
-                def _forget_notification(done: asyncio.Task) -> None:
-                    with contextlib.suppress(ValueError):
-                        self._background_tasks.remove(done)
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        done.result()
-
-                notification.add_done_callback(_forget_notification)
+                self._retain_background_task(notification)
                 raise
 
     def _release_waiting_body_budget(self,
@@ -928,22 +1149,17 @@ class SkyServeLoadBalancer:
         logger.info('Draining load balancer: failing readiness and '
                     'deregistering from the controller sync.')
         self._draining = True
-        if self._request_aggregator.request_history_snapshot() is None:
-            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # Direct synchronous tests and unsupported runtimes have no loop.
             # Production SIGTERM is delivered on uvicorn's running loop.
             return
-        task = loop.create_task(self._flush_request_history_on_drain())
-        self._background_tasks.append(task)
-
-        def _discard(done: asyncio.Task) -> None:
-            with contextlib.suppress(ValueError):
-                self._background_tasks.remove(done)
-
-        task.add_done_callback(_discard)
+        self._retain_background_task(
+            loop.create_task(self._notify_request_queue()))
+        if self._request_aggregator.request_history_snapshot() is not None:
+            self._retain_background_task(
+                loop.create_task(self._flush_request_history_on_drain()))
 
     def _get_lb_session_id(self) -> str:
         """Return the durable external LB identity, failing closed if absent."""
@@ -2070,7 +2286,6 @@ class SkyServeLoadBalancer:
                         'the last applied routes and readiness state.')
                     return
                 self._routing_version = service_version
-                logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):
                     # Spurious empty sync: the controller still has READY
@@ -2487,6 +2702,7 @@ class SkyServeLoadBalancer:
                             self._armed_generation = generation
                         else:
                             self._armed_generation = None
+                        await self._notify_request_queue()
                         return
         except asyncio.TimeoutError:
             outcome = lb_ha_obs.LbRoleOutcome.CLIENT_TIMEOUT.value
@@ -2582,7 +2798,6 @@ class SkyServeLoadBalancer:
             The response from the endpoint replica. Return the exception
             encountered if anything goes wrong.
         """
-        logger.info(f'Proxy request to {url}')
         # The token ties this request's release to the exact accounting
         # generation it incremented (see LoadBalancingPolicy hooks). Keep the
         # policy OBJECT too: a live routing-spec update may replace
@@ -2627,7 +2842,7 @@ class SkyServeLoadBalancer:
             proxy_request = client.build_request(
                 request.method,
                 worker_url,
-                headers=request.headers.raw,
+                headers=self._headers_without_request_priority(request),
                 content=await self._request_body(request),
                 # A scalar here would ALSO set the connect timeout: with a
                 # long stream timeout (sync model servers send no bytes
@@ -2715,6 +2930,8 @@ class SkyServeLoadBalancer:
             raise self._draining_request_error()
         if not self._accepts_new_requests():
             raise self._inactive_role_request_error()
+        priority = self._parse_request_priority(request)
+        setattr(request, _REQUEST_PRIORITY_ATTR, priority)
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
         # The dispatched phase is deliberately excluded: the dispatch

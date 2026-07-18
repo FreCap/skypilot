@@ -7,8 +7,9 @@ that was used pre-optimization, so any future regression that changes
 which lines are returned is caught at unit-test time instead of on a
 live customer log.
 """
-# pylint: disable=redefined-outer-name
+# pylint: disable=protected-access,redefined-outer-name
 import collections
+import io
 import os
 import random
 import tempfile
@@ -18,6 +19,33 @@ import pytest
 from sky.skylet import log_lib
 
 
+def test_tail_helpers_keep_log_lib_facade_identity():
+    assert log_lib.tail_lines_from_end.__module__ == 'sky.skylet.log_lib'
+    assert log_lib._peek_head_lines.__module__ == 'sky.skylet.log_lib'
+    assert (log_lib._should_stream_the_whole_tail_lines.__module__ ==
+            'sky.skylet.log_lib')
+
+
+def test_peek_head_lines_resets_stream_position():
+    lines = [f'line {i}\n' for i in range(25)]
+    stream = io.StringIO(''.join(lines))
+
+    assert log_lib._peek_head_lines(stream) == lines[:20]
+    assert stream.tell() == 0
+
+
+@pytest.mark.parametrize(('head_lines', 'tail_lines', 'expected'), [
+    (['setup\n', 'marker\n'], ['last\n'], True),
+    (['marker\n'], ['marker\n', 'last\n'], False),
+    (['setup\n'], ['last\n'], False),
+    (['marker\n'], [f'line {i}\n' for i in range(20)] + ['marker\n'], True),
+])
+def test_should_stream_whole_tail_marker_policy(head_lines, tail_lines,
+                                                expected):
+    assert (log_lib._should_stream_the_whole_tail_lines(head_lines, tail_lines,
+                                                        'marker') is expected)
+
+
 def _write_lines(path: str, lines: list) -> None:
     with open(path, 'w', encoding='utf-8') as f:
         for line in lines:
@@ -25,7 +53,7 @@ def _write_lines(path: str, lines: list) -> None:
 
 
 def _deque_tail(path: str, tail: int, offset: int = 0) -> list:
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         full = list(collections.deque(f, maxlen=tail + offset))
     if offset >= len(full):
         return []

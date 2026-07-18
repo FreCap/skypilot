@@ -308,6 +308,15 @@ LB_REJECT_WINDOW_SECONDS = 360
 # (documented raw-count over-estimation; the platform sends the header).
 LB_JOB_ID_HEADER = 'X-SkyServe-Job-Id'
 
+# Per-request scheduling priority consumed by the load balancer. Higher values
+# are dispatched first; equal values retain arrival order. The header is never
+# forwarded to replicas.
+LB_REQUEST_PRIORITY_HEADER = 'X-SkyServe-Priority'
+LB_REQUEST_PRIORITY_HEADER_BYTES = LB_REQUEST_PRIORITY_HEADER.lower().encode(
+    'ascii')
+LB_REQUEST_PRIORITY_MIN = 0
+LB_REQUEST_PRIORITY_MAX = 100
+
 # On SIGTERM the external LB first deregisters (stops POSTing
 # load_balancer_sync so the controller stops counting it -- avoiding a
 # double-count with the maxSurge replacement) and fails readiness (so k8s

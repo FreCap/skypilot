@@ -2327,8 +2327,6 @@ class SkyServeController:
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                logger.info(f'All replica info for autoscaler: {replica_infos}')
-
                 # Keep the exact autoscaler instance/version that produced
                 # this tick. A concurrent update may replace or mutate
                 # `self._autoscaler` before actuation; the manager's expected

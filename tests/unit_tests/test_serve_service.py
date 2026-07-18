@@ -859,6 +859,130 @@ class TestCleanupAuditLog:
         assert 'db row not found' in joined
 
 
+def test_cleanup_bulk_removes_large_absent_replica_inventory():
+    replica_infos = [
+        mock.Mock(replica_id=replica_id, cluster_name=f'svc-a-r{replica_id}')
+        for replica_id in range(2159)
+    ]
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=replica_infos), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils.global_user_state,
+                           'get_cluster_status_fields', return_value={}
+                          ) as cluster_snapshot, \
+         mock.patch.object(serve_state,
+                           'remove_replicas', return_value=True) as remove, \
+         mock.patch.object(serve_state, 'remove_replica') as remove_one, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate:
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert not failed
+    cluster_snapshot.assert_called_once()
+    assert cluster_snapshot.call_args.args[0] == [
+        info.cluster_name for info in replica_infos
+    ]
+    remove.assert_called_once_with('svc',
+                                   [info.replica_id for info in replica_infos],
+                                   expected_service_hash='incarnation-a',
+                                   expected_lifecycle_epoch=31,
+                                   expected_controller_owner=expected_owner)
+    remove_one.assert_not_called()
+    terminate.assert_not_called()
+
+
+def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
+    absent = mock.Mock(replica_id=1,
+                       cluster_name='svc-a-r1',
+                       status_property=mock.Mock())
+    present = mock.Mock(replica_id=2,
+                        cluster_name='svc-a-r2',
+                        status_property=mock.Mock())
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[absent,
+                                                              present]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(
+             service.serve_utils.global_user_state,
+             'get_cluster_status_fields',
+             return_value={'svc-a-r2': ('UP', 1)}), \
+         mock.patch.object(serve_state,
+                           'remove_replicas', return_value=True) as remove, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(serve_state,
+                           'remove_replica', return_value=True) as remove_one, \
+         mock.patch.object(service.controller_utils,
+                           'can_terminate', return_value=True), \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate, \
+         mock.patch.object(service.time, 'sleep'):
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert not failed
+    remove.assert_called_once_with('svc', [1],
+                                   expected_service_hash='incarnation-a',
+                                   expected_lifecycle_epoch=31,
+                                   expected_controller_owner=expected_owner)
+    terminate.assert_called_once()
+    assert terminate.call_args.args[0] == 'svc-a-r2'
+    remove_one.assert_called_once_with('svc',
+                                       2,
+                                       expected_service_hash='incarnation-a',
+                                       expected_lifecycle_epoch=31)
+
+
+def test_cleanup_cluster_inventory_uncertainty_keeps_replica_rows():
+    replica = mock.Mock(replica_id=1, cluster_name='svc-a-r1')
+    lifecycle_lock = mock.Mock(epoch=31)
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils.global_user_state,
+                           'get_cluster_status_fields',
+                           side_effect=RuntimeError('cluster DB unavailable')), \
+         mock.patch.object(serve_state, 'remove_replicas') as remove, \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate:
+        with pytest.raises(RuntimeError, match='cluster DB unavailable'):
+            service._cleanup('svc', True, 'incarnation-a', 4242, '10.4.7.7',
+                             lifecycle_lock)
+
+    remove.assert_not_called()
+    terminate.assert_not_called()
+
+
 class TestFailedStartupCleansOnlyScopedStorage:
     """A failed bootstrap cleans its disjoint generation, never a successor."""
 
