@@ -612,12 +612,15 @@ def test_stale_bootstrap_incarnation_is_rejected_before_file_or_lb_work():
         'controller_job_id': 1,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
-        'workspace': 'default',
+        'workspace': None,
     }
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
                            return_value=record), \
+         mock.patch.object(
+             service.serve_utils,
+             'resolve_service_workspace') as resolve_workspace, \
          mock.patch.object(service.serve_utils,
                            'is_consolidation_mode',
                            return_value=True), \
@@ -628,6 +631,7 @@ def test_stale_bootstrap_incarnation_is_rejected_before_file_or_lb_work():
                        'sky serve up',
                        requested_incarnation='incarnation-a',
                        lifecycle_epoch=7)
+    resolve_workspace.assert_not_called()
 
 
 def test_legacy_stale_bootstrap_job_is_rejected_before_file_or_lb_work():
@@ -636,12 +640,15 @@ def test_legacy_stale_bootstrap_job_is_rejected_before_file_or_lb_work():
         'controller_job_id': 2,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
-        'workspace': 'default',
+        'workspace': None,
     }
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
                            return_value=record), \
+         mock.patch.object(
+             service.serve_utils,
+             'resolve_service_workspace') as resolve_workspace, \
          mock.patch.object(service.serve_utils,
                            'is_consolidation_mode',
                            return_value=True), \
@@ -650,6 +657,7 @@ def test_legacy_stale_bootstrap_job_is_rejected_before_file_or_lb_work():
         # older API server. Its durable controller job ID still identifies the
         # old incarnation and must not be allowed to adopt the successor row.
         service._start('svc', '/does/not/exist', 1, 'sky serve up')
+    resolve_workspace.assert_not_called()
 
 
 def test_delayed_legacy_recovery_cannot_recreate_absent_service():

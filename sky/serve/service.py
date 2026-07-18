@@ -1158,6 +1158,29 @@ def _run_cleanup_and_finalize_locked(
     _cleanup_task_run_script(job_id)
 
 
+def _validate_recovery_target(service_name: str, record: dict[str, Any],
+                              requested_incarnation: str | None,
+                              job_id: int) -> None:
+    """Rejects a stale controller before it can mutate legacy service state."""
+    service_incarnation = record.get('hash')
+    if (requested_incarnation is not None and
+            requested_incarnation != service_incarnation):
+        raise RuntimeError(
+            f'Refusing stale controller bootstrap for {service_name!r} '
+            f'incarnation {requested_incarnation!r}; current incarnation '
+            f'is {service_incarnation!r}.')
+    if (requested_incarnation is None and
+            serve_utils.is_consolidation_mode(bool(record.get('pool'))) and
+            record.get('controller_job_id') != job_id):
+        # Recovery scripts produced before --service-incarnation was
+        # introduced still carry the original controller job ID. Fence those
+        # scripts before workspace backfill or any other durable mutation.
+        raise RuntimeError(
+            f'Refusing stale controller bootstrap for {service_name!r} '
+            f'controller job {job_id!r}; current controller job is '
+            f'{record.get("controller_job_id")!r}.')
+
+
 def _start(service_name: str,
            tmp_task_yaml: str,
            job_id: int,
@@ -1173,7 +1196,10 @@ def _start(service_name: str,
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
+    is_recovery = service is not None
     if service is not None:
+        _validate_recovery_target(service_name, service, requested_incarnation,
+                                  job_id)
         workspace_hint = workspace
         if (workspace_hint is None and
                 skypilot_config.is_active_workspace_set()):
@@ -1187,7 +1213,6 @@ def _start(service_name: str,
     # epoch. It cannot be re-derived in the controller child: run_controller
     # sets OVERRIDE_CONSOLIDATION_MODE for unrelated controller behavior.
     enforce_launch_fence = lifecycle_epoch is not None
-    is_recovery = service is not None
     logger.info(f'It is a {"first" if not is_recovery else "recovery"} run')
     if not is_recovery and requested_incarnation is None:
         # Fresh controllers created by this version always carry an API-
@@ -1206,24 +1231,6 @@ def _start(service_name: str,
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
-        if (requested_incarnation is not None and
-                requested_incarnation != service_incarnation):
-            raise RuntimeError(
-                f'Refusing stale controller bootstrap for {service_name!r} '
-                f'incarnation {requested_incarnation!r}; current incarnation '
-                f'is {service_incarnation!r}.')
-        if (requested_incarnation is None and
-                serve_utils.is_consolidation_mode(bool(service.get('pool'))) and
-                service.get('controller_job_id') != job_id):
-            # Recovery scripts produced before --service-incarnation was
-            # introduced still carry the original controller job ID.  Fence
-            # those legacy scripts too: an already-spawned recovery must not
-            # adopt a same-name successor merely because it has no explicit
-            # incarnation argument.
-            raise RuntimeError(
-                f'Refusing stale controller bootstrap for {service_name!r} '
-                f'controller job {job_id!r}; current controller job is '
-                f'{service.get("controller_job_id")!r}.')
         recovery_expected_controller_pid = service.get('controller_pid')
         recovery_expected_controller_ip = service.get('controller_ip')
         resource_scope = service.get('resource_scope')
@@ -1871,6 +1878,8 @@ if __name__ == '__main__':
     cli_workspace = args.workspace
     service_record = serve_state.get_service_from_name(args.service_name)
     if service_record is not None:
+        _validate_recovery_target(args.service_name, service_record,
+                                  args.service_incarnation, args.job_id)
         cli_workspace_hint = cli_workspace
         if (cli_workspace_hint is None and
                 skypilot_config.is_active_workspace_set()):
