@@ -1,4 +1,5 @@
 """Unit tests for sky.jobs.utils functions."""
+import pickle
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest import mock
@@ -21,10 +22,110 @@ class TestFacadeReexports:
         assert jobs_utils.load_managed_job_queue is (
             queue_utils.load_managed_job_queue)
         assert jobs_utils.format_job_table is queue_utils.format_job_table
+        assert queue_utils.format_job_table.__module__ == 'sky.jobs.queue_utils'
+        assert pickle.loads(pickle.dumps(
+            jobs_utils.format_job_table)) is (queue_utils.format_job_table)
 
     def test_utils_reexports_naming_helper(self):
         assert jobs_utils.generate_managed_job_cluster_name is (
             job_naming.generate_managed_job_cluster_name)
+
+
+class TestFormatJobTable:
+
+    @staticmethod
+    def _task(job_id: int = 7, **overrides) -> dict[str, Any]:
+        task = {
+            'job_id': job_id,
+            'task_id': 0,
+            'workspace': 'default',
+            'job_name': 'demo',
+            'task_name': 'train',
+            'user_name': 'Alice',
+            'user_hash': 'u1',
+            'resources': '1x A100',
+            'submitted_at': 100.0,
+            'start_at': 110.0,
+            'end_at': None,
+            'job_duration': 30.0,
+            'recovery_count': 1,
+            'status': managed_job_state.ManagedJobStatus.RUNNING,
+            'schedule_state': managed_job_state.ManagedJobScheduleState.ALIVE,
+            'pool': 'workers',
+            'current_cluster_name': 'cluster',
+            'job_id_on_pool_cluster': 3,
+            'infra': 'AWS/us-east-1/us-east-1a',
+            'cluster_resources': '1x A100',
+            'failure_reason': None,
+            'details': None,
+            'metadata': {
+                'git_commit': 'abc123'
+            },
+            'batch_total_batches': 10,
+            'batch_completed_batches': 4,
+            'is_primary_in_job_group': None,
+        }
+        task.update(overrides)
+        return task
+
+    def test_single_task_projection(self, monkeypatch):
+        monkeypatch.setattr(queue_utils.log_utils, 'readable_time_duration',
+                            lambda *args, **kwargs: 'duration')
+
+        rows = jobs_utils.format_job_table([self._task()],
+                                           show_all=True,
+                                           show_user=True,
+                                           return_rows=True,
+                                           pool_status=[{
+                                               'replica_info': [{
+                                                   'replica_id': 2,
+                                                   'used_by': [7]
+                                               }]
+                                           }],
+                                           job_status_counts={'RUNNING': 1})
+
+        assert rows == [[
+            7, '-', 'default', 'train', 'Alice', 'u1', '1x A100', 'duration',
+            'duration', 'duration', 1,
+            managed_job_state.ManagedJobStatus.RUNNING.colored_str(),
+            '40% 4/10', 'workers (worker=2)', 'cluster', 3, 'duration',
+            'AWS/us-east-1/us-east-1a', '1x A100',
+            managed_job_state.ManagedJobScheduleState.ALIVE, '-', 'abc123'
+        ]]
+
+    def test_job_group_uses_primary_status_and_ambiguous_worker(
+            self, monkeypatch):
+        monkeypatch.setattr(queue_utils.log_utils, 'readable_time_duration',
+                            lambda *args, **kwargs: 'duration')
+        primary = self._task(
+            task_name='primary',
+            status=managed_job_state.ManagedJobStatus.SUCCEEDED,
+            is_primary_in_job_group=True)
+        auxiliary = self._task(
+            task_id=1,
+            task_name='auxiliary',
+            status=managed_job_state.ManagedJobStatus.CANCELLED,
+            is_primary_in_job_group=False)
+
+        rows = jobs_utils.format_job_table([primary, auxiliary],
+                                           show_all=False,
+                                           show_user=False,
+                                           return_rows=True,
+                                           pool_status=[{
+                                               'replica_info': [{
+                                                   'replica_id': 1,
+                                                   'used_by': [7]
+                                               }, {
+                                                   'replica_id': 2,
+                                                   'used_by': [7]
+                                               }]
+                                           }])
+
+        assert rows[0][8] == (
+            managed_job_state.ManagedJobStatus.SUCCEEDED.colored_str())
+        assert rows[0][10] == 'workers'
+        assert rows[1][2] == 'primary [P]'
+        assert rows[2][2] == 'auxiliary'
 
 
 class TestJobTimestampHandleSnapshot:
