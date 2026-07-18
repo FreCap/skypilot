@@ -28,6 +28,7 @@ jest.mock('@/lib/cache', () => ({
 }));
 
 import dashboardCache from '@/lib/cache';
+import { getPoolStatus } from '@/data/connectors/jobs';
 import PoolDetailPage from '@/pages/jobs/pools/[pool]';
 
 function deferred() {
@@ -67,10 +68,16 @@ describe('PoolDetailPage request ownership', () => {
 
     const view = render(<PoolDetailPage />);
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(1, getPoolStatus, [
+      { poolNames: ['pool-a'] },
+    ]);
 
     router.query.pool = 'pool-b';
     view.rerender(<PoolDetailPage />);
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(2, getPoolStatus, [
+      { poolNames: ['pool-b'] },
+    ]);
 
     await act(async () => {
       poolB.resolve({ pools: [pool('pool-b', 'fresh-b')] });
@@ -155,6 +162,30 @@ describe('PoolDetailPage request ownership', () => {
     expect(screen.queryByText('stale-retry')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Refresh' })).not.toBeDisabled();
     expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getPoolStatus, [
+      { poolNames: ['pool-a'] },
+    ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('refreshes only the current pool cache entry', async () => {
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [pool('pool-a', 'initial')] })
+      .mockResolvedValueOnce({ pools: [pool('pool-a', 'fresh')] });
+
+    render(<PoolDetailPage />);
+    await screen.findByText('initial');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    await screen.findByText('fresh');
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getPoolStatus, [
+      { poolNames: ['pool-a'] },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenLastCalledWith(getPoolStatus, [
+      { poolNames: ['pool-a'] },
+    ]);
   });
 });

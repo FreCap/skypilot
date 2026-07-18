@@ -110,6 +110,7 @@ function UsedByJobsCell({ usedBy }) {
 export default function PoolDetailPage() {
   const router = useRouter();
   const { pool: poolName } = router.query;
+  const poolStatusArgs = useMemo(() => [{ poolNames: [poolName] }], [poolName]);
 
   const [poolData, setPoolData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -155,7 +156,10 @@ export default function PoolDetailPage() {
       setError(null);
 
       try {
-        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+        const poolsResponse = await dashboardCache.get(
+          getPoolStatus,
+          poolStatusArgs
+        );
         if (!isCurrentRequest()) return;
         const { pools = [] } = poolsResponse || {};
 
@@ -180,7 +184,14 @@ export default function PoolDetailPage() {
         }
       }
     },
-    [poolName, setLoading, setInitialLoading, setError, setPoolData]
+    [
+      poolName,
+      poolStatusArgs,
+      setLoading,
+      setInitialLoading,
+      setError,
+      setPoolData,
+    ]
   );
 
   useEffect(() => {
@@ -365,7 +376,7 @@ export default function PoolDetailPage() {
             <button
               onClick={() => {
                 // Invalidate cache to ensure fresh data
-                dashboardCache.invalidate(getPoolStatus, [{}]);
+                dashboardCache.invalidate(getPoolStatus, poolStatusArgs);
                 fetchPoolData(true);
               }}
               className="mt-4 bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
@@ -408,7 +419,7 @@ export default function PoolDetailPage() {
             <button
               onClick={() => {
                 // Invalidate cache to ensure fresh data
-                dashboardCache.invalidate(getPoolStatus, [{}]);
+                dashboardCache.invalidate(getPoolStatus, poolStatusArgs);
                 fetchPoolData(true);
               }}
               disabled={loading}
