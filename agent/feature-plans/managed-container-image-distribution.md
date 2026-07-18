@@ -270,6 +270,10 @@ fallback under `managed_required`; change workspace policy first.
   and stale-controller compatibility coverage pass.
 - PostgreSQL 16 migration reconciliation passes for both former revision-016
   preview layouts.
+- Serve-controller tests restore the in-process controller marker after each
+  test. The exact worker-order reproducer and the combined Serve-controller and
+  managed-image suites pass, so catalog-authority checks are no longer affected
+  by unrelated test process state.
 - The exact latest Boltz L4 fleet YAML parses all 254 candidates unchanged and
   produces `artifact_ids=[]`.
 - YAPF, isort, mypy, Pylint, Ruff, BasedPyright, the flake8 async-lifecycle
@@ -294,6 +298,9 @@ fallback under `managed_required`; change workspace policy first.
 
 ## Change log
 
+- 2026-07-18: Scoped the controller process marker to each Serve-controller
+  unit test after the exact-head full suite exposed a pytest-worker environment
+  leak. Production controller behavior is unchanged.
 - 2026-07-18: Merged the current `improvements` base and refreshed only shifted
   line numbers in the new async-lifecycle baseline after confirming identical
   files, rules, columns, and findings.
