@@ -3506,11 +3506,13 @@ class SkyletClient:
         request: 'servev1_pb2.WaitServiceRegistrationRequest',
         timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.WaitServiceRegistrationResponse':
-        # set timeout to at least 10 seconds more than service register
-        # constant to make sure that timeouts will not occur.
+        # The skylet-side handler gives controller setup and service
+        # registration independent timeout budgets. Keep the outer RPC alive
+        # for both phases, with margin for polling and transport overhead.
         if timeout is not None:
-            timeout = max(timeout,
-                          serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS + 10)
+            timeout = max(
+                timeout, serve_constants.CONTROLLER_SETUP_TIMEOUT_SECONDS +
+                serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS + 10)
         return self._serve_stub.WaitServiceRegistration(request,
                                                         timeout=timeout)
 

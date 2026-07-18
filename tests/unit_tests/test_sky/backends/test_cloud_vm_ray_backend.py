@@ -59,6 +59,22 @@ def test_gang_schedule_uses_worker_readiness_result(workers_ready,
                                             nodes_launching_progress_timeout=90)
 
 
+def test_wait_service_registration_rpc_covers_both_phase_budgets():
+    """The RPC deadline must not preempt either server-side wait phase."""
+    client = object.__new__(cloud_vm_ray_backend.SkyletClient)
+    client._serve_stub = MagicMock()  # pylint: disable=protected-access
+    request = MagicMock()
+
+    client.wait_service_registration(request)
+
+    expected_timeout = (
+        cloud_vm_ray_backend.serve_constants.CONTROLLER_SETUP_TIMEOUT_SECONDS +
+        cloud_vm_ray_backend.serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS +
+        10)
+    client._serve_stub.WaitServiceRegistration.assert_called_once_with(  # pylint: disable=protected-access
+        request, timeout=expected_timeout)
+
+
 class TestCloudVmRayBackendTaskRedaction:
     """Tests for CloudVmRayBackend usage of redacted task configs."""
 
