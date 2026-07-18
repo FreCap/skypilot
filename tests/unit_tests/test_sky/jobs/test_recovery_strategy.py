@@ -1,4 +1,5 @@
 """Unit tests for sky.jobs.recovery_strategy helpers."""
+# pylint: disable=protected-access
 from unittest import mock
 
 import pytest
@@ -30,6 +31,90 @@ def test_is_oom_failure_is_case_insensitive():
 def test_is_oom_failure_false_for_unrelated():
     assert recovery_strategy._is_oom_failure(
         RuntimeError('/bin/bash: line 1: conda: command not found')) is False
+
+
+class TestPoolRecoveryCancellation:
+    """Pool recovery targets one job without terminating shared capacity."""
+
+    @staticmethod
+    def _executor():
+        executor = recovery_strategy.StrategyExecutor.__new__(
+            recovery_strategy.StrategyExecutor)
+        executor.cluster_name = 'pool-cluster'
+        executor.pool = 'pool'
+        executor.job_id_on_pool_cluster = 7
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_cancels_only_assigned_pool_job(self, monkeypatch):
+        executor = self._executor()
+        lookup = mock.Mock(return_value=mock.sentinel.handle)
+        cancel = mock.Mock(return_value='cancel-request')
+        get = mock.Mock()
+        monkeypatch.setattr(recovery_strategy.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.sdk, 'get', get)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        lookup.assert_called_once_with('pool-cluster')
+        cancel.assert_called_once_with(
+            cluster_name='pool-cluster',
+            job_ids=[7],
+            _try_cancel_if_cluster_is_init=True,
+        )
+        get.assert_called_once_with('cancel-request')
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_preserves_shared_pool(self, monkeypatch):
+        executor = self._executor()
+        cancel = mock.Mock(side_effect=RuntimeError('cancel failed'))
+        terminate_cluster = mock.Mock()
+        monkeypatch.setattr(
+            recovery_strategy.global_user_state,
+            'get_handle_from_cluster_name',
+            mock.Mock(return_value=mock.sentinel.handle),
+        )
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.managed_job_utils,
+                            'terminate_cluster', terminate_cluster)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        cancel.assert_called_once()
+        terminate_cluster.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_terminates_dedicated_cluster(
+            self, monkeypatch):
+        executor = self._executor()
+        executor.pool = None
+        cancel = mock.Mock(side_effect=RuntimeError('cancel failed'))
+        terminate_cluster = mock.Mock()
+        monkeypatch.setattr(
+            recovery_strategy.global_user_state,
+            'get_handle_from_cluster_name',
+            mock.Mock(return_value=mock.sentinel.handle),
+        )
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.managed_job_utils,
+                            'terminate_cluster', terminate_cluster)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        cancel.assert_called_once_with(
+            cluster_name='pool-cluster',
+            all=True,
+            _try_cancel_if_cluster_is_init=True,
+        )
+        terminate_cluster.assert_called_once_with('pool-cluster')
 
 
 class TestSubmittedTimestampHandleSnapshot:
