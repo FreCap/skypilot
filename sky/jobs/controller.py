@@ -824,8 +824,8 @@ class JobController:
             callback_func = managed_job_utils.event_callback_func(
                 job_id=self._job_id, task_id=task_id, task=task)
 
-        transient_job_check_retry: Optional[tuple[float,
-                                                  common_utils.Backoff]] = None
+        transient_job_check_retry: tuple[float,
+                                         common_utils.Backoff] | None = None
         not_up_debouncer = _ClusterNotUpDebouncer(task.num_nodes)
 
         while True:
