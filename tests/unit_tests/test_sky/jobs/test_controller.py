@@ -2170,17 +2170,80 @@ class TestControllerManagerMonitorLoop:
         manager.start_job.assert_awaited_once_with(2, None)
 
 
-class TestRunJobLoopCancelInfoCleanup:
-    """run_job_loop must drop stale cancel info even on the success path.
+class TestRunJobLoopOwnershipCleanup:
+    """run_job_loop owns manager bookkeeping across every exit path.
 
     If a cancellation lands after the job task already finished,
     task.cancel() is a no-op and no CancelledError handler consumes the
-    stored cancel info; the finally block must remove it.
+    stored cancel info. Initialization failures must also release launch
+    capacity before the inner durable-cleanup scope starts.
     """
+
+    @pytest.mark.asyncio
+    async def test_start_job_hands_off_slot_without_cancellation_gap(
+            self, tmp_path):
+        manager = ControllerManager('test-uuid')
+        registered = []
+
+        def register(coro):
+            assert manager._job_tasks_lock.locked()
+            assert 3 in manager.starting
+            registered.append(coro)
+            coro.close()
+
+        with patch('sky.jobs.controller.jobs_constants.'
+                   'JOBS_CONTROLLER_LOGS_DIR', str(tmp_path)), \
+                patch('sky.jobs.controller.create_background_task',
+                      side_effect=register) as create_task:
+            await manager.start_job(3)
+
+        create_task.assert_called_once()
+        assert len(registered) == 1
+        assert 3 in manager.starting
+
+    @pytest.mark.asyncio
+    async def test_initialization_failure_releases_slot_and_wakes_waiter(self):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
+        waiter_started = asyncio.Event()
+
+        class TrackingCondition(asyncio.Condition):
+
+            async def wait(self):
+                waiter_started.set()
+                return await super().wait()
+
+        manager._starting_signal = TrackingCondition(manager._job_tasks_lock)
+
+        async def wait_for_slot():
+            async with manager._starting_signal:
+                await manager._starting_signal.wait_for(
+                    lambda: 3 not in manager.starting)
+
+        waiter = asyncio.create_task(wait_for_slot())
+        await waiter_started.wait()
+        manager._cleanup = AsyncMock()
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content',
+                      side_effect=RuntimeError('init failed')), \
+                patch('sky.jobs.controller.JobController') as controller:
+            with pytest.raises(RuntimeError, match='init failed'):
+                await manager.run_job_loop(3, '/dev/null')
+
+        await asyncio.wait_for(waiter, timeout=1)
+        assert 3 not in manager.starting
+        assert 3 not in manager.job_tasks
+        assert 3 not in manager._cancel_info
+        controller.assert_not_called()
+        manager._cleanup.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_success_path_pops_stale_cancel_info(self):
         manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
         manager._cancel_info[3] = (False, None)
         manager._cleanup = AsyncMock()
 
@@ -2204,4 +2267,5 @@ class TestRunJobLoopCancelInfoCleanup:
             await manager.run_job_loop(3, '/dev/null')
 
         assert 3 not in manager._cancel_info
+        assert 3 not in manager.starting
         assert 3 not in manager.job_tasks

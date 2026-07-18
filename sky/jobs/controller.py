@@ -66,7 +66,6 @@ else:
 logger = sky_logging.init_logger('sky.jobs.controller')
 
 _background_tasks: set[asyncio.Task] = set()
-_background_tasks_lock: asyncio.Lock = asyncio.Lock()
 
 # How many consecutive monitor ticks must observe a non-UP cluster while the
 # job itself still reports a non-terminal status before recovery is triggered
@@ -115,7 +114,7 @@ class _ClusterNotUpDebouncer:
         self._consecutive_not_up = 0
 
 
-async def create_background_task(coro: typing.Coroutine) -> None:
+def create_background_task(coro: typing.Coroutine) -> None:
     """Create a background task and add it to the set of background tasks.
 
     Main reason we do this is since tasks are only held as a weak reference in
@@ -125,11 +124,12 @@ async def create_background_task(coro: typing.Coroutine) -> None:
     Args:
         coro: The coroutine to create a task for.
     """
-    async with _background_tasks_lock:
-        task = asyncio.create_task(coro)
-        _background_tasks.add(task)
-        # TODO(cooperc): Discard needs a lock?
-        task.add_done_callback(_background_tasks.discard)
+    # Registration and callbacks run on the controller's single event-loop
+    # thread, so a second asyncio lock only added a cancellation point between
+    # reserving a launch slot and handing ownership to the task.
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # Make sure to limit the size as we don't want to cache too many DAGs in memory.
@@ -2233,6 +2233,28 @@ class ControllerManager:
                            job_id: int,
                            log_file: str,
                            pool: str | None = None):
+        """Run one job while owning its controller-manager bookkeeping."""
+        try:
+            await self._run_job_loop(job_id, log_file, pool)
+        finally:
+            # Own launch admission at the outermost scope. Initialization can
+            # fail before _run_job_loop reaches its durable-cleanup try/finally;
+            # leaking this slot would stop a saturated controller indefinitely.
+            async with self._job_tasks_lock:
+                if job_id in self.starting:
+                    self.starting.remove(job_id)
+                    self._starting_signal.notify()
+                self.job_tasks.pop(job_id, None)
+
+            # A cancellation that lands after the job task already finished
+            # stores cancel info that no CancelledError handler will consume.
+            async with self._cancel_info_lock:
+                self._cancel_info.pop(job_id, None)
+
+    async def _run_job_loop(self,
+                            job_id: int,
+                            log_file: str,
+                            pool: str | None = None):
         """Background task that runs the job loop."""
         ctx = context.get()
         assert ctx is not None, 'Context is not initialized'
@@ -2444,29 +2466,6 @@ class ControllerManager:
 
                 await scheduler.job_done_async(job_id)
 
-            async with self._job_tasks_lock:
-                try:
-                    # just in case we were cancelled or some other error
-                    # occurred during launch
-                    self.starting.remove(job_id)
-                    # its fine if we notify again, better to wake someone up
-                    # and have them go to sleep again, then have some stuck
-                    # sleeping.
-                    self._starting_signal.notify()
-                except KeyError:
-                    pass
-
-            # Remove the job from the job_tasks dictionary.
-            async with self._job_tasks_lock:
-                if job_id in self.job_tasks:
-                    del self.job_tasks[job_id]
-
-            # A cancellation that lands after the job task already finished
-            # stores cancel info that no CancelledError handler will ever
-            # consume; drop it so the dict cannot grow across jobs.
-            async with self._cancel_info_lock:
-                self._cancel_info.pop(job_id, None)
-
     async def start_job(
         self,
         job_id: int,
@@ -2486,7 +2485,8 @@ class ControllerManager:
 
         async with self._job_tasks_lock:
             self.starting.add(job_id)
-        await create_background_task(self.run_job_loop(job_id, log_file, pool))
+            # No await between reserving capacity and scheduling its owner.
+            create_background_task(self.run_job_loop(job_id, log_file, pool))
 
         logger.info(f'Job {job_id} started successfully')
 
