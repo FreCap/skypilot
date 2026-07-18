@@ -1395,6 +1395,7 @@ class SSHCommandRunner(CommandRunner):
                 return result
 
             if require_outputs:
+                assert isinstance(result, tuple), result
                 returncode, _, _ = result
             else:
                 returncode = result
@@ -1421,6 +1422,7 @@ class SSHCommandRunner(CommandRunner):
             if not has_auth_failure:
                 # No auth failure detected; don't attempt interactive auth.
                 if require_outputs:
+                    assert isinstance(result, tuple), result
                     returncode, stdout, stderr = result
                     return returncode, stdout, stderr + '\n' + ssh_log_content
                 return result

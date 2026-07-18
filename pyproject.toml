@@ -59,6 +59,7 @@ reportGeneralTypeIssues = "error"
 reportReturnType = "error"
 reportIncompatibleMethodOverride = "error"
 reportInvalidCast = "error"
+reportOverlappingOverload = "error"
 
 [tool.isort]
 profile = "google"
