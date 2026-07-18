@@ -811,6 +811,86 @@ def test_kubernetes_runner_run_does_not_enrich_on_success() -> None:
     mock_diagnose.assert_not_called()
 
 
+def test_slurm_rsync_preserves_ssh_home_resolver_contract() -> None:
+    """A Slurm runner remains substitutable for an SSH command runner."""
+    runner = object.__new__(command_runner.SlurmCommandRunner)
+    runner.container_args = None
+    get_remote_home_dir = mock.Mock(return_value='/custom/home')
+
+    with mock.patch.object(runner, '_rsync_via_srun') as mock_rsync:
+        runner.rsync('~/src',
+                     '~/dst',
+                     up=True,
+                     get_remote_home_dir=get_remote_home_dir)
+
+    mock_rsync.assert_called_once_with(
+        source='~/src',
+        target='~/dst',
+        up=True,
+        in_container=False,
+        log_path=os.devnull,
+        stream_logs=True,
+        max_retry=1,
+        get_remote_home_dir=get_remote_home_dir,
+        timeout=None,
+    )
+
+
+def test_slurm_rsync_passes_custom_home_resolver_to_rsync() -> None:
+    """The supplied resolver reaches the common tilde-expansion path."""
+    runner = object.__new__(command_runner.SlurmCommandRunner)
+    runner.container_args = None
+    runner.job_id = 'job-id'
+    runner.slurm_node = 'node-1'
+    get_remote_home_dir = mock.Mock(return_value='/custom/home')
+
+    with mock.patch.object(runner,
+                           'ssh_base_command',
+                           return_value=['ssh']), \
+         mock.patch.object(runner, '_rsync') as mock_rsync:
+        runner._rsync_via_srun(  # pylint: disable=protected-access
+            '~/src',
+            '~/dst',
+            up=True,
+            in_container=False,
+            get_remote_home_dir=get_remote_home_dir,
+        )
+
+    assert mock_rsync.call_args.kwargs[
+        'get_remote_home_dir'] is get_remote_home_dir
+    get_remote_home_dir.assert_not_called()
+
+
+@pytest.mark.parametrize(('in_container', 'expected_home'), [
+    (False, '/sky/home'),
+    (True, '/container/home'),
+])
+def test_slurm_rsync_preserves_default_home_resolution(
+        in_container: bool, expected_home: str) -> None:
+    """Omitting the optional resolver keeps Slurm's existing home mapping."""
+    runner = object.__new__(command_runner.SlurmCommandRunner)
+    runner.container_args = '--container' if in_container else None
+    runner.sky_dir = '/sky/home'
+    runner.job_id = 'job-id'
+    runner.slurm_node = 'node-1'
+
+    with mock.patch.object(runner,
+                           'ssh_base_command',
+                           return_value=['ssh']), \
+         mock.patch.object(runner, '_rsync') as mock_rsync, \
+         mock.patch.object(runner,
+                           'get_remote_home_dir',
+                           return_value='/container/home'):
+        runner._rsync_via_srun(  # pylint: disable=protected-access
+            '~/src',
+            '~/dst',
+            up=True,
+            in_container=in_container,
+        )
+        resolver = mock_rsync.call_args.kwargs['get_remote_home_dir']
+        assert resolver() == expected_home
+
+
 class TestRsyncTimeout:
     """Tests for the optional total timeout on CommandRunner.rsync."""
 
