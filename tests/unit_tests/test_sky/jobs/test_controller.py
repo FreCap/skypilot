@@ -1482,6 +1482,9 @@ class TestTransientJobStatusFetchDeadline:
     class ExpectedRecovery(Exception):
         """Stops the monitor immediately after it enters recovery."""
 
+    class ExpectedStop(Exception):
+        """Stops the monitor after exercising a completed recovery."""
+
     @staticmethod
     def _make_controller() -> JobController:
         controller = JobController.__new__(JobController)
@@ -1490,12 +1493,21 @@ class TestTransientJobStatusFetchDeadline:
         controller._backend = MagicMock()
         return controller
 
-    async def _run_until_recovery(self, statuses, monotonic_values):
+    async def _run_until_stopped(self,
+                                 statuses,
+                                 monotonic_values,
+                                 *,
+                                 recover_side_effect=None,
+                                 expected_exception=None):
         controller = self._make_controller()
         task = MagicMock(name='task')
         task.num_nodes = 1
         executor = MagicMock()
-        executor.recover = AsyncMock(side_effect=self.ExpectedRecovery)
+        if recover_side_effect is None:
+            recover_side_effect = self.ExpectedRecovery
+        if expected_exception is None:
+            expected_exception = self.ExpectedRecovery
+        executor.recover = AsyncMock(side_effect=recover_side_effect)
         get_status = AsyncMock(side_effect=statuses)
         refresh_cluster = MagicMock(return_value=(status_lib.ClusterStatus.UP,
                                                   None))
@@ -1507,22 +1519,29 @@ class TestTransientJobStatusFetchDeadline:
             'status-fetch retry window used wall-clock time'))
         fake_time = SimpleNamespace(monotonic=monotonic, time=wall_clock)
         set_recovering = AsyncMock()
+        set_recovered = AsyncMock()
 
         with patch.object(controller_lib, 'time', fake_time), patch.object(
                 controller_lib.asyncio, 'sleep', new=sleep), patch.object(
                     controller_lib.backend_utils,
-                    'async_check_network_connection', new=AsyncMock()
-                ), patch.object(
-                    controller_lib.managed_job_utils,
-                    'get_job_status', new=get_status), patch.object(
-                        controller_lib.backend_utils,
-                        'refresh_cluster_status_handle',
-                        new=refresh_cluster), patch.object(
-                            controller_lib.common_utils,
-                            'Backoff', return_value=backoff), patch.object(
-                                controller_lib.managed_job_state,
-                                'set_recovering_async', new=set_recovering), \
-                pytest.raises(self.ExpectedRecovery):
+                    'async_check_network_connection',
+                    new=AsyncMock()), patch.object(
+                        controller_lib.managed_job_utils,
+                        'get_job_status',
+                        new=get_status), patch.object(
+                            controller_lib.backend_utils,
+                            'refresh_cluster_status_handle',
+                            new=refresh_cluster), patch.object(
+                                controller_lib.common_utils,
+                                'Backoff',
+                                return_value=backoff), patch.object(
+                                    controller_lib.managed_job_state,
+                                    'set_recovering_async',
+                                    new=set_recovering), patch.object(
+                                        controller_lib.managed_job_state,
+                                        'set_recovered_async',
+                                        new=set_recovered), pytest.raises(
+                                            expected_exception):
             await controller._monitor_one_task(
                 task_id=0,
                 task=task,
@@ -1536,7 +1555,7 @@ class TestTransientJobStatusFetchDeadline:
 
     @pytest.mark.asyncio
     async def test_transient_status_fetch_uses_monotonic_deadline(self):
-        results = await self._run_until_recovery(
+        results = await self._run_until_stopped(
             statuses=[(None, 'transient'), (None, 'transient')],
             monotonic_values=[100.0, 100.0, 160.0],
         )
@@ -1557,7 +1576,7 @@ class TestTransientJobStatusFetchDeadline:
 
     @pytest.mark.asyncio
     async def test_transient_status_fetch_resets_deadline_after_success(self):
-        results = await self._run_until_recovery(
+        results = await self._run_until_stopped(
             statuses=[
                 (None, 'transient'),
                 (job_lib.JobStatus.RUNNING, None),
@@ -1580,6 +1599,34 @@ class TestTransientJobStatusFetchDeadline:
         assert get_status.await_count == 4
         assert refresh_cluster.call_count == 3
         assert monotonic.call_count == 5
+        wall_clock.assert_not_called()
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recovery_resets_transient_status_fetch_deadline(self):
+        results = await self._run_until_stopped(
+            statuses=[
+                (None, 'transient'),
+                (None, 'transient'),
+                self.ExpectedStop(),
+            ],
+            monotonic_values=[100.0, 160.0, 160.0, 160.0],
+            recover_side_effect=lambda: 123.0,
+            expected_exception=self.ExpectedStop,
+        )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        assert [call.args[0] for call in sleep.await_args_list] == [
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            10,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+        ]
+        assert get_status.await_count == 3
+        assert refresh_cluster.call_count == 2
+        assert monotonic.call_count == 4
         wall_clock.assert_not_called()
         set_recovering.assert_awaited_once()
         executor.recover.assert_awaited_once()
