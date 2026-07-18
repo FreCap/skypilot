@@ -60,6 +60,8 @@ reportReturnType = "error"
 reportIncompatibleMethodOverride = "error"
 reportInvalidCast = "error"
 reportOverlappingOverload = "error"
+reportInvalidStringEscapeSequence = "error"
+reportMatchNotExhaustive = "error"
 
 [tool.isort]
 profile = "google"
