@@ -103,26 +103,36 @@ def _clean_controller_logs_with_retention(retention_seconds: int,
     assert batch_size > 0, 'Batch size must be positive'
     jobs = managed_job_state.get_controller_logs_to_clean(retention_seconds,
                                                           batch_size=batch_size)
+    cleaned_at = time.time()
+    ts_str = datetime.fromtimestamp(cleaned_at).strftime('%Y-%m-%d %H:%M:%S')
+    cleaned_message = f'Controller log has been cleaned at {ts_str}.\n'
     job_ids_to_update = []
     for job in jobs:
-        job_ids_to_update.append(job['job_id'])
-        log_file = managed_job_utils.controller_log_file_for_job(job['job_id'])
-        cleaned_at = time.time()
-        if os.path.exists(log_file):
-            ts_str = datetime.fromtimestamp(cleaned_at).strftime(
-                '%Y-%m-%d %H:%M:%S')
-            msg = f'Controller log has been cleaned at {ts_str}.'
-            # Sync down logs will reference to this file directly, so we
-            # keep the file and delete the content.
-            # TODO(aylei): refactor sync down logs if the inode usage
-            # becomes an issue.
-            with open(log_file, 'w', encoding='utf-8') as f:
-                f.write(msg + '\n')
-    # Batch the update, the timestamp will be not accurate but it's okay.
+        job_id = job['job_id']
+        try:
+            log_file = managed_job_utils.controller_log_file_for_job(job_id)
+            if os.path.exists(log_file):
+                # Sync down logs will reference to this file directly, so we
+                # keep the file and delete the content.
+                # TODO(aylei): refactor sync down logs if the inode usage
+                # becomes an issue.
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write(cleaned_message)
+        except Exception as e:  # pylint: disable=broad-except
+            # Each row is an independent retry unit. Do not let one bad path
+            # starve later rows or publish cleanup for an artifact that may
+            # still exist.
+            logger.warning(
+                f'Failed to clean controller logs for job '
+                f'{job_id}: {e}',
+                exc_info=True)
+            continue
+        job_ids_to_update.append(job_id)
     managed_job_state.set_controller_logs_cleaned(job_ids=job_ids_to_update,
-                                                  logs_cleaned_at=time.time())
+                                                  logs_cleaned_at=cleaned_at)
     complete = len(jobs) < batch_size
-    logger.info(f'Cleaned {len(jobs)} controller logs with retention '
+    logger.info(f'Cleaned {len(job_ids_to_update)}/{len(jobs)} controller '
+                f'logs with retention '
                 f'{retention_seconds} seconds, complete: {complete}')
     return complete
 
@@ -148,14 +158,28 @@ def _clean_task_logs_with_retention(retention_seconds: int,
         #     - run.log
         # and also remove the tasks directory on cleanup.
         task_log_dir = local_log_file.parent.joinpath('tasks')
-        local_log_file.unlink(missing_ok=True)
-        shutil.rmtree(task_log_dir, ignore_errors=True)
+        try:
+            local_log_file.unlink(missing_ok=True)
+            try:
+                shutil.rmtree(task_log_dir)
+            except FileNotFoundError:
+                # Missing artifacts already satisfy the cleanup invariant.
+                pass
+        except Exception as e:  # pylint: disable=broad-except
+            # A failed removal must remain eligible for the next scheduled
+            # pass, while independent later tasks continue making progress.
+            logger.warning(
+                f'Failed to clean task logs for job '
+                f'{task["job_id"]}, task {task["task_id"]}: {e}',
+                exc_info=True)
+            continue
         # We have at least once semantic guarantee for the cleanup here.
         tasks_to_update.append((task['job_id'], task['task_id']))
     managed_job_state.set_task_logs_cleaned(tasks=list(tasks_to_update),
                                             logs_cleaned_at=time.time())
     complete = len(tasks) < batch_size
-    logger.info(f'Cleaned {len(tasks)} task logs with retention '
+    logger.info(f'Cleaned {len(tasks_to_update)}/{len(tasks)} task logs with '
+                f'retention '
                 f'{retention_seconds} seconds, complete: {complete}')
     return complete
 
