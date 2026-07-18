@@ -1092,11 +1092,6 @@ def stop(cluster_name: str,
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
 
-    global_user_state.add_cluster_event(
-        cluster_name, status_lib.ClusterStatus.STOPPED,
-        'Cluster was stopped by user.',
-        global_user_state.ClusterEventType.STATUS_CHANGE)
-
     backend = backend_utils.get_backend_from_handle(handle)
 
     if isinstance(backend, backends.CloudVmRayBackend):
@@ -1126,6 +1121,10 @@ def stop(cluster_name: str,
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
     _maybe_run_stop_hooks(handle, backend, cluster_name)
     backend.teardown(handle, terminate=False, purge=purge)
+    global_user_state.add_cluster_event(
+        cluster_name, status_lib.ClusterStatus.STOPPED,
+        'Cluster was stopped by user.',
+        global_user_state.ClusterEventType.STATUS_CHANGE)
 
 
 @usage_lib.entrypoint
