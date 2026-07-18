@@ -2603,8 +2603,6 @@ class ControllerManager:
                 running_tasks = [
                     task for task in self.job_tasks.values() if not task.done()
                 ]
-
-            async with self._job_tasks_lock:
                 starting_count = len(self.starting)
 
             # Report per-process metrics.
