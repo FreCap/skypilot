@@ -10,6 +10,7 @@ are no longer in INTERNAL_REQUEST_DAEMONS.
 
 The PG-backed implementation in the HA plugin is tested separately.
 """
+# pylint: disable=protected-access,redefined-outer-name,unused-argument
 import unittest.mock as mock
 
 import pytest
@@ -63,6 +64,15 @@ async def test_create_or_refresh_inserts_new_row(isolated_database,
     assert row.status == RequestStatus.PENDING
     assert row.pid is None
     assert row.request_body.env_vars.get('SKYPILOT_RECON_TAG') == 'fresh'
+
+
+@pytest.mark.asyncio
+async def test_close_db_async_is_idempotent(isolated_database):
+    del isolated_database  # Fixture provides the isolated paths and cleanup.
+    await requests.get_request_async('missing-request')
+
+    await requests.close_db_async()
+    await requests.close_db_async()
 
 
 @pytest.mark.asyncio

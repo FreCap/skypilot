@@ -1764,9 +1764,24 @@ async def requests_gc_daemon():
         await asyncio.sleep(_GC_INTERVAL_SECONDS)
 
 
+async def close_db_async() -> None:
+    """Close this process's SQLite request DB, if it was initialized.
+
+    Uvicorn workers must call this before their serving event loop exits.
+    Otherwise, the non-daemon aiosqlite connection thread can keep a worker
+    alive after application startup fails. Plugin request backends do not
+    initialize this module-level database, so this is a no-op for them.
+    """
+    global _DB
+    with _init_db_lock:
+        db = _DB
+        _DB = None
+    if db is not None:
+        await db.close()
+
+
 def _cleanup():
-    if _DB is not None:
-        asyncio.run(_DB.close())
+    asyncio.run(close_db_async())
 
 
 atexit.register(_cleanup)

@@ -349,7 +349,11 @@ class SQLiteConn(threading.local):
                     # Init logic like requests.init_db_within_lock will handle
                     # initialization like setting the WAL mode, so we do not
                     # duplicate that logic here.
-                    self._async_conn = await aiosqlite.connect(self.db_path)
+                    # aiosqlite otherwise falls back to sqlite3's five-second
+                    # default, which is shorter than the contention policy
+                    # used by this class's synchronous connection.
+                    self._async_conn = await aiosqlite.connect(
+                        self.db_path, timeout=_DB_TIMEOUT_S)
         return self._async_conn
 
     async def execute_and_commit_async(self,

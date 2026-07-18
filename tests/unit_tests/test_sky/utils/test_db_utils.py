@@ -1,4 +1,5 @@
 """Unit tests for database utilities with SKY_RUNTIME_DIR environment variable."""
+# pylint: disable=protected-access,redefined-outer-name
 import os
 import sqlite3
 from unittest import mock
@@ -93,6 +94,17 @@ async def test_execute_fetchall_async_error_does_not_stall_read_txn(
         values = [row[0] for row in rows]
 
     assert values == ['initial', 'external', 'after_error']
+
+
+@pytest.mark.asyncio
+async def test_sqlite_async_connection_uses_standard_lock_timeout(
+        isolated_database):
+    conn, _ = isolated_database
+
+    async with conn.execute_fetchall_async('PRAGMA busy_timeout') as rows:
+        busy_timeout_ms = rows[0][0]
+
+    assert busy_timeout_ms == 60_000
 
 
 class TestGetEngine:
