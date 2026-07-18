@@ -489,6 +489,29 @@ def test_traffic_loop_dispatches_at_fixed_rate_concurrently():
     assert session.max_active >= 2
 
 
+def test_active_loss_boundary_precedes_delete_call():
+
+    class FakeKubectl:
+        """Record when the asynchronous deletion is submitted."""
+
+        delete_started_at = None
+
+        async def run(self, *_args):
+            self.delete_started_at = time.monotonic()
+            await asyncio.sleep(0)
+
+    kubectl = FakeKubectl()
+    started_at = time.monotonic()
+    fault = asyncio.run(
+        qualify_cluster._delete_active_pods(kubectl, ['active-a'], started_at))
+
+    assert kubectl.delete_started_at is not None
+    assert fault['triggered_at_seconds'] <= (kubectl.delete_started_at -
+                                             started_at)
+    assert fault['action'] == 'delete-active-pods'
+    assert fault['pods'] == ['active-a']
+
+
 def test_sample_count_gate_rejects_under_sampled_service():
     snapshot = {'a:a': _snapshot()}
     gates = qualify_cluster.evaluate_gates(

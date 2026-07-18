@@ -414,6 +414,21 @@ async def _traffic_target(target: Target, duration_seconds: float,
                             requests_per_second, started_at, samples)
 
 
+async def _delete_active_pods(kubectl: KubectlRecorder, active_pods: list[str],
+                              started_at: float) -> dict[str, Any]:
+    # Mark the boundary before submitting the deletion. Traffic can observe
+    # the Pod terminating before kubectl returns, so recording afterward can
+    # misclassify the first real fault response as a pre-fault failure.
+    triggered_at = time.monotonic() - started_at
+    await kubectl.run('delete-active-pods', 'delete', 'pods', *active_pods,
+                      '--wait=false')
+    return {
+        'triggered_at_seconds': triggered_at,
+        'action': 'delete-active-pods',
+        'pods': active_pods,
+    }
+
+
 async def _run_fault(mode: str, command: list[str], fault_at: float,
                      started_at: float, kubectl: KubectlRecorder,
                      targets: list[Target]) -> dict[str, Any]:
@@ -448,14 +463,7 @@ async def _run_fault(mode: str, command: list[str], fault_at: float,
             raise RuntimeError(f'{service_name}: no Pod for selected slot '
                                f'{selected_slot!r}')
         active_pods.append(active['name'])
-    await kubectl.run('delete-active-pods', 'delete', 'pods', *active_pods,
-                      '--wait=false')
-    return {
-        # Start the recovery clock only after the API server accepts deletion.
-        'triggered_at_seconds': time.monotonic() - started_at,
-        'action': 'delete-active-pods',
-        'pods': active_pods,
-    }
+    return await _delete_active_pods(kubectl, active_pods, started_at)
 
 
 def _counter_delta(before: dict, after: dict) -> dict[str, int]:
