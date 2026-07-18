@@ -47,13 +47,16 @@ class SshMode(enum.Enum):
 
 
 class CommandRunner:
-    node_id: str
 
     def __init__(
         self,
         node: tuple[Any, ...],
         **kwargs,
     ) -> None:
+        ...
+
+    @property
+    def node_id(self) -> str:
         ...
 
     @typing.overload
@@ -64,10 +67,11 @@ class CommandRunner:
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
+            ssh_mode: SshMode = ...,
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> int:
         ...
@@ -80,10 +84,11 @@ class CommandRunner:
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
+            ssh_mode: SshMode = ...,
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str]:
         ...
@@ -96,10 +101,11 @@ class CommandRunner:
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
+            ssh_mode: SshMode = ...,
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str] | int:
         ...
@@ -116,6 +122,7 @@ class CommandRunner:
         log_path: str = ...,
         stream_logs: bool = ...,
         max_retry: int = ...,
+        timeout: int | None = ...,
     ) -> None:
         ...
 
@@ -169,7 +176,8 @@ class CommandRunner:
                      up: bool,
                      log_path: str = ...,
                      stream_logs: bool = ...,
-                     max_retry: int = ...) -> None:
+                     max_retry: int = ...,
+                     timeout: int | None = ...) -> None:
         ...
 
     def rsync_setup(self,
@@ -179,7 +187,8 @@ class CommandRunner:
                     up: bool,
                     log_path: str = ...,
                     stream_logs: bool = ...,
-                    max_retry: int = ...) -> None:
+                    max_retry: int = ...,
+                    timeout: int | None = ...) -> None:
         ...
 
     def port_forward_command(
@@ -235,7 +244,7 @@ class SSHCommandRunner(CommandRunner):
             cmd: str | list[str],
             *,
             require_outputs: Literal[False] = ...,
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
@@ -243,7 +252,7 @@ class SSHCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> int:
         ...
@@ -253,7 +262,7 @@ class SSHCommandRunner(CommandRunner):
             cmd: str | list[str],
             *,
             require_outputs: Literal[True],
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
@@ -261,7 +270,7 @@ class SSHCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str]:
         ...
@@ -271,7 +280,7 @@ class SSHCommandRunner(CommandRunner):
             cmd: str | list[str],
             *,
             require_outputs: bool = ...,
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             log_path: str = ...,
             process_stream: bool = ...,
             stream_logs: bool = ...,
@@ -279,7 +288,7 @@ class SSHCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str] | int:
         ...
@@ -290,6 +299,7 @@ class SSHCommandRunner(CommandRunner):
         ssh_mode: SshMode,
         port_forward: list[tuple[int, int]] | None,
         connect_timeout: int | None,
+        ssh_log_file: str | None = ...,
     ) -> list[str]:
         ...
 
@@ -303,6 +313,7 @@ class SSHCommandRunner(CommandRunner):
         stream_logs: bool = ...,
         max_retry: int = ...,
         get_remote_home_dir: Callable[[], str] = ...,
+        timeout: int | None = ...,
     ) -> None:
         ...
 
@@ -341,7 +352,7 @@ class KubernetesCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> int:
         ...
@@ -359,7 +370,7 @@ class KubernetesCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str]:
         ...
@@ -377,7 +388,7 @@ class KubernetesCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str] | int:
         ...
@@ -391,6 +402,7 @@ class KubernetesCommandRunner(CommandRunner):
         log_path: str = ...,
         stream_logs: bool = ...,
         max_retry: int = ...,
+        timeout: int | None = ...,
     ) -> None:
         ...
 
@@ -420,8 +432,22 @@ class SlurmCommandRunner(SSHCommandRunner):
         skypilot_runtime_dir: str,
         job_id: str,
         slurm_node: str,
-        container_args: str | None = ...,
+        container_args: str | None,
         **kwargs,
+    ) -> None:
+        ...
+
+    def rsync(
+        self,
+        source: str,
+        target: str,
+        *,
+        up: bool,
+        log_path: str = ...,
+        stream_logs: bool = ...,
+        max_retry: int = ...,
+        get_remote_home_dir: Callable[[], str] | None = ...,
+        timeout: int | None = ...,
     ) -> None:
         ...
 
@@ -435,7 +461,7 @@ class LocalProcessCommandRunner(CommandRunner):
     def run(self,
             cmd: str | list[str],
             *,
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             require_outputs: Literal[False] = ...,
             log_path: str = ...,
             process_stream: bool = ...,
@@ -444,7 +470,7 @@ class LocalProcessCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> int:
         ...
@@ -453,7 +479,7 @@ class LocalProcessCommandRunner(CommandRunner):
     def run(self,
             cmd: str | list[str],
             *,
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             require_outputs: Literal[True],
             log_path: str = ...,
             process_stream: bool = ...,
@@ -462,7 +488,7 @@ class LocalProcessCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str]:
         ...
@@ -471,7 +497,7 @@ class LocalProcessCommandRunner(CommandRunner):
     def run(self,
             cmd: str | list[str],
             *,
-            port_forward: list[int] | None = ...,
+            port_forward: list[tuple[int, int]] | None = ...,
             require_outputs: bool = ...,
             log_path: str = ...,
             process_stream: bool = ...,
@@ -480,7 +506,7 @@ class LocalProcessCommandRunner(CommandRunner):
             separate_stderr: bool = ...,
             connect_timeout: int | None = ...,
             source_bashrc: bool = ...,
-            skip_lines: int = ...,
+            skip_num_lines: int = ...,
             run_in_background: bool = ...,
             **kwargs) -> tuple[int, str, str] | int:
         ...

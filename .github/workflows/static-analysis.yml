@@ -53,6 +53,27 @@ jobs:
           basedpyright --project . \
             --baselinefile .basedpyright-baseline.json
 
+  stub-runtime-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: "3.14"
+      - name: Compare hand-written stubs with runtime signatures
+        run: |
+          uv venv --seed ~/lint-env
+          source ~/lint-env/bin/activate
+          uv pip install -e .
+          uv pip install mypy==1.19.1
+          python -m mypy.stubtest \
+            sky.skylet.log_lib sky.utils.command_runner \
+            --concise \
+            --ignore-missing-stub \
+            --mypy-config-file .stubtest.ini
+
   async-lifecycle:
     runs-on: ubuntu-latest
     steps:
