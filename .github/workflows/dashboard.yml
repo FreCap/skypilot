@@ -37,6 +37,7 @@ jobs:
           src/data/connectors/infra-slurm.test.jsx \
           src/components/job-detail-logs.test.jsx \
           src/components/jobs.test.jsx \
+          src/components/pools-table.test.jsx \
           src/components/users.test.jsx \
           src/components/workspace-editor.test.jsx \
           src/components/workspaces.test.jsx \

@@ -33,38 +33,56 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
   const [pageSize, setPageSize] = useState(10);
   const mountedRef = useRef(false);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
-  const fetchData = React.useCallback(async () => {
-    const version = requestVersionRef.current + 1;
-    requestVersionRef.current = version;
-    const ownsState = () =>
-      mountedRef.current && version === requestVersionRef.current;
-    setLocalLoading(true);
-    setLoading(true);
-    try {
-      const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
-      if (!ownsState()) return;
-      const { pools = [] } = poolsResponse || {};
-      setData(pools);
-      setIsInitialLoad(false);
-    } catch (err) {
-      if (!ownsState()) return;
-      console.error('Error fetching pools data:', err);
-      setData([]);
-      setIsInitialLoad(false);
-    } finally {
-      if (ownsState()) {
-        setLocalLoading(false);
-        setLoading(false);
+  const fetchData = React.useCallback(
+    async ({ forceRefresh = false } = {}) => {
+      const version = requestVersionRef.current + 1;
+      requestVersionRef.current = version;
+      refreshInFlightRef.current = version;
+      const ownsState = () =>
+        mountedRef.current && version === requestVersionRef.current;
+      setLocalLoading(true);
+      setLoading(true);
+      try {
+        if (forceRefresh) {
+          dashboardCache.invalidate(getPoolStatus, [{}]);
+        }
+        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+        if (!ownsState()) return;
+        const { pools = [] } = poolsResponse || {};
+        setData(pools);
+        setIsInitialLoad(false);
+      } catch (err) {
+        if (!ownsState()) return;
+        console.error('Error fetching pools data:', err);
+        if (!forceRefresh) {
+          setData([]);
+        }
+        setIsInitialLoad(false);
+      } finally {
+        if (ownsState()) {
+          setLocalLoading(false);
+          setLoading(false);
+        }
+        if (refreshInFlightRef.current === version) {
+          refreshInFlightRef.current = null;
+        }
       }
-    }
-  }, [setLoading]);
+    },
+    [setLoading]
+  );
 
   // Expose fetchData to parent component
   React.useEffect(() => {
     if (refreshDataRef) {
       refreshDataRef.current = fetchData;
     }
+    return () => {
+      if (refreshDataRef?.current === fetchData) {
+        refreshDataRef.current = null;
+      }
+    };
   }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
@@ -76,7 +94,8 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
 
     const interval = setInterval(() => {
       if (isCurrent && window.document.visibilityState === 'visible') {
-        fetchData();
+        if (refreshInFlightRef.current) return;
+        void fetchData({ forceRefresh: true });
       }
     }, refreshInterval);
 
@@ -84,6 +103,7 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
       isCurrent = false;
       mountedRef.current = false;
       requestVersionRef.current += 1;
+      refreshInFlightRef.current = null;
       clearInterval(interval);
     };
   }, [refreshInterval, fetchData]);
