@@ -824,8 +824,8 @@ class JobController:
             callback_func = managed_job_utils.event_callback_func(
                 job_id=self._job_id, task_id=task_id, task=task)
 
-        transient_job_check_deadline = None
-        job_check_backoff = None
+        transient_job_check_retry: Optional[tuple[float,
+                                                  common_utils.Backoff]] = None
         not_up_debouncer = _ClusterNotUpDebouncer(task.num_nodes)
 
         while True:
@@ -877,16 +877,15 @@ class JobController:
                     f'status. Reason: {transient_job_check_error_reason}.\n'
                     'Check cluster status to determine if the job is '
                     'preempted or failed.')
-                if transient_job_check_deadline is None:
-                    transient_job_check_deadline = (
-                        time.monotonic() +
-                        managed_job_utils.JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS
+                if transient_job_check_retry is None:
+                    transient_job_check_retry = (
+                        time.monotonic() + managed_job_utils.
+                        JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS,
+                        common_utils.Backoff(initial_backoff=1,
+                                             max_backoff_factor=5),
                     )
-                    job_check_backoff = common_utils.Backoff(
-                        initial_backoff=1, max_backoff_factor=5)
             else:
-                transient_job_check_deadline = None
-                job_check_backoff = None
+                transient_job_check_retry = None
 
             # Handle success
             if job_status == job_lib.JobStatus.SUCCEEDED:
@@ -1143,11 +1142,10 @@ class JobController:
                     # job status. Try to recover the job (will not restart the
                     # cluster, if the cluster is healthy).
                     if transient_job_check_error_reason is not None:
-                        assert transient_job_check_deadline is not None, (
-                            transient_job_check_deadline,
+                        assert transient_job_check_retry is not None, (
                             transient_job_check_error_reason)
-                        assert job_check_backoff is not None, (
-                            job_check_backoff, transient_job_check_error_reason)
+                        (transient_job_check_deadline,
+                         job_check_backoff) = transient_job_check_retry
                         remaining_timeout = (transient_job_check_deadline -
                                              time.monotonic())
                         if remaining_timeout > 0:
@@ -1231,7 +1229,9 @@ class JobController:
 
             logger.info(f'Task {task.name} recovered, continuing monitoring')
 
-            # Reset force flag after first recovery
+            # Recovery starts a fresh monitoring epoch. Retry state from the
+            # old cluster must not shorten the next transient-error budget.
+            transient_job_check_retry = None
             force_transit_to_recovering = False
             # Observations accumulated against the old cluster must not count
             # toward recovering the fresh one.
