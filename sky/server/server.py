@@ -1656,7 +1656,9 @@ async def stream(
         html_dir = pathlib.Path(__file__).parent / 'html'
         with open(html_dir / 'log.html', encoding='utf-8') as file:
             html_content = file.read()
-        html_content = html_content.replace('{stream_url}', str(stream_url))
+        html_content = html_content.replace(
+            '{stream_url}',  # noqa: RUF027
+            str(stream_url))
 
         nonce = csp_utils.generate_nonce()
         request.state.csp_nonce = nonce
