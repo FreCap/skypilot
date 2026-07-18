@@ -38,8 +38,7 @@ import { trackJobAction } from '@/lib/analytics';
 function TaskDetails() {
   const router = useRouter();
   const { job: jobId, task: taskIndex } = router.query;
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const { jobData, loading } = useSingleManagedJob(jobId, refreshTrigger);
+  const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
@@ -72,9 +71,9 @@ function TaskDetails() {
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     try {
-      setRefreshTrigger((prev) => prev + 1);
       setRefreshLogsFlag((prev) => prev + 1);
       setTelemetryRefreshTrigger((prev) => prev + 1);
+      await refreshJobData();
     } catch (error) {
       console.error('Error refreshing data:', error);
     } finally {

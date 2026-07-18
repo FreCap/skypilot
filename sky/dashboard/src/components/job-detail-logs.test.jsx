@@ -18,6 +18,8 @@ import { useLogStreamer } from '@/hooks/useLogStreamer';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { usePluginComponents } from '@/plugins/PluginProvider';
 import { useLogLinkExtractor } from '@/utils/externalLinks';
+import { checkGrafanaAvailability } from '@/utils/grafana';
+import { TelemetrySection } from '@/components/TelemetrySection';
 
 const router = {
   isReady: true,
@@ -60,6 +62,10 @@ jest.mock('@/utils/grafana', () => ({
   checkGrafanaAvailability: jest.fn().mockResolvedValue(false),
 }));
 
+jest.mock('@/components/TelemetrySection', () => ({
+  TelemetrySection: jest.fn(() => null),
+}));
+
 const mockScanLines = jest.fn();
 jest.mock('@/utils/externalLinks', () => ({
   normalizeUrl: jest.fn((url) => url),
@@ -87,11 +93,30 @@ const job = {
 const workerLines = ['worker output'];
 const controllerLines = ['controller output'];
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function enabledStreamCall(controller) {
   return useLogStreamer.mock.calls.find(
     ([options]) =>
       options.enabled === true && options.streamArgs.controller === controller
   )?.[0];
+}
+
+function latestEnabledStreamCall(controller) {
+  return [...useLogStreamer.mock.calls]
+    .reverse()
+    .find(
+      ([options]) =>
+        options.enabled === true && options.streamArgs.controller === controller
+    )?.[0];
 }
 
 beforeEach(() => {
@@ -107,6 +132,7 @@ beforeEach(() => {
   useSingleManagedJob.mockReturnValue({
     jobData: { jobs: [job] },
     loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
   });
   useManagedJobPools.mockReturnValue([]);
   useLogStreamer.mockImplementation(({ streamArgs }) => ({
@@ -129,6 +155,88 @@ it('uses the current task job rows for its pool-link snapshot', async () => {
 
   await screen.findByText('Task 0');
   expect(useManagedJobPools).toHaveBeenCalledWith([job], '42');
+});
+
+it('owns the job-detail refresh button until the data refresh settles', async () => {
+  const refresh = deferred();
+  const refreshJobData = jest.fn(() => refresh.promise);
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: false,
+    refreshJobData,
+  });
+  render(<JobDetails />);
+
+  const refreshButton = screen.getAllByRole('button', { name: 'Refresh' })[0];
+  fireEvent.click(refreshButton);
+
+  expect(refreshJobData).toHaveBeenCalledTimes(1);
+  expect(refreshButton).toBeDisabled();
+  expect(screen.getByText('Loading...')).toBeInTheDocument();
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false).refreshTrigger).toBe(1)
+  );
+
+  refresh.resolve();
+  await waitFor(() => expect(refreshButton).toBeEnabled());
+});
+
+it('owns the task-detail refresh button until the data refresh settles', async () => {
+  router.query = { job: '42', task: '0' };
+  const refresh = deferred();
+  const refreshJobData = jest.fn(() => refresh.promise);
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: false,
+    refreshJobData,
+  });
+  render(<TaskDetails />);
+
+  const refreshButton = screen.getAllByRole('button', { name: 'Refresh' })[0];
+  fireEvent.click(refreshButton);
+
+  expect(refreshJobData).toHaveBeenCalledTimes(1);
+  expect(refreshButton).toBeDisabled();
+  expect(screen.getByText('Loading...')).toBeInTheDocument();
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false).refreshTrigger).toBe(1)
+  );
+
+  refresh.resolve();
+  await waitFor(() => expect(refreshButton).toBeEnabled());
+});
+
+it('advances job telemetry once for an accepted manual refresh', async () => {
+  const refresh = deferred();
+  const refreshJobData = jest.fn(() => refresh.promise);
+  const kubeJob = {
+    ...job,
+    full_infra: 'Kubernetes (context-a)',
+    cluster_name_on_cloud: 'job-42',
+  };
+  checkGrafanaAvailability.mockResolvedValue(true);
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [kubeJob] },
+    loading: false,
+    refreshJobData,
+  });
+  render(<JobDetails />);
+
+  await waitFor(() => expect(TelemetrySection).toHaveBeenCalled());
+  expect(TelemetrySection.mock.calls.at(-1)[0].refreshTrigger).toBe(0);
+
+  const refreshButton = screen.getAllByRole('button', { name: 'Refresh' })[0];
+  fireEvent.click(refreshButton);
+
+  await waitFor(() =>
+    expect(TelemetrySection.mock.calls.at(-1)[0].refreshTrigger).toBe(1)
+  );
+  fireEvent.click(refreshButton);
+  expect(refreshJobData).toHaveBeenCalledTimes(1);
+  expect(TelemetrySection.mock.calls.at(-1)[0].refreshTrigger).toBe(1);
+
+  refresh.resolve();
+  await waitFor(() => expect(refreshButton).toBeEnabled());
 });
 
 it('preserves the managed-job log stream and plugin contract', async () => {
