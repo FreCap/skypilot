@@ -82,13 +82,16 @@ use_parentheses = true
 target-version = "py310"
 # yapf owns formatting; ruff runs as a bug-finding linter only.
 extend-exclude = ["sky/schemas/generated", "build", "sky/dashboard"]
+preview = true
 
 [tool.ruff.lint]
+explicit-preview-rules = true
 select = [
     "F",       # pyflakes: undefined names, unused vars, f-string bugs
     "B",       # bugbear: mutable defaults, loop-var capture, except bugs
     "PLE",     # pylint error-severity rules
     "RUF006",  # asyncio.create_task without a saved reference (GC hazard)
+    "RUF027",  # probable f-string missing its prefix
     "ASYNC1",  # async correctness (busy-wait, timeout misuse)
     "ASYNC2",  # blocking calls in async functions
     "UP",      # pyupgrade: keep code on modern (>=3.10) idioms
