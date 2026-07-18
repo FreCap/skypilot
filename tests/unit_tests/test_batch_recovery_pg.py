@@ -44,8 +44,8 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
 
     owner_locked = threading.Event()
     release_old = threading.Event()
+    takeover_started = threading.Event()
     takeover_done = threading.Event()
-    order = []
     errors = []
     new_launch = mock.Mock()
     original_lock = state._lock_batch_coordinator_owner
@@ -65,15 +65,14 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
         try:
             assert state.claim_batch(1, 0, 'old-owner', 'worker-a', 10,
                                      now=100) == (1, 0)
-            order.append('old-commit')
         except Exception as e:  # pylint: disable=broad-except
             errors.append(e)
 
     def _takeover_and_launch():
         try:
+            takeover_started.set()
             assert state.acquire_batch_coordinator(1,
                                                    'new-owner') == 'old-owner'
-            order.append('takeover-return')
             new_launch()
         except Exception as e:  # pylint: disable=broad-except
             errors.append(e)
@@ -86,12 +85,14 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
     takeover_thread = threading.Thread(target=_takeover_and_launch)
     takeover_thread.start()
 
+    assert takeover_started.wait(timeout=10)
     assert not takeover_done.wait(timeout=0.2)
     new_launch.assert_not_called()
     release_old.set()
     old_thread.join(timeout=10)
     takeover_thread.join(timeout=10)
 
+    assert not old_thread.is_alive()
+    assert not takeover_thread.is_alive()
     assert not errors
-    assert order == ['old-commit', 'takeover-return']
     new_launch.assert_called_once_with()

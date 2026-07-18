@@ -168,6 +168,27 @@ def mock_blocking_operations(mock_request_obj):
         side_effect=async_get_request)
     patches.append(get_request_async_patch)
 
+    # api_get first expands the request ID prefix and then polls its status.
+    # Mock both async storage calls so this endpoint test measures event-loop
+    # responsiveness instead of SQLite initialization and query throughput.
+    async def async_get_requests_with_prefix(*_args, **_kwargs):
+        await asyncio.sleep(0.02)
+        return [mock_request_obj]
+
+    get_requests_with_prefix_patch = mock.patch(
+        'sky.server.requests.requests.get_requests_async_with_prefix',
+        side_effect=async_get_requests_with_prefix)
+    patches.append(get_requests_with_prefix_patch)
+
+    async def async_get_request_status(*_args, **_kwargs):
+        await asyncio.sleep(0.02)
+        return requests_lib.StatusWithMsg(requests_lib.RequestStatus.SUCCEEDED)
+
+    get_request_status_patch = mock.patch(
+        'sky.server.requests.requests.get_request_status_async',
+        side_effect=async_get_request_status)
+    patches.append(get_request_status_patch)
+
     # Mock requests.get_request_tasks (blocking version - still used by api_status)
     get_tasks_patch = mock.patch(
         'sky.server.requests.requests.get_request_tasks',
@@ -267,10 +288,7 @@ async def test_endpoint_api_get(monitor, mock_blocking_operations):
     print("\n🔍 Testing: /api/get")
 
     async def test_func():
-        try:
-            await server.api_get('test_req')
-        except:
-            pass
+        await server.api_get('test_req')
 
     result = await run_endpoint_test(test_func, monitor)
     assert not result['blocking'], "/api/get should NOT block the event loop"
