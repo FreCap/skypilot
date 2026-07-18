@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import sys
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -13,7 +14,11 @@ def _handle_background_task_done(task: asyncio.Task) -> None:
         return
 
     exception = task.exception()
-    if exception is not None:
+    # Python 3.14+ reports failures from an inner shielded future when the
+    # outer future was cancelled. Older versions only retrieve the exception,
+    # so report it here to keep the behavior consistent across supported
+    # Python versions without double-reporting on 3.14+.
+    if exception is not None and sys.version_info < (3, 14):
         task.get_loop().call_exception_handler({
             'message': 'Exception in shielded background task',
             'exception': exception,

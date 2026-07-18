@@ -1,6 +1,7 @@
 """Tests for asyncio utilities."""
 
 import asyncio
+import sys
 
 import pytest
 
@@ -95,8 +96,12 @@ async def test_shield_reports_failure_after_parent_cancellation():
     assert inner not in asyncio_utils._background_tasks
     assert len(reported_contexts) == 1
     context = reported_contexts[0]
-    assert context['message'] == 'Exception in shielded background task'
-    assert context['task'] is inner
+    if sys.version_info >= (3, 14):
+        assert context['message'] == 'RuntimeError exception in shielded future'
+        assert context['future'] is inner
+    else:
+        assert context['message'] == 'Exception in shielded background task'
+        assert context['task'] is inner
     assert isinstance(context['exception'], RuntimeError)
     assert str(context['exception']) == 'shielded child failed'
 
