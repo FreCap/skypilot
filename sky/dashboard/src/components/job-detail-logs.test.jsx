@@ -7,9 +7,11 @@ import {
 } from '@testing-library/react';
 
 import JobDetails from '@/pages/jobs/[job]';
+import TaskDetails from '@/pages/jobs/[job]/[task]';
 import {
   downloadManagedJobLogs,
   streamManagedJobLogs,
+  useManagedJobPools,
   useSingleManagedJob,
 } from '@/data/connectors/jobs';
 import { useLogStreamer } from '@/hooks/useLogStreamer';
@@ -32,6 +34,7 @@ jest.mock('@/data/connectors/jobs', () => ({
   computeJobGroupStatus: jest.fn((tasks) => tasks[0]?.status),
   streamManagedJobLogs: jest.fn(),
   downloadManagedJobLogs: jest.fn(),
+  useManagedJobPools: jest.fn(() => []),
 }));
 
 jest.mock('@/lib/cache', () => ({
@@ -93,6 +96,7 @@ function enabledStreamCall(controller) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  router.query = { job: '42' };
   window.localStorage.clear();
   global.requestAnimationFrame = (callback) => callback();
   usePluginComponents.mockImplementation(() => []);
@@ -104,11 +108,27 @@ beforeEach(() => {
     jobData: { jobs: [job] },
     loading: false,
   });
+  useManagedJobPools.mockReturnValue([]);
   useLogStreamer.mockImplementation(({ streamArgs }) => ({
     lines: streamArgs.controller ? controllerLines : workerLines,
     isLoading: false,
     hasReceivedFirstChunk: true,
   }));
+});
+
+it('uses the current job rows for its pool-link snapshot', async () => {
+  render(<JobDetails />);
+
+  await screen.findByText('Managed Jobs');
+  expect(useManagedJobPools).toHaveBeenCalledWith([job], '42');
+});
+
+it('uses the current task job rows for its pool-link snapshot', async () => {
+  router.query = { job: '42', task: '0' };
+  render(<TaskDetails />);
+
+  await screen.findByText('Task 0');
+  expect(useManagedJobPools).toHaveBeenCalledWith([job], '42');
 });
 
 it('preserves the managed-job log stream and plugin contract', async () => {
