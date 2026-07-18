@@ -35,6 +35,55 @@ jobs:
           uv pip install ruff==0.15.21
           ruff check sky
 
+  basedpyright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: "3.14"
+      - name: Check coroutine and control-flow types
+        run: |
+          uv venv --seed ~/lint-env
+          source ~/lint-env/bin/activate
+          uv pip install basedpyright==1.39.9
+          # To accept reviewed baseline changes, add --writebaseline locally.
+          basedpyright --project . \
+            --baselinefile .basedpyright-baseline.json
+
+  async-lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: "3.14"
+      - name: Check cancellation and async resource lifecycles
+        run: |
+          uv venv --seed ~/lint-env
+          source ~/lint-env/bin/activate
+          uv pip install flake8==7.3.0 flake8-async==27.7.1
+          # flake8 appends to output files, so make repeated local runs stable.
+          truncate -s 0 /tmp/flake8-async-current.txt
+          set +e
+          flake8 sky --asyncio \
+            --select=ASYNC103,ASYNC104,ASYNC119,ASYNC120,ASYNC231,ASYNC232 \
+            --exclude=sky/schemas/generated,sky/dashboard \
+            --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s' \
+            --output-file=/tmp/flake8-async-current.txt
+          lint_status=$?
+          set -e
+          if (( lint_status > 1 )); then
+            exit "${lint_status}"
+          fi
+          # Regenerate the baseline only after reviewing every changed finding.
+          diff -u .flake8-async-baseline.txt \
+            /tmp/flake8-async-current.txt
+
   import-linter:
     runs-on: ubuntu-latest
     strategy:
