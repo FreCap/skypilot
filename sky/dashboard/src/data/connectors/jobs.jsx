@@ -421,10 +421,10 @@ export async function getManagedJobsWithClientPagination(options) {
   }
 }
 
-export async function getPoolStatus() {
+export async function getPoolStatus({ poolNames = null } = {}) {
   try {
     const response = await apiClient.post(`/jobs/pool_status`, {
-      pool_names: null, // null means get all pools
+      pool_names: poolNames,
     });
     if (!response.ok) {
       const msg = `Initial API request to get pool status failed with status ${response.status}`;

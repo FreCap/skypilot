@@ -14,8 +14,21 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+jest.mock('@/data/connectors/client', () => ({
+  apiClient: {
+    get: jest.fn(),
+    post: jest.fn(),
+  },
+  getCurrentUserInfo: jest.fn(),
+}));
+
 import dashboardCache from '@/lib/cache';
-import { useSingleManagedJob, getManagedJobs } from '@/data/connectors/jobs';
+import { apiClient } from '@/data/connectors/client';
+import {
+  getManagedJobs,
+  getPoolStatus,
+  useSingleManagedJob,
+} from '@/data/connectors/jobs';
 
 function deferred() {
   let resolve;
@@ -26,6 +39,40 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+describe('getPoolStatus request scope', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    apiClient.post.mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'pool-status-request' },
+    });
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ return_value: '[]' }),
+    });
+  });
+
+  it('sends only the requested pool names to the backend', async () => {
+    await getPoolStatus({ poolNames: ['pool-a'] });
+
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
+    expect(apiClient.post).toHaveBeenCalledWith('/jobs/pool_status', {
+      pool_names: ['pool-a'],
+    });
+  });
+
+  it('keeps the all-pools request as the default', async () => {
+    await getPoolStatus();
+
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
+    expect(apiClient.post).toHaveBeenCalledWith('/jobs/pool_status', {
+      pool_names: null,
+    });
+  });
+});
 
 describe('useSingleManagedJob manual-refresh cache invalidation', () => {
   const jobId = '56164';
