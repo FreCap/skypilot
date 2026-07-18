@@ -1349,16 +1349,19 @@ class JobController:
             mapping — a recovered peer may have a new IP, so every
             task's /etc/hosts needs refreshing.
             """
-            updated_handles = []
+            task_clusters = []
             for t, _ in all_tasks_handles:
                 t_name = t.name
                 assert t_name is not None
                 # JobGroups don't support pools, cluster name is deterministic
                 t_cluster = managed_job_utils.generate_managed_job_cluster_name(
                     t_name, self._job_id)
-                t_handle = await asyncio.to_thread(
-                    global_user_state.get_handle_from_cluster_name, t_cluster)
-                updated_handles.append((t, t_handle))
+                task_clusters.append((t, t_cluster))
+            handles = await asyncio.to_thread(
+                global_user_state.get_handles_from_cluster_names,
+                {cluster_name for _, cluster_name in task_clusters})
+            updated_handles = [(t, handles.get(cluster_name))
+                               for t, cluster_name in task_clusters]
 
             await job_group_networking.setup_job_group_networking(
                 job_group_name, updated_handles)
