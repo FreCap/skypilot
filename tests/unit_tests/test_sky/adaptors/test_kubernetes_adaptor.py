@@ -19,6 +19,22 @@ def _clear_refresh_interval_cache():
     kubernetes._get_kubeconfig_refresh_interval_seconds.cache_clear()  # pylint: disable=protected-access
 
 
+def test_ssh_node_pool_repair_command_renders_context(monkeypatch):
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    new_client = MagicMock(
+        side_effect=config_exception('Expected key current-context'))
+    monkeypatch.setattr(kubernetes.kubernetes.config, 'new_client_from_config',
+                        new_client)
+
+    with pytest.raises(ValueError) as exc_info:
+        kubernetes._get_api_client('ssh-test-pool')  # pylint: disable=protected-access
+
+    message = str(exc_info.value)
+    assert 'sky ssh up --infra test-pool' in message
+    assert '{context_name}' not in message
+
+
 @pytest.mark.parametrize(
     'ctor_name, api_func',
     [
