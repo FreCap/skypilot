@@ -667,7 +667,14 @@ class SkyServeLoadBalancer:
         return fastapi.HTTPException(
             status_code=503,
             detail='Load balancer is draining; retry another endpoint.',
-            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+            headers={
+                'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS),
+                # A persistent connection may still be pinned to this pod
+                # after the Service selector has moved to the standby. Close
+                # it after the rejection so the retry reaches the new active
+                # slot instead of repeating 503s for the full drain grace.
+                'Connection': 'close',
+            })
 
     async def _acquire_request_slot(self, request: fastapi.Request) -> bool:
         """Acquire process-local admission, queueing when configured."""
@@ -903,10 +910,16 @@ class SkyServeLoadBalancer:
 
     def _inactive_role_request_error(self) -> fastapi.HTTPException:
         role = getattr(self, '_lb_role', lb_ha.LbRole.STANDBY)
+        headers = {'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)}
+        if role is lb_ha.LbRole.DRAINING:
+            # Role-driven cutovers can fence the old active slot before its
+            # process receives SIGTERM. Release persistent clients in that
+            # interval for the same reason as process-local draining.
+            headers['Connection'] = 'close'
         return fastapi.HTTPException(
             status_code=503,
             detail=f'Load balancer slot is {role.value.lower()}.',
-            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+            headers=headers)
 
     def _begin_draining(self) -> None:
         """Start draining (idempotent): fail readiness + stop syncing."""
@@ -948,7 +961,8 @@ class SkyServeLoadBalancer:
                       request: fastapi.Request) -> fastapi.responses.Response:
         del request  # Unused.
         return fastapi.responses.Response(
-            status_code=200 if self._is_ready_to_serve() else 503)
+            status_code=200 if self._is_ready_to_serve() else 503,
+            headers={'Connection': 'close'} if self._draining else None)
 
     async def _liveness(self,
                         request: fastapi.Request) -> fastapi.responses.Response:
