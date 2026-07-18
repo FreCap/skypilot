@@ -178,6 +178,10 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
     """The controller lost authority while a replica launch was in flight."""
 
 
+class _UnfencedExternalLbLaunchError(RuntimeError):
+    """A legacy controller cannot satisfy the API replica-launch fence."""
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
@@ -338,6 +342,19 @@ def launch_cluster(
             # every cloud mutation. The shared watchdog event is a second,
             # cheap fence for an already-running request.
             _assert_launch_authorized()
+            if (launch_fence is None and
+                    serve_utils.is_external_load_balancer_mode()):
+                # The API rejects every controller-originated launch without
+                # the durable service-owner tuple. This occurs for pre-fence
+                # legacy rows recovered after external-LB mode is enabled.
+                # Retrying the same HTTP 409 can never repair the missing
+                # lifecycle fence; fail once with a typed error so the manager
+                # records one unrecoverable replica instead of appending
+                # failed rows forever.
+                raise _UnfencedExternalLbLaunchError(
+                    f'Refusing to launch replica {replica_id} for legacy '
+                    'service or pool without a durable owner fence. Purge '
+                    'and recreate it to establish a current lifecycle fence.')
             usage_lib.messages.usage.set_internal()
             launch_kwargs: dict[str, Any] = {}
             if launch_fence is not None:
@@ -359,6 +376,8 @@ def launch_cluster(
             # re-drive or garbage-collect; discard local bookkeeping.
             replica_to_request_id.pop(replica_id)
             replica_to_launch_cancelled.pop(replica_id)
+            raise
+        except _UnfencedExternalLbLaunchError:
             raise
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
@@ -830,10 +849,6 @@ class ReplicaStatusProperty:
         ready for the current version.
         """
         replica_status = self.to_replica_status()
-        logger.info(
-            'Check replica unrecorverable: first_ready_time '
-            f'{self.first_ready_time}, user_app_failed {self.user_app_failed}, '
-            f'status {replica_status}')
         if replica_status not in serve_state.ReplicaStatus.terminal_statuses():
             return False
         if self.first_ready_time is not None:
@@ -4671,6 +4686,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         finished_launches = [(replica_id, t)
                              for replica_id, t in launch_thread_pool_snapshot
                              if not t.is_alive()]
+        unfenced_launch_failures = {
+            replica_id for replica_id, t in finished_launches if isinstance(
+                getattr(t, 'exception', None), _UnfencedExternalLbLaunchError)
+        }
         launch_infos = serve_state.get_replica_infos_from_ids(
             self._service_name,
             [replica_id for replica_id, _ in finished_launches])
@@ -4689,7 +4708,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     location = resolved_location
                 finished_spot_locations[replica_id] = location
                 if t.format_exc is not None:
-                    failed_spot_locations.add(location)
+                    if replica_id not in unfenced_launch_failures:
+                        failed_spot_locations.add(location)
                 else:
                     selected_at = getattr(info, 'created_at', None)
                     if selected_at is not None:
@@ -4731,6 +4751,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                f'{t.format_exc}. Terminating...')
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.FAILED)
+                if replica_id in unfenced_launch_failures:
+                    # The current API requires a durable launch fence in
+                    # external-LB mode. A legacy controller cannot acquire
+                    # one by retrying a replica; make this failure
+                    # unrecoverable so the autoscaler stops creating rows
+                    # until the operator purges/recreates the service.
+                    info.status_property.user_app_failed = True
                 error_in_sky_launch = True
             else:
                 info.status_property.sky_launch_status = (
@@ -4745,7 +4772,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # locations would fail. We should implement a log parser
                 # to detect if the error is actually related to the
                 # availability of the location later.
-                if t.format_exc is not None:
+                if (t.format_exc is not None and
+                        replica_id not in unfenced_launch_failures):
                     info.status_property.failed_spot_availability = True
             self._persist_replica(replica_id, info)
             if error_in_sky_launch:
