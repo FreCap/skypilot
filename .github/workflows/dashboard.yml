@@ -35,6 +35,7 @@ jobs:
           src/components/infra-refresh-lifecycle.test.jsx \
           src/components/infra-page.test.jsx \
           src/data/connectors/infra-slurm.test.jsx \
+          src/components/serve-replica-history.test.jsx \
           src/components/job-detail-logs.test.jsx \
           src/components/jobs.test.jsx \
           src/components/pools-table.test.jsx \
