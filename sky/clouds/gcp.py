@@ -1163,9 +1163,10 @@ class GCP(clouds.Cloud):
                 'gcloud auth application-default login')
         return project_id
 
-    @staticmethod
+    @classmethod
     def _check_instance_type_accelerators_combination(
-            resources: 'resources.Resources') -> None:
+            cls, resources: 'resources.Resources') -> None:
+        del cls  # unused
         resources = resources.assert_launchable()
         catalog.check_accelerator_attachable_to_host(resources.instance_type,
                                                      resources.accelerators,

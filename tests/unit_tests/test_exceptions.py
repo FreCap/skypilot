@@ -1,5 +1,7 @@
 """Test exception serialization and deserialization."""
 
+import pickle
+
 from sky import exceptions
 from sky.utils import status_lib
 
@@ -15,6 +17,24 @@ def test_value_error():
     deserialized = _serialize_deserialize(e)
     assert isinstance(deserialized, ValueError)
     assert str(deserialized) == 'test'
+
+
+def test_execution_control_errors_are_picklable():
+    """Retry and pause exceptions preserve their constructor state."""
+    retryable = exceptions.ExecutionRetryableError('retry', 'later', 3)
+    paused = exceptions.ExecutionPausedError('pause', 'waiting', 5,
+                                             {'signal': 'ready'})
+
+    restored_retryable = pickle.loads(pickle.dumps(retryable))
+    restored_paused = pickle.loads(pickle.dumps(paused))
+
+    assert isinstance(restored_retryable, exceptions.ExecutionRetryableError)
+    assert restored_retryable.hint == 'later'
+    assert restored_retryable.retry_wait_seconds == 3
+    assert isinstance(restored_paused, exceptions.ExecutionPausedError)
+    assert restored_paused.hint == 'waiting'
+    assert restored_paused.retry_wait_seconds == 5
+    assert restored_paused.continue_condition == {'signal': 'ready'}
 
 
 def test_resources_unavailable_error():

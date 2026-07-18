@@ -56,6 +56,7 @@ reportUnboundVariable = "error"
 reportPossiblyUnboundVariable = "error"
 reportGeneralTypeIssues = "error"
 reportReturnType = "error"
+reportIncompatibleMethodOverride = "error"
 
 [tool.isort]
 profile = "google"
