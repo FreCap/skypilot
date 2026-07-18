@@ -722,7 +722,7 @@ class ExecutionRetryableError(Exception):
         self.hint = hint
         self.retry_wait_seconds = retry_wait_seconds
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type[Exception], tuple[Any, ...]]:
         # Make sure the exception is picklable
         return (self.__class__, (str(self), self.hint, self.retry_wait_seconds))
 
@@ -748,7 +748,7 @@ class ExecutionPausedError(ExecutionRetryableError):
         super().__init__(message, hint, retry_wait_seconds)
         self.continue_condition = continue_condition
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type[Exception], tuple[Any, ...]]:
         # Make sure the exception is picklable
         return (self.__class__, (str(self), self.hint, self.retry_wait_seconds,
                                  self.continue_condition))
