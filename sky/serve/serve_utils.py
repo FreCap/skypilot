@@ -483,6 +483,9 @@ class RequestTimestamp(RequestsAggregator):
         # acknowledged minute advances the same cumulative counter.
         self._request_history: dict[int, int] = {}
         self._acknowledged_request_history: dict[int, int] = {}
+        # Pruning rebuilds both bounded history dictionaries. Keep that work on
+        # minute boundaries (and controller snapshots), never on every request.
+        self._last_pruned_request_history_bucket: int | None = None
 
     def add(self, request: 'fastapi.Request') -> None:
         """Add a request to the request aggregator."""
@@ -493,13 +496,15 @@ class RequestTimestamp(RequestsAggregator):
         bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
         self._request_history[bucket_start] = (
             self._request_history.get(bucket_start, 0) + 1)
-        self._prune_request_history(bucket_start)
+        if bucket_start != self._last_pruned_request_history_bucket:
+            self._prune_request_history(bucket_start)
 
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
+        self._last_pruned_request_history_bucket = None
 
     def _prune_request_history(self, newest_bucket: int) -> None:
         oldest_bucket = (newest_bucket -
@@ -515,6 +520,7 @@ class RequestTimestamp(RequestsAggregator):
             for bucket, count in self._acknowledged_request_history.items()
             if bucket >= oldest_bucket
         }
+        self._last_pruned_request_history_bucket = newest_bucket
 
     def request_history_snapshot(self) -> dict[str, Any] | None:
         """Return counters changed since their last durable acknowledgement."""

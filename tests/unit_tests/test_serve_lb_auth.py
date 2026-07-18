@@ -618,6 +618,23 @@ def test_request_history_is_bounded_to_recent_hour(monkeypatch):
     assert snapshot['buckets'][0]['bucket_start'] == 5 * 60
 
 
+def test_request_history_pruning_is_minute_boundary_work(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    agg = serve_utils.RequestTimestamp()
+    prune = mock.Mock(wraps=agg._prune_request_history)  # pylint: disable=protected-access
+    monkeypatch.setattr(agg, '_prune_request_history', prune)
+
+    for _ in range(100):
+        agg.add(None)
+    assert prune.call_count == 1
+
+    now[0] += constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+    agg.add(None)
+    agg.add(None)
+    assert prune.call_count == 2
+
+
 def test_aggregator_drained_on_success_and_restored_on_failure(monkeypatch):
     monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
 
