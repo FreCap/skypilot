@@ -1,4 +1,5 @@
 """S3-compatible object storage backend implementations."""
+from abc import ABC
 from abc import abstractmethod
 from collections.abc import Callable
 import dataclasses
@@ -101,7 +102,7 @@ class S3CompatibleConfig:
             self.extra_cli_env = {}
 
 
-class S3CompatibleStore(AbstractStore):
+class S3CompatibleStore(AbstractStore, ABC):
     """Base class for S3-compatible object storage providers.
 
     This class provides a unified interface for all S3-compatible storage

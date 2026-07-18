@@ -321,9 +321,8 @@ class ClusterInfo:
         return node_names if node_names else None
 
 
-class Endpoint:
+class Endpoint(abc.ABC):
     """Base class for endpoints."""
-    pass
 
     @abc.abstractmethod
     def url(self, override_ip: str | None = None) -> str:
