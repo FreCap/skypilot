@@ -162,9 +162,8 @@ class Mithril(clouds.Cloud):
     def _check_compute_credentials(cls) -> tuple[bool, str | None]:
         return cls._check_credentials()
 
-    @classmethod
-    def get_credential_file_mounts(cls) -> dict[str, str]:
-        credentials_path = cls.get_credentials_path()
+    def get_credential_file_mounts(self) -> dict[str, str]:
+        credentials_path = self.get_credentials_path()
         expanded_path = os.path.expanduser(credentials_path)
         if os.path.exists(expanded_path):
             return {credentials_path: expanded_path}

@@ -1022,7 +1022,7 @@ class Cloud:
 
     # === End of Misc Failovers ===
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return self._REPR
 
     def __getstate__(self):
