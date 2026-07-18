@@ -1506,7 +1506,13 @@ class SkyServeLoadBalancer:
             'occupancy_probed_backend_count': probed_backend_count,
             'last_sync_age_seconds': last_sync_age,
             'queue_depth': self._queue_depth,
+            # Process-local admission counters are required to prove that a
+            # legacy LB has no body-bearing work before selector migration.
+            # They remain behind the data-plane bearer like this entire
+            # endpoint and contain neither request identifiers nor payloads.
+            'local_in_flight': self._active_request_count,
             'request_queue_depth': self._waiting_request_count,
+            'waiting_request_body_bytes': self._waiting_request_body_bytes,
             'request_queue_capacity': request_queue_capacity,
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,

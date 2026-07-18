@@ -696,7 +696,7 @@ def test_rollback_prepatch_keeps_terminating_migration_tail_in_drain_union():
         {}, None, [], [], 'ha-generation-5')
 
 
-def test_migration_recovers_selector_patch_then_commits_and_cleans():
+def test_migration_commits_without_blocking_role_on_cleanup():
     ctrl = _role_controller()
     migrating = _state(lb_ha.LbCutoverPhase.MIGRATING, generation=1)
     stable = _state(lb_ha.LbCutoverPhase.STABLE, generation=1)
@@ -732,10 +732,10 @@ def test_migration_recovers_selector_patch_then_commits_and_cleans():
 
     assert json.loads(response.body)['phase'] == 'STABLE'
     finish.assert_called_once()
-    cleanup.assert_called_once_with('service', 'incarnation', True, None)
+    cleanup.assert_not_called()
 
 
-def test_rollback_recovers_legacy_selector_then_commits_and_cleans():
+def test_rollback_commits_without_blocking_role_on_cleanup():
     ctrl = _role_controller()
     rolling_back = _state(lb_ha.LbCutoverPhase.ROLLING_BACK,
                           active=lb_ha.LbSlot.B,
@@ -772,7 +772,7 @@ def test_rollback_recovers_legacy_selector_then_commits_and_cleans():
     assert json.loads(response.body)['role'] == 'DRAINING'
     assert not ctrl._lb_ha_enabled
     finish.assert_called_once()
-    cleanup.assert_called_once_with('service', 'incarnation', False, None)
+    cleanup.assert_not_called()
 
 
 def test_rollback_waits_for_former_active_local_work_to_drain():
