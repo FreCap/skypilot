@@ -456,6 +456,33 @@ class TestIsConsolidationMode:
             else:
                 mock_validate.assert_not_called()
 
+    @pytest.mark.parametrize('pool,count,noun', [
+        (False, 3, 'services'),
+        (True, 2, 'pools'),
+    ])
+    def test_disabled_validation_uses_mode_scoped_count(self, pool, count,
+                                                        noun):
+        with mock.patch('sky.serve.serve_utils.serve_state.get_num_services',
+                        return_value=count) as get_num_services, \
+                mock.patch('sky.serve.serve_utils.serve_state.get_services',
+                           side_effect=AssertionError(
+                               'validation must not materialize services')), \
+                mock.patch('sky.serve.serve_utils.logger.warning') as warning:
+            serve_utils._validate_consolidation_mode_config(False, pool=pool)
+
+        get_num_services.assert_called_once_with(pool=pool)
+        warning.assert_called_once()
+        assert f'still {count} {noun} running' in warning.call_args.args[0]
+
+    def test_disabled_validation_skips_warning_when_mode_is_empty(self):
+        with mock.patch('sky.serve.serve_utils.serve_state.get_num_services',
+                        return_value=0) as get_num_services, \
+                mock.patch('sky.serve.serve_utils.logger.warning') as warning:
+            serve_utils._validate_consolidation_mode_config(False, pool=False)
+
+        get_num_services.assert_called_once_with(pool=False)
+        warning.assert_not_called()
+
     @pytest.mark.parametrize('config_value,expected', [(True, True),
                                                        (False, False)])
     def test_serve_reads_config_only(self, config_value, expected, monkeypatch):
