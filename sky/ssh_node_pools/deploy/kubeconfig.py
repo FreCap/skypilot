@@ -251,35 +251,57 @@ def configure_local_kubeconfig(*, head_node: str, ssh_user: str, ssh_key: str,
                                      f'Error processing key data: {e}'
                                      f'{RESET_ALL}')
 
-        # First check if context name exists and delete it if it does
-        # TODO(romilb): Should we throw an error here instead?
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-context', context_name],
-            shell=False,
-            silent=True)
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-cluster', context_name],
-            shell=False,
-            silent=True)
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'delete-user', context_name],
-            shell=False,
-            silent=True)
-
-        # Merge the configurations using kubectl
+        # Build and validate the merged config before publishing it. A failed
+        # kubectl command must not replace the caller's kubeconfig with an
+        # empty file or leave KUBECONFIG pointing into this temporary
+        # directory.
+        previous_kubeconfig = os.environ.get('KUBECONFIG')
+        base_config = os.path.join(temp_dir, 'base_config')
         merged_config = os.path.join(temp_dir, 'merged_config')
-        os.environ['KUBECONFIG'] = f'{kubeconfig_path}:{modified_config}'
-        with open(merged_config, 'w', encoding='utf-8') as merged_file:
+        try:
+            # Remove an older version of this context from a private copy.
+            # Mutating the live kubeconfig before the merge succeeds would
+            # make rollback impossible.
+            shutil.copyfile(kubeconfig_path, base_config)
+            os.environ['KUBECONFIG'] = base_config
+            # TODO(romilb): Should we throw an error here instead?
+            deploy_utils.run_command(
+                ['kubectl', 'config', 'delete-context', context_name],
+                shell=False,
+                silent=True)
+            deploy_utils.run_command(
+                ['kubectl', 'config', 'delete-cluster', context_name],
+                shell=False,
+                silent=True)
+            deploy_utils.run_command(
+                ['kubectl', 'config', 'delete-user', context_name],
+                shell=False,
+                silent=True)
+
+            os.environ['KUBECONFIG'] = f'{base_config}:{modified_config}'
             kubectl_cmd = ['kubectl', 'config', 'view', '--flatten']
             result = deploy_utils.run_command(kubectl_cmd, shell=False)
-            if result:
+            if not result:
+                raise RuntimeError('Failed to merge kubeconfig')
+            with open(merged_config, 'w', encoding='utf-8') as merged_file:
                 merged_file.write(result)
 
-        # Replace the kubeconfig with the merged config
-        shutil.move(merged_config, kubeconfig_path)
+            # Apply the context selection to the unpublished config so a
+            # failure still leaves the existing kubeconfig untouched.
+            os.environ['KUBECONFIG'] = merged_config
+            use_context_result = deploy_utils.run_command(
+                ['kubectl', 'config', 'use-context', context_name],
+                shell=False,
+                silent=True)
+            if use_context_result is None:
+                raise RuntimeError(
+                    f'Failed to select kubeconfig context {context_name!r}')
 
-        # Set the new context as the current context
-        deploy_utils.run_command(
-            ['kubectl', 'config', 'use-context', context_name],
-            shell=False,
-            silent=True)
+            shutil.move(merged_config, kubeconfig_path)
+            os.environ['KUBECONFIG'] = kubeconfig_path
+        except BaseException:
+            if previous_kubeconfig is None:
+                os.environ.pop('KUBECONFIG', None)
+            else:
+                os.environ['KUBECONFIG'] = previous_kubeconfig
+            raise

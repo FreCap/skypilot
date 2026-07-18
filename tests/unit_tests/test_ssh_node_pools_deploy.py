@@ -6,7 +6,10 @@ import os
 from pathlib import Path
 import pickle
 
+import pytest
+
 from sky.ssh_node_pools.deploy import deploy
+from sky.ssh_node_pools.deploy import kubeconfig
 
 
 def _run_single_cluster(monkeypatch,
@@ -80,8 +83,13 @@ current-context: default
                         lambda path: None)
     monkeypatch.setattr(deploy.deploy_utils, 'get_effective_host_ip',
                         lambda host: '10.0.0.2')
+
+    def fake_setup_kubectl_ssh_tunnel(*args, **kwargs):
+        del args, kwargs
+        local_state['kubeconfig_env_after_configure'] = os.environ['KUBECONFIG']
+
     monkeypatch.setattr(deploy.tunnel_utils, 'setup_kubectl_ssh_tunnel',
-                        lambda *args, **kwargs: None)
+                        fake_setup_kubectl_ssh_tunnel)
     monkeypatch.setattr(deploy.constants, 'NODE_POOLS_INFO_DIR', str(tmp_path))
 
     kubeconfig_path = str(tmp_path / 'kubeconfig')
@@ -245,6 +253,8 @@ current-context: ssh-test-pool
                                           'test-private-key\n'
                                           '-----END PRIVATE KEY-----')
     assert local_state['kubeconfig'] == 'apiVersion: v1\n'
+    assert local_state['kubeconfig_env_after_configure'] == str(tmp_path /
+                                                                'kubeconfig')
     assert local_state['kubeconfig_env'] == str(tmp_path / 'kubeconfig')
 
     commands = [command for command, _ in local_calls]
@@ -256,6 +266,82 @@ current-context: ssh-test-pool
         ['kubectl', 'config', 'use-context', 'ssh-test-pool'],
         ['sky', 'check', 'ssh'],
     ]
+    assert len(commands) == 7
+
+
+@pytest.mark.parametrize('failed_command', ['view', 'use-context'])
+@pytest.mark.parametrize('had_previous_environment', [False, True])
+def test_failed_kubeconfig_command_preserves_file_and_environment(
+        monkeypatch, tmp_path, failed_command, had_previous_environment):
+    kubeconfig_path = tmp_path / 'kubeconfig'
+    kubeconfig_path.write_text('existing: config\n', encoding='utf-8')
+    if had_previous_environment:
+        monkeypatch.setenv('KUBECONFIG', str(kubeconfig_path))
+    else:
+        monkeypatch.delenv('KUBECONFIG', raising=False)
+    commands = []
+
+    def fake_run_command(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        if command[0] == 'scp':
+            Path(command[-1]).write_text('''apiVersion: v1
+clusters:
+- cluster:
+    server: https://127.0.0.1:6443
+  name: default
+users:
+- name: default
+  user: {}
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+''',
+                                         encoding='utf-8')
+            return ''
+        if command[:4] == ['kubectl', 'config', 'view', '--flatten']:
+            if failed_command == 'view':
+                return None
+            return 'apiVersion: v1\n'
+        if command[:3] == ['kubectl', 'config', 'use-context']:
+            if failed_command == 'use-context':
+                return None
+            return ''
+        if command[1:3] in (["config",
+                             "delete-context"], ["config", "delete-cluster"],
+                            ["config", "delete-user"]):
+            Path(os.environ['KUBECONFIG']).write_text('mutated: config\n',
+                                                      encoding='utf-8')
+        return ''
+
+    monkeypatch.setattr(kubeconfig.deploy_utils, 'run_command',
+                        fake_run_command)
+    monkeypatch.setattr(kubeconfig.constants, 'NODE_POOLS_INFO_DIR',
+                        str(tmp_path))
+
+    with pytest.raises(RuntimeError, match='Failed to (merge|select)'):
+        kubeconfig.configure_local_kubeconfig(
+            head_node='head',
+            ssh_user='user',
+            ssh_key='key',
+            context_name='ssh-test-pool',
+            effective_master_ip='head',
+            kubeconfig_path=str(kubeconfig_path),
+            use_ssh_config=True)
+
+    assert kubeconfig_path.read_text(encoding='utf-8') == 'existing: config\n'
+    if had_previous_environment:
+        assert os.environ['KUBECONFIG'] == str(kubeconfig_path)
+    else:
+        assert 'KUBECONFIG' not in os.environ
+    expected_last_command = (
+        ['kubectl', 'config', 'view', '--flatten'] if failed_command == 'view'
+        else ['kubectl', 'config', 'use-context', 'ssh-test-pool'])
+    assert commands[-1] == expected_last_command
+    assert len(commands) == (5 if failed_command == 'view' else 6)
 
 
 def test_deploy_single_cluster_uses_ssh_config_for_kubeconfig_scp(
