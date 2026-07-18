@@ -291,9 +291,21 @@ When updating dependencies:
 
 ## Feature Plans
 
-Final implementation plans for non-trivial features must be checked into
-`agent/feature-plans/` as Markdown files. Use a descriptive kebab-case filename
-such as `agent/feature-plans/managed-container-image-distribution.md`.
+Final implementation plans are required only for major features and must be
+checked into `agent/feature-plans/` as Markdown files. A major feature has at
+least one of these characteristics:
+
+- It introduces a new cross-cutting architecture or responsibility boundary
+  spanning multiple core subsystems, clouds, backends, or control/data planes.
+- It adds durable state, migrations, or an operational component that requires
+  a staged deployment and rollback strategy.
+- It adds a broad public interface or configuration contract whose adoption
+  requires coordinated compatibility, migration, or activation work.
+
+Do not add feature plans for localized features, bug fixes, routine refactors,
+tests, documentation-only work, or maintenance changes. Use a descriptive
+kebab-case filename such as
+`agent/feature-plans/managed-container-image-distribution.md`.
 
 - Add the finalized plan before or with the implementation it describes. Draft
   exploration can live elsewhere, but the accepted implementation plan belongs
