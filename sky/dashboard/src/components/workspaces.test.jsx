@@ -155,7 +155,7 @@ describe('Workspaces request lifecycle', () => {
     render(<Workspaces />);
 
     await screen.findByRole('button', { name: 'default' });
-    expect(getCurrentUserRole).toHaveBeenCalled();
+    expect(getCurrentUserRole).not.toHaveBeenCalled();
     expect(screen.getByText('Private')).toBeInTheDocument();
     expect(screen.getByText('Public')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Kubernetes' })).toHaveAttribute(
@@ -192,6 +192,7 @@ describe('Workspaces request lifecycle', () => {
     await waitFor(() => {
       expect(mockRouterPush).toHaveBeenCalledWith('/workspaces/beta');
     });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('columnheader', { name: 'Workspace ↑' }));
     expect(
       screen.getByRole('columnheader', { name: 'Workspace ↓' })
@@ -199,6 +200,7 @@ describe('Workspaces request lifecycle', () => {
 
     fireEvent.click(screen.getByTitle('Delete workspace'));
     expect(await screen.findByText('Delete Workspace')).toBeInTheDocument();
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
   });
 
   it('does not start a request when preload finishes after unmount', async () => {
