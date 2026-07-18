@@ -151,6 +151,21 @@ class TestVolumeDatabaseOperations:
         mock_session.query.return_value.all.assert_called_once()
         mock_session.query.return_value.filter_by.assert_not_called()
 
+    def test_get_volumes_filters_name_and_ephemeral_in_one_query(
+            self,
+            mock_engine,  # pylint: disable=unused-argument
+            mock_session):
+        """Targeted volume reads compose predicates before querying."""
+        filtered_query = mock_session.query.return_value.filter_by.return_value
+        filtered_query.all.return_value = []
+
+        global_user_state.get_volumes(name='target-volume', is_ephemeral=False)
+
+        mock_session.query.return_value.filter_by.assert_called_once_with(
+            name='target-volume', is_ephemeral=0)
+        filtered_query.all.assert_called_once_with()
+        mock_session.query.return_value.all.assert_not_called()
+
     def test_get_volume_configs_by_names_is_one_exact_query(
             self,
             mock_engine,  # pylint: disable=unused-argument
