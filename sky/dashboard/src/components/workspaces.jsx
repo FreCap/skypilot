@@ -245,7 +245,6 @@ export function Workspaces() {
     userName: '',
   });
 
-  const [currentUser, setCurrentUser] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
   // Top-level error and success states
@@ -262,7 +261,6 @@ export function Workspaces() {
       if (roleData.roleFetchFailed) {
         throw new Error('Failed to get user role');
       }
-      setCurrentUser(roleData);
       return roleData;
     } finally {
       setRoleLoading(false);
@@ -297,12 +295,6 @@ export function Workspaces() {
     },
     [getUserRole]
   );
-
-  useEffect(() => {
-    getUserRole().catch(() => {
-      console.error('Failed to get user role');
-    });
-  }, [getUserRole]);
 
   // Fetch clusters independently and update state progressively
   const fetchClustersData = useCallback(
