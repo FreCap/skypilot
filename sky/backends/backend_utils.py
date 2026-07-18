@@ -1284,16 +1284,16 @@ def write_cluster_config(
             # Currently only used by Slurm. For other clouds, it is
             # already part of ray_skypilot_installation_commands
             'setup_sky_dirs_commands': constants.SETUP_SKY_DIRS_COMMANDS,
-            'ray_skypilot_installation_commands':
-                (constants.RAY_SKYPILOT_INSTALLATION_COMMANDS.replace(
-                    '{sky_wheel_hash}',
-                    wheel_hash).replace('{cloud}',
-                                        str(cloud).lower())),
+            'ray_skypilot_installation_commands': (
+                constants.RAY_SKYPILOT_INSTALLATION_COMMANDS.replace(
+                    '{sky_wheel_hash}', wheel_hash).replace(
+                        '{cloud}',  # noqa: RUF027
+                        str(cloud).lower())),
             'skypilot_wheel_installation_commands':
                 constants.SKYPILOT_WHEEL_INSTALLATION_COMMANDS.replace(
-                    '{sky_wheel_hash}',
-                    wheel_hash).replace('{cloud}',
-                                        str(cloud).lower()),
+                    '{sky_wheel_hash}', wheel_hash).replace(
+                        '{cloud}',  # noqa: RUF027
+                        str(cloud).lower()),
             'copy_skypilot_templates_commands':
                 constants.COPY_SKYPILOT_TEMPLATES_COMMANDS,
             # Port of Ray (GCS server).
