@@ -9,6 +9,7 @@ raise RuntimeError outright.
 import asyncio
 import multiprocessing
 import sqlite3
+from typing import Any
 
 import fastapi
 import uvicorn
@@ -19,7 +20,8 @@ from sky.server.requests import requests
 from sky.server.requests import storage as request_storage
 
 
-def _run_server_with_failed_lifespan(request_db_path: str) -> None:
+def _run_server_with_failed_lifespan(request_db_path: str,
+                                     failure_started: Any) -> None:
     """Run a worker whose lifespan fails after opening the async request DB."""
     server_constants.API_SERVER_REQUEST_DB_PATH = request_db_path
     requests._DB = None  # pylint: disable=protected-access
@@ -32,6 +34,7 @@ def _run_server_with_failed_lifespan(request_db_path: str) -> None:
         async def __aenter__(self):
             backend = request_storage.get_request_backend()
             await backend.get_request_async('missing-request')
+            failure_started.set()
             raise sqlite3.OperationalError('database is locked')
 
         async def __aexit__(self, exc_type, exc, traceback):
@@ -90,14 +93,22 @@ def test_lag_config_requires_running_loop():
 
 def test_startup_failure_does_not_leave_worker_process_alive(tmp_path):
     ctx = multiprocessing.get_context('spawn')
+    failure_started = ctx.Event()
     process = ctx.Process(target=_run_server_with_failed_lifespan,
-                          args=(str(tmp_path / 'requests.db'),))
+                          args=(str(tmp_path / 'requests.db'), failure_started))
     process.start()
-    process.join(timeout=15)
+    # Cold spawned-process imports compete with the other xdist workers and
+    # are not part of the shutdown behavior under test. Start the shutdown
+    # deadline only after the child has opened the DB and is about to fail its
+    # lifespan startup.
+    reached_failure = failure_started.wait(timeout=60)
+    if reached_failure:
+        process.join(timeout=15)
     still_alive = process.is_alive()
     if still_alive:
         process.kill()
         process.join(timeout=5)
 
+    assert reached_failure
     assert not still_alive
     assert process.exitcode == 0
