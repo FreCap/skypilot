@@ -270,6 +270,13 @@ async def wait_for_request_to_start(
         yield status_msg.stop()
 
 
+def _directory_log_files(log_path: pathlib.Path) -> list[pathlib.Path] | None:
+    """Return sorted log files when the stream path is a directory."""
+    if not log_path.is_dir():
+        return None
+    return sorted(log_path.glob('*.log'))
+
+
 async def log_streamer(
     request_id: str | None,
     log_path: pathlib.Path | None = None,
@@ -302,11 +309,10 @@ async def log_streamer(
                 polling_interval=polling_interval):
             yield chunk
 
+    log_files = (await asyncio.to_thread(_directory_log_files, log_path)
+                 if log_path is not None else None)
     # worker node provision logs
-    if log_path is not None and log_path.is_dir():
-        # Get all *.log files in the log_path dir
-        log_files = sorted(log_path.glob('*.log'))
-
+    if log_files is not None:
         for log_file_path in log_files:
             # Add header before each file (similar to tail -f behavior)
             header = f'\n==> {log_file_path} <==\n\n'
