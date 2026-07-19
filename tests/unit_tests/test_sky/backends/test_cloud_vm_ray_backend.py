@@ -3,6 +3,7 @@
 import multiprocessing
 import socket
 import time
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -576,6 +577,50 @@ class TestCloudVmRayBackendGetGrpcChannel:
 
         assert clock.sleeps == pytest.approx([0.02])
         assert clock.now == pytest.approx(1.0)
+
+    def test_get_grpc_channel_rechecks_tunnel_after_exclusive_lock(self):
+        """A late lock winner reuses a tunnel refreshed by another process."""
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        stale_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                     pid=self.INITIAL_TUNNEL_PID)
+        fresh_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
+                                     pid=self.INITIAL_TUNNEL_PID + 1)
+
+        class _AcquiredLock:
+
+            def acquire(self, blocking):
+                assert not blocking
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+
+        open_tunnel = MagicMock()
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel',
+                side_effect=[stale_tunnel, fresh_tunnel]), patch.object(
+                    handle, '_open_and_update_skylet_tunnel',
+                    open_tunnel), patch.object(
+                        cloud_vm_ray_backend,
+                        '_is_tunnel_healthy',
+                        side_effect=[False, True]) as is_healthy, patch.object(
+                            cloud_vm_ray_backend.locks,
+                            'get_lock',
+                            return_value=_AcquiredLock()), patch(
+                                'grpc.insecure_channel',
+                                side_effect=lambda addr, options: addr):
+            channel = handle.get_grpc_channel()
+
+        assert channel == f'localhost:{self.INITIAL_TUNNEL_PORT + 1}'
+        assert is_healthy.call_args_list == [
+            call(stale_tunnel),
+            call(fresh_tunnel),
+        ]
+        open_tunnel.assert_not_called()
 
     def test_get_grpc_channel_multiprocess_race_condition(self):
         """Test get_grpc_channel with multiple processes racing for tunnel creation."""

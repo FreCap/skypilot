@@ -2907,6 +2907,14 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     wait_elapsed = time.perf_counter() - start_time
                     logger.debug(f'Acquired exclusive lock for {lock_id} after '
                                  f'{wait_elapsed:.2f}s')
+                    # Another process may have refreshed the tunnel after our
+                    # lock-free fast-path check but before we acquired the
+                    # exclusive lock. Recheck while holding the lock to avoid
+                    # replacing that new tunnel with a second one.
+                    tunnel = self._get_skylet_ssh_tunnel()
+                    if tunnel is not None and _is_tunnel_healthy(tunnel):
+                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
+                                                     options=grpc_options)
                     try:
                         tunnel = self._open_and_update_skylet_tunnel()
                         return grpc.insecure_channel(f'localhost:{tunnel.port}',
