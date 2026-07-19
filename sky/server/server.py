@@ -2172,13 +2172,8 @@ async def create_debug_dump(
     )
 
 
-@app.get('/debug/dump_download/{dump_filename}')
-async def download_debug_dump(
-        dump_filename: str) -> fastapi.responses.FileResponse:
-    """Download a debug dump file.
-
-    The dump file is automatically deleted after the download completes.
-    """
+def _resolve_debug_dump_path(dump_filename: str) -> pathlib.Path:
+    """Resolve and validate a requested debug dump path."""
     dump_dir = pathlib.Path(debug_utils.DEBUG_DUMP_DIR).expanduser()
     dump_path = dump_dir / dump_filename
 
@@ -2193,6 +2188,17 @@ async def download_debug_dump(
     if not dump_path.exists():
         raise fastapi.HTTPException(status_code=404,
                                     detail='Debug dump not found')
+    return dump_path
+
+
+@app.get('/debug/dump_download/{dump_filename}')
+async def download_debug_dump(
+        dump_filename: str) -> fastapi.responses.FileResponse:
+    """Download a debug dump file.
+
+    The dump file is automatically deleted after the download completes.
+    """
+    dump_path = await asyncio.to_thread(_resolve_debug_dump_path, dump_filename)
 
     # Delete the dump file after download completes
     return fastapi.responses.FileResponse(
