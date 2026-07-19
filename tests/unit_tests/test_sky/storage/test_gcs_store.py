@@ -1,13 +1,16 @@
 """Characterization tests for the GCS storage backend facade."""
 
 # pylint: disable=protected-access
+import contextlib
 import pickle
+import shlex
 from unittest import mock
 
 import pytest
 
 from sky import exceptions
 from sky.data import storage as storage_lib
+from sky.data import storage_gcs
 
 
 def _gcs_store(**attributes) -> storage_lib.GcsStore:
@@ -96,6 +99,26 @@ def test_gcs_store_delete_preserves_external_bucket_with_sub_path():
 
     store._delete_sub_path.assert_called_once_with()
     store._delete_gcs_bucket.assert_not_called()
+
+
+def test_gcs_store_sub_path_delete_quotes_target_uri():
+    store = _gcs_store()
+    store.client = mock.Mock()
+    sub_path = 'prefix;echo_INJECTED'
+    target_uri = f'gs://{store.name}/{sub_path}'
+
+    with mock.patch.object(
+            storage_gcs.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_gcs.data_utils,
+                'get_gsutil_command',
+                return_value=('gsutil', 'true')), mock.patch.object(
+                    storage_gcs.subprocess, 'check_output') as check_output:
+        assert store._delete_gcs_bucket(store.name, sub_path)
+
+    command = check_output.call_args.args[0]
+    assert command.endswith(f'gsutil rm -r {shlex.quote(target_uri)}')
 
 
 def test_gcs_store_mount_command_delegates_provider_configuration():

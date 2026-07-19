@@ -558,9 +558,9 @@ class GcsStore(AbstractStore):
                 return False
             try:
                 gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-                remove_obj_command = (
-                    f'{alias_gen};{gsutil_alias} '
-                    f'rm -r gs://{bucket_name}{command_suffix}')
+                target_uri = f'gs://{bucket_name}{command_suffix}'
+                remove_obj_command = (f'{alias_gen};{gsutil_alias} '
+                                      f'rm -r {shlex.quote(target_uri)}')
                 subprocess.check_output(remove_obj_command,
                                         stderr=subprocess.STDOUT,
                                         shell=True,
