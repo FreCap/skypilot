@@ -3,9 +3,26 @@ import os
 import re
 from unittest import mock
 
+import pytest
+
 from sky.client import common as client_common
 from sky.client.common import _compute_zip_blob_id
 from sky.data import storage_utils
+
+
+def test_setup_upload_logger_preserves_file_handler_error(monkeypatch):
+
+    def raise_file_handler_error(*args, **kwargs):
+        del args, kwargs
+        raise OSError('disk full')
+
+    monkeypatch.setattr(client_common.logging, 'FileHandler',
+                        raise_file_handler_error)
+
+    with pytest.raises(OSError, match='disk full'):
+        with client_common._setup_upload_logger(  # pylint: disable=protected-access
+                '/tmp/upload.log'):
+            pass
 
 
 def test_download_logs_resolves_remote_prefix_per_call():

@@ -276,6 +276,8 @@ def add_debug_log_handler(request_id: str):
 
     os.makedirs(DEBUG_LOG_DIR, exist_ok=True)
     log_path = os.path.join(DEBUG_LOG_DIR, f'{request_id}.log')
+    debug_log_handler = None
+    provision_logger = None
     try:
         debug_log_handler = logging.FileHandler(log_path)
         debug_log_handler.setFormatter(FORMATTER)
@@ -288,6 +290,8 @@ def add_debug_log_handler(request_id: str):
         provision_logger.setLevel(logging.DEBUG)
         yield
     finally:
-        _root_logger.removeHandler(debug_log_handler)
-        provision_logger.removeHandler(debug_log_handler)
-        debug_log_handler.close()
+        if debug_log_handler is not None:
+            _root_logger.removeHandler(debug_log_handler)
+            if provision_logger is not None:
+                provision_logger.removeHandler(debug_log_handler)
+            debug_log_handler.close()
