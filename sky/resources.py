@@ -957,6 +957,12 @@ class Resources:
                         with ux_utils.print_exception_no_traceback():
                             raise ValueError(parse_error) from None
 
+            if not accelerators:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'The "accelerators" field must contain at least one '
+                        'accelerator.')
+
             for acc_name, acc_count in accelerators.items():
                 if not isinstance(acc_count, (int, float)) or acc_count <= 0:
                     with ux_utils.print_exception_no_traceback():
