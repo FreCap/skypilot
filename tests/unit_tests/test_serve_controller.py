@@ -2308,7 +2308,10 @@ class TestAuthoritativeLbReportIngestion:
         ctrl._confirm_logical_bridge_capacities = _capture_confirm  # pylint: disable=protected-access
         ctrl._apply_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
 
-        def _capture_capacity_hint(replica_infos, logical_versions):
+        def _capture_capacity_hint(replica_infos,
+                                   logical_versions,
+                                   replica_counts=None):
+            observed['hint_replica_counts'] = replica_counts
             observed['logical_versions'] = set(logical_versions)
             return {'n': len(replica_infos)}
 
@@ -2347,6 +2350,10 @@ class TestAuthoritativeLbReportIngestion:
         assert observed['ingest_logical_versions'] == {3}
         assert observed['logical_versions'] == {3}
         assert observed['sync_thread'] != event_loop_thread
+        # The sync handler must hand the hint the same counts dict it
+        # snapshotted, so the fleet is aggregated exactly once per sync.
+        assert observed['hint_replica_counts'] is ctrl._replica_counts_snapshot  # pylint: disable=protected-access
+        assert observed['hint_replica_counts'] is not None
 
 
 class _FakeAutoscaler:
@@ -2452,6 +2459,42 @@ class TestGetCapacityHint:
             logical_versions=set())
         assert hint['target_num_replicas'] == 10
         assert hint['max_replicas'] == 20
+
+    def test_capacity_hint_reuses_precomputed_replica_counts(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=5,
+            recomputed=True,
+            latest_version=2)
+        replicas = self._replicas()
+        expected = ctrl._get_replica_counts(replicas)  # pylint: disable=protected-access
+        with mock.patch.object(ctrl, '_get_replica_counts') as counts_mock:
+            hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+                replicas,
+                logical_versions=set(),
+                replica_counts=dict(expected))
+        counts_mock.assert_not_called()
+        assert hint['replica_unit'] == 'physical_backend'
+        for key, value in expected.items():
+            if key != 'replica_unit':
+                assert hint[key] == value
+
+    def test_capacity_hint_computes_counts_once_when_not_provided(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=5,
+            recomputed=True,
+            latest_version=2)
+        replicas = self._replicas()
+        real_counts = ctrl._get_replica_counts  # pylint: disable=protected-access
+        with mock.patch.object(ctrl,
+                               '_get_replica_counts',
+                               side_effect=real_counts) as counts_mock:
+            hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+                replicas,
+                logical_versions=set())
+        assert counts_mock.call_count == 1
+        assert hint['total_replicas'] == 5
 
     def test_logical_hint_sums_persisted_backend_widths(self):
         ctrl = _make_controller()

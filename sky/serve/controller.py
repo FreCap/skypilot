@@ -1007,14 +1007,16 @@ class SkyServeController:
                 authority,
                 observed_slots,
             )
-            self._replica_counts_snapshot = self._get_replica_counts(
-                replica_infos)
+            replica_counts = self._get_replica_counts(replica_infos)
+            self._replica_counts_snapshot = replica_counts
             response_content = {
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
                 'capacity_hint': self._get_capacity_hint(
-                    replica_infos, logical_versions),
+                    replica_infos,
+                    logical_versions,
+                    replica_counts=replica_counts),
                 'request_history_accepted': request_history_accepted,
             }
             if getattr(self, '_lb_ha_enabled', False):
@@ -1668,6 +1670,7 @@ class SkyServeController:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         logical_versions: set[int] | None = None,
+        replica_counts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the capacity_hint block of the sync response.
 
@@ -1694,10 +1697,6 @@ class SkyServeController:
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
         num_latest_nonterminal = 0
-        ready_by_accelerator: dict[str, int] = {}
-        provisioning_by_accelerator: dict[str, int] = {}
-        total_by_accelerator: dict[str, int] = {}
-        zero_cost_ready_by_accelerator: dict[str, int] = {}
         logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
         if logical_versions is None:
             logical_versions = {latest_version} if logical else set()
@@ -1709,40 +1708,11 @@ class SkyServeController:
                 continue
             width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
             num_latest_nonterminal += width
-            cached = self._lb_translation_cache.get(info.replica_id)
-            accelerator = cached[1] if cached is not None else 'unknown'
-            if accelerator == 'unknown':
-                override_accelerators = (getattr(
-                    info, 'resources_override', None) or {}).get('accelerators')
-                if isinstance(override_accelerators,
-                              dict) and override_accelerators:
-                    accelerator = next(iter(override_accelerators))
-            known_accelerator = accelerator != 'unknown'
-            if known_accelerator:
-                total_by_accelerator[accelerator] = (
-                    total_by_accelerator.get(accelerator, 0) + width)
             if not info.is_ready:
                 num_provisioning += width
-                if known_accelerator:
-                    provisioning_by_accelerator[accelerator] = (
-                        provisioning_by_accelerator.get(accelerator, 0) + width)
-            else:
-                if known_accelerator:
-                    ready_by_accelerator[accelerator] = (
-                        ready_by_accelerator.get(accelerator, 0) + width)
-                if (known_accelerator and
-                        bool(getattr(info, 'is_zero_cost', False))):
-                    zero_cost_ready_by_accelerator[accelerator] = (
-                        zero_cost_ready_by_accelerator.get(accelerator, 0) +
-                        width)
         target = self._autoscaler.get_final_target_num_replicas()
         if not self._autoscaler.has_recomputed_with_fresh_data():
             target = max(target, num_latest_nonterminal)
-        counts = self._get_replica_counts(replica_infos, include_unit=False)
-        free_reserved_by_accelerator = counts.get(
-            'free_reserved_slots_by_accelerator', {})
-        fill_target_by_accelerator = counts.get('fill_target_by_accelerator',
-                                                {})
         hint: dict[str, Any] = {
             'replica_unit': ('logical_slot' if logical else 'physical_backend'),
             'provisioning_replicas': num_provisioning,
@@ -1750,6 +1720,13 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
             'configured_max_replicas': self._autoscaler.max_replicas,
         }
+        if replica_counts is None:
+            replica_counts = self._get_replica_counts(replica_infos)
+        hint.update({
+            key: value
+            for key, value in replica_counts.items()
+            if key != 'replica_unit'
+        })
         min_by_accelerator = getattr(self._autoscaler,
                                      'min_replicas_by_accelerator', {})
         demand_by_accelerator = getattr(self._autoscaler,
@@ -1761,17 +1738,6 @@ class SkyServeController:
             hint['target_num_replicas_by_accelerator'] = dict(
                 demand_by_accelerator)
             hint['demand_target_by_accelerator'] = dict(demand_by_accelerator)
-        for key, value in {
-                'ready_replicas_by_accelerator': ready_by_accelerator,
-                'provisioning_replicas_by_accelerator': provisioning_by_accelerator,
-                'total_replicas_by_accelerator': total_by_accelerator,
-                'zero_cost_ready_replicas_by_accelerator': zero_cost_ready_by_accelerator,
-                'fill_target_by_accelerator': fill_target_by_accelerator,
-                'free_reserved_slots_by_accelerator': free_reserved_by_accelerator,
-        }.items():
-            if value:
-                hint[key] = value
-        hint.update(counts)
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -1789,7 +1755,6 @@ class SkyServeController:
     def _get_replica_counts(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
-        include_unit: bool = True,
     ) -> dict[str, Any]:
         """Return logical capacity and physical backend status aggregates."""
         autoscaler = getattr(self, '_autoscaler', None)
@@ -1887,9 +1852,8 @@ class SkyServeController:
                                 'target_num_replicas_by_accelerator', {})
         if isinstance(demand_target, dict) and demand_target:
             counts['demand_target_by_accelerator'] = dict(demand_target)
-        if include_unit:
-            counts['replica_unit'] = ('logical_slot'
-                                      if logical else 'physical_backend')
+        counts['replica_unit'] = ('logical_slot'
+                                  if logical else 'physical_backend')
         return counts
 
     def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:

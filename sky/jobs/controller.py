@@ -1661,12 +1661,22 @@ class JobController:
         }
 
         async def cancel_remaining_monitors() -> None:
-            """Cancel and join monitor tasks still owned by this scope."""
+            """Cancel and join monitors without interrupting their cleanup."""
             remaining_tasks = list(monitor_async_tasks.values())
             for monitor_task in remaining_tasks:
                 monitor_task.cancel()
             if remaining_tasks:
-                await asyncio.gather(*remaining_tasks, return_exceptions=True)
+                join_future = asyncio.gather(*remaining_tasks,
+                                             return_exceptions=True)
+                while True:
+                    try:
+                        await asyncio.shield(join_future)
+                        break
+                    except asyncio.CancelledError:  # noqa: ASYNC103
+                        # The owning scope already records and re-raises its
+                        # first cancellation. Delay later cancellations until
+                        # every child has finished its own cleanup.
+                        continue  # noqa: ASYNC104
 
         try:
             # Monitor with primary/auxiliary termination logic
@@ -2244,6 +2254,20 @@ class ControllerManager:
 
     # Use context.contextual to enable per-job output redirection and env var
     # isolation.
+    @asyncio_utils.shield
+    async def _release_job_loop_ownership(self, job_id: int) -> None:
+        """Release manager bookkeeping even under repeated cancellation."""
+        async with self._job_tasks_lock:
+            if job_id in self.starting:
+                self.starting.remove(job_id)
+                self._starting_signal.notify()
+            self.job_tasks.pop(job_id, None)
+
+        # A cancellation that lands after the job task already finished
+        # stores cancel info that no CancelledError handler will consume.
+        async with self._cancel_info_lock:
+            self._cancel_info.pop(job_id, None)
+
     @context.contextual_async
     async def run_job_loop(self,
                            job_id: int,
@@ -2256,16 +2280,9 @@ class ControllerManager:
             # Own launch admission at the outermost scope. Initialization can
             # fail before _run_job_loop reaches its durable-cleanup try/finally;
             # leaking this slot would stop a saturated controller indefinitely.
-            async with self._job_tasks_lock:
-                if job_id in self.starting:
-                    self.starting.remove(job_id)
-                    self._starting_signal.notify()
-                self.job_tasks.pop(job_id, None)
-
-            # A cancellation that lands after the job task already finished
-            # stores cancel info that no CancelledError handler will consume.
-            async with self._cancel_info_lock:
-                self._cancel_info.pop(job_id, None)
+            # Shield the complete two-lock cleanup so a repeated cancellation
+            # cannot strand launch capacity or stale ownership indefinitely.
+            await self._release_job_loop_ownership(job_id)
 
     async def _run_job_loop(self,
                             job_id: int,
