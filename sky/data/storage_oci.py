@@ -276,15 +276,20 @@ class OciStore(AbstractStore):
 
         @oci.with_oci_env
         def get_file_sync_command(base_dir_path, file_names):
-            includes = ' '.join(
-                [f'--include "{file_name}"' for file_name in file_names])
+            includes = ' '.join([
+                f'--include {shlex.quote(file_name)}'
+                for file_name in file_names
+            ])
             prefix_arg = ''
             if sub_path:
-                prefix_arg = f'--object-prefix "{sub_path.strip("/")}"'
+                prefix_arg = (
+                    f'--object-prefix {shlex.quote(sub_path.strip("/"))}')
             sync_command = (
                 'oci os object bulk-upload --no-follow-symlinks --overwrite '
-                f'--bucket-name {self.name} --namespace-name {self.namespace} '
-                f'--region {self.region} --src-dir "{base_dir_path}" '
+                f'--bucket-name {shlex.quote(self.name)} '
+                f'--namespace-name {shlex.quote(self.namespace)} '
+                f'--region {shlex.quote(str(self.region))} '
+                f'--src-dir {shlex.quote(base_dir_path)} '
                 f'{prefix_arg} '
                 f'{includes}')
 
@@ -305,10 +310,11 @@ class OciStore(AbstractStore):
             # we exclude .git directory from the sync
             sync_command = (
                 'oci os object bulk-upload --no-follow-symlinks --overwrite '
-                f'--bucket-name {self.name} --namespace-name {self.namespace} '
-                f'--region {self.region} '
-                f'--object-prefix "{sub_path}{dest_dir_name}" '
-                f'--src-dir "{src_dir_path}" {excludes}')
+                f'--bucket-name {shlex.quote(self.name)} '
+                f'--namespace-name {shlex.quote(self.namespace)} '
+                f'--region {shlex.quote(str(self.region))} '
+                f'--object-prefix {shlex.quote(sub_path + dest_dir_name)} '
+                f'--src-dir {shlex.quote(src_dir_path)} {excludes}')
 
             return sync_command
 
@@ -439,10 +445,13 @@ class OciStore(AbstractStore):
 
         @oci.with_oci_env
         def get_file_download_command(remote_path, local_path):
-            download_command = (f'oci os object get --bucket-name {self.name} '
-                                f'--namespace-name {self.namespace} '
-                                f'--region {self.region} --name {remote_path} '
-                                f'--file {local_path}')
+            download_command = (
+                'oci os object get '
+                f'--bucket-name {shlex.quote(self.name)} '
+                f'--namespace-name {shlex.quote(self.namespace)} '
+                f'--region {shlex.quote(str(self.region))} '
+                f'--name {shlex.quote(remote_path)} '
+                f'--file {shlex.quote(local_path)}')
 
             return download_command
 
@@ -498,9 +507,9 @@ class OciStore(AbstractStore):
 
         @oci.with_oci_env
         def get_bucket_delete_command(bucket_name):
-            remove_command = (f'oci os bucket delete '
-                              f'--bucket-name {bucket_name} '
-                              f'--region {self.region} '
+            remove_command = ('oci os bucket delete '
+                              f'--bucket-name {shlex.quote(bucket_name)} '
+                              f'--region {shlex.quote(str(self.region))} '
                               f'--empty --force')
 
             return remove_command
@@ -549,11 +558,11 @@ class OciStore(AbstractStore):
 
         @oci.with_oci_env
         def get_bulk_delete_command(bucket_name, prefix):
-            remove_command = (f'oci os object bulk-delete '
-                              f'--namespace-name {self.namespace} '
-                              f'--bucket-name {bucket_name} '
-                              f'--region {self.region} '
-                              f'--prefix "{prefix}/" --force')
+            remove_command = ('oci os object bulk-delete '
+                              f'--namespace-name {shlex.quote(self.namespace)} '
+                              f'--bucket-name {shlex.quote(bucket_name)} '
+                              f'--region {shlex.quote(str(self.region))} '
+                              f'--prefix {shlex.quote(prefix + "/")} --force')
 
             return remove_command
 
