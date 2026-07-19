@@ -549,6 +549,11 @@ def handle_concurrent_worker_exhausted_error(
         })
 
 
+async def _read_html_template(template_name: str) -> str:
+    template_path = pathlib.Path(__file__).parent / 'html' / template_name
+    return await asyncio.to_thread(template_path.read_text, encoding='utf-8')
+
+
 @app.get('/token')
 async def token(request: fastapi.Request,
                 local_port: int | None = None) -> fastapi.responses.Response:
@@ -557,11 +562,8 @@ async def token(request: fastapi.Request,
     base64_str = _generate_auth_token(request)
     user = _get_auth_user_header(request)
 
-    html_dir = pathlib.Path(__file__).parent / 'html'
-    token_page_path = html_dir / 'token_page.html'
     try:
-        with open(token_page_path, encoding='utf-8') as f:
-            html_content = f.read()
+        html_content = await _read_html_template('token_page.html')
     except FileNotFoundError as e:
         raise fastapi.HTTPException(
             status_code=500, detail='Token page template not found.') from e
@@ -665,10 +667,7 @@ async def authorize_page(
     user_info = html.escape(
         f'Logged in as {user.name}') if user is not None else ''
 
-    html_dir = pathlib.Path(__file__).parent / 'html'
-    authorize_page_path = html_dir / 'authorize_page.html'
-    with open(authorize_page_path, encoding='utf-8') as f:
-        html_content = f.read()
+    html_content = await _read_html_template('authorize_page.html')
 
     html_content = html_content.replace('USER_PLACEHOLDER', user_info)
 
@@ -1677,9 +1676,7 @@ async def stream(
     if use_html:
         # Return HTML page with JavaScript to handle streaming
         stream_url = request.url.include_query_params(format='plain')
-        html_dir = pathlib.Path(__file__).parent / 'html'
-        with open(html_dir / 'log.html', encoding='utf-8') as file:
-            html_content = file.read()
+        html_content = await _read_html_template('log.html')
         html_content = html_content.replace(
             '{stream_url}',  # noqa: RUF027
             str(stream_url))
