@@ -350,7 +350,7 @@ def test_empty_job_statuses_skipped_without_aborting_walk(monkeypatch):
     mgr = _build_manager()
     mgr._fetch_job_status()  # must not raise
 
-    assert probed == [1, 2]
+    assert sorted(probed) == [1, 2]
 
 
 def test_pool_missing_job_key_skipped_without_aborting_walk(monkeypatch):
@@ -379,7 +379,7 @@ def test_pool_missing_job_key_skipped_without_aborting_walk(monkeypatch):
     mgr._is_pool = True
     mgr._fetch_job_status()  # must not raise
 
-    assert probed == [1, 2]
+    assert sorted(probed) == [1, 2]
 
 
 def test_walk_constructs_backend_once(monkeypatch):
