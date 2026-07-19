@@ -872,7 +872,7 @@ class TestJobGroupRecovery:
         job_controller._monitor_job_group_task.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_job_group_parent_cancellation_joins_monitor_children(
+    async def test_job_group_repeated_parent_cancellation_joins_monitors(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
         mock_dag.tasks = mock_dag.tasks[:2]
@@ -883,7 +883,10 @@ class TestJobGroupRecovery:
                                                        executors[1])])
 
         all_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
         started = set()
+        cleaning_up = set()
         cancelled = set()
 
         async def monitor(task_id, *_args):
@@ -895,7 +898,10 @@ class TestJobGroupRecovery:
             except asyncio.CancelledError:
                 # Model cancellation cleanup that must finish before the
                 # owning JobGroup coroutine may exit.
-                await asyncio.sleep(0)
+                cleaning_up.add(task_id)
+                if len(cleaning_up) == 2:
+                    cleanup_started.set()
+                await allow_cleanup.wait()
                 cancelled.add(task_id)
                 raise
 
@@ -919,6 +925,11 @@ class TestJobGroupRecovery:
             run_task = asyncio.create_task(job_controller._run_job_group())
             await asyncio.wait_for(all_started.wait(), timeout=1)
             run_task.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_cleanup.set()
             with pytest.raises(asyncio.CancelledError):
                 await run_task
 
