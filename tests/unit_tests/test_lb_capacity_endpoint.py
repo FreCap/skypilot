@@ -344,9 +344,41 @@ class TestCapacityEndpoint(unittest.TestCase):
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
 
         self.assertEqual(body['ready_replicas'], 0)
+        self.assertEqual(body['materialized_slots'], 8)
         self.assertEqual(body['total_slots'], 0)
         self.assertEqual(body['free_slots'], 0)
         self.assertEqual(body['current_capacity'], 0)
+        self.assertEqual(body['occupancy_fresh_backend_count'], 0)
+        self.assertEqual(body['occupancy_unknown_ready_backend_count'], 1)
+
+    def test_logical_inventory_is_stable_during_partial_sampling(self):
+        sampled = 'http://sampled-four-gpu:8080'
+        unknown = 'http://unknown-four-gpu:8080'
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([sampled, unknown])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'max_replicas': 16,
+            'configured_max_replicas': 16,
+            'planned_capacity_by_url': {
+                sampled: 4,
+                unknown: 4,
+            },
+        }
+        balancer._replica_occupancy = {sampled: 0}
+        balancer._replica_total_slots = {sampled: 4}
+        balancer._replica_free_slots = {sampled: 4}
+        balancer._last_occupancy_probe_time = time.monotonic()
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['materialized_slots'], 8)
+        self.assertEqual(body['ready_replicas'], 0)
+        self.assertEqual(body['free_slots'], 4)
+        self.assertEqual(body['occupancy_fresh_backend_count'], 1)
+        self.assertEqual(body['occupancy_unknown_ready_backend_count'], 1)
 
     def test_logical_mode_caps_runtime_slots_at_pinned_width(self):
         url = 'http://eight-gpu:8080'

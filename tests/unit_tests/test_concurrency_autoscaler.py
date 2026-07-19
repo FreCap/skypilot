@@ -553,6 +553,7 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                 observed_slots={1: 0})
 
         self.assertEqual(_decisions(autoscaler, [backend]), [])
+        self.assertEqual(autoscaler.get_ready_replica_capacity(backend), 8)
         self.assertEqual(autoscaler._ready_capacity(backend), 0)
         self.assertEqual(autoscaler._committed_capacity(backend), 8)
 

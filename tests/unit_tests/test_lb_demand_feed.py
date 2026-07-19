@@ -713,6 +713,32 @@ def test_sync_payload_proves_valid_occupancy_sample():
     assert captured['json']['occupancy_sample_generation'] == {url: 7}
 
 
+def test_sync_payload_excludes_retained_probe_miss_from_idle_proof():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([url])
+
+    results = [(0, 4, 4), None]
+
+    async def _fetch(session, selected_url):
+        del session
+        assert selected_url == url
+        return results.pop(0)
+
+    lb._fetch_replica_occupancy = _fetch
+    asyncio.run(lb._probe_replica_occupancy_once())
+    asyncio.run(lb._probe_replica_occupancy_once())
+
+    with lb._client_pool_lock:
+        assert lb._effective_replica_free_slots_locked() == {url: 4}
+    captured = _run_sync(lb, {'replica_info': {}})
+    assert url not in (captured['json']['in_flight'] or {})
+    assert captured['json']['unknown_in_flight_urls'] == [url]
+    assert captured['json']['occupancy_sampled_urls'] == []
+    assert captured['json']['total_slots_by_url'] == {}
+    assert captured['json']['occupancy_sample_generation'] == {}
+
+
 def test_old_controller_omission_preserves_async_declaration():
     url = 'http://async:8080'
     lb = _make_lb()

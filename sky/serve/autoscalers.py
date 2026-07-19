@@ -2527,7 +2527,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def get_ready_replica_capacity(self,
                                    info: 'replica_managers.ReplicaInfo') -> int:
         if self.replica_unit == 'logical':
-            return self._ready_capacity(info)
+            # Public status reports materialized GPU inventory. Occupancy
+            # freshness remains a separate safety signal: internal scale-down,
+            # replacement, and retirement paths call `_ready_capacity()`
+            # directly and continue to fail closed on unknown observations.
+            return (max(1, int(self._replica_capacity(info)))
+                    if info.is_ready else 0)
         return super().get_ready_replica_capacity(info)
 
     def _cost_rebalance_replica_capacity(

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from unittest import mock
 
 from sky.serve import constants
 from sky.serve import lb_ha_observability as lb_ha_obs
@@ -32,6 +33,11 @@ def _role_payload(replica_count: int) -> dict:
         }
         lb._occupancy_sample_time = {  # pylint: disable=protected-access
             url: now for url in urls
+        }
+        lb._occupancy_current_round_sampled_urls = set(  # pylint: disable=protected-access
+            urls)
+        lb._occupancy_sample_role_epoch = {  # pylint: disable=protected-access
+            url: lb._occupancy_role_epoch for url in urls  # pylint: disable=protected-access
         }
     return lb._ha_role_payload()  # pylint: disable=protected-access
 
@@ -74,6 +80,105 @@ def test_full_role_and_routing_payload_sizes_cover_fleet_scale(monkeypatch):
     # optimization trigger; representative runtime latency remains the gate.
     assert role_sizes[-1] < 1024 * 1024
     assert routing_sizes[-1] < 1024 * 1024
+
+
+def test_role_payload_excludes_retained_sample_after_probe_miss(monkeypatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'retained-sample-pod')
+    lb = load_balancer.SkyServeLoadBalancer('http://controller',
+                                            8890,
+                                            service_hash='incarnation',
+                                            lb_slot='a')
+    url = 'http://worker:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])  # pylint: disable=protected-access
+    results = [(0, 4, 4), None]
+
+    async def _fetch(session, selected_url):
+        del session
+        assert selected_url == url
+        return results.pop(0)
+
+    lb._fetch_replica_occupancy = _fetch  # pylint: disable=protected-access
+    asyncio.run(lb._probe_replica_occupancy_once())  # pylint: disable=protected-access
+    asyncio.run(lb._probe_replica_occupancy_once())  # pylint: disable=protected-access
+
+    with lb._client_pool_lock:  # pylint: disable=protected-access
+        assert lb._effective_replica_free_slots_locked() == {url: 4}  # pylint: disable=protected-access
+    payload = lb._ha_role_payload()  # pylint: disable=protected-access
+    assert payload['async_occupancy'] == {}
+    assert payload['occupancy_sample_generation'] == {}
+    assert payload['occupancy_sample_age_seconds'] == {}
+    assert payload['unknown_in_flight_urls'] == [url]
+
+
+def test_active_role_transition_invalidates_then_immediately_reprobes(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'promotion-pod')
+    lb = load_balancer.SkyServeLoadBalancer('http://controller',
+                                            8890,
+                                            service_hash='incarnation',
+                                            lb_slot='a')
+    url = 'http://worker:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])  # pylint: disable=protected-access
+    lb._replica_occupancy = {url: 0}  # pylint: disable=protected-access
+    lb._replica_total_slots = {url: 4}  # pylint: disable=protected-access
+    lb._replica_free_slots = {url: 4}  # pylint: disable=protected-access
+    lb._occupancy_sample_generation = {url: 0}  # pylint: disable=protected-access
+    lb._occupancy_sample_time = {url: time.monotonic()}  # pylint: disable=protected-access
+    lb._occupancy_current_round_sampled_urls = {url}  # pylint: disable=protected-access
+    lb._occupancy_sample_role_epoch = {url: 0}  # pylint: disable=protected-access
+
+    class _RoleResponse:
+        """Minimal successful controller role response."""
+
+        status = 200
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            del exc
+            return False
+
+        async def json(self):
+            return {
+                'role': 'ACTIVE',
+                'generation': 2,
+                'outcome': 'success',
+            }
+
+    class _RoleSession:
+        """Minimal aiohttp session returning the role response."""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            del exc
+            return False
+
+        def post(self, *args, **kwargs):
+            del args, kwargs
+            return _RoleResponse()
+
+    async def _assert_invalidated_then_probe():
+        assert lb._replica_occupancy == {}  # pylint: disable=protected-access
+        assert lb._replica_total_slots == {}  # pylint: disable=protected-access
+        assert lb._replica_free_slots == {}  # pylint: disable=protected-access
+        assert lb._occupancy_sample_time == {}  # pylint: disable=protected-access
+        assert lb._lb_role.value == 'ACTIVE'  # pylint: disable=protected-access
+        assert lb._lb_role_generation == 2  # pylint: disable=protected-access
+        assert lb._occupancy_role_epoch == 1  # pylint: disable=protected-access
+
+    reprobe = mock.AsyncMock(side_effect=_assert_invalidated_then_probe)
+    monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession', _RoleSession)
+    monkeypatch.setattr(load_balancer.serve_utils, 'get_lb_sync_auth_tokens',
+                        lambda required: ('token',))
+    monkeypatch.setattr(lb, '_probe_replica_occupancy_once', reprobe)
+
+    asyncio.run(lb._sync_role_with_controller_once())  # pylint: disable=protected-access
+
+    reprobe.assert_awaited_once_with()
 
 
 def test_runtime_stats_are_bounded_and_classify_unknown_outcomes():
