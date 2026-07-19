@@ -38,6 +38,16 @@ def test_get_free_worker_resources_uses_grouped_pool_resource_lookup():
                            'get_replica_infos',
                            return_value=[replica_a, replica_b]), \
          mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             side_effect=lambda names:
+             {name: {'handle': object()} for name in names}) as get_clusters, \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_handle_from_cluster_name',
+             side_effect=AssertionError(
+                 'per-worker cluster-record read used')), \
+         mock.patch.object(
              serve_utils.managed_job_state,
              'get_pool_worker_used_resources_by_cluster',
              return_value={
@@ -55,6 +65,7 @@ def test_get_free_worker_resources_uses_grouped_pool_resource_lookup():
         free_resources = serve_utils.get_free_worker_resources('pool-a')
 
     grouped_usage.assert_called_once_with('pool-a')
+    get_clusters.assert_called_once_with(['replica-a', 'replica-b'])
     assert free_resources is not None
     assert float(free_resources['replica-a'].cpus) == pytest.approx(6.0)
     assert free_resources['replica-b'].is_empty()
@@ -287,3 +298,38 @@ def test_get_next_cluster_name_persists_chosen_heterogeneous_resource():
     # The fit decision is computed once per option during candidate
     # enumeration and not recomputed for the selected worker.
     assert task_fits.call_count == 2
+
+
+def test_get_free_worker_resources_skips_worker_missing_cluster_record():
+    """A worker whose cluster record is absent from the batched snapshot
+    (terminated between snapshot and walk) maps to None without a fallback
+    per-name cluster read."""
+    replica_a = _mock_pool_replica(1,
+                                   'replica-a',
+                                   launched_resources=Resources(cpus='8'))
+    replica_gone = _mock_pool_replica(2, 'replica-gone')
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[replica_a, replica_gone]), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             return_value={
+                 'replica-a': {'handle': object()},
+                 'replica-gone': None,
+             }), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_handle_from_cluster_name',
+             side_effect=AssertionError(
+                 'missing record must not trigger a per-name read')), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={'replica-a': Resources(cpus='2')}):
+        free_resources = serve_utils.get_free_worker_resources('pool-a')
+
+    assert free_resources is not None
+    assert float(free_resources['replica-a'].cpus) == pytest.approx(6.0)
+    assert free_resources['replica-gone'] is None
+    replica_gone.handle.assert_not_called()

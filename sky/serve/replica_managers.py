@@ -5328,6 +5328,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         refresh or a log sync while holding it.
         """
         infos = serve_state.get_replica_infos(self._service_name)
+        # Snapshot every replica's cluster record in one batched read; the
+        # per-replica ``info.handle()`` fallback would issue one cluster-table
+        # read per replica per fetch round.
+        cluster_records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in infos])
         # A setup error in a new version is commonly version-wide. Sample one
         # trackable latest-version replica before the serial full-fleet walk so
         # a bad rollout is stopped without waiting behind every old replica.
@@ -5342,7 +5347,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # We use backend API to avoid usage collection in the
             # sdk.job_status.
             backend = backends.CloudVmRayBackend()
-            handle = info.handle()
+            cluster_record = cluster_records.get(info.cluster_name)
+            handle = None if cluster_record is None else info.handle(
+                cluster_record)
             if handle is None:
                 # The walk runs lock-free, so the replica's cluster record can
                 # vanish mid-walk (a scale-down or preemption cleanup
