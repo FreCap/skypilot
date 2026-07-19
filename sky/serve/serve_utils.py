@@ -2207,11 +2207,18 @@ def get_free_worker_resources(
                        f'{pool!r}; disabling resource-aware scheduling')
         return None
 
+    # Snapshot every worker's cluster record in one batched read; the
+    # per-replica ``handle()`` fallback would issue one cluster-table read
+    # per worker on every scheduling attempt.
+    cluster_records = global_user_state.get_clusters_from_names(
+        [replica_info.cluster_name for replica_info in replicas])
     for replica_info in replicas:
         cluster_name = replica_info.cluster_name
 
         # Get cluster handle
-        handle = replica_info.handle()
+        cluster_record = cluster_records.get(cluster_name)
+        handle = (None if cluster_record is None else
+                  replica_info.handle(cluster_record))
         if handle is None or handle.launched_resources is None:
             free_resources[cluster_name] = None
             continue

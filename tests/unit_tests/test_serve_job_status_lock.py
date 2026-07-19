@@ -15,6 +15,8 @@ deterministic (uses Events, not sleeps).
 """
 import threading
 
+import pytest
+
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -34,6 +36,16 @@ def _tracked_replica(replica_id: int,
     # SUCCEEDED + no down -> should_track_service_status() is True.
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     return info
+
+
+@pytest.fixture(autouse=True)
+def _batched_cluster_records(monkeypatch):
+    """The walk resolves handles from one batched cluster-record read."""
+    monkeypatch.setattr(
+        replica_managers.global_user_state, 'get_clusters_from_names',
+        lambda names: {name: {
+            'handle': object()
+        } for name in names})
 
 
 def _build_manager():
@@ -219,3 +231,80 @@ def test_user_failure_path_skips_replica_scheduled_down(monkeypatch):
     assert not fresh.status_property.user_app_failed
     assert writes == []
     assert terminated == []
+
+
+def test_walk_batches_cluster_records_into_one_read(monkeypatch):
+    """The walk must resolve every replica's handle from ONE batched
+    cluster-record read; a per-replica cluster-table fallback re-introduces
+    N serialized DB reads per fetch round."""
+    replicas = [_tracked_replica(i) for i in (1, 2, 3)]
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    batch_calls = []
+
+    def _get_clusters_from_names(names):
+        batch_calls.append(list(names))
+        return {name: {'handle': object()} for name in names}
+
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'get_clusters_from_names', _get_clusters_from_names)
+    monkeypatch.setattr(
+        replica_managers.global_user_state, 'get_handle_from_cluster_name',
+        lambda name: pytest.fail(
+            'the walk must not read cluster records one at a time'))
+
+    seen_records = []
+
+    def _handle(self, cluster_record=None):
+        seen_records.append(cluster_record)
+        return object()
+
+    monkeypatch.setattr(replica_managers.ReplicaInfo, 'handle', _handle)
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status',
+                        lambda self, handle, job_ids, stream_logs=False:
+                        {1: job_lib.JobStatus.RUNNING})
+
+    mgr = _build_manager()
+    mgr._fetch_job_status()
+
+    assert batch_calls == [['c1', 'c2', 'c3']]
+    assert len(seen_records) == 3
+    assert all(record is not None for record in seen_records)
+
+
+def test_walk_skips_replica_missing_from_batched_records(monkeypatch):
+    """A replica whose cluster record is absent from the batched snapshot
+    (row deleted between snapshot and walk) is skipped without a fallback
+    per-name read and without aborting the walk."""
+    replicas = [_tracked_replica(1), _tracked_replica(2)]
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'get_clusters_from_names', lambda names: {
+                            'c1': None,
+                            'c2': {
+                                'handle': object()
+                            }
+                        })
+    monkeypatch.setattr(
+        replica_managers.global_user_state, 'get_handle_from_cluster_name',
+        lambda name: pytest.fail(
+            'missing record must not trigger a per-name fallback read'))
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: object())
+
+    probed = []
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status',
+                        lambda self, handle, job_ids, stream_logs=False:
+                        (probed.append(handle) or {
+                            1: job_lib.JobStatus.RUNNING
+                        }))
+
+    mgr = _build_manager()
+    mgr._fetch_job_status()  # must not raise
+
+    assert len(probed) == 1, 'the replica with a record must still be checked'
