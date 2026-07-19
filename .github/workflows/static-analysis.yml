@@ -34,6 +34,11 @@ jobs:
           source ~/lint-env/bin/activate
           uv pip install ruff==0.15.21
           ruff check sky
+          # A mutable class default bypasses threading.local's per-thread
+          # attribute storage and is shared by every thread. RUF012 is noisy
+          # for intentional class constants, so scope it to local subclasses.
+          git grep -lE 'class .*\(threading\.local\)' -- sky \
+            | xargs ruff check --select RUF012
 
   basedpyright:
     runs-on: ubuntu-latest
