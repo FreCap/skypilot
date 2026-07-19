@@ -1,13 +1,16 @@
 """Characterization tests for the GCS storage backend facade."""
 
 # pylint: disable=protected-access
+import contextlib
 import pickle
+import shlex
 from unittest import mock
 
 import pytest
 
 from sky import exceptions
 from sky.data import storage as storage_lib
+from sky.data import storage_gcs
 
 
 def _gcs_store(**attributes) -> storage_lib.GcsStore:
@@ -96,6 +99,94 @@ def test_gcs_store_delete_preserves_external_bucket_with_sub_path():
 
     store._delete_sub_path.assert_called_once_with()
     store._delete_gcs_bucket.assert_not_called()
+
+
+def test_gcs_store_sub_path_delete_quotes_target_uri():
+    store = _gcs_store()
+    store.client = mock.Mock()
+    sub_path = 'prefix;echo_INJECTED'
+    target_uri = f'gs://{store.name}/{sub_path}'
+
+    with mock.patch.object(
+            storage_gcs.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_gcs.data_utils,
+                'get_gsutil_command',
+                return_value=('gsutil', 'true')), mock.patch.object(
+                    storage_gcs.subprocess, 'check_output') as check_output:
+        assert store._delete_gcs_bucket(store.name, sub_path)
+
+    command = check_output.call_args.args[0]
+    assert command.endswith(f'gsutil rm -r {shlex.quote(target_uri)}')
+
+
+def test_gcs_store_cp_quotes_source_paths_and_target_uri():
+    store = _gcs_store(_bucket_sub_path='prefix;echo_INJECTED')
+    source_paths = ['/tmp/file $(echo INJECTED)', '/tmp/other file']
+    commands = []
+
+    with mock.patch.object(
+            storage_gcs.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_gcs.data_utils,
+                'get_gsutil_command',
+                return_value=('gsutil', 'true')), mock.patch.object(
+                    storage_gcs.data_utils,
+                    'run_upload_cli',
+                    side_effect=lambda command, *_args, **_kwargs: commands.
+                    append(command)), mock.patch.object(
+                        storage_gcs.sky_logging,
+                        'generate_tmp_logging_file_path',
+                        return_value='/tmp/storage.log'):
+        store.batch_gsutil_cp(source_paths)
+
+    expected_sources = ' '.join(shlex.quote(path) for path in source_paths)
+    target_uri = f'gs://{store.name}/{store._bucket_sub_path}'
+    assert commands == [
+        f"true; printf '%s\\n' {expected_sources} | gsutil "
+        f'cp -e -n -r -I {shlex.quote(target_uri)}'
+    ]
+
+
+def test_gcs_store_rsync_quotes_patterns_and_target_uris():
+    store = _gcs_store(_bucket_sub_path='prefix;echo_INJECTED')
+    commands = {}
+
+    def capture_commands(_source_paths, file_command_generator,
+                         dir_command_generator, *_args, **_kwargs):
+        commands['file'] = file_command_generator(
+            '/tmp/base dir', ['file[1]', 'file;echo_INJECTED'])
+        commands['dir'] = dir_command_generator('/tmp/source dir',
+                                                'dest;echo_INJECTED')
+
+    with mock.patch.object(
+            storage_gcs.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_gcs.data_utils,
+                'get_gsutil_command',
+                return_value=('gsutil', 'true')), mock.patch.object(
+                    storage_gcs.data_utils,
+                    'parallel_upload',
+                    side_effect=capture_commands), mock.patch.object(
+                        storage_gcs.storage_utils,
+                        'get_excluded_files',
+                        return_value=[]), mock.patch.object(
+                            storage_gcs.sky_logging,
+                            'generate_tmp_logging_file_path',
+                            return_value='/tmp/storage.log'):
+        store.batch_gsutil_rsync(['/tmp/ignored'])
+
+    file_pattern = r'^(?!(?:file\[1\]|file;echo_INJECTED)$).*'
+    base_target = f'gs://{store.name}/{store._bucket_sub_path}'
+    assert commands['file'].endswith(
+        f'rsync -e -x {shlex.quote(file_pattern)} '
+        f"'/tmp/base dir' {shlex.quote(base_target)}")
+    assert commands['dir'].endswith(
+        f"rsync -e -r -x '(^\\.git/.*$)' '/tmp/source dir' "
+        f"{shlex.quote(base_target + '/dest;echo_INJECTED')}")
 
 
 def test_gcs_store_mount_command_delegates_provider_configuration():
