@@ -996,14 +996,16 @@ class SkyServeController:
                 authority,
                 observed_slots,
             )
-            self._replica_counts_snapshot = self._get_replica_counts(
-                replica_infos)
+            replica_counts = self._get_replica_counts(replica_infos)
+            self._replica_counts_snapshot = replica_counts
             response_content = {
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
                 'capacity_hint': self._get_capacity_hint(
-                    replica_infos, logical_versions),
+                    replica_infos,
+                    logical_versions,
+                    replica_counts=replica_counts),
                 'request_history_accepted': request_history_accepted,
             }
             if getattr(self, '_lb_ha_enabled', False):
@@ -1657,6 +1659,7 @@ class SkyServeController:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         logical_versions: set[int] | None = None,
+        replica_counts: dict[str, int | str] | None = None,
     ) -> dict[str, Any]:
         """Build the capacity_hint block of the sync response.
 
@@ -1706,7 +1709,13 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
             'configured_max_replicas': self._autoscaler.max_replicas,
         }
-        hint.update(self._get_replica_counts(replica_infos, include_unit=False))
+        if replica_counts is None:
+            replica_counts = self._get_replica_counts(replica_infos)
+        hint.update({
+            key: value
+            for key, value in replica_counts.items()
+            if key != 'replica_unit'
+        })
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -1724,7 +1733,6 @@ class SkyServeController:
     def _get_replica_counts(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
-        include_unit: bool = True,
     ) -> dict[str, int | str]:
         """Return logical capacity and physical backend status aggregates."""
         autoscaler = getattr(self, '_autoscaler', None)
@@ -1765,9 +1773,8 @@ class SkyServeController:
             'physical_total_replicas': physical_total,
             'physical_failed_replicas': physical_failed,
         }
-        if include_unit:
-            counts['replica_unit'] = ('logical_slot'
-                                      if logical else 'physical_backend')
+        counts['replica_unit'] = ('logical_slot'
+                                  if logical else 'physical_backend')
         return counts
 
     @staticmethod
