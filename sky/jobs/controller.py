@@ -1661,12 +1661,22 @@ class JobController:
         }
 
         async def cancel_remaining_monitors() -> None:
-            """Cancel and join monitor tasks still owned by this scope."""
+            """Cancel and join monitors without interrupting their cleanup."""
             remaining_tasks = list(monitor_async_tasks.values())
             for monitor_task in remaining_tasks:
                 monitor_task.cancel()
             if remaining_tasks:
-                await asyncio.gather(*remaining_tasks, return_exceptions=True)
+                join_future = asyncio.gather(*remaining_tasks,
+                                             return_exceptions=True)
+                while True:
+                    try:
+                        await asyncio.shield(join_future)
+                        break
+                    except asyncio.CancelledError:  # noqa: ASYNC103
+                        # The owning scope already records and re-raises its
+                        # first cancellation. Delay later cancellations until
+                        # every child has finished its own cleanup.
+                        continue  # noqa: ASYNC104
 
         try:
             # Monitor with primary/auxiliary termination logic
