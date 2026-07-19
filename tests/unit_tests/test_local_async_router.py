@@ -18,6 +18,10 @@ from sky.serve import local_async_router
 
 _ASYNC_PATH = '/async'
 _READINESS_PATH = '/ready'
+# Keep the fast-path deadline comfortably below the deliberately slow worker
+# timeout without assuming sub-second scheduling on a loaded CI runner.
+_SLOW_WORKER_TIMEOUT_SECONDS = 5
+_FAST_RESPONSE_TIMEOUT_SECONDS = 2
 
 
 @dataclasses.dataclass
@@ -367,8 +371,8 @@ async def test_restart_owner_discovery_returns_before_unrelated_slow_worker(
         _FakeWorker(status_gate=never_respond),
     ]
     worker_servers = [await _start_worker(worker) for worker in workers]
-    router_server = await _start_router(worker_servers,
-                                        status_timeout_seconds=1)
+    router_server = await _start_router(
+        worker_servers, status_timeout_seconds=_SLOW_WORKER_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession() as session:
             response = await asyncio.wait_for(
@@ -377,7 +381,7 @@ async def test_restart_owner_discovery_returns_before_unrelated_slow_worker(
                         'action': 'async_predict',
                         'request_id': 'accepted-before-router-restart',
                     }),
-                timeout=0.2,
+                timeout=_FAST_RESPONSE_TIMEOUT_SECONDS,
             )
             assert response.status == 200
             assert (await response.json())['status'] == 'IN_PROGRESS'
@@ -766,16 +770,16 @@ async def test_missing_owner_status_returns_before_unrelated_slow_worker(
         _FakeWorker(status_gate=never_respond),
     ]
     worker_servers = [await _start_worker(worker) for worker in workers]
-    router_server = await _start_router(worker_servers,
-                                        status_timeout_seconds=1)
+    router_server = await _start_router(
+        worker_servers, status_timeout_seconds=_SLOW_WORKER_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession() as session:
-            response = await asyncio.wait_for(_post(
-                session, router_server, {
+            response = await asyncio.wait_for(
+                _post(session, router_server, {
                     'action': 'async_status',
                     'request_id': 'preexisting',
                 }),
-                                              timeout=0.2)
+                timeout=_FAST_RESPONSE_TIMEOUT_SECONDS)
             assert response.status == 200
             assert (await response.json())['status'] == 'IN_PROGRESS'
     finally:
@@ -812,13 +816,13 @@ async def test_readiness_returns_before_unrelated_slow_worker() -> None:
         _FakeWorker(readiness_gate=never_respond),
     ]
     worker_servers = [await _start_worker(worker) for worker in workers]
-    router_server = await _start_router(worker_servers,
-                                        readiness_timeout_seconds=1)
+    router_server = await _start_router(
+        worker_servers, readiness_timeout_seconds=_SLOW_WORKER_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession() as session:
-            response = await asyncio.wait_for(session.get(
-                router_server.make_url(_READINESS_PATH)),
-                                              timeout=0.2)
+            response = await asyncio.wait_for(
+                session.get(router_server.make_url(_READINESS_PATH)),
+                timeout=_FAST_RESPONSE_TIMEOUT_SECONDS)
             assert response.status == 200
     finally:
         never_respond.set()
