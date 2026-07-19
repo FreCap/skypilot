@@ -386,6 +386,14 @@ class StrategyExecutor:
         job_checking_retry_cnt = 0
         while job_checking_retry_cnt < MAX_JOB_CHECKING_RETRY:
             # Avoid the infinite loop, if any bug happens.
+            if job_checking_retry_cnt > 0:
+                # Pace every retry (including transient-error paths that
+                # `continue`), so the loop spans the intended
+                # MAX_JOB_CHECKING_RETRY * GAP wall-clock budget instead of
+                # burning all retries back-to-back while the cluster or
+                # network is flaky.
+                await asyncio.sleep(
+                    managed_job_utils.JOB_STARTED_STATUS_CHECK_GAP_SECONDS)
             job_checking_retry_cnt += 1
             try:
                 cluster_status, _ = (await asyncio.to_thread(
@@ -461,9 +469,6 @@ class StrategyExecutor:
                     logger.info(f'Unexpected Exception: {e}\nFailed to get '
                                 'the job start timestamp. Retrying.')
                     continue
-            # Wait for the job to be started
-            await asyncio.sleep(
-                managed_job_utils.JOB_STARTED_STATUS_CHECK_GAP_SECONDS)
         return None
 
     def _cleanup_cluster(self) -> None:
