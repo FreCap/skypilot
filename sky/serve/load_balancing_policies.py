@@ -247,16 +247,18 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
         if not candidates:
             return None
         with self.lock:
-            min_load = min(
-                self._effective_load(replica) for replica in candidates)
+            # Score each candidate exactly once: this runs per proxied
+            # request, and _effective_load reads two maps per call.
+            replica_loads = [(replica, self._effective_load(replica))
+                             for replica in candidates]
+            min_load = min(load for _, load in replica_loads)
             # Random tie-break: deterministic min() over URL order biases
             # cold starts (all-zero loads) onto the same replica wave
             # after wave.
-            candidates = [
-                replica for replica in candidates
-                if self._effective_load(replica) == min_load
+            tie_break = [
+                replica for replica, load in replica_loads if load == min_load
             ]
-            return random.choice(candidates)
+            return random.choice(tie_break)
 
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> Any | None:
