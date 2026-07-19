@@ -314,7 +314,7 @@ class StrategyExecutor:
             return
         handle = await asyncio.to_thread(
             global_user_state.get_handle_from_cluster_name, self.cluster_name)
-        if handle is None or self.pool is not None:
+        if handle is None:
             return
         try:
             usage_lib.messages.usage.set_internal()
@@ -346,6 +346,8 @@ class StrategyExecutor:
                     _try_cancel_if_cluster_is_init=True,
                 )
             else:
+                assert self.job_id_on_pool_cluster is not None, (
+                    'A recovering pool job must have its assigned job ID.')
                 request_id = await asyncio.to_thread(
                     sdk.cancel,
                     cluster_name=self.cluster_name,
@@ -358,13 +360,19 @@ class StrategyExecutor:
                 request_id,
             )
         except Exception as e:  # pylint: disable=broad-except
-            logger.info('Failed to cancel the job on the cluster. The cluster '
-                        'might be already down or the head node is preempted.'
-                        '\n  Detailed exception: '
-                        f'{common_utils.format_exception(e)}\n'
-                        'Terminating the cluster explicitly to ensure no '
-                        'remaining job process interferes with recovery.')
-            await asyncio.to_thread(self._cleanup_cluster)
+            message = ('Failed to cancel the job on the cluster. The cluster '
+                       'might be already down or the head node is preempted.'
+                       '\n  Detailed exception: '
+                       f'{common_utils.format_exception(e)}\n')
+            if self.pool is None:
+                logger.info(
+                    f'{message}Terminating the cluster explicitly to ensure no '
+                    'remaining job process interferes with recovery.')
+                await asyncio.to_thread(self._cleanup_cluster)
+            else:
+                logger.info(
+                    f'{message}Leaving the shared pool cluster running while '
+                    'recovery continues.')
 
     async def _wait_until_job_starts_on_cluster(self) -> float | None:
         """Wait for MAX_JOB_CHECKING_RETRY times until job starts on the cluster

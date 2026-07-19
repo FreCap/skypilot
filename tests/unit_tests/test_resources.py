@@ -785,6 +785,24 @@ def test_image_id_dual_pickle_round_trip():
     assert migrated._docker_image is None
 
 
+@pytest.mark.parametrize(
+    ('version', 'legacy_field'),
+    [(17, '_spot_recovery'), (18, '_job_recovery')],
+)
+def test_legacy_job_recovery_pickle_is_normalized(version, legacy_field):
+    legacy = Resources()
+    state = dict(legacy.__dict__)
+    state.pop('_job_recovery', None)
+    state['_version'] = version
+    state[legacy_field] = 'FAILOVER'
+
+    migrated = Resources.__new__(Resources)
+    migrated.__setstate__(state)
+
+    assert migrated.job_recovery == {'strategy': 'FAILOVER'}
+    migrated._try_validate_managed_job_attributes()  # pylint: disable=protected-access
+
+
 def test_network_tier_basic():
     """Test basic network tier functionality and validation."""
     # Test with no network_tier specified (defaults to None)
