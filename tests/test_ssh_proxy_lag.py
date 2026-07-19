@@ -240,9 +240,10 @@ async def run_endpoint_test(
         baseline = await monitor.measure_baseline()
         print(f"   Baseline: {baseline*1000:.1f}ms")
 
-    monitor.clear()
-
     for _ in range(3):
+        # Each retry is an independent measurement. Retaining samples from a
+        # noisy attempt prevents later healthy retries from recovering.
+        monitor.clear()
         # Run concurrent requests while monitoring SSH
         ssh_task = asyncio.create_task(monitor.monitor_during_operation())
         test_tasks = []
@@ -277,6 +278,36 @@ async def run_endpoint_test(
         'degradation': degradation,
         'blocking': blocking
     }
+
+
+@pytest.mark.asyncio
+async def test_endpoint_retries_use_independent_latency_samples():
+    """A noisy attempt must not poison later healthy measurements."""
+
+    class RetrySampleMonitor(SSHLatencyMonitor):
+        """Deterministic latency samples for retry-behavior validation."""
+
+        def __init__(self):
+            super().__init__()
+            self.baseline = 1
+            self.attempts = 0
+
+        async def monitor_during_operation(self):
+            self.attempts += 1
+            self.latencies.append(100 if self.attempts == 1 else 1)
+            return self.latencies[-1]
+
+    async def endpoint_func():
+        return None
+
+    retry_monitor = RetrySampleMonitor()
+    result = await run_endpoint_test(endpoint_func,
+                                     retry_monitor,
+                                     num_concurrent=1,
+                                     expected_degradation_threshold=10)
+
+    assert not result['blocking']
+    assert retry_monitor.attempts == 2
 
 
 # ========== CATEGORY 1: API REQUEST ENDPOINTS ==========
