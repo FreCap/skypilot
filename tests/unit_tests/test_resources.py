@@ -1149,6 +1149,15 @@ def test_memory_conversion():
         Resources(memory='invalid')
 
 
+def test_empty_accelerators_rejected():
+    with pytest.raises(ValueError,
+                       match='must contain at least one accelerator'):
+        Resources(accelerators={})
+
+    with pytest.raises(ValueError, match='accelerators'):
+        Resources.from_yaml_config({'accelerators': {}})
+
+
 def test_autostop_time_format():
     """Test autostop time format parsing."""
     # Test minutes format
