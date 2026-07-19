@@ -184,6 +184,29 @@ class RequestIDMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         return response
 
 
+def _cleanup_download_tmp_once() -> None:
+    """Synchronously delete expired download temporary directories."""
+    tmp_dir = bs.get_blob_storage().download_tmp_base_dir()
+    if tmp_dir is None:
+        # Backend shares the persistent log dir; no separate cleanup needed.
+        return
+    if not os.path.exists(tmp_dir):
+        return
+    cutoff = time.time() - bs.GC_GRACE_SECONDS
+    with os.scandir(tmp_dir) as user_entries:
+        for user_entry in user_entries:
+            if not user_entry.is_dir():
+                continue
+            with os.scandir(user_entry.path) as entries:
+                for entry in entries:
+                    if entry.is_dir():
+                        try:
+                            if entry.stat().st_mtime < cutoff:
+                                shutil.rmtree(entry.path, ignore_errors=True)
+                        except OSError:
+                            pass
+
+
 async def cleanup_download_tmp():
     """Delete expired download tmp directories.
 
@@ -194,24 +217,7 @@ async def cleanup_download_tmp():
     while True:
         await asyncio.sleep(3600)
         try:
-            tmp_dir = bs.get_blob_storage().download_tmp_base_dir()
-            if tmp_dir is None:
-                # Backend shares the persistent log dir; no separate
-                # cleanup needed.
-                continue
-            if not os.path.exists(tmp_dir):
-                continue
-            cutoff = time.time() - bs.GC_GRACE_SECONDS
-            for user_entry in os.scandir(tmp_dir):
-                if not user_entry.is_dir():
-                    continue
-                for entry in os.scandir(user_entry.path):
-                    if entry.is_dir():
-                        try:
-                            if entry.stat().st_mtime < cutoff:
-                                shutil.rmtree(entry.path, ignore_errors=True)
-                        except OSError:
-                            pass
+            await asyncio.to_thread(_cleanup_download_tmp_once)
         except Exception as e:  # pylint: disable=broad-except
             logger.error('Error in cleanup_download_tmp: '
                          f'{common_utils.format_exception(e)}')
