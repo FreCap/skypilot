@@ -32,6 +32,10 @@ INSECURE_RULES = {
 }
 REQUIRED_RULES.update(INSECURE_RULES)
 
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
+CLOUD_FUNCTION_ACTION_TIMEOUT_SECONDS = 600
+INVOKE_HTTP_TIMEOUT_SECONDS = CLOUD_FUNCTION_ACTION_TIMEOUT_SECONDS + 60
+
 
 class IBMVPCProvider:
     """
@@ -688,12 +692,14 @@ class ClusterCleaner:
                 "resource_plan_id": "functions-base-plan",
             }
 
-            res = requests.post(self.cf_namespaces_url,
-                                headers=self.get_headers(),
-                                json=data).json()
-            if res.status_code != 200:
-                logger.error(res.text)
-            namespace_id = res["id"]
+            res = requests.post(
+                self.cf_namespaces_url,
+                headers=self.get_headers(),
+                json=data,
+                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+            )
+            res.raise_for_status()
+            namespace_id = res.json()["id"]
             logger.info(f"Created new namespace with id: {namespace_id}")
             return namespace_id
 
@@ -705,7 +711,9 @@ class ClusterCleaner:
             res = requests.get(
                 f"{self.cf_namespaces_url}?limit=200&offset={offset}",
                 headers=self.get_headers(),
+                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
             )
+            res.raise_for_status()
             return json.loads(res.text)
 
         def _get_cloud_function_namespaces():
@@ -770,7 +778,9 @@ class ClusterCleaner:
         res = requests.get(
             f"{self.cf_namespaces_url}/{namespace_id}/actions?limit=200",
             headers=self.get_headers(),
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
         )
+        res.raise_for_status()
         return json.loads(res.text)
 
     def create_action(self, namespace_id):
@@ -782,16 +792,16 @@ class ClusterCleaner:
                 "code": self.function_code
             },
             "limits": {
-                "timeout": 600000
+                "timeout": CLOUD_FUNCTION_ACTION_TIMEOUT_SECONDS * 1000
             },
         }
         res = requests.put(
             f"{self.cf_namespaces_url}/{namespace_id}/actions/{self.action_name}?blocking=true&overwrite=true",
             headers=self.get_headers(),
             data=json.dumps(function_params),
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
         )
-        if res.status_code != 200:
-            logger.error(res.text)
+        res.raise_for_status()
         return json.loads(res.text)
 
     def delete_action(self, namespace_id):
@@ -800,9 +810,11 @@ class ClusterCleaner:
         res = requests.delete(
             f"{self.cf_namespaces_url}/{namespace_id}/actions/{self.action_name}?blocking=true",
             headers=self.get_headers(),
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
         )
-        if res.status_code != 200:
-            logger.warn(res.text)
+        if res.status_code == 404:
+            return {}
+        res.raise_for_status()
         return json.loads(res.text)
 
     def invoke_action(self, namespace_id: str):
@@ -817,9 +829,9 @@ class ClusterCleaner:
             f"{self.cf_namespaces_url}/{namespace_id}/actions/{self.action_name}?blocking=true",
             headers=self.get_headers(),
             data=json.dumps(payload),
+            timeout=INVOKE_HTTP_TIMEOUT_SECONDS,
         )
-        if res.status_code != 200:
-            logger.error(res.text)
+        res.raise_for_status()
         return json.loads(res.text)
 
     def delete_cluster(self):

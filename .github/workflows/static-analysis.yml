@@ -39,6 +39,7 @@ jobs:
           # have reviewed legacy findings.
           ruff check sky/adaptors/verda.py --select S113
           ruff check sky/provision/yotta/yotta_utils.py --select S113
+          ruff check sky/skylet/providers/ibm/vpc_provider.py --select S113
           # A mutable class default bypasses threading.local's per-thread
           # attribute storage and is shared by every thread. RUF012 is noisy
           # for intentional class constants, so scope it to local subclasses.
