@@ -129,6 +129,9 @@ class _PendingServiceUpdate(NamedTuple):
     committed_at: float
 
 
+_UPDATE_RETRY_BACKOFF_SECONDS = 5
+
+
 class SkyServeController:
     """SkyServeController: control everything about replica.
 
@@ -2154,7 +2157,7 @@ class SkyServeController:
         self._replica_manager.clear_pending_version(update.version)
 
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
-        """Apply one pending update; return whether it converged or vanished."""
+        """Apply one pending update; optionally wait through retry backoff."""
         with self._update_condition:
             while (self._pending_update is None or
                    self._pending_update.version <= self._applied_version):
@@ -2189,6 +2192,14 @@ class SkyServeController:
                          f'{update.version}; {retry_message}: {exception_str}')
             with ux_utils.enable_traceback():
                 logger.error(f'  Traceback: {traceback.format_exc()}')
+            if retry_same_update and wait:
+                # Release the condition during backoff and wake immediately if
+                # a newer commit supersedes this failed update. wait_for()
+                # also closes the commit-before-wait lost-wakeup window.
+                with self._update_condition:
+                    self._update_condition.wait_for(
+                        lambda: self._pending_update is not update,
+                        timeout=_UPDATE_RETRY_BACKOFF_SECONDS)
             return not retry_same_update
 
         with self._update_condition:
@@ -2203,11 +2214,8 @@ class SkyServeController:
 
     def _run_update_reconciler(self) -> None:
         """Continuously converge runtime state to the newest committed spec."""
-        retry_backoff_seconds = 5
         while True:
-            converged = self._reconcile_pending_update_once(wait=True)
-            if not converged:
-                time.sleep(retry_backoff_seconds)
+            self._reconcile_pending_update_once(wait=True)
 
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:

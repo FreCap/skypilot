@@ -943,6 +943,50 @@ class TestServiceUpdateReconciler:
         assert status['update_apply_error'] is None
         assert status['update_apply_failures'] == 0
 
+    def test_newer_commit_during_retry_handoff_skips_backoff(self):
+        ctrl = _make_update_controller()
+        notify_calls = []
+
+        def _commit_newer_during_failed_retry(version):
+            notify_calls.append(version)
+            if notify_calls == [2, 2]:
+                ctrl._record_committed_update(  # pylint: disable=protected-access
+                    3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+
+        applied_versions = []
+
+        def _apply(version, *_args):
+            applied_versions.append(version)
+            if version == 2:
+                raise RuntimeError('failed before replacement commit')
+
+        ctrl._replica_manager.notify_version_pending.side_effect = (  # pylint: disable=protected-access
+            _commit_newer_during_failed_retry)
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_apply)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        reconcile_once = ctrl._reconcile_pending_update_once  # pylint: disable=protected-access
+
+        def _stop_after_newer_apply(*, wait=False):
+            converged = reconcile_once(wait=wait)
+            if applied_versions == [2, 3]:
+                raise RuntimeError('stop after newer apply')
+            return converged
+
+        ctrl._reconcile_pending_update_once = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_stop_after_newer_apply)
+        with mock.patch.object(
+                controller.time,
+                'sleep',
+                side_effect=AssertionError('newer update hit retry backoff')), \
+             pytest.raises(RuntimeError, match='stop after newer apply'):
+            ctrl._run_update_reconciler()  # pylint: disable=protected-access
+
+        assert notify_calls == [2, 2, 3]
+        assert applied_versions == [2, 3]
+
     def test_terminal_service_drops_pending_apply(self):
         ctrl = _make_update_controller()
         ctrl._update_still_authorized.return_value = False  # pylint: disable=protected-access
