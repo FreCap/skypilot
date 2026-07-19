@@ -56,6 +56,12 @@ warn_unreachable = true
 module = "sky.jobs.recovery_strategy"
 warn_unreachable = true
 
+[[tool.mypy.overrides]]
+# Stream failures must remain reachable before successful-response metadata;
+# otherwise a validating header lookup can bypass the request-result fallback.
+module = "sky.client.sdk"
+warn_unreachable = true
+
 [tool.basedpyright]
 # A focused complement to mypy. Keep high-signal coroutine, control-flow, and
 # interface-contract checks enabled while the broader type baseline is noisy.

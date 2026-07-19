@@ -620,6 +620,33 @@ class MockRetryContext:
         self.progress_count = progress_count
 
 
+@pytest.mark.parametrize('request_id', ['request-id', None])
+def test_stream_and_get_non_200_uses_safe_fallback(request_id):
+    """A stream-endpoint failure must not enter the stream decoder."""
+    response = requests.Response()
+    response.status_code = 503
+    response.url = 'http://api.example/api/stream'
+
+    with mock.patch(
+            'sky.server.common.make_authenticated_request',
+            return_value=response), mock.patch(
+                'sky.server.common.check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk.stream_response') as mock_stream, \
+            mock.patch('sky.client.sdk.get', return_value='result') as mock_get:
+        if request_id is None:
+            with pytest.raises(requests.HTTPError):
+                client_sdk.stream_and_get(request_id)
+        else:
+            result = client_sdk.stream_and_get(request_id)
+
+    mock_stream.assert_not_called()
+    if request_id is None:
+        mock_get.assert_not_called()
+    else:
+        assert result == 'result'
+        mock_get.assert_called_once_with(request_id)
+
+
 def test_stream_response_non_resumable():
     """Test stream_response when resumable=False."""
     test_lines = ['Line 1\n', 'Line 2\n', 'Line 3\n']
