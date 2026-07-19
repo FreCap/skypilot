@@ -11,6 +11,26 @@ from sky.utils import auth_utils
 from sky.utils import common_utils
 
 
+class _RequestSentinel(Exception):
+    """Stops a client method immediately after it issues its request."""
+
+
+@pytest.mark.parametrize('method', ['get', 'post', 'put'])
+def test_lambda_cloud_requests_have_finite_timeout(method):
+    """Every provider request must have a finite liveness bound."""
+    with mock.patch.object(
+            lambda_utils.requests, method,
+            side_effect=_RequestSentinel) as request, pytest.raises(
+                _RequestSentinel):
+        # pylint: disable=protected-access
+        lambda_utils._try_request_with_backoff(method, 'https://example.com',
+                                               {})
+        # pylint: enable=protected-access
+
+    assert request.call_args.kwargs[
+        'timeout'] == lambda_utils.DEFAULT_HTTP_TIMEOUT_SECONDS
+
+
 def test_get_private_ip():
     valid_info = {'private_ip': '10.19.83.125'}
     invalid_info = {}
