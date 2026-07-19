@@ -1193,8 +1193,13 @@ class SkyServeLoadBalancer:
                                   card_order.get(card, len(card_order)),
                               ))
 
-            def assign(waiter: _RequestQueueWaiter, seen_cards: set[str],
-                       seen_waiters: set[int]) -> bool:
+            def assign(
+                waiter: _RequestQueueWaiter,
+                seen_cards: set[str],
+                seen_waiters: set[int],
+                assigned_by_card: dict[str, list[_RequestQueueWaiter]],
+                assignments: dict[int, str],
+            ) -> bool:
                 if waiter.sequence in seen_waiters:
                     return False
                 seen_waiters.add(waiter.sequence)
@@ -1210,7 +1215,8 @@ class SkyServeLoadBalancer:
                     # Move an already-admitted peer to another compatible
                     # card to preserve maximum immediate admissions.
                     for occupant in list(reversed(occupants)):
-                        if assign(occupant, set(seen_cards), set(seen_waiters)):
+                        if assign(occupant, set(seen_cards), set(seen_waiters),
+                                  assigned_by_card, assignments):
                             occupants.remove(occupant)
                             occupants.append(waiter)
                             assignments[waiter.sequence] = card
@@ -1219,7 +1225,7 @@ class SkyServeLoadBalancer:
 
             accepted: list[_RequestQueueWaiter] = []
             for waiter in tier:
-                if assign(waiter, set(), set()):
+                if assign(waiter, set(), set(), assigned_by_card, assignments):
                     accepted.append(waiter)
             for waiter in accepted:
                 card = assignments[waiter.sequence]
