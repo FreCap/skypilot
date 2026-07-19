@@ -136,8 +136,6 @@ ignore = [
     "B904",     # raise without from inside except (66 sites)
     "B905",     # zip without strict= (31 sites)
     "ASYNC109", # async function with a timeout parameter
-    "ASYNC230", # blocking open() in async function (18 sites)
-    "ASYNC240", # blocking path method in async function
 ]
 
 [tool.ruff.lint.per-file-ignores]
