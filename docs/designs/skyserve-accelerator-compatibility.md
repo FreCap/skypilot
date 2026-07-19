@@ -11,7 +11,7 @@ Scheduling and scaling follow these rules:
 1. Never preempt or migrate an admitted request.
 2. Numeric request priority remains the primary queue order (`high = 50`, `low = 20` in boltz-platform).
 3. At equal numeric priority, make a supply-aware assignment that maximizes immediate admissions and protects the request with the worst realistic fallback; FIFO breaks a true fallback tie. Raw compatibility-set size is not a sufficient ordering rule.
-4. A request uses already-ready compatible capacity before causing a scale-up, even if that ready capacity is a larger card.
+4. A request uses already-ready compatible capacity before causing a scale-up, even if that ready capacity is a larger card. Among otherwise-valid ready assignments, prefer reserved/zero-cost replicas before paid replicas so paid capacity can become idle and scale down.
 5. A healthy provisioning replica is committed future capacity, not a routable slot: count it against the target to avoid a duplicate launch. For demand still unmet after ready and committed capacity, launch into a free compatible reserved-capacity slot, then cold-start the cheapest compatible paid card.
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
 7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. The UI shows all three.
@@ -70,7 +70,8 @@ Process numeric-priority tiers from highest to lowest. Within one tier, group au
 Define fallback quality from the same exact-card supply snapshot as an ordered tuple, not from compatibility count:
 
 ```text
-ready alternative
+ready reserved/zero-cost alternative
+  < ready paid alternative
   < healthy provisioning alternative within startup SLA
   < free reserved-capacity alternative
   < paid cold alternative (cheapest/fastest first)
@@ -78,6 +79,8 @@ ready alternative
 ```
 
 A ready card is an admission edge only when it is in the waiter's exact compatibility set. Provisioning/reserved/paid alternatives influence which waiter most needs a scarce ready slot, but they do not become routable until ready. A provisioning attempt that exceeds its startup SLA or enters failure stops counting as a healthy fallback and triggers replanning.
+
+Reserved-first is a replica-assignment tie-break after numeric priority, maximum immediate admission, and scarce-card protection. It must not let a flexible request take the only ready reserved A100 from an equal-priority A100-only request when a paid L4 can serve the flexible request. Within an equivalent exact-card assignment, route to a healthy reserved replica with a free concurrency slot before a paid replica; never overload reserved capacity merely to preserve the cost preference.
 
 Example for equal numeric priority:
 
@@ -102,7 +105,7 @@ The active LB reports a bounded histogram keyed by `(numeric priority, compatibi
 
 The autoscaler allocates aggregate demand by numeric priority descending using the same exact-card marginal-supply model, with stable assignments and existing up/down hysteresis to prevent oscillation. Below `max_replicas`, all priority partitions still contribute demand; when the cap forces a choice, the per-card target allocation mirrors queue precedence instead of reserving scarce capacity for work that cannot yet be admitted. For each compatibility profile:
 
-1. subtract ready capacity already assigned to its demand;
+1. subtract ready capacity already assigned to its demand, consuming reserved/zero-cost ready slots before paid ready slots within an otherwise-valid compatibility assignment;
 2. subtract healthy compatible replicas already provisioning from the still-needed target—they are committed capacity, not a place to dispatch;
 3. for residual scale-out, claim a free exact-card slot on reserved/zero-cost infrastructure;
 4. for any remaining scale-out, choose the cheapest cold paid compatible resource, using request/service order only as a deterministic equal-cost tie-break.
@@ -153,6 +156,7 @@ Reserved capacity is supply, not accelerator identity and not hidden demand.
 - Observe, claim, and report reserved slots by exact `(cluster/context, accelerator_id)` pool. Lowercasing for case-insensitive equality is allowed; collapsing `A100` with `A100-80GB` is forbidden.
 - Split any current multi-accelerator broker/fill round into exact-card grants before applying per-card targets. A claim for A100 cannot satisfy an A100-80GB decision.
 - A free compatible reserved slot has zero incremental infrastructure cost and therefore wins before a paid cold start, including when it is a larger card.
+- A healthy ready replica already running on reserved infrastructure wins before an otherwise-equivalent ready paid replica. This makes paid replicas idle sooner so the normal graceful scale-down can remove them; request priority, compatibility matching, and concurrency safety still take precedence.
 - Keep `reserved_capacity_fill` as an optional overlay, reported as `fill_target_by_accelerator` and `free_reserved_slots_by_accelerator`, not folded into demand target.
 - With fill enabled, zero-cost serving replicas may intentionally remain above demand/floors; the UI labels them as fill capacity. With fill disabled, idle serving replicas gracefully drain to demand/floors while the underlying reserved physical machines may remain up and appear as free reserved supply. This is expected extra capacity, not a failed scale-down.
 - When demand and fill both want the same exact-card replica, count it once via `max(demand_target, fill_target)`, not by adding both targets.
@@ -192,6 +196,7 @@ SkyPilot changes:
 
 - In `sky/serve/service_spec.py` and `sky/utils/service_schema.py`, add `min_replicas_by_accelerator`, canonical exact-card validation, the one-GPU-count-shape-per-card guard, and serialization/backward-compatible defaults.
 - Add a shared SkyServe exact accelerator registry derived from the active task resources. It maps case-insensitive wire tokens to canonical display IDs but exposes no family/prefix matcher.
+- Persist explicit zero-cost/reserved-supply provenance on every replica placed on a reserved zero-cost location, whether it was launched for ordinary demand or proactive fill. Do not infer this from `reserved_fill`, which describes why the replica was launched rather than where it runs.
 - Extend `sky/serve/constants.py` with the compatibility header name, version, and size/count bounds.
 - Extend autoscaler/controller status types in `sky/serve/autoscalers.py`, `sky/serve/controller.py`, `sky/serve/serve_utils.py`, and API schemas with additive per-card maps while preserving existing aggregate fields for old clients.
 - Add unit tests proving `A100`, `A100-80GB`, and differently cased spellings have the intended equality boundaries; test invalid maps, floor/max conflicts, serialization, and old service YAML.
@@ -209,6 +214,7 @@ SkyPilot changes:
 - Replace the single global-head grant loop with one authoritative waiter registry plus exact-card secondary indexes. Run the bounded priority-tier/profile-to-card matcher from a consistent supply snapshot and keep atomic cross-index removal/cancellation.
 - Use existing `LoadBalancingPolicy.select_replica(..., eligible=...)` support to restrict dispatch to URLs whose `replica_info.gpu_type` is an exact compatible card.
 - In `sky/serve/load_balancing_policies.py`, centralize exact-card URL lookup while retaining instance-aware least-load selection among eligible replicas.
+- Include the persisted zero-cost provenance in controller-to-LB `replica_info` and use it only as the final ready-replica cost preference after the compatibility matcher has protected constrained demand.
 - Add card-specific reservation transfer/requeue behavior for proxy failures and cancellation cleanup.
 - Add bounded compatibility-set queue metrics and the capability/configured-card fields to the LB capacity endpoint.
 
@@ -234,6 +240,7 @@ SkyPilot changes:
 - Update autoscaler decisions to carry exact accelerator resource overrides on ordinary demand scale-up, not only reserved-fill scale-up.
 - Make scale-down exact-card-aware and enforce both aggregate and per-card hard floors under the existing graceful delays.
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, split grants by exact pool, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets.
+- Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
 - Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
 
 Tests:
@@ -241,6 +248,7 @@ Tests:
 - Extend `tests/unit_tests/test_instance_aware_autoscaler.py` and `tests/unit_tests/test_reserved_capacity_fill.py` with empty-fleet cheapest selection, already-ready larger-card selection, healthy-provisioning capacity preventing duplicate launch, timed-out provisioning triggering replanning, free-reserved-before-paid residual scale-out, constrained demand reserving/scaling its exact card, crossed-set fallback-cost allocation, and no double-count of flexible demand.
 - Cover global min greater than floor sum, floor sum greater than calculated demand, max-replica saturation, per-card graceful scale-down, optional fill enabled/disabled, and reserved physical machines remaining after serving replicas drain.
 - Preserve and expand the existing A100/A100-80GB reserved-pool separation tests.
+- Test that demand and fill replicas on reserved infrastructure both advertise zero-cost provenance to the LB, while a paid replica and a replica with unknown/stale provenance do not receive reserved-first preference.
 - Add controller/LB synchronization tests for service-version changes and stale reserved observations.
 
 Acceptance gate:
@@ -318,6 +326,7 @@ Production checks:
 
 - Cold fleet + flexible request starts the cheapest compatible paid card.
 - Ready reserved A100 + flexible L4/A100/H100 request uses A100 without launching L4.
+- Ready reserved A100 + ready paid L4 + flexible L4/A100 request uses A100 when no constrained peer needs it, allowing L4 to become idle; with an equal-priority A100-only peer, match that peer to A100 and the flexible request to L4.
 - Large flexible backlog + same-priority A100-only request gives the next A100 slot to the constrained request with no preemption.
 - High flexible versus low constrained demonstrates numeric priority dominance.
 - `A100` traffic never reaches `A100-80GB`, and vice versa, unless both are explicitly in the compatibility set.
@@ -352,7 +361,7 @@ Use a test SkyServe service configured with exact L4, A100, A100-80GB, and H100 
 
 1. Start with zero serving replicas and no free reserved capacity. Submit a default/missing-field request and confirm the cheapest compatible paid card is targeted.
 2. Expose a free reserved A100 slot (and no ready replica), submit the same request, and confirm the exact A100 resource override is selected before paid L4.
-3. Keep an A100 replica ready with spare concurrency, submit a flexible request, and confirm immediate A100 dispatch without scale-up.
+3. Keep a reserved A100 replica and a paid L4 replica ready with spare concurrency. Submit only a flexible L4/A100 request and confirm reserved A100 dispatch. Then add an equal-priority A100-only request and confirm the matcher assigns A100-only to reserved A100 and flexible to paid L4.
 4. Fill all A100 slots with flexible requests, queue an older same-priority flexible request and then an A100-only request, release one A100 slot, and confirm A100-only runs next. Confirm existing work was not interrupted.
 5. Repeat with flexible priority 50 and A100-only priority 20; confirm the priority-50 request runs first.
 6. Queue equal-priority `{L4,A100}` and `{A100,H100}` requests. With L4 unavailable and A100/H100 ready, confirm the maximum matching uses A100/H100. With only A100 and no viable alternatives, confirm FIFO. Then expose paid L4 versus paid H100 fallbacks and confirm the ready A100 avoids the worse fallback while L4 is the cold target.
