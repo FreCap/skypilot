@@ -450,6 +450,17 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
     the launch finishes.
     """
 
+    def setUp(self):
+        # Scale-down selection batch-resolves cluster records once; feed it
+        # non-None records so ReplicaInfo.handle(record) (mocked) is used.
+        patcher = mock.patch(
+            'sky.serve.autoscalers.global_user_state.get_clusters_from_names',
+            side_effect=lambda names: {name: {
+                'handle': None
+            } for name in names})
+        self.mock_get_clusters = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _make_autoscaler(self):
         autoscaler = object.__new__(
             autoscalers.InstanceAwareRequestRateAutoscaler)
@@ -465,6 +476,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         info = mock.Mock()
         info.replica_id = 1
         info.version = 1
+        info.cluster_name = 'mock-cluster'
         info.status_property.sky_launch_status = launch_status
         info.handle.return_value.launched_resources.accelerators = {
             gpu_type: count
@@ -694,6 +706,69 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         selected = autoscaler._select_replicas_to_scale_down_by_qps(
             1, [ready_small, provisioning_big])
         self.assertEqual(selected, [2])
+
+    def test_scale_down_batches_handle_resolution(self):
+        """One batched cluster read per selection; no bare handle() DB
+        reads even though provisioning replicas are scored twice
+        (shape + cost) and can never be served from the memos."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        infos = []
+        for rid in (1, 2, 3):
+            info = self._make_replica('L4', common_utils.ProcessStatus.RUNNING)
+            info.replica_id = rid
+            info.cluster_name = f'cluster-{rid}'
+            info.status = serve_state.ReplicaStatus.PROVISIONING
+            info.is_terminal = False
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = 0.5
+            infos.append(info)
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(1, infos)
+        self.assertEqual(selected, [3])
+        self.mock_get_clusters.assert_called_once_with(
+            ['cluster-1', 'cluster-2', 'cluster-3'])
+        for info in infos:
+            # Every handle() call must carry the pre-fetched record; a bare
+            # call would be a per-replica cluster-table read.
+            self.assertTrue(info.handle.call_args_list)
+            for call in info.handle.call_args_list:
+                self.assertTrue(call.args or call.kwargs)
+
+    def test_scale_down_skips_batch_read_when_memos_cover_fleet(self):
+        """A fully cached fleet must not touch the cluster table at all."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        infos = []
+        for rid in (1, 2):
+            info = self._make_replica('L4',
+                                      common_utils.ProcessStatus.SUCCEEDED)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            infos.append(info)
+            autoscaler._gpu_shape_cache[rid] = ('L4', 1)
+            autoscaler._replica_cost_cache[rid] = 0.5
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(1, infos)
+        self.assertEqual(selected, [2])
+        self.mock_get_clusters.assert_not_called()
+        for info in infos:
+            info.handle.assert_not_called()
+
+    def test_scale_down_missing_cluster_record_resolves_to_no_handle(self):
+        """A replica whose cluster row is gone must not trigger a bare
+        handle() fallback read; it degrades to unknown shape / zero cost."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        self.mock_get_clusters.side_effect = lambda names: {
+            name: None for name in names
+        }
+        info = self._make_replica('L4', common_utils.ProcessStatus.RUNNING)
+        info.replica_id = 1
+        info.status = serve_state.ReplicaStatus.PROVISIONING
+        info.is_terminal = False
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(1, [info])
+        self.assertEqual(selected, [1])
+        info.handle.assert_not_called()
 
     def test_gpu_count_weights_capacity(self):
         """A 4-GPU replica contributes 4x per-GPU capacity; an exact

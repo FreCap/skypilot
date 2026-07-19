@@ -10,6 +10,7 @@ import time
 import typing
 from typing import Any
 
+from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
@@ -1531,6 +1532,11 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             logger.info(f'Remaining dynamic states: {dynamic_states}')
 
 
+# Distinguishes "caller did not resolve a handle" from a resolved None
+# (cluster row or handle genuinely absent) in the mixin helpers below.
+_UNRESOLVED_HANDLE = object()
+
+
 class _GpuShapeResolverMixin:
     """Shared GPU-shape resolution with a post-launch-only memo.
 
@@ -1563,8 +1569,41 @@ class _GpuShapeResolverMixin:
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
 
+    def _resolve_replica_handles(
+            self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> dict[int, Any]:
+        """Batch-resolve cluster handles for replicas missing a cached memo.
+
+        `ReplicaInfo.handle()` with no record hits the cluster table once per
+        call, and while a replica is provisioning neither the shape nor the
+        cost memo may cache (the record is rewritten per failover attempt), so
+        a selection pass that scores each replica twice would pay 2 reads per
+        provisioning replica. One batched read replaces all of them, and also
+        scores shape and cost from the same record snapshot instead of two
+        reads at different times mid-sort.
+        """
+        uncached = [
+            info for info in replica_infos
+            if info.replica_id not in self._gpu_shape_cache or
+            info.replica_id not in self._replica_cost_cache
+        ]
+        if not uncached:
+            return {}
+        records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in uncached])
+        handles: dict[int, Any] = {}
+        for info in uncached:
+            record = records.get(info.cluster_name)
+            # A missing record means the cluster row is gone; a bare
+            # info.handle() would resolve to None too, just via another read.
+            handles[info.replica_id] = (info.handle(record)
+                                        if record is not None else None)
+        return handles
+
     def _get_hourly_cost_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+            self,
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> float:
         """Hourly cost of a replica's launched resources (0.0 = reserved).
 
         Used to prefer scaling down PAID replicas before zero-cost ones
@@ -1579,7 +1618,8 @@ class _GpuShapeResolverMixin:
         cost = 0.0
         resolved = False
         try:
-            handle = replica_info.handle()
+            if handle is _UNRESOLVED_HANDLE:
+                handle = replica_info.handle()
             if handle is not None:
                 # Coerce: anything non-numeric degrades to 0.0 (shed last).
                 cost = float(handle.launched_resources.get_cost(seconds=3600))
@@ -1595,14 +1635,16 @@ class _GpuShapeResolverMixin:
 
     def _get_gpu_shape_from_replica_info(
             self,
-            replica_info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> tuple[str, int]:
         """Extract (GPU type, GPU count) from ReplicaInfo object."""
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
         gpu_type = 'unknown'
         gpu_count = 1
-        handle = replica_info.handle()
+        if handle is _UNRESOLVED_HANDLE:
+            handle = replica_info.handle()
         if handle is not None:
             accelerators = handle.launched_resources.accelerators
             if accelerators and len(accelerators) > 0:
@@ -2047,6 +2089,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # Create a list of (replica_info, target_qps) tuples
         replica_qps_pairs: list[tuple[replica_managers.ReplicaInfo, float]] = []
 
+        # One batched cluster-table read for every replica the memos cannot
+        # serve; the sort below scores each replica twice (shape + cost).
+        handles = self._resolve_replica_handles(replica_infos)
+
         for info in replica_infos:
             # Include old-version replicas as well so they also get a target_qps
             # assigned. Skip terminal replicas only.
@@ -2054,7 +2100,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
 
             # Get GPU shape directly from replica info
-            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(info)
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
+                info, handles.get(info.replica_id, _UNRESOLVED_HANDLE))
 
             # Use flexible matching logic, weighted by GPU count so
             # smaller-capacity replicas are preferred for scale-down.
@@ -2112,7 +2159,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             key=lambda info: (
                 _status_rank(info),
                 round(replica_qps_map.get(info.replica_id, float('inf')), 9),
-                -self._get_hourly_cost_from_replica_info(info),
+                -self._get_hourly_cost_from_replica_info(
+                    info, handles.get(info.replica_id, _UNRESOLVED_HANDLE)),
                 info.version,
                 -info.replica_id,
             ))
