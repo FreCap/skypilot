@@ -6,11 +6,8 @@ from unittest import mock
 
 import pytest
 
-from sky import check
 from sky import clouds
-from sky import global_user_state
 from sky import skypilot_config
-from sky.clouds import cloud as sky_cloud
 from sky.resources import Resources
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -102,14 +99,9 @@ def test_kubernetes_labels_resources():
     _run_label_test(allowed_labels, invalid_labels, cloud)
 
 
-def test_no_cloud_labels_resources():
-    global_user_state.set_enabled_clouds(['aws', 'gcp'],
-                                         sky_cloud.CloudCapability.COMPUTE,
-                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
-    global_user_state.set_allowed_clouds(
-        check._get_workspace_allowed_clouds(
-            constants.SKYPILOT_DEFAULT_WORKSPACE),
-        constants.SKYPILOT_DEFAULT_WORKSPACE)
+@mock.patch('sky.resources.sky_check.get_cached_enabled_clouds_or_refresh',
+            return_value=[clouds.AWS(), clouds.GCP()])
+def test_no_cloud_labels_resources(_mock_enabled_clouds):
     allowed_labels = {
         **GLOBAL_VALID_LABELS,
     }
@@ -121,14 +113,9 @@ def test_no_cloud_labels_resources():
     _run_label_test(allowed_labels, invalid_labels)
 
 
-def test_no_cloud_labels_resources_single_enabled_cloud():
-    global_user_state.set_enabled_clouds(['aws'],
-                                         sky_cloud.CloudCapability.COMPUTE,
-                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
-    global_user_state.set_allowed_clouds(
-        check._get_workspace_allowed_clouds(
-            constants.SKYPILOT_DEFAULT_WORKSPACE),
-        constants.SKYPILOT_DEFAULT_WORKSPACE)
+@mock.patch('sky.resources.sky_check.get_cached_enabled_clouds_or_refresh',
+            return_value=[clouds.AWS()])
+def test_no_cloud_labels_resources_single_enabled_cloud(_mock_enabled_clouds):
     allowed_labels = {
         **GLOBAL_VALID_LABELS,
         'domain/key': 'value',  # Valid for AWS
@@ -137,7 +124,7 @@ def test_no_cloud_labels_resources_single_enabled_cloud():
         **GLOBAL_INVALID_LABELS,
         'aws:cannotstartwithaws': 'value',
     }
-    _run_label_test(allowed_labels, invalid_labels, cloud=clouds.AWS())
+    _run_label_test(allowed_labels, invalid_labels)
 
 
 @mock.patch('sky.catalog.instance_type_exists', return_value=True)
