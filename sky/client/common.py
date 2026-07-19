@@ -64,6 +64,14 @@ _FILE_UPLOAD_LOCK_DIR = '~/.sky/locks/file_uploads'
 
 # Connection timeout when sending requests to the API server.
 API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS = 5
+# Per-operation timeout for file-upload reads, writes, and pool waits. This is
+# not a total upload deadline: active large transfers can still run longer.
+FILE_UPLOAD_HTTP_TIMEOUT_SECONDS = 180
+
+
+def _file_upload_http_timeout() -> 'httpx.Timeout':
+    return httpx.Timeout(FILE_UPLOAD_HTTP_TIMEOUT_SECONDS,
+                         connect=API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS)
 
 
 def download_logs_from_api_server(
@@ -418,7 +426,7 @@ def upload_mounts_to_api_server(
                         upload_logger: logging.Logger):
             zip_file_size = os.path.getsize(zip_file_path)
             total_chunks = int(math.ceil(zip_file_size / _UPLOAD_CHUNK_BYTES))
-            timeout = httpx.Timeout(None, read=180.0)
+            timeout = _file_upload_http_timeout()
             status.update(
                 ux_utils.spinner_message(
                     'Uploading files to API server (2/2 - Uploading)',
