@@ -272,6 +272,8 @@ def _upload_chunk_with_retry(params: UploadChunkParams) -> str:
 @contextlib.contextmanager
 def _setup_upload_logger(
         log_file: str) -> Generator[logging.Logger, None, None]:
+    upload_logger = None
+    handler = None
     try:
         upload_logger = logging.getLogger('sky.upload')
         upload_logger.propagate = False
@@ -282,8 +284,10 @@ def _setup_upload_logger(
         upload_logger.setLevel(logging.DEBUG)
         yield upload_logger
     finally:
-        upload_logger.removeHandler(handler)
-        handler.close()
+        if handler is not None:
+            if upload_logger is not None:
+                upload_logger.removeHandler(handler)
+            handler.close()
 
 
 _HASH_CHUNK_SIZE = 2**18
