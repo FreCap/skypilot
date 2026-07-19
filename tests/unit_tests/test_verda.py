@@ -8,10 +8,55 @@ from unittest.mock import patch
 import pytest
 
 from sky import clouds
+from sky.adaptors import verda as verda_adaptor
 from sky.adaptors.verda import Instance
 from sky.adaptors.verda import InstanceStatus
 from sky.adaptors.verda import VerdaClient
 from sky.clouds import verda
+
+
+def _make_http_client():
+    client = verda_adaptor._HTTPClient.__new__(  # pylint: disable=protected-access
+        verda_adaptor._HTTPClient)  # pylint: disable=protected-access
+    client._base_url = (  # pylint: disable=protected-access
+        'https://api.verda.com/v1')
+    client._auth_service = MagicMock()  # pylint: disable=protected-access
+    # pylint: disable=protected-access
+    client._auth_service.is_expired.return_value = False
+    client._auth_service.generate_headers.return_value = {}
+    # pylint: enable=protected-access
+    return client
+
+
+@pytest.mark.parametrize('method', ['get', 'post', 'put', 'patch', 'delete'])
+def test_verda_http_client_applies_default_timeout(method):
+    """Every provider request must have a finite liveness bound."""
+    client = _make_http_client()
+    response = MagicMock(ok=True)
+
+    with patch.object(verda_adaptor.requests, method,
+                      return_value=response) as request:
+        request_method = getattr(client, method)
+        if method == 'get':
+            request_method('/resource')
+        elif method == 'patch':
+            request_method('/resource', body={}, params=None)
+        else:
+            request_method('/resource', body={})
+
+    assert request.call_args.kwargs[
+        'timeout'] == verda_adaptor.DEFAULT_HTTP_TIMEOUT_SECONDS
+
+
+def test_verda_http_client_preserves_timeout_override():
+    client = _make_http_client()
+    response = MagicMock(ok=True)
+
+    with patch.object(verda_adaptor.requests, 'get',
+                      return_value=response) as request:
+        client.get('/resource', timeout=(1, 2))
+
+    assert request.call_args.kwargs['timeout'] == (1, 2)
 
 
 def test_verda_cloud_basics():

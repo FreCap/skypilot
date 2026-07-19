@@ -8,6 +8,8 @@ import time
 
 import requests
 
+DEFAULT_HTTP_TIMEOUT_SECONDS = 30
+
 
 @dataclasses.dataclass
 class VerdaConfiguration:
@@ -216,7 +218,7 @@ class _AuthenticationService:
         response = requests.post(url,
                                  json=payload,
                                  headers=self.generate_headers(),
-                                 timeout=30)
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         handle_error(response)
 
         auth_data = response.json()
@@ -253,7 +255,8 @@ class _AuthenticationService:
 
         response = requests.post(url,
                                  json=payload,
-                                 headers=self.generate_headers())
+                                 headers=self.generate_headers(),
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
 
         # if refresh token is also expired, authenticate again:
         if response.status_code == 401 or response.status_code == 400:
@@ -341,11 +344,13 @@ class _HTTPClient:
 
         url = self._add_base_url(url)
         headers = self._generate_headers()
+        timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
         response = requests.post(url,
                                  json=body,
                                  headers=headers,
                                  params=params,
+                                 timeout=timeout,
                                  **kwargs)
         handle_error(response)
 
@@ -378,11 +383,13 @@ class _HTTPClient:
 
         url = self._add_base_url(url)
         headers = self._generate_headers()
+        timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
         response = requests.put(url,
                                 json=body,
                                 headers=headers,
                                 params=params,
+                                timeout=timeout,
                                 **kwargs)
         handle_error(response)
 
@@ -412,8 +419,13 @@ class _HTTPClient:
 
         url = self._add_base_url(url)
         headers = self._generate_headers()
+        timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
-        response = requests.get(url, params=params, headers=headers, **kwargs)
+        response = requests.get(url,
+                                params=params,
+                                headers=headers,
+                                timeout=timeout,
+                                **kwargs)
         handle_error(response)
 
         return response
@@ -442,11 +454,13 @@ class _HTTPClient:
 
         url = self._add_base_url(url)
         headers = self._generate_headers()
+        timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
         response = requests.patch(url,
                                   json=body,
                                   headers=headers,
                                   params=params,
+                                  timeout=timeout,
                                   **kwargs)
         handle_error(response)
 
@@ -479,11 +493,13 @@ class _HTTPClient:
 
         url = self._add_base_url(url)
         headers = self._generate_headers()
+        timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
         response = requests.delete(url,
                                    headers=headers,
                                    json=body,
                                    params=params,
+                                   timeout=timeout,
                                    **kwargs)
         handle_error(response)
 
