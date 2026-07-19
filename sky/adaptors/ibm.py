@@ -10,6 +10,7 @@ from sky import sky_logging
 from sky.adaptors import common
 
 CREDENTIAL_FILE = '~/.ibm/credentials.yaml'
+IAM_HTTP_TIMEOUT_SECONDS = 30
 logger = sky_logging.init_logger(__name__)
 
 _IMPORT_ERROR_MESSAGE = ('Failed to import dependencies for IBM. '
@@ -63,8 +64,10 @@ def get_oauth_token():
         'https://iam.cloud.ibm.com/identity/token',
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
         data=
-        f'grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={get_api_key()}'
+        f'grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={get_api_key()}',
+        timeout=IAM_HTTP_TIMEOUT_SECONDS,
     )
+    res.raise_for_status()
     return json.loads(res.text)['access_token']
 
 
