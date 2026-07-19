@@ -233,6 +233,134 @@ def test_user_failure_path_skips_replica_scheduled_down(monkeypatch):
     assert terminated == []
 
 
+def test_command_error_on_one_replica_does_not_starve_the_rest(monkeypatch):
+    """A non-preemption CommandError on one replica must not abort the walk:
+    a FAILED user job on a later replica must still be detected and the
+    replica terminated in the same round."""
+    broken = _tracked_replica(1)
+    failed = _tracked_replica(2)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: [broken, failed])
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: self.replica_id)
+
+    def _get_job_status(self, handle, job_ids, stream_logs=False):
+        if handle == 1:
+            raise exceptions.CommandError(returncode=255,
+                                          command='get_job_status',
+                                          error_msg='ssh failed',
+                                          detailed_reason=None)
+        return {1: job_lib.JobStatus.FAILED}
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status', _get_job_status)
+    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
+                        lambda svc, rid: broken if rid == 1 else failed)
+    monkeypatch.setattr(serve_state, 'add_or_update_replica',
+                        lambda svc, rid, info: None)
+
+    terminated = []
+    mgr = _build_manager()
+    # Not preempted: the error is a persistent command failure.
+    mgr._handle_preemption = lambda info: False
+    mgr._terminate_replica = lambda rid, **kwargs: terminated.append(rid)
+    mgr._fetch_job_status()  # must not raise
+
+    assert terminated == [
+        2
+    ], ('the failed replica after the broken one must still be terminated')
+    assert failed.status_property.user_app_failed
+
+
+def test_empty_job_statuses_skipped_without_aborting_walk(monkeypatch):
+    """An empty job-status result on one replica (e.g. wiped job table) must
+    be skipped, not raise IndexError and abort the walk."""
+    empty = _tracked_replica(1)
+    healthy = _tracked_replica(2)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: [empty, healthy])
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: self.replica_id)
+
+    probed = []
+
+    def _get_job_status(self, handle, job_ids, stream_logs=False):
+        probed.append(handle)
+        if handle == 1:
+            return {}
+        return {1: job_lib.JobStatus.RUNNING}
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status', _get_job_status)
+
+    mgr = _build_manager()
+    mgr._fetch_job_status()  # must not raise
+
+    assert probed == [1, 2]
+
+
+def test_pool_missing_job_key_skipped_without_aborting_walk(monkeypatch):
+    """For pools, a result missing job id 1 must be skipped, not raise
+    KeyError and abort the walk."""
+    missing = _tracked_replica(1)
+    healthy = _tracked_replica(2)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: [missing, healthy])
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: self.replica_id)
+
+    probed = []
+
+    def _get_job_status(self, handle, job_ids, stream_logs=False):
+        probed.append(handle)
+        if handle == 1:
+            return {}
+        return {1: job_lib.JobStatus.RUNNING}
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status', _get_job_status)
+
+    mgr = _build_manager()
+    mgr._is_pool = True
+    mgr._fetch_job_status()  # must not raise
+
+    assert probed == [1, 2]
+
+
+def test_walk_constructs_backend_once(monkeypatch):
+    """The stateless backend must be constructed once per walk, not once per
+    replica."""
+    replicas = [_tracked_replica(i) for i in (1, 2, 3)]
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: object())
+
+    constructed = []
+    real_backend = replica_managers.backends.CloudVmRayBackend
+
+    class _CountingBackend(real_backend):
+
+        def __init__(self, *args, **kwargs):
+            constructed.append(1)
+            super().__init__(*args, **kwargs)
+
+        def get_job_status(self, handle, job_ids, stream_logs=False):
+            return {1: job_lib.JobStatus.RUNNING}
+
+    monkeypatch.setattr(replica_managers.backends, 'CloudVmRayBackend',
+                        _CountingBackend)
+
+    mgr = _build_manager()
+    mgr._fetch_job_status()
+
+    assert len(constructed) == 1
+
+
 def test_walk_batches_cluster_records_into_one_read(monkeypatch):
     """The walk must resolve every replica's handle from ONE batched
     cluster-record read; a per-replica cluster-table fallback re-introduces
