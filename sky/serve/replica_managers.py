@@ -75,6 +75,12 @@ _DRAIN_WALL_CLOCK_FUTURE_SKEW_SECONDS = 5 * 60
 # not reporting): the drain wait then falls back to the full cap.
 _IN_FLIGHT_REPORT_STALENESS_SECONDS = (
     3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+# A controller and its external LB commonly roll together. Give the new pair
+# multiple sync opportunities to publish one matching target/capacity proof,
+# but bound how long capacity selected by the old controller can stay
+# conservatively off-route when the surviving fleet is insufficient.
+_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS = (
+    6 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 _SERVICE_OWNER_WATCH_INTERVAL_SECONDS = 1
 _LAUNCH_OWNER_WATCH_INTERVAL_SECONDS = 0.5
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
@@ -2069,6 +2075,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Keep it off-route until a fresh current-generation replacement proof
         # lets us safely re-drive the idempotent teardown.
         self._legacy_uncertain_logical_retirement_ids: set[int] = set()
+        # Current-format pre-commit logical retirements are safe to re-fence
+        # after a controller restart. Until a fresh target/capacity proof is
+        # available, keep them off-route instead of aborting every old-epoch
+        # selection back to READY.
+        self._recovering_logical_retirement_ids: set[int] = set()
+        self._logical_retirement_recovery_deadline: float | None = None
+        self._logical_retirement_reactivation_generation: int | None = None
 
         # Tick-scoped memo of per-version specs, reset at the start of every
         # probe round (see _probe_all_replicas). Within a single readiness probe
@@ -2347,6 +2360,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             legacy_uncertain_ids = set()
             self._legacy_uncertain_logical_retirement_ids = (
                 legacy_uncertain_ids)
+        recovering_logical_ids = getattr(self,
+                                         '_recovering_logical_retirement_ids',
+                                         None)
+        if recovering_logical_ids is None:
+            recovering_logical_ids = set()
+            self._recovering_logical_retirement_ids = recovering_logical_ids
         for replica_info in to_down_replicas:
             try:
                 if self._is_legacy_uncertain_logical_retirement(replica_info):
@@ -2359,6 +2378,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (getattr(replica_info.status_property,
                             'wait_for_idle_before_termination', False) is True):
                     self._register_wait_for_idle(replica_info)
+                    if (self._is_recoverable_uncommitted_logical_retirement(
+                            replica_info) and
+                            getattr(replica_info.status_property,
+                                    'logical_retirement_controller_epoch', None)
+                            != self._logical_controller_epoch):
+                        recovering_logical_ids.add(replica_info.replica_id)
                     continue
                 # A scale-down retirement interrupted by a controller restart
                 # re-enters the remaining bounded drain. The cap and wall-clock
@@ -2422,6 +2447,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.error('Failed to re-drive termination of replica '
                              f'{replica_info.replica_id}: '
                              f'{common_utils.format_exception(e)}')
+        if (recovering_logical_ids and getattr(
+                self, '_logical_retirement_recovery_deadline', None) is None):
+            self._logical_retirement_recovery_deadline = (
+                time.monotonic() + _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS)
+            logger.info(
+                f'Recovered {len(recovering_logical_ids)} uncommitted logical '
+                'retirements; keeping them off-route until current capacity '
+                'is revalidated.')
 
     ################################
     # Replica management functions #
@@ -3946,9 +3979,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not self._logical_retirement_victim_is_idle(info, snapshot)):
             return 'wait'
 
+        ready_capacity = self._logical_ready_capacity(
+            serve_state.get_replica_infos(self._service_name), snapshot,
+            version, {info.replica_id})
+        return 'safe' if ready_capacity >= current_target else 'abort'
+
+    @staticmethod
+    def _logical_ready_capacity(
+            replica_infos: list[ReplicaInfo],
+            snapshot: LogicalReconcileSnapshot, version: int,
+            excluded_replica_ids: set[int] | frozenset[int]) -> int:
+        """Return freshly observed ready capacity from one fleet snapshot."""
         ready_capacity = 0
-        for candidate in serve_state.get_replica_infos(self._service_name):
-            if (candidate.replica_id == info.replica_id or
+        for candidate in replica_infos:
+            if (candidate.replica_id in excluded_replica_ids or
                     candidate.is_terminal or candidate.version != version or
                     not candidate.is_ready):
                 continue
@@ -3959,7 +4003,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             ready_capacity += min(
                 int(getattr(candidate, 'planned_capacity', 1)), observed)
-        return 'safe' if ready_capacity >= current_target else 'abort'
+        return ready_capacity
 
     def _logical_retirement_victim_is_idle(
             self, info: ReplicaInfo,
@@ -4021,6 +4065,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                 selection_target >= 0 and type(confirmed_generation) is int and
                 confirmed_generation >= selection_generation and
                 type(bounded_deadline) is bool)
+
+    @staticmethod
+    def _is_recoverable_uncommitted_logical_retirement(
+            info: ReplicaInfo) -> bool:
+        """Whether an old-epoch pre-commit retirement can be re-fenced."""
+        status = info.status_property
+        retirement_version = getattr(status, 'logical_retirement_version', None)
+        controller_epoch = getattr(status,
+                                   'logical_retirement_controller_epoch', None)
+        selection_generation = getattr(status, 'logical_retirement_generation',
+                                       None)
+        selection_target = getattr(status, 'logical_retirement_target_capacity',
+                                   None)
+        confirmed_generation = getattr(
+            status, 'logical_retirement_confirmed_generation', None)
+        bounded_deadline = getattr(status,
+                                   'logical_retirement_bounded_deadline', False)
+        committed = getattr(status, 'logical_retirement_committed', None)
+        info_version = getattr(info, 'version', None)
+        generation_valid = (type(selection_generation) is int and
+                            selection_generation >= 0)
+        confirmation_valid = (
+            confirmed_generation is None or
+            (type(confirmed_generation) is int and generation_valid and
+             confirmed_generation >= typing.cast(int, selection_generation)))
+        return (
+            status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
+            status.is_scale_down is True and status.preempted is False and
+            status.purged is False and
+            status.wait_for_idle_before_termination is True and
+            status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
+            committed is False and type(info_version) is int and
+            type(retirement_version) is int and
+            info_version <= retirement_version and
+            isinstance(controller_epoch, str) and bool(controller_epoch) and
+            generation_valid and type(selection_target) is int and
+            selection_target >= 0 and confirmation_valid and
+            type(bounded_deadline) is bool)
 
     @staticmethod
     def _is_legacy_uncertain_logical_retirement(info: ReplicaInfo) -> bool:
@@ -4157,6 +4239,181 @@ class SkyPilotReplicaManager(ReplicaManager):
                                    f'{common_utils.format_exception(e)}')
                     continue
                 uncertain_ids.discard(replica_id)
+
+    def _logical_retirement_recovery_timed_out(self) -> bool:
+        deadline = getattr(self, '_logical_retirement_recovery_deadline', None)
+        return deadline is not None and time.monotonic() >= deadline
+
+    @staticmethod
+    def _logical_planned_capacity(info: ReplicaInfo) -> int:
+        planned = getattr(info, 'planned_capacity', 1)
+        if (isinstance(planned, bool) or not isinstance(planned, int) or
+                planned < 1):
+            return 1
+        return planned
+
+    def _clear_logical_retirement_recovery_if_done(self) -> None:
+        recovering_ids: set[int] = getattr(
+            self, '_recovering_logical_retirement_ids', set())
+        if recovering_ids:
+            return
+        self._logical_retirement_recovery_deadline = None
+        self._logical_retirement_reactivation_generation = None
+
+    def _reconcile_recovering_logical_retirements(self) -> None:
+        """Adopt safe old-epoch drains without advertising the whole fleet."""
+        recovering_ids = getattr(self, '_recovering_logical_retirement_ids',
+                                 None)
+        if not recovering_ids:
+            return
+        if getattr(self, '_logical_retirement_recovery_deadline', None) is None:
+            self._logical_retirement_recovery_deadline = (
+                time.monotonic() + _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS)
+
+        # One fleet read per pass. Calling _logical_retirement_state() for each
+        # candidate would rescan the whole table O(candidates * fleet).
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        infos_by_id = {info.replica_id: info for info in replica_infos}
+        candidates: list[ReplicaInfo] = []
+        for replica_id in sorted(list(recovering_ids)):
+            info = infos_by_id.get(replica_id)
+            if info is None:
+                recovering_ids.discard(replica_id)
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            if self._is_committed_logical_retirement(info):
+                recovering_ids.discard(replica_id)
+                continue
+            if not self._is_recoverable_uncommitted_logical_retirement(info):
+                # The normal refresh path retains authority over malformed or
+                # otherwise changed state; the recovery-only epoch gate must
+                # not hide it.
+                recovering_ids.discard(replica_id)
+                continue
+            if (info.status_property.logical_retirement_controller_epoch ==
+                    self._logical_controller_epoch):
+                # A prior persist may have committed even if its caller saw an
+                # exception. A fresh read distinguishes that safe adoption.
+                recovering_ids.discard(replica_id)
+                continue
+            candidates.append(info)
+
+        if not candidates:
+            self._clear_logical_retirement_recovery_if_done()
+            return
+
+        if self._logical_retirement_recovery_timed_out():
+            logger.warning(
+                f'Logical retirement recovery timed out after '
+                f'{_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS}s; '
+                f'reactivating {len(candidates)} uncommitted replicas for '
+                'availability.')
+            for info in candidates:
+                self._abort_logical_retirement(
+                    info, 'controller recovery evidence timed out')
+                recovering_ids.discard(info.replica_id)
+            self._clear_logical_retirement_recovery_if_done()
+            return
+
+        with self._logical_state_lock:
+            snapshot = self._logical_reconcile_snapshot
+            target_state = self._logical_target
+            if (snapshot is None or target_state is None or
+                    not self._logical_snapshot_is_fresh(snapshot) or
+                    snapshot.version != self.latest_version):
+                return
+            target_version, target_generation, current_target = target_state
+            if (target_version != self.latest_version or
+                    target_generation != snapshot.generation):
+                return
+            pending_version = getattr(self, '_pending_version', None)
+            if (pending_version is not None and
+                    pending_version > self.latest_version):
+                return
+            reactivation_generation = getattr(
+                self, '_logical_retirement_reactivation_generation', None)
+            if (reactivation_generation is not None and
+                    snapshot.generation <= reactivation_generation):
+                return
+            self._logical_retirement_reactivation_generation = None
+
+            ready_capacity = self._logical_ready_capacity(
+                replica_infos, snapshot, self.latest_version,
+                frozenset(recovering_ids))
+            if ready_capacity < current_target:
+                shortfall = current_target - ready_capacity
+                reactivated_capacity = 0
+                reactivated_count = 0
+                for info in candidates:
+                    # Only a current-version backend can satisfy this logical
+                    # target. Outdated candidates remain safely off-route and
+                    # are reconsidered after current capacity is restored.
+                    if info.version != self.latest_version:
+                        continue
+                    self._abort_logical_retirement(
+                        info, 'current capacity is below the recovered target')
+                    recovering_ids.discard(info.replica_id)
+                    reactivated_capacity += self._logical_planned_capacity(info)
+                    reactivated_count += 1
+                    if reactivated_capacity >= shortfall:
+                        break
+                if reactivated_count:
+                    self._logical_retirement_reactivation_generation = (
+                        snapshot.generation)
+                    logger.info(
+                        f'Reactivated {reactivated_count} recovered logical '
+                        f'retirements ({reactivated_capacity} planned slots) '
+                        f'to cover a {shortfall}-slot target shortfall; '
+                        'waiting for a newer observed-capacity generation.')
+                self._clear_logical_retirement_recovery_if_done()
+                return
+
+            adopted = 0
+            for info in candidates:
+                status = info.status_property
+                old_selection = (
+                    status.logical_retirement_version,
+                    status.logical_retirement_controller_epoch,
+                    status.logical_retirement_generation,
+                    status.logical_retirement_target_capacity,
+                    status.logical_retirement_confirmed_generation,
+                    status.logical_retirement_bounded_deadline,
+                    status.logical_retirement_committed,
+                )
+                status.logical_retirement_version = self.latest_version
+                status.logical_retirement_controller_epoch = (
+                    self._logical_controller_epoch)
+                status.logical_retirement_generation = snapshot.generation
+                status.logical_retirement_target_capacity = current_target
+                # Adoption only refreshes the selection fence. Idle proof and
+                # the irreversible teardown commit remain in the existing
+                # _finish_logical_retirement path.
+                status.logical_retirement_confirmed_generation = None
+                status.logical_retirement_bounded_deadline = False
+                status.logical_retirement_committed = False
+                try:
+                    self._persist_replica(info.replica_id, info)
+                except Exception as e:  # pylint: disable=broad-except
+                    (status.logical_retirement_version,
+                     status.logical_retirement_controller_epoch,
+                     status.logical_retirement_generation,
+                     status.logical_retirement_target_capacity,
+                     status.logical_retirement_confirmed_generation,
+                     status.logical_retirement_bounded_deadline,
+                     status.logical_retirement_committed) = old_selection
+                    logger.warning(
+                        f'Failed to re-fence recovered logical retirement '
+                        f'{info.replica_id}; keeping it off-route for retry: '
+                        f'{common_utils.format_exception(e)}')
+                    continue
+                recovering_ids.discard(info.replica_id)
+                adopted += 1
+            if adopted:
+                logger.info(
+                    f'Adopted {adopted} recovered logical retirements under '
+                    'the current controller fence while preserving their '
+                    'durable drain deadlines.')
+        self._clear_logical_retirement_recovery_if_done()
 
     def _detach_committed_logical_retirement(self, info: ReplicaInfo) -> None:
         """Make an irreversible teardown independent of its selection."""
@@ -4319,6 +4576,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                          'logical_retirement_version',
                                          None) is not None
             if logical_retirement:
+                recovering_ids: set[int] = getattr(
+                    self, '_recovering_logical_retirement_ids', set())
+                if replica_id in recovering_ids:
+                    if not self._logical_retirement_recovery_timed_out():
+                        # A new controller cannot act on the old selection,
+                        # but it also need not advertise every victim while a
+                        # fresh target/capacity proof is pending.
+                        continue
+                    recovering_ids.discard(replica_id)
+                    with self._logical_state_lock:
+                        self._abort_logical_retirement(
+                            info, 'controller recovery evidence timed out')
+                    self._clear_logical_retirement_recovery_if_done()
+                    continue
                 with self._logical_state_lock:
                     retirement_state = self._logical_retirement_state(info)
                     if retirement_state == 'abort':
@@ -4677,6 +4948,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.
         self._reconcile_legacy_uncertain_logical_retirements()
+        # Current-format uncommitted retirements retain their original drain
+        # deadlines and are either adopted under a fresh controller fence or
+        # selectively reactivated for current capacity.
+        self._reconcile_recovering_logical_retirements()
         # Economic retirements are persisted off-route first and enter the
         # normal termination pool only after the LB proves they are idle.
         self._refresh_wait_for_idle()
