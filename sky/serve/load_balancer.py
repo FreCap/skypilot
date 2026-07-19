@@ -42,6 +42,9 @@ _ReleasingStreamingResponse.__module__ = __name__
 # gets a fresh client while the old one is still draining, and the two
 # must not share a counter.
 _INFLIGHT_ATTR = '_sky_inflight_requests'
+# Per-client wakeup for the drain task. The counter above remains
+# authoritative; this event only avoids polling after the final release.
+_INFLIGHT_ZERO_EVENT_ATTR = '_sky_inflight_zero_event'
 # Request-local marker for an occupancy-aware queue admission that has not yet
 # been assigned to a concrete replica. It closes the short scheduling gap
 # between the fleet-wide admission decision and per-replica slot reservation.
@@ -2441,6 +2444,29 @@ class SkyServeLoadBalancer:
                 if not request_batch_accepted:
                     self._request_aggregator.restore(request_batch)
 
+    @staticmethod
+    def _release_client_refcount(client: httpx.AsyncClient) -> None:
+        """Release one request and wake an active drain on the last one."""
+        remaining = getattr(client, _INFLIGHT_ATTR, 1) - 1
+        setattr(client, _INFLIGHT_ATTR, remaining)
+        if remaining <= 0:
+            zero_event = getattr(client, _INFLIGHT_ZERO_EVENT_ATTR, None)
+            if isinstance(zero_event, asyncio.Event):
+                zero_event.set()
+
+    @staticmethod
+    def _client_refcount_zero_event(client: httpx.AsyncClient) -> asyncio.Event:
+        """Return a wakeup whose state reflects the authoritative counter."""
+        zero_event = getattr(client, _INFLIGHT_ZERO_EVENT_ATTR, None)
+        if not isinstance(zero_event, asyncio.Event):
+            zero_event = asyncio.Event()
+            setattr(client, _INFLIGHT_ZERO_EVENT_ATTR, zero_event)
+        if getattr(client, _INFLIGHT_ATTR, 0) > 0:
+            zero_event.clear()
+        else:
+            zero_event.set()
+        return zero_event
+
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
         """Close a pruned replica's client once its in-flight work drains.
@@ -2453,14 +2479,18 @@ class SkyServeLoadBalancer:
         (stream timeout + margin) bounds leaked connections if a counter
         is ever stuck.
         """
-        deadline = (asyncio.get_event_loop().time() +
-                    self._stream_timeout_seconds +
+        loop = asyncio.get_running_loop()
+        deadline = (loop.time() + self._stream_timeout_seconds +
                     constants.LB_DRAIN_CLOSE_GRACE_SECONDS)
-        # Deliberate 1s poll: in-flight tracking is a plain counter attribute
-        # on the httpx client, with no Event to await.
-        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and  # noqa: ASYNC110
-               asyncio.get_event_loop().time() < deadline):
-            await asyncio.sleep(1)
+        while getattr(client, _INFLIGHT_ATTR, 0) > 0:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            zero_event = self._client_refcount_zero_event(client)
+            try:
+                await asyncio.wait_for(zero_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
         inflight = getattr(client, _INFLIGHT_ATTR, 0)
         if inflight > 0:
             logger.warning(f'Closing drained client for {url} with '
@@ -2818,8 +2848,7 @@ class SkyServeLoadBalancer:
             if client_refcount_dropped or client is None:
                 return
             client_refcount_dropped = True
-            setattr(client, _INFLIGHT_ATTR,
-                    getattr(client, _INFLIGHT_ATTR, 1) - 1)
+            self._release_client_refcount(client)
 
         try:
             # We defer the get of the client here on purpose, for case when the
@@ -2835,8 +2864,13 @@ class SkyServeLoadBalancer:
             # only after its in-flight work drains (a re-added URL gets a
             # fresh client with its own counter). Decremented exactly once
             # per request alongside the slot release below.
-            setattr(client, _INFLIGHT_ATTR,
-                    getattr(client, _INFLIGHT_ATTR, 0) + 1)
+            inflight = getattr(client, _INFLIGHT_ATTR, 0)
+            if type(inflight) is not int:
+                # Tolerate partially initialized clients during rolling
+                # upgrades and lightweight test doubles. Real clients only
+                # ever carry the integer written below.
+                inflight = 0
+            setattr(client, _INFLIGHT_ATTR, inflight + 1)
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             proxy_request = client.build_request(
