@@ -696,7 +696,35 @@ def test_check_cluster_available_uses_refresh_as_only_healthy_read(monkeypatch):
 
     assert result is handle
     refresh.assert_called_once_with('test-cluster')
-    get_record.assert_not_called()
+    # One pre-refresh snapshot read: it feeds the terminated-during-refresh
+    # diagnostics and must not be repeated on the healthy path.
+    get_record.assert_called_once_with('test-cluster',
+                                       include_user_info=False,
+                                       summary_response=True)
+
+
+def test_check_cluster_available_removed_during_refresh_keeps_diagnostics(
+        monkeypatch):
+    """A cluster whose row is deleted by the refresh itself (e.g. spot
+    preemption discovered on the cloud) must surface the pre-refresh record's
+    preempted/autodowned diagnostics rather than a bare does-not-exist."""
+    stale_handle = mock.MagicMock()
+    get_record = mock.Mock(return_value=_available_cluster_record(stale_handle))
+    # Refresh succeeds but observed all nodes terminated: the row is removed
+    # and (None, None) is returned.
+    refresh = mock.Mock(return_value=(None, None))
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name', get_record)
+    monkeypatch.setattr(backend_utils, 'refresh_cluster_status_handle', refresh)
+
+    with pytest.raises(exceptions.ClusterDoesNotExist):
+        backend_utils.check_cluster_available('test-cluster',
+                                              operation='test operation',
+                                              check_cloud_vm_ray_backend=False)
+
+    # The diagnostic branch consults the snapshot's spot/autostop state; a
+    # bare "does not exist" branch never touches the handle.
+    stale_handle.launched_resources.use_spot.__bool__.assert_called()
 
 
 @pytest.mark.parametrize('removed', [False, True])
@@ -738,9 +766,12 @@ def test_check_cluster_available_refresh_error_uses_current_record(
             check_cloud_vm_ray_backend=False)
         assert result is current_handle
 
-    get_record_mock.assert_called_once_with('test-cluster',
-                                            include_user_info=False,
-                                            summary_response=True)
+    # One pre-refresh snapshot read plus one post-failure re-read; the
+    # fallback must use the current record, not the stale snapshot.
+    assert get_record_mock.call_args_list == [
+        mock.call(
+            'test-cluster', include_user_info=False, summary_response=True),
+    ] * 2
 
 
 def test_check_cluster_available_dryrun_reads_once_without_refresh(monkeypatch):
