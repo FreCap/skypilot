@@ -91,9 +91,9 @@ Example for equal numeric priority:
 
 This matching rule subsumes the simple A100-only-versus-flexible case without making the incorrect assumption that all two-card sets are equally flexible.
 
-The scheduler atomically grants a waiter a card-specific capacity reservation/eligible replica set. It removes all secondary references in the same lock, so a flexible request cannot be granted once from L4 and again from A100. New requests always enter the authoritative waiter registry before dispatch; they cannot bypass already-eligible waiters.
+The scheduler atomically grants a waiter a card-specific eligible replica set while retaining one process-level admission owner. It removes all secondary references in the same lock, so a flexible request cannot be granted once from L4 and again from A100. New requests always enter the authoritative waiter registry before dispatch; they cannot bypass already-eligible waiters.
 
-If a granted replica fails during proxying, the request may retry on another compatible ready card. The scheduler atomically transfers the reservation. If no compatible slot remains, it requeues the same waiter with its original priority, FIFO sequence, deadline, and compatibility set. It does not become a newer request and does not hold a phantom card slot.
+If a granted replica fails during proxying before the upstream outcome becomes ambiguous, the already-admitted request may retry on another compatible ready card. It retains the same process-level admission ownership throughout the bounded retry loop, so it cannot leak or double-consume a slot. If no compatible replica remains, it fails with a retryable 503 and releases admission; it is not silently widened to an incompatible card.
 
 Strict numeric priority and fallback-aware ordering can starve lower-priority requests or requests with consistently better alternatives. This is intentional and matches the accepted priority policy; existing queue timeout/cancellation remains the bound.
 
@@ -138,6 +138,7 @@ service:
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
 - For this first version, require one GPU-count shape per exact accelerator ID in a multi-card service. Reject ambiguous configurations such as both `A100:1` and `A100:8` under one `A100` floor until the public identity is extended to an exact card-plus-count shape.
+- For this first version, exact-card compatibility and per-card floors require dict `target_qps_per_replica` plus `instance_aware_least_load`. Other autoscalers retain their legacy aggregate behavior and do not advertise the compatibility capability, preventing constrained demand from triggering generic scale-ups onto the wrong card.
 
 The control loop exposes three related but different values:
 
@@ -215,7 +216,7 @@ SkyPilot changes:
 - Use existing `LoadBalancingPolicy.select_replica(..., eligible=...)` support to restrict dispatch to URLs whose `replica_info.gpu_type` is an exact compatible card.
 - In `sky/serve/load_balancing_policies.py`, centralize exact-card URL lookup while retaining instance-aware least-load selection among eligible replicas.
 - Include the persisted zero-cost provenance in controller-to-LB `replica_info` and use it only as the final ready-replica cost preference after the compatibility matcher has protected constrained demand.
-- Add card-specific reservation transfer/requeue behavior for proxy failures and cancellation cleanup.
+- Preserve one admitted owner across compatible proxy retries and prove cancellation/failure cleanup releases it exactly once.
 - Add bounded compatibility-set queue metrics and the capability/configured-card fields to the LB capacity endpoint.
 
 Tests:
@@ -224,7 +225,7 @@ Tests:
 - Add deterministic concurrency cases: 1000 same-priority flexible L4/A100/H100 waiters, then an A100-only waiter; the constrained waiter gets the next A100 slot, L4 continues serving flexible work, and no running request is interrupted.
 - Test numeric dominance separately: priority-50 flexible remains ahead of priority-20 A100-only for an A100 slot.
 - Test the crossed two-card case: `{L4,A100}` and `{A100,H100}` use A100/H100 when L4 is unavailable and H100 is ready; with only A100 and equally unavailable alternatives FIFO wins; with paid L4 versus paid H100 fallback, assign A100 to the request avoiding the worse fallback and target the cheaper cold card for the other.
-- Test replica failure requeue preserves original FIFO sequence and never leaks occupancy.
+- Test compatible replica retry preserves one admission owner and never leaks occupancy; exhaustion fails retryably without widening compatibility.
 
 Acceptance gate:
 
@@ -239,7 +240,7 @@ SkyPilot changes:
 - In `sky/serve/autoscalers.py`, add a deterministic, sticky priority-first supply-aware allocator that converts demand profiles into `demand_target_by_accelerator` using each exact card's request-rate target and the same marginal fallback ranking as admission.
 - Update autoscaler decisions to carry exact accelerator resource overrides on ordinary demand scale-up, not only reserved-fill scale-up.
 - Make scale-down exact-card-aware and enforce both aggregate and per-card hard floors under the existing graceful delays.
-- In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, split grants by exact pool, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets.
+- In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
 - Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
 

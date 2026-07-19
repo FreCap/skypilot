@@ -1033,7 +1033,10 @@ class ReplicaInfo:
     # rows so a persistent telemetry outage cannot recursively replace them.
     # Version 10 records that a pre-activation physical bridge has published
     # a load-balancer-verified logical width.
-    _VERSION = 10
+    # Version 11 persists placement-cost provenance independently from the
+    # reserved_fill launch reason. Demand launches can also land on free
+    # reserved capacity and must receive the same routing preference.
+    _VERSION = 11
 
     def __init__(self,
                  replica_id: int,
@@ -1090,6 +1093,9 @@ class ReplicaInfo:
         # (prior_reserved_fill) -- otherwise the replacement row would
         # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
+        # Placement-cost provenance, not launch intent. True means the
+        # replica occupies capacity the placer classifies as zero cost.
+        self.is_zero_cost: bool = False
         # Incumbent id this replica was launched to replace economically.
         # None for ordinary demand/fill launches.
         self.cost_rebalance_for_replica_id: int | None = None
@@ -1141,6 +1147,7 @@ class ReplicaInfo:
             'logical_bridge_capacity_verified': bool(
                 getattr(self, 'logical_bridge_capacity_verified', False)),
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
+            'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
             'status_property': {
@@ -1218,6 +1225,7 @@ class ReplicaInfo:
         replica.logical_bridge_capacity_verified = bool(
             state.get('logical_bridge_capacity_verified', False))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
+        replica.is_zero_cost = bool(state.get('is_zero_cost', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.status_property = ReplicaStatusProperty(
@@ -1586,6 +1594,12 @@ class ReplicaInfo:
             # replaces them with flagged rows -- the conservative
             # direction for a live fleet crossing the upgrade.
             self.reserved_fill = False
+
+        if version < 11:
+            # Old rows do not contain authoritative cost provenance. False is
+            # conservative: it preserves correctness and only forgoes the new
+            # economic tie-break until natural replacement.
+            self.is_zero_cost = False
 
         state.setdefault('cost_rebalance_for_replica_id', None)
 
@@ -2287,6 +2301,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'recovering_existing_replica': True,
                     'prior_reserved_fill': bool(
                         getattr(replica_info, 'reserved_fill', False)),
+                    'prior_is_zero_cost': bool(
+                        getattr(replica_info, 'is_zero_cost', False)),
                     'prior_planned_capacity': prior_planned_capacity,
                     'prior_unknown_capacity_replacement': bool(
                         getattr(replica_info, 'unknown_capacity_replacement',
@@ -2468,6 +2484,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
+        prior_is_zero_cost: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_planned_capacity: int | None = None,
         prior_unknown_capacity_replacement: bool = False,
@@ -2489,6 +2506,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         from the persisted override; OR-ing the prior flag in keeps a
         recovered fill replica counted as arbitrated (ceiling-governed)
         capacity instead of silently converting it to demand.
+
+        prior_is_zero_cost: placement-cost provenance of a recovery row. The
+        recovered exact pin remains on the same capacity, so preserve it even
+        if the current placer snapshot is temporarily unavailable.
 
         recovering_existing_replica: the replica already has a durable row
         and cluster identity. Reuse an exact persisted placement instead of
@@ -2627,6 +2648,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             # conflict with the spot placer's selection.
             if resources_override is None:
                 resources_override = {}
+            allowed_locations = self._locations_for_accelerator_override(
+                resources_override)
+            allowed_location_kwargs: dict[str, Any] = (
+                {} if allowed_locations is None else {
+                    'allowed_locations': allowed_locations
+                })
+            if (resources_override.get('accelerators') and
+                    not allowed_locations):
+                raise ValueError(
+                    'No active placement location matches exact accelerator '
+                    f'override {resources_override["accelerators"]!r}.')
             if existing_replica_infos is None:
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
@@ -2669,7 +2701,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # aborted fill launch leaks nothing and the autoscaler
                 # simply retries on a later tick as capacity frees.
                 zero_cost_location = (
-                    self._spot_placer.select_next_zero_cost_location())
+                    self._spot_placer.select_next_zero_cost_location(
+                        allowed_locations=allowed_locations))
                 if zero_cost_location is None:
                     self._log_fill_skip(
                         'no ACTIVE zero-cost location available')
@@ -2681,11 +2714,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # preferring the zero-cost tier.  The placer falls back to
                 # zero-cost when no paid candidate exists.
                 location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True, **allowed_location_kwargs)
                 if (zero_cost_demand_budget is not None and
                         location in self._spot_placer.zero_cost_locations()):
                     budgeted_location = self._select_budgeted_zero_cost_location(
-                        zero_cost_demand_budget)
+                        zero_cost_demand_budget, allowed_locations)
                     if budgeted_location is None:
                         logger.info('Deferring demand launch because the '
                                     'shared zero-cost GPU budget is exhausted '
@@ -2694,10 +2727,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     location = budgeted_location
             elif zero_cost_demand_budget is not None:
                 location = self._select_budgeted_zero_cost_location(
-                    zero_cost_demand_budget)
+                    zero_cost_demand_budget, allowed_locations)
                 if location is None:
                     location = self._spot_placer.select_next_location(
-                        skip_zero_cost_preference=True)
+                        skip_zero_cost_preference=True,
+                        **allowed_location_kwargs)
                     if location in self._spot_placer.zero_cost_locations():
                         # A successful zero (or an exhausted speculative
                         # allowance) is authoritative. If no paid candidate is
@@ -2710,9 +2744,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             elif self._demand_should_skip_saturated_zero_cost(
                     existing_replica_infos):
                 location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True, **allowed_location_kwargs)
             else:
-                location = self._spot_placer.select_next_location()
+                location = self._spot_placer.select_next_location(
+                    **allowed_location_kwargs)
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
@@ -2814,6 +2849,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
+        is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
+        if not is_zero_cost and self._spot_placer is not None:
+            candidates = self._spot_placer.zero_cost_locations()
+            if isinstance(candidates, (list, tuple, set, frozenset)):
+                is_zero_cost = location in candidates
+        info.is_zero_cost = is_zero_cost
         info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
         logical_state_guard = (self._logical_state_lock
                                if logical_reconcile_fence is not None else
@@ -2919,12 +2960,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         return holdings >= grant
 
     def _select_budgeted_zero_cost_location(
-            self, budget: _ZeroCostDemandBudget) -> spot_placer.Location | None:
+        self,
+        budget: _ZeroCostDemandBudget,
+        allowed_locations: set[spot_placer.Location] | None = None,
+    ) -> spot_placer.Location | None:
         """Reserve and select one location from a measured batch budget."""
         if self._spot_placer is None:
             return None
         allowed = set()
         for location in self._spot_placer.zero_cost_locations():
+            if (allowed_locations is not None and
+                    location not in allowed_locations):
+                continue
             pool_key = _zero_cost_pool_key(location)
             if pool_key is None:
                 continue
@@ -2955,6 +3002,27 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert remaining >= debit, (location, budget)
         budget.remaining_by_pool[pool_key] = remaining - debit
         return location
+
+    def _locations_for_accelerator_override(
+        self,
+        resources_override: dict[str, Any],
+    ) -> set[spot_placer.Location] | None:
+        """Restrict a targeted launch to one exact accelerator shape."""
+        if self._spot_placer is None:
+            return None
+        requested = resources_override.get('accelerators')
+        if not isinstance(requested, dict) or not requested:
+            return None
+        requested_shape = {
+            str(name).casefold(): count for name, count in requested.items()
+        }
+        return {
+            location for location in self._spot_placer.active_locations()
+            if isinstance(location.accelerators, dict) and {
+                str(name).casefold(): count
+                for name, count in location.accelerators.items()
+            } == requested_shape
+        }
 
     def _build_zero_cost_demand_budget(
         self,

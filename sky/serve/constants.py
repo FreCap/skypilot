@@ -317,6 +317,16 @@ LB_REQUEST_PRIORITY_HEADER_BYTES = LB_REQUEST_PRIORITY_HEADER.lower().encode(
 LB_REQUEST_PRIORITY_MIN = 0
 LB_REQUEST_PRIORITY_MAX = 100
 
+# Optional exact accelerator compatibility set for one request. The controller
+# advertises the configured exact card catalog over the routing sync before the
+# load balancer accepts this header; omission means every configured card.
+LB_REQUEST_ACCELERATORS_HEADER = 'X-SkyServe-Compatible-Accelerators'
+LB_REQUEST_ACCELERATORS_HEADER_BYTES = (
+    LB_REQUEST_ACCELERATORS_HEADER.lower().encode('ascii'))
+LB_REQUEST_ACCELERATORS_VERSION = 1
+LB_REQUEST_ACCELERATORS_MAX_BYTES = 512
+LB_REQUEST_ACCELERATORS_MAX_ITEMS = 8
+
 # On SIGTERM the external LB first deregisters (stops POSTing
 # load_balancer_sync so the controller stops counting it -- avoiding a
 # double-count with the maxSurge replacement) and fails readiness (so k8s

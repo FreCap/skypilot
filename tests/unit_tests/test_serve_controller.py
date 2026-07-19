@@ -273,6 +273,48 @@ class TestGetRoutingSpec:
         get_service.assert_not_called()
         get_spec.assert_not_called()
 
+    def test_only_instance_aware_autoscaler_advertises_exact_card_capability(
+            self):
+        ctrl = _make_controller()
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica={'A100': 1.0},
+                         lb_stream_timeout_seconds=30)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['A100']):
+            ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+                spec=controller.autoscalers.RequestRateAutoscaler)
+            legacy = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+            assert 'request_accelerator_compatibility_version' not in legacy
+
+            ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+                spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
+            capable = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+            assert capable['request_accelerator_compatibility_version'] == 1
+            assert capable['configured_accelerators'] == ['A100']
+
+    def test_controller_feeds_exact_task_gpu_counts_to_autoscaler(self):
+        ctrl = _make_controller()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}')
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'A100': 8}),
+            types.SimpleNamespace(accelerators={'A100-80GB': 1}),
+        ])
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={})
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            ctrl._configure_instance_aware_accelerators(  # pylint: disable=protected-access
+                spec)
+        ctrl._autoscaler.set_configured_accelerator_shapes.assert_called_once_with(  # pylint: disable=line-too-long
+            {
+                'A100': 8,
+                'A100-80GB': 1,
+            })
+
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
         assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
@@ -2446,6 +2488,15 @@ class TestGetCapacityHint:
             'physical_ready_replicas': 2,
             'physical_total_replicas': 5,
             'physical_failed_replicas': 0,
+            'ready_replicas_by_accelerator': {
+                'A100': 8,
+            },
+            'provisioning_replicas_by_accelerator': {
+                'A100': 5,
+            },
+            'total_replicas_by_accelerator': {
+                'A100': 13,
+            },
             'planned_capacity_by_url': {
                 'http://eight': 8,
                 'http://four': 4,

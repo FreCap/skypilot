@@ -232,6 +232,7 @@ class SkyServeController:
         self._autoscaler: autoscalers.Autoscaler = (
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
+        self._configure_instance_aware_accelerators(service_spec)
         # [boltz fork] Reserved-capacity fill poller lifecycle: started
         # from run() when the service booted with the flag on, and
         # lazily from update_service when an update enables the flag on
@@ -462,6 +463,13 @@ class SkyServeController:
                 'gpu_type': gpu_type,
                 'gpu_count': str(gpu_count),
             }
+            is_zero_cost = getattr(info, 'is_zero_cost', None)
+            if isinstance(is_zero_cost, bool):
+                # Placement-cost provenance is independent from the launch
+                # reason: an ordinary demand launch may land on free reserved
+                # capacity and should receive the same economic tie-break.
+                replica_info[url]['is_zero_cost'] = ('true' if is_zero_cost else
+                                                     'false')
             async_occupancy = ((async_occupancy_by_version or
                                 {}).get(info.version))
             if async_occupancy is not None:
@@ -871,6 +879,8 @@ class SkyServeController:
             request_aggregator: dict[str, Any] = effective_request_data.get(
                 'request_aggregator', {})
             timestamps: list[int] = request_aggregator.get('timestamps', [])
+            compatibility_profiles = request_aggregator.get(
+                'compatibility_profiles', [])
             logger.info(f'Received {len(timestamps)} inflight requests.')
             translated_in_flight = self._translate_in_flight(
                 effective_request_data.get('in_flight'))
@@ -886,6 +896,7 @@ class SkyServeController:
             reconcile_generation = self._reconcile_generation
             self._autoscaler.collect_request_information({
                 'timestamps': timestamps,
+                'compatibility_profiles': compatibility_profiles,
                 'in_flight_by_replica_id': translated_in_flight,
                 'unknown_in_flight_replica_ids': list(unknown_replica_ids),
                 'observed_slots_by_replica_id': observed_slots,
@@ -1683,6 +1694,10 @@ class SkyServeController:
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
         num_latest_nonterminal = 0
+        ready_by_accelerator: dict[str, int] = {}
+        provisioning_by_accelerator: dict[str, int] = {}
+        total_by_accelerator: dict[str, int] = {}
+        zero_cost_ready_by_accelerator: dict[str, int] = {}
         logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
         if logical_versions is None:
             logical_versions = {latest_version} if logical else set()
@@ -1694,11 +1709,40 @@ class SkyServeController:
                 continue
             width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
             num_latest_nonterminal += width
+            cached = self._lb_translation_cache.get(info.replica_id)
+            accelerator = cached[1] if cached is not None else 'unknown'
+            if accelerator == 'unknown':
+                override_accelerators = (getattr(
+                    info, 'resources_override', None) or {}).get('accelerators')
+                if isinstance(override_accelerators,
+                              dict) and override_accelerators:
+                    accelerator = next(iter(override_accelerators))
+            known_accelerator = accelerator != 'unknown'
+            if known_accelerator:
+                total_by_accelerator[accelerator] = (
+                    total_by_accelerator.get(accelerator, 0) + width)
             if not info.is_ready:
                 num_provisioning += width
+                if known_accelerator:
+                    provisioning_by_accelerator[accelerator] = (
+                        provisioning_by_accelerator.get(accelerator, 0) + width)
+            else:
+                if known_accelerator:
+                    ready_by_accelerator[accelerator] = (
+                        ready_by_accelerator.get(accelerator, 0) + width)
+                if (known_accelerator and
+                        bool(getattr(info, 'is_zero_cost', False))):
+                    zero_cost_ready_by_accelerator[accelerator] = (
+                        zero_cost_ready_by_accelerator.get(accelerator, 0) +
+                        width)
         target = self._autoscaler.get_final_target_num_replicas()
         if not self._autoscaler.has_recomputed_with_fresh_data():
             target = max(target, num_latest_nonterminal)
+        counts = self._get_replica_counts(replica_infos, include_unit=False)
+        free_reserved_by_accelerator = counts.get(
+            'free_reserved_slots_by_accelerator', {})
+        fill_target_by_accelerator = counts.get('fill_target_by_accelerator',
+                                                {})
         hint: dict[str, Any] = {
             'replica_unit': ('logical_slot' if logical else 'physical_backend'),
             'provisioning_replicas': num_provisioning,
@@ -1706,7 +1750,28 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
             'configured_max_replicas': self._autoscaler.max_replicas,
         }
-        hint.update(self._get_replica_counts(replica_infos, include_unit=False))
+        min_by_accelerator = getattr(self._autoscaler,
+                                     'min_replicas_by_accelerator', {})
+        demand_by_accelerator = getattr(self._autoscaler,
+                                        'target_num_replicas_by_accelerator',
+                                        {})
+        if isinstance(min_by_accelerator, dict) and min_by_accelerator:
+            hint['min_replicas_by_accelerator'] = dict(min_by_accelerator)
+        if isinstance(demand_by_accelerator, dict) and demand_by_accelerator:
+            hint['target_num_replicas_by_accelerator'] = dict(
+                demand_by_accelerator)
+            hint['demand_target_by_accelerator'] = dict(demand_by_accelerator)
+        for key, value in {
+                'ready_replicas_by_accelerator': ready_by_accelerator,
+                'provisioning_replicas_by_accelerator': provisioning_by_accelerator,
+                'total_replicas_by_accelerator': total_by_accelerator,
+                'zero_cost_ready_replicas_by_accelerator': zero_cost_ready_by_accelerator,
+                'fill_target_by_accelerator': fill_target_by_accelerator,
+                'free_reserved_slots_by_accelerator': free_reserved_by_accelerator,
+        }.items():
+            if value:
+                hint[key] = value
+        hint.update(counts)
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -1725,13 +1790,18 @@ class SkyServeController:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         include_unit: bool = True,
-    ) -> dict[str, int | str]:
+    ) -> dict[str, Any]:
         """Return logical capacity and physical backend status aggregates."""
         autoscaler = getattr(self, '_autoscaler', None)
         logical = getattr(autoscaler, 'replica_unit', None) == 'logical'
 
         ready = total = failed = 0
         physical_ready = physical_total = physical_failed = 0
+        ready_by_accelerator: dict[str, int] = {}
+        provisioning_by_accelerator: dict[str, int] = {}
+        total_by_accelerator: dict[str, int] = {}
+        zero_cost_ready_by_accelerator: dict[str, int] = {}
+        zero_cost_total_by_accelerator: dict[str, int] = {}
         failed_statuses = serve_state.ReplicaStatus.failed_statuses()
         for info in replica_infos:
             status = info.status
@@ -1743,6 +1813,18 @@ class SkyServeController:
                      if logical and isinstance(planned_capacity, int) and
                      not isinstance(planned_capacity, bool) and
                      planned_capacity > 0 else 1)
+            cached = self._lb_translation_cache.get(info.replica_id)
+            accelerator = cached[1] if cached is not None else 'unknown'
+            if accelerator == 'unknown':
+                resources = getattr(getattr(info, 'handle', None),
+                                    'launched_resources', None)
+                accelerators = getattr(resources, 'accelerators', None)
+                if not accelerators:
+                    accelerators = (getattr(info, 'resources_override', None) or
+                                    {}).get('accelerators')
+                if isinstance(accelerators, dict) and accelerators:
+                    accelerator = next(iter(accelerators))
+            known_accelerator = accelerator != 'unknown'
             if status == serve_state.ReplicaStatus.READY:
                 capacity_getter = getattr(autoscaler,
                                           'get_ready_replica_capacity', None)
@@ -1750,14 +1832,34 @@ class SkyServeController:
                                   callable(capacity_getter) else width)
                 ready += max(0, int(observed_ready))
                 physical_ready += 1
+                if known_accelerator:
+                    ready_by_accelerator[accelerator] = (
+                        ready_by_accelerator.get(accelerator, 0) + width)
+                if (known_accelerator and
+                        bool(getattr(info, 'is_zero_cost', False))):
+                    zero_cost_ready_by_accelerator[accelerator] = (
+                        zero_cost_ready_by_accelerator.get(accelerator, 0) +
+                        width)
             if status in failed_statuses:
                 failed += width
                 physical_failed += 1
             else:
                 total += width
                 physical_total += 1
+                if known_accelerator:
+                    total_by_accelerator[accelerator] = (
+                        total_by_accelerator.get(accelerator, 0) + width)
+                if (known_accelerator and
+                        bool(getattr(info, 'is_zero_cost', False))):
+                    zero_cost_total_by_accelerator[accelerator] = (
+                        zero_cost_total_by_accelerator.get(accelerator, 0) +
+                        width)
+                if (known_accelerator and
+                        status != serve_state.ReplicaStatus.READY):
+                    provisioning_by_accelerator[accelerator] = (
+                        provisioning_by_accelerator.get(accelerator, 0) + width)
 
-        counts: dict[str, int | str] = {
+        counts: dict[str, Any] = {
             'ready_replicas': ready,
             'total_replicas': total,
             'failed_replicas': failed,
@@ -1765,19 +1867,207 @@ class SkyServeController:
             'physical_total_replicas': physical_total,
             'physical_failed_replicas': physical_failed,
         }
+        for key, value in {
+                'ready_replicas_by_accelerator': ready_by_accelerator,
+                'provisioning_replicas_by_accelerator': provisioning_by_accelerator,
+                'total_replicas_by_accelerator': total_by_accelerator,
+                'zero_cost_ready_replicas_by_accelerator': zero_cost_ready_by_accelerator,
+                'zero_cost_total_replicas_by_accelerator': zero_cost_total_by_accelerator,
+        }.items():
+            if value:
+                counts[key] = value
+        free_reserved = self._get_free_reserved_slots_by_accelerator()
+        if free_reserved:
+            counts['free_reserved_slots_by_accelerator'] = free_reserved
+        fill_target = self._get_fill_target_by_accelerator(
+            zero_cost_total_by_accelerator, free_reserved)
+        if fill_target:
+            counts['fill_target_by_accelerator'] = fill_target
+        demand_target = getattr(autoscaler,
+                                'target_num_replicas_by_accelerator', {})
+        if isinstance(demand_target, dict) and demand_target:
+            counts['demand_target_by_accelerator'] = dict(demand_target)
         if include_unit:
             counts['replica_unit'] = ('logical_slot'
                                       if logical else 'physical_backend')
         return counts
 
-    @staticmethod
-    def _build_routing_spec(service_spec: Any) -> dict[str, Any] | None:
+    def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:
+        """Return fresh cached physical zero-cost supply by exact card."""
+        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
+                         None)
+        getter = getattr(placer, 'zero_cost_locations', None)
+        if not callable(getter):
+            return {}
+        locations = getter()
+        if not isinstance(locations, list) or not locations:
+            return {}
+        shapes = reserved_capacity.zero_cost_pool_shapes(locations)
+        observations = reserved_capacity.get_cached_free_gpus_by_pool(locations)
+        canonical_by_name = {
+            str(card).casefold(): str(card) for location in locations
+            for card in (location.accelerators or {})
+        }
+        free_by_accelerator: dict[str, int] = {}
+        for (context, normalized_card), per_replica in shapes.items():
+            observation = observations.get((context, normalized_card))
+            if observation is None or observation.free_gpus is None:
+                continue
+            card = canonical_by_name.get(normalized_card, normalized_card)
+            free_by_accelerator[card] = (
+                free_by_accelerator.get(card, 0) +
+                max(0, observation.free_gpus) // max(1, per_replica))
+        return free_by_accelerator
+
+    def _get_fill_target_by_accelerator(
+        self,
+        zero_cost_total: dict[str, int],
+        free_reserved: dict[str, int],
+    ) -> dict[str, int]:
+        """Project the aggregate fill overlay onto exact observed cards."""
+        if getattr(self._autoscaler, 'reserved_capacity_fill',
+                   False) is not True:
+            return {}
+        raw_aggregate_target = getattr(self._autoscaler, '_fill_target', 0)
+        aggregate_target = (max(0, raw_aggregate_target)
+                            if isinstance(raw_aggregate_target, int) and
+                            not isinstance(raw_aggregate_target, bool) else 0)
+        card_order: list[str] = []
+        seen: set[str] = set()
+        demand_target = getattr(self._autoscaler,
+                                'target_num_replicas_by_accelerator', {})
+        if not isinstance(demand_target, dict):
+            demand_target = {}
+        for mapping in (demand_target, zero_cost_total, free_reserved):
+            for card in mapping:
+                if card.casefold() in seen:
+                    continue
+                seen.add(card.casefold())
+                card_order.append(card)
+        result: dict[str, int] = {}
+        remaining = aggregate_target
+        # Existing reserved replicas are the stable allocation. New fill is
+        # then projected only onto exact cards with fresh physical supply.
+        for source in (zero_cost_total, free_reserved):
+            for card in card_order:
+                if remaining <= 0:
+                    break
+                allocated = min(remaining, max(0, int(source.get(card, 0))))
+                if allocated <= 0:
+                    continue
+                result[card] = result.get(card, 0) + allocated
+                remaining -= allocated
+        if remaining > 0 and card_order:
+            # A broker grant may remain visible for one poll after the exact
+            # free observation becomes stale. Preserve aggregate reconciliation
+            # without inventing a family match by assigning only to the first
+            # exact configured card.
+            result[card_order[0]] = result.get(card_order[0], 0) + remaining
+        return result
+
+    def _configured_accelerators(self, service_spec: Any) -> list[str]:
+        """Return configured exact accelerator IDs in service resource order."""
+        yaml_content = getattr(getattr(self, '_replica_manager', None),
+                               'yaml_content', None)
+        if not isinstance(yaml_content, str):
+            # Direct controller unit tests replace ReplicaManager with a loose
+            # mock. A real manager always owns the committed YAML string.
+            return []
+        task = replica_managers.load_task_with_service_spec(
+            yaml_content, service_spec)
+        configured: list[str] = []
+        seen: set[str] = set()
+        counts_by_accelerator: dict[str, set[int]] = {}
+        for resources in task.resources:
+            for accelerator, raw_count in (resources.accelerators or
+                                           {}).items():
+                normalized = accelerator.casefold()
+                try:
+                    count = int(raw_count)
+                except (TypeError, ValueError):
+                    count = 0
+                counts_by_accelerator.setdefault(normalized, set()).add(count)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                configured.append(accelerator)
+        floors = getattr(service_spec, 'min_replicas_by_accelerator', {})
+        configured_by_name = {name.casefold(): name for name in configured}
+        unknown_floors = [
+            name for name in floors if name.casefold() not in configured_by_name
+        ]
+        if unknown_floors:
+            raise ValueError(
+                'min_replicas_by_accelerator contains accelerators not '
+                f'configured by the service resources: {unknown_floors}.')
+        ambiguous = {
+            name: sorted(counts)
+            for name, counts in counts_by_accelerator.items()
+            if len(counts) > 1 or not counts or min(counts) < 1
+        }
+        # A larger legacy any_of service remains valid but cannot encode its
+        # default-all set in the bounded version-1 header. Withhold the
+        # capability instead of breaking that existing service. Floors still
+        # require an unambiguous shape for every exact card they target.
+        if len(configured) > serve_constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS:
+            ambiguous_floors = {
+                name: counts
+                for name, counts in ambiguous.items()
+                if name in {floor.casefold() for floor in floors}
+            }
+            if ambiguous_floors:
+                raise ValueError(
+                    'SkyServe per-card floors require one positive GPU count '
+                    'shape per accelerator; found ambiguous floor shapes '
+                    f'{ambiguous_floors}.')
+            return []
+        if ambiguous:
+            raise ValueError(
+                'SkyServe exact-card compatibility requires one positive GPU '
+                'count shape per accelerator; found ambiguous shapes '
+                f'{ambiguous}.')
+        return configured
+
+    def _configured_accelerator_shapes(self,
+                                       service_spec: Any) -> dict[str, int]:
+        """Return canonical exact-card GPU counts from active task resources."""
+        configured = self._configured_accelerators(service_spec)
+        if not configured:
+            return {}
+        yaml_content = getattr(getattr(self, '_replica_manager', None),
+                               'yaml_content', None)
+        if not isinstance(yaml_content, str):
+            return {}
+        task = replica_managers.load_task_with_service_spec(
+            yaml_content, service_spec)
+        configured_by_name = {card.casefold(): card for card in configured}
+        shapes: dict[str, int] = {}
+        for resources in task.resources:
+            for accelerator, raw_count in (resources.accelerators or
+                                           {}).items():
+                card = configured_by_name.get(accelerator.casefold())
+                if card is not None:
+                    shapes[card] = int(raw_count)
+        return shapes
+
+    def _configure_instance_aware_accelerators(self, service_spec: Any) -> None:
+        """Feed task-authoritative exact shapes to the compatible autoscaler."""
+        if isinstance(self._autoscaler,
+                      autoscalers.InstanceAwareRequestRateAutoscaler):
+            self._autoscaler.set_configured_accelerator_shapes(
+                self._configured_accelerator_shapes(service_spec))
+
+    def _build_routing_spec(self, service_spec: Any) -> dict[str, Any] | None:
         """Build the immutable routing config shipped on LB syncs."""
         if service_spec is None:
             return None
         target_qps = service_spec.target_qps_per_replica
         retriable_status_codes = service_spec.lb_retriable_status_codes
-        return {
+        configured_accelerators = (
+            self._configured_accelerators(service_spec) if isinstance(
+                getattr(self, '_autoscaler', None),
+                autoscalers.InstanceAwareRequestRateAutoscaler) else [])
+        routing_spec = {
             # `load_balancing_policy` resolves None to the default policy
             # name, so the LB always receives a concrete policy to build.
             'load_balancing_policy_name': service_spec.load_balancing_policy,
@@ -1797,6 +2087,13 @@ class SkyServeController:
                 (service_spec.lb_retry_initial_backoff_seconds),
             'request_queue': getattr(service_spec, 'lb_request_queue', None),
         }
+        if configured_accelerators:
+            routing_spec.update({
+                'request_accelerator_compatibility_version':
+                    serve_constants.LB_REQUEST_ACCELERATORS_VERSION,
+                'configured_accelerators': configured_accelerators,
+            })
+        return routing_spec
 
     def _get_routing_spec(self) -> dict[str, Any] | None:
         """Return the routing spec for the load_balancer_sync response.
@@ -2266,6 +2563,7 @@ class SkyServeController:
             self._autoscaler.update_version(version,
                                             service,
                                             update_mode=update_mode)
+        self._configure_instance_aware_accelerators(service)
         self._reserved_capacity_fill_enabled = bool(
             getattr(service, 'reserved_capacity_fill', False))
         if self._reserved_capacity_fill_enabled:
@@ -2344,6 +2642,10 @@ class SkyServeController:
                 decision_version = decision_autoscaler.latest_version
                 decision_autoscaler.set_spot_placer(
                     self._replica_manager.spot_placer)
+                if isinstance(decision_autoscaler,
+                              autoscalers.InstanceAwareRequestRateAutoscaler):
+                    decision_autoscaler.set_free_reserved_slots_by_accelerator(
+                        self._get_free_reserved_slots_by_accelerator())
 
                 # Autoscaler now extracts GPU type info directly from
                 # replica_infos in generate_scaling_decisions method

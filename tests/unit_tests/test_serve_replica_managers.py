@@ -362,7 +362,7 @@ def test_confirm_logical_bridge_capacity_is_durable_and_monotonic():
         confirmed = mgr.confirm_logical_bridge_capacities({1: 8})
 
     assert confirmed == {1: 8}
-    assert info.to_storage_dict()['replica_info_version'] == 10
+    assert info.to_storage_dict()['replica_info_version'] == 11
     assert info.planned_capacity == 8
     assert info.logical_bridge_capacity_verified is True
     assert persisted == [(1, info)]
@@ -4932,6 +4932,37 @@ class TestZeroCostDemandProbeBudget:
         assert budget.remaining_by_pool == {
             ('research-ctx', 'a100'): 223,
             ('research-ctx', 'h100'): 16,
+        }
+
+    def test_targeted_zero_cost_selection_keeps_a100_variants_exact(self):
+        a100 = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        a100_80gb = self._location('Kubernetes',
+                                   'research-ctx',
+                                   'A100-80GB',
+                                   use_spot=False)
+        manager = self._manager([a100, a100_80gb], [a100, a100_80gb])
+        manager._spot_placer.select_next_zero_cost_location.side_effect = (
+            lambda *, allowed_locations: next(iter(allowed_locations)))
+        budget = replica_managers._ZeroCostDemandBudget(
+            remaining_by_pool={
+                ('research-ctx', 'a100'): 1,
+                ('research-ctx', 'a100-80gb'): 1,
+            },
+            measured_by_pool={
+                ('research-ctx', 'a100'): 1,
+                ('research-ctx', 'a100-80gb'): 1,
+            })
+
+        selected = manager._select_budgeted_zero_cost_location(
+            budget, {a100_80gb})
+
+        assert selected == a100_80gb
+        assert budget.remaining_by_pool == {
+            ('research-ctx', 'a100'): 1,
+            ('research-ctx', 'a100-80gb'): 0,
         }
 
     def test_successful_zero_snapshot_does_not_speculate(self):

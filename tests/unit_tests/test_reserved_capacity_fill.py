@@ -1025,6 +1025,43 @@ class TestFillLaunchPath(unittest.TestCase):
         # relies on it.
         self.assertIsNotNone(info.created_at)
 
+    def test_targeted_fill_keeps_a100_variants_exact(self):
+        a100 = make_location('research-ctx',
+                             accelerators={'A100': 1},
+                             use_spot=False)
+        a100_80gb = make_location('research-ctx',
+                                  accelerators={'A100-80GB': 1},
+                                  use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [a100, a100_80gb]
+        placer.select_next_zero_cost_location.return_value = a100_80gb
+        manager = _make_manager(placer)
+        override = {
+            _FILL_KEY: True,
+            'accelerators': {
+                'A100-80GB': 1
+            },
+        }
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica') as add_mock:
+            manager._scale_up_one_locked(override, set())
+
+        placer.select_next_zero_cost_location.assert_called_once_with(
+            allowed_locations={a100_80gb})
+        info = add_mock.call_args[0][2]
+        self.assertEqual(info.resources_override['accelerators'],
+                         {'A100-80GB': 1})
+
     def test_redriven_pinned_launch_keeps_location(self):
         # Controller crash mid-PENDING: the launch is re-driven with the
         # persisted override (location inlined, sentinel already

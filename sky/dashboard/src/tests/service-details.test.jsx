@@ -23,6 +23,7 @@ jest.mock('@/lib/cache', () => ({
 import dashboardCache from '@/lib/cache';
 import { getServices } from '@/data/connectors/services';
 import {
+  AcceleratorCapacityCard,
   getReplicaPlacementBreakdown,
   ReplicaPlacementCard,
   ReplicasCard,
@@ -30,6 +31,50 @@ import {
   sortReplicas,
   useServiceDetails,
 } from '@/pages/services/[service]';
+
+describe('AcceleratorCapacityCard', () => {
+  it('renders exact cards and separates demand floors from reserved supply', () => {
+    render(
+      <AcceleratorCapacityCard
+        serviceData={{
+          fillTarget: 4,
+          freeReservedSlots: 2,
+          acceleratorCapacity: [
+            {
+              card: 'A100',
+              ready: 1,
+              provisioning: 2,
+              total: 3,
+              demandTarget: 3,
+              hardFloor: 1,
+              zeroCostReady: 1,
+              fillTarget: null,
+              freeReserved: null,
+            },
+            {
+              card: 'A100-80GB',
+              ready: 2,
+              provisioning: 0,
+              total: 2,
+              demandTarget: 2,
+              hardFloor: 2,
+              zeroCostReady: 0,
+              fillTarget: null,
+              freeReserved: null,
+            },
+          ],
+        }}
+      />
+    );
+
+    expect(screen.getByText('A100')).toBeInTheDocument();
+    expect(screen.getByText('A100-80GB')).toBeInTheDocument();
+    expect(screen.getByText('Aggregate fill target: 4')).toBeInTheDocument();
+    expect(
+      screen.getByText('Aggregate free reserved slots: 2')
+    ).toBeInTheDocument();
+  });
+});
 
 function deferred() {
   let resolve;

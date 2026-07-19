@@ -526,6 +526,46 @@ describe('normalizeReplicaHistory', () => {
 });
 
 describe('normalizeService / normalizeReplica', () => {
+  it('keeps A100 and A100-80GB as separate exact-card capacity rows', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        min_replicas_by_accelerator: { A100: 1, 'A100-80GB': 2 },
+        target_num_replicas_by_accelerator: { A100: 3, 'A100-80GB': 4 },
+        ready_replicas_by_accelerator: { A100: 2, 'A100-80GB': 1 },
+        provisioning_replicas_by_accelerator: {
+          A100: 1,
+          'A100-80GB': 3,
+        },
+        total_replicas_by_accelerator: { A100: 3, 'A100-80GB': 4 },
+        zero_cost_ready_replicas_by_accelerator: {
+          A100: 1,
+          'A100-80GB': 0,
+        },
+        fill_target: 5,
+        fill_free_slots: 2,
+      })
+    );
+
+    expect(service.acceleratorCapacity).toEqual([
+      expect.objectContaining({
+        card: 'A100',
+        ready: 2,
+        provisioning: 1,
+        demandTarget: 3,
+        hardFloor: 1,
+      }),
+      expect.objectContaining({
+        card: 'A100-80GB',
+        ready: 1,
+        provisioning: 3,
+        demandTarget: 4,
+        hardFloor: 2,
+      }),
+    ]);
+    expect(service.fillTarget).toBe(5);
+    expect(service.freeReservedSlots).toBe(2);
+  });
+
   it('combines spot and on-demand replica costs and tracks exclusions', () => {
     const service = normalizeService(
       rawServiceRecord({

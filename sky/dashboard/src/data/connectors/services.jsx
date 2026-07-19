@@ -131,6 +131,18 @@ export function normalizeReplicaHistory(history) {
   };
 }
 
+function normalizeAcceleratorCountMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([card, rawCount]) => {
+      const count = Number(rawCount);
+      return typeof card === 'string' && Number.isInteger(count) && count >= 0
+        ? [[card, count]]
+        : [];
+    })
+  );
+}
+
 // Normalize a raw service record from the /serve/status response into the
 // shape consumed by the services pages. Statuses arrive as plain strings
 // (sky/serve/serve_state.py ServiceStatus values).
@@ -249,6 +261,50 @@ export function normalizeService(record) {
         // cloud spend divided by all requests served by the fleet.
         (knownHourlyCost * 1000) / (normalizedRequestRate * 3600)
       : null;
+  const acceleratorMaps = {
+    hardFloor: normalizeAcceleratorCountMap(record.min_replicas_by_accelerator),
+    demandTarget: normalizeAcceleratorCountMap(
+      record.demand_target_by_accelerator ??
+        record.target_num_replicas_by_accelerator
+    ),
+    ready: normalizeAcceleratorCountMap(record.ready_replicas_by_accelerator),
+    provisioning: normalizeAcceleratorCountMap(
+      record.provisioning_replicas_by_accelerator
+    ),
+    total: normalizeAcceleratorCountMap(record.total_replicas_by_accelerator),
+    zeroCostReady: normalizeAcceleratorCountMap(
+      record.zero_cost_ready_replicas_by_accelerator
+    ),
+    fillTarget: normalizeAcceleratorCountMap(record.fill_target_by_accelerator),
+    freeReserved: normalizeAcceleratorCountMap(
+      record.free_reserved_slots_by_accelerator
+    ),
+  };
+  const acceleratorCards = [];
+  const seenAccelerators = new Set();
+  Object.values(acceleratorMaps).forEach((counts) => {
+    Object.keys(counts).forEach((card) => {
+      const normalized = card.toLowerCase();
+      if (seenAccelerators.has(normalized) || normalized === 'unknown') return;
+      seenAccelerators.add(normalized);
+      acceleratorCards.push(card);
+    });
+  });
+  const acceleratorCapacity = acceleratorCards.map((card) => ({
+    card,
+    ready: acceleratorMaps.ready[card] || 0,
+    provisioning: acceleratorMaps.provisioning[card] || 0,
+    total: acceleratorMaps.total[card] || 0,
+    demandTarget: acceleratorMaps.demandTarget[card] || 0,
+    hardFloor: acceleratorMaps.hardFloor[card] || 0,
+    zeroCostReady: acceleratorMaps.zeroCostReady[card] || 0,
+    fillTarget: Object.hasOwn(acceleratorMaps.fillTarget, card)
+      ? acceleratorMaps.fillTarget[card]
+      : null,
+    freeReserved: Object.hasOwn(acceleratorMaps.freeReserved, card)
+      ? acceleratorMaps.freeReserved[card]
+      : null,
+  }));
 
   return {
     name: record.name,
@@ -274,6 +330,9 @@ export function normalizeService(record) {
     // per-replica list is intentionally absent, not empty.
     summaryOnly: Boolean(counts),
     targetReplicas: record.target_num_replicas ?? null,
+    acceleratorCapacity,
+    fillTarget: record.fill_target ?? null,
+    freeReservedSlots: record.fill_free_slots ?? null,
     policy: record.policy || null,
     loadBalancingPolicy: record.load_balancing_policy || null,
     requestedResources: record.requested_resources_str || null,

@@ -194,6 +194,20 @@ def get_service_schema():
                         'type': 'integer',
                         'minimum': 0,
                     },
+                    'min_replicas_by_accelerator': {
+                        'type': 'object',
+                        'minProperties': 1,
+                        'maxProperties': 8,
+                        'patternProperties': {
+                            # Exact accelerator identifiers. In particular,
+                            # A100 and A100-80GB are distinct keys.
+                            '^[A-Za-z0-9-]+$': {
+                                'type': 'integer',
+                                'minimum': 0,
+                            },
+                        },
+                        'additionalProperties': False,
+                    },
                     'max_replicas': {
                         'type': 'integer',
                         'minimum': 0,

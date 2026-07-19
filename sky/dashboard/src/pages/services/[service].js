@@ -382,6 +382,7 @@ function ServiceDetails() {
                 requestHistory={replicaHistory}
                 pricingLoading={replicasLoading && serviceData.summaryOnly}
               />
+              <AcceleratorCapacityCard serviceData={serviceData} />
               <ServeHistorySection
                 key={serviceName}
                 history={replicaHistory}
@@ -404,6 +405,71 @@ function ServiceDetails() {
         )}
       </>
     </>
+  );
+}
+
+export function AcceleratorCapacityCard({ serviceData }) {
+  const rows = serviceData.acceleratorCapacity || [];
+  if (!rows.length) return null;
+  return (
+    <Card className="mb-6 overflow-hidden">
+      <div className="flex items-start justify-between border-b px-4 py-3">
+        <div>
+          <h3 className="text-lg font-semibold">Capacity by exact card</h3>
+          <p className="mt-1 text-sm text-gray-500">
+            Demand targets and hard floors are independent from reserved-fill
+            capacity. A100 and A100-80GB are always separate rows.
+          </p>
+        </div>
+        {(serviceData.fillTarget != null ||
+          serviceData.freeReservedSlots != null) && (
+          <div className="text-right text-xs text-gray-500">
+            {serviceData.fillTarget != null && (
+              <div>Aggregate fill target: {serviceData.fillTarget}</div>
+            )}
+            {serviceData.freeReservedSlots != null && (
+              <div>
+                Aggregate free reserved slots: {serviceData.freeReservedSlots}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Card</TableHead>
+            <TableHead className="text-right">Ready</TableHead>
+            <TableHead className="text-right">Provisioning</TableHead>
+            <TableHead className="text-right">Total</TableHead>
+            <TableHead className="text-right">Demand target</TableHead>
+            <TableHead className="text-right">Hard floor</TableHead>
+            <TableHead className="text-right">Zero-cost ready</TableHead>
+            <TableHead className="text-right">Fill target</TableHead>
+            <TableHead className="text-right">Free reserved</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((row) => (
+            <TableRow key={row.card}>
+              <TableCell className="font-medium">{row.card}</TableCell>
+              <TableCell className="text-right">{row.ready}</TableCell>
+              <TableCell className="text-right">{row.provisioning}</TableCell>
+              <TableCell className="text-right">{row.total}</TableCell>
+              <TableCell className="text-right">{row.demandTarget}</TableCell>
+              <TableCell className="text-right">{row.hardFloor}</TableCell>
+              <TableCell className="text-right">{row.zeroCostReady}</TableCell>
+              <TableCell className="text-right">
+                {row.fillTarget ?? '—'}
+              </TableCell>
+              <TableCell className="text-right">
+                {row.freeReserved ?? '—'}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
   );
 }
 
