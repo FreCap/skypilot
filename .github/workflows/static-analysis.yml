@@ -34,6 +34,10 @@ jobs:
           source ~/lint-env/bin/activate
           uv pip install ruff==0.15.21
           ruff check sky
+          # Provider requests must not be able to block provisioning forever.
+          # Scope S113 to the Verda HTTP wrapper while other provider clients
+          # still have reviewed legacy findings.
+          ruff check sky/adaptors/verda.py --select S113
           # A mutable class default bypasses threading.local's per-thread
           # attribute storage and is shared by every thread. RUF012 is noisy
           # for intentional class constants, so scope it to local subclasses.
