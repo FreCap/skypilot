@@ -10,6 +10,7 @@ and file mount cleanup in task_cleanup().
 """
 import asyncio
 import pathlib
+import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
@@ -1987,6 +1988,63 @@ class TestCancelSignalScan:
         assert manager._cancel_info[7] == (False, None)
 
     @pytest.mark.asyncio
+    async def test_signal_lock_contention_does_not_block_event_loop(
+            self, signal_dir):
+        manager = self._make_manager()
+        task = MagicMock()
+        delivered = asyncio.Event()
+        task.cancel.side_effect = delivered.set
+        manager.job_tasks[7] = task
+        (signal_dir / '7').touch()
+        lock_entered = asyncio.Event()
+        release_lock = threading.Event()
+
+        class ContendedLock:
+            """Lock stand-in that can model both sync and async contention."""
+
+            def __enter__(self):
+                lock_entered.set()
+                release_lock.wait()
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            async def __aenter__(self):
+                lock_entered.set()
+                await asyncio.to_thread(release_lock.wait)
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        fallback_release = threading.Timer(1, release_lock.set)
+        fallback_release.start()
+        try:
+            lock = ContendedLock()
+            with patch('sky.jobs.controller.filelock.FileLock',
+                       return_value=lock), patch(
+                           'sky.jobs.controller.filelock.AsyncFileLock',
+                           return_value=lock):
+                scan = asyncio.create_task(manager._process_cancel_signals())
+                await lock_entered.wait()
+
+                # A synchronous FileLock would hold the event loop until the
+                # fallback timer fires. The async lock lets this task run while
+                # another process owns the signal lock.
+                assert not release_lock.is_set()
+                scan.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await scan
+                release_lock.set()
+                await asyncio.wait_for(delivered.wait(), timeout=2)
+                task.cancel.assert_called_once_with()
+                assert not (signal_dir / '7').exists()
+        finally:
+            release_lock.set()
+            fallback_release.cancel()
+
+    @pytest.mark.asyncio
     async def test_orphan_signal_for_terminal_job_reaped(self, signal_dir):
         manager = self._make_manager()
         manager._cancel_info[5] = (False, None)
@@ -2047,14 +2105,14 @@ class TestCancelSignalScan:
             def __init__(self, lock_path: str):
                 self._signal = pathlib.Path(lock_path[:-len('.lock')])
 
-            def __enter__(self):
+            async def __aenter__(self):
                 self._signal.unlink(missing_ok=True)
                 return self
 
-            def __exit__(self, *args):
+            async def __aexit__(self, *args):
                 return False
 
-        with patch('sky.jobs.controller.filelock.FileLock', ConsumingLock):
+        with patch('sky.jobs.controller.filelock.AsyncFileLock', ConsumingLock):
             await manager._process_cancel_signals()
 
         task.cancel.assert_not_called()
@@ -2095,13 +2153,14 @@ class TestCancelSignalScan:
         sleep.assert_awaited_once_with(15)
         assert isinstance(result[0], asyncio.CancelledError)
 
-    def test_remove_signal_file_is_idempotent(self, signal_dir):
+    @pytest.mark.asyncio
+    async def test_remove_signal_file_is_idempotent(self, signal_dir):
         """The shared signal consumer tolerates an already-removed file."""
         (signal_dir / '12').touch()
-        ControllerManager._remove_signal_file(12)
+        await ControllerManager._remove_signal_file(12)
         assert not (signal_dir / '12').exists()
         # Second removal (lost race with another consumer) must not raise.
-        ControllerManager._remove_signal_file(12)
+        await ControllerManager._remove_signal_file(12)
 
     @pytest.mark.asyncio
     async def test_pending_cancel_uses_idempotent_signal_removal(self):
@@ -2126,7 +2185,8 @@ class TestCancelSignalScan:
                       'get_status_async', new_callable=AsyncMock,
                       return_value=managed_job_state.ManagedJobStatus.PENDING
                      ) as get_status, \
-                patch.object(manager, '_remove_signal_file') as remove_signal, \
+                patch.object(manager, '_remove_signal_file',
+                             new_callable=AsyncMock) as remove_signal, \
                 patch('sky.jobs.controller.managed_job_state.'
                       'set_cancelling_async', new_callable=AsyncMock
                      ) as set_cancelling, \
@@ -2139,7 +2199,7 @@ class TestCancelSignalScan:
                 await manager.monitor_loop()
 
         get_status.assert_awaited_once_with(12)
-        remove_signal.assert_called_once_with(12)
+        remove_signal.assert_awaited_once_with(12)
         set_cancelling.assert_awaited_once()
         set_cancelled.assert_awaited_once()
         manager.start_job.assert_not_awaited()
