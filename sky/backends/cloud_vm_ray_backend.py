@@ -4715,7 +4715,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         task_names: list[str],
         resources_str: str,
         metadata_jsons: list[str],
-        is_primary_in_job_groups: list[bool],
+        is_primary_in_job_groups: list[bool | None],
         num_jobs: int = 1,
         execution: str = DEFAULT_EXECUTION.value,
         is_batch: bool = False,
@@ -4743,7 +4743,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     metadata_jsons=metadata_jsons,
                     num_jobs=num_jobs,
                     execution=execution,
-                    is_primary_in_job_groups=is_primary_in_job_groups)
+                    # Field 13 cannot represent None. Keep populating it for
+                    # compatibility with older jobs controllers.
+                    is_primary_in_job_groups=[
+                        value if value is not None else False
+                        for value in is_primary_in_job_groups
+                    ],
+                    is_primary_in_job_groups_v2=[
+                        jobsv1_pb2.OptionalBool(value=value)
+                        if value is not None else jobsv1_pb2.OptionalBool()
+                        for value in is_primary_in_job_groups
+                    ])
                 response = backend_utils.invoke_skylet_with_retries(
                     lambda: SkyletClient(handle.get_grpc_channel()
                                         ).set_job_info_without_job_id(request))

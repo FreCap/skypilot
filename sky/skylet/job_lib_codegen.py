@@ -68,7 +68,7 @@ class JobLibCodeGen:
                                     task_names: list[str],
                                     resources_str: str,
                                     metadata_jsons: list[str],
-                                    is_primary_in_job_groups: list[bool],
+                                    is_primary_in_job_groups: list[bool | None],
                                     execution: str,
                                     num_jobs: int = 1,
                                     is_batch: bool = False) -> str:

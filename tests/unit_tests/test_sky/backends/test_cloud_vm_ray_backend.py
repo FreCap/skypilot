@@ -15,7 +15,41 @@ from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import GangSchedulingStatus
 from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
+from sky.schemas.generated import jobsv1_pb2
 from sky.utils import status_lib
+
+
+def test_set_job_info_encodes_nullable_job_group_roles():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock(is_grpc_enabled_with_flag=True)
+    client = MagicMock()
+    client.set_job_info_without_job_id.return_value = (
+        jobsv1_pb2.SetJobInfoWithoutJobIdResponse(job_ids=[7]))
+
+    with patch.object(cloud_vm_ray_backend, 'SkyletClient',
+                      return_value=client), patch.object(
+                          cloud_vm_ray_backend.backend_utils,
+                          'invoke_skylet_with_retries',
+                          side_effect=lambda callback: callback()):
+        job_ids = backend.set_job_info_without_job_id(
+            handle=handle,
+            name='job',
+            workspace='default',
+            entrypoint='sky jobs launch job.yaml',
+            pool=None,
+            pool_hash=None,
+            user_hash=None,
+            task_ids=[0, 1],
+            task_names=['standalone', 'primary'],
+            resources_str='{}',
+            metadata_jsons=['{}', '{}'],
+            is_primary_in_job_groups=[None, True])
+
+    assert job_ids == [7]
+    request = client.set_job_info_without_job_id.call_args.args[0]
+    assert list(request.is_primary_in_job_groups) == [False, True]
+    assert not request.is_primary_in_job_groups_v2[0].HasField('value')
+    assert request.is_primary_in_job_groups_v2[1].value is True
 
 
 @pytest.mark.parametrize(('workers_ready', 'expected_status'),

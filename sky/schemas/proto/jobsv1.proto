@@ -186,6 +186,12 @@ message GetJobExitCodesResponse {
   repeated int32 exit_codes = 1;
 }
 
+// Wrapper for a nullable bool in a repeated field. An absent value represents
+// NULL/None.
+message OptionalBool {
+  optional bool value = 1;
+}
+
 message SetJobInfoWithoutJobIdRequest {
   string name = 1;
   string workspace = 2;
@@ -199,7 +205,9 @@ message SetJobInfoWithoutJobIdRequest {
   repeated string metadata_jsons = 10;
   int32 num_jobs = 11;
   string execution = 12;
-  repeated bool is_primary_in_job_groups = 13;
+  repeated bool is_primary_in_job_groups = 13 [deprecated = true];
+  // Added in SKYLET_VERSION 40; older skylets ignore the field.
+  repeated OptionalBool is_primary_in_job_groups_v2 = 14;
 }
 
 message SetJobInfoWithoutJobIdResponse {
