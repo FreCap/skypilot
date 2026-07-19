@@ -7,7 +7,10 @@ from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
+from sky.provision import capacity_cache
+from sky.serve import placement_history
 from sky.serve import serve_rpc_utils
+from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import impl
 from sky.usage import usage_lib
@@ -22,6 +25,10 @@ else:
     grpc = adaptors_common.LazyImport('grpc')
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _unavailable_section(reason: str) -> dict[str, Any]:
+    return {'available': False, 'reason': reason}
 
 
 @usage_lib.entrypoint
@@ -287,6 +294,60 @@ def status(
                        summary_only=summary_only,
                        include_target_num_replicas=include_target_num_replicas,
                        history_hours=history_hours)
+
+
+@usage_lib.entrypoint
+def placement(service_name: str,
+              hours: int = placement_history.RETENTION_HOURS,
+              limit: int = placement_history.DEFAULT_PAGE_SIZE,
+              cursor: str | None = None) -> dict[str, Any]:
+    """Return bounded placement state for one exact service incarnation."""
+    record = serve_state.get_service_from_name(service_name)
+    if record is None or record.get('pool'):
+        raise ValueError(f'Service {service_name!r} not found.')
+    service_hash = record.get('hash')
+    if not isinstance(service_hash, str) or not service_hash:
+        return {
+            'service_name': service_name,
+            'placer_state': _unavailable_section('legacy_service'),
+            'capacity_hints': _unavailable_section('legacy_service'),
+            'history': _unavailable_section('legacy_service'),
+        }
+
+    try:
+        placer_state = serve_utils.get_service_placement_state(
+            service_name, service_hash)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Placement-state read failed for %r: %s', service_name, e)
+        placer_state = _unavailable_section('controller_unavailable')
+
+    try:
+        capacity_hints = capacity_cache.active_service_observations(
+            service_name, service_hash)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Capacity-observation read failed for %r: %s',
+                     service_name, e)
+        capacity_hints = _unavailable_section('cache_unavailable')
+
+    try:
+        history = placement_history.get_history(service_name,
+                                                service_hash,
+                                                hours=hours,
+                                                limit=limit,
+                                                cursor=cursor)
+    except ValueError:
+        raise
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Placement-history read failed for %r: %s', service_name,
+                     e)
+        history = _unavailable_section('history_unavailable')
+
+    return {
+        'service_name': service_name,
+        'placer_state': placer_state,
+        'capacity_hints': capacity_hints,
+        'history': history,
+    }
 
 
 ServiceComponentOrStr = str | serve_utils.ServiceComponent

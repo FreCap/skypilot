@@ -84,6 +84,29 @@ def test_add_or_extend_keeps_latest_expiry_and_value(isolated_database,
     assert kv_cache.get_cache_entry('test_key') is None
 
 
+def test_add_or_extend_many_batches_and_preserves_latest(
+        isolated_database, monkeypatch):
+    now = {'value': 1000.0}
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+
+    kv_cache.add_or_extend_cache_entries([
+        ('capacity:key', 'old-capacity', 1100.0),
+        ('observation:key', 'old-observation', 1100.0),
+    ])
+    kv_cache.add_or_extend_cache_entries([
+        ('capacity:key', 'new-capacity', 1200.0),
+        ('observation:key', 'new-observation', 1200.0),
+    ])
+    kv_cache.add_or_extend_cache_entries([
+        ('capacity:key', 'stale-capacity', 1150.0),
+        ('observation:key', 'stale-observation', 1150.0),
+    ])
+
+    now['value'] = 1160.0
+    assert kv_cache.get_cache_entry('capacity:key') == 'new-capacity'
+    assert kv_cache.get_cache_entry('observation:key') == 'new-observation'
+
+
 def test_delete_cache_entry_is_exact(isolated_database):
     expires = time.time() + 3600
     kv_cache.add_or_update_cache_entry('key1', 'value1', expires)

@@ -242,6 +242,21 @@ async def status(
     )
 
 
+@router.post('/placement')
+async def placement(
+    request: fastapi.Request,
+    placement_body: payloads.ServePlacementBody,
+) -> None:
+    await executor.schedule_request_async(
+        request_id=request.state.request_id,
+        request_name=request_names.RequestName.SERVE_PLACEMENT,
+        request_body=placement_body,
+        func=core.placement,
+        schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
+    )
+
+
 @router.post('/logs')
 async def tail_logs(
     request: fastapi.Request, log_body: payloads.ServeLogsBody,
