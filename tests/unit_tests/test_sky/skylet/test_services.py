@@ -89,19 +89,36 @@ class TestTailLogsBuffering(unittest.TestCase):
         longer than the default time limit of 50ms between some log lines.
         """
 
+        first_line_consumed = threading.Event()
+        third_line_consumed = threading.Event()
+        original_write = log_lib.LogBuffer.write
+
+        def tracked_write(buffer, line):
+            should_flush = original_write(buffer, line)
+            if line == 'a\n':
+                first_line_consumed.set()
+            elif line == 'c\n':
+                third_line_consumed.set()
+            return should_flush
+
         def iterator_with_delay(*_args, **_kwargs):
             yield 'a\n'
-            # Force flush timeout
+            # Wait until the consumer has drained the queue before starting
+            # the delay. A producer-side sleep alone is racy on loaded CI
+            # runners: the consumer may not run until the next lines are
+            # already queued, so no idle timeout can occur.
+            self.assertTrue(first_line_consumed.wait(timeout=5))
             time.sleep(services.DEFAULT_LOG_CHUNK_FLUSH_INTERVAL + 0.01)
             yield 'b\n'
             yield 'c\n'
-            # Force flush timeout
+            self.assertTrue(third_line_consumed.wait(timeout=5))
             time.sleep(services.DEFAULT_LOG_CHUNK_FLUSH_INTERVAL + 0.01)
             yield 'd\n'
 
         with mock.patch('sky.skylet.services.job_lib.get_log_dir_for_job', return_value='/tmp'), \
              mock.patch('sky.skylet.services.job_lib.get_status', return_value=job_lib.JobStatus.RUNNING), \
-             mock.patch('sky.skylet.services.log_lib.tail_logs_iter', side_effect=iterator_with_delay):
+             mock.patch('sky.skylet.services.log_lib.tail_logs_iter', side_effect=iterator_with_delay), \
+             mock.patch.object(log_lib.LogBuffer, 'write', new=tracked_write):
 
             req = jobsv1_pb2.TailLogsRequest(job_id=2, follow=True, tail=0)
             responses = list(self.service.TailLogs(req, object()))
