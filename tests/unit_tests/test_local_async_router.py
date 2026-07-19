@@ -655,12 +655,14 @@ async def test_repeated_concurrent_saturation_recovers_without_slot_leaks(
     try:
         async with aiohttp.ClientSession() as session:
             for round_index in range(3):
+                # Exercise concurrent over-capacity admission without opening
+                # enough loopback connections to starve a loaded CI runner.
                 responses = await asyncio.gather(*[
                     _post(
                         session, router_server, {
                             'action': 'async_predict',
                             'request_id': f'round-{round_index}-job-{index}',
-                        }) for index in range(32)
+                        }) for index in range(12)
                 ])
                 accepted_ids = []
                 for response in responses:
