@@ -1599,6 +1599,38 @@ async def api_get(request_id: str) -> payloads.RequestPayload:
     return request_task.encode()
 
 
+def _resolve_stream_log_path(log_path: str) -> pathlib.Path:
+    """Resolve and validate a user-supplied log path."""
+    if log_path == constants.API_SERVER_LOGS:
+        resolved_log_path = pathlib.Path(constants.API_SERVER_LOGS).expanduser()
+        if not resolved_log_path.exists():
+            raise fastapi.HTTPException(
+                status_code=404,
+                detail='Server log file does not exist. The API server may '
+                'have been started with `--foreground` - check the '
+                'stdout of API server process, such as: '
+                '`kubectl logs -n api-server-namespace '
+                'api-server-pod-name`')
+        return resolved_log_path
+
+    # This should be a log path under ~/sky_logs.
+    resolved_logs_directory = pathlib.Path(
+        constants.SKY_LOGS_DIRECTORY).expanduser().resolve()
+    resolved_log_path = resolved_logs_directory.joinpath(log_path).resolve()
+    # Make sure the log path is under ~/sky_logs. We calculate the
+    # common path to check if the log path is under ~/sky_logs.
+    # This prevents path traversal using '..'
+    if os.path.commonpath([resolved_log_path, resolved_logs_directory
+                          ]) != str(resolved_logs_directory):
+        raise fastapi.HTTPException(status_code=400,
+                                    detail=f'Unauthorized log path: '
+                                    f'{log_path!r}')
+    if not resolved_log_path.exists():
+        raise fastapi.HTTPException(
+            status_code=404, detail=f'Log path {log_path!r} does not exist')
+    return resolved_log_path
+
+
 @app.get('/api/stream')
 async def stream(
     request: fastapi.Request,
@@ -1709,37 +1741,8 @@ async def stream(
         del request_task
     else:
         assert log_path is not None, (request_id, log_path)
-        if log_path == constants.API_SERVER_LOGS:
-            resolved_log_path = pathlib.Path(
-                constants.API_SERVER_LOGS).expanduser()
-            if not resolved_log_path.exists():
-                raise fastapi.HTTPException(
-                    status_code=404,
-                    detail='Server log file does not exist. The API server may '
-                    'have been started with `--foreground` - check the '
-                    'stdout of API server process, such as: '
-                    '`kubectl logs -n api-server-namespace '
-                    'api-server-pod-name`')
-        else:
-            # This should be a log path under ~/sky_logs.
-            resolved_logs_directory = pathlib.Path(
-                constants.SKY_LOGS_DIRECTORY).expanduser().resolve()
-            resolved_log_path = resolved_logs_directory.joinpath(
-                log_path).resolve()
-            # Make sure the log path is under ~/sky_logs. We calculate the
-            # common path to check if the log path is under ~/sky_logs.
-            # This prevents path traversal using '..'
-            if os.path.commonpath([resolved_log_path, resolved_logs_directory
-                                  ]) != str(resolved_logs_directory):
-                raise fastapi.HTTPException(
-                    status_code=400,
-                    detail=f'Unauthorized log path: {log_path!r}')
-            elif not resolved_log_path.exists():
-                raise fastapi.HTTPException(
-                    status_code=404,
-                    detail=f'Log path {log_path!r} does not exist')
-
-        log_path_to_stream = resolved_log_path
+        log_path_to_stream = await asyncio.to_thread(_resolve_stream_log_path,
+                                                     log_path)
 
     headers = {
         'Cache-Control': 'no-cache, no-transform',
