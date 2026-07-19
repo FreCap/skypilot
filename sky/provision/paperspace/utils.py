@@ -24,6 +24,7 @@ INITIAL_BACKOFF_SECONDS = 10
 MAX_BACKOFF_FACTOR = 10
 MAX_ATTEMPTS = 6
 ADD_KEY_SCRIPT = 'sky-add-key'
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 
 class PaperspaceCloudError(Exception):
@@ -58,15 +59,29 @@ def _try_request_with_backoff(
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
     for i in range(MAX_ATTEMPTS):
         if method == 'get':
-            response = requests.get(url, headers=headers, params=data)
+            response = requests.get(url,
+                                    headers=headers,
+                                    params=data,
+                                    timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'post':
-            response = requests.post(url, headers=headers, data=data)
+            response = requests.post(url,
+                                     headers=headers,
+                                     data=data,
+                                     timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'put':
-            response = requests.put(url, headers=headers, data=data)
+            response = requests.put(url,
+                                    headers=headers,
+                                    data=data,
+                                    timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'patch':
-            response = requests.patch(url, headers=headers, data=data)
+            response = requests.patch(url,
+                                      headers=headers,
+                                      data=data,
+                                      timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'delete':
-            response = requests.delete(url, headers=headers)
+            response = requests.delete(url,
+                                       headers=headers,
+                                       timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         else:
             raise ValueError(f'Unsupported requests method: {method}')
         # If rate limited, wait and try again
