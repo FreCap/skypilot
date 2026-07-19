@@ -1,5 +1,6 @@
 """Dashboard presentation routes and middleware for the API server."""
 
+import asyncio
 import json
 import os
 import pathlib
@@ -170,9 +171,10 @@ async def serve_dashboard(request: fastapi.Request, full_path: str):
     # Try to serve the static file directly e.g. /skypilot.svg,
     # /favicon.ico, and /_next/, etc.
     file_path = os.path.join(server_constants.DASHBOARD_DIR, safe_full_path)
-    if os.path.isfile(file_path):
+    if await asyncio.to_thread(os.path.isfile, file_path):
         if file_path.endswith('.html'):
-            return _serve_html_with_nonce(request, file_path)
+            return await asyncio.to_thread(_serve_html_with_nonce, request,
+                                           file_path)
         return fastapi.responses.FileResponse(file_path)
 
     # Build assets under _next/ are content-hashed static files; a missing
@@ -189,8 +191,9 @@ async def serve_dashboard(request: fastapi.Request, full_path: str):
     # e.g. /clusters -> clusters.html, /jobs -> jobs.html
     html_path = os.path.join(server_constants.DASHBOARD_DIR,
                              f'{safe_full_path}.html')
-    if os.path.isfile(html_path):
-        return _serve_html_with_nonce(request, html_path)
+    if await asyncio.to_thread(os.path.isfile, html_path):
+        return await asyncio.to_thread(_serve_html_with_nonce, request,
+                                       html_path)
 
     # Resolve Next.js dynamic routes using the routes manifest.
     # Handles patterns like:
@@ -198,15 +201,18 @@ async def serve_dashboard(request: fastapi.Request, full_path: str):
     #   /jobs/123/456         -> jobs/[job]/[task].html
     #   /plugins/foo/bar      -> plugins/[...slug].html
     if safe_full_path:
-        resolved = _resolve_dynamic_route(server_constants.DASHBOARD_DIR,
-                                          safe_full_path)
+        resolved = await asyncio.to_thread(_resolve_dynamic_route,
+                                           server_constants.DASHBOARD_DIR,
+                                           safe_full_path)
         if resolved is not None:
-            return _serve_html_with_nonce(request, resolved)
+            return await asyncio.to_thread(_serve_html_with_nonce, request,
+                                           resolved)
 
     # Serve index.html as a last resort.
     index_path = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
     try:
-        return _serve_html_with_nonce(request, index_path)
+        return await asyncio.to_thread(_serve_html_with_nonce, request,
+                                       index_path)
     except Exception as e:
         logger.error(f'Error serving dashboard: {e}')
         raise fastapi.HTTPException(status_code=500, detail=str(e))
