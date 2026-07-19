@@ -130,7 +130,10 @@ def _clean_controller_logs_with_retention(retention_seconds: int,
         job_ids_to_update.append(job_id)
     managed_job_state.set_controller_logs_cleaned(job_ids=job_ids_to_update,
                                                   logs_cleaned_at=cleaned_at)
-    complete = len(jobs) < batch_size
+    # A full batch where every row failed would be re-selected verbatim on
+    # the next pass; end the round so the caller backs off until the next
+    # scheduled interval instead of spinning on the same failing rows.
+    complete = len(jobs) < batch_size or not job_ids_to_update
     logger.info(f'Cleaned {len(job_ids_to_update)}/{len(jobs)} controller '
                 f'logs with retention '
                 f'{retention_seconds} seconds, complete: {complete}')
@@ -177,7 +180,9 @@ def _clean_task_logs_with_retention(retention_seconds: int,
         tasks_to_update.append((task['job_id'], task['task_id']))
     managed_job_state.set_task_logs_cleaned(tasks=list(tasks_to_update),
                                             logs_cleaned_at=time.time())
-    complete = len(tasks) < batch_size
+    # See _clean_controller_logs_with_retention: an all-failed full batch
+    # must end the round to avoid a sleepless re-selection loop.
+    complete = len(tasks) < batch_size or not tasks_to_update
     logger.info(f'Cleaned {len(tasks_to_update)}/{len(tasks)} task logs with '
                 f'retention '
                 f'{retention_seconds} seconds, complete: {complete}')
