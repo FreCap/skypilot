@@ -98,6 +98,7 @@ _REQUEST_BODY_ALLOWLIST: dict[str, tuple[str, ...]] = {
     'sky.serve.logs': (),
     'sky.serve.sync_down_logs': (),
     'sky.serve.status': (),
+    'sky.serve.placement': (),
     'sky.serve.terminate_replica': (),
     'sky.serve.lb_high_availability': (),
     'sky.storage_ls': (),
