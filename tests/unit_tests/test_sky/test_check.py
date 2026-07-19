@@ -5,6 +5,7 @@ from unittest import mock
 from click import testing as cli_testing
 import pytest
 
+from sky import check_presentation
 from sky import clouds as sky_clouds
 from sky import exceptions
 from sky import models
@@ -184,6 +185,79 @@ def test_k8s_summary_allowed_contexts_workspace_override(monkeypatch):
         assert 'ctx-c' in s_ws1
         assert 'ctx-a' not in s_ws1
         assert 'ctx-b' not in s_ws1
+
+
+def test_print_checked_cloud_preserves_capability_details(monkeypatch):
+    monkeypatch.setattr(sky_clouds.AWS, 'get_active_user_identity_str',
+                        lambda _self: 'test-account')
+    output = []
+
+    sky_check._print_checked_cloud(
+        output.append,
+        verbose=True,
+        cloud_tuple=('AWS', sky_clouds.AWS()),
+        cloud_capabilities=[
+            (CloudCapability.COMPUTE, True, 'compute hint'),
+            (CloudCapability.STORAGE, False, 'storage failure'),
+        ],
+        ctx2text={},
+    )
+
+    assert [strip_ansi(line) for line in output] == [
+        '  AWS: enabled [compute]',
+        '    Activated account: test-account',
+        '    Hint [compute]: compute hint',
+        '    Reason [storage]: storage failure',
+    ]
+
+
+def test_format_ssh_context_details_preserves_allowed_pool_reason(monkeypatch):
+    monkeypatch.setattr(sky_clouds.SSH, 'get_ssh_node_pool_contexts',
+                        staticmethod(lambda: ['ssh-pool-a', 'ssh-pool-b']))
+    monkeypatch.setattr(sky_clouds.SSH, 'existing_allowed_contexts',
+                        staticmethod(lambda: ['ssh-pool-a']))
+
+    details = sky_check._format_context_details(
+        sky_clouds.SSH(),
+        show_details=True,
+        ctx2text={'ssh-pool-a': 'enabled.'},
+    )
+
+    assert strip_ansi(details) == (
+        '\n    SSH Node Pools:'
+        '\n    ├── pool-a: enabled.'
+        '\n    └── pool-b: disabled. Reason: Not included in '
+        'allowed_node_pools configuration.')
+
+
+def test_summary_message_preserves_empty_and_disallowed_clouds():
+    summary = sky_check._summary_message(
+        enabled_clouds={},
+        cloud2ctx2text={},
+        current_workspace_name='research',
+        hide_workspace_str=False,
+        disallowed_cloud_names=['AWS', 'GCP'],
+    )
+
+    assert strip_ansi(summary) == (
+        "\n🎉 Enabled infra for workspace: 'research' 🎉"
+        '\n  No infra to check/enabled.'
+        '\nNote: The following clouds were disabled because they were not '
+        'included in allowed_clouds in ~/.sky/config.yaml or disabled for '
+        "this workspace 'research': AWS, GCP")
+
+
+def test_check_presentation_helpers_remain_available_from_facade():
+    assert sky_check.PARTY_POPPER_EMOJI == (
+        check_presentation.PARTY_POPPER_EMOJI)
+    assert sky_check._print_checked_cloud is (
+        check_presentation._print_checked_cloud)
+    assert sky_check._green_color is check_presentation._green_color
+    assert sky_check._format_context_details is (
+        check_presentation._format_context_details)
+    assert sky_check._format_enabled_cloud is (
+        check_presentation._format_enabled_cloud)
+    assert sky_check._summary_message is check_presentation._summary_message
 
 
 def test_cli_check_prints_server_url(monkeypatch):
