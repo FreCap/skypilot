@@ -41,11 +41,11 @@ _CODEGEN_CASES = [
         'task_names': ['a', 'b'],
         'resources_str': 'A100:1',
         'metadata_jsons': ['{}', '{"x":1}'],
-        'is_primary_in_job_groups': [True, False],
+        'is_primary_in_job_groups': [None, False],
         'execution': 'cloudvm',
         'num_jobs': 2,
         'is_batch': False,
-    }, 'efc253e86cba289984ee373d44418711181b1bcbaf9bac90fd4a318867392430'),
+    }, '73d73747e4e0896371cd15c38e08a90760336309dea548af5280f896da22c7ab'),
     ('set_job_info_without_job_id', (), {
         'name': 'batch',
         'workspace': 'ws',
