@@ -995,11 +995,16 @@ class FailoverStrategyExecutor(StrategyExecutor):
                 new_resources = self._launched_resources.copy(
                     cloud=launched_cloud, region=launched_region, zone=None)
                 task.set_resources({new_resources})
-                # Not using self.launch to avoid the retry until up logic.
-                job_submitted_at = await self._launch(raise_on_failure=False,
-                                                      recovery=True)
-                # Restore the original dag, i.e. reset the region constraint.
-                task.set_resources(original_resources)
+                try:
+                    # Not using self.launch to avoid the retry until up logic.
+                    job_submitted_at = await self._launch(
+                        raise_on_failure=False, recovery=True)
+                finally:
+                    # Restore the original dag, i.e. reset the region
+                    # constraint. The dag is shared across recovery attempts,
+                    # so a raise from _launch (e.g. cancellation) must not
+                    # leak the constraint into later attempts.
+                    task.set_resources(original_resources)
                 if job_submitted_at is not None:
                     return job_submitted_at
 
@@ -1085,10 +1090,15 @@ class EagerFailoverStrategyExecutor(FailoverStrategyExecutor):
                     requested_resources.copy(cloud=launched_cloud,
                                              region=launched_region)
                 }
-                # Not using self.launch to avoid the retry until up logic.
-                job_submitted_at = await self._launch(raise_on_failure=False,
-                                                      recovery=True)
-                task.blocked_resources = None
+                try:
+                    # Not using self.launch to avoid the retry until up logic.
+                    job_submitted_at = await self._launch(
+                        raise_on_failure=False, recovery=True)
+                finally:
+                    # The dag is shared across recovery attempts, so a raise
+                    # from _launch (e.g. cancellation) must not leave the
+                    # previous region blocked for later attempts.
+                    task.blocked_resources = None
                 if job_submitted_at is not None:
                     return job_submitted_at
 
