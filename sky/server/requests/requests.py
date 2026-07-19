@@ -1701,9 +1701,9 @@ def _cleanup_legacy_directory_if_empty_sync():
     garbage collected after a server upgrade.
     """
     legacy_path = pathlib.Path(LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser()
-    if not legacy_path.exists():
-        return
     try:
+        if not legacy_path.exists():
+            return
         # Check if directory is empty (no .log or .lock files)
         if not any(legacy_path.iterdir()):
             logger.info(f'Removing empty legacy log directory: {legacy_path}')
