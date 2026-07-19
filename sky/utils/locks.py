@@ -226,15 +226,24 @@ class PostgresLock(DistributedLock):
         self._connection = self._get_connection()
         cursor = self._connection.cursor()
 
-        start_time = time.time()
+        deadline = (None if self.timeout is None else time.monotonic() +
+                    self.timeout)
 
         if self._shared_lock:
             lock_func = 'pg_try_advisory_lock_shared'
         else:
             lock_func = 'pg_try_advisory_lock'
+        mode_str = ('shared' if self._shared_lock else 'exclusive')
 
         try:
+            first_attempt = True
             while True:
+                if (not first_attempt and deadline is not None and
+                        time.monotonic() >= deadline):
+                    raise LockTimeout(
+                        f'Failed to acquire {mode_str} postgres lock '
+                        f'{self.lock_id} within {self.timeout} seconds')
+                first_attempt = False
                 cursor.execute(f'SELECT {lock_func}(%s)', (self._lock_key,))
                 result = cursor.fetchone()[0]
 
@@ -242,20 +251,21 @@ class PostgresLock(DistributedLock):
                     self._acquired = True
                     return AcquireReturnProxy(self)
 
-                mode_str = ('shared' if self._shared_lock else 'exclusive')
                 if not blocking:
                     raise LockTimeout(
                         f'Failed to immediately acquire {mode_str} '
                         f'postgres lock {self.lock_id}')
 
-                if (self.timeout is not None and
-                        time.time() - start_time > self.timeout):
-                    raise LockTimeout(
-                        f'Failed to acquire {mode_str} postgres lock '
-                        f'{self.lock_id} within {self.timeout} '
-                        f'seconds')
+                sleep_interval = self.poll_interval
+                if deadline is not None:
+                    remaining_timeout = deadline - time.monotonic()
+                    if remaining_timeout <= 0:
+                        raise LockTimeout(
+                            f'Failed to acquire {mode_str} postgres lock '
+                            f'{self.lock_id} within {self.timeout} seconds')
+                    sleep_interval = min(sleep_interval, remaining_timeout)
 
-                time.sleep(self.poll_interval)
+                time.sleep(sleep_interval)
 
         except Exception:
             self._close_connection()

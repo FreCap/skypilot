@@ -286,6 +286,42 @@ class TestPostgresLock:
             lock.acquire()
 
     @mock.patch.object(locks.PostgresLock, '_get_connection')
+    def test_postgres_lock_acquire_clamps_poll_to_deadline(
+            self, mock_get_connection, mock_connection):
+        """A short residual timeout must not incur a full polling sleep."""
+        connection, cursor = mock_connection
+        mock_get_connection.return_value = connection
+        cursor.fetchone.return_value = [False]
+
+        class _FakeClock:
+            """Deterministic monotonic and wall clock for lock polling."""
+
+            def __init__(self):
+                self.now = 0.0
+                self.sleeps = []
+
+            def time(self):
+                return self.now
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+                self.now += seconds
+
+        clock = _FakeClock()
+        lock = locks.PostgresLock('test_lock', timeout=0.02, poll_interval=1.0)
+
+        with mock.patch.object(locks, 'time', clock):
+            with pytest.raises(locks.LockTimeout):
+                lock.acquire()
+
+        assert clock.sleeps == pytest.approx([0.02])
+        assert clock.now == pytest.approx(0.02)
+        assert cursor.execute.call_count == 1
+
+    @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_acquire_non_blocking_failure(self,
                                                         mock_get_connection,
                                                         mock_connection):
