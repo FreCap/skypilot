@@ -744,16 +744,6 @@
                 }
             }
         ],
-        "./sky/utils/common_utils.py": [
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 11,
-                    "endColumn": 14,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./sky/utils/context.py": [
             {
                 "code": "reportReturnType",

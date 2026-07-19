@@ -1165,7 +1165,7 @@ def get_mem_size_gb() -> float:
 
 def _cpu_count() -> int:
     # host cpu cores (logical)
-    cpu = psutil.cpu_count()
+    cpu = psutil.cpu_count() or 1
     # cpu affinity on Linux
     if hasattr(os, 'sched_getaffinity'):
         # just for safe, length of CPU set should always <= logical cpu cores
