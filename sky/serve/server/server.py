@@ -1,20 +1,18 @@
 """Rest APIs for SkyServe."""
 
 import asyncio
-import pathlib
 
 import fastapi
 
 from sky import sky_logging
 from sky.serve import serve_state
 from sky.serve.server import core
+from sky.server import common as server_common
 from sky.server import stream_utils
-from sky.server.blob import blob_storage as bs
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
-from sky.skylet import constants
 from sky.users import permission
 from sky.users import rbac
 from sky.utils import common
@@ -276,12 +274,15 @@ async def download_logs(
     request: fastapi.Request,
     download_logs_body: payloads.ServeDownloadLogsBody,
 ) -> None:
-    user_hash = download_logs_body.env_vars[constants.USER_ID_ENV_VAR]
+    user_hash = server_common.get_request_user_id(request, download_logs_body)
     timestamp = sky_logging.get_run_timestamp()
-    logs_dir_on_api_server = (
-        pathlib.Path(bs.get_blob_storage().download_tmp_dir(user_hash)) /
-        'service' / f'{download_logs_body.service_name}_{timestamp}')
-    logs_dir_on_api_server.expanduser().mkdir(parents=True, exist_ok=True)
+    download_tmp = await asyncio.to_thread(
+        server_common.prepare_download_tmp_dir, user_hash)
+    logs_dir_on_api_server = (download_tmp / 'service' /
+                              f'{download_logs_body.service_name}_{timestamp}')
+    await asyncio.to_thread(logs_dir_on_api_server.mkdir,
+                            parents=True,
+                            exist_ok=True)
     # We should reuse the original request body, so that the env vars, such as
     # user hash, are kept the same.
     download_logs_body.local_dir = str(logs_dir_on_api_server)

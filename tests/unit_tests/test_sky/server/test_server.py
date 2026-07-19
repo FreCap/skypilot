@@ -231,6 +231,154 @@ async def test_logs():
                                             kill_request_on_disconnect=False)
 
 
+@pytest.mark.asyncio
+async def test_download_rejects_sibling_prefix(tmp_path):
+    """A path sharing only the textual prefix of a user root is rejected."""
+    user_root = tmp_path / 'user'
+    sibling = tmp_path / 'user-private'
+    user_root.mkdir()
+    sibling.mkdir()
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(sibling)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=user_root), mock.patch.object(
+                               server.bs,
+                               'get_blob_storage',
+                               return_value=blob_storage):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            await server.download(body, request)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_symlink_escape(tmp_path):
+    """A symlink under a user root cannot expose a path outside the root."""
+    user_root = tmp_path / 'user'
+    outside = tmp_path / 'outside'
+    user_root.mkdir()
+    outside.mkdir()
+    escape = user_root / 'escape'
+    escape.symlink_to(outside, target_is_directory=True)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(escape)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=user_root), mock.patch.object(
+                               server.bs,
+                               'get_blob_storage',
+                               return_value=blob_storage):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            await server.download(body, request)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_download_accepts_canonical_child_path(tmp_path):
+    """A real directory inside the authenticated user's root remains valid."""
+    user_root = tmp_path / 'user'
+    child = user_root / 'logs'
+    child.mkdir(parents=True)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(child)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+    archived_folders = []
+
+    def create_archive(folders, zip_path):
+        archived_folders.extend(folders)
+        pathlib.Path(zip_path).touch()
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=user_root), mock.patch.object(
+                               server.bs,
+                               'get_blob_storage',
+                               return_value=blob_storage), mock.patch.object(
+                                   server.storage_utils,
+                                   'zip_files_and_folders',
+                                   side_effect=create_archive):
+        response = await server.download(body, request)
+
+    assert isinstance(response, fastapi.responses.FileResponse)
+    assert archived_folders == [str(child.resolve())]
+    await response.background()
+
+
+@pytest.mark.asyncio
+async def test_download_uses_authenticated_user_identity(tmp_path):
+    """The request body cannot select another user's download directory."""
+    authenticated_root = tmp_path / 'authenticated'
+    spoofed_root = tmp_path / 'spoofed'
+    authenticated_root.mkdir()
+    spoofed_root.mkdir()
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        auth_user=types.SimpleNamespace(id='authenticated-user')),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(spoofed_root)],
+        env_vars={constants.USER_ID_ENV_VAR: 'spoofed-user'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(authenticated_root)
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=authenticated_root) as logs_dir, \
+         mock.patch.object(server.bs,
+                           'get_blob_storage',
+                           return_value=blob_storage):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            await server.download(body, request)
+
+    assert exc_info.value.status_code == 400
+    logs_dir.assert_called_once_with('authenticated-user')
+    blob_storage.download_tmp_dir.assert_called_once_with('authenticated-user')
+
+
+@pytest.mark.asyncio
+async def test_download_logs_uses_authenticated_user_identity(tmp_path):
+    """Log staging also ignores a body-supplied identity when authenticated."""
+    authenticated_root = tmp_path / 'authenticated'
+    request = types.SimpleNamespace(
+        state=types.SimpleNamespace(auth_user=types.SimpleNamespace(
+            id='authenticated-user'),
+                                    request_id='request-id'))
+    body = mock.MagicMock()
+    body.env_vars = {constants.USER_ID_ENV_VAR: 'spoofed-user'}
+    body.cluster_name = 'cluster'
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(authenticated_root)
+
+    with mock.patch.object(server.bs,
+                           'get_blob_storage',
+                           return_value=blob_storage), mock.patch.object(
+                               server.executor,
+                               'schedule_request_async',
+                               new_callable=mock.AsyncMock) as schedule:
+        await server.download_logs(request, body)
+
+    blob_storage.download_tmp_dir.assert_called_once_with('authenticated-user')
+    assert body.local_dir == str(authenticated_root)
+    schedule.assert_awaited_once()
+
+
 @mock.patch('sky.utils.context_utils.hijack_sys_attrs')
 @mock.patch('asyncio.run')
 def test_server_run_uses_uvloop(mock_asyncio_run, mock_hijack_sys_attrs):
