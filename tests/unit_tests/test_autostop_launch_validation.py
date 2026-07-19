@@ -10,6 +10,7 @@ contract: non-down autostop requires STOP too.
 """
 # pylint: disable=protected-access
 import pathlib
+import pickle
 from unittest import mock
 
 import pytest
@@ -23,6 +24,17 @@ from sky.backends import cloud_vm_ray_backend as backend_lib
 from sky.utils import status_lib
 
 _FEATURES = clouds.CloudImplementationFeatures
+
+
+@pytest.mark.parametrize('helper_name', [
+    '_compute_set_autostop_args_for_hooks_only_relaunch',
+    '_check_autostop_feasibility_early',
+    'autostop_requested_features',
+])
+def test_execution_autostop_helper_identity_is_stable(helper_name):
+    helper = getattr(execution, helper_name)
+    assert helper.__module__ == execution.__name__
+    assert pickle.loads(pickle.dumps(helper)) is helper
 
 
 def test_non_down_autostop_requires_stop_feature():
