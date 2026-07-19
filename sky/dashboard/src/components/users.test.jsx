@@ -13,6 +13,7 @@ import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import { ServiceAccountTokensView } from '@/components/service-account-tokens';
 import {
   aggregateUserUsage,
+  buildUsageFilterLookup,
   getJobGpuCount as extractedGetJobGpuCount,
 } from '@/components/user-usage';
 import {
@@ -303,6 +304,77 @@ describe('UsersTable refresh lifecycle', () => {
     expect(props.refreshDataRef.current).toBeNull();
     expect(dashboardCache.get).not.toHaveBeenCalled();
   });
+
+  it('projects GPU and infra filters from one resource snapshot', async () => {
+    const bob = {
+      ...user,
+      userId: 'bob-id',
+      username: 'bob@example.com',
+    };
+    const setValueList = jest.fn();
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) return Promise.resolve([user, bob]);
+      if (fetcher === getClusters) {
+        return Promise.resolve([
+          {
+            ...cluster,
+            gpus: "{'H100': 2}",
+            num_nodes: 2,
+          },
+          {
+            ...cluster,
+            cluster: 'bob-cluster',
+            user_hash: bob.userId,
+            gpus: { L4: 1 },
+            infra: 'gcp/us-central1',
+          },
+        ]);
+      }
+      if (fetcher === getManagedJobs) {
+        return Promise.resolve({
+          jobs: [
+            job,
+            {
+              ...job,
+              job_id: 2,
+              user_hash: bob.userId,
+              accelerators: { L4: 1 },
+              resources_str_full: '1x(L4:1)',
+              infra: 'gcp/us-central1',
+            },
+          ],
+        });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    renderTable({
+      filters: [
+        { property: 'GPU', value: 'h100' },
+        { property: 'Infra', value: 'AWS/US-EAST-1' },
+      ],
+      setValueList,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('alice')).toBeInTheDocument();
+      expect(screen.queryByText('bob')).not.toBeInTheDocument();
+      expect(screen.getByTitle('Total GPUs: 6')).toHaveTextContent('6');
+      expect(screen.getByTitle('View 1 cluster for alice')).toHaveTextContent(
+        '1'
+      );
+      expect(
+        screen.getByTitle('View 1 active job for alice')
+      ).toHaveTextContent('1');
+    });
+    expect(setValueList).toHaveBeenLastCalledWith({
+      name: ['alice', 'bob'],
+      'user id': ['alice-id', 'bob-id'],
+      role: ['user'],
+      'gpu type': ['H100', 'L4'],
+      infra: ['aws/us-east-1', 'gcp/us-central1'],
+    });
+  });
 });
 
 describe('Users page role lookup', () => {
@@ -483,6 +555,81 @@ describe('aggregateUserUsage', () => {
       gpuCount: 14,
     });
     expect(usage.has('missing-id')).toBe(false);
+    expect(clusterVisits).toBe(2);
+    expect(jobVisits).toBe(2);
+  });
+});
+
+describe('buildUsageFilterLookup', () => {
+  it('indexes each snapshot once by user, infra, and GPU type', () => {
+    let clusterVisits = 0;
+    let jobVisits = 0;
+    const trackVisits = (items, increment) => ({
+      *[Symbol.iterator]() {
+        for (const item of items) {
+          increment();
+          yield item;
+        }
+      },
+    });
+    const clusters = trackVisits(
+      [
+        {
+          user_hash: 'alice-id',
+          status: 'UP',
+          gpus: "{'H100': 2}",
+          num_nodes: 3,
+          cluster: 'active',
+          infra: 'aws/us-east-1',
+        },
+        {
+          user_hash: 'alice-id',
+          status: 'STOPPED',
+          gpus: { H100: 8 },
+          num_nodes: 4,
+          cluster: 'stopped',
+          infra: 'aws/us-east-1',
+        },
+      ],
+      () => {
+        clusterVisits += 1;
+      }
+    );
+    const jobs = trackVisits(
+      [
+        {
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+          accelerators: { H100: 4 },
+          resources_str_full: '2x(H100:4)',
+          job_id: 1,
+          infra: 'aws/us-east-1',
+        },
+        {
+          user_hash: 'alice-id',
+          status: 'SUCCEEDED',
+          accelerators: { H100: 8 },
+          resources_str_full: '1x(H100:8)',
+          job_id: 2,
+          infra: 'aws/us-east-1',
+        },
+      ],
+      () => {
+        jobVisits += 1;
+      }
+    );
+
+    expect(buildUsageFilterLookup(clusters, jobs)).toEqual({
+      'alice-id': {
+        'aws/us-east-1': {
+          Total: { clusterCount: 2, jobCount: 1, gpuCount: 14 },
+          H100: { clusterCount: 2, jobCount: 1, gpuCount: 14 },
+        },
+        Total: {
+          H100: { clusterCount: 2, jobCount: 1, gpuCount: 14 },
+        },
+      },
+    });
     expect(clusterVisits).toBe(2);
     expect(jobVisits).toBe(2);
   });
