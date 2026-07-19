@@ -13,6 +13,7 @@ from sky.provision.vsphere.common.id_generator import generate_random_uuid
 from sky.provision.vsphere.common.vim_utils import get_obj_by_mo_id
 
 logger = sky_logging.init_logger(__name__)
+TRANSFER_HTTP_TIMEOUT_SECONDS = 120
 
 
 class ClsApiHelper:
@@ -160,9 +161,11 @@ class ClsApiHelper:
                 library_item_id=library_item_id),
             client_token=generate_random_uuid(),
         )
-        self.upload_files_in_session(files_map, session_id)
-        self.client.upload_service.complete(session_id)
-        self.client.upload_service.delete(session_id)
+        try:
+            self.upload_files_in_session(files_map, session_id)
+            self.client.upload_service.complete(session_id)
+        finally:
+            self.client.upload_service.delete(session_id)
 
     def upload_files_in_session(self, files_map, session_id):
         for f_name, f_path in files_map.items():
@@ -188,11 +191,16 @@ class ClsApiHelper:
                     # so we need to pass in a context when dealing with
                     # self-signed certificates.
                     context = ssl._create_unverified_context()  # pylint: disable=protected-access
-                    urllib2.urlopen(request, context=context)
+                    response = urllib2.urlopen(
+                        request,
+                        context=context,
+                        timeout=TRANSFER_HTTP_TIMEOUT_SECONDS)
                 else:
                     # Don't pass context parameter since versions of Python
                     # before 2.7.9 don't support it.
-                    urllib2.urlopen(request)
+                    response = urllib2.urlopen(
+                        request, timeout=TRANSFER_HTTP_TIMEOUT_SECONDS)
+                response.close()
 
     def download_files(self, library_item_id, directory):
         """Download files from a library item
@@ -209,29 +217,38 @@ class ClsApiHelper:
                 library_item_id=library_item_id),
             client_token=generate_random_uuid(),
         )
-        file_infos = self.client.download_file_service.list(session_id)
-        for file_info in file_infos:
-            self.client.download_file_service.prepare(session_id,
+        try:
+            file_infos = self.client.download_file_service.list(session_id)
+            for file_info in file_infos:
+                self.client.download_file_service.prepare(
+                    session_id, file_info.name)
+                download_info = self.wait_for_prepare(session_id,
                                                       file_info.name)
-            download_info = self.wait_for_prepare(session_id, file_info.name)
-            if self.skip_verification and hasattr(ssl,
-                                                  '_create_unverified_context'):
-                # Python 2.7.9 has stronger SSL certificate validation,
-                # so we need to pass in a context when dealing with self-signed
-                # certificates.
-                context = ssl._create_unverified_context()  # pylint: disable=protected-access
-                response = urllib2.urlopen(  # pylint: disable=consider-using-with
-                    url=download_info.download_endpoint.uri,
-                    context=context)
-            else:
-                # Don't pass context parameter since versions of Python
-                # before 2.7.9 don't support it.
-                response = urllib2.urlopen(download_info.download_endpoint.uri)  # pylint: disable=consider-using-with
-            file_path = os.path.join(directory, file_info.name)
-            with open(file_path, 'wb') as local_file:
-                local_file.write(response.read())
-            downloaded_files_map[file_info.name] = file_path
-        self.client.download_service.delete(session_id)
+                if self.skip_verification and hasattr(
+                        ssl, '_create_unverified_context'):
+                    # Python 2.7.9 has stronger SSL certificate validation,
+                    # so we need to pass in a context when dealing with
+                    # self-signed certificates.
+                    context = ssl._create_unverified_context()  # pylint: disable=protected-access
+                    response = urllib2.urlopen(
+                        url=download_info.download_endpoint.uri,
+                        context=context,
+                        timeout=TRANSFER_HTTP_TIMEOUT_SECONDS)
+                else:
+                    # Don't pass context parameter since versions of Python
+                    # before 2.7.9 don't support it.
+                    response = urllib2.urlopen(
+                        download_info.download_endpoint.uri,
+                        timeout=TRANSFER_HTTP_TIMEOUT_SECONDS)
+                file_path = os.path.join(directory, file_info.name)
+                try:
+                    with open(file_path, 'wb') as local_file:
+                        local_file.write(response.read())
+                finally:
+                    response.close()
+                downloaded_files_map[file_info.name] = file_path
+        finally:
+            self.client.download_service.delete(session_id)
         return downloaded_files_map
 
     def wait_for_prepare(
