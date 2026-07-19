@@ -187,6 +187,38 @@ def test_async_occupancy_sizes_queue_by_probed_slots():
     assert lb._request_queue_limits() == (3, 9)
 
 
+def test_logical_queue_size_uses_plan_but_dispatch_requires_observation():
+    lb = _make_lb(min_size=0,
+                  size_per_replica=3,
+                  max_size=3000,
+                  max_concurrency_per_replica=8,
+                  use_async_occupancy=True)
+    url = 'http://four-gpu:8000'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._capacity_hint = {
+        'replica_unit': 'logical_slot',
+        'planned_capacity_by_url': {
+            url: 4,
+        },
+    }
+
+    assert lb._request_queue_limits() == (0, 12)
+
+    lb._replica_occupancy = {url: 0}
+    lb._replica_total_slots = {url: 4}
+    lb._replica_free_slots = {url: 4}
+    lb._occupancy_sample_generation = {url: 0}
+    lb._occupancy_sample_time = {url: load_balancer.time.monotonic()}
+    lb._occupancy_sample_role_epoch = {
+        url: lb._occupancy_role_epoch,
+    }
+    assert lb._request_queue_limits() == (4, 12)
+
+    lb._occupancy_sample_time[url] -= (
+        constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS + 1)
+    assert lb._request_queue_limits() == (0, 12)
+
+
 def test_fast_ack_multi_slot_reservations_fill_and_resume_exactly():
     """Collected local E2E for one URL backed by four async workers."""
 
