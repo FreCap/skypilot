@@ -63,6 +63,7 @@ from sky.jobs import constants as managed_job_constants
 from sky.jobs import state
 from sky.jobs import utils as managed_job_utils
 from sky.skylet import constants
+from sky.utils import asyncio_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import subprocess_utils
@@ -349,6 +350,16 @@ def submit_jobs(job_ids: list[int],
     maybe_start_controllers(from_scheduler=True)
 
 
+@asyncio_utils.shield
+async def _release_launch_slot(job_id: int, starting: set[int],
+                               starting_lock: asyncio.Lock,
+                               starting_signal: asyncio.Condition) -> None:
+    """Release one launch slot even under repeated cancellation."""
+    async with starting_lock:
+        starting.remove(job_id)
+        starting_signal.notify()
+
+
 @contextlib.asynccontextmanager
 async def scheduled_launch(
     job_id: int,
@@ -432,9 +443,8 @@ async def scheduled_launch(
     else:
         await state.scheduler_set_alive_async(job_id)
     finally:
-        async with starting_lock:
-            starting.remove(job_id)
-            starting_signal.notify()
+        await _release_launch_slot(job_id, starting, starting_lock,
+                                   starting_signal)
 
 
 def job_done(job_id: int, idempotent: bool = False) -> None:
