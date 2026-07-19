@@ -21,24 +21,22 @@ from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants as skylet_constants
 from sky.usage import constants
+from sky.usage.payloads import _clean_yaml  # pylint: disable=unused-import
+from sky.usage.payloads import prepare_json_from_yaml_config
 from sky.utils import common_utils
 from sky.utils import env_options
 from sky.utils import ux_utils
-from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
-    import inspect
-
     import requests
 
     from sky import resources as resources_lib
     from sky import task as task_lib
     from sky.utils import status_lib
 else:
-    # requests and inspect cost ~100ms to load, which can be postponed to
-    # collection phase or skipped if user specifies no collection
+    # requests costs ~100ms to load, which can be postponed to collection phase
+    # or skipped if the user disables collection.
     requests = adaptors_common.LazyImport('requests')
-    inspect = adaptors_common.LazyImport('inspect')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -534,7 +532,7 @@ class _MessagesProxy:
         return _get_messages().values()
 
 
-messages = _MessagesProxy()
+messages: _MessagesProxy = _MessagesProxy()
 
 
 def _send_to_loki(message_type: MessageType):
@@ -588,61 +586,6 @@ def _send_to_loki(message_type: MessageType):
         logger.debug(
             f'Grafana Loki failed with response: {response.text}\n{payload}')
     messages.reset(message_type)
-
-
-def _clean_yaml(yaml_info: dict[str, str | None]):
-    """Remove sensitive information from user YAML."""
-    cleaned_yaml_info = yaml_info.copy()
-    for redact_type in constants.USAGE_MESSAGE_REDACT_KEYS:
-        if redact_type in cleaned_yaml_info:
-            contents = cleaned_yaml_info[redact_type]
-            if not contents:
-                cleaned_yaml_info[redact_type] = None
-                continue
-
-            message = None
-            try:
-                if callable(contents):
-                    contents = inspect.getsource(contents)
-
-                if type(contents) in constants.USAGE_MESSAGE_REDACT_TYPES:
-                    lines = yaml_utils.dump_yaml_str({
-                        redact_type: contents
-                    }).strip().split('\n')
-                    message = (f'{len(lines)} lines {redact_type.upper()}'
-                               ' redacted')
-                else:
-                    message = (f'Error: Unexpected type for {redact_type}: '
-                               f'{type(contents)}')
-                    logger.debug(message)
-            except Exception:  # pylint: disable=broad-except
-                message = (
-                    f'Error: Failed to dump lines for {redact_type.upper()}')
-                logger.debug(message)
-
-            cleaned_yaml_info[redact_type] = message
-
-    return cleaned_yaml_info
-
-
-def prepare_json_from_yaml_config(
-        yaml_config_or_path: dict | str) -> list[dict[str, Any]]:
-    """Upload safe contents of YAML file to Loki."""
-    if isinstance(yaml_config_or_path, dict):
-        yaml_info = [yaml_config_or_path]
-        comment_lines = []
-    else:
-        with open(yaml_config_or_path, encoding='utf-8') as f:
-            lines = f.readlines()
-            comment_lines = [line for line in lines if line.startswith('#')]
-        yaml_info = yaml_utils.read_yaml_all(yaml_config_or_path)
-
-    for i in range(len(yaml_info)):
-        if yaml_info[i] is None:
-            yaml_info[i] = {}
-        yaml_info[i] = _clean_yaml(yaml_info[i])
-        yaml_info[i]['__redacted_comment_lines'] = len(comment_lines)
-    return yaml_info
 
 
 def _send_local_messages():
