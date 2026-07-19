@@ -1,13 +1,16 @@
 """Characterization tests for the IBM COS storage backend facade."""
 
 # pylint: disable=protected-access
+import contextlib
 import pickle
+import shlex
 from unittest import mock
 
 import pytest
 
 from sky import exceptions
 from sky.data import storage as storage_lib
+from sky.data import storage_ibm
 
 
 def _ibm_store(**attributes) -> storage_lib.IBMCosStore:
@@ -107,6 +110,49 @@ def test_ibm_cos_store_delete_preserves_external_bucket_with_sub_path():
 
     store._delete_sub_path.assert_called_once_with()
     store._delete_cos_bucket.assert_not_called()
+
+
+def test_ibm_cos_upload_quotes_remote_paths():
+    store = _ibm_store(_bucket_sub_path='prefix $(echo INJECTED)')
+    commands = {}
+
+    def capture_commands(_source_paths, file_command_generator,
+                         dir_command_generator, *_args, **_kwargs):
+        commands['file'] = file_command_generator('/tmp/base dir',
+                                                  ['file $(echo INJECTED)'])
+        commands['dir'] = dir_command_generator('/tmp/source dir',
+                                                'dest $(echo INJECTED)')
+
+    with mock.patch.object(
+            storage_ibm.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_ibm.data_utils,
+                'parallel_upload',
+                side_effect=capture_commands), mock.patch.object(
+                    storage_ibm.sky_logging,
+                    'generate_tmp_logging_file_path',
+                    return_value='/tmp/storage.log'):
+        store.batch_ibm_rsync(['/tmp/ignored'])
+
+    remote_prefix = (
+        f'{store.rclone_profile_name}:{store.name}/{store._bucket_sub_path}')
+    assert shlex.split(commands['file']) == [
+        'rclone',
+        'copy',
+        '--include',
+        'file $(echo INJECTED)',
+        '/tmp/base dir',
+        remote_prefix,
+    ]
+    assert shlex.split(commands['dir']) == [
+        'rclone',
+        'copy',
+        '--exclude',
+        '.git/*',
+        '/tmp/source dir',
+        f'{remote_prefix}/dest $(echo INJECTED)',
+    ]
 
 
 def test_ibm_cos_store_download_file_preserves_sdk_argument_order():
