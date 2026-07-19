@@ -58,9 +58,18 @@ def _build_manager():
 
 
 def test_fetch_job_status_samples_latest_version_first(monkeypatch):
+    """The latest-version replica's result is consumed (acted on) first.
+
+    The SSH fetches run in parallel, so no ordering is asserted on the
+    fetches themselves -- only that every replica is fetched and that the
+    failure-handling consumption starts with the latest-version replica,
+    so a version-wide bad rollout is stopped without waiting behind every
+    old replica.
+    """
     old = [_tracked_replica(1), _tracked_replica(2)]
     latest = _tracked_replica(3, version=2)
     replicas = old + [latest]
+    by_id = {info.replica_id: info for info in replicas}
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas))
     monkeypatch.setattr(replica_managers.ReplicaInfo,
@@ -71,16 +80,59 @@ def test_fetch_job_status_samples_latest_version_first(monkeypatch):
 
     def _get_job_status(self, handle, job_ids, stream_logs=False):
         probed.append(handle)
-        return {1: job_lib.JobStatus.RUNNING}
+        return {1: job_lib.JobStatus.FAILED}
 
     monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
                         'get_job_status', _get_job_status)
+    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
+                        lambda svc, rid: by_id.get(rid))
 
+    terminated = []
     mgr = _build_manager()
     mgr.latest_version = 2
+    mgr._persist_replica = lambda rid, info: None
+    mgr._terminate_replica = (
+        lambda rid, sync_down_logs, replica_drain_delay_seconds: terminated.
+        append(rid))
     mgr._fetch_job_status()
 
-    assert probed == [3, 1, 2]
+    assert sorted(probed) == [1, 2, 3]
+    assert terminated == [3, 1, 2]
+
+
+def test_fetch_job_status_walk_is_parallel(monkeypatch):
+    """One hung replica must not serialize the whole fleet's SSH walk.
+
+    Every replica's ``get_job_status`` blocks until all replicas have
+    entered it. A serial walk deadlocks (the first SSH never returns while
+    the others never start); the parallel walk proceeds. Deterministic:
+    uses a barrier, not sleeps.
+    """
+    num_replicas = 3
+    replicas = [_tracked_replica(i) for i in range(num_replicas)]
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: object())
+
+    all_entered = threading.Barrier(num_replicas)
+
+    def _blocking_get_job_status(self, handle, job_ids, stream_logs=False):
+        # Times out (raising BrokenBarrierError -> test failure) if the
+        # walk is serial and the other fetches never start.
+        all_entered.wait(timeout=5)
+        return {1: job_lib.JobStatus.RUNNING}
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status', _blocking_get_job_status)
+
+    mgr = _build_manager()
+    fetch = threading.Thread(target=mgr._fetch_job_status)
+    fetch.start()
+    fetch.join(timeout=10)
+    assert not fetch.is_alive(), 'parallel job-status walk did not complete'
+    assert not all_entered.broken
 
 
 def test_fetch_job_status_releases_lock_during_ssh(monkeypatch):

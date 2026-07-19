@@ -5326,6 +5326,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         The lock is re-acquired only on the failure-handling paths (preemption
         and user-code failure); those paths may still run a cloud status
         refresh or a log sync while holding it.
+
+        The SSH fetches run in a thread pool (like ``_probe_all_replicas``):
+        a serial walk lets one hung replica delay failure detection for every
+        replica after it, scaling the round as O(N * per-replica SSH). The
+        failure-handling branches still run serially, consuming results in
+        latest-version-first order, and each re-reads fresh state under
+        ``self.lock`` before acting.
         """
         infos = serve_state.get_replica_infos(self._service_name)
         # Snapshot every replica's cluster record in one batched read; the
@@ -5333,9 +5340,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         # read per replica per fetch round.
         cluster_records = global_user_state.get_clusters_from_names(
             [info.cluster_name for info in infos])
-        # A setup error in a new version is commonly version-wide. Sample one
-        # trackable latest-version replica before the serial full-fleet walk so
-        # a bad rollout is stopped without waiting behind every old replica.
+        # A setup error in a new version is commonly version-wide. Consume one
+        # trackable latest-version replica's result before the rest of the
+        # fleet so a bad rollout is stopped without waiting behind every old
+        # replica.
         for index, info in enumerate(infos):
             if (info.version == self.latest_version and
                     info.status_property.should_track_service_status()):
@@ -5345,6 +5353,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # sdk.job_status. The backend object is stateless; construct it
         # once for the whole walk.
         backend = backends.CloudVmRayBackend()
+        to_fetch: list[tuple[ReplicaInfo, Any]] = []
         for info in infos:
             if not info.status_property.should_track_service_status():
                 continue
@@ -5357,14 +5366,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # completing after the snapshot was taken). Skip it; the next
                 # round re-snapshots.
                 continue
-            # Use None to fetch latest job, which stands for user task job
-            job_ids = [1] if self._is_pool else None
+            to_fetch.append((info, handle))
+        if not to_fetch:
+            return
+        # Use None to fetch latest job, which stands for user task job
+        job_ids = [1] if self._is_pool else None
+
+        def _get_job_status(handle):
+            # SSH into the replica's head node -- intentionally OUTSIDE
+            # self.lock so an unreachable replica cannot wedge the round.
+            return backend.get_job_status(handle, job_ids, stream_logs=False)
+
+        # The fetches are pure I/O; run them in parallel so one hung SSH
+        # (preempted spot) delays only its own replica's result, not the
+        # whole fleet's failure detection.
+        num_fetch_threads = min(len(to_fetch),
+                                self._PROBE_ROUND_MAX_PARALLELISM)
+        with mp_pool.ThreadPool(num_fetch_threads) as pool:
+            fetch_results = [(info, pool.apply_async(_get_job_status,
+                                                     (handle,)))
+                             for info, handle in to_fetch]
+            self._handle_job_status_results(fetch_results)
+
+    def _handle_job_status_results(
+            self, fetch_results: list[tuple[ReplicaInfo, Any]]) -> None:
+        """Consume the parallel job-status fetches, in submission order."""
+        for info, result in fetch_results:
             try:
-                # SSH into the replica's head node -- intentionally OUTSIDE
-                # self.lock so an unreachable replica cannot wedge the loop.
-                job_statuses = backend.get_job_status(handle,
-                                                      job_ids,
-                                                      stream_logs=False)
+                job_statuses = result.get()
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
                 # cluster is preempted.
