@@ -692,7 +692,10 @@ async def test_request_worker_retry_execution_retryable_error(
 
     monkeypatch.setattr(executor, '_get_queue', mock_get_queue)
 
-    # Mock time.sleep to track calls (but still sleep for very short waits).
+    # Mock only the executor module's view of time. Patching time.sleep on the
+    # shared module object also intercepts FileLock and watchdog sleeps in
+    # background threads, making their polling mutate this test's assertions
+    # and race database teardown.
     # Capture the request status and queue length observed *at the moment*
     # the backoff sleep happens, to pin the ordering: the request must be
     # PENDING (not RUNNING) and not yet re-enqueued before we wait.
@@ -709,7 +712,9 @@ async def test_request_worker_retry_execution_retryable_error(
         status_msg_at_sleep.append(observed.status_msg if observed else None)
         queue_len_at_sleep.append(len(queue_items))
 
-    monkeypatch.setattr('time.sleep', mock_sleep)
+    executor_time = mock.Mock(wraps=time)
+    executor_time.sleep.side_effect = mock_sleep
+    monkeypatch.setattr(executor, 'time', executor_time)
 
     # Create a mock executor that tracks submit_until_success calls
     submit_calls = []
