@@ -10,6 +10,7 @@ Also covers the federation observability helpers: FederationStats.summary()
 (the per-context success/timeout/error classification).
 """
 import asyncio
+import threading
 from unittest import mock
 
 import pytest
@@ -68,15 +69,23 @@ def test_endpoint_metrics_route_registered():
 async def test_federation_handlers_preserve_order_and_facade(
         handler_name, fetch_name, route):
     handler = getattr(server_metrics, handler_name)
+    request_thread = threading.current_thread()
+    context_threads = []
+
+    def get_contexts():
+        context_threads.append(threading.current_thread())
+        return ['in-cluster', 'ctx-b', 'ctx-a']
+
     fetch = mock.AsyncMock(
         side_effect=lambda context, **_: f'metric{{context="{context}"}} 1')
 
-    with mock.patch.object(skypilot_config, 'reload_config') as reload_config, \
+    with mock.patch.object(skypilot_config,
+                           'safe_reload_config') as reload_config, \
          mock.patch.object(annotations,
                            'clear_request_level_cache') as clear_cache, \
          mock.patch.object(core,
                            'get_all_contexts',
-                           return_value=['in-cluster', 'ctx-b', 'ctx-a']), \
+                           side_effect=get_contexts), \
          mock.patch.object(metrics_utils, fetch_name, fetch), \
          mock.patch.object(metrics_utils,
                            'record_federation_outcome') as record_outcome:
@@ -93,6 +102,8 @@ async def test_federation_handlers_preserve_order_and_facade(
     ]
     reload_config.assert_called_once_with()
     clear_cache.assert_called_once_with()
+    assert len(context_threads) == 1
+    assert context_threads[0] is not request_thread
 
     registered = [
         candidate for candidate in server_metrics.metrics_app.routes
@@ -110,10 +121,17 @@ async def test_gpu_metrics_debug_preserves_facade_and_cache_refresh(
     kubeconfig.write_text('apiVersion: v1\n')
     monkeypatch.setenv('KUBECONFIG', str(kubeconfig))
 
-    with mock.patch.object(
-            core,
-            'get_all_contexts',
-            side_effect=[['before'], ['after']]) as get_contexts, \
+    request_thread = threading.current_thread()
+    context_threads = []
+    contexts = iter([['before'], ['after']])
+
+    def get_all_contexts():
+        context_threads.append(threading.current_thread())
+        return next(contexts)
+
+    with mock.patch.object(core,
+                           'get_all_contexts',
+                           side_effect=get_all_contexts) as get_contexts, \
          mock.patch.object(annotations,
                            'clear_request_level_cache') as clear_cache:
         result = await server_metrics.gpu_metrics_debug()
@@ -125,6 +143,8 @@ async def test_gpu_metrics_debug_preserves_facade_and_cache_refresh(
     }
     assert result['contexts_before_cache_clear'] == ['before']
     assert result['contexts_after_cache_clear'] == ['after']
+    assert result['thread'] == request_thread.name
+    assert all(thread is not request_thread for thread in context_threads)
     assert get_contexts.call_count == 2
     clear_cache.assert_called_once_with()
 
@@ -144,7 +164,7 @@ async def test_gpu_metrics_preserves_result_handler_patch_point():
     def append_result(_context, _route, result, _stats, all_metrics):
         all_metrics.append(result)
 
-    with mock.patch.object(skypilot_config, 'reload_config'), \
+    with mock.patch.object(skypilot_config, 'safe_reload_config'), \
          mock.patch.object(annotations, 'clear_request_level_cache'), \
          mock.patch.object(core,
                            'get_all_contexts',

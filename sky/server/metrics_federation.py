@@ -41,8 +41,8 @@ _ResultHandler = abc.Callable[
 _MetricsFetcher = abc.Callable[..., abc.Awaitable[str]]
 
 
-async def gpu_metrics_debug() -> dict:
-    """Collect diagnostics for GPU metrics federation."""
+def _collect_gpu_metrics_debug(pid: int, thread_name: str) -> dict:
+    """Collect synchronous diagnostics for GPU metrics federation."""
     kubeconfig_env = os.environ.get('KUBECONFIG', 'NOT_SET')
     default_path = os.path.expanduser('~/.kube/config')
 
@@ -76,8 +76,8 @@ async def gpu_metrics_debug() -> dict:
             cred_mgr_contexts = [f'error: {e}']
 
     return {
-        'pid': os.getpid(),
-        'thread': threading.current_thread().name,
+        'pid': pid,
+        'thread': thread_name,
         'KUBECONFIG': kubeconfig_env,
         'kubeconfig_paths': path_info,
         'credential_manager_kubeconfig': {
@@ -88,6 +88,14 @@ async def gpu_metrics_debug() -> dict:
         'contexts_before_cache_clear': pre_clear_contexts,
         'contexts_after_cache_clear': post_clear_contexts,
     }
+
+
+async def gpu_metrics_debug() -> dict:
+    """Collect diagnostics for GPU metrics federation."""
+    # Preserve the endpoint thread identity in the diagnostic payload while
+    # running kubeconfig discovery and filesystem probes in a worker thread.
+    return await asyncio.to_thread(_collect_gpu_metrics_debug, os.getpid(),
+                                   threading.current_thread().name)
 
 
 def handle_federation_result(context: str, route: str, result: object,
@@ -118,15 +126,20 @@ def handle_federation_result(context: str, route: str, result: object,
     all_metrics.append(result)
 
 
+def _prepare_federation_contexts() -> list[str]:
+    """Reload config and discover contexts outside the event loop."""
+    skypilot_config.safe_reload_config()
+    annotations.clear_request_level_cache()
+    return core.get_all_contexts()
+
+
 async def _federate_metrics(
     route: str,
     fetch_metrics: _MetricsFetcher,
     handle_result: _ResultHandler,
 ) -> fastapi.Response:
     """Federate one metrics family from every external Kubernetes context."""
-    skypilot_config.reload_config()
-    annotations.clear_request_level_cache()
-    contexts = core.get_all_contexts()
+    contexts = await asyncio.to_thread(_prepare_federation_contexts)
     remote_contexts = [
         context for context in contexts if context != 'in-cluster'
     ]
