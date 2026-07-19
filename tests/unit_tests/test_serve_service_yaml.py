@@ -123,13 +123,42 @@ def test_pickled_status_strips_raw_yaml_for_services(monkeypatch):
     monkeypatch.setattr(serve_state, 'get_replica_status_counts',
                         lambda name: {})
 
-    statuses = serve_utils.get_service_status_pickled(None,
-                                                      pool=False,
-                                                      summary_only=True)
+    statuses = serve_utils.get_service_status_pickled(
+        None, pool=False, include_target_num_replicas=False)
 
     decoded = serve_utils.unpickle_service_status(statuses)[0]
     assert 'yaml_content' not in decoded
     assert 'super-secret' not in decoded['service_yaml']
+
+
+def test_pickled_service_summary_skips_yaml_rendering(monkeypatch):
+    service_names = [f'svc-{index}' for index in range(25)]
+    monkeypatch.setattr(serve_state,
+                        'get_glob_service_names',
+                        lambda names, pool=None: list(service_names))
+    monkeypatch.setattr(
+        serve_state, 'get_service_from_name', lambda name: {
+            **_service_record(_RENDERED_YAML),
+            'name': name,
+        })
+    monkeypatch.setattr(serve_state, 'get_replica_status_counts',
+                        lambda name: {})
+    read_yaml = mock.Mock(return_value={'_user_specified_yaml': _USER_YAML})
+    redact_yaml = mock.Mock(return_value='redacted')
+    monkeypatch.setattr(serve_utils.yaml_utils, 'read_yaml_str', read_yaml)
+    monkeypatch.setattr(serve_utils.debug_dump_helpers, 'redact_task_yaml',
+                        redact_yaml)
+
+    statuses = serve_utils.get_service_status_pickled(None,
+                                                      pool=False,
+                                                      summary_only=True)
+
+    decoded = serve_utils.unpickle_service_status(statuses)
+    assert len(decoded) == len(service_names)
+    read_yaml.assert_not_called()
+    redact_yaml.assert_not_called()
+    assert all('yaml_content' not in status for status in decoded)
+    assert all('service_yaml' not in status for status in decoded)
 
 
 def test_pickled_status_keeps_raw_yaml_for_pools(monkeypatch):

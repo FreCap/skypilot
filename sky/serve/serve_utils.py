@@ -2081,6 +2081,12 @@ def get_service_status_pickled(
             'with_replica_counts': summary_only,
             'with_target_num_replicas': include_target_num_replicas,
         }
+        # Service summaries are metadata-only dashboard snapshots. Avoid
+        # parsing, redacting, and dumping one YAML document per service on
+        # every poll. Pool summaries deliberately keep YAML because pool
+        # lifecycle consumers parse it back into a launchable task.
+        if summary_only and not pool:
+            kwargs['with_yaml'] = False
         return parent_ctx.copy().run(_get_service_status, name, **kwargs)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
