@@ -14,6 +14,7 @@ import traceback
 import typing
 from typing import Any, Optional
 
+import anyio
 import dotenv
 import filelock
 
@@ -43,6 +44,7 @@ from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.usage import usage_lib
 from sky.utils import annotations
+from sky.utils import asyncio_utils
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import context
@@ -2514,7 +2516,8 @@ class ControllerManager:
 
     async def _process_cancel_signals(self):
         """Run one scan of the cancel signal directory."""
-        cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+        cancels = await asyncio.to_thread(
+            os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
         for cancel in cancels:
             if not cancel.isdigit():
                 # There maybe unexpected files that are written to the
@@ -2532,48 +2535,62 @@ class ControllerManager:
                 continue
             logger.info(f'Cancelling job {job_id}')
 
-            signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
-                                       cancel)
-            with filelock.FileLock(signal_path + '.lock'):
-                try:
-                    content = pathlib.Path(signal_path).read_text(
-                        encoding='utf-8').strip()
-                except FileNotFoundError:
-                    # The signal was consumed between the directory listing
-                    # and acquiring the lock (e.g. the orphan reaper of a
-                    # sibling controller process, after the job turned
-                    # terminal). There is nothing left to deliver.
-                    continue
-                except Exception as e:  # pylint: disable=broad-except
-                    content = ''
-                    logger.debug('Problem occurred when reading '
-                                 f'{signal_path}: '
-                                 f'{common_utils.format_exception(e)}')
-                finally:
-                    pathlib.Path(signal_path).unlink(missing_ok=True)
+            await self._consume_and_cancel_task(job_id, task)
 
-            # Parse and store graceful cancel info before
-            # cancelling the task.
-            graceful, graceful_timeout = (
-                managed_job_utils.parse_job_cancel_file(content))
-            async with self._cancel_info_lock:
-                self._cancel_info[job_id] = (graceful, graceful_timeout)
-            task.cancel()
-            logger.info(f'Job {job_id} cancelled successfully')
+    @asyncio_utils.shield
+    async def _consume_and_cancel_task(self, job_id: int,
+                                       task: asyncio.Task) -> None:
+        """Consume a cancel signal and deliver it without interruption.
+
+        Shield the complete consume-and-deliver operation rather than only
+        the file-lock critical section. Otherwise cancellation of the scan
+        could let the background lock holder delete the signal without
+        cancelling the job.
+        """
+        content = await self._consume_signal_file(job_id)
+        if content is None:
+            # The signal was consumed between the directory listing and
+            # acquiring the lock (e.g. by a sibling controller process).
+            return
+
+        # Parse and store graceful cancel info before cancelling the task.
+        graceful, graceful_timeout = (
+            managed_job_utils.parse_job_cancel_file(content))
+        async with self._cancel_info_lock:
+            self._cancel_info[job_id] = (graceful, graceful_timeout)
+        task.cancel()
+        logger.info(f'Job {job_id} cancelled successfully')
 
     @staticmethod
-    def _remove_signal_file(job_id: int) -> None:
-        """Consume a job's cancel signal file, tolerating a lost race.
+    async def _consume_signal_file(job_id: int) -> str | None:
+        """Read and consume a cancel signal without blocking the event loop.
 
-        Takes the same filelock as the signal writer and the other
-        consumers; missing_ok covers the file being consumed by another
-        scanner (e.g. a sibling controller process) between listing the
-        directory and acquiring the lock.
+        The caller must shield the complete operation that owns delivery of
+        the consumed signal. This helper takes the same file lock as signal
+        writers and other consumers; missing_ok covers a lost race with a
+        sibling controller process.
         """
-        signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
+        signal_path = pathlib.Path(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
                                    str(job_id))
-        with filelock.FileLock(signal_path + '.lock'):
-            pathlib.Path(signal_path).unlink(missing_ok=True)
+        async with filelock.AsyncFileLock(f'{signal_path}.lock'):
+            try:
+                return (await anyio.Path(signal_path).read_text(encoding='utf-8'
+                                                               )).strip()
+            except FileNotFoundError:
+                return None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug('Problem occurred when reading '
+                             f'{signal_path}: '
+                             f'{common_utils.format_exception(e)}')
+                return ''
+            finally:
+                await anyio.Path(signal_path).unlink(missing_ok=True)
+
+    @staticmethod
+    @asyncio_utils.shield
+    async def _remove_signal_file(job_id: int) -> None:
+        """Consume a job's cancel signal file, tolerating a lost race."""
+        await ControllerManager._consume_signal_file(job_id)
 
     async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
         """Remove a cancel signal that no consumer will ever pick up.
@@ -2591,7 +2608,7 @@ class ControllerManager:
         if status is not None and not status.is_terminal():
             return
         try:
-            self._remove_signal_file(job_id)
+            await self._remove_signal_file(job_id)
         except OSError as e:
             logger.debug(f'Failed to reap cancel signal for job {job_id}: '
                          f'{common_utils.format_exception(e)}')
@@ -2674,12 +2691,13 @@ class ControllerManager:
             job_id = waiting_job['job_id']
             pool = waiting_job.get('pool', None)
 
-            cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+            cancels = await asyncio.to_thread(
+                os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
             if str(job_id) in cancels:
                 status = await managed_job_state.get_status_async(job_id)
                 if status == managed_job_state.ManagedJobStatus.PENDING:
                     logger.info(f'Job {job_id} cancelled')
-                    self._remove_signal_file(job_id)
+                    await self._remove_signal_file(job_id)
                     await managed_job_state.set_cancelling_async(
                         job_id=job_id,
                         callback_func=managed_job_utils.event_callback_func(
