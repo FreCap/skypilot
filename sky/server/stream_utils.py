@@ -39,6 +39,18 @@ LONG_REQUEST_POLL_INTERVAL = 1
 DEFAULT_POLL_INTERVAL = 0.1
 
 
+def ensure_request_log_storage_available() -> None:
+    """Reject new remote-log work before it consumes the disk reserve."""
+    usage = requests_lib.get_request_log_storage_usage()
+    if usage.free_bytes >= usage.hard_free_bytes:
+        return
+    raise fastapi.HTTPException(
+        status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=('API server request-log storage is under pressure; retry '
+                'after terminal streaming logs are cleaned up.'),
+        headers={'Retry-After': '60'})
+
+
 async def _yield_log_file_with_payloads_skipped(
         log_file) -> AsyncGenerator[str, None]:
     async for line in log_file:

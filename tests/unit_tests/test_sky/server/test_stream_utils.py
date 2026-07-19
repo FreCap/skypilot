@@ -7,10 +7,34 @@ import pathlib
 import types
 
 import aiofiles
+import fastapi
 import pytest
 
 from sky.server import stream_utils
+from sky.server.requests import requests as requests_lib
 from sky.utils import context
+
+
+def test_request_log_storage_admission_allows_healthy_filesystem(monkeypatch):
+    monkeypatch.setattr(
+        requests_lib, 'get_request_log_storage_usage',
+        lambda: requests_lib.RequestLogStorageUsage(
+            free_bytes=11, soft_free_bytes=10, hard_free_bytes=5))
+
+    stream_utils.ensure_request_log_storage_available()
+
+
+def test_request_log_storage_admission_sheds_under_pressure(monkeypatch):
+    monkeypatch.setattr(
+        requests_lib, 'get_request_log_storage_usage',
+        lambda: requests_lib.RequestLogStorageUsage(
+            free_bytes=4, soft_free_bytes=10, hard_free_bytes=5))
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        stream_utils.ensure_request_log_storage_available()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {'Retry-After': '60'}
 
 
 @pytest.mark.asyncio

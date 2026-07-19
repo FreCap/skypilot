@@ -14,6 +14,7 @@ import functools
 import logging
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,6 +40,11 @@ REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES = len(
         _REQUEST_LOG_TRUNCATION_GENERATION_LENGTH +
         len(_REQUEST_LOG_TRUNCATION_START_SEPARATOR.encode('utf-8')) +
         _REQUEST_LOG_TRUNCATION_START_LENGTH + 1)
+REQUEST_LOG_DISK_PRESSURE_MARKER = (
+    '[SkyPilot] Request output stopped because the API server filesystem '
+    'reached its reserved free-space limit. Retry after old request logs are '
+    'cleaned up.\n')
+_DEFAULT_DISK_CHECK_INTERVAL_BYTES = 1024 * 1024
 
 
 class RequestLogTruncationMarker(NamedTuple):
@@ -88,12 +94,30 @@ def _format_request_log_truncation_marker(logical_start: int) -> str:
 class _TruncatingLogFile:
     """Append-only text stream that bounds an actively streamed log file."""
 
-    def __init__(self, path: pathlib.Path, max_bytes: int):
+    def __init__(
+            self,
+            path: pathlib.Path,
+            max_bytes: int,
+            min_free_bytes: int | None = None,
+            disk_check_interval_bytes: int = _DEFAULT_DISK_CHECK_INTERVAL_BYTES
+    ):
         if max_bytes <= REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES:
             raise ValueError('max_bytes must be larger than the truncation '
                              'marker')
+        if min_free_bytes is not None and min_free_bytes < 0:
+            raise ValueError('min_free_bytes must be non-negative')
+        if disk_check_interval_bytes <= 0:
+            raise ValueError('disk_check_interval_bytes must be positive')
+        self._path = path
         self._file = open(path, 'a+', encoding='utf-8')
         self._max_bytes = max_bytes
+        self._min_free_bytes = min_free_bytes
+        self._disk_check_interval_bytes = disk_check_interval_bytes
+        # Check the filesystem on the first write, then only once per bounded
+        # amount of output. This keeps the healthy path cheap while bounding
+        # concurrent overshoot when the filesystem approaches its reserve.
+        self._bytes_since_disk_check = disk_check_interval_bytes
+        self._disk_pressure_reached = False
         # Leave substantial headroom after a rollover. Retaining all the way
         # back to the cap would make every subsequent small write rewrite the
         # entire production-sized log while holding the file lock.
@@ -103,10 +127,44 @@ class _TruncatingLogFile:
         self._size_bytes = path.stat().st_size
         self._lock = threading.Lock()
 
+    def _filesystem_under_pressure(self, incoming_bytes: int) -> bool:
+        if self._min_free_bytes is None:
+            return False
+        self._bytes_since_disk_check += incoming_bytes
+        if self._bytes_since_disk_check < self._disk_check_interval_bytes:
+            return False
+        self._bytes_since_disk_check %= self._disk_check_interval_bytes
+        # Include this pending write in the decision so a single large output
+        # chunk cannot cross the reserve after observing a healthy snapshot.
+        return (shutil.disk_usage(self._path.parent).free - incoming_bytes
+                < self._min_free_bytes)
+
+    def _replace_with_disk_pressure_marker(self, fd: int) -> None:
+        """Release this spool's payload and leave a follower-visible marker."""
+        prefix = os.pread(fd, REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES, 0)
+        previous_marker = parse_request_log_truncation_marker(prefix)
+        payload_offset = (previous_marker.byte_length
+                          if previous_marker is not None else 0)
+        logical_start = (previous_marker.logical_start
+                         if previous_marker is not None else 0)
+        logical_end = logical_start + max(0, self._size_bytes - payload_offset)
+        content = (_format_request_log_truncation_marker(logical_end) +
+                   REQUEST_LOG_DISK_PRESSURE_MARKER)
+        self._file.seek(0)
+        self._file.truncate()
+        self._file.write(content)
+        self._file.flush()
+        self._size_bytes = len(content.encode('utf-8'))
+        self._disk_pressure_reached = True
+
     def write(self, content: str) -> int:
         original_length = len(content)
+        if self._disk_pressure_reached:
+            return original_length
         encoded_content = content.encode('utf-8')
         with self._lock:
+            if self._disk_pressure_reached:
+                return original_length
             fd = self._file.fileno()
             fcntl.flock(fd, fcntl.LOCK_EX)
             try:
@@ -115,6 +173,9 @@ class _TruncatingLogFile:
                 # stale per-handle size and exceed the cap.
                 self._file.flush()
                 self._size_bytes = os.fstat(fd).st_size
+                if self._filesystem_under_pressure(len(encoded_content)):
+                    self._replace_with_disk_pressure_marker(fd)
+                    return original_length
                 if self._size_bytes + len(encoded_content) > self._max_bytes:
                     prefix = os.pread(fd,
                                       REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES,
@@ -235,6 +296,7 @@ class SkyPilotContext:
         self._log_file = None
         self._log_file_handle = None
         self._log_file_max_bytes = None
+        self._log_file_min_free_bytes = None
         self.env_overrides = {}
         self.config_context = None
         self.request_context = None
@@ -294,7 +356,8 @@ class SkyPilotContext:
 
     def redirect_log(self,
                      log_file: pathlib.Path | None,
-                     max_bytes: int | None = None) -> pathlib.Path | None:
+                     max_bytes: int | None = None,
+                     min_free_bytes: int | None = None) -> pathlib.Path | None:
         """Redirect the stdout and stderr of current context to a file.
 
         Args:
@@ -303,6 +366,8 @@ class SkyPilotContext:
             max_bytes: If set, truncate earlier output whenever the file would
                 grow beyond this many bytes. The active stream can continue
                 writing after truncation.
+            min_free_bytes: If set with ``max_bytes``, stop growing the file
+                when its filesystem has less than this many free bytes.
 
         Returns:
             The old log file, or None if the stdout and stderr were not
@@ -313,11 +378,13 @@ class SkyPilotContext:
         if log_file is None:
             self._log_file_handle = None
         elif max_bytes is not None:
-            self._log_file_handle = _TruncatingLogFile(log_file, max_bytes)
+            self._log_file_handle = _TruncatingLogFile(
+                log_file, max_bytes, min_free_bytes=min_free_bytes)
         else:
             self._log_file_handle = open(log_file, 'a', encoding='utf-8')
         self._log_file = log_file
         self._log_file_max_bytes = max_bytes
+        self._log_file_min_free_bytes = min_free_bytes
         if original_log_handle is not None:
             original_log_handle.close()
         return original_log_file
@@ -361,7 +428,8 @@ class SkyPilotContext:
         Cancellation of the current context will not be propagated to the copy.
         """
         new_context = SkyPilotContext()
-        new_context.redirect_log(self._log_file, self._log_file_max_bytes)
+        new_context.redirect_log(self._log_file, self._log_file_max_bytes,
+                                 self._log_file_min_free_bytes)
         new_context.env_overrides = self.env_overrides.copy()
         new_context.config_context = copy.deepcopy(self.config_context)
         return new_context
