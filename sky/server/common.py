@@ -48,11 +48,13 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import aiohttp
+    import fastapi
     import pydantic
     import requests
 
     from sky import dag as dag_lib
     from sky import models
+    from sky.server.requests import payloads
 else:
     aiohttp = adaptors_common.LazyImport('aiohttp')
     pydantic = adaptors_common.LazyImport('pydantic')
@@ -1073,6 +1075,23 @@ def api_server_user_logs_dir_prefix(
     if user_hash is None:
         user_hash = common_utils.get_user_hash()
     return API_SERVER_CLIENT_DIR / user_hash / 'sky_logs'
+
+
+def get_request_user_id(request: 'fastapi.Request',
+                        request_body: 'payloads.RequestBody') -> str:
+    """Returns the trusted user identity for request-scoped storage paths."""
+    auth_user = request.state.auth_user
+    if auth_user is not None:
+        return auth_user.id
+    return request_body.env_vars[constants.USER_ID_ENV_VAR]
+
+
+def prepare_download_tmp_dir(user_hash: str) -> pathlib.Path:
+    """Returns a user's download staging directory, creating it if needed."""
+    download_tmp = pathlib.Path(
+        bs.get_blob_storage().download_tmp_dir(user_hash)).expanduser()
+    download_tmp.mkdir(parents=True, exist_ok=True)
+    return download_tmp
 
 
 def request_body_to_params(body: 'pydantic.BaseModel') -> dict[str, Any]:

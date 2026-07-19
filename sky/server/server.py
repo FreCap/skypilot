@@ -1175,10 +1175,9 @@ async def download_logs(
         request: fastapi.Request,
         cluster_jobs_body: payloads.ClusterJobsDownloadLogsBody) -> None:
     """Downloads the logs of a job."""
-    user_hash = cluster_jobs_body.env_vars[constants.USER_ID_ENV_VAR]
-    logs_dir_on_api_server = pathlib.Path(
-        bs.get_blob_storage().download_tmp_dir(user_hash))
-    logs_dir_on_api_server.expanduser().mkdir(parents=True, exist_ok=True)
+    user_hash = common.get_request_user_id(request, cluster_jobs_body)
+    logs_dir_on_api_server = await asyncio.to_thread(
+        common.prepare_download_tmp_dir, user_hash)
     # We should reuse the original request body, so that the env vars, such as
     # user hash, are kept the same.
     cluster_jobs_body.local_dir = str(logs_dir_on_api_server)
@@ -1193,36 +1192,60 @@ async def download_logs(
     )
 
 
-@app.post('/download')
-async def download(download_body: payloads.DownloadBody,
-                   request: fastapi.Request) -> None:
-    """Downloads a folder from the cluster to the local machine."""
-    folder_paths = [
-        pathlib.Path(folder_path) for folder_path in download_body.folder_paths
-    ]
-    user_hash = download_body.env_vars[constants.USER_ID_ENV_VAR]
-    logs_dir_on_api_server = common.api_server_user_logs_dir_prefix(user_hash)
-    download_tmp = bs.get_blob_storage().download_tmp_dir(user_hash)
-    for folder_path in folder_paths:
-        folder_str = str(folder_path)
-        expanded_str = str(folder_path.expanduser())
-        if not (folder_str.startswith(str(logs_dir_on_api_server)) or
-                folder_str.startswith(download_tmp) or
-                expanded_str.startswith(os.path.expanduser(download_tmp))):
+def _is_path_within(path: pathlib.Path, allowed_root: pathlib.Path) -> bool:
+    """Returns whether a resolved path is contained by a resolved root."""
+    try:
+        return os.path.commonpath([path, allowed_root]) == str(allowed_root)
+    except ValueError:
+        # Different drives on Windows cannot have a common path.
+        return False
+
+
+def _resolve_download_paths(
+        folder_path_strings: list[str], logs_dir_on_api_server: pathlib.Path,
+        download_tmp: pathlib.Path) -> tuple[list[pathlib.Path], pathlib.Path]:
+    """Validates requested folders and returns their canonical paths."""
+    resolved_logs_root = logs_dir_on_api_server.expanduser().resolve()
+    allowed_roots = {
+        resolved_logs_root,
+        download_tmp.expanduser().resolve(),
+    }
+    folder_paths = []
+    for folder_path_str in folder_path_strings:
+        folder_path = pathlib.Path(folder_path_str).expanduser().resolve()
+        if not any(
+                _is_path_within(folder_path, allowed_root)
+                for allowed_root in allowed_roots):
             raise fastapi.HTTPException(
                 status_code=400,
                 detail=
                 f'Invalid folder path: {folder_path}; {logs_dir_on_api_server}')
 
-        if not folder_path.expanduser().resolve().exists():
+        if not folder_path.exists():
             raise fastapi.HTTPException(
                 status_code=404, detail=f'Folder not found: {folder_path}')
+        # Keep the canonical path so a symlink cannot be swapped after the
+        # containment check but before the archive is created.
+        folder_paths.append(folder_path)
+    return folder_paths, resolved_logs_root
+
+
+@app.post('/download')
+async def download(download_body: payloads.DownloadBody,
+                   request: fastapi.Request) -> None:
+    """Downloads a folder from the cluster to the local machine."""
+    user_hash = common.get_request_user_id(request, download_body)
+    logs_dir_on_api_server = common.api_server_user_logs_dir_prefix(user_hash)
+    download_tmp = await asyncio.to_thread(common.prepare_download_tmp_dir,
+                                           user_hash)
+    folder_paths, resolved_logs_root = await asyncio.to_thread(
+        _resolve_download_paths, download_body.folder_paths,
+        logs_dir_on_api_server, download_tmp)
 
     # Create a temporary zip file
     log_id = str(uuid.uuid4().hex)
     zip_filename = f'folder_{log_id}.zip'
-    zip_path = pathlib.Path(
-        logs_dir_on_api_server).expanduser().resolve() / zip_filename
+    zip_path = resolved_logs_root / zip_filename
 
     try:
 
