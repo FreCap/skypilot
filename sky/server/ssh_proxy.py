@@ -213,8 +213,6 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
                          'ssh websocket connection was closed. Remaining '
                          f'output: {str(stdout)}')
             reason = 'KubectlPortForwardExit'
-            metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-                pid=os.getpid(), reason=reason).inc()
         else:
             if ssh_failed:
                 reason = 'SSHToPodDisconnected'
@@ -362,8 +360,6 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
                          'ssh websocket connection was closed. Remaining '
                          f'output: {str(stdout_data)}')
             reason = 'SrunProcessExit'
-            metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-                pid=os.getpid(), reason=reason).inc()
         else:
             if ssh_failed:
                 reason = 'SSHToSlurmJobDisconnected'
