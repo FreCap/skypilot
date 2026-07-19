@@ -133,6 +133,7 @@ async def logs(
     jobs_logs_body: payloads.JobsLogsBody = fastapi.Depends(
         role_filter.force_viewer_jobs_logs_body),
 ) -> fastapi.responses.StreamingResponse:
+    stream_utils.ensure_request_log_storage_available()
     schedule_type = api_requests.ScheduleType.SHORT
     if _controller_refresh_need_long(jobs_logs_body.refresh):
         # When refresh is specified, the job controller might be restarted,
@@ -244,6 +245,7 @@ async def pool_tail_logs(
     request: fastapi.Request, log_body: payloads.JobsPoolLogsBody,
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
+    stream_utils.ensure_request_log_storage_available()
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.JOBS_POOL_LOGS,

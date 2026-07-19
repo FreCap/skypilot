@@ -195,6 +195,35 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         mock_ctx.cancel.assert_called()
 
 
+@pytest.mark.asyncio
+async def test_execute_request_coroutine_fails_if_storage_probe_fails():
+    request = requests_lib.Request(
+        request_id='storage-probe-failure',
+        name='sky.logs',
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='test-user-id',
+        entrypoint=mock.Mock(),
+        request_body=payloads.RequestBody(),
+    )
+    mock_ctx = mock.Mock()
+    mock_failure = mock.AsyncMock()
+
+    with mock.patch('sky.utils.context.initialize'), \
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(requests_lib, 'update_status_async',
+                           new_callable=mock.AsyncMock), \
+         mock.patch.object(requests_lib, 'get_request_log_storage_usage',
+                           side_effect=OSError('statvfs failed')), \
+         mock.patch.object(requests_lib, 'set_request_failed_async',
+                           mock_failure):
+        task = executor.execute_request_in_coroutine(request)
+        await task.task
+
+    mock_failure.assert_awaited_once()
+    request.entrypoint.assert_not_called()
+
+
 CALLED_FLAG = [False]
 
 

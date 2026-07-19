@@ -84,6 +84,57 @@ DEFAULT_REQUESTS_RETENTION_HOURS = 24  # 1 day
 # of the rows being cleaned; the GC itself always runs at this cadence so
 # the table does not grow unboundedly between runs under high request rates.
 _GC_INTERVAL_SECONDS = 3600
+_REQUEST_LOG_PRESSURE_CHECK_INTERVAL_SECONDS = 10
+_REQUEST_LOG_PRESSURE_CLEANUP_INTERVAL_SECONDS = 300
+_REQUEST_LOG_HARD_PRESSURE_CLEANUP_INTERVAL_SECONDS = 60
+_REQUEST_LOG_PRESSURE_CLEANUP_GRACE_SECONDS = 5
+_GIB = 1024 * 1024 * 1024
+_REQUEST_LOG_SOFT_FREE_FRACTION = 0.10
+_REQUEST_LOG_HARD_FREE_FRACTION = 0.05
+_REQUEST_LOG_SOFT_FREE_MIN_BYTES = 2 * _GIB
+_REQUEST_LOG_SOFT_FREE_MAX_BYTES = 20 * _GIB
+_REQUEST_LOG_HARD_FREE_MIN_BYTES = 1 * _GIB
+_REQUEST_LOG_HARD_FREE_MAX_BYTES = 10 * _GIB
+
+# These requests proxy remote logs through their local request log. Their
+# completed rows are the safest first target when the shared filesystem is
+# under pressure: deleting them preserves active streams and ordinary request
+# history while removing duplicated transport data.
+STREAMING_REQUEST_NAMES = tuple(server_constants.REQUEST_NAME_PREFIX +
+                                name.value for name in (
+                                    request_names.RequestName.CLUSTER_JOB_LOGS,
+                                    request_names.RequestName.JOBS_LOGS,
+                                    request_names.RequestName.JOBS_POOL_LOGS,
+                                    request_names.RequestName.SERVE_LOGS,
+                                ))
+
+
+class RequestLogStorageUsage(NamedTuple):
+    """Filesystem usage and pressure thresholds for API request logs."""
+
+    free_bytes: int
+    soft_free_bytes: int
+    hard_free_bytes: int
+
+
+def _clamp(value: int, minimum: int, maximum: int) -> int:
+    return min(maximum, max(minimum, value))
+
+
+def get_request_log_storage_usage() -> RequestLogStorageUsage:
+    """Return an O(1) request-log filesystem pressure snapshot."""
+    log_dir = pathlib.Path(
+        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(log_dir)
+    soft_free_bytes = _clamp(int(usage.total * _REQUEST_LOG_SOFT_FREE_FRACTION),
+                             _REQUEST_LOG_SOFT_FREE_MIN_BYTES,
+                             _REQUEST_LOG_SOFT_FREE_MAX_BYTES)
+    hard_free_bytes = _clamp(int(usage.total * _REQUEST_LOG_HARD_FREE_FRACTION),
+                             _REQUEST_LOG_HARD_FREE_MIN_BYTES,
+                             _REQUEST_LOG_HARD_FREE_MAX_BYTES)
+    return RequestLogStorageUsage(usage.free, soft_free_bytes, hard_free_bytes)
+
 
 # Escape hatch: set to '1' to restore the legacy behavior of wiping the
 # request DB and logs on API server startup instead of recovering them.
@@ -1662,8 +1713,10 @@ async def _cleanup_legacy_directory_if_empty():
         logger.debug(f'Failed to cleanup legacy directory: {e}')
 
 
-async def clean_finished_requests_with_retention(retention_seconds: int,
-                                                 batch_size: int = 1000):
+async def clean_finished_requests_with_retention(
+        retention_seconds: int,
+        batch_size: int = 1000,
+        include_request_names: list[str] | None = None):
     """Clean up finished requests older than the retention period.
 
     This function removes old finished requests (SUCCEEDED, FAILED, CANCELLED)
@@ -1680,12 +1733,15 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
             db query complete in a reasonable time. All stale
             requests older than the retention period will be deleted
             regardless of the batch size.
+        include_request_names: If set, clean only these request names.
     """
     debug_log_dir = pathlib.Path(sky_logging.DEBUG_LOG_DIR)
     total_deleted = 0
     while True:
         reqs = await get_request_tasks_async(
             req_filter=RequestTaskFilter(status=RequestStatus.finished_status(),
+                                         include_request_names=(
+                                             include_request_names),
                                          finished_before=time.time() -
                                          retention_seconds,
                                          include_missing_finished_at=True,
@@ -1739,29 +1795,107 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
                 f'older than {retention_seconds} seconds')
 
 
+async def cleanup_streaming_requests_under_pressure(
+        usage: RequestLogStorageUsage | None = None) -> bool:
+    """Reclaim terminal streaming spools only when disk headroom is low."""
+    if usage is None:
+        usage = get_request_log_storage_usage()
+    if usage.free_bytes >= usage.soft_free_bytes:
+        return False
+    logger.warning(
+        'Request-log filesystem pressure detected: '
+        f'free={usage.free_bytes} soft_limit={usage.soft_free_bytes}; '
+        'cleaning terminal streaming requests')
+    if usage.free_bytes < usage.hard_free_bytes:
+        # Process-backed streams do not use the coroutine log writer. Stop all
+        # active streaming producers once the hard reserve is crossed, then
+        # collect their now-terminal spools below.
+        active_requests = await get_request_tasks_async(
+            req_filter=RequestTaskFilter(status=RequestStatus.active_statuses(),
+                                         include_request_names=list(
+                                             STREAMING_REQUEST_NAMES),
+                                         fields=['request_id']))
+        results = await asyncio.gather(
+            *(kill_request_async(req.request_id) for req in active_requests),
+            return_exceptions=True)
+        cancelled = sum(result is True for result in results)
+        failures = sum(isinstance(result, BaseException) for result in results)
+        logger.warning('Hard request-log reserve crossed: '
+                       f'cancelled={cancelled} active streaming requests; '
+                       f'cancel_failures={failures}')
+    # Leave newly cancelled rows visible long enough for their executors to
+    # observe cancellation and stop. The next pressure pass reclaims them.
+    await clean_finished_requests_with_retention(
+        _REQUEST_LOG_PRESSURE_CLEANUP_GRACE_SECONDS,
+        include_request_names=list(STREAMING_REQUEST_NAMES))
+    updated_usage = get_request_log_storage_usage()
+    logger.info('Request-log pressure cleanup finished: '
+                f'free={updated_usage.free_bytes} '
+                f'soft_limit={updated_usage.soft_free_bytes}')
+    return True
+
+
 async def requests_gc_daemon():
     """Garbage collect finished requests periodically."""
+    last_retention_gc = float('-inf')
+    last_pressure_cleanup = float('-inf')
+    last_hard_pressure_cleanup = float('-inf')
     while True:
-        logger.info('Running requests GC daemon...')
-        # Use the latest config.
-        skypilot_config.reload_config()
-        retention_seconds = skypilot_config.get_nested(
-            ('api_server', 'requests_retention_hours'),
-            DEFAULT_REQUESTS_RETENTION_HOURS) * 3600
+        now = time.monotonic()
+        # Protect the disk reserve before starting the potentially longer
+        # ordinary retention pass, especially during server startup.
         try:
-            # Negative value disables the requests GC
-            if retention_seconds >= 0:
-                await clean_finished_requests_with_retention(retention_seconds)
+            usage = get_request_log_storage_usage()
+            if usage.free_bytes >= usage.soft_free_bytes:
+                # A new pressure episode should reclaim terminal streams
+                # immediately instead of inheriting the previous cooldown.
+                last_pressure_cleanup = float('-inf')
+                last_hard_pressure_cleanup = float('-inf')
+            elif (usage.free_bytes < usage.hard_free_bytes and
+                  now - last_hard_pressure_cleanup
+                  >= _REQUEST_LOG_HARD_PRESSURE_CLEANUP_INTERVAL_SECONDS):
+                # Crossing the hard reserve bypasses a recent soft cleanup,
+                # but repeated emergency database work remains bounded.
+                last_hard_pressure_cleanup = now
+                last_pressure_cleanup = now
+                await cleanup_streaming_requests_under_pressure(usage)
+            elif (usage.free_bytes >= usage.hard_free_bytes and
+                  now - last_pressure_cleanup
+                  >= _REQUEST_LOG_PRESSURE_CLEANUP_INTERVAL_SECONDS):
+                # Advance before the database query so a failure cannot spin
+                # on every O(1) filesystem probe.
+                last_pressure_cleanup = now
+                await cleanup_streaming_requests_under_pressure(usage)
         except asyncio.CancelledError:
             logger.info('Requests GC daemon cancelled')
-            break
+            raise
         except Exception as e:  # pylint: disable=broad-except
-            logger.error(f'Error running requests GC daemon: {e}'
+            logger.error(f'Error running request-log pressure cleanup: {e}; '
                          f'traceback: {traceback.format_exc()}')
-        # Run the daemon hourly regardless of the retention period, so the
-        # table is trimmed continuously; retention only controls the age
-        # cutoff of the rows being cleaned.
-        await asyncio.sleep(_GC_INTERVAL_SECONDS)
+        if now - last_retention_gc >= _GC_INTERVAL_SECONDS:
+            # Advance the deadline before touching config or the database. A
+            # broken normal-retention pass must not turn an hourly operation
+            # into a retry every pressure-check tick.
+            last_retention_gc = now
+            try:
+                logger.info('Running requests GC daemon...')
+                # Use the latest config for the normal retention pass.
+                skypilot_config.reload_config()
+                retention_seconds = skypilot_config.get_nested(
+                    ('api_server', 'requests_retention_hours'),
+                    DEFAULT_REQUESTS_RETENTION_HOURS) * 3600
+                # Negative value disables normal retention, but pressure
+                # cleanup remains a safety invariant.
+                if retention_seconds >= 0:
+                    await clean_finished_requests_with_retention(
+                        retention_seconds)
+            except asyncio.CancelledError:
+                logger.info('Requests GC daemon cancelled')
+                raise
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f'Error running normal requests GC: {e}; '
+                             f'traceback: {traceback.format_exc()}')
+        await asyncio.sleep(_REQUEST_LOG_PRESSURE_CHECK_INTERVAL_SECONDS)
 
 
 async def close_db_async() -> None:

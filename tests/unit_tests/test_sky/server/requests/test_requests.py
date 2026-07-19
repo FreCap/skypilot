@@ -593,23 +593,30 @@ async def test_requests_gc_daemon_disabled(isolated_database):
         with mock.patch(
                 'sky.server.requests.requests.clean_finished_requests_with_retention'
         ) as mock_clean:
-            with mock.patch('asyncio.sleep') as mock_sleep:
-                # Configure negative retention (disabled)
-                mock_config.get_nested.return_value = -1
+            with mock.patch(
+                    'sky.server.requests.requests.get_request_log_storage_usage',
+                    return_value=requests.RequestLogStorageUsage(
+                        free_bytes=11, soft_free_bytes=10,
+                        hard_free_bytes=5)) as mock_pressure_check:
+                with mock.patch('asyncio.sleep') as mock_sleep:
+                    # Configure negative retention (disabled)
+                    mock_config.get_nested.return_value = -1
 
-                # Make sleep raise CancelledError after first iteration
-                mock_sleep.side_effect = [None, asyncio.CancelledError()]
+                    # Make sleep raise CancelledError after first iteration
+                    mock_sleep.side_effect = [None, asyncio.CancelledError()]
 
-                # Run the daemon
-                with pytest.raises(asyncio.CancelledError):
-                    await requests.requests_gc_daemon()
+                    # Run the daemon
+                    with pytest.raises(asyncio.CancelledError):
+                        await requests.requests_gc_daemon()
 
                 # Verify cleanup was NOT called due to negative retention
-                mock_clean.assert_not_called()
+                    mock_clean.assert_not_called()
 
-                # Verify sleep was called with max(-1, 3600) = 3600
-                assert mock_sleep.call_count == 2
-                mock_sleep.assert_any_call(3600)
+                    # The pressure check remains active while normal retention is
+                    # disabled, but performs no database cleanup when healthy.
+                    assert mock_pressure_check.call_count == 2
+                    assert mock_sleep.call_count == 2
+                    mock_sleep.assert_any_call(10)
 
 
 def test_get_legacy_log_path():

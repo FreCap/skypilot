@@ -1144,6 +1144,7 @@ async def logs(
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
     """Tails the logs of a job."""
+    stream_utils.ensure_request_log_storage_available()
     # TODO(zhwu): This should wait for the request on the cluster, e.g., async
     # launch, to finish, so that a user does not need to manually pull the
     # request status.

@@ -157,6 +157,50 @@ def test_bounded_log_multiple_handles_share_cap(tmp_path):
         encoding='utf-8')
 
 
+def test_bounded_log_releases_payload_under_disk_pressure(tmp_path):
+    log_path = tmp_path / 'request.log'
+    log_path.write_text('old payload', encoding='utf-8')
+    # There is nominally enough free space now, but not after the pending
+    # write. The writer must preserve the reserve before appending.
+    usage = mock.Mock(free=105)
+
+    with mock.patch('sky.utils.context.shutil.disk_usage',
+                    return_value=usage) as mock_disk_usage:
+        stream = context._TruncatingLogFile(log_path,
+                                            max_bytes=512,
+                                            min_free_bytes=100,
+                                            disk_check_interval_bytes=1)
+        assert stream.write('new payload') == len('new payload')
+        assert stream.write('discarded payload') == len('discarded payload')
+        stream.close()
+
+    content = log_path.read_text(encoding='utf-8')
+    assert 'old payload' not in content
+    assert 'new payload' not in content
+    assert 'discarded payload' not in content
+    assert context.REQUEST_LOG_DISK_PRESSURE_MARKER in content
+    assert mock_disk_usage.call_count == 1
+
+
+def test_bounded_log_checks_disk_once_per_interval(tmp_path):
+    log_path = tmp_path / 'request.log'
+    usage = mock.Mock(free=1000)
+
+    with mock.patch('sky.utils.context.shutil.disk_usage',
+                    return_value=usage) as mock_disk_usage:
+        stream = context._TruncatingLogFile(log_path,
+                                            max_bytes=512,
+                                            min_free_bytes=100,
+                                            disk_check_interval_bytes=10)
+        stream.write('A' * 3)
+        stream.write('B' * 3)
+        stream.write('C' * 4)
+        stream.close()
+
+    assert mock_disk_usage.call_count == 2
+    assert log_path.read_text(encoding='utf-8') == ('A' * 3 + 'B' * 3 + 'C' * 4)
+
+
 def test_env_overrides(ctx):
     """Test environment variable overrides."""
     # Setup env overrides
