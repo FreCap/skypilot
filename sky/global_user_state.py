@@ -1530,13 +1530,16 @@ def get_cluster_events(
     return [row.reason for row in rows]
 
 
+_CLUSTER_EVENT_NAMES_CHUNK = 500
+
+
 @db_retries.retry
-def get_cluster_events_by_name(
-    cluster_name: str,
+def get_cluster_events_by_names(
+    cluster_names: list[str],
     event_types: list[ClusterEventType],
     limit: int | None = None,
 ) -> list[dict[str, str | int]]:
-    """Returns cluster events looked up by the persisted cluster name.
+    """Returns cluster events looked up by persisted cluster names.
 
     Unlike get_cluster_events, this filters on the cluster_events ``name``
     column directly instead of resolving the name to a hash via the clusters
@@ -1545,29 +1548,40 @@ def get_cluster_events_by_name(
     finished managed jobs whose clusters have already been torn down.
 
     Args:
-        cluster_name: Name of the cluster.
+        cluster_names: Names of the clusters.
         event_types: Event types to include.
         limit: If specified, returns at most this many events (most recent),
-            across all the requested event types.
+            across all names and requested event types.
 
     Returns:
         List of dicts with 'reason' and 'transitioned_at' (unix timestamp)
         fields, ordered from newest to oldest.
     """
-    if not event_types:
+    cluster_names = list(dict.fromkeys(cluster_names))
+    if not cluster_names or not event_types or limit == 0:
         return []
     engine = _db_manager.get_engine()
     type_values = [event_type.value for event_type in event_types]
+    rows = []
     with orm.Session(engine) as session:
-        query = session.query(
-            cluster_event_table.c.reason,
-            cluster_event_table.c.transitioned_at,
-        ).filter(cluster_event_table.c.name == cluster_name,
-                 cluster_event_table.c.type.in_(type_values)).order_by(
-                     cluster_event_table.c.transitioned_at.desc())
-        if limit is not None:
-            query = query.limit(limit)
-        rows = query.all()
+        for start in range(0, len(cluster_names), _CLUSTER_EVENT_NAMES_CHUNK):
+            names = cluster_names[start:start + _CLUSTER_EVENT_NAMES_CHUNK]
+            query = session.query(
+                cluster_event_table.c.reason,
+                cluster_event_table.c.transitioned_at,
+            ).filter(cluster_event_table.c.name.in_(names),
+                     cluster_event_table.c.type.in_(type_values)).order_by(
+                         cluster_event_table.c.transitioned_at.desc())
+            if limit is not None:
+                # The global newest L events must be within each chunk's
+                # newest L, so bounding every query preserves the final result
+                # without materializing older rows that cannot survive.
+                query = query.limit(limit)
+            rows.extend(query.all())
+    if len(cluster_names) > _CLUSTER_EVENT_NAMES_CHUNK:
+        rows.sort(key=lambda row: row.transitioned_at, reverse=True)
+        if limit is not None and limit >= 0:
+            rows = rows[:limit]
     return [{
         'reason': row.reason,
         'transitioned_at': row.transitioned_at,

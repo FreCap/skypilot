@@ -68,6 +68,8 @@ def get_job_events(
         # the cluster name(s) could not be reconstructed.
         logger.debug(f'Failed to resolve cluster name(s) for job {job_id}: {e}')
         return events
+    if not cluster_names:
+        return events
 
     # STATUS_CHANGE carries the launch/setup milestone sequence (provisioning,
     # runtime setup, file-mount syncing, ...); LAUNCH_PROGRESS carries the
@@ -76,17 +78,14 @@ def get_job_events(
         global_user_state.ClusterEventType.STATUS_CHANGE,
         global_user_state.ClusterEventType.LAUNCH_PROGRESS,
     ]
-    cluster_events: list[dict[str, Any]] = []
-    for cluster_name in cluster_names:
-        try:
-            cluster_events.extend(
-                global_user_state.get_cluster_events_by_name(cluster_name,
-                                                             event_types,
-                                                             limit=limit))
-        except Exception as e:  # pylint: disable=broad-except
-            # Best-effort: skip a cluster whose events cannot be read.
-            logger.debug(f'Failed to read cluster events for job {job_id} '
-                         f'(cluster {cluster_name!r}): {e}')
+    try:
+        cluster_events = global_user_state.get_cluster_events_by_names(
+            cluster_names, event_types, limit=limit)
+    except Exception as e:  # pylint: disable=broad-except
+        # The merge is best-effort: never fail the job-events request because
+        # cluster events could not be read.
+        logger.debug(f'Failed to read cluster events for job {job_id}: {e}')
+        cluster_events = []
 
     # Match the timezone of the existing job-event timestamps so the merged
     # cluster events serialize consistently. Postgres returns tz-aware
