@@ -3693,7 +3693,13 @@ def check_cluster_available(
         assert record is not None, cluster_name
         return record['handle']
 
-    record = None
+    # Snapshot the record before refreshing: if the refresh discovers the
+    # cluster is gone on the cloud, it deletes the row, and this pre-refresh
+    # snapshot is the only way to tell "just terminated" (with its
+    # preempted/autodowned hints) apart from "never existed".
+    record = global_user_state.get_cluster_from_name(cluster_name,
+                                                     include_user_info=False,
+                                                     summary_response=True)
     try:
         cluster_status, handle = refresh_cluster_status_handle(cluster_name)
     except exceptions.ClusterStatusFetchingError as e:
