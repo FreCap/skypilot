@@ -200,8 +200,11 @@ class Dag:
 
 class _DagContext(threading.local):
     """A thread-local stack of Dags."""
-    _current_dag: Dag | None = None
-    _previous_dags: list[Dag] = []
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._current_dag: Dag | None = None
+        self._previous_dags: list[Dag] = []
 
     def push_dag(self, dag: Dag):
         if self._current_dag is not None:

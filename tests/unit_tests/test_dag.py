@@ -1,8 +1,52 @@
 """Unit tests for sky.dag."""
+import concurrent.futures
+import threading
+
 import pytest
 
 from sky import dag as dag_lib
 from sky import task as task_lib
+
+
+def test_nested_dag_context_stack_is_thread_local():
+    dag_context = dag_lib._DagContext()  # pylint: disable=protected-access
+    outer_a, inner_a = dag_lib.Dag(), dag_lib.Dag()
+    outer_b, inner_b = dag_lib.Dag(), dag_lib.Dag()
+    a_nested = threading.Event()
+    b_nested = threading.Event()
+    a_popped = threading.Event()
+    b_popped = threading.Event()
+
+    def run_a() -> dag_lib.Dag | None:
+        dag_context.push_dag(outer_a)
+        dag_context.push_dag(inner_a)
+        a_nested.set()
+        assert b_nested.wait(timeout=5)
+        assert dag_context.pop_dag() is inner_a
+        restored = dag_context.get_current_dag()
+        a_popped.set()
+        assert b_popped.wait(timeout=5)
+        dag_context.pop_dag()
+        return restored
+
+    def run_b() -> dag_lib.Dag | None:
+        assert a_nested.wait(timeout=5)
+        dag_context.push_dag(outer_b)
+        dag_context.push_dag(inner_b)
+        b_nested.set()
+        assert a_popped.wait(timeout=5)
+        assert dag_context.pop_dag() is inner_b
+        restored = dag_context.get_current_dag()
+        b_popped.set()
+        dag_context.pop_dag()
+        return restored
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        result_a = executor.submit(run_a)
+        result_b = executor.submit(run_b)
+
+    assert result_a.result() is outer_a
+    assert result_b.result() is outer_b
 
 
 @pytest.fixture
