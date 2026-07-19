@@ -32,6 +32,7 @@ else:
     requests = adaptors_common.LazyImport('requests')
 
 logger = sky_logging.init_logger(__name__)
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 
 def merge_pricing_dicts(base: dict[str, Any],
@@ -340,7 +341,9 @@ def read_catalog(filename: str,
                         f'Updating {cloud} catalog: {filename}') +
                     f'{update_frequency_str}'):
                 try:
-                    r = requests.get(url=url, headers=headers)
+                    r = requests.get(url=url,
+                                     headers=headers,
+                                     timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
                     if r.status_code == 429 and url_fallback != url:
                         # fallback to s3 mirror, github introduced rate
                         # limit after 2025-05, see
@@ -348,7 +351,9 @@ def read_catalog(filename: str,
                         # for more details. With a self-hosted mirror the
                         # fallback equals the primary; retrying the same URL
                         # on 429 would only worsen the throttling.
-                        r = requests.get(url=url_fallback, headers=headers)
+                        r = requests.get(url=url_fallback,
+                                         headers=headers,
+                                         timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
                     r.raise_for_status()
                 except requests.exceptions.RequestException as e:
                     error_str = (f'Failed to fetch {cloud} catalog '
