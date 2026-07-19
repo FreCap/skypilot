@@ -18,6 +18,7 @@ ENDPOINT = 'https://api.yottalabs.ai/openapi'
 API_KEY_HEADER = 'X-API-KEY'
 CLUSTER_NOT_FOUND_CODE = 44003
 CREDENTIAL_FILE = '~/.yotta/credentials'
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 
 class PodStatusEnum(enum.Enum):
@@ -153,7 +154,9 @@ class YottaClient:
     def check_api_key(self) -> bool:
         url = f'{ENDPOINT}/key/check?orgId={self.org_id}'
         logger.debug(f'Checking api key for user {self.org_id}')
-        response = requests.get(url, headers={API_KEY_HEADER: self.api_key})
+        response = requests.get(url,
+                                headers={API_KEY_HEADER: self.api_key},
+                                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         raise_yotta_error(response)
         check_result = response.json()
         # True if api key is valid
@@ -171,7 +174,8 @@ class YottaClient:
         logger.debug(f'Listing instances for cluster {cluster_name_on_cloud}')
         response = requests.post(url,
                                  headers={API_KEY_HEADER: self.api_key},
-                                 json=request_data)
+                                 json=request_data,
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         response.raise_for_status()
         response_json = response.json()
         logger.debug(f'Listing instances for cluster {cluster_name_on_cloud}'
@@ -234,7 +238,8 @@ class YottaClient:
         }
         response = requests.post(url,
                                  headers={API_KEY_HEADER: self.api_key},
-                                 json=request_data)
+                                 json=request_data,
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         logger.debug(f'Creating cluster {cluster_name}, '
                      f'response: {response.json()}')
         raise_yotta_error(response)
@@ -242,7 +247,9 @@ class YottaClient:
 
     def get_cluster_status(self, cluster_id: str) -> str:
         url = f'{ENDPOINT}/v1/skypilot/cluster/status/{cluster_id}'
-        response = requests.get(url, headers={API_KEY_HEADER: self.api_key})
+        response = requests.get(url,
+                                headers={API_KEY_HEADER: self.api_key},
+                                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         logger.debug(f'Getting cluster status for {cluster_id}, '
                      f'response: {response.json()}')
         raise_yotta_error(response)
@@ -320,7 +327,8 @@ class YottaClient:
 
         response = requests.post(url,
                                  headers={API_KEY_HEADER: self.api_key},
-                                 json=request_data)
+                                 json=request_data,
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         logger.debug(f'Launching instance for {cluster_id}, '
                      f'request: {request_data}, '
                      f'response: {response.json()}')
@@ -333,7 +341,8 @@ class YottaClient:
         request_data = {'clusterName': cluster_name}
         response = requests.post(url=url,
                                  headers={API_KEY_HEADER: self.api_key},
-                                 json=request_data)
+                                 json=request_data,
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         logger.debug(f'Terminating instances for {cluster_name}, '
                      f'response: {response.json()}')
         raise_yotta_error(response)
