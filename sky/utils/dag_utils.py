@@ -377,12 +377,8 @@ def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag,
             default_strategy = 'FAILOVER'
         for resources in list(task_.resources):
             original_job_recovery = resources.job_recovery
-            job_recovery: dict[str, str | int | None] = {
-                'strategy': default_strategy
-            }
-            if isinstance(original_job_recovery, str):
-                job_recovery['strategy'] = original_job_recovery
-            elif isinstance(original_job_recovery, dict):
+            job_recovery: dict[str, Any] = {'strategy': default_strategy}
+            if isinstance(original_job_recovery, dict):
                 job_recovery.update(original_job_recovery)
                 strategy = job_recovery.get('strategy')
                 if strategy is None:
