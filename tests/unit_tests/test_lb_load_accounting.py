@@ -112,6 +112,25 @@ class TestTieBreakRandomization:
         assert seen == {'http://a:8080', 'http://b:8080'}
 
 
+class TestSelectReplicaScoring:
+    """Each candidate is scored exactly once per selection."""
+
+    def test_effective_load_called_once_per_candidate(self):
+        policy = _make_least_load()
+        with mock.patch.object(policy,
+                               '_effective_load',
+                               wraps=policy._effective_load) as scored:
+            policy._select_replica(None, policy.ready_replicas)
+        assert scored.call_count == len(policy.ready_replicas)
+
+    def test_min_load_replica_selected(self):
+        policy = _make_least_load()
+        policy.pre_execute_hook('http://a:8080', None)
+        for _ in range(20):
+            assert policy._select_replica(
+                None, policy.ready_replicas) == 'http://b:8080'
+
+
 def _make_lb(policy, client_pool):
     balancer = object.__new__(lb_module.SkyServeLoadBalancer)
     balancer._load_balancing_policy = policy
