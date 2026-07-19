@@ -932,11 +932,25 @@ class CoroutineTask:
         self.task = task
 
     async def cancel(self):
-        try:
-            self.task.cancel()
-            await self.task
-        except asyncio.CancelledError:
-            pass
+        self.task.cancel()
+        current_task = asyncio.current_task()
+        parent_cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(self.task)
+                break
+            except asyncio.CancelledError as e:  # noqa: ASYNC103
+                if (parent_cancellation is None and current_task is not None and
+                        current_task.cancelling()):
+                    parent_cancellation = e
+                if not self.task.done():
+                    # Keep the child's cancellation cleanup alive if this
+                    # background cleanup task is itself cancelled.
+                    continue  # noqa: ASYNC104
+                # Cancellation raised by the child is expected here.
+                break  # noqa: ASYNC104
+        if parent_cancellation is not None:
+            raise parent_cancellation
 
 
 def check_request_thread_executor_available() -> None:

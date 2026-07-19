@@ -16,10 +16,9 @@ sky/jobs/state.py:4318:16: ASYNC103 asyncio.exceptions.CancelledError block with
 sky/jobs/state.py:4320:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/server/metrics.py:164:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/metrics.py:166:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
-sky/server/requests/executor.py:938:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1037:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1055:12: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1064:9: ASYNC120 checkpoint inside except on line 1061 will discard the active exception if cancelled.
+sky/server/requests/executor.py:1051:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/server/requests/executor.py:1069:12: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/server/requests/executor.py:1078:9: ASYNC120 checkpoint inside except on line 1075 will discard the active exception if cancelled.
 sky/server/requests/process.py:90:12: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/server.py:2092:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.

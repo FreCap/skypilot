@@ -196,6 +196,36 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_coroutine_task_cancel_joins_cleanup_through_repeated_cancel():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def child_task() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+            raise
+
+    child = asyncio.create_task(child_task())
+    cancel_task = asyncio.create_task(executor.CoroutineTask(child).cancel())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    cancel_task.cancel()
+    await asyncio.sleep(0)
+    assert not cancel_task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cancel_task, timeout=1)
+    assert cleanup_finished.is_set()
+    assert child.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_execute_request_coroutine_fails_if_storage_probe_fails():
     request = requests_lib.Request(
         request_id='storage-probe-failure',
