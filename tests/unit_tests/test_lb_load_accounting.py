@@ -498,7 +498,7 @@ class TestDrainPrunedClients(unittest.TestCase):
         self.assertEqual(seen['inflight_during'], 1)
         self.assertEqual(getattr(client, lb_module._INFLIGHT_ATTR), 0)
 
-    def test_drain_waits_for_inflight_then_closes(self):
+    def test_drain_wakes_promptly_after_last_inflight_release(self):
         policy = mock.MagicMock()
         balancer = _make_lb(policy, client_pool={})
 
@@ -511,17 +511,41 @@ class TestDrainPrunedClients(unittest.TestCase):
 
         client = _Client()
         setattr(client, lb_module._INFLIGHT_ATTR, 1)
+        # The event is only a wakeup hint. A stale set state must not override
+        # the authoritative positive counter and close the client early.
+        stale_zero_event = asyncio.Event()
+        stale_zero_event.set()
+        setattr(client, lb_module._INFLIGHT_ZERO_EVENT_ATTR, stale_zero_event)
 
         async def _run():
             task = asyncio.create_task(
                 balancer._drain_and_close_client('http://a:8080', client))
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.05)
             self.assertFalse(closed.is_set())  # still in flight: not closed
-            setattr(client, lb_module._INFLIGHT_ATTR, 0)
-            await asyncio.wait_for(task, timeout=5)
+            released_at = asyncio.get_running_loop().time()
+            balancer._release_client_refcount(client)
+            await asyncio.wait_for(task, timeout=0.25)
             self.assertTrue(closed.is_set())
+            self.assertLess(asyncio.get_running_loop().time() - released_at,
+                            0.25)
 
         asyncio.run(_run())
+
+    def test_release_before_drain_wait_is_not_lost(self):
+        policy = mock.MagicMock()
+        balancer = _make_lb(policy, client_pool={})
+        client = mock.MagicMock()
+        client.aclose = mock.AsyncMock()
+        setattr(client, lb_module._INFLIGHT_ATTR, 1)
+
+        # Release can win before the drain coroutine first runs. The counter
+        # remains authoritative, so no event needs to have existed yet.
+        balancer._release_client_refcount(client)
+        asyncio.run(
+            asyncio.wait_for(balancer._drain_and_close_client(
+                'http://a:8080', client),
+                             timeout=0.25))
+        client.aclose.assert_awaited_once()
 
     def test_drain_deadline_force_closes_stuck_counter(self):
         policy = mock.MagicMock()
