@@ -500,14 +500,6 @@
                     "endColumn": 27,
                     "lineCount": 1
                 }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 27,
-                    "lineCount": 1
-                }
             }
         ],
         "./sky/server/file_mount_uploads.py": [

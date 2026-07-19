@@ -962,7 +962,6 @@ class Resources:
                     raise ValueError(
                         'The "accelerators" field must contain at least one '
                         'accelerator.')
-
             for acc_name, acc_count in accelerators.items():
                 if not isinstance(acc_count, (int, float)) or acc_count <= 0:
                     with ux_utils.print_exception_no_traceback():
@@ -1873,9 +1872,9 @@ class Resources:
         accelerators = self.accelerators
         if accelerators is None:
             accelerators = '-'
-        elif isinstance(accelerators, dict) and len(accelerators) == 1:
-            accelerators, count = list(accelerators.items())[0]
-            accelerators = f'{accelerators}:{count}'
+        elif isinstance(accelerators, dict):
+            accelerators = ','.join(
+                f'{name}:{count}' for name, count in accelerators.items())
         return accelerators
 
     def get_spot_str(self) -> str:

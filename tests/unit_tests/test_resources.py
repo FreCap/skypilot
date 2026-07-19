@@ -1158,6 +1158,23 @@ def test_empty_accelerators_rejected():
         Resources.from_yaml_config({'accelerators': {}})
 
 
+def test_multiple_accelerators_string():
+    resources = Resources(accelerators={'A100': 1, 'H100': 1}, use_spot=True)
+    assert resources.get_accelerators_str() == 'A100:1,H100:1'
+    assert (resources.get_accelerators_str() +
+            resources.get_spot_str()) == 'A100:1,H100:1[Spot]'
+
+    # YAML mappings with multiple entries are alternatives, not a single
+    # multi-accelerator Resources object, and remain supported.
+    resources = Resources.from_yaml_config(
+        {'accelerators': {
+            'A100': 1,
+            'H100': 1,
+        }})
+    assert {next(iter(resource.accelerators)) for resource in resources
+           } == {'A100', 'H100'}
+
+
 def test_autostop_time_format():
     """Test autostop time format parsing."""
     # Test minutes format
