@@ -2434,18 +2434,17 @@ def stream_and_get(
         detail = response.json().get('detail')
         with ux_utils.print_exception_no_traceback():
             raise exceptions.ClientError(f'Failed to stream logs: {detail}')
+    if response.status_code != 200 and request_id is not None:
+        # A failed stream may still correspond to a request whose result is
+        # available through /api/get when the caller supplied its ID. Without
+        # one, get_stream_request_id() preserves the HTTP error.
+        return get(request_id)
     stream_request_id: server_common.RequestId[
         T] | None = server_common.get_stream_request_id(response)
     if request_id is not None and stream_request_id is not None:
         assert request_id == stream_request_id
     if request_id is None:
         request_id = stream_request_id
-    elif response.status_code != 200:
-        # TODO(syang): handle the case where the requestID is not provided
-        # see https://github.com/skypilot-org/skypilot/issues/6549
-        if request_id is None:
-            return None
-        return get(request_id)
     return stream_response(request_id,
                            response,
                            output_stream,
