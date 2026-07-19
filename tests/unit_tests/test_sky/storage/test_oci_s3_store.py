@@ -1,6 +1,9 @@
 """Unit tests for OCI S3-compatible storage dispatch and store behavior."""
 
+import contextlib
+import os
 import pickle
+import shlex
 import subprocess
 import unittest
 from unittest import mock
@@ -45,6 +48,87 @@ class TestOciStoreDispatch(unittest.TestCase):
 
         mock_parent_init.assert_called_once_with('bucket', None, 'us-sanjose-1',
                                                  None, True, None)
+
+    def test_native_download_quotes_object_key_and_local_path(self):
+        store = object.__new__(storage_oci.OciStore)
+        store.name = 'test-bucket'
+        store.namespace = 'test-namespace'
+        store.region = 'us-phoenix-1'
+        remote_path = 'prefix/object;echo_INJECTED'
+        local_dir = '/tmp/download dir'
+        local_path = os.path.join(local_dir, os.path.basename(remote_path))
+
+        with mock.patch.object(
+                storage_oci.oci, 'with_oci_env',
+                side_effect=lambda func: func), mock.patch.object(
+                    storage_oci.rich_utils,
+                    'safe_status',
+                    return_value=contextlib.nullcontext()), mock.patch.object(
+                        storage_oci.subprocess, 'check_output') as check_output:
+            store._download_file(remote_path, local_dir)
+
+        command = check_output.call_args.args[0]
+        self.assertIn(f'--name {shlex.quote(remote_path)}', command)
+        self.assertIn(f'--file {shlex.quote(local_path)}', command)
+
+    def test_native_upload_quotes_local_and_object_paths(self):
+        store = object.__new__(storage_oci.OciStore)
+        store.name = 'test-bucket'
+        store.namespace = 'test-namespace'
+        store.region = 'us-phoenix-1'
+        store._bucket_sub_path = 'prefix;echo_INJECTED'
+        commands = {}
+
+        def capture_commands(**kwargs):
+            commands['file'] = kwargs['filesync_command_generator'](
+                '/tmp/base dir', ['file;echo_INJECTED'])
+            commands['dir'] = kwargs['dirsync_command_generator'](
+                '/tmp/source dir', 'dest;echo_INJECTED')
+
+        with mock.patch.object(
+                storage_oci.oci, 'with_oci_env',
+                side_effect=lambda func: func), mock.patch.object(
+                    storage_oci.rich_utils,
+                    'safe_status',
+                    return_value=contextlib.nullcontext()), mock.patch.object(
+                        storage_oci.sky_logging,
+                        'generate_tmp_logging_file_path',
+                        return_value='/tmp/storage.log'), mock.patch.object(
+                            storage_oci.storage_utils,
+                            'get_excluded_files',
+                            return_value=[]), mock.patch.object(
+                                storage_oci.data_utils,
+                                'parallel_upload',
+                                side_effect=capture_commands):
+            store.batch_oci_rsync(['/tmp/ignored'])
+
+        self.assertIn("--include 'file;echo_INJECTED'", commands['file'])
+        self.assertIn("--object-prefix 'prefix;echo_INJECTED'",
+                      commands['file'])
+        self.assertIn("--src-dir '/tmp/base dir'", commands['file'])
+        self.assertIn(
+            "--object-prefix 'prefix;echo_INJECTED/dest;echo_INJECTED/'",
+            commands['dir'])
+        self.assertIn("--src-dir '/tmp/source dir'", commands['dir'])
+
+    def test_native_prefix_delete_quotes_object_path(self):
+        store = object.__new__(storage_oci.OciStore)
+        store.name = 'test-bucket'
+        store.namespace = 'test-namespace'
+        store.region = 'us-phoenix-1'
+        prefix = 'prefix;echo_INJECTED'
+
+        with mock.patch.object(
+                storage_oci.oci, 'with_oci_env',
+                side_effect=lambda func: func), mock.patch.object(
+                    storage_oci.rich_utils,
+                    'safe_status',
+                    return_value=contextlib.nullcontext()), mock.patch.object(
+                        storage_oci.subprocess, 'check_output') as check_output:
+            store._delete_oci_bucket_sub_path(store.name, prefix)
+
+        command = check_output.call_args.args[0]
+        self.assertIn(f'--prefix {shlex.quote(prefix + "/")}', command)
 
     def test_oci_s3_store_not_in_s3_compatible_registry(self):
         # Registering under 'OCI' would take over all StoreType.OCI dispatch
@@ -217,7 +301,7 @@ class TestOciStoreDeleteGuard(unittest.TestCase):
         cmd = self._run_delete(store)
         # Only the per-run prefix is removed; the bucket is left intact.
         self.assertIn('oci os object bulk-delete', cmd)
-        self.assertIn('--prefix "run-123/"', cmd)
+        self.assertIn(f'--prefix {shlex.quote("run-123/")}', cmd)
         self.assertIn('--bucket-name user-bucket', cmd)
         self.assertNotIn('oci os bucket delete', cmd)
 
