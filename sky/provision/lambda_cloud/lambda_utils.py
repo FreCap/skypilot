@@ -19,6 +19,7 @@ API_ENDPOINT = 'https://cloud.lambdalabs.com/api/v1'
 INITIAL_BACKOFF_SECONDS = 10
 MAX_BACKOFF_FACTOR = 10
 MAX_ATTEMPTS = 6
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 
 class LambdaCloudError(Exception):
@@ -109,11 +110,19 @@ def _try_request_with_backoff(method: str,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
     for i in range(MAX_ATTEMPTS):
         if method == 'get':
-            response = requests.get(url, headers=headers)
+            response = requests.get(url,
+                                    headers=headers,
+                                    timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'post':
-            response = requests.post(url, headers=headers, data=data)
+            response = requests.post(url,
+                                     headers=headers,
+                                     data=data,
+                                     timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         elif method == 'put':
-            response = requests.put(url, headers=headers, data=data)
+            response = requests.put(url,
+                                    headers=headers,
+                                    data=data,
+                                    timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         else:
             raise ValueError(f'Unsupported requests method: {method}')
         # If rate limited, wait and try again
