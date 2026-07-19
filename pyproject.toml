@@ -50,6 +50,12 @@ enable_error_code = ["possibly-undefined"]
 module = "sky.utils.lock_events"
 warn_unreachable = true
 
+[[tool.mypy.overrides]]
+# Recovery paths must keep dedicated-cluster and shared-pool behavior reachable;
+# a misplaced pool guard can otherwise silently disable targeted cancellation.
+module = "sky.jobs.recovery_strategy"
+warn_unreachable = true
+
 [tool.basedpyright]
 # A focused complement to mypy. Keep high-signal coroutine, control-flow, and
 # interface-contract checks enabled while the broader type baseline is noisy.
