@@ -24,6 +24,7 @@ else:
 CREDENTIALS_PATH = '~/.scp/scp_credential'
 API_ENDPOINT = 'https://openapi.samsungsdscloud.com'
 TEMP_VM_JSON_PATH = '/tmp/json/tmp_vm_body.json'
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +194,9 @@ class SCPClient:
     def _get(self, url, contents_key='contents'):
         method = 'GET'
         headers = self._signed_headers(method, url)
-        response = requests.get(url, headers=headers)
+        response = requests.get(url,
+                                headers=headers,
+                                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         raise_scp_error(response)
         if contents_key is not None:
             return response.json().get(contents_key, [])
@@ -204,7 +207,10 @@ class SCPClient:
     def _post(self, url, request_body):
         method = 'POST'
         headers = self._signed_headers(method, url)
-        response = requests.post(url, json=request_body, headers=headers)
+        response = requests.post(url,
+                                 json=request_body,
+                                 headers=headers,
+                                 timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         raise_scp_error(response)
         return response.json()
 
@@ -213,9 +219,14 @@ class SCPClient:
         method = 'DELETE'
         headers = self._signed_headers(method, url)
         if request_body:
-            response = requests.delete(url, json=request_body, headers=headers)
+            response = requests.delete(url,
+                                       json=request_body,
+                                       headers=headers,
+                                       timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         else:
-            response = requests.delete(url, headers=headers)
+            response = requests.delete(url,
+                                       headers=headers,
+                                       timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         raise_scp_error(response)
         return response.json()
 
@@ -352,7 +363,9 @@ class SCPClient:
         """List offered instances and their availability."""
         url = f'{API_ENDPOINT}/instance-types'
         headers = self._signed_headers('GET', url)
-        response = requests.get(url, headers=headers)
+        response = requests.get(url,
+                                headers=headers,
+                                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
         raise_scp_error(response)
         return response.json().get('data', [])
 
