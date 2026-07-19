@@ -2105,7 +2105,10 @@ class TestScaleUpBatch:
 
         The shared list must also accumulate each newly enqueued replica so
         reserved-capacity accounting sees in-wave reservations. Cost-first
-        placement must not scan the N existing rows for location load.
+        placement must not scan the N existing rows for location load. The
+        current service must come from the same global snapshot used for
+        cross-service capacity; combining a separate local read with a later
+        global read can mix two database states in one placement decision.
         """
         mgr = _make_manager(next_replica_id=1)
         mgr.lock = self._CountingLock()
@@ -2113,6 +2116,7 @@ class TestScaleUpBatch:
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         mgr.yaml_content = 'dummy: yaml'
         initial = [_fake_replica_info(40), _fake_replica_info(41)]
+        stale_local = [_fake_replica_info(99)]
         snapshots = []
 
         def _launch(replica_id,
@@ -2129,18 +2133,19 @@ class TestScaleUpBatch:
                 'get_replica_ids') as id_scan, \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=list(initial)) as scan, \
+                 return_value=stale_local) as local_scan, \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.'
                  'get_replica_infos_grouped',
-                 return_value={'svc': list(initial)}), \
+                 return_value={'svc': list(initial)}) as grouped_scan, \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \
              mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
             mgr.scale_up_batch([{'use_spot': True}] * 3)
 
-        scan.assert_called_once_with('svc')
+        local_scan.assert_not_called()
+        grouped_scan.assert_called_once_with()
         # The id set is derived from the placement snapshot; no second query.
         id_scan.assert_not_called()
         assert [size for _, size in snapshots] == [2, 3, 4]
@@ -2453,7 +2458,10 @@ class TestLogicalCapacityPlanning:
                 unknown_replica_ids=frozenset({1}),
                 received_at=replica_managers.time.monotonic()))
         mgr._logical_target = (1, 9, 8)
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launches = []
+        stale_replacement = self._ready_backend(2, 8)
+        stale_replacement.unknown_capacity_replacement = True
 
         def _append_replacement(_override,
                                 _used_ids,
@@ -2472,10 +2480,12 @@ class TestLogicalCapacityPlanning:
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
-                               return_value=[original]), \
+                               return_value=[original, stale_replacement
+                                            ]) as local_scan, \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_grouped',
-                               return_value={'svc': [original]}), \
+                               return_value={'svc': [original]
+                                            }) as grouped_scan, \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \
@@ -2488,6 +2498,8 @@ class TestLogicalCapacityPlanning:
                                              replace_unknown_replica_ids=(1,))
 
         assert launches == [True]
+        local_scan.assert_not_called()
+        grouped_scan.assert_called_once_with()
 
     def test_existing_zero_capacity_replacement_prevents_recursive_launch(self):
         mgr = _make_manager()

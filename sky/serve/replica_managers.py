@@ -3209,7 +3209,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'{batch_version}.')
             return
         existing_replica_infos = None
-        if self._batch_needs_placement_snapshot(resources_overrides):
+        infos_by_service = None
+        needs_placement_snapshot = self._batch_needs_placement_snapshot(
+            resources_overrides)
+        uses_shared_capacity = (needs_placement_snapshot and
+                                self._uses_shared_zero_cost_demand_budget())
+        if uses_shared_capacity:
+            infos_by_service = serve_state.get_replica_infos_grouped()
+            existing_replica_infos = infos_by_service.get(
+                self._service_name, [])
+        elif needs_placement_snapshot:
             existing_replica_infos = serve_state.get_replica_infos(
                 self._service_name)
         # One id-only snapshot for the whole batch: the collision guard in
@@ -3223,10 +3232,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         else:
             used_replica_ids = serve_state.get_replica_ids(self._service_name)
         zero_cost_demand_budget = None
-        if (existing_replica_infos is not None and
-                self._uses_shared_zero_cost_demand_budget()):
-            infos_by_service = serve_state.get_replica_infos_grouped()
-            infos_by_service[self._service_name] = existing_replica_infos
+        if existing_replica_infos is not None and infos_by_service is not None:
             capacity_replica_infos = [
                 info for infos in infos_by_service.values() for info in infos
             ]
@@ -3301,8 +3307,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             replace_unknown_replica_ids: tuple[int, ...]) -> None:
         """Persist complete shapes while the global demand lock is held."""
 
-        existing_replica_infos = serve_state.get_replica_infos(
-            self._service_name)
+        uses_shared_capacity = self._uses_shared_zero_cost_demand_budget()
+        infos_by_service = None
+        if uses_shared_capacity:
+            infos_by_service = serve_state.get_replica_infos_grouped()
+            existing_replica_infos = infos_by_service.get(
+                self._service_name, [])
+        else:
+            existing_replica_infos = serve_state.get_replica_infos(
+                self._service_name)
         used_replica_ids = {info.replica_id for info in existing_replica_infos}
 
         def _committed_capacity() -> int:
@@ -3339,9 +3352,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         committed = _committed_capacity()
         zero_cost_demand_budget = None
-        if self._uses_shared_zero_cost_demand_budget():
-            infos_by_service = serve_state.get_replica_infos_grouped()
-            infos_by_service[self._service_name] = existing_replica_infos
+        if infos_by_service is not None:
             capacity_replica_infos = [
                 info for infos in infos_by_service.values() for info in infos
             ]
