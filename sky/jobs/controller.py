@@ -1977,6 +1977,13 @@ class JobController:
                 task=self._dag.tasks[task_id]))
 
 
+def _prepare_job_log_path(job_id: int) -> str:
+    """Create the controller log directory and return this job's log path."""
+    log_dir = os.path.expanduser(jobs_constants.JOBS_CONTROLLER_LOGS_DIR)
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f'{job_id}.log')
+
+
 class ControllerManager:
     """Main loop for a job controller process.
 
@@ -2485,10 +2492,7 @@ class ControllerManager:
         Args:
             job_id: The ID of the job to start.
         """
-        # Create log file path for job output redirection
-        log_dir = os.path.expanduser(jobs_constants.JOBS_CONTROLLER_LOGS_DIR)
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f'{job_id}.log')
+        log_file = await asyncio.to_thread(_prepare_job_log_path, job_id)
 
         logger.info(f'Starting job {job_id} with log_file={log_file}')
 
