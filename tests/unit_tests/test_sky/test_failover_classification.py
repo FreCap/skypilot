@@ -119,6 +119,19 @@ def test_classify_is_structured_and_aws_only():
         clouds.GCP(), _FakeClientError('VcpuLimitExceeded')) is None
 
 
+def test_placement_classification_tolerates_malformed_provider_response():
+
+    class _MalformedResponseError(Exception):
+
+        def __init__(self):
+            self.response = {'Error': 'not-an-object'}
+            super().__init__('provider request failed')
+
+    error = _MalformedResponseError()
+    assert backend._placement_error_code(error) is None
+    assert backend._placement_outcome(error) == 'failed'
+
+
 @pytest.mark.parametrize('code', [
     'VcpuLimitExceeded',
     'quotaExceeded',

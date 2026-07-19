@@ -136,7 +136,20 @@ def add_or_extend_cache_entry(
     This is useful for negative-cache hints written concurrently by multiple
     worker processes: a delayed older writer must not shorten a newer hint.
     """
-    engine = _get_engine('add_or_extend', 'write')
+    _add_or_extend_cache_entries([(key, value, expires_at)], 'add_or_extend')
+
+
+@metrics_lib.time_me
+def add_or_extend_cache_entries(entries: list[tuple[str, str, float]],) -> None:
+    """Store distinct entries in one transaction without shortening TTLs."""
+    if not entries:
+        return
+    _add_or_extend_cache_entries(entries, 'add_or_extend_many')
+
+
+def _add_or_extend_cache_entries(entries: list[tuple[str, str, float]],
+                                 operation: str) -> None:
+    engine = _get_engine(operation, 'write')
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
         insert_func = sqlite.insert
         greatest = sqlalchemy.func.max
@@ -147,9 +160,11 @@ def add_or_extend_cache_entry(
         raise ValueError('Unsupported database dialect')
 
     with orm.Session(engine) as session:
-        insert_stmt = insert_func(kv_cache_table).values(key=key,
-                                                         value=value,
-                                                         expires_at=expires_at)
+        insert_stmt = insert_func(kv_cache_table).values([{
+            'key': key,
+            'value': value,
+            'expires_at': expires_at,
+        } for key, value, expires_at in entries])
         existing_expiry = sqlalchemy.func.coalesce(
             kv_cache_table.c.expires_at, insert_stmt.excluded.expires_at)
         value_at_latest_expiry = sqlalchemy.case((sqlalchemy.or_(
@@ -185,6 +200,22 @@ def get_cache_entry(key: str) -> str | None:
 
 
 @metrics_lib.time_me
+def get_active_cache_entries(keys: list[str]) -> dict[str, tuple[str, float]]:
+    """Get unexpired values and expirations for a bounded set of keys."""
+    if not keys:
+        return {}
+    engine = _get_engine('get_many', 'read')
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                kv_cache_table.c.key, kv_cache_table.c.value,
+                kv_cache_table.c.expires_at).where(
+                    kv_cache_table.c.key.in_(keys)).where(
+                        kv_cache_table.c.expires_at > time.time())).all()
+    return {key: (value, float(expires_at)) for key, value, expires_at in rows}
+
+
+@metrics_lib.time_me
 def delete_cache_entry(key: str) -> None:
     """Delete exactly one cache entry."""
     engine = _get_engine('delete', 'write')
@@ -202,6 +233,27 @@ def _escape_like(value: str) -> str:
     """Escape SQL LIKE wildcard characters (%, _) in a literal value."""
     return (value.replace(_LIKE_ESCAPE_CHAR, _LIKE_ESCAPE_CHAR * 2).replace(
         '%', f'{_LIKE_ESCAPE_CHAR}%').replace('_', f'{_LIKE_ESCAPE_CHAR}_'))
+
+
+@metrics_lib.time_me
+def list_active_cache_entries_by_prefix(prefix: str,
+                                        limit: int = 100
+                                       ) -> list[tuple[str, str, float]]:
+    """List a bounded number of unexpired entries under a literal prefix."""
+    if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or
+            limit > 1000):
+        raise ValueError('limit must be an integer from 1 to 1000.')
+    escaped = _escape_like(prefix)
+    engine = _get_engine('list_prefix', 'read')
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(kv_cache_table.c.key, kv_cache_table.c.value,
+                              kv_cache_table.c.expires_at).where(
+                                  kv_cache_table.c.key.like(
+                                      f'{escaped}%', escape=_LIKE_ESCAPE_CHAR)).
+            where(kv_cache_table.c.expires_at > time.time()).order_by(
+                kv_cache_table.c.expires_at).limit(limit)).all()
+    return [(key, value, float(expires_at)) for key, value, expires_at in rows]
 
 
 @metrics_lib.time_me

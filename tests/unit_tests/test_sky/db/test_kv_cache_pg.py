@@ -98,6 +98,20 @@ def test_postgres_extend_is_monotonic_under_concurrent_writers(
     assert kv_cache.get_cache_entry('capacity:key') == 'value-1170'
 
 
+def test_postgres_extend_many_is_one_statement(postgres_database):
+    expires_at = time.time() + 60
+
+    with _count_sql_statements(postgres_database) as count:
+        kv_cache.add_or_extend_cache_entries([
+            ('capacity:key', '1', expires_at),
+            ('observation:key', 'details', expires_at),
+        ])
+
+    assert count['value'] == 1
+    assert kv_cache.get_cache_entry('capacity:key') == '1'
+    assert kv_cache.get_cache_entry('observation:key') == 'details'
+
+
 def test_postgres_migration_is_idempotent_and_lookup_uses_primary_key(
         postgres_database):
     kv_cache.create_table(postgres_database)

@@ -2,8 +2,6 @@
 
 from unittest import mock
 
-import pytest
-
 from sky.users import rbac
 
 
@@ -31,6 +29,11 @@ class TestGetViewerAllowlist:
         with mock.patch('sky.skypilot_config.get_nested', return_value={}):
             allowlist = rbac.get_viewer_allowlist()
         assert {'path': '/status', 'method': 'POST'} in allowlist
+
+    def test_serve_placement_is_on_default_allowlist(self):
+        with mock.patch('sky.skypilot_config.get_nested', return_value={}):
+            allowlist = rbac.get_viewer_allowlist()
+        assert {'path': '/serve/placement', 'method': 'POST'} in allowlist
 
     def test_launch_is_NOT_on_default_allowlist(self):
         with mock.patch('sky.skypilot_config.get_nested', return_value={}):

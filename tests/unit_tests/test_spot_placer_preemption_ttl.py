@@ -145,3 +145,39 @@ class TestPreemptionTtlRetry:
         placer.set_preemptive(cheap)
         now[0] += 61
         assert cheap in placer.active_locations()
+
+    def test_snapshot_does_not_consume_retry(self, placer_and_locations,
+                                             monkeypatch):
+        placer, cheap, other, third = placer_and_locations
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+        placer.set_preemptive(cheap)
+        benched_at = placer.location2preempted_at[cheap]
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+
+        snapshot = placer.placement_snapshot()
+
+        location = next(item for item in snapshot['locations']
+                        if item['region'] == cheap.region)
+        assert location['stored_status'] == 'PREEMPTED'
+        assert location['effective_status'] == 'ACTIVE'
+        assert location['probe_eligible'] is True
+        assert location['benched_at'] == benched_at
+        assert placer.location2preempted_at[cheap] == benched_at
+        # The first real selection still gets the one probe.
+        assert placer.select_next_location() == cheap
+
+    def test_snapshot_uses_only_cached_prices(self, placer_and_locations,
+                                              monkeypatch):
+        placer, cheap, other, third = placer_and_locations
+        monkeypatch.setattr(
+            placer, '_get_cost_per_hour_cached',
+            lambda _: pytest.fail('snapshot must not look up catalog prices'))
+
+        snapshot = placer.placement_snapshot()
+
+        prices = {
+            item['region']: item['cached_hourly_cost']
+            for item in snapshot['locations']
+        }
+        assert prices == {'seoul': 1.0, 'oregon': 2.0, 'iowa': 3.0}

@@ -318,6 +318,21 @@ def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
                                              **kwargs)
 
 
+def get_service_placement_state(service_name: str,
+                                expected_service_hash: str) -> dict[str, Any]:
+    """Read one controller's in-memory placer state with bounded I/O."""
+    response = _get_to_controller_with_retry(
+        service_name,
+        expected_service_hash,
+        constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+        timeout=(1.0, 2.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError('Placement-state response must be an object.')
+    return payload
+
+
 def _get_to_local_controller_with_retry(service_name: str,
                                         controller_owner: _ControllerOwner,
                                         path: str, **kwargs):
