@@ -1694,8 +1694,8 @@ def _get_legacy_log_path(request_id: str) -> pathlib.Path:
 
 
 # TODO Remove this function on or after v0.15.0
-async def _cleanup_legacy_directory_if_empty():
-    """Remove legacy request log directory if empty.
+def _cleanup_legacy_directory_if_empty_sync():
+    """Synchronously remove the legacy request log directory if empty.
 
     This helps clean up the legacy directory once all old logs have been
     garbage collected after a server upgrade.
@@ -1711,6 +1711,11 @@ async def _cleanup_legacy_directory_if_empty():
     except Exception as e:  # pylint: disable=broad-except
         # Don't fail GC if cleanup fails
         logger.debug(f'Failed to cleanup legacy directory: {e}')
+
+
+async def _cleanup_legacy_directory_if_empty():
+    """Remove the legacy request log directory if empty."""
+    await asyncio.to_thread(_cleanup_legacy_directory_if_empty_sync)
 
 
 async def clean_finished_requests_with_retention(
