@@ -1,6 +1,8 @@
+import json
 import pathlib
 import shlex
 import typing
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -15,6 +17,7 @@ from sky.clouds import Zone
 from sky.clouds.aws import AWS
 from sky.provision import constants as provision_constants
 from sky.provision.aws import config
+from sky.provision.aws import iam_profile
 from sky.utils import common_utils
 from sky.utils import config_utils
 
@@ -382,6 +385,107 @@ def _client_error(code: str):
             'Code': code,
             'Message': code,
         }}, 'AuthorizeSecurityGroupIngress')
+
+
+def test_configure_iam_role_reuses_existing_profile():
+    assert config._configure_iam_role is iam_profile.configure_iam_role
+    assert (config.DEFAULT_SKYPILOT_INSTANCE_PROFILE ==
+            iam_profile.DEFAULT_SKYPILOT_INSTANCE_PROFILE)
+    assert config.DEFAULT_SKYPILOT_IAM_ROLE == iam_profile.DEFAULT_SKYPILOT_IAM_ROLE
+
+    iam = MagicMock()
+    profile = iam.InstanceProfile.return_value
+    profile.arn = 'arn:aws:iam::123:instance-profile/skypilot-v1'
+    profile.roles = [MagicMock()]
+
+    with patch.object(config.time, 'sleep') as mock_sleep:
+        result = config._configure_iam_role(iam)
+
+    assert result == {'Arn': profile.arn}
+    iam.InstanceProfile.assert_called_once_with(
+        config.DEFAULT_SKYPILOT_INSTANCE_PROFILE)
+    profile.load.assert_called_once_with()
+    iam.meta.client.create_instance_profile.assert_not_called()
+    iam.Role.assert_not_called()
+    profile.add_role.assert_not_called()
+    mock_sleep.assert_not_called()
+
+
+def test_configure_iam_role_creates_profile_role_and_policies():
+    iam = MagicMock()
+    missing_profile = MagicMock()
+    missing_profile.load.side_effect = _client_error('NoSuchEntity')
+    profile = MagicMock()
+    profile.arn = 'arn:aws:iam::123:instance-profile/skypilot-v1'
+    profile.roles = []
+    iam.InstanceProfile.side_effect = [missing_profile, profile]
+
+    missing_role = MagicMock()
+    missing_role.load.side_effect = _client_error('NoSuchEntity')
+    role = MagicMock()
+    role.name = config.DEFAULT_SKYPILOT_IAM_ROLE
+    role.arn = 'arn:aws:iam::123:role/skypilot-v1'
+    iam.Role.side_effect = [missing_role, role]
+
+    with patch.object(config.time, 'sleep') as mock_sleep:
+        result = config._configure_iam_role(iam)
+
+    assert result == {'Arn': profile.arn}
+    iam.meta.client.create_instance_profile.assert_called_once_with(
+        InstanceProfileName=config.DEFAULT_SKYPILOT_INSTANCE_PROFILE)
+    iam.create_role.assert_called_once()
+    role_kwargs = iam.create_role.call_args.kwargs
+    assert role_kwargs['RoleName'] == config.DEFAULT_SKYPILOT_IAM_ROLE
+    assert json.loads(role_kwargs['AssumeRolePolicyDocument']) == {
+        'Statement': [{
+            'Effect': 'Allow',
+            'Principal': {
+                'Service': 'ec2.amazonaws.com'
+            },
+            'Action': 'sts:AssumeRole',
+        }]
+    }
+    assert [
+        call.kwargs['PolicyArn'] for call in role.attach_policy.call_args_list
+    ] == [
+        'arn:aws:iam::aws:policy/AmazonEC2FullAccess',
+        'arn:aws:iam::aws:policy/AmazonS3FullAccess',
+    ]
+    role.Policy.assert_called_once_with('SkyPilotPassRolePolicy')
+    inline_policy = json.loads(
+        role.Policy.return_value.put.call_args.kwargs['PolicyDocument'])
+    assert inline_policy == {
+        'Statement': [{
+            'Effect': 'Allow',
+            'Action': ['iam:GetRole', 'iam:PassRole'],
+            'Resource': role.arn,
+        }, {
+            'Effect': 'Allow',
+            'Action': 'iam:GetInstanceProfile',
+            'Resource': profile.arn,
+        }]
+    }
+    profile.add_role.assert_called_once_with(RoleName=role.name)
+    assert mock_sleep.call_args_list == [call(15), call(15)]
+
+
+def test_configure_iam_role_attaches_existing_role():
+    iam = MagicMock()
+    profile = iam.InstanceProfile.return_value
+    profile.arn = 'arn:aws:iam::123:instance-profile/skypilot-v1'
+    profile.roles = []
+    role = iam.Role.return_value
+    role.name = config.DEFAULT_SKYPILOT_IAM_ROLE
+
+    with patch.object(config.time, 'sleep') as mock_sleep:
+        result = config._configure_iam_role(iam)
+
+    assert result == {'Arn': profile.arn}
+    iam.create_role.assert_not_called()
+    role.attach_policy.assert_not_called()
+    role.Policy.assert_not_called()
+    profile.add_role.assert_called_once_with(RoleName=role.name)
+    mock_sleep.assert_called_once_with(15)
 
 
 def test_configure_security_group_ignores_concurrent_duplicate_ingress():
