@@ -18,12 +18,18 @@ def _test_optimize_speed(resources: sky.Resources):
     with sky.Dag() as dag:
         task = sky.Task(run='echo hi')
         task.set_resources(resources)
-    start = time.time()
+    cpu_start = time.process_time()
+    wall_start = time.perf_counter()
     sky.optimize(dag)
-    end = time.time()
-    # 8.0 seconds = somewhat flaky.
-    assert end - start < 8.0, (f'optimize took too long for {resources}, '
-                               f'{end - start} seconds')
+    cpu_duration = time.process_time() - cpu_start
+    wall_duration = time.perf_counter() - wall_start
+
+    # CPU time makes the regression signal independent of transient runner
+    # scheduling delays. Keep a looser wall-clock guard to still catch stalls.
+    assert cpu_duration < 8.0, (
+        f'optimize used too much CPU for {resources}: {cpu_duration} seconds')
+    assert wall_duration < 30.0, (
+        f'optimize stalled for {resources}: {wall_duration} seconds')
 
 
 def test_optimize_speed(enable_all_clouds):
