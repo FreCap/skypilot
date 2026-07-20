@@ -704,6 +704,32 @@ def test_dispatch_waits_for_live_lease_and_uses_db_completion(monkeypatch):
     assert progress.call_count == 3
 
 
+def test_dispatch_preserves_worker_discovery_failure(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator.batches = [[0, 3]]
+    batch_coordinator._workers = ['worker-a']
+    batch_coordinator._enqueue_batch(0)
+    monkeypatch.setattr(batch_coordinator, '_reclaim_expired_batches',
+                        mock.Mock(return_value=0))
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_cleanup_stale_worker_services',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_sync_batch_progress_from_db',
+                        mock.Mock(return_value=(0, set(), [])))
+    monkeypatch.setattr(
+        batch_coordinator, '_get_ready_workers',
+        mock.Mock(side_effect=RuntimeError('Recreate pool before retrying')))
+    dispatch = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_worker_dispatch_loop', dispatch)
+    monkeypatch.setattr(coordinator.time, 'sleep', mock.Mock())
+
+    with pytest.raises(RuntimeError, match='Recreate pool before retrying'):
+        batch_coordinator._dispatch_all()
+
+    dispatch.assert_not_called()
+
+
 def test_worker_commands_are_scoped_to_coordinator_token():
     batch_coordinator = _make_coordinator()
     batch_coordinator.batches = [[0, 3]]

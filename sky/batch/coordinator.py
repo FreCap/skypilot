@@ -1416,20 +1416,23 @@ class BatchCoordinator:
 
             # Re-discover workers and start threads for idle ones.
             started_new = False
+            worker_discovery_error: Exception | None = None
             try:
                 current_workers = self._get_ready_workers()
                 if not current_workers:
                     current_workers = self._workers
-                for w in current_workers:
-                    already_active = (w in active_threads and
-                                      active_threads[w].is_alive())
-                    if (not already_active and w not in leased_workers and
-                            self._has_pending_batches()):
-                        logger.info(f'Discovered new/idle worker: {w}')
-                        _start_worker_thread(w)
-                        started_new = True
-            except Exception:  # pylint: disable=broad-except
-                pass
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f'Failed to rediscover Batch workers: {e}')
+                worker_discovery_error = e
+                current_workers = []
+            for w in current_workers:
+                already_active = (w in active_threads and
+                                  active_threads[w].is_alive())
+                if (not already_active and w not in leased_workers and
+                        self._has_pending_batches()):
+                    logger.info(f'Discovered new/idle worker: {w}')
+                    _start_worker_thread(w)
+                    started_new = True
 
             # If all threads are dead, work remains, and we couldn't
             # start any new threads, wait if durable leases are the only
@@ -1438,6 +1441,8 @@ class BatchCoordinator:
                 if leased_workers:
                     time.sleep(10)
                     continue
+                if worker_discovery_error is not None:
+                    errors.append(worker_discovery_error)
                 break
 
             time.sleep(10)
