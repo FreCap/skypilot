@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from sky import cloud_stores
 from sky import exceptions
 from sky.data import storage as storage_lib
 from sky.data import storage_gcs
@@ -61,6 +62,19 @@ def test_gcs_store_validate_name_accepts_valid_names(name):
 def test_gcs_store_validate_name_rejects_invalid_names(name, expected):
     with pytest.raises(exceptions.StorageNameError, match=expected):
         storage_lib.GcsStore.validate_name(name)
+
+
+def test_gcs_directory_probe_quotes_ordinary_object_url(monkeypatch):
+    url = 'gs://test-bucket/research team\'s "final"; results #1.csv'
+    run = mock.Mock(return_value=mock.Mock(stdout=f'{url}\n'.encode()))
+    monkeypatch.setattr(cloud_stores.GcsCloudStorage, '_INSTALL_GSUTIL', 'true')
+    monkeypatch.setattr(cloud_stores.GcsCloudStorage, '_gsutil_command',
+                        property(lambda _: 'gsutil'))
+    monkeypatch.setattr(cloud_stores.subprocess, 'run', run)
+
+    assert cloud_stores.GcsCloudStorage().is_directory(url) is False
+    command = run.call_args.args[0]
+    assert command == f'true && gsutil ls -d {shlex.quote(url)}'
 
 
 @pytest.mark.parametrize('source, expected_call', [
