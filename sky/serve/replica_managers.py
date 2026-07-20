@@ -5265,6 +5265,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_infos = serve_state.get_replica_infos_from_ids(
             self._service_name,
             [replica_id for replica_id, _ in finished_launches])
+        # A completed local worker can outlive its durable replica row. This
+        # happens when another reconciliation path removes the row before the
+        # worker result is observed. Treat durable absence as terminal local
+        # cleanup, not as a controller-wide assertion failure: the latter
+        # aborts this refresh before unrelated teardown workers are handled.
+        # Partition stale workers before spot-placement evidence is collected,
+        # since that pass also dereferences every finished launch row.
+        stale_finished_launches = [
+            replica_id for replica_id, _ in finished_launches
+            if replica_id not in launch_infos
+        ]
+        for replica_id in stale_finished_launches:
+            logger.warning(
+                f'Discarding completed launch worker for replica '
+                f'{replica_id}: its durable replica row no longer exists.')
+            self._launch_thread_pool.pop(replica_id)
+            self._replica_to_request_id.pop(replica_id)
+            self._replica_to_launch_cancelled.pop(replica_id)
+        if stale_finished_launches:
+            stale_replica_ids = set(stale_finished_launches)
+            finished_launches = [(replica_id, t)
+                                 for replica_id, t in finished_launches
+                                 if replica_id not in stale_replica_ids]
         finished_spot_locations: dict[int, spot_placer.Location] = {}
         if self._spot_placer is not None:
             for replica_id, t in finished_launches:
