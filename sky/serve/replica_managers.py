@@ -1583,7 +1583,13 @@ class ReplicaInfo:
             if response.status_code == 200:
                 logger.debug(f'{replica_identity.capitalize()} is ready.')
                 return self, True, probe_time
-        except requests.exceptions.RequestException as e:
+        except Exception as e:  # pylint: disable=broad-except
+            # Catch all errors, not just RequestException: probe inputs
+            # (readiness path/headers/post data) come from user YAML and can
+            # make the HTTP stack raise e.g. UnicodeEncodeError or ValueError.
+            # An escaping exception aborts the whole probe round when the
+            # prober drains futures, stalling status updates for every
+            # replica on each tick.
             logger.error(
                 f'{colorama.Fore.YELLOW}Error when probing {replica_identity}:'
                 f' {common_utils.format_exception(e)}.'
