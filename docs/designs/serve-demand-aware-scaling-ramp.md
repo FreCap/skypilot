@@ -167,6 +167,13 @@ uncertainty into a fleet-wide reactivation feedback loop. If no newer evidence
 arrives, the recovery deadline remains diagnostic and the victim stays
 off-route; timeout alone is never route-admission authority.
 
+The recovery gate also owns every queued shutdown-admission row while that
+replica remains indexed for recovery. The admission pass must check membership
+under the same logical-state lock before evaluating the persisted controller
+fence. Otherwise a pre-restart queued worker can observe the obsolete epoch,
+abort the retirement, and advertise the backend while the recovery pass is
+still adopting the same row.
+
 Unknown-capacity replacement stays tied to the exact decision generation; a
 newer snapshot may narrow or cancel the set but cannot authorize new overlap
 from stale evidence.
@@ -490,6 +497,8 @@ rate to 100, then restore the previous control-plane image if required.
   generation, is released only after a strictly newer matching target and
   snapshot, and remains off route when the diagnostic recovery deadline expires
   without newer evidence.
+- Verify queued shutdown admission cannot abort or advertise a recovered
+  retirement before the recovery pass adopts and releases it.
 - Verify in-process updates preserve the rate timestamp and a rebuild never
   jumps directly to the raw target.
 - Verify a demand rebound does not cause scale-down and stale reports cannot
