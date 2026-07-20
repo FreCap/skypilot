@@ -863,7 +863,7 @@ ceiling held at 023. It continues distribution work but returns
 `IMAGE_SCHEMA_PENDING` for builder routes. Its distribution code uses a frozen
 explicit 023 common-column projection and cannot select or write 024-only
 columns/enums; a superset ORM `SELECT *` is forbidden. Only after every API,
-controller, copy-worker, and purge-worker image-plane process reports API 63 and
+controller, copy-worker, and lifecycle-worker image-plane process reports API 63 and
 no API-62 database session remains does a dedicated Job take the exclusive
 compatibility advisory transaction lock. That preflight is operational evidence,
 not the safety boundary. Every image transaction has held the shared form since
@@ -881,7 +881,7 @@ valid against the additive schema and cannot emit BUILD state.
 
 The API-63 activation transaction locks the catalog singleton, verifies
 migration 024, the already-63 image-plane fence, and healthy
-API/controller/publisher/purge capability evidence before any builder intent is
+API/controller/publisher/lifecycle capability evidence before any builder intent is
 admitted. The first transaction that will create any 024-owned row or BUILD
 value sets the migration-023 catalog
 singleton's `builder_state_ever_created` flag TRUE while holding the phase-1
@@ -1217,6 +1217,15 @@ size, rather than an estimate of provider layer deduplication, in the reservatio
 transaction. Failure to reserve it ends the attempt before canonical paid I/O.
 The output row retains the independently measured size for equality checks. No
 source row or release is created.
+
+Every reservation, reclaim, or publisher transition that would acquire or
+extend a BUILD_OUTPUT location lease locks the exact distribution profile head
+and declines while its active revision has an unexpired configuration-quiesce
+token. A publisher that already owns the lease may heartbeat and finalize, but
+checks the token between bounded registry calls and starts no later call after
+observing it. This is the builder side of the distribution design's
+starvation-free profile activation protocol; the uncapped
+`ix_ci_loc_activate_build_output` probe remains the drain authority.
 
 Only the current RESERVED output lease can obtain short-lived authority for its
 exact stored-assigned-shard canonical repository and immutable tag. The trusted
@@ -1696,7 +1705,8 @@ rejection. A pre-witness locked 024-to-023 downgrade restores the fence to 62
 only after exact absence; every witness/row/value and old/new writer race keeps
 revision 024 and fence 63. Tests also cover post-state API-62 rollback rejection,
 disabled-builder API-63 rollback, activation fencing including an uncapped live
-twentieth BUILD_OUTPUT claim, the named constraint replacement, pre-I/O
+twentieth BUILD_OUTPUT claim plus sustained producer pressure blocked by the
+generation-fenced quiesce token, the named constraint replacement, pre-I/O
 artifact/location/byte reservation,
 generation/attempt/token-scoped output and staging records, crashes and stale
 attempts before and after canonical push, immutable-tag recovery, cancellation
