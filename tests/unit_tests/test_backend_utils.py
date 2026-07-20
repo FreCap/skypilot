@@ -24,6 +24,34 @@ from sky.utils import status_lib
 from sky.utils import yaml_utils
 
 
+def test_optimize_file_mounts_quotes_local_sources(monkeypatch, tmp_path):
+    source = tmp_path / 'research\'s "final" credentials.json'
+    source.write_text('credential', encoding='utf-8')
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    yaml_path = tmp_path / 'cluster.yaml'
+    yaml_utils.dump_yaml(yaml_path, {
+        'file_mounts': {
+            '/remote/credential': str(source),
+        },
+    })
+    monkeypatch.setattr(backend_utils.tempstore, 'mkdtemp',
+                        lambda: str(runtime_dir))
+
+    backend_utils._optimize_file_mounts(str(yaml_path))
+
+    copied_files = list(runtime_dir.iterdir())
+    assert len(copied_files) == 1
+    assert copied_files[0].read_text(encoding='utf-8') == 'credential'
+
+
+def test_path_size_megabytes_quotes_path(tmp_path):
+    source = tmp_path / 'research\'s "final" data.json'
+    source.write_text('data', encoding='utf-8')
+
+    assert backend_utils.path_size_megabytes(str(source)) == 0
+
+
 # Set env var to test config file.
 @mock.patch.object(skypilot_config, '_global_config_context',
                    skypilot_config.ConfigContext())
