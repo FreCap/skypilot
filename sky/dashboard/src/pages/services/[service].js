@@ -544,8 +544,8 @@ export function ServiceDetailCard({
                     {' '}
                     (+{serviceData.replicasFailed}{' '}
                     {usesLogicalReplicas
-                      ? 'failed slots in history'
-                      : 'failed replicas in history'}
+                      ? 'failed or cleanup-uncertain slots, including history'
+                      : 'failed or cleanup-uncertain replicas, including history'}
                     )
                   </span>
                 )}
@@ -564,8 +564,12 @@ export function ServiceDetailCard({
                   {serviceData.physicalReplicasFailed > 0 && (
                     <span className="text-red-700">
                       {' '}
-                      (+{serviceData.physicalReplicasFailed} failed backends in
-                      history)
+                      (+{serviceData.physicalReplicasFailed} failed or
+                      cleanup-uncertain{' '}
+                      {serviceData.physicalReplicasFailed === 1
+                        ? 'backend'
+                        : 'backends'}
+                      , including history)
                     </span>
                   )}
                 </div>
