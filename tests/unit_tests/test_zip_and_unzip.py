@@ -177,3 +177,40 @@ def test_unzip_file_zip_slip_blocked():
             error_msg = getattr(exc, 'detail', None) or str(exc)
             assert 'outside target directory' in error_msg, \
                 f'Expected "outside target directory" error for {name}'
+
+
+def test_unzip_file_symlinked_extraction_root(tmp_path):
+    """Test containment checks against a canonical extraction root."""
+    real_extract_dir = tmp_path / 'real-extract'
+    real_extract_dir.mkdir()
+    extract_dir = tmp_path / 'extract'
+    extract_dir.symlink_to(real_extract_dir, target_is_directory=True)
+    zip_path = tmp_path / 'safe.zip'
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        zipf.writestr('safe.txt', 'safe content')
+
+    asyncio.run(server.unzip_file(zip_path, extract_dir))
+
+    assert (real_extract_dir / 'safe.txt').read_text() == 'safe content'
+
+
+def test_unzip_file_absolute_symlink_blocked(tmp_path):
+    """Test that absolute symlink targets are rejected."""
+    extract_dir = tmp_path.resolve() / 'extract'
+    extract_dir.mkdir()
+    target = extract_dir / 'target.txt'
+    target.write_text('safe target')
+    zip_path = tmp_path / 'absolute-symlink.zip'
+
+    symlink_info = zipfile.ZipInfo('link.txt')
+    symlink_info.create_system = 3
+    symlink_info.external_attr = 0xA << 28
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        zipf.writestr(symlink_info, str(target))
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        asyncio.run(server.unzip_file(zip_path, extract_dir))
+
+    error_msg = getattr(exc_info.value, 'detail', None) or str(exc_info.value)
+    assert 'must be relative' in error_msg
+    assert not (extract_dir / 'link.txt').is_symlink()
