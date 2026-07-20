@@ -489,22 +489,28 @@ class StrategyExecutor:
         """
         try:
             content = file_content_utils.get_job_dag_content(self.job_id)
-            if content is None:
-                return
-            fresh_dag = dag_utils.load_dag_from_yaml_str(content)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 f'Failed to re-read persisted DAG for job {self.job_id}; '
                 f'keeping current priority: {e}')
             return
-        if self.task_id >= len(fresh_dag.tasks) or not self.dag.tasks:
+        if content is None:
             return
-        fresh_resources = list(fresh_dag.tasks[self.task_id].resources)
-        if not fresh_resources:
+        # Extract only the priority scalars instead of rehydrating the full
+        # DAG: it is far cheaper on the per-recovery hot path, and it keeps
+        # working even when the rest of the spec cannot be reconstructed.
+        extracted = dag_utils.extract_task_priority_from_yaml_str(
+            content, self.task_id)
+        if extracted is None or not self.dag.tasks:
             return
-        # Priority is uniform across a task's resources; take the first.
-        new_priority = fresh_resources[0].priority
-        new_priority_class = fresh_resources[0].priority_class
+        new_priority, new_priority_class = extracted
+        if new_priority is not None and not (constants.MIN_PRIORITY <=
+                                             new_priority <=
+                                             constants.MAX_PRIORITY):
+            logger.warning(
+                f'Ignoring out-of-range priority {new_priority} in persisted '
+                f'DAG for job {self.job_id}; keeping current priority.')
+            return
         task = self.dag.tasks[0]
         changed = False
         new_resources = []
