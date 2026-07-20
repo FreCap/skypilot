@@ -47,7 +47,7 @@ def test_download_logs_resolves_remote_prefix_per_call():
             return_value='/fresh-user/sky_logs') as mock_prefix, \
          mock.patch.object(client_common.server_common,
                            'make_authenticated_request',
-                           return_value=response), \
+                           return_value=response) as mock_request, \
          mock.patch.object(client_common.zipfile,
                            'ZipFile',
                            return_value=zip_file):
@@ -56,6 +56,8 @@ def test_download_logs_resolves_remote_prefix_per_call():
 
     assert result == {'/fresh-user/sky_logs/job-1': '/local-logs/job-1'}
     mock_prefix.assert_called_once_with()
+    assert mock_request.call_args.kwargs['timeout'] == (
+        client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None)
 
 
 def test_download_logs_preserves_explicit_remote_prefix():

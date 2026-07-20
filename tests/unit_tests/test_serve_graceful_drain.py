@@ -254,6 +254,86 @@ class TestReplicaDrainTracker:
             rm._lb_in_flight_report = self._report(1021.0, {}, {self.OTHER})
             assert tracker()  # Clean after having been seen.
 
+    def test_fresh_pre_drain_routing_report_seeds_seen(self):
+        rm = _manager()
+        rm._lb_in_flight_report = self._report(999.0, {}, {self.URL})
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            # The report only acknowledges the backend. It predates the drain
+            # and cannot itself prove the backend idle.
+            assert not tracker()
+            rm._lb_in_flight_report = self._report(1001.0, {}, set())
+            assert tracker()
+
+    def test_seed_report_at_drain_start_cannot_finish_drain(self):
+        rm = _manager()
+        rm._lb_in_flight_report = self._report(1000.0, {}, {self.URL})
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            # Exercise the normal blocked predicate, not the pre-drain guard.
+            assert not tracker()
+            rm._lb_in_flight_report = self._report(1001.0, {}, set())
+            assert tracker()
+
+    def test_session_change_clears_pre_drain_seed(self):
+        rm = _manager()
+        rm._lb_in_flight_report = self._report(999.0, {}, {self.URL},
+                                               session='lb-a')
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            rm._lb_in_flight_report = self._report(1001.0, {},
+                                                   set(),
+                                                   session='lb-b')
+            assert not tracker()
+            rm._lb_in_flight_report = self._report(1002.0, {}, {self.URL},
+                                                   session='lb-b')
+            assert not tracker()
+            rm._lb_in_flight_report = self._report(1003.0, {},
+                                                   set(),
+                                                   session='lb-b')
+            assert tracker()
+
+    def test_absent_pre_drain_report_does_not_seed_seen(self):
+        rm = _manager()
+        rm._lb_in_flight_report = self._report(999.0, {}, {self.OTHER})
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            rm._lb_in_flight_report = self._report(1001.0, {}, {self.OTHER})
+            assert not tracker()
+
+    def test_fresh_pre_drain_unknown_report_seeds_taint(self):
+        rm = _manager()
+        rm._lb_in_flight_report = self._report(999.0, {}, {self.URL},
+                                               unknown_urls={self.URL})
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            rm._lb_in_flight_report = self._report(1001.0, {}, set())
+            assert not tracker()
+            rm._lb_in_flight_report = self._report(1002.0, {self.URL: 0}, set())
+            assert tracker()
+
+    def test_stale_pre_drain_report_does_not_seed_seen(self):
+        rm = _manager()
+        stale_at = (1000.0 -
+                    replica_managers._IN_FLIGHT_REPORT_STALENESS_SECONDS - 1)
+        rm._lb_in_flight_report = self._report(stale_at, {}, {self.URL})
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1000.0):
+            tracker = self._tracker(rm)
+            rm._lb_in_flight_report = self._report(1001.0, {}, set())
+            assert not tracker()
+
     def test_explicit_zero_is_seen_and_clean_at_once(self):
         rm = _manager()
         rm._lb_in_flight_report = self._report(1001.0, {self.URL: 0},
@@ -861,6 +941,28 @@ class TestRecoveredStrictDrainDeadline:
                 'http://r7:8080': 0
             }, set(), set(), set(), 'lb-a')
             assert tracker() is True
+
+    def test_recovery_uses_pre_resolved_url_without_property_lookup(self):
+        rm, info = self._manager_and_info(700.0)
+        type(info).url = mock.PropertyMock(
+            side_effect=AssertionError('unexpected per-replica lookup'))
+        with mock.patch.object(replica_managers.time,
+                               'time', return_value=1000.0), \
+             mock.patch.object(replica_managers.time,
+                               'monotonic', return_value=2000.0):
+            rm._register_wait_for_idle(info,
+                                       replica_url='http://batched-r7:8080')
+
+        tracker, deadline = rm._wait_for_idle_trackers[7]
+        assert tracker is not None
+        assert deadline == 2300.0
+        rm._lb_in_flight_report = (2001.0, {
+            'http://batched-r7:8080': 0
+        }, set(), set(), set(), 'lb-a')
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=2001.0):
+            assert tracker()
 
     def test_legacy_row_backfill_is_durable_before_tracker_registration(self):
         rm, info = self._manager_and_info(None)

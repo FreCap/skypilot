@@ -12,6 +12,7 @@ import pytest
 
 from sky import clouds
 from sky import skypilot_config
+from sky.resources import LaunchableResources
 from sky.resources import Resources
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -28,6 +29,12 @@ GLOBAL_INVALID_LABELS = {
     'spaces in label': 'spaces in value',
     '': 'emptykey',
 }
+
+
+def test_launchable_resources_cannot_be_instantiated():
+    with pytest.raises(AssertionError,
+                       match='should not be instantiated directly'):
+        LaunchableResources()
 
 
 def test_get_reservations_available_resources():

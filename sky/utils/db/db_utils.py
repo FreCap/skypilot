@@ -326,6 +326,26 @@ def fault_point():
     pass
 
 
+# Escape character for LIKE patterns built by ``glob_to_like_pattern``. Pass
+# it as the ``escape`` argument of ``ColumnOperators.like``.
+LIKE_ESCAPE_CHAR = '\\'
+
+
+def glob_to_like_pattern(glob_pattern: str) -> str:
+    """Converts a glob pattern to a SQL LIKE pattern.
+
+    LIKE metacharacters (``%``, ``_``) and the escape character itself are
+    escaped so they match literally, then glob wildcards are mapped
+    (``*`` -> ``%``, ``?`` -> ``_``). The result must be used with
+    ``column.like(pattern, escape=LIKE_ESCAPE_CHAR)``.
+    """
+    escaped = (glob_pattern.replace(LIKE_ESCAPE_CHAR,
+                                    LIKE_ESCAPE_CHAR * 2).replace(
+                                        '%', LIKE_ESCAPE_CHAR + '%').replace(
+                                            '_', LIKE_ESCAPE_CHAR + '_'))
+    return escaped.replace('*', '%').replace('?', '_')
+
+
 class SQLiteConn(threading.local):
     """Thread-local connection to the sqlite3 database."""
 

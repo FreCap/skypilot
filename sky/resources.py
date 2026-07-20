@@ -2751,8 +2751,8 @@ class Resources:
                     parsed_accels = cls._parse_accelerators_from_str(accel_name)
                     accelerators_list.extend(parsed_accels)
             else:
-                assert False, ('Invalid accelerators type:'
-                               f'{type(accelerators)}')
+                raise AssertionError('Invalid accelerators type:'
+                                     f'{type(accelerators)}')
             # now that accelerators is a list, we need to decide which to
             # include in the final set, however, there may be multiple copies
             # of the same accelerator, some given by name by the user and the
@@ -3286,7 +3286,7 @@ class LaunchableResources(Resources):
     """
 
     def __init__(self, *args, **kwargs) -> None:  # pylint: disable=super-init-not-called,unused-argument
-        assert False, (
+        raise AssertionError(
             'LaunchableResources should not be instantiated directly. '
             'It is only used for type checking by MyPy.')
 

@@ -2932,6 +2932,8 @@ def download_debug_dump(dump_filename: str,
         'GET',
         f'/debug/dump_download/{dump_filename}',
         stream=True,
+        timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
+                 None),
     )
 
     with response:
