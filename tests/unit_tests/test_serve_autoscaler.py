@@ -1205,11 +1205,17 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
             'compatible_accelerators': tuple(cards),
         } for _ in range(count)]
 
-    def _replica(self, replica_id, card, *, ready=True, zero_cost=False):
+    def _replica(self,
+                 replica_id,
+                 card,
+                 *,
+                 ready=True,
+                 zero_cost=False,
+                 version=1):
         info = mock.Mock()
         info.replica_id = replica_id
         info.cluster_name = f'svc-{replica_id}'
-        info.version = 1
+        info.version = version
         info.is_terminal = False
         info.is_ready = ready
         info.is_zero_cost = zero_cost
@@ -1400,6 +1406,35 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
         self.assertEqual([decision.target for decision in decisions], [3])
+
+    def test_rolling_drain_waits_for_ready_exact_card_replacement(self):
+        spec = self._spec(max_replicas=2, num_overprovision=1)
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                    spec,
+                                                                    version=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.compatibility_profiles = (self._profiles(50, ['L4']) +
+                                             self._profiles(50, ['A100']))
+        autoscaler._compatibility_demand_complete = True
+        old_l4 = self._replica(1, 'L4', version=1)
+        latest_a100s = [
+            self._replica(replica_id, 'A100', version=2)
+            for replica_id in (2, 3, 4)
+        ]
+
+        first = autoscaler.generate_scaling_decisions([old_l4, *latest_a100s],
+                                                      [1, 2])
+
+        self.assertNotIn(1, [decision.target for decision in first])
+        self.assertIn({'accelerators': {
+            'L4': 1
+        }}, [decision.target for decision in first])
+
+        latest_l4 = self._replica(5, 'L4', version=2)
+        second = autoscaler.generate_scaling_decisions(
+            [old_l4, *latest_a100s, latest_l4], [1, 2])
+
+        self.assertIn(1, [decision.target for decision in second])
 
     def test_constrained_peer_gets_a100_and_flexible_peer_gets_l4(self):
         autoscaler = self._autoscaler(max_replicas=2)

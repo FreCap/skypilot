@@ -2677,6 +2677,28 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         ]
         if not old_nonterminal:
             return []
+        actuation_target, exact_target_complete = (
+            self._actuation_target_by_accelerator(replica_infos))
+        if exact_target_complete:
+            canonical_by_name = {
+                card.casefold(): card for card in actuation_target
+            }
+            ready_latest_by_card = {card: 0 for card in actuation_target}
+            for info in replica_infos:
+                if info.version != self.latest_version or not info.is_ready:
+                    continue
+                raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                card = canonical_by_name.get(raw_card.casefold())
+                if card is not None:
+                    ready_latest_by_card[card] += 1
+            if any(
+                    ready_latest_by_card.get(card, 0) < target
+                    for card, target in actuation_target.items()):
+                # The latest fleet may satisfy the aggregate count entirely
+                # with the wrong card. Launch the exact replacement first;
+                # retaining all old replicas for one more tick is the only
+                # non-preemptive rollout choice.
+                return []
         num_ready_latest = 0
         ready_latest_capacity = 0.0
         for info in replica_infos:
