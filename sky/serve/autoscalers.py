@@ -3015,6 +3015,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
+        if (self.replica_unit == 'logical' and
+                self.max_scale_up_rate_percentage is not None):
+            # target_num_replicas described the previous version's launch
+            # intent.  The new version has no committed capacity yet, so
+            # carrying that target across the update would let its first
+            # reconciliation bypass the scale-up wave and launch the whole
+            # inherited target from zero.  Start at the new minimum; the next
+            # fresh or stale recompute authorizes at most one configured wave.
+            self.target_num_replicas = self.min_replicas
         self._snap_target_on_next_recompute = True
         self._last_logical_target_state = None
 

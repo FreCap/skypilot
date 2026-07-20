@@ -98,6 +98,13 @@ next_target = min(raw_target, current_committed_capacity + step)
 Current committed capacity is latest-version nonterminal planned logical
 capacity, including ready and provisioning backends. This prevents repeated
 ticks from authorizing the same missing capacity while launches are pending.
+On a version update, the previous version's adopted target is not treated as
+already-authorized capacity for the new version. When the wave limiter is
+enabled, the new version resets its adopted target to `min_replicas`; the next
+fresh or stale recompute may then authorize at most one wave above the new
+version's committed capacity. This keeps a rolling update from inheriting an
+arbitrarily large target and launching that entire target from zero in one
+reconciliation.
 Because the adopted target is controller-local, the first fresh recompute
 after a controller rebuild first raises its actuation baseline to current
 committed capacity. Any lower raw demand then goes through the ordinary
@@ -188,8 +195,10 @@ occupancy as fail-closed active work.
 ### 3. Bounded actuation
 
 Apply the scale-up wave to fresh and stale target increases. Persist its
-timestamp through in-process service updates. Apply the 50 percent downscale
-wave after hysteresis and reset the counter after each permitted reduction.
+timestamp through in-process service updates. Reset a newly committed
+version's adopted target to its minimum so an inherited old-version target
+cannot bypass the first wave. Apply the 50 percent downscale wave after
+hysteresis and reset the counter after each permitted reduction.
 
 ### 4. Production consumer and rollout
 

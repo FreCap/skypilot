@@ -1302,6 +1302,37 @@ class TestUpdateVersion(unittest.TestCase):
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_ramped_update_does_not_inherit_old_version_target(self):
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            min_replicas=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=10,
+            scale_up_rate_period_seconds=60,
+        )
+        autoscaler.target_num_replicas = 1000
+
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0,
+                  min_replicas=1,
+                  max_replicas=1000,
+                  replica_unit='logical',
+                  max_scale_up_rate_percentage=20,
+                  scale_up_rate_min_replicas=10,
+                  scale_up_rate_period_seconds=60),
+            serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        autoscaler._last_scale_up_wave_at = None
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic([])
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+
     def test_old_version_replicas_keep_their_launch_knob(self):
         # A knob-raising update must not inflate old replicas' capacity:
         # the rolling drain sizes the kept old set by capacity, and
