@@ -1210,7 +1210,10 @@ class SkyServeLoadBalancer:
                 card: [] for card in remaining
             }
 
-            def card_preferences(waiter: _RequestQueueWaiter) -> list[str]:
+            def card_preferences(
+                waiter: _RequestQueueWaiter,
+                assigned_by_card: dict[str, list[_RequestQueueWaiter]],
+            ) -> list[str]:
                 cards = [
                     card for card in compatible_cards(waiter)
                     if remaining.get(card, 0) > 0
@@ -1232,7 +1235,7 @@ class SkyServeLoadBalancer:
                 if waiter.sequence in seen_waiters:
                     return False
                 seen_waiters.add(waiter.sequence)
-                for card in card_preferences(waiter):
+                for card in card_preferences(waiter, assigned_by_card):
                     if card in seen_cards:
                         continue
                     seen_cards.add(card)
