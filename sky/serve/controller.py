@@ -97,6 +97,47 @@ def _make_controller_owner_dependency(
     return _verify
 
 
+def _validate_terminate_replica_payload(request_data: Any) -> tuple[int, bool]:
+    """Validate the destructive replica-termination request payload."""
+    if not isinstance(request_data, dict):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Replica termination payload must be an object.')
+    replica_id = request_data.get('replica_id')
+    # bool is a subclass of int, so isinstance(True, int) is unsafe here.
+    if type(replica_id) is not int:
+        raise fastapi.HTTPException(status_code=400,
+                                    detail='Replica ID must be an integer.')
+    purge = request_data.get('purge')
+    if type(purge) is not bool:
+        raise fastapi.HTTPException(status_code=400,
+                                    detail='Purge must be a boolean.')
+    return replica_id, purge
+
+
+async def _read_terminate_replica_payload(
+        request: fastapi.Request) -> tuple[int, bool]:
+    """Read and validate a replica-termination request body."""
+    try:
+        request_data = await request.json()
+    except ValueError as e:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Replica termination payload must be valid JSON.') from e
+    return _validate_terminate_replica_payload(request_data)
+
+
+def _get_replica_info_for_termination(
+        service_name: str, replica_id: int) -> replica_managers.ReplicaInfo:
+    """Return the requested replica or a stable client-facing 404."""
+    replica_info = serve_state.get_replica_info_from_id(service_name,
+                                                        replica_id)
+    if replica_info is None:
+        raise fastapi.HTTPException(
+            status_code=404, detail=f'Replica {replica_id} does not exist.')
+    return replica_info
+
+
 def _read_declared_submitted_yaml(request_data: dict[str, Any],
                                   service_name: str, version: int,
                                   resource_scope: str | None) -> str | None:
@@ -2763,16 +2804,9 @@ class SkyServeController:
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
-            request_data = await request.json()
-            replica_id = request_data['replica_id']
-            assert isinstance(replica_id,
-                              int), 'Error: replica ID must be an integer.'
-            purge = request_data['purge']
-            assert isinstance(purge, bool), 'Error: purge must be a boolean.'
-            replica_info = serve_state.get_replica_info_from_id(
+            replica_id, purge = await _read_terminate_replica_payload(request)
+            replica_info = _get_replica_info_for_termination(
                 self._service_name, replica_id)
-            assert replica_info is not None, (f'Error: replica '
-                                              f'{replica_id} does not exist.')
             replica_status = replica_info.status
 
             if replica_status == serve_state.ReplicaStatus.SHUTTING_DOWN:
