@@ -193,6 +193,17 @@ def test_reject_window_ttl_expiry_and_refresh():
     assert lb._rejected_in_window() == 1
 
 
+def test_recent_reject_window_tracks_spikes_separately_from_retention():
+    lb = _make_lb()
+    lb._record_rejection(_request(job_id='recent'))
+    lb._record_rejection(_request(job_id='retained'))
+    lb._reject_last_seen['retained'] = (
+        time.monotonic() - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS - 1)
+
+    assert lb._rejected_in_window() == 2
+    assert lb._rejected_in_recent_window() == 1
+
+
 def test_terminal_503_records_rejection():
     lb = _make_lb()  # empty ready set -> "no ready replicas" exit
     with pytest.raises(fastapi.HTTPException):
@@ -664,6 +675,7 @@ def test_sync_payload_carries_demand_gauges():
     assert body['in_flight'] == {'http://a:8080': 2}
     assert body['queue_depth'] == 3
     assert body['rejected_in_window'] == 1
+    assert body['rejected_in_recent_window'] == 1
     assert 'timestamps' in body['request_aggregator']
     # Gauges are NOT cleared by a successful sync (only the timestamp
     # aggregator keeps clear-on-report semantics).

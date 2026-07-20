@@ -901,6 +901,8 @@ class SkyServeController:
                 'queue_depth': effective_request_data.get('queue_depth'),
                 'rejected_in_window':
                     effective_request_data.get('rejected_in_window'),
+                'rejected_in_recent_window':
+                    effective_request_data.get('rejected_in_recent_window'),
             })
             if (translated_in_flight is not None and getattr(
                     self._autoscaler, 'replica_unit', None) == 'logical'):

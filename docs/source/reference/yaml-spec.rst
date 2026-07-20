@@ -1349,6 +1349,7 @@ Syntax
       :ref:`min_replicas <yaml-spec-service-replica-policy-min-replicas>`: 1
       :ref:`max_replicas <yaml-spec-service-replica-policy-max-replicas>`: 3
       :ref:`target_qps_per_replica <yaml-spec-service-replica-policy-target-qps-per-replica>`: 5
+      :ref:`target_concurrency_per_replica <yaml-spec-service-replica-policy-target-concurrency-per-replica>`: 1
       :ref:`upscale_delay_seconds <yaml-spec-service-replica-policy-upscale-delay-seconds>`: 300
       :ref:`downscale_delay_seconds <yaml-spec-service-replica-policy-downscale-delay-seconds>`: 1200
 
@@ -1723,22 +1724,55 @@ SkyServe will scale your service so that, ultimately, each replica manages appro
 ``service.replica_policy.target_concurrency_per_replica``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Target outstanding work per GPU (optional). Mutually exclusive with
+Target simultaneous work per GPU (optional). Mutually exclusive with
 ``target_qps_per_replica``.
 
 Outstanding work includes in-flight, queued, and recently rejected requests.
 For ordinary physical-backend services, SkyServe packs that work onto each
 replica's configured target multiplied by its GPU count. With
 ``dynamic_fallback_per_gpu``, the value must be a positive integer and SkyServe
-publishes ``ceil(outstanding / target)`` logical GPU slots before packing those
-slots into physical backends. This target controls autoscaling headroom; it
-does not increase the model's execution concurrency.
+publishes a logical GPU target before packing those slots into physical
+backends. Running and queued work remain current-state signals. The optional
+duration and utilization fields below control rejected-pressure conversion and
+headroom without changing model execution concurrency.
 
 .. code-block:: yaml
 
   service:
     replica_policy:
       target_concurrency_per_replica: 2
+
+
+Logical concurrency tuning fields
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following optional fields require ``dynamic_fallback_per_gpu`` and
+``target_concurrency_per_replica``:
+
+* ``target_utilization_percentage`` is an integer from 1 to 100 (default 100).
+* ``expected_request_duration_seconds`` is a positive number. It converts the
+  retained rejected-request population and stale arrival rate into concurrent
+  work. When absent, each retained rejection contributes one work unit.
+* ``max_scale_up_rate_percentage``, ``scale_up_rate_min_replicas``, and
+  ``scale_up_rate_period_seconds`` must be set together. Each upward wave adds
+  at most the larger of the minimum replica count or the configured percentage
+  of committed logical capacity, then waits for the configured period.
+* ``max_scale_down_rate_percentage`` is an integer from 1 to 100 (default 50).
+  After the downscale delay, each wave removes at most that fraction of
+  committed logical capacity and requires a new full delay before another
+  wave.
+
+.. code-block:: yaml
+
+  service:
+    replica_policy:
+      target_concurrency_per_replica: 1
+      target_utilization_percentage: 90
+      expected_request_duration_seconds: 30
+      max_scale_up_rate_percentage: 20
+      scale_up_rate_min_replicas: 10
+      scale_up_rate_period_seconds: 60
+      max_scale_down_rate_percentage: 50
 
 
 ``service.replica_policy.cost_rebalance``

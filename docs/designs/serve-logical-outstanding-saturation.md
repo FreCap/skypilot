@@ -1,5 +1,10 @@
 # Logical outstanding-work saturation
 
+> Superseded by [Demand-aware logical scaling with bounded waves](serve-demand-aware-scaling-ramp.md).
+> Saturation remains supported for compatibility, but it is no longer the
+> recommended way to smooth rejection-driven demand for one-job-per-GPU
+> services.
+
 ## Problem
 
 SkyServe logical fleets currently map every outstanding unit directly to one

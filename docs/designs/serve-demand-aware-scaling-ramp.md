@@ -1,0 +1,286 @@
+# Demand-aware logical scaling with bounded waves
+
+## Problem
+
+Logical concurrency autoscaling currently treats
+`target_concurrency_per_replica` as both model execution concurrency and a
+divisor over all outstanding work. For one-job-per-GPU models, configuring 10
+to damp rejected bursts also divides real running occupancy by 10. This can
+publish a target below the number of GPUs that are actively executing jobs.
+
+The rejection signal has the opposite problem before saturation is applied.
+The load balancer retains each uniquely rejected job for 360 seconds. Adding
+that retained population one-for-one to current occupancy interprets every
+rejected arrival as six minutes of concurrent GPU work, even when the typical
+job takes 15 to 60 seconds.
+
+Finally, once hysteresis accepts a higher raw target, SkyServe can adopt the
+entire target in one decision. A short burst can therefore authorize hundreds
+of logical GPU launches before any provisioned capacity becomes ready.
+
+The production symptom has two separate parts. On 2026-07-19,
+`boltz-l4-fleet` had a demand target of 3 logical slots with no rejected demand,
+but 546 ready logical slots remained on 363 physical machines while service
+versions 15 and 16 overlapped. Target correctness and physical rollout or
+downscale convergence must remain separately observable.
+
+## Behavior contract
+
+### Demand components
+
+For logical concurrency services:
+
+```text
+active_work = in_flight + queue_depth + unknown_occupancy_floor
+
+retained_rejected_concurrency =
+    rejected_in_retention_window * expected_request_duration_seconds
+    / rejected_retention_window_seconds
+
+recent_rejected_concurrency =
+    rejected_in_recent_window * expected_request_duration_seconds
+    / recent_window_seconds
+
+rejected_concurrency = max(
+    retained_rejected_concurrency,
+    recent_rejected_concurrency)
+
+effective_capacity_per_gpu =
+    target_concurrency_per_replica
+    * target_utilization_percentage / 100
+
+raw_target = ceil(
+    (active_work + rejected_concurrency)
+    / effective_capacity_per_gpu)
+```
+
+`target_concurrency_per_replica` again describes simultaneous model execution
+slots per GPU. For Boltz it is 1. `target_utilization_percentage` describes
+request-slot headroom and is not hardware utilization.
+
+The load balancer reports both the existing six-minute deduplicated rejection
+population and the subset refreshed during the autoscaler's one-minute request
+window. The recent rate reacts to spikes; the retained rate keeps retried work
+as a slower pressure floor. A controller paired with an older load balancer
+uses only the retained value.
+
+If `expected_request_duration_seconds` is absent, rejected jobs retain the
+existing one-for-one contribution for backward compatibility. The expected
+duration conversion applies only to rejected pressure. Real running, queued,
+and unknown work remain current state and are never duration-compressed.
+
+The stale-report arrival floor uses the same workload conversion over its
+60-second timestamp window:
+
+```text
+arrival_concurrency =
+    arrivals_in_window * expected_request_duration_seconds
+    / arrival_window_seconds
+```
+
+It is then divided by effective per-GPU capacity. Stale mode remains raise-only
+and continues to prohibit scale-down.
+
+### Scale-up wave
+
+When raw demand exceeds the adopted target, a logical concurrency service may
+adopt at most:
+
+```text
+step = max(
+    scale_up_rate_min_replicas,
+    ceil(current_committed_capacity
+         * max_scale_up_rate_percentage / 100))
+
+next_target = min(raw_target, current_committed_capacity + step)
+```
+
+Current committed capacity is latest-version nonterminal planned logical
+capacity, including ready and provisioning backends. This prevents repeated
+ticks from authorizing the same missing capacity while launches are pending.
+Because the adopted target is controller-local, the first fresh recompute
+after a controller rebuild first raises its actuation baseline to current
+committed capacity. Any lower raw demand then goes through the ordinary
+downscale delay and wave limit instead of retiring a recovered fleet at once.
+
+After one upward wave, another increase requires
+`scale_up_rate_period_seconds`. Lower raw demand may still cancel an unneeded
+target through normal downscale rules. A controller rebuild may allow a fresh
+wave, but it still bases the ceiling on current committed capacity and can
+never jump from zero to the complete raw target.
+
+The limiter applies to demand-driven logical scale-up, including the stale
+arrival floor. It does not throttle failed replica cleanup, explicit service
+operations, or old-version retirement. Unknown-capacity replacement remains
+bounded by its existing incident controls.
+
+### Scale-down wave
+
+After raw demand remains lower for `downscale_delay_seconds`, ordinary
+demand-driven logical downscale may reduce the adopted target by at most:
+
+```text
+allowance = max(
+    1,
+    ceil(current_committed_capacity
+         * max_scale_down_rate_percentage / 100))
+
+next_target = max(raw_target,
+                  current_committed_capacity - allowance)
+```
+
+After adopting this lower target, the downscale counter resets. Another lower
+wave requires a new complete delay window. Busy-replica and stale-signal safety
+continue to clip actual victims.
+
+Failed/stopping cleanup, explicit shutdown, cost rebalance, and old-version
+retirement remain exempt. These are lifecycle actions rather than ordinary
+demand downscale. The dashboard and logs must expose raw demand, adopted
+target, and current committed capacity so an exempt rollout drain is not
+mistaken for a demand wave.
+
+### Configuration
+
+Add the following fields to logical concurrency replica policies:
+
+| Field | Type and range | Compatibility behavior |
+|---|---|---|
+| `target_utilization_percentage` | integer, 1 through 100 | 100 when absent |
+| `expected_request_duration_seconds` | positive number | absent preserves one-for-one rejected pressure |
+| `max_scale_up_rate_percentage` | integer, 1 through 100 | absent disables the scale-up wave limiter |
+| `scale_up_rate_min_replicas` | positive integer | required with scale-up percentage |
+| `scale_up_rate_period_seconds` | positive integer | required with scale-up percentage |
+| `max_scale_down_rate_percentage` | integer, 1 through 100 | 50 for new specs, 100 for old persisted objects missing the field |
+
+Scale-up fields must be configured together. Reject booleans and partial
+groups. Duration, utilization, and scale-up fields require
+`target_concurrency_per_replica` and logical replica semantics.
+
+The production Boltz policy is:
+
+```yaml
+target_concurrency_per_replica: 1
+target_utilization_percentage: 90
+expected_request_duration_seconds: 30
+max_scale_up_rate_percentage: 20
+scale_up_rate_min_replicas: 10
+scale_up_rate_period_seconds: 60
+upscale_delay_seconds: 20
+downscale_delay_seconds: 300
+max_scale_down_rate_percentage: 50
+```
+
+## Implementation milestones
+
+### 1. Policy plumbing
+
+Extend `SkyServiceSpec`, YAML schemas, parsing, serialization, copying,
+pickling compatibility, policy descriptions, and autoscaler diagnostics. Keep
+the new scale-up group opt-in so unrelated services do not change merely from
+a server upgrade.
+
+### 2. Logical target calculation
+
+Split active work from rejected pressure, calculate concurrent-equivalent
+rejections and stale arrivals, apply target utilization, and preserve unknown
+occupancy as fail-closed active work.
+
+### 3. Bounded actuation
+
+Apply the scale-up wave to fresh and stale target increases. Persist its
+timestamp through in-process service updates. Apply the 50 percent downscale
+wave after hysteresis and reset the counter after each permitted reduction.
+
+### 4. Production consumer and rollout
+
+Update the Boltz Platform production spec and inherited validator. Deploy an
+exact SkyPilot control-plane version first, then update the service directly.
+Keep the public load-balancer endpoint unchanged.
+
+Monitor through 08:00 EST. Success means the applied target follows actual
+in-flight work plus duration-normalized rejection pressure, target increases
+obey the 10-or-20-percent per-minute ceiling, ordinary downscale obeys the
+five-minute 50-percent waves, and physical capacity converges without request
+or error regression.
+
+## Alternatives considered
+
+### Continue using saturation 10
+
+Rejected. Dividing real running occupancy by 10 can target fewer GPUs than are
+actively executing. It also hides a duration assumption inside a concurrency
+field.
+
+### Remove rejected pressure
+
+Rejected. Rejected jobs represent demand SkyPilot could serve on later retries
+and must continue to incentivize capacity growth.
+
+### Average all outstanding work over a moving window
+
+Rejected for this iteration. Running and queued jobs are current state, not an
+arrival rate, and smoothing them can hide a growing real queue. The retained
+rejection population already provides a bounded arrival window and is the
+signal that needs duration conversion.
+
+### Use raw request rate only
+
+Rejected. Actual occupancy is more reliable for accepted asynchronous jobs,
+and pure request rate loses the safety floor for long-running and
+unknown-occupancy work.
+
+### Apply scale limits to rollout retirement
+
+Rejected. A rollout is not an ordinary demand decrease, and rate-limiting old
+version cleanup can prolong duplicate fleets. Rollout convergence remains
+separately observable and busy old replicas remain protected.
+
+## Rollout and rollback
+
+The user approved direct production deployment without a test-fleet gate.
+Focused unit and schema tests, formatting, exact-head review, and control-plane
+health are still mandatory before the service update.
+
+Deploy SkyPilot first. Verify the live API commit and version, then update the
+Platform service policy. Verify the service's committed and applied version,
+endpoint identity, raw and adopted targets, and logical and physical capacity.
+
+Rollback the service policy before rolling back SkyPilot. Remove the new
+scale-up fields, restore utilization 100 and concurrency 10, set scale-down
+rate to 100, then restore the previous control-plane image if required.
+
+## Test plan
+
+- Validate defaults, explicit values, invalid ranges, partial scale-up groups,
+  YAML round trips, copying, and old-pickle fallbacks.
+- Verify running and queued work remain one-for-one while rejected work is
+  converted from both 30/360 retained and 30/60 recent rates, takes the larger
+  value, and is divided by 90 percent effective capacity.
+- Verify stale arrivals use duration divided by the 60-second arrival window.
+- Verify zero-to-high demand adopts 10 slots, waits 60 seconds, then adopts the
+  larger of 10 or 20 percent based on committed logical capacity.
+- Verify provisioning capacity is committed and prevents duplicate waves.
+- Verify in-process updates preserve the rate timestamp and a rebuild never
+  jumps directly to the raw target.
+- Verify a demand rebound does not cause scale-down and stale reports cannot
+  shrink capacity.
+- Verify 50 percent downscale requires a fresh complete five-minute window per
+  wave and works for mixed 1, 4, and 8-slot backends.
+- Verify busy replica, rolling update, failed cleanup, and cost-rebalance safety
+  remain unchanged or exempt as specified.
+- Run focused Serve tests, format changed files, then rerun the focused suite.
+
+## Manual production test
+
+1. Record the live API commit/version, service endpoint, service version,
+   target components, and logical/physical capacity.
+2. Deploy the exact SkyPilot build and verify health and commit identity.
+3. Apply the production service YAML and verify committed version equals
+   applied version without endpoint change.
+4. Sample every minute. A rising raw demand target may be large, but the
+   adopted target must increase by no more than the configured wave per 60
+   seconds.
+5. During falling demand, verify no ordinary second downscale wave occurs
+   before a fresh 300-second window.
+6. Track request rate, in-flight, queue, rejected, failed, and endpoint health
+   while logical and physical capacity converge.
