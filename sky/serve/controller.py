@@ -937,10 +937,30 @@ class SkyServeController:
                     drain_authoritative or ha_enabled) else ()),
                 'reconcile_generation': reconcile_generation,
                 'queue_depth': effective_request_data.get('queue_depth'),
+                'queue_depth_by_priority':
+                    effective_request_data.get('queue_depth_by_priority'),
                 'rejected_in_window':
                     effective_request_data.get('rejected_in_window'),
                 'rejected_in_recent_window':
                     effective_request_data.get('rejected_in_recent_window'),
+                'rejected_in_window_by_priority': effective_request_data.get(
+                    'rejected_in_window_by_priority'),
+                'rejected_in_recent_window_by_priority':
+                    effective_request_data.get(
+                        'rejected_in_recent_window_by_priority'),
+                'unique_job_arrivals_60s':
+                    effective_request_data.get('unique_job_arrivals_60s'),
+                'unique_job_arrivals_300s':
+                    effective_request_data.get('unique_job_arrivals_300s'),
+                'headerless_arrivals_60s':
+                    effective_request_data.get('headerless_arrivals_60s'),
+                'headerless_arrivals_300s':
+                    effective_request_data.get('headerless_arrivals_300s'),
+                'offered_arrival_tracking_saturated':
+                    effective_request_data.get(
+                        'offered_arrival_tracking_saturated'),
+                'pressure_report_is_floored':
+                    effective_request_data.get('pressure_report_is_floored'),
             })
             if (translated_in_flight is not None and getattr(
                     self._autoscaler, 'replica_unit', None) == 'logical'):
