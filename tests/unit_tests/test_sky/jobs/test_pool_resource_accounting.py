@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access,redefined-outer-name
 
+import asyncio
 import contextlib
 
 import filelock
@@ -36,7 +37,11 @@ def managed_jobs_db(tmp_path, monkeypatch):
     monkeypatch.setattr(state._db_manager, '_engine_async', async_engine)
 
     state.create_table(engine)
-    yield engine
+    try:
+        yield engine
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 def _insert_task(engine, job_id: int, task_id: int, *, status: ManagedJobStatus,

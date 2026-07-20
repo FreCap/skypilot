@@ -173,6 +173,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/serve/placement',
+        'method': 'POST'
+    },
+    {
         'path': '/serve/logs',
         'method': 'POST'
     },

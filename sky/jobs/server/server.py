@@ -1,20 +1,19 @@
 """REST API for managed jobs."""
 
-import pathlib
+import asyncio
 
 import fastapi
 
 from sky import sky_logging
 from sky.jobs import utils as managed_jobs_utils
 from sky.jobs.server import core
+from sky.server import common as server_common
 from sky.server import stream_utils
-from sky.server.blob import blob_storage as bs
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.server.requests import role_filter
-from sky.skylet import constants
 from sky.utils import common
 
 logger = sky_logging.init_logger(__name__)
@@ -133,6 +132,7 @@ async def logs(
     jobs_logs_body: payloads.JobsLogsBody = fastapi.Depends(
         role_filter.force_viewer_jobs_logs_body),
 ) -> fastapi.responses.StreamingResponse:
+    stream_utils.ensure_request_log_storage_available()
     schedule_type = api_requests.ScheduleType.SHORT
     if _controller_refresh_need_long(jobs_logs_body.refresh):
         # When refresh is specified, the job controller might be restarted,
@@ -176,10 +176,10 @@ async def download_logs(
     jobs_download_logs_body: payloads.JobsDownloadLogsBody = fastapi.Depends(
         role_filter.force_viewer_jobs_download_logs_body),
 ) -> None:
-    user_hash = jobs_download_logs_body.env_vars[constants.USER_ID_ENV_VAR]
-    logs_dir_on_api_server = pathlib.Path(
-        bs.get_blob_storage().download_tmp_dir(user_hash))
-    logs_dir_on_api_server.expanduser().mkdir(parents=True, exist_ok=True)
+    user_hash = server_common.get_request_user_id(request,
+                                                  jobs_download_logs_body)
+    logs_dir_on_api_server = await asyncio.to_thread(
+        server_common.prepare_download_tmp_dir, user_hash)
     # We should reuse the original request body, so that the env vars, such as
     # user hash, are kept the same.
     jobs_download_logs_body.local_dir = str(logs_dir_on_api_server)
@@ -244,6 +244,7 @@ async def pool_tail_logs(
     request: fastapi.Request, log_body: payloads.JobsPoolLogsBody,
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
+    stream_utils.ensure_request_log_storage_available()
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.JOBS_POOL_LOGS,
@@ -272,12 +273,15 @@ async def pool_download_logs(
     request: fastapi.Request,
     download_logs_body: payloads.JobsPoolDownloadLogsBody,
 ) -> None:
-    user_hash = download_logs_body.env_vars[constants.USER_ID_ENV_VAR]
+    user_hash = server_common.get_request_user_id(request, download_logs_body)
     timestamp = sky_logging.get_run_timestamp()
-    logs_dir_on_api_server = (
-        pathlib.Path(bs.get_blob_storage().download_tmp_dir(user_hash)) /
-        'pool' / f'{download_logs_body.pool_name}_{timestamp}')
-    logs_dir_on_api_server.expanduser().mkdir(parents=True, exist_ok=True)
+    download_tmp = await asyncio.to_thread(
+        server_common.prepare_download_tmp_dir, user_hash)
+    logs_dir_on_api_server = (download_tmp / 'pool' /
+                              f'{download_logs_body.pool_name}_{timestamp}')
+    await asyncio.to_thread(logs_dir_on_api_server.mkdir,
+                            parents=True,
+                            exist_ok=True)
     # We should reuse the original request body, so that the env vars, such as
     # user hash, are kept the same.
     download_logs_body.local_dir = str(logs_dir_on_api_server)

@@ -10,14 +10,22 @@ allow_split_before_dict_value = false
 required_plugins = [
     "pytest-xdist",
     "pytest-env>=0.6",
-    "buildkite-test-collector"
+    "buildkite-test-collector",
+    "pytest-asyncio>=1.2",
 ]
 env = [
     "SKYPILOT_DEBUG=1",
     "SKYPILOT_DISABLE_USAGE_COLLECTION=1"
 ]
 addopts = "-s -n 16 -q --tb=short --dist loadgroup --disable-warnings"
+asyncio_mode = "strict"
+asyncio_debug = true
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "error::RuntimeWarning",
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.mypy]
 python_version = "3.14"
@@ -36,9 +44,27 @@ allow_redefinition = true
 check_untyped_defs = true
 enable_error_code = ["possibly-undefined"]
 
+[[tool.mypy.overrides]]
+# Lock-event transitions depend on before/after state predicates. Catch
+# predicate methods accidentally treated as truthy objects.
+module = "sky.utils.lock_events"
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# Recovery paths must keep dedicated-cluster and shared-pool behavior reachable;
+# a misplaced pool guard can otherwise silently disable targeted cancellation.
+module = "sky.jobs.recovery_strategy"
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# Stream failures must remain reachable before successful-response metadata;
+# otherwise a validating header lookup can bypass the request-result fallback.
+module = "sky.client.sdk"
+warn_unreachable = true
+
 [tool.basedpyright]
-# A focused complement to mypy. Keep the high-signal coroutine and
-# control-flow checks enabled while the broader type baseline remains noisy.
+# A focused complement to mypy. Keep high-signal coroutine, control-flow, and
+# interface-contract checks enabled while the broader type baseline is noisy.
 include = ["sky"]
 exclude = ["sky/schemas/generated", "sky/dashboard"]
 pythonVersion = "3.14"
@@ -49,6 +75,22 @@ reportUnboundVariable = "error"
 reportPossiblyUnboundVariable = "error"
 reportGeneralTypeIssues = "error"
 reportReturnType = "error"
+reportIncompatibleMethodOverride = "error"
+reportInvalidCast = "error"
+reportOverlappingOverload = "error"
+reportInvalidStringEscapeSequence = "error"
+reportMatchNotExhaustive = "error"
+# Keep abstract declarations backed by runtime ABC machinery and prevent
+# abstract base classes from being instantiated internally.
+reportAbstractUsage = "error"
+reportInvalidAbstractMethod = "error"
+# Preserve structural invariants that are otherwise easy for dynamic Python to
+# accept until the affected path executes.
+reportInconsistentConstructor = "error"
+reportInvalidTypeVarUse = "error"
+reportAssertAlwaysTrue = "error"
+reportUnhashable = "error"
+reportUnsafeMultipleInheritance = "error"
 
 [tool.isort]
 profile = "google"
@@ -65,13 +107,16 @@ use_parentheses = true
 target-version = "py310"
 # yapf owns formatting; ruff runs as a bug-finding linter only.
 extend-exclude = ["sky/schemas/generated", "build", "sky/dashboard"]
+preview = true
 
 [tool.ruff.lint]
+explicit-preview-rules = true
 select = [
     "F",       # pyflakes: undefined names, unused vars, f-string bugs
     "B",       # bugbear: mutable defaults, loop-var capture, except bugs
     "PLE",     # pylint error-severity rules
     "RUF006",  # asyncio.create_task without a saved reference (GC hazard)
+    "RUF027",  # probable f-string missing its prefix
     "ASYNC1",  # async correctness (busy-wait, timeout misuse)
     "ASYNC2",  # blocking calls in async functions
     "UP",      # pyupgrade: keep code on modern (>=3.10) idioms
@@ -91,8 +136,6 @@ ignore = [
     "B904",     # raise without from inside except (66 sites)
     "B905",     # zip without strict= (31 sites)
     "ASYNC109", # async function with a timeout parameter
-    "ASYNC230", # blocking open() in async function (18 sites)
-    "ASYNC240", # blocking path method in async function
 ]
 
 [tool.ruff.lint.per-file-ignores]

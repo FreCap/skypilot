@@ -17,12 +17,18 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
-from sqlalchemy.ext import declarative
 
 from sky import exceptions
 from sky import resources as resources_lib
 from sky import sky_logging
-from sky.dag import DagExecution
+from sky.jobs import state_schema
+from sky.jobs.state_schema import api_access_token_table
+from sky.jobs.state_schema import batch_state_table
+from sky.jobs.state_schema import batch_worker_table
+from sky.jobs.state_schema import ha_recovery_script_table
+from sky.jobs.state_schema import job_events_table
+from sky.jobs.state_schema import job_info_table
+from sky.jobs.state_schema import spot_table
 from sky.jobs.status_types import BatchLifecycleTransition
 from sky.jobs.status_types import ControllerPidRecord
 from sky.jobs.status_types import JobCancellationState
@@ -54,238 +60,8 @@ JOB_EVENT_DAEMON_INTERVAL_SECONDS = 3600
 # Bound parameters per token upsert while keeping all chunks in one transaction.
 _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
 
-Base = declarative.declarative_base()
-
-# === Database schema ===
-# `spot` table contains all the finest-grained tasks, including all the
-# tasks of a managed job (called spot for legacy reason, as it is generalized
-# from the previous managed spot jobs). All tasks of the same job will have the
-# same `spot_job_id`.
-# The `job_name` column is now deprecated. It now holds the task's name, i.e.,
-# the same content as the `task_name` column.
-# The `job_id` is now not really a job id, but a only a unique
-# identifier/primary key for all the tasks. We will use `spot_job_id`
-# to identify the job.
-# TODO(zhwu): schema migration may be needed.
-
-spot_table = sqlalchemy.Table(
-    'spot',
-    Base.metadata,
-    sqlalchemy.Column('job_id',
-                      sqlalchemy.Integer,
-                      primary_key=True,
-                      autoincrement=True),
-    sqlalchemy.Column('job_name', sqlalchemy.Text),
-    sqlalchemy.Column('resources', sqlalchemy.Text),
-    sqlalchemy.Column('submitted_at', sqlalchemy.Float),
-    # Indexed because non-terminal-status filtering on this column is on the
-    # hot path for the pool dashboard (per-pool job listing) and skip_finished
-    # queries; without it the filter is a full table scan over all (including
-    # finished) tasks.
-    sqlalchemy.Column('status', sqlalchemy.Text, index=True),
-    sqlalchemy.Column('run_timestamp', sqlalchemy.Text),
-    sqlalchemy.Column('start_at', sqlalchemy.Float, server_default=None),
-    sqlalchemy.Column('end_at', sqlalchemy.Float, server_default=None),
-    sqlalchemy.Column('last_recovered_at',
-                      sqlalchemy.Float,
-                      server_default='-1'),
-    sqlalchemy.Column('recovery_count', sqlalchemy.Integer, server_default='0'),
-    sqlalchemy.Column('job_duration', sqlalchemy.Float, server_default='0'),
-    sqlalchemy.Column('failure_reason', sqlalchemy.Text),
-    sqlalchemy.Column('spot_job_id', sqlalchemy.Integer, index=True),
-    sqlalchemy.Column('task_id', sqlalchemy.Integer, server_default='0'),
-    sqlalchemy.Column('task_name', sqlalchemy.Text),
-    sqlalchemy.Column('specs', sqlalchemy.Text),
-    sqlalchemy.Column('local_log_file', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('metadata', sqlalchemy.Text, server_default='{}'),
-    sqlalchemy.Column('links', sqlalchemy.JSON, server_default=None),
-    sqlalchemy.Column('logs_cleaned_at', sqlalchemy.Float, server_default=None),
-    sqlalchemy.Column('full_resources', sqlalchemy.JSON, server_default=None),
-    # Whether this task is a primary task (True) or auxiliary task (False)
-    # within a job group. NULL for non-job-group jobs (single jobs/pipelines).
-    # Auxiliary tasks are terminated when all primary tasks complete.
-    sqlalchemy.Column('is_primary_in_job_group',
-                      sqlalchemy.Boolean,
-                      server_default=None),
-    # Optional plugin-provided override for the user-facing status. The core
-    # state machine never reads this column; it always uses `status`. Read
-    # paths (status counts, status filter, returned status) may surface this
-    # value instead of `status` via the optional `status_expr` seam, so a
-    # plugin can present a refined status (e.g. show a still-launching job as
-    # PENDING while it waits in an external scheduler queue) without altering
-    # the underlying job lifecycle. NULL means "no override".
-    sqlalchemy.Column('status_override', sqlalchemy.Text, server_default=None),
-)
-
-job_info_table = sqlalchemy.Table(
-    'job_info',
-    Base.metadata,
-    sqlalchemy.Column('spot_job_id',
-                      sqlalchemy.Integer,
-                      primary_key=True,
-                      autoincrement=True),
-    sqlalchemy.Column('name', sqlalchemy.Text),
-    sqlalchemy.Column('schedule_state', sqlalchemy.Text),
-    sqlalchemy.Column('controller_pid', sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('controller_pid_started_at',
-                      sqlalchemy.Float,
-                      server_default=None),
-    sqlalchemy.Column('dag_yaml_path', sqlalchemy.Text),
-    sqlalchemy.Column('env_file_path', sqlalchemy.Text),
-    sqlalchemy.Column('dag_yaml_content', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('env_file_content', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('config_file_content',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('user_hash', sqlalchemy.Text),
-    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('priority',
-                      sqlalchemy.Integer,
-                      server_default=str(constants.DEFAULT_PRIORITY)),
-    sqlalchemy.Column('priority_class', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('entrypoint', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('original_user_yaml_path',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('original_user_yaml_content',
-                      sqlalchemy.Text,
-                      server_default=None),
-    # Indexed: every per-pool dashboard query and pool_status request filters
-    # by this column. Without an index a job_info table with tens of thousands
-    # of (mostly finished) rows turns each pool lookup into a full scan.
-    sqlalchemy.Column('pool', sqlalchemy.Text, server_default=None, index=True),
-    # Indexed: pool_status fetches per-replica used_by lists by filtering on
-    # current_cluster_name; the index keeps that fast when many jobs share
-    # the same pool.
-    sqlalchemy.Column('current_cluster_name',
-                      sqlalchemy.Text,
-                      server_default=None,
-                      index=True),
-    sqlalchemy.Column('job_id_on_pool_cluster',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('pool_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('controller_logs_cleaned_at',
-                      sqlalchemy.Float,
-                      server_default=None),
-    # DAG execution mode: 'parallel' (job group) or 'serial' (pipeline/single)
-    sqlalchemy.Column('execution',
-                      sqlalchemy.Text,
-                      server_default=DagExecution.SERIAL.value),
-    # Infrastructure columns for efficient filtering/sorting
-    sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('zone', sqlalchemy.Text, server_default=None),
-    # Whether this job is a batch coordinator (ds.map()).  Batch jobs are
-    # serialized one-at-a-time per pool by the scheduler.
-    sqlalchemy.Column('is_batch',
-                      sqlalchemy.Boolean,
-                      server_default=sqlalchemy.sql.expression.false()),
-    # Durable fencing token for the coordinator incarnation that currently
-    # owns this Batch job.  Every attempt mutation checks this value so a
-    # replacement controller immediately fences its predecessor.
-    sqlalchemy.Column('batch_coordinator_token',
-                      sqlalchemy.Text,
-                      server_default=None),
-    # Node names for dashboard display (comma-separated)
-    sqlalchemy.Column('node_names', sqlalchemy.Text, server_default=None),
-    # In consolidation mode, managed jobs shares the filemount blob managed
-    # by API server. This id is a reference to the blob.
-    sqlalchemy.Column('file_mounts_blob_id',
-                      sqlalchemy.Text,
-                      server_default=None),
-)
-
-# Separate table for API access token IDs associated with managed jobs.
-# Maps job_id -> token_id for cleanup when the job completes.
-api_access_token_table = sqlalchemy.Table(
-    'api_access_tokens',
-    Base.metadata,
-    sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('token_id', sqlalchemy.Text, nullable=False),
-)
-
-# TODO(cooperc): drop the table in a migration
-ha_recovery_script_table = sqlalchemy.Table(
-    'ha_recovery_script',
-    Base.metadata,
-    sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('script', sqlalchemy.Text),
-)
-
-job_events_table = sqlalchemy.Table(
-    'job_events',
-    Base.metadata,
-    sqlalchemy.Column('id',
-                      sqlalchemy.Integer,
-                      primary_key=True,
-                      autoincrement=True),
-    # See comment above for explanation of the legacy spot_job_id and
-    # task_id columns.
-    sqlalchemy.Column('spot_job_id', sqlalchemy.Integer, index=True),
-    sqlalchemy.Column('task_id', sqlalchemy.Integer, index=True),
-    sqlalchemy.Column('new_status', sqlalchemy.Text),
-    sqlalchemy.Column('code', sqlalchemy.Text),
-    sqlalchemy.Column('reason', sqlalchemy.Text),
-    sqlalchemy.Column('timestamp',
-                      sqlalchemy.DateTime(timezone=True),
-                      index=True),
-)
-
-batch_state_table = sqlalchemy.Table(
-    'batch_state',
-    Base.metadata,
-    sqlalchemy.Column('job_id', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('batch_idx', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('start_idx', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('end_idx', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('status',
-                      sqlalchemy.Text,
-                      nullable=False,
-                      server_default='PENDING'),
-    sqlalchemy.Column('worker_cluster', sqlalchemy.Text),
-    sqlalchemy.Column('retry_count',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      server_default='0'),
-    # Monotonically increasing fencing token.  Every successful claim gets a
-    # new value; state transitions from an older controller incarnation are
-    # rejected once a newer attempt has claimed the batch.
-    sqlalchemy.Column('attempt_id',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      server_default='0'),
-    # Coordinator incarnation that claimed the current attempt.  This remains
-    # set after the attempt leaves DISPATCHED so replacement coordinators can
-    # identify exactly which token-scoped worker services may be stale.
-    sqlalchemy.Column('attempt_owner_token', sqlalchemy.Text),
-    sqlalchemy.Column('lease_expires_at', sqlalchemy.Float),
-    # Earliest wall-clock time at which a failed batch may be claimed again.
-    # Persisting this makes retry backoff survive controller restarts.
-    sqlalchemy.Column('next_retry_at', sqlalchemy.Float),
-    sqlalchemy.Column('updated_at', sqlalchemy.Float),
-    sqlalchemy.PrimaryKeyConstraint('job_id', 'batch_idx'),
-)
-
-# Durable launch intents for long-running Batch worker services.  The row is
-# inserted before the external ``sdk.exec`` call, then filled with the request
-# ID and exact worker job ID as they become available.  This bridges worker
-# launches that happen before any batch attempt is claimed and lets a later
-# coordinator clean only the exact external job created by an older one.
-batch_worker_table = sqlalchemy.Table(
-    'batch_worker',
-    Base.metadata,
-    sqlalchemy.Column('job_id', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('coordinator_token', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('worker_cluster', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('worker_job_name', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('launch_request_id', sqlalchemy.Text),
-    sqlalchemy.Column('worker_job_id', sqlalchemy.Integer),
-    sqlalchemy.Column('updated_at', sqlalchemy.Float),
-    sqlalchemy.PrimaryKeyConstraint('job_id', 'coordinator_token',
-                                    'worker_cluster'),
-)
+# Keep the historical schema facade for migrations and external callers.
+Base = state_schema.Base
 
 # Subquery that aggregates batch_state into per-job progress counts.
 # Used by jobs-queue queries to supply batch_total_batches and
@@ -426,7 +202,8 @@ async def _retry_schedule_state_update(
             await session.commit()
             if count == 1 or idempotent:
                 return
-            assert count == 0, (job_id, count)
+            if count != 0:
+                raise AssertionError((job_id, count))
             if count == 0 and attempt > 0 and prior_update_matched:
                 current = await session.execute(
                     sqlalchemy.select(job_info_table.c.schedule_state).where(
@@ -434,7 +211,7 @@ async def _retry_schedule_state_update(
                 row = current.fetchone()
                 if row is not None and row[0] == target_state.value:
                     return
-            assert False, (job_id, count)
+            raise AssertionError((job_id, count))
 
     await db_retries.with_db_retries_async(_op)
 
@@ -848,18 +625,18 @@ def get_nonterminal_job_ids_by_name(name: str | None,
         return job_ids
 
 
-def get_jobs_to_check_status(job_id: int | None = None) -> list[int]:
+def get_jobs_to_check_status(job_ids: list[int] | None = None) -> list[int]:
     """Get jobs that need controller process checking.
 
     Args:
-        job_id: Optional job ID to check. If None, checks all jobs.
+        job_ids: Optional job IDs to check. If None, checks all jobs.
 
     Returns a list of job_ids, including the following:
     - Jobs that have a schedule_state that is not DONE
     - Jobs have schedule_state DONE but are in a non-terminal status
     - Legacy jobs (that is, no schedule state) that are in non-terminal status
     """
-    where_condition = _get_jobs_to_check_status_condition(job_id)
+    where_condition = _get_jobs_to_check_status_condition(job_ids)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = sqlalchemy.select(
@@ -1060,7 +837,7 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
     for row in rows:
         job_dict = _get_jobs_dict(row._mapping)  # pylint: disable=protected-access
         # WARNING: Keep this decode (enum conversion + job_name fallback) in
-        # sync with get_jobs_status_check_info.
+        # sync with _merge_jobs_status_check_rows.
         job_dict['status'] = ManagedJobStatus(job_dict['status'])
         job_dict['schedule_state'] = ManagedJobScheduleState(
             job_dict['schedule_state'])
@@ -1091,7 +868,7 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
 _STATUS_CHECK_JOB_ID_CHUNK = 500
 
 
-def _get_jobs_to_check_status_condition(job_id: int | None = None):
+def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     """Build the filter for jobs that need controller-process checking."""
     terminal_status_values = [
         status.value for status in ManagedJobStatus.terminal_statuses()
@@ -1113,10 +890,46 @@ def _get_jobs_to_check_status_condition(job_id: int | None = None):
         ~spot_table.c.status.in_(terminal_status_values),
     )
     where_condition = sqlalchemy.or_(condition1, condition2)
-    if job_id is not None:
+    if job_ids is not None:
         where_condition = sqlalchemy.and_(where_condition,
-                                          spot_table.c.spot_job_id == job_id)
+                                          spot_table.c.spot_job_id.in_(job_ids))
     return where_condition
+
+
+def _status_check_select(from_clause) -> 'sqlalchemy.Select':
+    """The slim 9-column projection shared by the status-check snapshots."""
+    return sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.task_name,
+        job_info_table.c.name.label('job_info_name'),
+        job_info_table.c.schedule_state,
+        job_info_table.c.controller_pid,
+        job_info_table.c.controller_pid_started_at,
+        job_info_table.c.pool,
+    ).select_from(from_clause)
+
+
+def _spot_job_info_outerjoin():
+    return spot_table.outerjoin(
+        job_info_table,
+        spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
+
+
+def _collect_status_check_snapshot(
+    job_ids: list[int] | None, fetch_chunk: Callable[[list[int] | None],
+                                                     list[Any]]
+) -> dict[int, dict[str, Any]]:
+    """Chunk ``job_ids`` and merge the fetched rows into one snapshot."""
+    result: dict[int, dict[str, Any]] = {}
+    if job_ids is None:
+        _merge_jobs_status_check_rows(result, fetch_chunk(None))
+        return result
+    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+        _merge_jobs_status_check_rows(result, fetch_chunk(chunk))
+    return result
 
 
 def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
@@ -1151,7 +964,7 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
 
 
 def get_jobs_to_check_status_info(
-        job_id: int | None = None) -> dict[int, dict[str, Any]]:
+        job_ids: list[int] | None = None) -> dict[int, dict[str, Any]]:
     """One-query slim snapshot for jobs needing controller-process checking.
 
     The status-refresh sweep needs two things from the same tables:
@@ -1162,37 +975,26 @@ def get_jobs_to_check_status_info(
     per-job/per-task shape as ``get_jobs_status_check_info`` but does the
     "which jobs?" filter in a subquery and returns the full slim snapshot in
     one SQL statement.
+
+    When ``job_ids`` is given, the filter is chunked so a large batch (e.g.
+    ``sky jobs cancel --all``) never overflows the DB bind-parameter limit.
     """
     engine = _db_manager.get_engine()
-    jobs_to_check = sqlalchemy.select(
-        spot_table.c.spot_job_id.label('spot_job_id')).select_from(
-            spot_table.outerjoin(
-                job_info_table,
-                spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
-        ).where(
-            _get_jobs_to_check_status_condition(job_id)).distinct().subquery()
-    query = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-        spot_table.c.task_name,
-        job_info_table.c.name.label('job_info_name'),
-        job_info_table.c.schedule_state,
-        job_info_table.c.controller_pid,
-        job_info_table.c.controller_pid_started_at,
-        job_info_table.c.pool,
-    ).select_from(
-        spot_table.outerjoin(
-            job_info_table,
-            spot_table.c.spot_job_id == job_info_table.c.spot_job_id).join(
-                jobs_to_check, spot_table.c.spot_job_id ==
-                jobs_to_check.c.spot_job_id)).order_by(
-                    spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
-    with orm.Session(engine) as session:
-        rows = session.execute(query).fetchall()
-    result: dict[int, dict[str, Any]] = {}
-    _merge_jobs_status_check_rows(result, rows)
-    return result
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        jobs_to_check = sqlalchemy.select(
+            spot_table.c.spot_job_id.label('spot_job_id')).select_from(
+                _spot_job_info_outerjoin()).where(
+                    _get_jobs_to_check_status_condition(
+                        chunk)).distinct().subquery()
+        query = _status_check_select(_spot_job_info_outerjoin().join(
+            jobs_to_check,
+            spot_table.c.spot_job_id == jobs_to_check.c.spot_job_id)).order_by(
+                spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
+        with orm.Session(engine) as session:
+            return session.execute(query).fetchall()
+
+    return _collect_status_check_snapshot(job_ids, _fetch_chunk)
 
 
 def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -1221,30 +1023,16 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not job_ids:
         return {}
     engine = _db_manager.get_engine()
-    result: dict[int, dict[str, Any]] = {}
-    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-        query = sqlalchemy.select(
-            spot_table.c.spot_job_id,
-            spot_table.c.task_id,
-            spot_table.c.status,
-            spot_table.c.task_name,
-            job_info_table.c.name.label('job_info_name'),
-            job_info_table.c.schedule_state,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
-            job_info_table.c.pool,
-        ).select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    spot_table.c.spot_job_id.in_(chunk)).order_by(
-                        spot_table.c.spot_job_id.asc(),
-                        spot_table.c.task_id.asc())
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        assert chunk is not None
+        query = _status_check_select(_spot_job_info_outerjoin()).where(
+            spot_table.c.spot_job_id.in_(chunk)).order_by(
+                spot_table.c.spot_job_id.asc(), spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
-            rows = session.execute(query).fetchall()
-        _merge_jobs_status_check_rows(result, rows)
-    return result
+            return session.execute(query).fetchall()
+
+    return _collect_status_check_snapshot(job_ids, _fetch_chunk)
 
 
 def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
@@ -2018,7 +1806,8 @@ def scheduler_set_waiting(job_ids: list[int],
             sqlalchemy.and_(
                 job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
         session.commit()
-        assert updated_count == len(job_ids), (job_ids, updated_count)
+        if updated_count != len(job_ids):
+            raise AssertionError((job_ids, updated_count))
 
 
 @db_retries.retry
@@ -2836,8 +2625,8 @@ def scheduler_set_done(job_id: int, idempotent: bool = False) -> None:
                     ManagedJobScheduleState.DONE.value
             })
         session.commit()
-        if not idempotent:
-            assert updated_count == 1, (job_id, updated_count)
+        if not idempotent and updated_count != 1:
+            raise AssertionError((job_id, updated_count))
 
 
 def get_job_schedule_state(job_id: int) -> ManagedJobScheduleState:

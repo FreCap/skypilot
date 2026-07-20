@@ -50,7 +50,8 @@ def _handle_io_stream(io_stream, out_stream, args: _ProcessingArgs):
     ...
 
 
-def process_subprocess_stream(proc, args: _ProcessingArgs) -> tuple[str, str]:
+def process_subprocess_stream(proc, stdout_stream_handler,
+                              stderr_stream_handler) -> tuple[str, str]:
     ...
 
 
@@ -98,7 +99,7 @@ def run_with_log(cmd: list[str] | str,
 def run_with_log(cmd: list[str] | str,
                  log_path: str,
                  *,
-                 require_outputs: bool = False,
+                 require_outputs: bool,
                  stream_logs: bool = ...,
                  start_streaming_at: str = ...,
                  end_streaming_at: str | None = ...,
@@ -110,7 +111,7 @@ def run_with_log(cmd: list[str] | str,
                  streaming_prefix: str | None = ...,
                  log_cmd: bool = ...,
                  timeout: int | None = ...,
-                 **kwargs) -> tuple[int, int]:
+                 **kwargs) -> int | tuple[int, str, str]:
     ...
 
 

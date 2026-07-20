@@ -38,6 +38,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 import test_reserved_fill_broker as sqlite_suite
 
 from sky.serve import lb_ha
+from sky.serve import placement_history
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
@@ -350,6 +351,8 @@ class TestMigrationChainPG:
                     'demand_capacity_observations',
                     'serve_replica_status_history',
                     'serve_request_activity_history',
+                    'serve_autoscaler_history',
+                    'serve_placement_events',
                 }.issubset(tables), tables
                 service_columns = {
                     column['name']
@@ -398,11 +401,19 @@ class TestMigrationChainPG:
                 assert 'phantom_streak' in columns, columns
                 assert 'shrink_baseline' in columns, columns
                 assert 'fence_pending' in columns, columns
+                request_columns = {
+                    column['name']: column for column in inspector.get_columns(
+                        'serve_request_activity_history')
+                }
+                assert 'rejected_count' in request_columns, request_columns
+                assert request_columns['rejected_count']['default'] is not None
+                assert request_columns['rejection_count_available'][
+                    'default'] is not None
         finally:
             engine.dispose()
 
     @pytest.mark.parametrize('preview_workspace_016', [False, True])
-    def test_revision_018_reconciles_conflicting_revision_016_layouts(
+    def test_revision_020_reconciles_conflicting_revision_016_layouts(
             self, pg_server, preview_workspace_016):
         """Both pre-merge revision 016 schemas converge on PostgreSQL."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
@@ -494,6 +505,47 @@ class TestMigrationChainPG:
                             'name': 'legacy-svc'
                         }).scalar_one()
             assert workspace is None
+        finally:
+            engine.dispose()
+
+    def test_revision_020_repairs_preview_revision_018_collision(
+            self, pg_server):
+        """A preview DB stamped 018 gains the current 018 placement table."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '017')
+            with engine.begin() as connection:
+                # The preview's revision 018 added ``workspace``.  Revision
+                # 001 creates tables from the current model metadata, so a
+                # fresh test database already has that column by revision 017.
+                # Stamping it 018 without running the current revision 018
+                # faithfully models the historical collision: workspace is
+                # present while the placement-events table is absent.
+                connection.execute(
+                    sqlalchemy.text(
+                        'UPDATE alembic_version_serve_state_db '
+                        "SET version_num = '018'"))
+
+            assert 'serve_placement_events' not in set(
+                sqlalchemy.inspect(engine).get_table_names())
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            assert 'serve_placement_events' in set(inspector.get_table_names())
+            assert 'workspace' in {
+                column['name'] for column in inspector.get_columns('services')
+            }
+            with engine.connect() as connection:
+                version = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert version == migration_utils.SERVE_VERSION
         finally:
             engine.dispose()
 
@@ -640,9 +692,64 @@ def history_engine(pg_server, monkeypatch):
     engine = create_engine(url)
     serve_state.Base.metadata.create_all(engine)
     serve_history.metadata.create_all(engine)
+    placement_history.metadata.create_all(engine)
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    placement_history.reset_request_buffer()
     yield engine
+    placement_history.reset_request_buffer()
     engine.dispose()
+
+
+class TestServePlacementHistoryPG:
+
+    def test_flush_pages_and_scopes_exact_incarnation(self, history_engine):
+        del history_engine  # Fixture initializes the PostgreSQL metadata.
+        now = time.time()
+        for timestamp, service_hash, outcome in [
+            (now, 'hash-a', 'capacity_failed'),
+            (now + 1, 'hash-a', 'succeeded'),
+            (now + 2, 'hash-b', 'quota_failed'),
+        ]:
+            assert placement_history.record_event(
+                service_name='svc',
+                service_hash=service_hash,
+                request_id='request-a',
+                cluster_name='svc-1',
+                outcome=outcome,
+                provider='AWS',
+                region='us-east-1',
+                zone='us-east-1a',
+                instance_type='g6.4xlarge',
+                num_nodes=1,
+                hourly_price=0.25,
+                error_summary='\x1b[31m capacity\n unavailable \x1b[0m',
+                timestamp=timestamp)
+
+        assert placement_history.flush_request_buffer() == 3
+        first = placement_history.get_history('svc',
+                                              'hash-a',
+                                              limit=1,
+                                              timestamp=now + 3)
+        assert [event['outcome'] for event in first['events']] == ['succeeded']
+        assert first['next_cursor'] is not None
+        second = placement_history.get_history('svc',
+                                               'hash-a',
+                                               limit=1,
+                                               cursor=first['next_cursor'],
+                                               timestamp=now + 3)
+        assert [event['outcome'] for event in second['events']
+               ] == ['capacity_failed']
+        assert second['events'][0]['error_summary'] == 'capacity unavailable'
+        assert first['outcome_counts'] == {
+            'capacity_failed': 1,
+            'succeeded': 1,
+        }
+
+        recreated = placement_history.get_history('svc',
+                                                  'hash-b',
+                                                  timestamp=now + 3)
+        assert [event['outcome'] for event in recreated['events']
+               ] == ['quota_failed']
 
 
 class TestServeStatusHistoryPG:
@@ -778,12 +885,13 @@ class TestServeStatusHistoryPG:
         timestamp = 1784207110.0
         bucket_start = int(timestamp) // 60 * 60
 
-        def request_history(count):
+        def request_history(count, rejected=0):
             return {
                 'bucket_seconds': 60,
                 'buckets': [{
                     'bucket_start': bucket_start,
                     'request_count': count,
+                    'rejected_count': rejected,
                 }],
             }
 
@@ -794,7 +902,7 @@ class TestServeStatusHistoryPG:
 
         assert serve_history.record_request_activity('svc', 'hash-a',
                                                      'pod-a:process-a',
-                                                     request_history(3),
+                                                     request_history(3, 1),
                                                      timestamp) == 1
         # Stale/out-of-order retry cannot decrement the exact counter.
         serve_history.record_request_activity('svc', 'hash-a',
@@ -802,18 +910,21 @@ class TestServeStatusHistoryPG:
                                               request_history(2), timestamp + 1)
         serve_history.record_request_activity('svc', 'hash-a',
                                               'pod-a:process-a',
-                                              request_history(5), timestamp + 2)
+                                              request_history(5,
+                                                              2), timestamp + 2)
         # A concurrently live maxSurge process receives distinct requests, so
         # its cumulative counter is additive.
         serve_history.record_request_activity('svc', 'hash-a',
                                               'pod-b:process-b',
-                                              request_history(7), timestamp + 3)
+                                              request_history(7,
+                                                              3), timestamp + 3)
 
         history = serve_history.get_status_history('svc',
                                                    timestamp=timestamp + 4)
         assert history['request_samples'] == [{
             'timestamp': float(bucket_start),
             'request_count': 12,
+            'rejected_count': 5,
         }]
         assert history['requests_last_hour'] == 12
         assert history['request_window_seconds'] == 3600
@@ -825,8 +936,119 @@ class TestServeStatusHistoryPG:
         current = serve_history.get_status_history('svc',
                                                    timestamp=timestamp + 5)
         assert current['service_hash'] == 'hash-b'
-        assert current['request_samples'] == []
+        assert not current['request_samples']
         assert current['requests_last_hour'] == 0
+
+    def test_autoscaler_history_retains_latest_state_and_minute_peaks(
+            self, history_engine):
+        timestamp = 1784207110.0
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        base = {
+            'version': 1,
+            'replica_unit': 'physical_backend',
+            'demand_target': 5,
+            'capacity_target': 10,
+            'ready_capacity': 4,
+            'provisioning_capacity': 3,
+            'total_capacity': 12,
+            'peak_in_flight': 2,
+            'peak_queue_depth': 1,
+        }
+        assert serve_history.record_autoscaler_snapshot('svc',
+                                                        'hash-a',
+                                                        'a' * 32,
+                                                        timestamp=timestamp,
+                                                        **base) == 1
+        # An older observation cannot replace state, but its peaks remain
+        # meaningful for the minute.
+        serve_history.record_autoscaler_snapshot('svc',
+                                                 'hash-a',
+                                                 'a' * 32,
+                                                 timestamp=timestamp - 1,
+                                                 **{
+                                                     **base,
+                                                     'demand_target': 2,
+                                                     'capacity_target': 2,
+                                                     'ready_capacity': 2,
+                                                     'provisioning_capacity': 0,
+                                                     'total_capacity': 2,
+                                                     'peak_in_flight': 5,
+                                                     'peak_queue_depth': 4,
+                                                 })
+        serve_history.record_autoscaler_snapshot('svc',
+                                                 'hash-a',
+                                                 'b' * 32,
+                                                 timestamp=timestamp + 20,
+                                                 **{
+                                                     **base,
+                                                     'version': 2,
+                                                     'demand_target': 6,
+                                                     'capacity_target': 12,
+                                                     'ready_capacity': 8,
+                                                     'provisioning_capacity': 2,
+                                                     'total_capacity': 14,
+                                                     'peak_in_flight': 3,
+                                                     'peak_queue_depth': 7,
+                                                 })
+
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 21)
+        assert history['autoscaler_samples'] == [{
+            'timestamp': float(int(timestamp) // 60 * 60),
+            'observed_at': timestamp + 20,
+            'controller_session_id': 'b' * 32,
+            'version': 2,
+            'replica_unit': 'physical_backend',
+            'demand_target': 6,
+            'capacity_target': 12,
+            'ready_capacity': 8,
+            'provisioning_capacity': 2,
+            'total_capacity': 14,
+            'peak_in_flight': 5,
+            'peak_queue_depth': 7,
+        }]
+
+    def test_mixed_reporter_rejection_history_is_not_false_zero(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        legacy = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 2,
+            }],
+        }
+        current = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 3,
+                'rejected_count': 0,
+            }],
+        }
+        serve_history.record_request_activity('svc', 'hash-a', 'legacy', legacy,
+                                              timestamp)
+        serve_history.record_request_activity('svc', 'hash-a', 'current',
+                                              current, timestamp)
+
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 1)
+        assert history['rejection_history_available'] is True
+        assert history['request_samples'] == [{
+            'timestamp': float(bucket_start),
+            'request_count': 5,
+            'rejected_count': None,
+        }]
 
     def test_hourly_snapshot_prunes_rows_older_than_three_days(
             self, history_engine):
@@ -836,6 +1058,7 @@ class TestServeStatusHistoryPG:
                                                             microsecond=0)
         table = serve_history.serve_replica_status_history_table
         request_table = serve_history.serve_request_activity_history_table
+        autoscaler_table = serve_history.serve_autoscaler_history_table
         with history_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(serve_state.services_table).values(
@@ -860,7 +1083,24 @@ class TestServeStatusHistoryPG:
                     reporter_session_id='pod:process',
                     bucket_start=old_bucket,
                     observed_at=old_bucket,
-                    request_count=1))
+                    request_count=1,
+                    rejected_count=0))
+            connection.execute(
+                sqlalchemy.insert(autoscaler_table).values(
+                    service_name='old',
+                    service_hash='old-hash',
+                    bucket_start=old_bucket,
+                    observed_at=old_bucket,
+                    controller_session_id='a' * 32,
+                    version=1,
+                    replica_unit='physical_backend',
+                    demand_target=1,
+                    capacity_target=1,
+                    ready_capacity=1,
+                    provisioning_capacity=0,
+                    total_capacity=1,
+                    peak_in_flight=None,
+                    peak_queue_depth=None))
 
         serve_history.record_status_snapshot(now)
 
@@ -875,6 +1115,11 @@ class TestServeStatusHistoryPG:
                     sqlalchemy.func.count()  # pylint: disable=not-callable
                 ).select_from(request_table).where(
                     request_table.c.service_name == 'old')).scalar_one() == 0
+            assert connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(autoscaler_table).where(
+                    autoscaler_table.c.service_name == 'old')).scalar_one() == 0
 
 
 # ======================= Concurrency smoke on PG =======================

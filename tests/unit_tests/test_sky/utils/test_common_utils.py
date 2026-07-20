@@ -310,6 +310,12 @@ class TestCgroupFunctions:
                              {'SKYPILOT_POD_CPU_CORE_LIMIT': '2'}):
             assert common_utils.get_cpu_count() == 2
 
+        # psutil may return None when the logical CPU count is undetermined.
+        mock_cpu_count.return_value = None
+        mock_cgroup_cpu.return_value = None
+        mock_affinity.return_value = {0, 1, 2, 3}
+        assert common_utils.get_cpu_count() == 1
+
     @mock.patch('psutil.virtual_memory')
     @mock.patch('sky.utils.common_utils._get_cgroup_memory_limit')
     def test_get_mem_size_gb(self, mock_cgroup_mem, mock_virtual_memory):

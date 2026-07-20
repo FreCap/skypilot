@@ -1,8 +1,28 @@
-import os
+"""Tests for request debug logging."""
+
 from pathlib import Path
+
+import pytest
 
 from sky import sky_logging
 from sky.skylet import constants
+
+
+def test_add_debug_log_handler_preserves_file_handler_error(
+        tmp_path: Path, monkeypatch):
+    monkeypatch.setenv(constants.ENV_VAR_ENABLE_REQUEST_DEBUG_LOGGING, 'true')
+    monkeypatch.setattr(sky_logging, 'DEBUG_LOG_DIR', str(tmp_path))
+
+    def raise_file_handler_error(*args, **kwargs):
+        del args, kwargs
+        raise OSError('disk full')
+
+    monkeypatch.setattr(sky_logging.logging, 'FileHandler',
+                        raise_file_handler_error)
+
+    with pytest.raises(OSError, match='disk full'):
+        with sky_logging.add_debug_log_handler('request-id'):
+            pass
 
 
 def test_add_debug_log_handler_writes_log(tmp_path: Path, monkeypatch):

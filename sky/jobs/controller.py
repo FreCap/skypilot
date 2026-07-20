@@ -14,6 +14,7 @@ import traceback
 import typing
 from typing import Any, Optional
 
+import anyio
 import dotenv
 import filelock
 
@@ -43,6 +44,7 @@ from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.usage import usage_lib
 from sky.utils import annotations
+from sky.utils import asyncio_utils
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import context
@@ -66,7 +68,6 @@ else:
 logger = sky_logging.init_logger('sky.jobs.controller')
 
 _background_tasks: set[asyncio.Task] = set()
-_background_tasks_lock: asyncio.Lock = asyncio.Lock()
 
 # How many consecutive monitor ticks must observe a non-UP cluster while the
 # job itself still reports a non-terminal status before recovery is triggered
@@ -115,7 +116,7 @@ class _ClusterNotUpDebouncer:
         self._consecutive_not_up = 0
 
 
-async def create_background_task(coro: typing.Coroutine) -> None:
+def create_background_task(coro: typing.Coroutine) -> None:
     """Create a background task and add it to the set of background tasks.
 
     Main reason we do this is since tasks are only held as a weak reference in
@@ -125,11 +126,12 @@ async def create_background_task(coro: typing.Coroutine) -> None:
     Args:
         coro: The coroutine to create a task for.
     """
-    async with _background_tasks_lock:
-        task = asyncio.create_task(coro)
-        _background_tasks.add(task)
-        # TODO(cooperc): Discard needs a lock?
-        task.add_done_callback(_background_tasks.discard)
+    # Registration and callbacks run on the controller's single event-loop
+    # thread, so a second asyncio lock only added a cancellation point between
+    # reserving a launch slot and handing ownership to the task.
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # Make sure to limit the size as we don't want to cache too many DAGs in memory.
@@ -1659,12 +1661,22 @@ class JobController:
         }
 
         async def cancel_remaining_monitors() -> None:
-            """Cancel and join monitor tasks still owned by this scope."""
+            """Cancel and join monitors without interrupting their cleanup."""
             remaining_tasks = list(monitor_async_tasks.values())
             for monitor_task in remaining_tasks:
                 monitor_task.cancel()
             if remaining_tasks:
-                await asyncio.gather(*remaining_tasks, return_exceptions=True)
+                join_future = asyncio.gather(*remaining_tasks,
+                                             return_exceptions=True)
+                while True:
+                    try:
+                        await asyncio.shield(join_future)
+                        break
+                    except asyncio.CancelledError:  # noqa: ASYNC103
+                        # The owning scope already records and re-raises its
+                        # first cancellation. Delay later cancellations until
+                        # every child has finished its own cleanup.
+                        continue  # noqa: ASYNC104
 
         try:
             # Monitor with primary/auxiliary termination logic
@@ -1975,6 +1987,13 @@ class JobController:
                 task=self._dag.tasks[task_id]))
 
 
+def _prepare_job_log_path(job_id: int) -> str:
+    """Create the controller log directory and return this job's log path."""
+    log_dir = os.path.expanduser(jobs_constants.JOBS_CONTROLLER_LOGS_DIR)
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f'{job_id}.log')
+
+
 class ControllerManager:
     """Main loop for a job controller process.
 
@@ -2138,36 +2157,6 @@ class ControllerManager:
             # some data here.
             raise error
 
-    async def _download_log_from_cluster(
-            self,
-            controller: JobController,
-            job_id: int,
-            task_id: int,
-            cluster_name: str,
-            job_id_on_cluster: int | None = None) -> None:
-        """Download logs for a single task from its cluster.
-
-        Looks up the cluster by name and downloads logs via the controller's
-        download_log_and_stream method. Skips gracefully if the cluster is
-        not found.
-        """
-        clusters = await asyncio.to_thread(
-            backend_utils.get_clusters,
-            cluster_names=[cluster_name],
-            refresh=common.StatusRefreshMode.NONE,
-            all_users=True,
-            _include_is_managed=True)
-
-        if not clusters:
-            logger.info(f'Cluster {cluster_name} not found for job {job_id}, '
-                        f'task {task_id}. Skipping log download.')
-            return
-
-        assert len(clusters) == 1, (clusters, cluster_name)
-        handle = clusters[0].get('handle')
-        await asyncio.to_thread(controller.download_log_and_stream, task_id,
-                                handle, job_id_on_cluster)
-
     async def _download_logs_for_cancelled_job(self, controller: JobController,
                                                job_id: int, task_ids: list[int],
                                                dag: 'sky.Dag',
@@ -2196,6 +2185,7 @@ class ControllerManager:
         logger.info(f'Downloading logs for cancelled job {job_id}, '
                     f'task_ids {task_ids}')
 
+        task_clusters: list[tuple[int, str, int | None]] = []
         if pool is not None:
             # Pool jobs are single-task; job groups don't support pools.
             cluster_name, job_id_on_pool_cluster = (
@@ -2206,33 +2196,98 @@ class ControllerManager:
                             'Skipping log download.')
                 return
 
-            await self._download_log_from_cluster(controller, job_id,
-                                                  task_ids[0], cluster_name,
-                                                  job_id_on_pool_cluster)
+            task_clusters.append(
+                (task_ids[0], cluster_name, job_id_on_pool_cluster))
+        else:
+            for task_id in task_ids:
+                try:
+                    task = dag.tasks[task_id]
+                    assert task.name is not None, task
+                    cluster_name = (
+                        managed_job_utils.generate_managed_job_cluster_name(
+                            task.name, job_id))
+                    task_clusters.append((task_id, cluster_name, None))
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f'Failed to resolve cluster for job {job_id}, '
+                        f'task {task_id}: '
+                        f'{common_utils.format_exception(e)}')
+
+        if not task_clusters:
             return
 
-        # Non-pool path: download logs for each active task.
-        for task_id in task_ids:
+        cluster_names = [cluster_name for _, cluster_name, _ in task_clusters]
+        try:
+            clusters = await asyncio.to_thread(
+                backend_utils.get_clusters,
+                cluster_names=cluster_names,
+                refresh=common.StatusRefreshMode.NONE,
+                all_users=True,
+                _include_is_managed=True)
+        except Exception as e:  # pylint: disable=broad-except
+            if pool is not None:
+                raise
+            logger.warning(
+                f'Failed to resolve clusters for cancelled job {job_id}: '
+                f'{common_utils.format_exception(e)}')
+            return
+        handles_by_cluster = {
+            cluster['name']: cluster.get('handle') for cluster in clusters
+        }
+
+        for task_id, cluster_name, job_id_on_cluster in task_clusters:
+            handle = handles_by_cluster.get(cluster_name)
+            if handle is None:
+                logger.info(
+                    f'Cluster {cluster_name} not found for job {job_id}, '
+                    f'task {task_id}. Skipping log download.')
+                continue
             try:
-                task = dag.tasks[task_id]
-                assert task.name is not None, task
-                cluster_name = (
-                    managed_job_utils.generate_managed_job_cluster_name(
-                        task.name, job_id))
-                await self._download_log_from_cluster(controller, job_id,
-                                                      task_id, cluster_name)
+                await asyncio.to_thread(controller.download_log_and_stream,
+                                        task_id, handle, job_id_on_cluster)
             except Exception as e:  # pylint: disable=broad-except
+                if pool is not None:
+                    raise
                 logger.warning(
                     f'Failed to download logs for job {job_id}, '
                     f'task {task_id}: {common_utils.format_exception(e)}')
 
     # Use context.contextual to enable per-job output redirection and env var
     # isolation.
+    @asyncio_utils.shield
+    async def _release_job_loop_ownership(self, job_id: int) -> None:
+        """Release manager bookkeeping even under repeated cancellation."""
+        async with self._job_tasks_lock:
+            if job_id in self.starting:
+                self.starting.remove(job_id)
+                self._starting_signal.notify()
+            self.job_tasks.pop(job_id, None)
+
+        # A cancellation that lands after the job task already finished
+        # stores cancel info that no CancelledError handler will consume.
+        async with self._cancel_info_lock:
+            self._cancel_info.pop(job_id, None)
+
     @context.contextual_async
     async def run_job_loop(self,
                            job_id: int,
                            log_file: str,
                            pool: str | None = None):
+        """Run one job while owning its controller-manager bookkeeping."""
+        try:
+            await self._run_job_loop(job_id, log_file, pool)
+        finally:
+            # Own launch admission at the outermost scope. Initialization can
+            # fail before _run_job_loop reaches its durable-cleanup try/finally;
+            # leaking this slot would stop a saturated controller indefinitely.
+            # Shield the complete two-lock cleanup so a repeated cancellation
+            # cannot strand launch capacity or stale ownership indefinitely.
+            await self._release_job_loop_ownership(job_id)
+
+    async def _run_job_loop(self,
+                            job_id: int,
+                            log_file: str,
+                            pool: str | None = None):
         """Background task that runs the job loop."""
         ctx = context.get()
         assert ctx is not None, 'Context is not initialized'
@@ -2444,29 +2499,6 @@ class ControllerManager:
 
                 await scheduler.job_done_async(job_id)
 
-            async with self._job_tasks_lock:
-                try:
-                    # just in case we were cancelled or some other error
-                    # occurred during launch
-                    self.starting.remove(job_id)
-                    # its fine if we notify again, better to wake someone up
-                    # and have them go to sleep again, then have some stuck
-                    # sleeping.
-                    self._starting_signal.notify()
-                except KeyError:
-                    pass
-
-            # Remove the job from the job_tasks dictionary.
-            async with self._job_tasks_lock:
-                if job_id in self.job_tasks:
-                    del self.job_tasks[job_id]
-
-            # A cancellation that lands after the job task already finished
-            # stores cancel info that no CancelledError handler will ever
-            # consume; drop it so the dict cannot grow across jobs.
-            async with self._cancel_info_lock:
-                self._cancel_info.pop(job_id, None)
-
     async def start_job(
         self,
         job_id: int,
@@ -2477,16 +2509,14 @@ class ControllerManager:
         Args:
             job_id: The ID of the job to start.
         """
-        # Create log file path for job output redirection
-        log_dir = os.path.expanduser(jobs_constants.JOBS_CONTROLLER_LOGS_DIR)
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f'{job_id}.log')
+        log_file = await asyncio.to_thread(_prepare_job_log_path, job_id)
 
         logger.info(f'Starting job {job_id} with log_file={log_file}')
 
         async with self._job_tasks_lock:
             self.starting.add(job_id)
-        await create_background_task(self.run_job_loop(job_id, log_file, pool))
+            # No await between reserving capacity and scheduling its owner.
+            create_background_task(self.run_job_loop(job_id, log_file, pool))
 
         logger.info(f'Job {job_id} started successfully')
 
@@ -2507,7 +2537,8 @@ class ControllerManager:
 
     async def _process_cancel_signals(self):
         """Run one scan of the cancel signal directory."""
-        cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+        cancels = await asyncio.to_thread(
+            os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
         for cancel in cancels:
             if not cancel.isdigit():
                 # There maybe unexpected files that are written to the
@@ -2525,48 +2556,62 @@ class ControllerManager:
                 continue
             logger.info(f'Cancelling job {job_id}')
 
-            signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
-                                       cancel)
-            with filelock.FileLock(signal_path + '.lock'):
-                try:
-                    content = pathlib.Path(signal_path).read_text(
-                        encoding='utf-8').strip()
-                except FileNotFoundError:
-                    # The signal was consumed between the directory listing
-                    # and acquiring the lock (e.g. the orphan reaper of a
-                    # sibling controller process, after the job turned
-                    # terminal). There is nothing left to deliver.
-                    continue
-                except Exception as e:  # pylint: disable=broad-except
-                    content = ''
-                    logger.debug('Problem occurred when reading '
-                                 f'{signal_path}: '
-                                 f'{common_utils.format_exception(e)}')
-                finally:
-                    pathlib.Path(signal_path).unlink(missing_ok=True)
+            await self._consume_and_cancel_task(job_id, task)
 
-            # Parse and store graceful cancel info before
-            # cancelling the task.
-            graceful, graceful_timeout = (
-                managed_job_utils.parse_job_cancel_file(content))
-            async with self._cancel_info_lock:
-                self._cancel_info[job_id] = (graceful, graceful_timeout)
-            task.cancel()
-            logger.info(f'Job {job_id} cancelled successfully')
+    @asyncio_utils.shield
+    async def _consume_and_cancel_task(self, job_id: int,
+                                       task: asyncio.Task) -> None:
+        """Consume a cancel signal and deliver it without interruption.
+
+        Shield the complete consume-and-deliver operation rather than only
+        the file-lock critical section. Otherwise cancellation of the scan
+        could let the background lock holder delete the signal without
+        cancelling the job.
+        """
+        content = await self._consume_signal_file(job_id)
+        if content is None:
+            # The signal was consumed between the directory listing and
+            # acquiring the lock (e.g. by a sibling controller process).
+            return
+
+        # Parse and store graceful cancel info before cancelling the task.
+        graceful, graceful_timeout = (
+            managed_job_utils.parse_job_cancel_file(content))
+        async with self._cancel_info_lock:
+            self._cancel_info[job_id] = (graceful, graceful_timeout)
+        task.cancel()
+        logger.info(f'Job {job_id} cancelled successfully')
 
     @staticmethod
-    def _remove_signal_file(job_id: int) -> None:
-        """Consume a job's cancel signal file, tolerating a lost race.
+    async def _consume_signal_file(job_id: int) -> str | None:
+        """Read and consume a cancel signal without blocking the event loop.
 
-        Takes the same filelock as the signal writer and the other
-        consumers; missing_ok covers the file being consumed by another
-        scanner (e.g. a sibling controller process) between listing the
-        directory and acquiring the lock.
+        The caller must shield the complete operation that owns delivery of
+        the consumed signal. This helper takes the same file lock as signal
+        writers and other consumers; missing_ok covers a lost race with a
+        sibling controller process.
         """
-        signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
+        signal_path = pathlib.Path(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
                                    str(job_id))
-        with filelock.FileLock(signal_path + '.lock'):
-            pathlib.Path(signal_path).unlink(missing_ok=True)
+        async with filelock.AsyncFileLock(f'{signal_path}.lock'):
+            try:
+                return (await anyio.Path(signal_path).read_text(encoding='utf-8'
+                                                               )).strip()
+            except FileNotFoundError:
+                return None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug('Problem occurred when reading '
+                             f'{signal_path}: '
+                             f'{common_utils.format_exception(e)}')
+                return ''
+            finally:
+                await anyio.Path(signal_path).unlink(missing_ok=True)
+
+    @staticmethod
+    @asyncio_utils.shield
+    async def _remove_signal_file(job_id: int) -> None:
+        """Consume a job's cancel signal file, tolerating a lost race."""
+        await ControllerManager._consume_signal_file(job_id)
 
     async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
         """Remove a cancel signal that no consumer will ever pick up.
@@ -2584,7 +2629,7 @@ class ControllerManager:
         if status is not None and not status.is_terminal():
             return
         try:
-            self._remove_signal_file(job_id)
+            await self._remove_signal_file(job_id)
         except OSError as e:
             logger.debug(f'Failed to reap cancel signal for job {job_id}: '
                          f'{common_utils.format_exception(e)}')
@@ -2603,8 +2648,6 @@ class ControllerManager:
                 running_tasks = [
                     task for task in self.job_tasks.values() if not task.done()
                 ]
-
-            async with self._job_tasks_lock:
                 starting_count = len(self.starting)
 
             # Report per-process metrics.
@@ -2636,8 +2679,19 @@ class ControllerManager:
                     pid=pid_str).set(max_jobs)
 
             if len(running_tasks) >= max_jobs:
-                logger.info('Too many jobs running, waiting for 60 seconds')
-                await asyncio.sleep(60)
+                logger.info('Too many jobs running, waiting for capacity')
+                if running_tasks:
+                    # Recheck immediately when a task that contributed to the
+                    # limit finishes. Keep the timeout because max_jobs can
+                    # change when the controller process count changes.
+                    await asyncio.wait(running_tasks,
+                                       timeout=60,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    # max_jobs may be zero when the controller process count
+                    # exceeds MAX_TOTAL_RUNNING_JOBS. asyncio.wait() rejects
+                    # an empty task set, so retain the topology recheck here.
+                    await asyncio.sleep(60)
                 continue
 
             # Check if there are any jobs that are waiting to launch
@@ -2658,12 +2712,13 @@ class ControllerManager:
             job_id = waiting_job['job_id']
             pool = waiting_job.get('pool', None)
 
-            cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+            cancels = await asyncio.to_thread(
+                os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
             if str(job_id) in cancels:
                 status = await managed_job_state.get_status_async(job_id)
                 if status == managed_job_state.ManagedJobStatus.PENDING:
                     logger.info(f'Job {job_id} cancelled')
-                    self._remove_signal_file(job_id)
+                    await self._remove_signal_file(job_id)
                     await managed_job_state.set_cancelling_async(
                         job_id=job_id,
                         callback_func=managed_job_utils.event_callback_func(

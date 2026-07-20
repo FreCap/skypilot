@@ -42,6 +42,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.metrics import utils as metrics_utils
+from sky.serve import placement_history
 from sky.server import clean_env as clean_env_module
 from sky.server import common as server_common
 from sky.server import config as server_config
@@ -790,6 +791,7 @@ def _request_execution_wrapper(request_id: str,
     global _in_request_execution  # pylint: disable=global-statement
     try:
         _in_request_execution = True
+        placement_history.reset_request_buffer()
         # As soon as the request is updated with the executor PID, we can
         # receive SIGTERM from cancellation. So, we update the request inside
         # the try block to ensure we have the KeyboardInterrupt handling.
@@ -892,6 +894,13 @@ def _request_execution_wrapper(request_id: str,
         _in_request_execution = False
         _restore_output()
         try:
+            placement_history.flush_request_buffer()
+        except Exception as e:  # pylint: disable=broad-except
+            # Placement history is observability. Its PostgreSQL write runs
+            # after the request result is durable and must never alter it.
+            logger.warning('Failed to flush placement history: '
+                           f'{common_utils.format_exception(e)}')
+        try:
             # Capture the peak RSS before GC.
             peak_rss = max(proc.memory_info().rss, metrics_lib.peak_rss_bytes)
             # Clear request level cache to release all memory used by the
@@ -937,11 +946,25 @@ class CoroutineTask:
         self.task = task
 
     async def cancel(self):
-        try:
-            self.task.cancel()
-            await self.task
-        except asyncio.CancelledError:
-            pass
+        self.task.cancel()
+        current_task = asyncio.current_task()
+        parent_cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(self.task)
+                break
+            except asyncio.CancelledError as e:  # noqa: ASYNC103
+                if (parent_cancellation is None and current_task is not None and
+                        current_task.cancelling()):
+                    parent_cancellation = e
+                if not self.task.done():
+                    # Keep the child's cancellation cleanup alive if this
+                    # background cleanup task is itself cancelled.
+                    continue  # noqa: ASYNC104
+                # Cancellation raised by the child is expected here.
+                break  # noqa: ASYNC104
+        if parent_cancellation is not None:
+            raise parent_cancellation
 
 
 def check_request_thread_executor_available() -> None:
@@ -1001,9 +1024,18 @@ async def _execute_request_coroutine(request: api_requests.Request):
     await api_requests.update_status_async(request.request_id,
                                            api_requests.RequestStatus.RUNNING)
     # Redirect stdout and stderr to the request log path.
-    original_output = ctx.redirect_log(
-        request.log_path,
-        max_bytes=server_constants.STREAMING_REQUEST_LOG_MAX_BYTES)
+    try:
+        hard_free_bytes = api_requests.get_request_log_storage_usage(
+        ).hard_free_bytes
+        original_output = ctx.redirect_log(
+            request.log_path,
+            max_bytes=server_constants.STREAMING_REQUEST_LOG_MAX_BYTES,
+            min_free_bytes=hard_free_bytes)
+    except Exception as e:  # pylint: disable=broad-except
+        await api_requests.set_request_failed_async(request.request_id, e)
+        logger.error(f'Failed to open request log for {request.request_id}: '
+                     f'{common_utils.format_exception(e)}')
+        return
     try:
         fut: asyncio.Future = context_utils.to_thread_with_executor(
             get_request_thread_executor(), _execute_with_config_override, func,

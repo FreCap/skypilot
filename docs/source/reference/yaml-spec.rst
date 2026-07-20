@@ -1411,6 +1411,7 @@ Syntax
       :ref:`min_replicas <yaml-spec-service-replica-policy-min-replicas>`: 1
       :ref:`max_replicas <yaml-spec-service-replica-policy-max-replicas>`: 3
       :ref:`target_qps_per_replica <yaml-spec-service-replica-policy-target-qps-per-replica>`: 5
+      :ref:`target_concurrency_per_replica <yaml-spec-service-replica-policy-target-concurrency-per-replica>`: 1
       :ref:`upscale_delay_seconds <yaml-spec-service-replica-policy-upscale-delay-seconds>`: 300
       :ref:`downscale_delay_seconds <yaml-spec-service-replica-policy-downscale-delay-seconds>`: 1200
 
@@ -1699,20 +1700,22 @@ Describes how SkyServe autoscales your service based on the QPS (queries per sec
         target_qps_per_replica: 10
 
 For async multi-GPU services, the ``dynamic_fallback_per_gpu`` spot placer
-automatically changes these public replica counts to concurrent job slots. All
+automatically changes these public replica counts to logical GPU slots. All
 other placement strategies keep the historical meaning of one replica per
 physical SkyServe backend. This unit is an internal consequence of the placer,
 not a separate user setting.
 
 The per-GPU placer currently supports the local async router's
-one-job-per-whole-GPU contract. It requires
-``target_concurrency_per_replica: 1`` (the integer),
+one-job-per-whole-GPU execution contract. It requires a positive integer
+``target_concurrency_per_replica``,
 ``graceful_drain_async_occupancy: true``, and a whole-GPU accelerator shape.
-SkyServe may provision a multi-GPU backend that contributes several replicas.
+Values above one retain waiting work as headroom without increasing execution
+concurrency. SkyServe may provision a multi-GPU backend that contributes
+several replicas.
 Because a backend is indivisible, ready capacity can exceed ``max_replicas`` by
 the width of the final backend without causing scaling churn. This mode
 currently requires rolling updates and does not yet support blue-green updates
-or ``reserved_capacity_fill``.
+or multi-GPU ``reserved_capacity_fill`` shapes.
 
 .. code-block:: yaml
 
@@ -1721,7 +1724,7 @@ or ``reserved_capacity_fill``.
     replica_policy:
       min_replicas: 1
       max_replicas: 1000
-      target_concurrency_per_replica: 1
+      target_concurrency_per_replica: 2
       spot_placer: dynamic_fallback_per_gpu
 
 .. _yaml-spec-service-replica-policy-min-replicas:
@@ -1730,8 +1733,8 @@ or ``reserved_capacity_fill``.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Minimum number of active replicas (required). With
-``dynamic_fallback_per_gpu``, this is the minimum number of concurrent job
-slots, not physical backends.
+``dynamic_fallback_per_gpu``, this is the minimum number of logical GPU slots,
+not physical backends.
 
 Service never scales below this count.
 
@@ -1748,8 +1751,8 @@ Service never scales below this count.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Maximum requested replicas (optional). With ``dynamic_fallback_per_gpu``, this
-clamps the demand target in job slots; an indivisible multi-GPU backend may
-create stable materialized capacity above it.
+clamps the demand target in logical GPU slots; an indivisible multi-GPU backend
+may create stable materialized capacity above it.
 
 If not specified, SkyServe will use a fixed number of replicas (the same as min_replicas) and ignore any QPS threshold specified below.
 
@@ -1776,6 +1779,62 @@ SkyServe will scale your service so that, ultimately, each replica manages appro
   service:
     replica_policy:
       target_qps_per_replica: 5
+
+
+.. _yaml-spec-service-replica-policy-target-concurrency-per-replica:
+
+``service.replica_policy.target_concurrency_per_replica``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Target simultaneous work per GPU (optional). Mutually exclusive with
+``target_qps_per_replica``.
+
+Outstanding work includes in-flight, queued, and recently rejected requests.
+For ordinary physical-backend services, SkyServe packs that work onto each
+replica's configured target multiplied by its GPU count. With
+``dynamic_fallback_per_gpu``, the value must be a positive integer and SkyServe
+publishes a logical GPU target before packing those slots into physical
+backends. Running and queued work remain current-state signals. The optional
+duration and utilization fields below control rejected-pressure conversion and
+headroom without changing model execution concurrency.
+
+.. code-block:: yaml
+
+  service:
+    replica_policy:
+      target_concurrency_per_replica: 2
+
+
+Logical concurrency tuning fields
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following optional fields require ``dynamic_fallback_per_gpu`` and
+``target_concurrency_per_replica``:
+
+* ``target_utilization_percentage`` is an integer from 1 to 100 (default 100).
+* ``expected_request_duration_seconds`` is a positive number. It converts the
+  retained rejected-request population and stale arrival rate into concurrent
+  work. When absent, each retained rejection contributes one work unit.
+* ``max_scale_up_rate_percentage``, ``scale_up_rate_min_replicas``, and
+  ``scale_up_rate_period_seconds`` must be set together. Each upward wave adds
+  at most the larger of the minimum replica count or the configured percentage
+  of committed logical capacity, then waits for the configured period.
+* ``max_scale_down_rate_percentage`` is an integer from 1 to 100 (default 50).
+  After the downscale delay, each wave removes at most that fraction of
+  committed logical capacity and requires a new full delay before another
+  wave.
+
+.. code-block:: yaml
+
+  service:
+    replica_policy:
+      target_concurrency_per_replica: 1
+      target_utilization_percentage: 90
+      expected_request_duration_seconds: 30
+      max_scale_up_rate_percentage: 20
+      scale_up_rate_min_replicas: 10
+      scale_up_rate_period_seconds: 60
+      max_scale_down_rate_percentage: 50
 
 
 ``service.replica_policy.cost_rebalance``

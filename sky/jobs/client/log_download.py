@@ -2,6 +2,7 @@
 import json
 import pathlib
 import threading
+from typing import TYPE_CHECKING
 import zlib
 
 from sky.client import common as client_common
@@ -9,6 +10,9 @@ from sky.client import sdk
 from sky.server import common as server_common
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
+
+if TYPE_CHECKING:
+    import requests
 
 
 def download_logs_streaming(
@@ -19,6 +23,13 @@ def download_logs_streaming(
     local_dir: str,
 ) -> dict[int, str] | None:
     """Download a managed job log through the streaming API."""
+
+    def _close_response(response: 'requests.Response') -> None:
+        try:
+            response.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     body = payloads.JobsLogsBody(
         name=name,
         job_id=job_id,
@@ -34,36 +45,54 @@ def download_logs_streaming(
         stream=True,
         timeout=(5, None))
     if not dispatch.ok:
-        raise RuntimeError(
-            f'Failed to dispatch /jobs/logs: HTTP {dispatch.status_code}')
+        status_code = dispatch.status_code
+        _close_response(dispatch)
+        raise RuntimeError(f'Failed to dispatch /jobs/logs: HTTP {status_code}')
     request_id = dispatch.headers.get(server_constants.STREAM_REQUEST_HEADER) \
         or dispatch.headers.get('X-SkyPilot-Request-ID')
     if not request_id:
+        _close_response(dispatch)
         raise RuntimeError(
             '/jobs/logs response missing X-SkyPilot-Request-ID header')
+
+    stream_url = (f'/api/stream?request_id={request_id}'
+                  '&format=plain&compress=gz')
+    try:
+        stream_resp = server_common.make_authenticated_request('GET',
+                                                               stream_url,
+                                                               stream=True,
+                                                               timeout=(5,
+                                                                        None))
+    except BaseException:
+        _close_response(dispatch)
+        raise
+    if not stream_resp.ok:
+        status_code = stream_resp.status_code
+        _close_response(stream_resp)
+        _close_response(dispatch)
+        raise RuntimeError(
+            f'Failed to attach to /api/stream: HTTP {status_code}')
 
     # Drain the dispatch body in a background thread. Cancelling/closing
     # would tell the API server the client disconnected and the running
     # tail_logs task would be cancelled, leaving /api/stream with only
-    # a partial log. Reading and discarding keeps the request alive.
+    # a partial log. Start only after the consumer stream is attached, then
+    # let this thread exclusively own and close the dispatch response.
     def _drain() -> None:
         try:
             for _ in dispatch.iter_content(chunk_size=64 * 1024):
                 pass
         except Exception:  # pylint: disable=broad-except
             pass
+        finally:
+            _close_response(dispatch)
 
-    threading.Thread(target=_drain, daemon=True).start()
-
-    stream_url = (f'/api/stream?request_id={request_id}'
-                  '&format=plain&compress=gz')
-    stream_resp = server_common.make_authenticated_request('GET',
-                                                           stream_url,
-                                                           stream=True,
-                                                           timeout=(5, None))
-    if not stream_resp.ok:
-        raise RuntimeError(
-            f'Failed to attach to /api/stream: HTTP {stream_resp.status_code}')
+    try:
+        threading.Thread(target=_drain, daemon=True).start()
+    except BaseException:
+        _close_response(stream_resp)
+        _close_response(dispatch)
+        raise
 
     # Save into a per-job directory matching the legacy download_logs
     # shape (<dir>/controller.log or <dir>/run.log) so existing scripts
@@ -84,30 +113,42 @@ def download_logs_streaming(
     job_dir.mkdir(parents=True, exist_ok=True)
     local_path = job_dir / log_filename
 
+    def _remove_local_artifact() -> None:
+        try:
+            local_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            job_dir.rmdir()
+        except OSError:
+            pass
+
     bytes_written = 0
-    with open(local_path, 'wb') as f:
-        for chunk in stream_resp.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            out = decompressor.decompress(chunk) if decompressor else chunk
-            if out:
-                f.write(out)
-                bytes_written += len(out)
-        if decompressor is not None:
-            tail_bytes = decompressor.flush()
-            if tail_bytes:
-                f.write(tail_bytes)
-                bytes_written += len(tail_bytes)
+    try:
+        with open(local_path, 'wb') as f:
+            for chunk in stream_resp.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                out = decompressor.decompress(chunk) if decompressor else chunk
+                if out:
+                    f.write(out)
+                    bytes_written += len(out)
+            if decompressor is not None:
+                tail_bytes = decompressor.flush()
+                if tail_bytes:
+                    f.write(tail_bytes)
+                    bytes_written += len(tail_bytes)
+    except BaseException:
+        _remove_local_artifact()
+        raise
+    finally:
+        _close_response(stream_resp)
 
     if bytes_written == 0:
         # Server sent nothing (e.g., terminal job, worker cluster gone) —
         # the underlying tail_logs has no source. Remove the empty file
         # + dir and return None so the caller falls back to sync-down.
-        try:
-            local_path.unlink()
-            job_dir.rmdir()
-        except OSError:
-            pass
+        _remove_local_artifact()
         return None
 
     key = int(job_id) if job_id is not None else 0

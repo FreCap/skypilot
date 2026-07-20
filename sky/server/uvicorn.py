@@ -309,7 +309,15 @@ class Server(uvicorn.Server):
             # one that serves (and on Python 3.14+ that call raises when no
             # loop is running).
             _configure_running_loop_lag_debug(lag_threshold)
-            await self.serve(*serve_args, **serve_kwargs)
+            try:
+                await self.serve(*serve_args, **serve_kwargs)
+            finally:
+                # Lifespan startup failures are logged and converted into a
+                # normal return by Uvicorn. Close the process-local request DB
+                # before asyncio.run() closes this loop; otherwise aiosqlite's
+                # non-daemon connection thread keeps the failed worker alive
+                # and responsive to supervisor pings indefinitely.
+                await requests_lib.close_db_async()
 
         stop_monitor = threading.Event()
         monitor = threading.Thread(

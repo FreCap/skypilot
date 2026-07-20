@@ -306,6 +306,82 @@ def test_wait_registration_aborts_terminal_service_without_polling(status):
     sleep.assert_not_called()
 
 
+@pytest.mark.parametrize('status', [
+    status for status in serve_utils.job_lib.JobStatus if status.is_terminal()
+])
+def test_wait_registration_aborts_terminal_controller_job_without_polling(
+        status):
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(serve_utils.job_lib,
+                           'get_status',
+                           return_value=status) as get_status, \
+         mock.patch.object(serve_utils,
+                           '_get_service_status') as get_service_status, \
+         mock.patch.object(serve_utils.time, 'sleep') as sleep, \
+         pytest.raises(RuntimeError, match=f'terminal status {status.value}'):
+        serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    get_status.assert_called_once_with(7)
+    get_service_status.assert_not_called()
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize('status', [
+    serve_utils.job_lib.JobStatus.INIT,
+    serve_utils.job_lib.JobStatus.PENDING,
+    serve_utils.job_lib.JobStatus.SETTING_UP,
+])
+def test_wait_registration_keeps_waiting_for_controller_setup_states(status):
+    clock = mock.MagicMock()
+    clock.monotonic.side_effect = [100.0, 401.0]
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(serve_utils.job_lib,
+                           'get_status',
+                           return_value=status) as get_status, \
+         mock.patch.object(serve_utils,
+                           '_get_service_status') as get_service_status, \
+         mock.patch.object(serve_utils, 'time', clock), \
+         pytest.raises(RuntimeError, match='controller process'):
+        serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    get_status.assert_called_once_with(7)
+    get_service_status.assert_not_called()
+    clock.sleep.assert_not_called()
+
+
+def test_wait_registration_running_controller_polls_service_immediately():
+    record = {
+        'controller_job_id': 7,
+        'status': serve_state.ServiceStatus.READY,
+        'load_balancer_port': 8080,
+    }
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(
+             serve_utils.job_lib,
+             'get_status',
+             return_value=serve_utils.job_lib.JobStatus.RUNNING) as get_status, \
+         mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value=record) as get_service_status, \
+         mock.patch.object(serve_utils.time, 'sleep') as sleep:
+        payload = serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    assert serve_utils.load_service_initialization_result(payload) == 8080
+    get_status.assert_called_once_with(7)
+    get_service_status.assert_called_once_with('svc',
+                                               pool=False,
+                                               with_replica_info=False,
+                                               with_yaml=False,
+                                               status_snapshot_only=True)
+    sleep.assert_not_called()
+
+
 def test_wait_registration_reads_scoped_log_before_row_exists():
     log_path = '/tmp/scoped/controller.log'
     log_contents = constants.MAX_NUMBER_OF_SERVICES_REACHED_ERROR
@@ -545,6 +621,33 @@ class TestIsConsolidationMode:
                 mock_validate.assert_called_once_with(arg, pool=True)
             else:
                 mock_validate.assert_not_called()
+
+    @pytest.mark.parametrize('pool,count,noun', [
+        (False, 3, 'services'),
+        (True, 2, 'pools'),
+    ])
+    def test_disabled_validation_uses_mode_scoped_count(self, pool, count,
+                                                        noun):
+        with mock.patch('sky.serve.serve_utils.serve_state.get_num_services',
+                        return_value=count) as get_num_services, \
+                mock.patch('sky.serve.serve_utils.serve_state.get_services',
+                           side_effect=AssertionError(
+                               'validation must not materialize services')), \
+                mock.patch('sky.serve.serve_utils.logger.warning') as warning:
+            serve_utils._validate_consolidation_mode_config(False, pool=pool)
+
+        get_num_services.assert_called_once_with(pool=pool)
+        warning.assert_called_once()
+        assert f'still {count} {noun} running' in warning.call_args.args[0]
+
+    def test_disabled_validation_skips_warning_when_mode_is_empty(self):
+        with mock.patch('sky.serve.serve_utils.serve_state.get_num_services',
+                        return_value=0) as get_num_services, \
+                mock.patch('sky.serve.serve_utils.logger.warning') as warning:
+            serve_utils._validate_consolidation_mode_config(False, pool=False)
+
+        get_num_services.assert_called_once_with(pool=False)
+        warning.assert_not_called()
 
     @pytest.mark.parametrize('config_value,expected', [(True, True),
                                                        (False, False)])

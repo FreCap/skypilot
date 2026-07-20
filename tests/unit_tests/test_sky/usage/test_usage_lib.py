@@ -4,6 +4,7 @@ import contextvars
 
 import pytest
 
+from sky.usage import payloads
 from sky.usage import usage_lib
 from sky.utils import context
 
@@ -16,6 +17,78 @@ def _reset_module_state():
     ``_messages_var`` makes each test start with an empty Context.
     """
     usage_lib._messages_var.set(None)
+
+
+def test_prepare_json_redacts_sensitive_fields_without_mutating_input():
+    yaml_config = {
+        'name': 'demo',
+        'run': 'echo secret',
+        'setup': 'line1\nline2',
+        'envs': {
+            'TOKEN': 'secret'
+        },
+        'secrets': None,
+        'resources': {
+            'cpus': 2
+        },
+    }
+
+    prepared = usage_lib.prepare_json_from_yaml_config(yaml_config)
+
+    assert prepared == [{
+        'name': 'demo',
+        'run': '1 lines RUN redacted',
+        'setup': '3 lines SETUP redacted',
+        'envs': '2 lines ENVS redacted',
+        'secrets': None,
+        'resources': {
+            'cpus': 2
+        },
+        '__redacted_comment_lines': 0,
+    }]
+    assert yaml_config['run'] == 'echo secret'
+    assert yaml_config['envs'] == {'TOKEN': 'secret'}
+
+
+def test_prepare_json_preserves_multidoc_shape_and_counts_comments(tmp_path):
+    yaml_path = tmp_path / 'tasks.yaml'
+    yaml_path.write_text(
+        '# first comment\n'
+        'name: first\n'
+        'run: echo secret\n'
+        '---\n'
+        '# second comment\n'
+        'envs:\n'
+        '  TOKEN: secret\n'
+        '---\n',
+        encoding='utf-8')
+
+    prepared = usage_lib.prepare_json_from_yaml_config(str(yaml_path))
+
+    assert prepared == [{
+        'name': 'first',
+        'run': '1 lines RUN redacted',
+        '__redacted_comment_lines': 2,
+    }, {
+        'envs': '2 lines ENVS redacted',
+        '__redacted_comment_lines': 2,
+    }, {
+        '__redacted_comment_lines': 2,
+    }]
+
+
+def test_clean_yaml_reports_unsupported_sensitive_value_type():
+    cleaned = usage_lib._clean_yaml({'secrets': ['not', 'supported']})
+
+    assert cleaned == {
+        'secrets': "Error: Unexpected type for secrets: <class 'list'>"
+    }
+
+
+def test_payload_helpers_remain_available_through_usage_lib_facade():
+    assert usage_lib._clean_yaml is payloads._clean_yaml
+    assert (usage_lib.prepare_json_from_yaml_config
+            is payloads.prepare_json_from_yaml_config)
 
 
 def test_proxy_returns_same_instance_within_one_context():

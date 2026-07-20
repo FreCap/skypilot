@@ -331,7 +331,7 @@ class StrategyExecutor:
             return
         handle = await asyncio.to_thread(
             global_user_state.get_handle_from_cluster_name, self.cluster_name)
-        if handle is None or self.pool is not None:
+        if handle is None:
             return
         try:
             usage_lib.messages.usage.set_internal()
@@ -363,6 +363,8 @@ class StrategyExecutor:
                     _try_cancel_if_cluster_is_init=True,
                 )
             else:
+                assert self.job_id_on_pool_cluster is not None, (
+                    'A recovering pool job must have its assigned job ID.')
                 request_id = await asyncio.to_thread(
                     sdk.cancel,
                     cluster_name=self.cluster_name,
@@ -375,13 +377,19 @@ class StrategyExecutor:
                 request_id,
             )
         except Exception as e:  # pylint: disable=broad-except
-            logger.info('Failed to cancel the job on the cluster. The cluster '
-                        'might be already down or the head node is preempted.'
-                        '\n  Detailed exception: '
-                        f'{common_utils.format_exception(e)}\n'
-                        'Terminating the cluster explicitly to ensure no '
-                        'remaining job process interferes with recovery.')
-            await asyncio.to_thread(self._cleanup_cluster)
+            message = ('Failed to cancel the job on the cluster. The cluster '
+                       'might be already down or the head node is preempted.'
+                       '\n  Detailed exception: '
+                       f'{common_utils.format_exception(e)}\n')
+            if self.pool is None:
+                logger.info(
+                    f'{message}Terminating the cluster explicitly to ensure no '
+                    'remaining job process interferes with recovery.')
+                await asyncio.to_thread(self._cleanup_cluster)
+            else:
+                logger.info(
+                    f'{message}Leaving the shared pool cluster running while '
+                    'recovery continues.')
 
     async def _wait_until_job_starts_on_cluster(self) -> float | None:
         """Wait for MAX_JOB_CHECKING_RETRY times until job starts on the cluster
@@ -395,6 +403,14 @@ class StrategyExecutor:
         job_checking_retry_cnt = 0
         while job_checking_retry_cnt < MAX_JOB_CHECKING_RETRY:
             # Avoid the infinite loop, if any bug happens.
+            if job_checking_retry_cnt > 0:
+                # Pace every retry (including transient-error paths that
+                # `continue`), so the loop spans the intended
+                # MAX_JOB_CHECKING_RETRY * GAP wall-clock budget instead of
+                # burning all retries back-to-back while the cluster or
+                # network is flaky.
+                await asyncio.sleep(
+                    managed_job_utils.JOB_STARTED_STATUS_CHECK_GAP_SECONDS)
             job_checking_retry_cnt += 1
             try:
                 cluster_status, _ = (await asyncio.to_thread(
@@ -470,9 +486,6 @@ class StrategyExecutor:
                     logger.info(f'Unexpected Exception: {e}\nFailed to get '
                                 'the job start timestamp. Retrying.')
                     continue
-            # Wait for the job to be started
-            await asyncio.sleep(
-                managed_job_utils.JOB_STARTED_STATUS_CHECK_GAP_SECONDS)
         return None
 
     def _cleanup_cluster(self) -> None:
@@ -1004,11 +1017,16 @@ class FailoverStrategyExecutor(StrategyExecutor):
                 new_resources = self._launched_resources.copy(
                     cloud=launched_cloud, region=launched_region, zone=None)
                 task.set_resources({new_resources})
-                # Not using self.launch to avoid the retry until up logic.
-                job_submitted_at = await self._launch(raise_on_failure=False,
-                                                      recovery=True)
-                # Restore the original dag, i.e. reset the region constraint.
-                task.set_resources(original_resources)
+                try:
+                    # Not using self.launch to avoid the retry until up logic.
+                    job_submitted_at = await self._launch(
+                        raise_on_failure=False, recovery=True)
+                finally:
+                    # Restore the original dag, i.e. reset the region
+                    # constraint. The dag is shared across recovery attempts,
+                    # so a raise from _launch (e.g. cancellation) must not
+                    # leak the constraint into later attempts.
+                    task.set_resources(original_resources)
                 if job_submitted_at is not None:
                     return job_submitted_at
 
@@ -1094,10 +1112,15 @@ class EagerFailoverStrategyExecutor(FailoverStrategyExecutor):
                     requested_resources.copy(cloud=launched_cloud,
                                              region=launched_region)
                 }
-                # Not using self.launch to avoid the retry until up logic.
-                job_submitted_at = await self._launch(raise_on_failure=False,
-                                                      recovery=True)
-                task.blocked_resources = None
+                try:
+                    # Not using self.launch to avoid the retry until up logic.
+                    job_submitted_at = await self._launch(
+                        raise_on_failure=False, recovery=True)
+                finally:
+                    # The dag is shared across recovery attempts, so a raise
+                    # from _launch (e.g. cancellation) must not leave the
+                    # previous region blocked for later attempts.
+                    task.blocked_resources = None
                 if job_submitted_at is not None:
                     return job_submitted_at
 

@@ -230,15 +230,43 @@ def get_service_schema():
                             }
                         ]
                     },
-                    # Per-GPU target concurrency (replica capacity =
-                    # knob * gpu_count). Mutually exclusive with
-                    # target_qps_per_replica; the exclusivity (and the
-                    # load-tracking LB policy requirement) is validated in
-                    # SkyServiceSpec.__init__, not here — this schema has no
-                    # cross-field constructs.
+                    # Per-GPU outstanding-work target. Physical replicas have
+                    # capacity knob * gpu_count; logical fleets divide demand
+                    # by the knob and publish whole GPU-slot targets. Mutually
+                    # exclusive with target_qps_per_replica; the exclusivity
+                    # (plus logical integer and load-tracking policy
+                    # requirements) is validated in SkyServiceSpec.__init__,
+                    # not here — this schema has no cross-field constructs.
                     'target_concurrency_per_replica': {
                         'type': 'number',
                         'exclusiveMinimum': 0,
+                    },
+                    'target_utilization_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
+                    },
+                    'expected_request_duration_seconds': {
+                        'type': 'number',
+                        'exclusiveMinimum': 0,
+                    },
+                    'max_scale_up_rate_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
+                    },
+                    'scale_up_rate_min_replicas': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'scale_up_rate_period_seconds': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'max_scale_down_rate_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
                     },
                     # Opt-in: allow the autoscaler to scale up onto free
                     # reserved (zero-cost) capacity. Absent/False means no

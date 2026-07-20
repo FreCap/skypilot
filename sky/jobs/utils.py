@@ -561,7 +561,7 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
-def update_managed_jobs_statuses(job_id: int | None = None):
+def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     """Update managed job status if the controller process failed abnormally.
 
     Check the status of the controller process. If it is not running, it must
@@ -570,8 +570,8 @@ def update_managed_jobs_statuses(job_id: int | None = None):
     when above happens, which could be not accurate based on the frequency this
     function is called.
 
-    Note: we expect that job_id, if provided, refers to a nonterminal job or a
-    job that has not completed its cleanup (schedule state not DONE).
+    Note: we expect that job_ids, if provided, refer to nonterminal jobs or
+    jobs that have not completed their cleanup (schedule state not DONE).
     """
     # The signal file suggests that the controller is recovering from a
     # failure. See sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -595,22 +595,34 @@ def update_managed_jobs_statuses(job_id: int | None = None):
         on the failure path and keeps cleanup keyed off ``task_name``, which is
         what the controller uses to name task clusters.
         """
-        error_msgs = []
         if pool is not None:
             return None
+        cluster_names = []
         for task in tasks:
             cluster_name = generate_managed_job_cluster_name(
                 task['task_name'], job_id)
-            if cluster_name is None:
-                continue
+            if cluster_name is not None:
+                cluster_names.append(cluster_name)
+
+        def _terminate_one(cluster_name: str) -> str | None:
             try:
                 terminate_cluster(cluster_name)
+                return None
             except Exception as e:  # pylint: disable=broad-except
                 error_msg = (
                     f'Failed to terminate cluster {cluster_name}: '
                     f'{common_utils.format_exception(e, use_bracket=True)}')
                 logger.exception(error_msg, exc_info=e)
-                error_msgs.append(error_msg)
+                return error_msg
+
+        # Terminate the task clusters in parallel: each task in a JobGroup has
+        # a distinct cluster, and a single teardown can take minutes, so a
+        # serial walk holds up the whole refresh tick and widens the window in
+        # which the batched status snapshot goes stale.
+        error_msgs = [
+            msg for msg in subprocess_utils.run_in_parallel(
+                _terminate_one, cluster_names) if msg is not None
+        ]
         if not error_msgs:
             return None
         return '; '.join(error_msgs)
@@ -618,10 +630,10 @@ def update_managed_jobs_statuses(job_id: int | None = None):
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
-    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_id)
+    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
     if not jobs_info:
-        # job_id is already terminal, or if job_id is None, there are no jobs
-        # that need to be checked.
+        # The given jobs are already terminal, or if job_ids is None, there
+        # are no jobs that need to be checked.
         return
 
     for job_id, info in jobs_info.items():
@@ -1037,9 +1049,13 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
                 cancelled_job_ids.append(job_id)
                 continue
 
-        update_managed_jobs_statuses(job_id)
         jobs_to_refresh.append(job_id)
 
+    if jobs_to_refresh:
+        # One batched refresh sweep for every job that needs it, instead of a
+        # sweep per job: all jobs are judged against a single status snapshot,
+        # and a cancel of N live jobs issues one refresh query instead of N.
+        update_managed_jobs_statuses(jobs_to_refresh)
     fresh_states = managed_job_state.get_job_cancellation_states(
         jobs_to_refresh)
     for job_id in jobs_to_refresh:

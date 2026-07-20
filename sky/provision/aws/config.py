@@ -8,7 +8,6 @@ _default_ec2_resource() to avoid version mismatch issues.
 # https://github.com/ray-project/ray/tree/ray-2.0.1/python/ray/autoscaler/_private/aws/config.py
 # Git commit of the release 2.0.1: 03b6bc7b5a305877501110ec04710a9c57011479
 import copy
-import json
 import logging
 import time
 import typing
@@ -22,6 +21,7 @@ from sky.adaptors import aws
 from sky.clouds import aws as aws_cloud
 from sky.provision import common
 from sky.provision import constants as provision_constants
+from sky.provision.aws import iam_profile
 from sky.provision.aws import utils
 from sky.utils import annotations
 from sky.utils import common_utils
@@ -35,9 +35,12 @@ logger = sky_logging.init_logger(__name__)
 RAY = 'ray-autoscaler'
 SECURITY_GROUP_TEMPLATE = RAY + '-{}'
 
-SKYPILOT = 'skypilot'
-DEFAULT_SKYPILOT_INSTANCE_PROFILE = SKYPILOT + '-v1'
-DEFAULT_SKYPILOT_IAM_ROLE = SKYPILOT + '-v1'
+SKYPILOT = iam_profile.SKYPILOT
+DEFAULT_SKYPILOT_INSTANCE_PROFILE = (
+    iam_profile.DEFAULT_SKYPILOT_INSTANCE_PROFILE)
+DEFAULT_SKYPILOT_IAM_ROLE = iam_profile.DEFAULT_SKYPILOT_IAM_ROLE
+
+_configure_iam_role = iam_profile.configure_iam_role
 
 # Suppress excessive connection dropped logs from boto
 logging.getLogger('botocore').setLevel(logging.WARNING)
@@ -184,110 +187,6 @@ def delete_placement_group(ec2: 'mypy_boto3_ec2.ServiceResource',
                 f'Placement group {placement_group_name} does not exist.')
         else:
             raise exc
-
-
-def _configure_iam_role(iam) -> dict[str, Any]:
-
-    def _get_instance_profile(profile_name: str):
-        profile = iam.InstanceProfile(profile_name)
-        try:
-            profile.load()
-            return profile
-        except aws.botocore_exceptions().ClientError as exc:
-            if exc.response.get('Error', {}).get('Code') == 'NoSuchEntity':
-                return None
-            else:
-                utils.handle_boto_error(
-                    exc, 'Failed to fetch IAM instance profile data for '
-                    f'{colorama.Style.BRIGHT}{profile_name}'
-                    f'{colorama.Style.RESET_ALL} from AWS.')
-                raise exc
-
-    def _get_role(role_name: str):
-        role = iam.Role(role_name)
-        try:
-            role.load()
-            return role
-        except aws.botocore_exceptions().ClientError as exc:
-            if exc.response.get('Error', {}).get('Code') == 'NoSuchEntity':
-                return None
-            else:
-                utils.handle_boto_error(
-                    exc,
-                    f'Failed to fetch IAM role data for {colorama.Style.BRIGHT}'
-                    f'{role_name}{colorama.Style.RESET_ALL} from AWS.')
-                raise exc
-
-    instance_profile_name = DEFAULT_SKYPILOT_INSTANCE_PROFILE
-    profile = _get_instance_profile(instance_profile_name)
-
-    if profile is None:
-        logger.info(
-            f'Creating new IAM instance profile {colorama.Style.BRIGHT}'
-            f'{instance_profile_name}{colorama.Style.RESET_ALL} for use as the '
-            'default.')
-        iam.meta.client.create_instance_profile(
-            InstanceProfileName=instance_profile_name)
-        profile = _get_instance_profile(instance_profile_name)
-        time.sleep(15)  # wait for propagation
-    assert profile is not None, 'Failed to create instance profile'
-
-    if not profile.roles:
-        role_name = DEFAULT_SKYPILOT_IAM_ROLE
-        role = _get_role(role_name)
-        if role is None:
-            logger.info(
-                f'Creating new IAM role {colorama.Style.BRIGHT}{role_name}'
-                f'{colorama.Style.RESET_ALL} for use as the default instance '
-                'role.')
-            policy_doc = {
-                'Statement': [{
-                    'Effect': 'Allow',
-                    'Principal': {
-                        'Service': 'ec2.amazonaws.com'
-                    },
-                    'Action': 'sts:AssumeRole',
-                }]
-            }
-            attach_policy_arns = [
-                'arn:aws:iam::aws:policy/AmazonEC2FullAccess',
-                'arn:aws:iam::aws:policy/AmazonS3FullAccess',
-            ]
-
-            iam.create_role(RoleName=role_name,
-                            AssumeRolePolicyDocument=json.dumps(policy_doc))
-            role = _get_role(role_name)
-            assert role is not None, 'Failed to create role'
-
-            for policy_arn in attach_policy_arns:
-                role.attach_policy(PolicyArn=policy_arn)
-
-            # SkyPilot: 'PassRole' is required by the controllers (jobs and
-            # services) created with `aws.remote_identity: SERVICE_ACCOUNT` to
-            # create instances with the IAM role.
-            skypilot_pass_role_policy_doc = {
-                'Statement': [
-                    {
-                        'Effect': 'Allow',
-                        'Action': [
-                            'iam:GetRole',
-                            'iam:PassRole',
-                        ],
-                        'Resource': role.arn,
-                    },
-                    {
-                        'Effect': 'Allow',
-                        'Action': 'iam:GetInstanceProfile',
-                        'Resource': profile.arn,
-                    },
-                ]
-            }
-            role.Policy('SkyPilotPassRolePolicy').put(
-                PolicyDocument=json.dumps(skypilot_pass_role_policy_doc))
-
-        profile.add_role(RoleName=role.name)
-        time.sleep(15)  # wait for propagation
-    return {'Arn': profile.arn}
 
 
 @annotations.lru_cache(scope='request', maxsize=128)  # Keep bounded.

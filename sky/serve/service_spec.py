@@ -45,6 +45,12 @@ class SkyServiceSpec:
         ports: str | None = None,
         target_qps_per_replica: float | dict[str, float] | None = None,
         target_concurrency_per_replica: float | None = None,
+        target_utilization_percentage: int | None = None,
+        expected_request_duration_seconds: float | None = None,
+        max_scale_up_rate_percentage: int | None = None,
+        scale_up_rate_min_replicas: int | None = None,
+        scale_up_rate_period_seconds: int | None = None,
+        max_scale_down_rate_percentage: int | None = None,
         reserved_capacity_fill: bool | dict[str, Any] | None = None,
         cost_rebalance: dict[str, Any] | None = None,
         post_data: dict[str, Any] | None = None,
@@ -71,6 +77,12 @@ class SkyServiceSpec:
                 'num_overprovision',
                 'target_qps_per_replica',
                 'target_concurrency_per_replica',
+                'target_utilization_percentage',
+                'expected_request_duration_seconds',
+                'max_scale_up_rate_percentage',
+                'scale_up_rate_min_replicas',
+                'scale_up_rate_period_seconds',
+                'max_scale_down_rate_percentage',
                 'base_ondemand_fallback_replicas',
                 'dynamic_ondemand_fallback',
                 'spot_placer',
@@ -244,15 +256,81 @@ class SkyServiceSpec:
 
         uses_logical_replicas = (
             spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER)
-        if uses_logical_replicas:
-            if (not isinstance(target_concurrency_per_replica, int) or
-                    isinstance(target_concurrency_per_replica, bool) or
-                    target_concurrency_per_replica != 1):
+
+        def _validate_percentage(name: str, value: int | None) -> None:
+            if (value is not None and
+                (not isinstance(value, int) or isinstance(value, bool) or
+                 value < 1 or value > 100)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
-                        'dynamic_fallback_per_gpu currently requires '
-                        'target_concurrency_per_replica: 1 so one logical '
-                        'replica is exactly one concurrent job slot.')
+                        f'{name} must be an integer between 1 and 100. '
+                        f'Got: {value!r}')
+
+        _validate_percentage('target_utilization_percentage',
+                             target_utilization_percentage)
+        _validate_percentage('max_scale_up_rate_percentage',
+                             max_scale_up_rate_percentage)
+        _validate_percentage('max_scale_down_rate_percentage',
+                             max_scale_down_rate_percentage)
+        if (expected_request_duration_seconds is not None and
+            (not isinstance(expected_request_duration_seconds, (int, float)) or
+             isinstance(expected_request_duration_seconds, bool) or
+             not math.isfinite(expected_request_duration_seconds) or
+             expected_request_duration_seconds <= 0)):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'expected_request_duration_seconds must be a finite '
+                    'number > 0. Got: '
+                    f'{expected_request_duration_seconds!r}')
+        for name, value in (
+            ('scale_up_rate_min_replicas', scale_up_rate_min_replicas),
+            ('scale_up_rate_period_seconds', scale_up_rate_period_seconds),
+        ):
+            if (value is not None and (not isinstance(value, int) or
+                                       isinstance(value, bool) or value <= 0)):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(f'{name} must be a positive integer. '
+                                     f'Got: {value!r}')
+        scale_up_rate_fields = (
+            max_scale_up_rate_percentage,
+            scale_up_rate_min_replicas,
+            scale_up_rate_period_seconds,
+        )
+        if any(value is not None for value in scale_up_rate_fields) and not all(
+                value is not None for value in scale_up_rate_fields):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'max_scale_up_rate_percentage, '
+                    'scale_up_rate_min_replicas, and '
+                    'scale_up_rate_period_seconds must be set together.')
+
+        logical_scaling_fields = {
+            'target_utilization_percentage': target_utilization_percentage,
+            'expected_request_duration_seconds': expected_request_duration_seconds,
+            'max_scale_up_rate_percentage': max_scale_up_rate_percentage,
+            'scale_up_rate_min_replicas': scale_up_rate_min_replicas,
+            'scale_up_rate_period_seconds': scale_up_rate_period_seconds,
+            'max_scale_down_rate_percentage': max_scale_down_rate_percentage,
+        }
+        explicitly_set_logical_fields = [
+            name for name, value in logical_scaling_fields.items()
+            if value is not None
+        ]
+        if explicitly_set_logical_fields and not uses_logical_replicas:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    f'{", ".join(explicitly_set_logical_fields)} require '
+                    'logical replicas with spot_placer: '
+                    f'{spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER}.')
+        if uses_logical_replicas:
+            if (not isinstance(target_concurrency_per_replica, int) or
+                    isinstance(target_concurrency_per_replica, bool)):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu requires '
+                        'target_concurrency_per_replica to be a positive '
+                        'integer so logical GPU targets remain whole slots. '
+                        f'Got: {target_concurrency_per_replica!r}')
             if graceful_drain_async_occupancy is not True:
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
@@ -448,6 +526,18 @@ class SkyServiceSpec:
         # Per-GPU target concurrency: replica capacity = knob * gpu_count.
         self._target_concurrency_per_replica: float | None = (
             target_concurrency_per_replica)
+        self._target_utilization_percentage: int | None = (
+            target_utilization_percentage)
+        self._expected_request_duration_seconds: float | None = (
+            expected_request_duration_seconds)
+        self._max_scale_up_rate_percentage: int | None = (
+            max_scale_up_rate_percentage)
+        self._scale_up_rate_min_replicas: int | None = (
+            scale_up_rate_min_replicas)
+        self._scale_up_rate_period_seconds: int | None = (
+            scale_up_rate_period_seconds)
+        self._max_scale_down_rate_percentage: int | None = (
+            max_scale_down_rate_percentage)
         # Internal compatibility marker. dynamic_fallback_per_gpu predates
         # logical replica semantics, so old persisted specs must remain
         # physical across controller restarts. New specs activate logical
@@ -497,6 +587,16 @@ class SkyServiceSpec:
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
+        state.setdefault('_target_utilization_percentage', None)
+        state.setdefault('_expected_request_duration_seconds', None)
+        state.setdefault('_max_scale_up_rate_percentage', None)
+        state.setdefault('_scale_up_rate_min_replicas', None)
+        state.setdefault('_scale_up_rate_period_seconds', None)
+        # Old persisted specs predate bounded downscale and preserve the
+        # previous unlimited target adoption rather than silently changing on
+        # an API-server restart. Newly parsed specs default to 50 via the
+        # property below.
+        state.setdefault('_max_scale_down_rate_percentage', 100)
         # dynamic_fallback_per_gpu existed before logical replica semantics.
         # Missing means this service version still counts physical backends
         # until an explicit update creates a newly marked version.
@@ -708,6 +808,12 @@ class SkyServiceSpec:
             service_config['num_overprovision'] = None
             service_config['target_qps_per_replica'] = None
             service_config['target_concurrency_per_replica'] = None
+            service_config['target_utilization_percentage'] = None
+            service_config['expected_request_duration_seconds'] = None
+            service_config['max_scale_up_rate_percentage'] = None
+            service_config['scale_up_rate_min_replicas'] = None
+            service_config['scale_up_rate_period_seconds'] = None
+            service_config['max_scale_down_rate_percentage'] = None
             service_config['reserved_capacity_fill'] = None
             service_config['cost_rebalance'] = None
         else:
@@ -720,6 +826,13 @@ class SkyServiceSpec:
                 'target_qps_per_replica', None)
             service_config['target_concurrency_per_replica'] = (
                 policy_section.get('target_concurrency_per_replica', None))
+            for field in ('target_utilization_percentage',
+                          'expected_request_duration_seconds',
+                          'max_scale_up_rate_percentage',
+                          'scale_up_rate_min_replicas',
+                          'scale_up_rate_period_seconds',
+                          'max_scale_down_rate_percentage'):
+                service_config[field] = policy_section.get(field, None)
             service_config['reserved_capacity_fill'] = policy_section.get(
                 'reserved_capacity_fill', None)
             service_config['cost_rebalance'] = policy_section.get(
@@ -915,6 +1028,13 @@ class SkyServiceSpec:
                         self.target_qps_per_replica)
         add_if_not_none('replica_policy', 'target_concurrency_per_replica',
                         self.target_concurrency_per_replica)
+        for field in ('target_utilization_percentage',
+                      'expected_request_duration_seconds',
+                      'max_scale_up_rate_percentage',
+                      'scale_up_rate_min_replicas',
+                      'scale_up_rate_period_seconds',
+                      'max_scale_down_rate_percentage'):
+            add_if_not_none('replica_policy', field, getattr(self, f'_{field}'))
         # no_empty: omit both None and False so older controllers never see
         # the field unless the user opted in. Canonicalize: an object form
         # carrying only default knobs collapses to the plain bool form.
@@ -1011,11 +1131,13 @@ class SkyServiceSpec:
         # This runs on every service record build (serve_state.get_service),
         # so it must render (not assert) for every valid autoscaling spec.
         if self.target_concurrency_per_replica is not None:
+            utilization = self.target_utilization_percentage
             return (
                 f'Autoscaling from {self.min_replicas} to {self.max_replicas} '
                 f'{noun}{max_plural}{overprovision_str} '
                 '(target_concurrency_per_replica: '
-                f'{self.target_concurrency_per_replica} per GPU)')
+                f'{self.target_concurrency_per_replica} per GPU, '
+                f'target utilization: {utilization}%)')
         # Already checked in __init__: a non-fixed, non-pool service without
         # the concurrency knob must carry the QPS knob.
         assert self.target_qps_per_replica is not None
@@ -1127,6 +1249,32 @@ class SkyServiceSpec:
         # Per GPU: replica capacity = knob * gpu_count. Guarded with getattr
         # semantics via __setstate__ for specs unpickled from old DB rows.
         return self._target_concurrency_per_replica
+
+    @property
+    def target_utilization_percentage(self) -> int:
+        value = getattr(self, '_target_utilization_percentage', None)
+        return 100 if value is None else value
+
+    @property
+    def expected_request_duration_seconds(self) -> float | None:
+        return getattr(self, '_expected_request_duration_seconds', None)
+
+    @property
+    def max_scale_up_rate_percentage(self) -> int | None:
+        return getattr(self, '_max_scale_up_rate_percentage', None)
+
+    @property
+    def scale_up_rate_min_replicas(self) -> int | None:
+        return getattr(self, '_scale_up_rate_min_replicas', None)
+
+    @property
+    def scale_up_rate_period_seconds(self) -> int | None:
+        return getattr(self, '_scale_up_rate_period_seconds', None)
+
+    @property
+    def max_scale_down_rate_percentage(self) -> int:
+        value = getattr(self, '_max_scale_down_rate_percentage', None)
+        return 50 if value is None else value
 
     @property
     def replica_unit(self) -> str:
@@ -1259,6 +1407,25 @@ class SkyServiceSpec:
         constructor_spot_placer = (spot_placer_lib.SPOT_HEDGE_PLACER
                                    if preserve_legacy_semantics else
                                    copied_spot_placer)
+        logical_scaling_values = {
+            'target_utilization_percentage': override.pop(
+                'target_utilization_percentage',
+                self._target_utilization_percentage),
+            'expected_request_duration_seconds': override.pop(
+                'expected_request_duration_seconds',
+                self._expected_request_duration_seconds),
+            'max_scale_up_rate_percentage': override.pop(
+                'max_scale_up_rate_percentage',
+                self._max_scale_up_rate_percentage),
+            'scale_up_rate_min_replicas': override.pop(
+                'scale_up_rate_min_replicas', self._scale_up_rate_min_replicas),
+            'scale_up_rate_period_seconds': override.pop(
+                'scale_up_rate_period_seconds',
+                self._scale_up_rate_period_seconds),
+            'max_scale_down_rate_percentage': override.pop(
+                'max_scale_down_rate_percentage',
+                self._max_scale_down_rate_percentage),
+        }
         copied = SkyServiceSpec(
             readiness_path=override.pop('readiness_path', self._readiness_path),
             initial_delay_seconds=override.pop('initial_delay_seconds',
@@ -1295,6 +1462,24 @@ class SkyServiceSpec:
             target_concurrency_per_replica=override.pop(
                 'target_concurrency_per_replica',
                 self._target_concurrency_per_replica),
+            target_utilization_percentage=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['target_utilization_percentage']),
+            expected_request_duration_seconds=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['expected_request_duration_seconds']),
+            max_scale_up_rate_percentage=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['max_scale_up_rate_percentage']),
+            scale_up_rate_min_replicas=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['scale_up_rate_min_replicas']),
+            scale_up_rate_period_seconds=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['scale_up_rate_period_seconds']),
+            max_scale_down_rate_percentage=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['max_scale_down_rate_percentage']),
             reserved_capacity_fill=override.pop('reserved_capacity_fill',
                                                 self._reserved_capacity_fill),
             cost_rebalance=override.pop('cost_rebalance', self._cost_rebalance),
@@ -1327,6 +1512,8 @@ class SkyServiceSpec:
             # policy choice and keeps the constructor-derived semantics.
             copied._spot_placer = copied_spot_placer  # pylint: disable=protected-access
             copied._uses_logical_replicas = False  # pylint: disable=protected-access
+            for field, value in logical_scaling_values.items():
+                setattr(copied, f'_{field}', value)
         copied._lb_high_availability_specified = (  # pylint: disable=protected-access
             self._lb_high_availability_specified)
         return copied

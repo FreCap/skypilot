@@ -286,13 +286,16 @@ class GcsStore(AbstractStore):
             (os.path.isdir(path) and not create_dirs) else str(path)
             for path in source_path_list
         ]
-        copy_list = '\n'.join(
-            os.path.abspath(os.path.expanduser(p)) for p in source_path_list)
+        copy_args = ' '.join(
+            shlex.quote(os.path.abspath(os.path.expanduser(p)))
+            for p in source_path_list)
         gsutil_alias, alias_gen = data_utils.get_gsutil_command()
         sub_path = (f'/{self._bucket_sub_path}'
                     if self._bucket_sub_path else '')
-        sync_command = (f'{alias_gen}; echo "{copy_list}" | {gsutil_alias} '
-                        f'cp -e -n -r -I gs://{self.name}{sub_path}')
+        target_uri = f'gs://{self.name}{sub_path}'
+        sync_command = (
+            f'{alias_gen}; printf \'%s\\n\' {copy_args} | {gsutil_alias} '
+            f'cp -e -n -r -I {shlex.quote(target_uri)}')
         log_path = sky_logging.generate_tmp_logging_file_path(
             _STORAGE_LOG_FILE_NAME)
         sync_path = f'{source_message} -> gs://{self.name}{sub_path}/'
@@ -331,12 +334,14 @@ class GcsStore(AbstractStore):
                     if self._bucket_sub_path else '')
 
         def get_file_sync_command(base_dir_path, file_names):
-            sync_format = '|'.join(file_names)
+            sync_format = '|'.join(re.escape(name) for name in file_names)
+            exclude_pattern = f'^(?!(?:{sync_format})$).*'
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-            base_dir_path = shlex.quote(base_dir_path)
+            target_uri = f'gs://{self.name}{sub_path}'
             sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -x \'^(?!{sync_format}$).*\' '
-                            f'{base_dir_path} gs://{self.name}{sub_path}')
+                            f'rsync -e -x {shlex.quote(exclude_pattern)} '
+                            f'{shlex.quote(base_dir_path)} '
+                            f'{shlex.quote(target_uri)}')
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name):
@@ -345,10 +350,11 @@ class GcsStore(AbstractStore):
             excluded_list.append(r'^\.git/.*$')
             excludes = '|'.join(excluded_list)
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-            src_dir_path = shlex.quote(src_dir_path)
+            target_uri = (f'gs://{self.name}{sub_path}/{dest_dir_name}')
             sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -r -x \'({excludes})\' {src_dir_path} '
-                            f'gs://{self.name}{sub_path}/{dest_dir_name}')
+                            f'rsync -e -r -x {shlex.quote(f"({excludes})")} '
+                            f'{shlex.quote(src_dir_path)} '
+                            f'{shlex.quote(target_uri)}')
             return sync_command
 
         # Generate message for upload
@@ -558,9 +564,9 @@ class GcsStore(AbstractStore):
                 return False
             try:
                 gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-                remove_obj_command = (
-                    f'{alias_gen};{gsutil_alias} '
-                    f'rm -r gs://{bucket_name}{command_suffix}')
+                target_uri = f'gs://{bucket_name}{command_suffix}'
+                remove_obj_command = (f'{alias_gen};{gsutil_alias} '
+                                      f'rm -r {shlex.quote(target_uri)}')
                 subprocess.check_output(remove_obj_command,
                                         stderr=subprocess.STDOUT,
                                         shell=True,

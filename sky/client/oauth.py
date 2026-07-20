@@ -38,7 +38,11 @@ class _AuthCallbackHandler(BaseHTTPRequestHandler):
                              self.remote_endpoint)
             self.end_headers()
 
-    def log_message(self, *args):  # pylint: disable=unused-argument
+    def log_message(
+        self,
+        format: str,  # pylint: disable=redefined-builtin
+        *args: object,
+    ) -> None:  # pylint: disable=unused-argument
         """Suppress default HTTP server logging."""
         pass
 

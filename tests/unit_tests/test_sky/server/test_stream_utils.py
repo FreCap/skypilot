@@ -5,12 +5,74 @@ import asyncio
 import fcntl
 import pathlib
 import types
+from unittest import mock
 
 import aiofiles
+import fastapi
 import pytest
 
 from sky.server import stream_utils
+from sky.server.requests import requests as requests_lib
 from sky.utils import context
+
+
+@pytest.mark.asyncio
+async def test_log_streamer_scans_directory_off_event_loop(tmp_path):
+    first_log = tmp_path / 'a.log'
+    second_log = tmp_path / 'b.log'
+    first_log.write_text('first\n', encoding='utf-8')
+    second_log.write_text('second\n', encoding='utf-8')
+    original_to_thread = asyncio.to_thread
+
+    with mock.patch.object(stream_utils.asyncio,
+                           'to_thread',
+                           wraps=original_to_thread) as to_thread:
+        output = ''.join([
+            chunk async for chunk in stream_utils.log_streamer(
+                request_id=None, log_path=tmp_path, follow=False)
+        ])
+
+    assert output.index(str(first_log)) < output.index(str(second_log))
+    assert 'first\n' in output
+    assert 'second\n' in output
+    to_thread.assert_awaited_once_with(
+        stream_utils._directory_log_files,  # pylint: disable=protected-access
+        tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_log_streamer_preserves_single_file_behavior(tmp_path):
+    log_path = tmp_path / 'request.log'
+    log_path.write_text('request output\n', encoding='utf-8')
+
+    output = ''.join([
+        chunk async for chunk in stream_utils.log_streamer(
+            request_id=None, log_path=log_path, follow=False)
+    ])
+
+    assert output == 'request output\n'
+
+
+def test_request_log_storage_admission_allows_healthy_filesystem(monkeypatch):
+    monkeypatch.setattr(
+        requests_lib, 'get_request_log_storage_usage',
+        lambda: requests_lib.RequestLogStorageUsage(
+            free_bytes=11, soft_free_bytes=10, hard_free_bytes=5))
+
+    stream_utils.ensure_request_log_storage_available()
+
+
+def test_request_log_storage_admission_sheds_under_pressure(monkeypatch):
+    monkeypatch.setattr(
+        requests_lib, 'get_request_log_storage_usage',
+        lambda: requests_lib.RequestLogStorageUsage(
+            free_bytes=4, soft_free_bytes=10, hard_free_bytes=5))
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        stream_utils.ensure_request_log_storage_available()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {'Retry-After': '60'}
 
 
 @pytest.mark.asyncio

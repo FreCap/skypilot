@@ -26,6 +26,7 @@ jobs:
         npm --prefix sky/dashboard test -- --runInBand \
           src/components/services.test.jsx \
           src/components/service-version-history.test.jsx \
+          src/components/service-placement.test.jsx \
           src/components/recipe-hub.test.jsx \
           src/components/recipe-detail.test.jsx \
           src/components/clusters.test.jsx \
@@ -37,6 +38,7 @@ jobs:
           src/data/connectors/infra-slurm.test.jsx \
           src/components/serve-replica-history.test.jsx \
           src/components/job-detail-logs.test.jsx \
+          src/components/job-log-actions.test.jsx \
           src/components/jobs.test.jsx \
           src/components/pools-table.test.jsx \
           src/components/users.test.jsx \

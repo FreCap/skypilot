@@ -2760,13 +2760,16 @@ def get_cluster_events(
     return [row.reason for row in rows]
 
 
+_CLUSTER_EVENT_NAMES_CHUNK = 500
+
+
 @db_retries.retry
-def get_cluster_events_by_name(
-    cluster_name: str,
+def get_cluster_events_by_names(
+    cluster_names: list[str],
     event_types: list[ClusterEventType],
     limit: int | None = None,
 ) -> list[dict[str, str | int]]:
-    """Returns cluster events looked up by the persisted cluster name.
+    """Returns cluster events looked up by persisted cluster names.
 
     Unlike get_cluster_events, this filters on the cluster_events ``name``
     column directly instead of resolving the name to a hash via the clusters
@@ -2775,29 +2778,40 @@ def get_cluster_events_by_name(
     finished managed jobs whose clusters have already been torn down.
 
     Args:
-        cluster_name: Name of the cluster.
+        cluster_names: Names of the clusters.
         event_types: Event types to include.
         limit: If specified, returns at most this many events (most recent),
-            across all the requested event types.
+            across all names and requested event types.
 
     Returns:
         List of dicts with 'reason' and 'transitioned_at' (unix timestamp)
         fields, ordered from newest to oldest.
     """
-    if not event_types:
+    cluster_names = list(dict.fromkeys(cluster_names))
+    if not cluster_names or not event_types or limit == 0:
         return []
     engine = _db_manager.get_engine()
     type_values = [event_type.value for event_type in event_types]
+    rows = []
     with orm.Session(engine) as session:
-        query = session.query(
-            cluster_event_table.c.reason,
-            cluster_event_table.c.transitioned_at,
-        ).filter(cluster_event_table.c.name == cluster_name,
-                 cluster_event_table.c.type.in_(type_values)).order_by(
-                     cluster_event_table.c.transitioned_at.desc())
-        if limit is not None:
-            query = query.limit(limit)
-        rows = query.all()
+        for start in range(0, len(cluster_names), _CLUSTER_EVENT_NAMES_CHUNK):
+            names = cluster_names[start:start + _CLUSTER_EVENT_NAMES_CHUNK]
+            query = session.query(
+                cluster_event_table.c.reason,
+                cluster_event_table.c.transitioned_at,
+            ).filter(cluster_event_table.c.name.in_(names),
+                     cluster_event_table.c.type.in_(type_values)).order_by(
+                         cluster_event_table.c.transitioned_at.desc())
+            if limit is not None:
+                # The global newest L events must be within each chunk's
+                # newest L, so bounding every query preserves the final result
+                # without materializing older rows that cannot survive.
+                query = query.limit(limit)
+            rows.extend(query.all())
+    if len(cluster_names) > _CLUSTER_EVENT_NAMES_CHUNK:
+        rows.sort(key=lambda row: row.transitioned_at, reverse=True)
+        if limit is not None and limit >= 0:
+            rows = rows[:limit]
     return [{
         'reason': row.reason,
         'transitioned_at': row.transitioned_at,
@@ -4793,30 +4807,33 @@ def get_cluster_yaml_str(cluster_yaml_path: str | None) -> str | None:
     return row.yaml
 
 
-def get_cluster_yaml_str_multiple(cluster_yaml_paths: list[str]) -> list[str]:
-    """Get the cluster yaml from the database or the local file system.
-    """
+def get_cluster_yaml_str_multiple(
+        cluster_yaml_paths: list[str]) -> list[str | None]:
+    """Get cluster YAMLs while preserving input order and cardinality."""
+    if not cluster_yaml_paths:
+        return []
+
     engine = _db_manager.get_engine()
-    cluster_names_to_yaml_paths = {}
+    cluster_names = []
+    cluster_names_to_yaml_paths: dict[str, str] = {}
     for cluster_yaml_path in cluster_yaml_paths:
         cluster_name, _ = os.path.splitext(os.path.basename(cluster_yaml_path))
+        cluster_names.append(cluster_name)
         cluster_names_to_yaml_paths[cluster_name] = cluster_yaml_path
 
-    cluster_names = list(cluster_names_to_yaml_paths.keys())
+    unique_cluster_names = list(cluster_names_to_yaml_paths)
     with orm.Session(engine) as session:
         rows = session.query(cluster_yaml_table).filter(
-            cluster_yaml_table.c.cluster_name.in_(cluster_names)).all()
-    row_cluster_names_to_yaml = {row.cluster_name: row.yaml for row in rows}
+            cluster_yaml_table.c.cluster_name.in_(unique_cluster_names)).all()
+    cluster_names_to_yaml: dict[str, str | None] = {
+        row.cluster_name: row.yaml for row in rows
+    }
 
-    yaml_strs = []
-    for cluster_name in cluster_names:
-        if cluster_name in row_cluster_names_to_yaml:
-            yaml_strs.append(row_cluster_names_to_yaml[cluster_name])
-        else:
-            yaml_str = _set_cluster_yaml_from_file(
+    for cluster_name in unique_cluster_names:
+        if cluster_name not in cluster_names_to_yaml:
+            cluster_names_to_yaml[cluster_name] = _set_cluster_yaml_from_file(
                 cluster_names_to_yaml_paths[cluster_name], cluster_name)
-            yaml_strs.append(yaml_str)
-    return yaml_strs
+    return [cluster_names_to_yaml[name] for name in cluster_names]
 
 
 def _set_cluster_yaml_from_file(cluster_yaml_path: str,

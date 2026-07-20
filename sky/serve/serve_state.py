@@ -1583,13 +1583,15 @@ def get_services() -> list[dict[str, Any]]:
     return records
 
 
-def get_num_services() -> int:
-    """Get the number of services."""
+def get_num_services(pool: bool | None = None) -> int:
+    """Get the number of raw service rows, optionally filtered by mode."""
     engine = _db_manager.get_engine()
+    query = sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(services_table)
+    if pool is not None:
+        query = query.where(services_table.c.pool == int(pool))
     with orm.Session(engine) as session:
-        return session.execute(
-            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
-                             ).select_from(services_table)).fetchone()[0]
+        return session.execute(query).fetchone()[0]
 
 
 def get_service_from_name(service_name: str) -> dict[str, Any] | None:
@@ -2176,7 +2178,7 @@ def mark_lb_demand_handoff_complete(
     expected_lifecycle_epoch: int,
     generation: int,
 ) -> float | None:
-    """Record the first complete report from the promoted active."""
+    """Record the promoted active's first complete demand-gauge report."""
     engine = _db_manager.get_engine()
     _require_postgresql_lb_cutover(engine)
     predicates = _lb_cutover_owner_predicates(service_name,

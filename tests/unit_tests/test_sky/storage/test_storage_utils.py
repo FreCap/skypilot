@@ -51,7 +51,8 @@ def tmp_dir_with_files_to_ignore():
                 f.write('test content')
         for socket_path in sockets:
             full_path = os.path.join(temp_dir, socket_path)
-            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind(full_path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.bind(full_path)
 
         # Create symlinks
         os.symlink(os.path.join(temp_dir, 'keep.py'),

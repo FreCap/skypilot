@@ -1,3 +1,4 @@
+# pyright: reportCallInDefaultInitializer=error
 """Common utilities for the client."""
 
 from collections.abc import Generator
@@ -63,12 +64,19 @@ _FILE_UPLOAD_LOCK_DIR = '~/.sky/locks/file_uploads'
 
 # Connection timeout when sending requests to the API server.
 API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS = 5
+# Per-operation timeout for file-upload reads, writes, and pool waits. This is
+# not a total upload deadline: active large transfers can still run longer.
+FILE_UPLOAD_HTTP_TIMEOUT_SECONDS = 180
+
+
+def _file_upload_http_timeout() -> 'httpx.Timeout':
+    return httpx.Timeout(FILE_UPLOAD_HTTP_TIMEOUT_SECONDS,
+                         connect=API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS)
 
 
 def download_logs_from_api_server(
         paths_on_api_server: Iterable[str],
-        remote_machine_prefix: str = str(
-            server_common.api_server_user_logs_dir_prefix()),
+        remote_machine_prefix: str | None = None,
         local_machine_prefix: str = constants.SKY_LOGS_DIRECTORY
 ) -> dict[str, str]:
     """Downloads the logs from the API server.
@@ -82,6 +90,11 @@ def download_logs_from_api_server(
     Returns:
         A dictionary mapping the remote path on API server to the local path.
     """
+    if remote_machine_prefix is None:
+        # API login can update the local user hash after this module is
+        # imported, so resolve the per-user API-server path for each call.
+        remote_machine_prefix = str(
+            server_common.api_server_user_logs_dir_prefix())
     remote2local_path_dict = {
         remote_path: remote_path.replace(
             # TODO(zhwu): handling the replacement locally is not stable, and
@@ -267,6 +280,8 @@ def _upload_chunk_with_retry(params: UploadChunkParams) -> str:
 @contextlib.contextmanager
 def _setup_upload_logger(
         log_file: str) -> Generator[logging.Logger, None, None]:
+    upload_logger = None
+    handler = None
     try:
         upload_logger = logging.getLogger('sky.upload')
         upload_logger.propagate = False
@@ -277,8 +292,10 @@ def _setup_upload_logger(
         upload_logger.setLevel(logging.DEBUG)
         yield upload_logger
     finally:
-        upload_logger.removeHandler(handler)
-        handler.close()
+        if handler is not None:
+            if upload_logger is not None:
+                upload_logger.removeHandler(handler)
+            handler.close()
 
 
 _HASH_CHUNK_SIZE = 2**18
@@ -409,7 +426,7 @@ def upload_mounts_to_api_server(
                         upload_logger: logging.Logger):
             zip_file_size = os.path.getsize(zip_file_path)
             total_chunks = int(math.ceil(zip_file_size / _UPLOAD_CHUNK_BYTES))
-            timeout = httpx.Timeout(None, read=180.0)
+            timeout = _file_upload_http_timeout()
             status.update(
                 ux_utils.spinner_message(
                     'Uploading files to API server (2/2 - Uploading)',

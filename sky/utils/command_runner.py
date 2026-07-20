@@ -1395,6 +1395,7 @@ class SSHCommandRunner(CommandRunner):
                 return result
 
             if require_outputs:
+                assert isinstance(result, tuple), result
                 returncode, _, _ = result
             else:
                 returncode = result
@@ -1421,6 +1422,7 @@ class SSHCommandRunner(CommandRunner):
             if not has_auth_failure:
                 # No auth failure detected; don't attempt interactive auth.
                 if require_outputs:
+                    assert isinstance(result, tuple), result
                     returncode, stdout, stderr = result
                     return returncode, stdout, stderr + '\n' + ssh_log_content
                 return result
@@ -2058,6 +2060,7 @@ class SlurmCommandRunner(SSHCommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
+        get_remote_home_dir: Callable[[], str] | None = None,
         timeout: int | None = None,
     ) -> None:
         """Rsyncs files via srun, either to host or into container.
@@ -2071,6 +2074,9 @@ class SlurmCommandRunner(SSHCommandRunner):
             log_path: Path for rsync logs.
             stream_logs: Whether to stream logs.
             max_retry: Maximum retry attempts.
+            get_remote_home_dir: Optional callable for resolving remote paths
+                beginning with ``~``. The Slurm host or container home is used
+                when omitted.
             timeout: Optional total timeout in seconds for the rsync, including
                 all retries and backoff waits. None means no timeout (default).
         """
@@ -2081,12 +2087,13 @@ class SlurmCommandRunner(SSHCommandRunner):
 
         extra_srun_args = (f'{self.container_args} '
                            if in_container and self.container_args else '')
-        if in_container:
-            # TODO(kevin): Cache container home dir using kv_cache.py keyed by
-            # container image+version (same image -> same $HOME).
-            remote_home_dir = self.get_remote_home_dir()
-        else:
-            remote_home_dir = self.sky_dir
+        if get_remote_home_dir is None:
+            if in_container:
+                # TODO(kevin): Cache container home dir using kv_cache.py keyed
+                # by container image+version (same image -> same $HOME).
+                get_remote_home_dir = self.get_remote_home_dir
+            else:
+                get_remote_home_dir = lambda: self.sky_dir
 
         script_content = f"""#!/bin/bash
 job_id=$(echo "$1" | cut -d+ -f1)
@@ -2110,7 +2117,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
                         log_path=log_path,
                         stream_logs=stream_logs,
                         max_retry=max_retry,
-                        get_remote_home_dir=lambda: remote_home_dir,
+                        get_remote_home_dir=get_remote_home_dir,
                         timeout=timeout)
         finally:
             try:
@@ -2169,6 +2176,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
+        get_remote_home_dir: Callable[[], str] | None = None,
         timeout: int | None = None,
     ) -> None:
         # Default: run in container if container_args set, otherwise on host
@@ -2180,6 +2188,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
                              log_path=log_path,
                              stream_logs=stream_logs,
                              max_retry=max_retry,
+                             get_remote_home_dir=get_remote_home_dir,
                              timeout=timeout)
 
     @timeline.event

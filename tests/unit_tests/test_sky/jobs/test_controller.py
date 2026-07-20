@@ -10,9 +10,11 @@ and file mount cleanup in task_cleanup().
 """
 import asyncio
 import pathlib
+import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -870,7 +872,7 @@ class TestJobGroupRecovery:
         job_controller._monitor_job_group_task.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_job_group_parent_cancellation_joins_monitor_children(
+    async def test_job_group_repeated_parent_cancellation_joins_monitors(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
         mock_dag.tasks = mock_dag.tasks[:2]
@@ -881,7 +883,10 @@ class TestJobGroupRecovery:
                                                        executors[1])])
 
         all_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
         started = set()
+        cleaning_up = set()
         cancelled = set()
 
         async def monitor(task_id, *_args):
@@ -893,7 +898,10 @@ class TestJobGroupRecovery:
             except asyncio.CancelledError:
                 # Model cancellation cleanup that must finish before the
                 # owning JobGroup coroutine may exit.
-                await asyncio.sleep(0)
+                cleaning_up.add(task_id)
+                if len(cleaning_up) == 2:
+                    cleanup_started.set()
+                await allow_cleanup.wait()
                 cancelled.add(task_id)
                 raise
 
@@ -917,6 +925,11 @@ class TestJobGroupRecovery:
             run_task = asyncio.create_task(job_controller._run_job_group())
             await asyncio.wait_for(all_started.wait(), timeout=1)
             run_task.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_cleanup.set()
             with pytest.raises(asyncio.CancelledError):
                 await run_task
 
@@ -1418,9 +1431,6 @@ class TestDownloadLogsForCancelledJob:
         manager._download_logs_for_cancelled_job = (
             ControllerManager._download_logs_for_cancelled_job.__get__(
                 manager, ControllerManager))
-        manager._download_log_from_cluster = (
-            ControllerManager._download_log_from_cluster.__get__(
-                manager, ControllerManager))
         return manager
 
     @pytest.mark.asyncio
@@ -1442,7 +1452,10 @@ class TestDownloadLogsForCancelledJob:
                    '.generate_managed_job_cluster_name',
                    return_value='sky-managed-1-test-job') as mock_gen_name, \
              patch('sky.jobs.controller.backend_utils.get_clusters',
-                   return_value=[{'handle': mock_handle}]) as mock_get_cl:
+                   return_value=[{
+                       'name': 'sky-managed-1-test-job',
+                       'handle': mock_handle
+                   }]) as mock_get_cl:
 
             await ControllerManager._download_logs_for_cancelled_job(
                 manager,
@@ -1476,7 +1489,10 @@ class TestDownloadLogsForCancelledJob:
                    '.get_pool_submit_info_async',
                    return_value=('pool-cluster-1', 42)) as mock_pool_info, \
              patch('sky.jobs.controller.backend_utils.get_clusters',
-                   return_value=[{'handle': mock_handle}]):
+                   return_value=[{
+                       'name': 'pool-cluster-1',
+                       'handle': mock_handle
+                   }]):
 
             await ControllerManager._download_logs_for_cancelled_job(
                 manager,
@@ -1573,7 +1589,10 @@ class TestDownloadLogsForCancelledJob:
                    '.generate_managed_job_cluster_name',
                    return_value='sky-managed-5-test-job'), \
              patch('sky.jobs.controller.backend_utils.get_clusters',
-                   return_value=[{'handle': mock_handle}]):
+                   return_value=[{
+                       'name': 'sky-managed-5-test-job',
+                       'handle': mock_handle
+                   }]):
 
             # Should NOT raise - exceptions are caught per-task
             await ControllerManager._download_logs_for_cancelled_job(
@@ -1607,20 +1626,18 @@ class TestDownloadLogsForCancelledJob:
         mock_handle_0 = MagicMock()
         mock_handle_2 = MagicMock()
 
-        def get_clusters_side_effect(cluster_names, **kwargs):
-            name = cluster_names[0]
-            if 'job-a' in name:
-                return [{'handle': mock_handle_0}]
-            elif 'job-c' in name:
-                return [{'handle': mock_handle_2}]
-            return []
-
         with patch('sky.jobs.controller.managed_job_utils'
                    '.generate_managed_job_cluster_name',
                    side_effect=lambda name, jid: f'sky-managed-{jid}-{name}'
                    ), \
              patch('sky.jobs.controller.backend_utils.get_clusters',
-                   side_effect=get_clusters_side_effect):
+                   return_value=[{
+                       'name': 'sky-managed-6-job-c',
+                       'handle': mock_handle_2
+                   }, {
+                       'name': 'sky-managed-6-job-a',
+                       'handle': mock_handle_0
+                   }]) as mock_get_clusters:
 
             # task 1 already succeeded, so only tasks 0 and 2 are active
             await ControllerManager._download_logs_for_cancelled_job(
@@ -1631,11 +1648,48 @@ class TestDownloadLogsForCancelledJob:
                 dag=mock_dag,
                 pool=None)
 
-            assert controller.download_log_and_stream.call_count == 2
-            controller.download_log_and_stream.assert_any_call(
-                0, mock_handle_0, None)
-            controller.download_log_and_stream.assert_any_call(
-                2, mock_handle_2, None)
+            mock_get_clusters.assert_called_once_with(
+                cluster_names=['sky-managed-6-job-a', 'sky-managed-6-job-c'],
+                refresh=common.StatusRefreshMode.NONE,
+                all_users=True,
+                _include_is_managed=True)
+            assert controller.download_log_and_stream.call_args_list == [
+                call(0, mock_handle_0, None),
+                call(2, mock_handle_2, None),
+            ]
+
+    @pytest.mark.asyncio
+    async def test_job_group_skips_only_missing_cluster_rows(self):
+        """A partial cluster snapshot still downloads every present task."""
+        manager = self._make_manager()
+        controller = MagicMock()
+        job_id = 8
+        mock_dag = MagicMock()
+        mock_dag.tasks = [MagicMock(name='task-a'), MagicMock(name='task-b')]
+        mock_dag.tasks[0].name = 'job-a'
+        mock_dag.tasks[1].name = 'job-b'
+        mock_handle_1 = MagicMock()
+
+        with patch('sky.jobs.controller.managed_job_utils'
+                   '.generate_managed_job_cluster_name',
+                   side_effect=lambda name, jid: f'sky-managed-{jid}-{name}'
+                   ), \
+             patch('sky.jobs.controller.backend_utils.get_clusters',
+                   return_value=[{
+                       'name': 'sky-managed-8-job-b',
+                       'handle': mock_handle_1
+                   }]) as mock_get_clusters:
+            await ControllerManager._download_logs_for_cancelled_job(
+                manager,
+                controller,
+                job_id,
+                task_ids=[0, 1],
+                dag=mock_dag,
+                pool=None)
+
+        mock_get_clusters.assert_called_once()
+        controller.download_log_and_stream.assert_called_once_with(
+            1, mock_handle_1, None)
 
     @pytest.mark.asyncio
     async def test_per_task_exception_continues_to_next(self):
@@ -1655,14 +1709,6 @@ class TestDownloadLogsForCancelledJob:
         mock_handle_0 = MagicMock()
         mock_handle_1 = MagicMock()
 
-        def get_clusters_side_effect(cluster_names, **kwargs):
-            name = cluster_names[0]
-            if 'job-a' in name:
-                return [{'handle': mock_handle_0}]
-            elif 'job-b' in name:
-                return [{'handle': mock_handle_1}]
-            return []
-
         # Task 0 fails, task 1 succeeds
         call_count = [0]
 
@@ -1678,7 +1724,13 @@ class TestDownloadLogsForCancelledJob:
                    side_effect=lambda name, jid: f'sky-managed-{jid}-{name}'
                    ), \
              patch('sky.jobs.controller.backend_utils.get_clusters',
-                   side_effect=get_clusters_side_effect):
+                   return_value=[{
+                       'name': 'sky-managed-7-job-b',
+                       'handle': mock_handle_1
+                   }, {
+                       'name': 'sky-managed-7-job-a',
+                       'handle': mock_handle_0
+                   }]) as mock_get_clusters:
 
             # Should NOT raise despite task 0 failing
             await ControllerManager._download_logs_for_cancelled_job(
@@ -1689,12 +1741,12 @@ class TestDownloadLogsForCancelledJob:
                 dag=mock_dag,
                 pool=None)
 
-            # Both tasks should have been attempted
-            assert controller.download_log_and_stream.call_count == 2
-            controller.download_log_and_stream.assert_any_call(
-                0, mock_handle_0, None)
-            controller.download_log_and_stream.assert_any_call(
-                1, mock_handle_1, None)
+            mock_get_clusters.assert_called_once()
+            # Both tasks should have been attempted in task order.
+            assert controller.download_log_and_stream.call_args_list == [
+                call(0, mock_handle_0, None),
+                call(1, mock_handle_1, None),
+            ]
 
 
 class TestTransientJobStatusFetchDeadline:
@@ -1947,6 +1999,63 @@ class TestCancelSignalScan:
         assert manager._cancel_info[7] == (False, None)
 
     @pytest.mark.asyncio
+    async def test_signal_lock_contention_does_not_block_event_loop(
+            self, signal_dir):
+        manager = self._make_manager()
+        task = MagicMock()
+        delivered = asyncio.Event()
+        task.cancel.side_effect = delivered.set
+        manager.job_tasks[7] = task
+        (signal_dir / '7').touch()
+        lock_entered = asyncio.Event()
+        release_lock = threading.Event()
+
+        class ContendedLock:
+            """Lock stand-in that can model both sync and async contention."""
+
+            def __enter__(self):
+                lock_entered.set()
+                release_lock.wait()
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            async def __aenter__(self):
+                lock_entered.set()
+                await asyncio.to_thread(release_lock.wait)
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        fallback_release = threading.Timer(1, release_lock.set)
+        fallback_release.start()
+        try:
+            lock = ContendedLock()
+            with patch('sky.jobs.controller.filelock.FileLock',
+                       return_value=lock), patch(
+                           'sky.jobs.controller.filelock.AsyncFileLock',
+                           return_value=lock):
+                scan = asyncio.create_task(manager._process_cancel_signals())
+                await lock_entered.wait()
+
+                # A synchronous FileLock would hold the event loop until the
+                # fallback timer fires. The async lock lets this task run while
+                # another process owns the signal lock.
+                assert not release_lock.is_set()
+                scan.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await scan
+                release_lock.set()
+                await asyncio.wait_for(delivered.wait(), timeout=2)
+                task.cancel.assert_called_once_with()
+                assert not (signal_dir / '7').exists()
+        finally:
+            release_lock.set()
+            fallback_release.cancel()
+
+    @pytest.mark.asyncio
     async def test_orphan_signal_for_terminal_job_reaped(self, signal_dir):
         manager = self._make_manager()
         manager._cancel_info[5] = (False, None)
@@ -2007,14 +2116,14 @@ class TestCancelSignalScan:
             def __init__(self, lock_path: str):
                 self._signal = pathlib.Path(lock_path[:-len('.lock')])
 
-            def __enter__(self):
+            async def __aenter__(self):
                 self._signal.unlink(missing_ok=True)
                 return self
 
-            def __exit__(self, *args):
+            async def __aexit__(self, *args):
                 return False
 
-        with patch('sky.jobs.controller.filelock.FileLock', ConsumingLock):
+        with patch('sky.jobs.controller.filelock.AsyncFileLock', ConsumingLock):
             await manager._process_cancel_signals()
 
         task.cancel.assert_not_called()
@@ -2055,13 +2164,14 @@ class TestCancelSignalScan:
         sleep.assert_awaited_once_with(15)
         assert isinstance(result[0], asyncio.CancelledError)
 
-    def test_remove_signal_file_is_idempotent(self, signal_dir):
+    @pytest.mark.asyncio
+    async def test_remove_signal_file_is_idempotent(self, signal_dir):
         """The shared signal consumer tolerates an already-removed file."""
         (signal_dir / '12').touch()
-        ControllerManager._remove_signal_file(12)
+        await ControllerManager._remove_signal_file(12)
         assert not (signal_dir / '12').exists()
         # Second removal (lost race with another consumer) must not raise.
-        ControllerManager._remove_signal_file(12)
+        await ControllerManager._remove_signal_file(12)
 
     @pytest.mark.asyncio
     async def test_pending_cancel_uses_idempotent_signal_removal(self):
@@ -2086,7 +2196,8 @@ class TestCancelSignalScan:
                       'get_status_async', new_callable=AsyncMock,
                       return_value=managed_job_state.ManagedJobStatus.PENDING
                      ) as get_status, \
-                patch.object(manager, '_remove_signal_file') as remove_signal, \
+                patch.object(manager, '_remove_signal_file',
+                             new_callable=AsyncMock) as remove_signal, \
                 patch('sky.jobs.controller.managed_job_state.'
                       'set_cancelling_async', new_callable=AsyncMock
                      ) as set_cancelling, \
@@ -2099,7 +2210,7 @@ class TestCancelSignalScan:
                 await manager.monitor_loop()
 
         get_status.assert_awaited_once_with(12)
-        remove_signal.assert_called_once_with(12)
+        remove_signal.assert_awaited_once_with(12)
         set_cancelling.assert_awaited_once()
         set_cancelled.assert_awaited_once()
         manager.start_job.assert_not_awaited()
@@ -2121,6 +2232,139 @@ class TestCancelSignalScan:
 
 class TestControllerManagerMonitorLoop:
     """The controller monitor reacts to capacity changes without polling."""
+
+    @pytest.mark.asyncio
+    async def test_capacity_snapshot_uses_one_lock_acquisition(self):
+        manager = ControllerManager('test-uuid')
+
+        class CountingLock:
+            """Count async context entries around a real lock."""
+
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self.acquisitions = 0
+
+            async def __aenter__(self):
+                self.acquisitions += 1
+                await self._lock.acquire()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                self._lock.release()
+
+        capacity_lock = CountingLock()
+        manager._job_tasks_lock = capacity_lock
+
+        with patch('sky.jobs.controller.controller_utils.'
+                   'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async',
+                      new=AsyncMock(side_effect=asyncio.CancelledError)
+                     ) as get_waiting:
+            with pytest.raises(asyncio.CancelledError):
+                await manager.monitor_loop()
+
+        assert capacity_lock.acquisitions == 1
+        get_waiting.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_running_limit_wakes_when_tracked_job_finishes(self):
+        manager = ControllerManager('test-uuid')
+        release_job = asyncio.Event()
+        tracked_job = asyncio.create_task(release_job.wait())
+        manager.job_tasks[1] = tracked_job
+        wait_started = asyncio.Event()
+        scheduler_queried = asyncio.Event()
+        original_wait = asyncio.wait
+
+        async def wait_for_completion(*args, **kwargs):
+            wait_started.set()
+            return await original_wait(*args, **kwargs)
+
+        async def get_waiting_job(**_kwargs):
+            scheduler_queried.set()
+            raise asyncio.CancelledError
+
+        sleep = AsyncMock(side_effect=AssertionError(
+            'running capacity must not use polling sleeps'))
+        wait = AsyncMock(side_effect=wait_for_completion)
+        with patch('sky.jobs.controller.controller_utils.'
+                   'MAX_JOBS_PER_WORKER', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'MAX_TOTAL_RUNNING_JOBS', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async', side_effect=get_waiting_job
+                     ) as get_waiting, \
+                patch('sky.jobs.controller.asyncio.wait', new=wait), \
+                patch('sky.jobs.controller.asyncio.sleep', new=sleep):
+            monitor = asyncio.create_task(manager.monitor_loop())
+            await asyncio.wait_for(wait_started.wait(), timeout=1)
+            monitor.cancel()
+            monitor_result, = await asyncio.gather(monitor,
+                                                   return_exceptions=True)
+            assert isinstance(monitor_result, asyncio.CancelledError)
+            assert not tracked_job.done()
+            assert not tracked_job.cancelled()
+
+            wait_started.clear()
+            monitor = asyncio.create_task(manager.monitor_loop())
+            try:
+                await asyncio.wait_for(wait_started.wait(), timeout=1)
+                get_waiting.assert_not_awaited()
+                release_job.set()
+                await asyncio.wait_for(scheduler_queried.wait(), timeout=1)
+                await asyncio.gather(monitor, return_exceptions=True)
+            finally:
+                monitor.cancel()
+                release_job.set()
+                await asyncio.gather(monitor,
+                                     tracked_job,
+                                     return_exceptions=True)
+
+        sleep.assert_not_awaited()
+        assert wait.await_count == 2
+        for wait_call in wait.await_args_list:
+            assert wait_call.kwargs == {
+                'timeout': 60,
+                'return_when': asyncio.FIRST_COMPLETED,
+            }
+        assert tracked_job.done()
+        assert not tracked_job.cancelled()
+        get_waiting.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_zero_running_limit_retains_topology_recheck(self):
+        manager = ControllerManager('test-uuid')
+        sleep_started = asyncio.Event()
+
+        async def sleep_for_recheck(delay):
+            assert delay == 60
+            sleep_started.set()
+            raise asyncio.CancelledError
+
+        sleep = AsyncMock(side_effect=sleep_for_recheck)
+        wait = AsyncMock(side_effect=AssertionError(
+            'asyncio.wait rejects an empty task set'))
+        with patch('sky.jobs.controller.controller_utils.'
+                   'MAX_JOBS_PER_WORKER', 1), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'MAX_TOTAL_RUNNING_JOBS', 0), \
+                patch('sky.jobs.controller.controller_utils.'
+                      'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async', new_callable=AsyncMock
+                     ) as get_waiting, \
+                patch('sky.jobs.controller.asyncio.wait', new=wait), \
+                patch('sky.jobs.controller.asyncio.sleep', new=sleep):
+            monitor = asyncio.create_task(manager.monitor_loop())
+            await asyncio.wait_for(sleep_started.wait(), timeout=1)
+            await asyncio.gather(monitor, return_exceptions=True)
+
+        sleep.assert_awaited_once_with(60)
+        wait.assert_not_awaited()
+        get_waiting.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_saturated_launch_slot_wakes_on_notification(self):
@@ -2170,17 +2414,80 @@ class TestControllerManagerMonitorLoop:
         manager.start_job.assert_awaited_once_with(2, None)
 
 
-class TestRunJobLoopCancelInfoCleanup:
-    """run_job_loop must drop stale cancel info even on the success path.
+class TestRunJobLoopOwnershipCleanup:
+    """run_job_loop owns manager bookkeeping across every exit path.
 
     If a cancellation lands after the job task already finished,
     task.cancel() is a no-op and no CancelledError handler consumes the
-    stored cancel info; the finally block must remove it.
+    stored cancel info. Initialization failures must also release launch
+    capacity before the inner durable-cleanup scope starts.
     """
+
+    @pytest.mark.asyncio
+    async def test_start_job_hands_off_slot_without_cancellation_gap(
+            self, tmp_path):
+        manager = ControllerManager('test-uuid')
+        registered = []
+
+        def register(coro):
+            assert manager._job_tasks_lock.locked()
+            assert 3 in manager.starting
+            registered.append(coro)
+            coro.close()
+
+        with patch('sky.jobs.controller.jobs_constants.'
+                   'JOBS_CONTROLLER_LOGS_DIR', str(tmp_path)), \
+                patch('sky.jobs.controller.create_background_task',
+                      side_effect=register) as create_task:
+            await manager.start_job(3)
+
+        create_task.assert_called_once()
+        assert len(registered) == 1
+        assert 3 in manager.starting
+
+    @pytest.mark.asyncio
+    async def test_initialization_failure_releases_slot_and_wakes_waiter(self):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
+        waiter_started = asyncio.Event()
+
+        class TrackingCondition(asyncio.Condition):
+
+            async def wait(self):
+                waiter_started.set()
+                return await super().wait()
+
+        manager._starting_signal = TrackingCondition(manager._job_tasks_lock)
+
+        async def wait_for_slot():
+            async with manager._starting_signal:
+                await manager._starting_signal.wait_for(
+                    lambda: 3 not in manager.starting)
+
+        waiter = asyncio.create_task(wait_for_slot())
+        await waiter_started.wait()
+        manager._cleanup = AsyncMock()
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content',
+                      side_effect=RuntimeError('init failed')), \
+                patch('sky.jobs.controller.JobController') as controller:
+            with pytest.raises(RuntimeError, match='init failed'):
+                await manager.run_job_loop(3, '/dev/null')
+
+        await asyncio.wait_for(waiter, timeout=1)
+        assert 3 not in manager.starting
+        assert 3 not in manager.job_tasks
+        assert 3 not in manager._cancel_info
+        controller.assert_not_called()
+        manager._cleanup.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_success_path_pops_stale_cancel_info(self):
         manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
         manager._cancel_info[3] = (False, None)
         manager._cleanup = AsyncMock()
 
@@ -2204,4 +2511,5 @@ class TestRunJobLoopCancelInfoCleanup:
             await manager.run_job_loop(3, '/dev/null')
 
         assert 3 not in manager._cancel_info
+        assert 3 not in manager.starting
         assert 3 not in manager.job_tasks

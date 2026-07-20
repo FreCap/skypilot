@@ -1,9 +1,86 @@
 """Unit tests for sky/client/common.py."""
 import os
 import re
+from unittest import mock
 
+import pytest
+
+from sky.client import common as client_common
 from sky.client.common import _compute_zip_blob_id
 from sky.data import storage_utils
+
+
+def test_file_upload_timeout_bounds_every_network_phase():
+    timeout = client_common._file_upload_http_timeout()  # pylint: disable=protected-access
+
+    assert timeout.connect == client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS
+    assert timeout.read == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+    assert timeout.write == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+    assert timeout.pool == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+
+
+def test_setup_upload_logger_preserves_file_handler_error(monkeypatch):
+
+    def raise_file_handler_error(*args, **kwargs):
+        del args, kwargs
+        raise OSError('disk full')
+
+    monkeypatch.setattr(client_common.logging, 'FileHandler',
+                        raise_file_handler_error)
+
+    with pytest.raises(OSError, match='disk full'):
+        with client_common._setup_upload_logger(  # pylint: disable=protected-access
+                '/tmp/upload.log'):
+            pass
+
+
+def test_download_logs_resolves_remote_prefix_per_call():
+    response = mock.MagicMock(status_code=200,
+                              headers={'X-Home-Path': '/server-home'})
+    response.iter_content.return_value = []
+    zip_file = mock.MagicMock()
+    zip_file.__enter__.return_value.namelist.return_value = []
+
+    with mock.patch.object(
+            client_common.server_common,
+            'api_server_user_logs_dir_prefix',
+            return_value='/fresh-user/sky_logs') as mock_prefix, \
+         mock.patch.object(client_common.server_common,
+                           'make_authenticated_request',
+                           return_value=response), \
+         mock.patch.object(client_common.zipfile,
+                           'ZipFile',
+                           return_value=zip_file):
+        result = client_common.download_logs_from_api_server(
+            ['/fresh-user/sky_logs/job-1'], local_machine_prefix='/local-logs')
+
+    assert result == {'/fresh-user/sky_logs/job-1': '/local-logs/job-1'}
+    mock_prefix.assert_called_once_with()
+
+
+def test_download_logs_preserves_explicit_remote_prefix():
+    response = mock.MagicMock(status_code=200,
+                              headers={'X-Home-Path': '/server-home'})
+    response.iter_content.return_value = []
+    zip_file = mock.MagicMock()
+    zip_file.__enter__.return_value.namelist.return_value = []
+
+    with mock.patch.object(
+            client_common.server_common,
+            'api_server_user_logs_dir_prefix') as mock_prefix, \
+         mock.patch.object(client_common.server_common,
+                           'make_authenticated_request',
+                           return_value=response), \
+         mock.patch.object(client_common.zipfile,
+                           'ZipFile',
+                           return_value=zip_file):
+        result = client_common.download_logs_from_api_server(
+            ['/explicit/sky_logs/job-1'],
+            remote_machine_prefix='/explicit/sky_logs',
+            local_machine_prefix='/local-logs')
+
+    assert result == {'/explicit/sky_logs/job-1': '/local-logs/job-1'}
+    mock_prefix.assert_not_called()
 
 
 def test_blob_id_determinism(tmp_path):

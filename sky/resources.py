@@ -169,7 +169,7 @@ class Resources:
         accelerator_args: dict[str, str] | None = None,
         infra: str | None = None,
         use_spot: bool | None = None,
-        job_recovery: dict[str, str | int | None] | str | None = None,
+        job_recovery: dict[str, Any] | str | None = None,
         region: str | None = None,
         zone: str | None = None,
         image_id: dict[str | None, str] | str | None = None,
@@ -356,7 +356,7 @@ class Resources:
 
         self._use_spot_specified = use_spot is not None
         self._use_spot = use_spot if use_spot is not None else False
-        self._job_recovery: dict[str, str | int | None] | None = None
+        self._job_recovery: dict[str, Any] | None = None
         if job_recovery is not None:
             if isinstance(job_recovery, str):
                 job_recovery = {'strategy': job_recovery}
@@ -816,7 +816,7 @@ class Resources:
         return self._use_spot_specified
 
     @property
-    def job_recovery(self) -> dict[str, str | int | None] | None:
+    def job_recovery(self) -> dict[str, Any] | None:
         return self._job_recovery
 
     @property
@@ -1095,6 +1095,11 @@ class Resources:
                         with ux_utils.print_exception_no_traceback():
                             raise ValueError(parse_error) from None
 
+            if not accelerators:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'The "accelerators" field must contain at least one '
+                        'accelerator.')
             for acc_name, acc_count in accelerators.items():
                 if not isinstance(acc_count, (int, float)) or acc_count <= 0:
                     with ux_utils.print_exception_no_traceback():
@@ -2001,9 +2006,9 @@ class Resources:
         accelerators = self.accelerators
         if accelerators is None:
             accelerators = '-'
-        elif isinstance(accelerators, dict) and len(accelerators) == 1:
-            accelerators, count = list(accelerators.items())[0]
-            accelerators = f'{accelerators}:{count}'
+        elif isinstance(accelerators, dict):
+            accelerators = ','.join(
+                f'{name}:{count}' for name, count in accelerators.items())
         return accelerators
 
     def get_spot_str(self) -> str:
@@ -3117,7 +3122,12 @@ class Resources:
             state['_labels'] = state.get('_labels', None)
 
         if version < 18:
-            self._job_recovery = state.pop('_spot_recovery', None)
+            state['_job_recovery'] = state.pop('_spot_recovery', None)
+        # Resources pickled after job_recovery was introduced but before its
+        # mapping form was added can also contain the original string form.
+        legacy_job_recovery = state.get('_job_recovery')
+        if isinstance(legacy_job_recovery, str):
+            state['_job_recovery'] = {'strategy': legacy_job_recovery}
 
         if version < 19:
             self._cluster_config_overrides = state.pop(

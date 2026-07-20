@@ -1447,6 +1447,16 @@ class ServeStatusBody(RequestBody):
     history_hours: int | None = None
 
 
+class ServePlacementBody(RequestBody):
+    """The request body for one service's placement observability."""
+    service_name: str
+    hours: int = pydantic.Field(default=24, ge=1, le=24)
+    limit: int = pydantic.Field(default=50, ge=1, le=100)
+    cursor: str | None = pydantic.Field(default=None,
+                                        min_length=1,
+                                        max_length=512)
+
+
 class RealtimeGpuAvailabilityRequestBody(RequestBody):
     """The request body for the realtime GPU availability endpoint."""
     context: str | None = None

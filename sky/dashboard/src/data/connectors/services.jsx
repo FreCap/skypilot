@@ -107,7 +107,79 @@ export function normalizeReplicaHistory(history) {
           ) {
             return null;
           }
-          return { timestamp, requestCount };
+          const rejectedCount = Number(sample.rejected_count);
+          return {
+            timestamp,
+            requestCount,
+            rejectedCount:
+              Object.prototype.hasOwnProperty.call(sample, 'rejected_count') &&
+              sample.rejected_count !== null &&
+              sample.rejected_count !== undefined &&
+              Number.isInteger(rejectedCount) &&
+              rejectedCount >= 0
+                ? rejectedCount
+                : null,
+          };
+        })
+        .filter(Boolean)
+    : [];
+  const autoscalerSamples = Array.isArray(history.autoscaler_samples)
+    ? history.autoscaler_samples
+        .map((sample) => {
+          const timestamp = Number(sample.timestamp);
+          const observedAt = Number(sample.observed_at);
+          const version = Number(sample.version);
+          const requiredCounts = [
+            sample.demand_target,
+            sample.capacity_target,
+            sample.ready_capacity,
+            sample.provisioning_capacity,
+            sample.total_capacity,
+          ].map(Number);
+          if (
+            !Number.isFinite(timestamp) ||
+            !Number.isFinite(observedAt) ||
+            !Number.isInteger(version) ||
+            version < 1 ||
+            !['physical_backend', 'logical_slot'].includes(
+              sample.replica_unit
+            ) ||
+            requiredCounts.some(
+              (value) => !Number.isInteger(value) || value < 0
+            )
+          ) {
+            return null;
+          }
+          const [
+            demandTarget,
+            capacityTarget,
+            readyCapacity,
+            provisioningCapacity,
+            totalCapacity,
+          ] = requiredCounts;
+          if (capacityTarget < demandTarget) return null;
+          const optionalCount = (value) => {
+            if (value === null || value === undefined) return null;
+            const count = Number(value);
+            return Number.isInteger(count) && count >= 0 ? count : null;
+          };
+          return {
+            timestamp,
+            observedAt,
+            controllerSessionId:
+              typeof sample.controller_session_id === 'string'
+                ? sample.controller_session_id
+                : null,
+            version,
+            replicaUnit: sample.replica_unit,
+            demandTarget,
+            capacityTarget,
+            readyCapacity,
+            provisioningCapacity,
+            totalCapacity,
+            peakInFlight: optionalCount(sample.peak_in_flight),
+            peakQueueDepth: optionalCount(sample.peak_queue_depth),
+          };
         })
         .filter(Boolean)
     : [];
@@ -120,6 +192,8 @@ export function normalizeReplicaHistory(history) {
     windowEnd: Number(history.window_end) || null,
     samples,
     requestSamples,
+    autoscalerSamples,
+    rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:
       Number(history.request_window_seconds) > 0
         ? Number(history.request_window_seconds)
@@ -381,6 +455,129 @@ export async function getServices(options = {}) {
     console.error('Error fetching services:', error);
     throw error;
   }
+}
+
+function finiteOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+export function normalizeServicePlacement(payload) {
+  const placer = payload?.placer_state || {};
+  const capacity = payload?.capacity_hints || {};
+  const history = payload?.history || {};
+  return {
+    serviceName: payload?.service_name || null,
+    placerState: {
+      available: placer.available !== false,
+      reason: placer.reason || null,
+      enabled: placer.enabled === true,
+      retrySeconds: finiteOrNull(placer.retry_seconds),
+      observedAt: finiteOrNull(placer.observed_at),
+      truncated: placer.truncated === true,
+      locations: Array.isArray(placer.locations)
+        ? placer.locations.map((location) => ({
+            cloud: location.cloud || 'Unknown',
+            region: location.region || null,
+            zone: location.zone || null,
+            accelerators: location.accelerators || null,
+            useSpot: location.use_spot === true,
+            storedStatus: location.stored_status || null,
+            effectiveStatus: location.effective_status || null,
+            probeEligible: location.probe_eligible === true,
+            benchedAt: finiteOrNull(location.benched_at),
+            nextProbeAt: finiteOrNull(location.next_probe_at),
+            cachedHourlyCost: finiteOrNull(location.cached_hourly_cost),
+          }))
+        : [],
+    },
+    capacityHints: {
+      available: capacity.available !== false,
+      reason: capacity.reason || null,
+      truncated: capacity.truncated === true,
+      hints: Array.isArray(capacity.hints)
+        ? capacity.hints.map((hint) => ({
+            kind: hint.kind || 'capacity',
+            region: hint.region || null,
+            zone: hint.zone || null,
+            instanceType: hint.instance_type || null,
+            numNodes: finiteOrNull(hint.num_nodes),
+            observedAt: finiteOrNull(hint.observed_at),
+            expiresAt: finiteOrNull(hint.expires_at),
+          }))
+        : [],
+    },
+    history: {
+      available: history.available !== false,
+      reason: history.reason || null,
+      retentionHours: finiteOrNull(history.retention_hours) || 24,
+      windowStart: finiteOrNull(history.window_start),
+      windowEnd: finiteOrNull(history.window_end),
+      outcomeCounts: history.outcome_counts || {},
+      nextCursor: history.next_cursor || null,
+      events: Array.isArray(history.events)
+        ? history.events.map((event) => ({
+            eventId: event.event_id,
+            requestId: event.request_id,
+            replicaId: event.replica_id,
+            clusterName: event.cluster_name,
+            attemptOrdinal: event.attempt_ordinal,
+            observedAt: finiteOrNull(event.observed_at),
+            outcome: event.outcome,
+            provider: event.provider,
+            region: event.region,
+            zone: event.zone,
+            instanceType: event.instance_type,
+            accelerators: event.accelerators || null,
+            useSpot: event.use_spot === true,
+            numNodes: finiteOrNull(event.num_nodes),
+            hourlyPrice: finiteOrNull(event.hourly_price),
+            priceSource: event.price_source || null,
+            errorCode: event.error_code || null,
+            errorSummary: event.error_summary || null,
+          }))
+        : [],
+    },
+  };
+}
+
+export async function getServicePlacement({
+  serviceName,
+  hours = 24,
+  limit = 50,
+  cursor = null,
+}) {
+  const response = await apiClient.post('/serve/placement', {
+    service_name: serviceName,
+    hours,
+    limit,
+    cursor,
+  });
+  if (!response.ok) {
+    const error = new Error(
+      `Failed to request service placement (${response.status})`
+    );
+    error.status = response.status;
+    throw error;
+  }
+  const requestId = response.headers.get('X-Skypilot-Request-ID');
+  if (!requestId) {
+    throw new Error('No request ID received for service placement');
+  }
+  const result = await apiClient.get(`/api/get?request_id=${requestId}`);
+  if (!result.ok) {
+    const error = new Error(
+      `Failed to fetch service placement (${result.status})`
+    );
+    error.status = result.status;
+    throw error;
+  }
+  const envelope = await result.json();
+  const payload = envelope.return_value
+    ? JSON.parse(envelope.return_value)
+    : {};
+  return normalizeServicePlacement(payload);
 }
 
 async function parseImmediateResponse(response, fallback) {

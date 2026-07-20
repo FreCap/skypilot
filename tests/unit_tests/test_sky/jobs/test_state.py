@@ -1,6 +1,7 @@
 """Unit tests for sky.jobs.state."""
 # pylint: disable=protected-access
 
+import asyncio
 import contextlib
 import time
 from typing import Optional
@@ -38,7 +39,11 @@ def _mock_managed_jobs_db_conn(tmp_path, monkeypatch):
 
     # Create schema via migrations
     state.create_table(engine)
-    yield engine
+    try:
+        yield engine
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 def _insert_task(

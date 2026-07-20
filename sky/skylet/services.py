@@ -249,10 +249,57 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
+    @staticmethod
+    def _unpack_is_primary(
+        request: jobsv1_pb2.SetJobInfoWithoutJobIdRequest,
+    ) -> list[bool | None]:
+        """Unpacks nullable per-task job-group roles."""
+        if request.is_primary_in_job_groups_v2:
+            return [
+                optional.value if optional.HasField('value') else None
+                for optional in request.is_primary_in_job_groups_v2
+            ]
+        if request.is_primary_in_job_groups:
+            return list(request.is_primary_in_job_groups)
+        # Clients predating job groups omit the field. Their tasks are not in
+        # a group, whose database representation is NULL rather than False.
+        return [None] * len(request.task_ids)
+
     def SetJobInfoWithoutJobId(  # type: ignore[return]
         self, request: jobsv1_pb2.SetJobInfoWithoutJobIdRequest,
         context: grpc.ServicerContext
     ) -> jobsv1_pb2.SetJobInfoWithoutJobIdResponse:
+        task_count = len(request.task_ids)
+        task_field_lengths = {
+            'task_ids': task_count,
+            'task_names': len(request.task_names),
+            'metadata_jsons': len(request.metadata_jsons),
+        }
+        if task_count == 0 or len(set(task_field_lengths.values())) != 1:
+            lengths = ', '.join(f'{name}={length}'
+                                for name, length in task_field_lengths.items())
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                'Managed job task fields must be non-empty and have equal '
+                f'lengths: {lengths}.')
+            return jobsv1_pb2.SetJobInfoWithoutJobIdResponse()
+
+        is_primary_in_job_groups = self._unpack_is_primary(request)
+        if len(is_primary_in_job_groups) != task_count:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                'Managed job task fields must have equal lengths: '
+                f'task_ids={task_count}, is_primary_in_job_groups='
+                f'{len(is_primary_in_job_groups)}.')
+            return jobsv1_pb2.SetJobInfoWithoutJobIdResponse()
+
+        num_jobs = request.num_jobs
+        if num_jobs <= 0:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f'Managed job num_jobs must be positive: {num_jobs}.')
+            return jobsv1_pb2.SetJobInfoWithoutJobIdResponse()
+
         try:
             pool = request.pool if request.HasField('pool') else None
             pool_hash = request.pool_hash if request.HasField(
@@ -266,8 +313,7 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
                 for md in request.metadata_jsons)
             job_ids = []
             execution = request.execution
-            for i in range(request.num_jobs):
-                is_primary_in_job_group = request.is_primary_in_job_groups[i]
+            for _ in range(num_jobs):
                 job_id = managed_job_state.set_job_info_without_job_id(
                     name=request.name,
                     workspace=request.workspace,
@@ -279,13 +325,15 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
                     is_batch=is_batch)
                 job_ids.append(job_id)
                 # Set pending state for all tasks
-                for task_id, task_name, metadata_json in zip(
-                        request.task_ids, request.task_names,
-                        request.metadata_jsons):
+                for task_id, task_name, metadata_json, is_primary in zip(
+                        request.task_ids,
+                        request.task_names,
+                        request.metadata_jsons,
+                        is_primary_in_job_groups,
+                        strict=True):
                     managed_job_state.set_pending(job_id, task_id, task_name,
                                                   request.resources_str,
-                                                  metadata_json,
-                                                  is_primary_in_job_group)
+                                                  metadata_json, is_primary)
             return jobsv1_pb2.SetJobInfoWithoutJobIdResponse(job_ids=job_ids)
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))

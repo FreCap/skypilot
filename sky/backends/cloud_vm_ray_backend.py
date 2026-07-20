@@ -97,6 +97,8 @@ from sky.utils import yaml_utils
 from sky.utils.plugin_extensions import ExternalFailureSource
 
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
+serve_placement_history = adaptors_common.LazyImport(
+    'sky.serve.placement_history')
 
 if typing.TYPE_CHECKING:
     import grpc
@@ -894,6 +896,27 @@ def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
         exc = exc.__cause__
 
 
+def _provider_error_codes(error: BaseException) -> list[str]:
+    """Return structured provider codes from the explicit exception chain."""
+    codes: list[str] = []
+    for exc in _iter_error_chain(error):
+        errors = getattr(exc, 'errors', None)
+        if isinstance(errors, list):
+            codes.extend(
+                str(item['code'])
+                for item in errors
+                if isinstance(item, dict) and item.get('code') is not None)
+        response = getattr(exc, 'response', None)
+        if not isinstance(response, dict):
+            continue
+        error_payload = response.get('Error')
+        if isinstance(error_payload, dict):
+            code = error_payload.get('Code')
+            if code is not None:
+                codes.append(str(code))
+    return codes
+
+
 def _classify_capacity_error(cloud: 'clouds.Cloud',
                              error: BaseException) -> str | None:
     """Classifies an AWS failure using structured codes only.
@@ -905,19 +928,7 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     """
     if not isinstance(cloud, clouds.AWS):
         return None
-    codes: list[str] = []
-    for exc in _iter_error_chain(error):
-        errors = getattr(exc, 'errors', None)
-        if isinstance(errors, list):
-            codes.extend(
-                str(item['code'])
-                for item in errors
-                if isinstance(item, dict) and item.get('code') is not None)
-        response = getattr(exc, 'response', None)
-        if isinstance(response, dict):
-            code = response.get('Error', {}).get('Code')
-            if code is not None:
-                codes.append(str(code))
+    codes = _provider_error_codes(error)
     known_codes = _CAPACITY_ERROR_CODES | _QUOTA_ERROR_CODES
     if codes and all(code in known_codes for code in codes):
         # A quota denial is regional and makes sibling-AZ attempts for this
@@ -932,20 +943,8 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
 
 def _is_quota_error(error: BaseException) -> bool:
     """Whether an exception chain contains a recognized provider quota code."""
-    for exc in _iter_error_chain(error):
-        errors = getattr(exc, 'errors', None)
-        if isinstance(errors, list):
-            if any(
-                    isinstance(item, dict) and
-                    str(item.get('code')) in _PROVIDER_QUOTA_ERROR_CODES
-                    for item in errors):
-                return True
-        response = getattr(exc, 'response', None)
-        if isinstance(response, dict):
-            code = response.get('Error', {}).get('Code')
-            if code is not None and str(code) in _PROVIDER_QUOTA_ERROR_CODES:
-                return True
-    return False
+    return any(code in _PROVIDER_QUOTA_ERROR_CODES
+               for code in _provider_error_codes(error))
 
 
 def _record_insufficient_quota_notification(
@@ -1095,6 +1094,111 @@ def _get_workload_attribution(
     if task_id_match is not None:
         workload_task_id = int(task_id_match.group(1))
     return workload_id, workload_task_id
+
+
+def _placement_error_code(error: BaseException) -> str | None:
+    """Return the first structured provider error code in an exception."""
+    codes = _provider_error_codes(error)
+    return codes[0] if codes else None
+
+
+def _placement_outcome(error: Exception,
+                       capacity_reason: str | None = None) -> str:
+    if capacity_reason is not None:
+        return f'{capacity_reason}_failed'
+    if _is_quota_error(error):
+        return 'quota_failed'
+    if _placement_error_code(error) in {
+            'ZONE_RESOURCE_POOL_EXHAUSTED',
+            'RESOURCE_EXHAUSTED',
+            'InsufficientInstanceCapacity',
+    }:
+        return 'capacity_failed'
+    return 'failed'
+
+
+def _record_service_placement_event(
+    *,
+    task: task_lib.Task,
+    cluster_name: str,
+    workload_type: str,
+    launch_context: dict[str, Any] | None,
+    resources: resources_lib.Resources,
+    region: 'clouds.Region',
+    zones: list['clouds.Zone'] | None,
+    num_nodes: int,
+    outcome: str,
+    error: Exception | None = None,
+) -> None:
+    """Capture one Serve placement outcome without database I/O."""
+    if workload_type != 'service':
+        return
+    launch_context = launch_context or {}
+    service_name = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+    service_hash = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash):
+        return
+    replica_id = None
+    raw_replica_id = (task.envs or {}).get(serve_constants.REPLICA_ID_ENV_VAR)
+    try:
+        if raw_replica_id is not None:
+            replica_id = int(raw_replica_id)
+    except (TypeError, ValueError):
+        pass
+    hourly_price = None
+    try:
+        hourly_price = resources.get_cost(seconds=3600)
+    except Exception:  # pylint: disable=broad-except
+        # Placement visibility must never affect provisioning when catalog
+        # pricing is temporarily unavailable or a provider implementation
+        # raises an unexpected error.
+        pass
+    zone = zones[0].name if zones is not None and len(zones) == 1 else None
+    try:
+        serve_placement_history.record_event(
+            service_name=service_name,
+            service_hash=service_hash,
+            request_id=common_utils.get_current_request_id(),
+            replica_id=replica_id,
+            cluster_name=cluster_name,
+            outcome=outcome,
+            provider=str(resources.cloud)
+            if resources.cloud is not None else None,
+            region=region.name,
+            zone=zone,
+            instance_type=resources.instance_type,
+            accelerators=resources.accelerators,
+            use_spot=resources.use_spot,
+            num_nodes=num_nodes,
+            hourly_price=hourly_price,
+            error_code=(_placement_error_code(error)
+                        if error is not None else None),
+            error_summary=(common_utils.format_exception(error)
+                           if error is not None else None),
+        )
+    except Exception as history_error:  # pylint: disable=broad-except
+        logger.debug('Placement-event capture failed: '
+                     f'{common_utils.format_exception(history_error)}')
+
+
+def _capacity_service_observation(
+    workload_type: str,
+    launch_context: dict[str, Any] | None,
+) -> capacity_cache.ServiceObservation | None:
+    if workload_type != 'service':
+        return None
+    launch_context = launch_context or {}
+    service_name = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+    service_hash = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash):
+        return None
+    return capacity_cache.ServiceObservation(service_name, service_hash)
 
 
 class RetryingVmProvisioner:
@@ -1717,6 +1821,16 @@ class RetryingVmProvisioner:
                                         'Quota-cooldown clear failed: '
                                         f'{common_utils.format_exception(cache_error)}'
                                     )
+                        _record_service_placement_event(
+                            task=task,
+                            cluster_name=cluster_name,
+                            workload_type=self._workload_type,
+                            launch_context=self._extra_launch_context,
+                            resources=launched_resources,
+                            region=region,
+                            zones=zones,
+                            num_nodes=num_nodes,
+                            outcome='succeeded')
                         return config_dict
                     except provision_common.StopFailoverError:
                         with ux_utils.print_exception_no_traceback():
@@ -1748,6 +1862,18 @@ class RetryingVmProvisioner:
                         FailoverCloudErrorHandlerV2.update_blocklist_on_error(
                             self._blocked_resources, to_provision, region,
                             zones, e)
+                        _record_service_placement_event(
+                            task=task,
+                            cluster_name=cluster_name,
+                            workload_type=self._workload_type,
+                            launch_context=self._extra_launch_context,
+                            resources=launched_resources,
+                            region=region,
+                            zones=zones,
+                            num_nodes=num_nodes,
+                            outcome=('capacity_failed'
+                                     if e.insufficent_resources else 'failed'),
+                            error=e)
                         continue
                     except Exception as e:  # pylint: disable=broad-except
                         capacity_reason = _classify_capacity_error(
@@ -1759,6 +1885,8 @@ class RetryingVmProvisioner:
                             capacity_reason is not None and
                             _failure_requested_full_demand(e, num_nodes))
                         capacity_key = None
+                        service_observation = _capacity_service_observation(
+                            self._workload_type, self._extra_launch_context)
                         if capacity_reason == 'capacity' and not cluster_exists:
                             capacity_key = _capacity_cache_key(
                                 to_provision, region, zones, num_nodes,
@@ -1766,7 +1894,8 @@ class RetryingVmProvisioner:
                             if (capacity_key is not None and
                                     failure_requested_full_demand):
                                 try:
-                                    capacity_cache.mark_exhausted(capacity_key)
+                                    capacity_cache.mark_exhausted(
+                                        capacity_key, service_observation)
                                     _record_capacity_metric('capacity', 'mark')
                                 except Exception as cache_error:  # pylint: disable=broad-except
                                     _record_capacity_metric(
@@ -1781,7 +1910,7 @@ class RetryingVmProvisioner:
                               failure_requested_full_demand):
                             try:
                                 capacity_cache.mark_quota_failure(
-                                    quota_cooldown_key)
+                                    quota_cooldown_key, service_observation)
                                 _record_capacity_metric('quota', 'mark')
                             except Exception as cache_error:  # pylint: disable=broad-except
                                 _record_capacity_metric('quota', 'cache_error')
@@ -1792,6 +1921,17 @@ class RetryingVmProvisioner:
                         if capacity_reason is not None:
                             _record_capacity_metric(capacity_reason,
                                                     'probe_failure')
+                        _record_service_placement_event(
+                            task=task,
+                            cluster_name=cluster_name,
+                            workload_type=self._workload_type,
+                            launch_context=self._extra_launch_context,
+                            resources=launched_resources,
+                            region=region,
+                            zones=zones,
+                            num_nodes=num_nodes,
+                            outcome=_placement_outcome(e, capacity_reason),
+                            error=e)
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
@@ -1868,6 +2008,16 @@ class RetryingVmProvisioner:
                             f'Cluster launched: {cluster_name!r}.',
                             log_path,
                             cluster_name=cluster_name))
+                    _record_service_placement_event(
+                        task=task,
+                        cluster_name=cluster_name,
+                        workload_type=self._workload_type,
+                        launch_context=self._extra_launch_context,
+                        resources=launched_resources,
+                        region=region,
+                        zones=zones,
+                        num_nodes=num_nodes,
+                        outcome='succeeded')
                     return config_dict
 
                 # The cluster is not ready. We must perform error recording and/or
@@ -2978,6 +3128,14 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     wait_elapsed = time.perf_counter() - start_time
                     logger.debug(f'Acquired exclusive lock for {lock_id} after '
                                  f'{wait_elapsed:.2f}s')
+                    # Another process may have refreshed the tunnel after our
+                    # lock-free fast-path check but before we acquired the
+                    # exclusive lock. Recheck while holding the lock to avoid
+                    # replacing that new tunnel with a second one.
+                    tunnel = self._get_skylet_ssh_tunnel()
+                    if tunnel is not None and _is_tunnel_healthy(tunnel):
+                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
+                                                     options=grpc_options)
                     try:
                         tunnel = self._open_and_update_skylet_tunnel()
                         return grpc.insecure_channel(f'localhost:{tunnel.port}',
@@ -3578,11 +3736,13 @@ class SkyletClient:
         request: 'servev1_pb2.WaitServiceRegistrationRequest',
         timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.WaitServiceRegistrationResponse':
-        # set timeout to at least 10 seconds more than service register
-        # constant to make sure that timeouts will not occur.
+        # The skylet-side handler gives controller setup and service
+        # registration independent timeout budgets. Keep the outer RPC alive
+        # for both phases, with margin for polling and transport overhead.
         if timeout is not None:
-            timeout = max(timeout,
-                          serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS + 10)
+            timeout = max(
+                timeout, serve_constants.CONTROLLER_SETUP_TIMEOUT_SECONDS +
+                serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS + 10)
         return self._serve_stub.WaitServiceRegistration(request,
                                                         timeout=timeout)
 
@@ -4788,7 +4948,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         task_names: list[str],
         resources_str: str,
         metadata_jsons: list[str],
-        is_primary_in_job_groups: list[bool],
+        is_primary_in_job_groups: list[bool | None],
         num_jobs: int = 1,
         execution: str = DEFAULT_EXECUTION.value,
         is_batch: bool = False,
@@ -4816,7 +4976,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     metadata_jsons=metadata_jsons,
                     num_jobs=num_jobs,
                     execution=execution,
-                    is_primary_in_job_groups=is_primary_in_job_groups)
+                    # Field 13 cannot represent None. Keep populating it for
+                    # compatibility with older jobs controllers.
+                    is_primary_in_job_groups=[
+                        value if value is not None else False
+                        for value in is_primary_in_job_groups
+                    ],
+                    is_primary_in_job_groups_v2=[
+                        jobsv1_pb2.OptionalBool(value=value)
+                        if value is not None else jobsv1_pb2.OptionalBool()
+                        for value in is_primary_in_job_groups
+                    ])
                 response = backend_utils.invoke_skylet_with_retries(
                     lambda: SkyletClient(handle.get_grpc_channel()
                                         ).set_job_info_without_job_id(request))

@@ -17,11 +17,88 @@ describe('buildRequestHistoryView', () => {
 
     expect(view.timestamps).toEqual([120, 180, 240]);
     expect(view.counts).toEqual([3, 0, 9]);
+    expect(view.demandTargets).toEqual([null, null, null]);
+    expect(view.capacityTargets).toEqual([null, null, null]);
+    expect(view.readyCapacities).toEqual([null, null, null]);
+    expect(view.provisioningCapacities).toEqual([null, null, null]);
+    expect(view.totalCapacities).toEqual([null, null, null]);
+    expect(view.events).toEqual([]);
     expect(view.stats).toEqual({
       total: 12,
       averagePerMinute: 4,
       peakPerMinute: 9,
     });
+    expect(view.capacityStats).toBeNull();
+  });
+
+  it('derives target deficits and lifecycle markers', () => {
+    const view = buildRequestHistoryView(
+      {
+        available: true,
+        bucketSeconds: 60,
+        requestSamples: [],
+        autoscalerSamples: [
+          {
+            timestamp: 120,
+            controllerSessionId: 'a',
+            version: 1,
+            demandTarget: 2,
+            capacityTarget: 4,
+            readyCapacity: 1,
+            provisioningCapacity: 3,
+            totalCapacity: 6,
+          },
+          {
+            timestamp: 180,
+            controllerSessionId: 'a',
+            version: 1,
+            demandTarget: 3,
+            capacityTarget: 5,
+            readyCapacity: 3,
+            provisioningCapacity: 2,
+            totalCapacity: 7,
+          },
+          {
+            timestamp: 240,
+            controllerSessionId: 'b',
+            version: 2,
+            demandTarget: 2,
+            capacityTarget: 2,
+            readyCapacity: 2,
+            provisioningCapacity: 0,
+            totalCapacity: 2,
+          },
+        ],
+      },
+      { start: 120, end: 240 }
+    );
+
+    expect(view.demandTargets).toEqual([2, 3, 2]);
+    expect(view.capacityTargets).toEqual([4, 5, 2]);
+    expect(view.readyCapacities).toEqual([1, 3, 2]);
+    expect(view.provisioningCapacities).toEqual([3, 2, 0]);
+    expect(view.totalCapacities).toEqual([6, 7, 2]);
+    expect(view.capacityStats).toEqual({
+      peakDemandTarget: 3,
+      peakCapacityTarget: 5,
+      peakDeficit: 3,
+      belowTargetMinutes: 2,
+      longestBelowTargetMinutes: 2,
+    });
+    expect(view.events).toEqual([
+      {
+        timestamp: 240,
+        y: 2,
+        kind: 'restart',
+        label: 'Controller restarted',
+      },
+      {
+        timestamp: 240,
+        y: 2,
+        kind: 'update',
+        label: 'Service updated to v2',
+      },
+    ]);
   });
 
   it('returns no chart when durable history is unavailable', () => {
@@ -33,6 +110,17 @@ describe('buildRequestHistoryView', () => {
         },
         { start: 120, end: 180 }
       )
-    ).toEqual({ timestamps: [], counts: [], stats: null });
+    ).toEqual({
+      timestamps: [],
+      counts: [],
+      demandTargets: [],
+      capacityTargets: [],
+      readyCapacities: [],
+      provisioningCapacities: [],
+      totalCapacities: [],
+      events: [],
+      stats: null,
+      capacityStats: null,
+    });
   });
 });

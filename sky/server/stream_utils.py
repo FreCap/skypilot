@@ -39,6 +39,18 @@ LONG_REQUEST_POLL_INTERVAL = 1
 DEFAULT_POLL_INTERVAL = 0.1
 
 
+def ensure_request_log_storage_available() -> None:
+    """Reject new remote-log work before it consumes the disk reserve."""
+    usage = requests_lib.get_request_log_storage_usage()
+    if usage.free_bytes >= usage.hard_free_bytes:
+        return
+    raise fastapi.HTTPException(
+        status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=('API server request-log storage is under pressure; retry '
+                'after terminal streaming logs are cleaned up.'),
+        headers={'Retry-After': '60'})
+
+
 async def _yield_log_file_with_payloads_skipped(
         log_file) -> AsyncGenerator[str, None]:
     async for line in log_file:
@@ -258,6 +270,13 @@ async def wait_for_request_to_start(
         yield status_msg.stop()
 
 
+def _directory_log_files(log_path: pathlib.Path) -> list[pathlib.Path] | None:
+    """Return sorted log files when the stream path is a directory."""
+    if not log_path.is_dir():
+        return None
+    return sorted(log_path.glob('*.log'))
+
+
 async def log_streamer(
     request_id: str | None,
     log_path: pathlib.Path | None = None,
@@ -290,11 +309,10 @@ async def log_streamer(
                 polling_interval=polling_interval):
             yield chunk
 
+    log_files = (await asyncio.to_thread(_directory_log_files, log_path)
+                 if log_path is not None else None)
     # worker node provision logs
-    if log_path is not None and log_path.is_dir():
-        # Get all *.log files in the log_path dir
-        log_files = sorted(log_path.glob('*.log'))
-
+    if log_files is not None:
         for log_file_path in log_files:
             # Add header before each file (similar to tail -f behavior)
             header = f'\n==> {log_file_path} <==\n\n'
@@ -374,13 +392,15 @@ async def _tail_log_file(
     # Read file in chunks instead of line-by-line for better performance
     incomplete_line = b''  # Buffer for incomplete lines across chunks
 
-    async def flush_buffer() -> AsyncGenerator[str, None]:
+    def flush_buffer() -> str | None:
         nonlocal buffer, buffer_bytes, last_flush_time
         if buffer:
-            yield ''.join(buffer)
+            chunk = ''.join(buffer)
             buffer.clear()
             buffer_bytes = 0
             last_flush_time = asyncio.get_event_loop().time()
+            return chunk
+        return None
 
     while True:
         # Sleep 0 to yield control to allow other coroutines to run,
@@ -391,7 +411,8 @@ async def _tail_log_file(
         # flush timeout is reached.
         if buffer and (buffer_bytes >= _BUFFER_SIZE or
                        (current_time - last_flush_time) >= _BUFFER_TIMEOUT):
-            async for chunk in flush_buffer():
+            chunk = flush_buffer()
+            if chunk is not None:
                 yield chunk
 
         if log_path is not None:
@@ -401,7 +422,8 @@ async def _tail_log_file(
             if lost_prefix:
                 # Preserve complete output before the gap, but never join a
                 # partial discarded line to the retained generation.
-                async for chunk in flush_buffer():
+                chunk = flush_buffer()
+                if chunk is not None:
                     yield chunk
                 incomplete_line = b''
         else:
@@ -445,7 +467,8 @@ async def _tail_log_file(
                             await
                             _read_request_log_chunk(f, log_marker, log_path))
                         if lost_prefix:
-                            async for chunk in flush_buffer():
+                            chunk = flush_buffer()
+                            if chunk is not None:
                                 yield chunk
                             incomplete_line = b''
                     else:
@@ -555,7 +578,8 @@ async def _tail_log_file(
             buffer_bytes += len(line_str.encode('utf-8'))
 
     # Flush remaining lines in the buffer.
-    async for chunk in flush_buffer():
+    chunk = flush_buffer()
+    if chunk is not None:
         yield chunk
 
 

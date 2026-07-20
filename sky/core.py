@@ -240,28 +240,29 @@ all_clusters, unmanaged_clusters, all_jobs, context
                              f'Kubernetes: {str(e)}') from e
     all_clusters, jobs_controllers, _ = (kubernetes_utils.process_skypilot_pods(
         pods, context))
-    all_jobs = []
+
+    def _query_jobs_controller(
+        job_controller_info: kubernetes_utils.KubernetesSkyPilotClusterInfo
+    ) -> list[dict[str, Any]]:
+        user = job_controller_info.user
+        pod = job_controller_info.pods[0]
+        try:
+            job_list = managed_jobs_core.queue_from_kubernetes_pod(
+                pod.metadata.name, context=context)
+        except RuntimeError as e:
+            logger.warning('Failed to get managed jobs from controller '
+                           f'{pod.metadata.name}: {str(e)}')
+            return []
+        for job in job_list:
+            job['user'] = user
+        return job_list
+
     with rich_utils.safe_status(
             ux_utils.spinner_message(
-                '[bold cyan]Checking in-progress managed jobs[/]')) as spinner:
-        for i, job_controller_info in enumerate(jobs_controllers):
-            user = job_controller_info.user
-            pod = job_controller_info.pods[0]
-            status_message = '[bold cyan]Checking managed jobs controller'
-            if len(jobs_controllers) > 1:
-                status_message += f's ({i + 1}/{len(jobs_controllers)})'
-            spinner.update(f'{status_message}[/]')
-            try:
-                job_list = managed_jobs_core.queue_from_kubernetes_pod(
-                    pod.metadata.name, context=context)
-            except RuntimeError as e:
-                logger.warning('Failed to get managed jobs from controller '
-                               f'{pod.metadata.name}: {str(e)}')
-                job_list = []
-            # Add user field to jobs
-            for job in job_list:
-                job['user'] = user
-            all_jobs.extend(job_list)
+                '[bold cyan]Checking in-progress managed jobs[/]')):
+        controller_jobs = subprocess_utils.run_in_parallel(
+            _query_jobs_controller, jobs_controllers)
+    all_jobs = [job for job_list in controller_jobs for job in job_list]
     # Reconcile cluster state between managed jobs and clusters:
     # To maintain a clear separation between regular SkyPilot clusters
     # and those from managed jobs, we need to exclude the latter from
@@ -280,16 +281,17 @@ all_clusters, unmanaged_clusters, all_jobs, context
         c for c in all_clusters
         if c.cluster_name not in managed_job_cluster_names
     ]
-    all_clusters = [
+    all_cluster_payloads = [
         kubernetes_utils.KubernetesSkyPilotClusterInfoPayload.from_cluster(c)
         for c in all_clusters
     ]
-    unmanaged_clusters = [
+    unmanaged_cluster_payloads = [
         kubernetes_utils.KubernetesSkyPilotClusterInfoPayload.from_cluster(c)
         for c in unmanaged_clusters
     ]
-    all_jobs = [responses.ManagedJobRecord(**job) for job in all_jobs]
-    return all_clusters, unmanaged_clusters, all_jobs, context
+    job_records = [responses.ManagedJobRecord(**job) for job in all_jobs]
+    return (all_cluster_payloads, unmanaged_cluster_payloads, job_records,
+            context)
 
 
 @typing.overload
@@ -308,7 +310,8 @@ def get_cluster_events(
     cluster_name: str | None = ...,
     cluster_hash: str | None = ...,
     event_type: str = ...,
-    include_timestamps: Literal[True] = ...,
+    *,
+    include_timestamps: Literal[True],
     limit: int | None = ...,
 ) -> list[dict[str, str | int]]:
     ...
@@ -1091,11 +1094,6 @@ def stop(cluster_name: str,
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
 
-    global_user_state.add_cluster_event(
-        cluster_name, status_lib.ClusterStatus.STOPPED,
-        'Cluster was stopped by user.',
-        global_user_state.ClusterEventType.STATUS_CHANGE)
-
     backend = backend_utils.get_backend_from_handle(handle)
 
     if isinstance(backend, backends.CloudVmRayBackend):
@@ -1125,6 +1123,10 @@ def stop(cluster_name: str,
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
     _maybe_run_stop_hooks(handle, backend, cluster_name)
     backend.teardown(handle, terminate=False, purge=purge)
+    global_user_state.add_cluster_event(
+        cluster_name, status_lib.ClusterStatus.STOPPED,
+        'Cluster was stopped by user.',
+        global_user_state.ClusterEventType.STATUS_CHANGE)
 
 
 @usage_lib.entrypoint

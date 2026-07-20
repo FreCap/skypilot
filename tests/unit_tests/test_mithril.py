@@ -109,7 +109,7 @@ class TestMithrilCredentials:
         monkeypatch.setattr(mithril.Mithril, 'get_credentials_path',
                             classmethod(lambda cls: unexpanded_path))
 
-        mounts = mithril.Mithril.get_credential_file_mounts()
+        mounts = mithril.Mithril().get_credential_file_mounts()
 
         # The method returns {remote_path: local_path}
         # Key should be the unexpanded remote path, value should be
@@ -125,7 +125,7 @@ class TestMithrilCredentials:
         monkeypatch.setattr(mithril.Mithril, 'get_credentials_path',
                             classmethod(lambda cls: str(fake_path)))
 
-        mounts = mithril.Mithril.get_credential_file_mounts()
+        mounts = mithril.Mithril().get_credential_file_mounts()
 
         assert not mounts
 

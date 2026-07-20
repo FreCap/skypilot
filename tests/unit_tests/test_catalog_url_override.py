@@ -61,8 +61,9 @@ def test_source_change_invalidates_fresh_cache(monkeypatch, tmp_path):
     monkeypatch.delenv('SKYPILOT_HOSTED_CATALOG_DIR_URL', raising=False)
     requested_urls = []
 
-    def fake_get(url, headers=None):
+    def fake_get(url, headers=None, *, timeout):
         del headers
+        assert timeout == common.DEFAULT_HTTP_TIMEOUT_SECONDS
         requested_urls.append(url)
         return _FakeResponse('InstanceType,Region\nx1,us-east-1\n')
 
@@ -93,8 +94,9 @@ def test_pre_tracking_cache_refetched_under_override(monkeypatch, tmp_path):
                         str(tmp_path))
     requested = []
 
-    def fake_get(url, headers=None):
+    def fake_get(url, headers=None, *, timeout):
         del headers
+        assert timeout == common.DEFAULT_HTTP_TIMEOUT_SECONDS
         requested.append(url)
         return _FakeResponse('InstanceType,Region\nx1,us-east-1\n')
 

@@ -10,11 +10,8 @@ from unittest import mock
 
 import pytest
 
-from sky import check
 from sky import clouds
-from sky import global_user_state
 from sky import skypilot_config
-from sky.clouds import cloud as sky_cloud
 from sky.resources import Resources
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -106,14 +103,9 @@ def test_kubernetes_labels_resources():
     _run_label_test(allowed_labels, invalid_labels, cloud)
 
 
-def test_no_cloud_labels_resources():
-    global_user_state.set_enabled_clouds(['aws', 'gcp'],
-                                         sky_cloud.CloudCapability.COMPUTE,
-                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
-    global_user_state.set_allowed_clouds(
-        check._get_workspace_allowed_clouds(
-            constants.SKYPILOT_DEFAULT_WORKSPACE),
-        constants.SKYPILOT_DEFAULT_WORKSPACE)
+@mock.patch('sky.resources.sky_check.get_cached_enabled_clouds_or_refresh',
+            return_value=[clouds.AWS(), clouds.GCP()])
+def test_no_cloud_labels_resources(_mock_enabled_clouds):
     allowed_labels = {
         **GLOBAL_VALID_LABELS,
     }
@@ -125,14 +117,9 @@ def test_no_cloud_labels_resources():
     _run_label_test(allowed_labels, invalid_labels)
 
 
-def test_no_cloud_labels_resources_single_enabled_cloud():
-    global_user_state.set_enabled_clouds(['aws'],
-                                         sky_cloud.CloudCapability.COMPUTE,
-                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
-    global_user_state.set_allowed_clouds(
-        check._get_workspace_allowed_clouds(
-            constants.SKYPILOT_DEFAULT_WORKSPACE),
-        constants.SKYPILOT_DEFAULT_WORKSPACE)
+@mock.patch('sky.resources.sky_check.get_cached_enabled_clouds_or_refresh',
+            return_value=[clouds.AWS()])
+def test_no_cloud_labels_resources_single_enabled_cloud(_mock_enabled_clouds):
     allowed_labels = {
         **GLOBAL_VALID_LABELS,
         'domain/key': 'value',  # Valid for AWS
@@ -141,7 +128,7 @@ def test_no_cloud_labels_resources_single_enabled_cloud():
         **GLOBAL_INVALID_LABELS,
         'aws:cannotstartwithaws': 'value',
     }
-    _run_label_test(allowed_labels, invalid_labels, cloud=clouds.AWS())
+    _run_label_test(allowed_labels, invalid_labels)
 
 
 @mock.patch('sky.catalog.instance_type_exists', return_value=True)
@@ -843,6 +830,24 @@ def test_image_id_dual_pickle_round_trip():
     assert migrated.image_id is None
 
 
+@pytest.mark.parametrize(
+    ('version', 'legacy_field'),
+    [(17, '_spot_recovery'), (18, '_job_recovery')],
+)
+def test_legacy_job_recovery_pickle_is_normalized(version, legacy_field):
+    legacy = Resources()
+    state = dict(legacy.__dict__)
+    state.pop('_job_recovery', None)
+    state['_version'] = version
+    state[legacy_field] = 'FAILOVER'
+
+    migrated = Resources.__new__(Resources)
+    migrated.__setstate__(state)
+
+    assert migrated.job_recovery == {'strategy': 'FAILOVER'}
+    migrated._try_validate_managed_job_attributes()  # pylint: disable=protected-access
+
+
 def test_network_tier_basic():
     """Test basic network tier functionality and validation."""
     # Test with no network_tier specified (defaults to None)
@@ -1218,6 +1223,32 @@ def test_memory_conversion():
     # Test invalid format
     with pytest.raises(ValueError):
         Resources(memory='invalid')
+
+
+def test_empty_accelerators_rejected():
+    with pytest.raises(ValueError,
+                       match='must contain at least one accelerator'):
+        Resources(accelerators={})
+
+    with pytest.raises(ValueError, match='accelerators'):
+        Resources.from_yaml_config({'accelerators': {}})
+
+
+def test_multiple_accelerators_string():
+    resources = Resources(accelerators={'A100': 1, 'H100': 1}, use_spot=True)
+    assert resources.get_accelerators_str() == 'A100:1,H100:1'
+    assert (resources.get_accelerators_str() +
+            resources.get_spot_str()) == 'A100:1,H100:1[Spot]'
+
+    # YAML mappings with multiple entries are alternatives, not a single
+    # multi-accelerator Resources object, and remain supported.
+    resources = Resources.from_yaml_config(
+        {'accelerators': {
+            'A100': 1,
+            'H100': 1,
+        }})
+    assert {next(iter(resource.accelerators)) for resource in resources
+           } == {'A100', 'H100'}
 
 
 def test_autostop_time_format():

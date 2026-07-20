@@ -2,8 +2,9 @@
 
 The concurrency autoscaler sizes the fleet by OUTSTANDING WORK (in-flight
 + queued + recently-rejected jobs, reported by the LB as gauges) instead
-of request rate, packs demand onto per-GPU capacities (knob x gpu_count),
-and never shrinks the fleet while its demand signal is stale (a rebuilt
+of request rate. Physical targets pack demand onto per-GPU capacities;
+logical targets divide demand by the per-GPU saturation knob and publish GPU
+slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
 # pylint: disable=protected-access
@@ -27,7 +28,13 @@ def _spec(knob=1.0,
           max_replicas=20,
           upscale_delay_seconds=None,
           downscale_delay_seconds=None,
-          replica_unit='physical_backend'):
+          replica_unit='physical_backend',
+          target_utilization_percentage=100,
+          expected_request_duration_seconds=None,
+          max_scale_up_rate_percentage=None,
+          scale_up_rate_min_replicas=None,
+          scale_up_rate_period_seconds=None,
+          max_scale_down_rate_percentage=100):
     # Default delays resolve to one decision interval -> hysteresis
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
@@ -38,6 +45,12 @@ def _spec(knob=1.0,
         num_overprovision=None,
         target_concurrency_per_replica=knob,
         replica_unit=replica_unit,
+        target_utilization_percentage=target_utilization_percentage,
+        expected_request_duration_seconds=expected_request_duration_seconds,
+        max_scale_up_rate_percentage=max_scale_up_rate_percentage,
+        scale_up_rate_min_replicas=scale_up_rate_min_replicas,
+        scale_up_rate_period_seconds=scale_up_rate_period_seconds,
+        max_scale_down_rate_percentage=max_scale_down_rate_percentage,
         upscale_delay_seconds=(upscale_delay_seconds if upscale_delay_seconds
                                is not None else interval),
         downscale_delay_seconds=(downscale_delay_seconds
@@ -78,12 +91,13 @@ def _report(autoscaler,
             in_flight,
             queue_depth=0,
             rejected=0,
+            recent_rejected=None,
             timestamps=(),
             unknown=(),
             unknown_capacity=None,
             observed_slots=None,
             generation=1):
-    autoscaler.collect_request_information({
+    report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
         'queue_depth': queue_depth,
@@ -93,7 +107,10 @@ def _report(autoscaler,
         'unknown_capacity_replica_ids':
             list(unknown if unknown_capacity is None else unknown_capacity),
         'reconcile_generation': generation,
-    })
+    }
+    if recent_rejected is not None:
+        report['rejected_in_recent_window'] = recent_rejected
+    autoscaler.collect_request_information(report)
 
 
 def _decisions(autoscaler, replicas, active_versions=(1,)):
@@ -198,6 +215,78 @@ class TestTargetMath(unittest.TestCase):
         _report(autoscaler, in_flight={}, queue_depth=2, rejected=3)
         self._recompute(autoscaler, [])
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_logical_saturation_divides_all_outstanding_work(self):
+        autoscaler = _make_autoscaler(knob=2,
+                                      replica_unit='logical',
+                                      min_replicas=0)
+        replicas = [
+            _replica(1, planned_capacity=1),
+            _replica(2, planned_capacity=1),
+        ]
+        _report(autoscaler,
+                in_flight={
+                    1: 1,
+                    2: 0
+                },
+                queue_depth=2,
+                rejected=4,
+                unknown=(2,))
+
+        self._recompute(autoscaler, replicas)
+
+        # (1 in flight + 2 queued + 4 rejected + 1 unknown) / 2 per GPU.
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+
+    def test_logical_duration_normalizes_only_rejected_pressure(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=100,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        _report(autoscaler, in_flight={1: 30}, queue_depth=10, rejected=120)
+
+        self._recompute(autoscaler, [_replica(1)])
+
+        # Running and queued work stay current state. Rejections retained for
+        # 360 seconds contribute 120 * 30 / 360 = 10 concurrent jobs. At 90%
+        # target utilization, ceil(50 / 0.9) = 56 GPUs.
+        self.assertEqual(autoscaler._rejected_concurrency, 10)
+        self.assertEqual(autoscaler.target_num_replicas, 56)
+
+    def test_duration_normalized_rejections_still_drive_scale_up(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        _report(autoscaler, in_flight={}, rejected=36)
+
+        self._recompute(autoscaler, [])
+
+        # 36 retained rejects represent 3 concurrent jobs, not zero pressure.
+        self.assertEqual(autoscaler._rejected_concurrency, 3)
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+
+    def test_recent_rejection_rate_drives_spiky_scale_up(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=200,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        _report(autoscaler, in_flight={}, rejected=120, recent_rejected=120)
+
+        self._recompute(autoscaler, [])
+
+        # The six-minute retained floor is 10 concurrent jobs, but 120 new
+        # rejects in one minute imply 60. The spike-responsive value wins.
+        self.assertEqual(autoscaler._rejected_concurrency, 60)
+        self.assertEqual(autoscaler.target_num_replicas, 67)
 
     def test_unknown_async_occupancy_adds_full_capacity_floor(self):
         # Two declared async replicas missed their occupancy probes. Their
@@ -371,6 +460,275 @@ class TestSignalGap(unittest.TestCase):
         self.assertEqual(len(_scale_ups(decisions)), 4)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_logical_arrival_floor_uses_saturation_target(self):
+        autoscaler = _make_autoscaler(knob=2,
+                                      min_replicas=1,
+                                      replica_unit='logical')
+        replicas = [_replica(1)]
+        now = time.time()
+        autoscaler.collect_request_information({'timestamps': [now - 1] * 5})
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        self.assertEqual(_scale_ups(decisions)[0].target.target_capacity, 3)
+
+    def test_logical_arrival_floor_uses_duration_and_utilization(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=100,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        now = time.time()
+        autoscaler.collect_request_information({'timestamps': [now - 1] * 60})
+
+        decisions = _decisions(autoscaler, [])
+
+        # 60 arrivals / minute at 30 seconds each imply 30 concurrent jobs;
+        # 90% target utilization reserves four additional slots.
+        self.assertEqual(autoscaler.target_num_replicas, 34)
+        self.assertEqual(_scale_ups(decisions)[0].target.target_capacity, 34)
+
+
+class TestLogicalScalingWaves(unittest.TestCase):
+    """Logical demand changes are adopted in bounded, timed waves."""
+
+    @staticmethod
+    def _ramped_autoscaler(**kwargs):
+        return _make_autoscaler(knob=1,
+                                min_replicas=0,
+                                max_replicas=1000,
+                                replica_unit='logical',
+                                max_scale_up_rate_percentage=20,
+                                scale_up_rate_min_replicas=10,
+                                scale_up_rate_period_seconds=60,
+                                **kwargs)
+
+    def test_zero_to_burst_starts_with_ten_slots(self):
+        autoscaler = self._ramped_autoscaler()
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic([])
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+        self.assertEqual(autoscaler._last_scale_up_wave_at, 100.0)
+
+    def test_next_wave_waits_a_minute_and_counts_committed_slots(self):
+        autoscaler = self._ramped_autoscaler()
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        replicas = [_replica(i + 1) for i in range(10)]
+        autoscaler.target_num_replicas = 10
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler._last_scale_up_wave_at = 100.0
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=159.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=160.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+
+    def test_pending_target_is_not_reduced_when_committed_capacity_lags(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.target_num_replicas = 20
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler._last_scale_up_wave_at = 100.0
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        replicas = [_replica(i + 1) for i in range(10)]
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=160.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+
+    def test_twenty_percent_dominates_floor_for_large_fleet(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.target_num_replicas = 100
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        replicas = [_replica(i + 1) for i in range(100)]
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 120)
+
+    def test_stale_arrival_floor_obeys_scale_up_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        now = time.time()
+        autoscaler.collect_request_information({'timestamps': [now - 1] * 100})
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 100)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+        self.assertEqual(_scale_ups(decisions)[0].target.target_capacity, 10)
+
+    def test_downscale_takes_one_fifty_percent_wave_per_full_delay(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=2 * interval,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 119.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+            converged_replicas = replicas[:50]
+            _report(autoscaler,
+                    in_flight={
+                        replica.replica_id: 0 for replica in converged_replicas
+                    })
+            clock.return_value = 200.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                converged_replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+            clock.return_value = 220.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                converged_replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 25)
+
+    def test_rebuilt_target_uses_committed_fleet_as_downscale_baseline(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=2 * interval,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 119.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_downscale_target_does_not_rebound_while_retirement_lags(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=2 * interval,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+            # Actuation is asynchronous, so committed capacity can still
+            # report the pre-wave fleet on the next tick. That must not undo
+            # the adopted target while the retirement batch catches up.
+            clock.return_value = 121.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_downscale_uses_elapsed_time_when_decision_ticks_are_slow(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 250.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 379.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 380.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_downscale_elapsed_window_resets_on_rebound_and_stale_signal(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 250.0
+            autoscaler._tick_fresh = False
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            autoscaler._tick_fresh = None
+            self.assertIsNone(autoscaler._downscale_started_at)
+
+            clock.return_value = 260.0
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas})
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 539.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas},
+                    queue_depth=100)
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertIsNone(autoscaler._downscale_started_at)
+
+            clock.return_value = 600.0
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas})
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 879.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 880.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
     def test_arrival_floor_never_lowers_target(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
         autoscaler.target_num_replicas = 7
@@ -395,7 +753,16 @@ class TestSignalGap(unittest.TestCase):
 
 
 class TestLogicalReplicaSemantics(unittest.TestCase):
-    """Logical targets are job slots; physical shapes remain indivisible."""
+    """Logical targets are GPU slots; physical shapes remain indivisible."""
+
+    def test_cost_rebalance_location_capacity_stays_in_gpu_slots(self):
+        autoscaler = _make_autoscaler(knob=2, replica_unit='logical')
+        location = mock.Mock()
+        with mock.patch.object(autoscaler,
+                               '_location_gpu_shape',
+                               return_value=('L4', 8)):
+            self.assertEqual(
+                autoscaler._cost_rebalance_location_capacity(location), 8)
 
     def test_scale_from_zero_emits_one_capacity_target(self):
         autoscaler = _make_autoscaler(knob=1,
@@ -553,6 +920,7 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                 observed_slots={1: 0})
 
         self.assertEqual(_decisions(autoscaler, [backend]), [])
+        self.assertEqual(autoscaler.get_ready_replica_capacity(backend), 8)
         self.assertEqual(autoscaler._ready_capacity(backend), 0)
         self.assertEqual(autoscaler._committed_capacity(backend), 8)
 
@@ -1022,6 +1390,139 @@ class TestRollingDrain(unittest.TestCase):
         self.assertEqual(
             autoscaler._select_outdated_replicas_to_scale_down(old, [1]), [])
 
+    def _logical_mid_update(self,
+                            target,
+                            raw_target,
+                            update_mode=serve_utils.UpdateMode.ROLLING):
+        autoscaler = _make_autoscaler(knob=1.0,
+                                      min_replicas=1,
+                                      max_replicas=1000,
+                                      replica_unit='logical')
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0,
+                  min_replicas=1,
+                  max_replicas=1000,
+                  replica_unit='logical'), update_mode)
+        autoscaler.target_num_replicas = target
+        autoscaler._raw_target_num_replicas = raw_target
+        return autoscaler
+
+    def test_logical_rollout_retires_before_latest_reaches_target(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        autoscaler._upscale_pending = True
+        old = [_replica(i, version=1) for i in range(1, 41)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        # Five observed new slots permit five conservative old-backend
+        # retirements. The rollout does not wait for all 40 new slots or for
+        # the adopted scale-up wave to catch raw demand.
+        self.assertEqual(len(retired), 5)
+        self.assertTrue(
+            set(retired).issubset({info.replica_id for info in old}))
+
+    def test_logical_blue_green_waits_for_complete_latest_target(self):
+        autoscaler = self._logical_mid_update(
+            target=40,
+            raw_target=40,
+            update_mode=serve_utils.UpdateMode.BLUE_GREEN)
+        old = [_replica(i, version=1) for i in range(1, 41)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(retired, [])
+
+    def test_logical_rollout_batches_proven_old_excess(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        old = [_replica(i, version=1) for i in range(1, 101)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        # Sixty-five old READY backends are proven excess, but one decision
+        # tick removes at most the bounded physical batch.
+        self.assertEqual(len(retired), 20)
+
+    def test_logical_rollout_preserves_raw_demand_and_drops_nonready(self):
+        autoscaler = self._logical_mid_update(target=10, raw_target=40)
+        ready_old = [_replica(i, version=1) for i in range(1, 36)]
+        nonready_old = [
+            _replica(i,
+                     version=1,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for i in range(36, 41)
+        ]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in ready_old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            ready_old + nonready_old + [new_ready], [1, 2])
+
+        # The adopted rollout ramp is only 10, but raw demand keeps all 35
+        # READY old backends as the coverage floor. Never-served old launches
+        # add no coverage and are retired first.
+        self.assertEqual(set(retired),
+                         {info.replica_id for info in nonready_old})
+
+    def test_logical_rollout_protects_busy_and_unknown_old_backends(self):
+        autoscaler = self._logical_mid_update(target=1, raw_target=1)
+        old = [_replica(i, version=1) for i in range(1, 31)]
+        new_ready = _replica(101, version=2)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    1: 1,
+                    101: 0,
+                },
+                unknown=(2,),
+                observed_slots={101: 1})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(len(retired), 20)
+        self.assertNotIn(1, retired)
+        self.assertNotIn(2, retired)
+
 
 class TestUpdateVersion(unittest.TestCase):
     """Version updates re-read the knob; stale versions are inert."""
@@ -1050,6 +1551,96 @@ class TestUpdateVersion(unittest.TestCase):
         autoscaler.update_version(2, _spec(knob=1.0, max_replicas=5),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_update_resets_logical_downscale_elapsed_window(self):
+        autoscaler = _make_autoscaler(knob=1.0,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300)
+        autoscaler._downscale_started_at = 123.0
+        autoscaler.downscale_counter = 4
+
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0, replica_unit='logical',
+                  downscale_delay_seconds=300), serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertIsNone(autoscaler._downscale_started_at)
+        self.assertEqual(autoscaler.downscale_counter, 0)
+
+    def test_ramped_update_does_not_inherit_old_version_target(self):
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            min_replicas=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=10,
+            scale_up_rate_period_seconds=60,
+        )
+        autoscaler.target_num_replicas = 1000
+
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0,
+                  min_replicas=1,
+                  max_replicas=1000,
+                  replica_unit='logical',
+                  max_scale_up_rate_percentage=20,
+                  scale_up_rate_min_replicas=10,
+                  scale_up_rate_period_seconds=60),
+            serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        autoscaler._last_scale_up_wave_at = None
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic([])
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+
+    def test_ramped_update_completes_ramp_to_raw_demand_target(self):
+        # A wave-limited rolling update must (a) bound the first wave
+        # instead of inheriting the old version's large target and
+        # (b) terminate: as committed capacity catches up each wave, the
+        # target strictly increases until it reaches the raw demand target.
+        ramp_kwargs = dict(knob=1.0,
+                           min_replicas=1,
+                           max_replicas=1000,
+                           replica_unit='logical',
+                           max_scale_up_rate_percentage=20,
+                           scale_up_rate_min_replicas=10,
+                           scale_up_rate_period_seconds=60)
+        autoscaler = _make_autoscaler(**ramp_kwargs)
+        autoscaler.target_num_replicas = 1000
+        autoscaler.update_version(2, _spec(**ramp_kwargs),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        now = 100.0
+        with mock.patch.object(autoscalers.time, 'time', return_value=now):
+            autoscaler._set_target_num_replicas_with_concurrency_logic([])
+        # First wave is bounded, not the inherited 1000.
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+
+        # Successive waves: commit the granted capacity, advance the wave
+        # timer, and recompute. 20% growth from 10 reaches 1000 within
+        # 22 waves (10, 20, ..., 50, then x1.2 per wave).
+        for _ in range(21):
+            previous_target = autoscaler.target_num_replicas
+            replicas = [
+                _replica(i + 1, version=2)
+                for i in range(autoscaler.target_num_replicas)
+            ]
+            _report(autoscaler, in_flight={}, queue_depth=1000)
+            now += 60.0
+            with mock.patch.object(autoscalers.time, 'time', return_value=now):
+                autoscaler._set_target_num_replicas_with_concurrency_logic(
+                    replicas)
+            self.assertGreater(autoscaler.target_num_replicas, previous_target)
+            if autoscaler.target_num_replicas == 1000:
+                break
+        self.assertEqual(autoscaler.target_num_replicas, 1000)
 
     def test_old_version_replicas_keep_their_launch_knob(self):
         # A knob-raising update must not inflate old replicas' capacity:
@@ -1101,11 +1692,13 @@ class TestDynamicStates(unittest.TestCase):
                 in_flight={1: 2},
                 queue_depth=1,
                 rejected=1,
+                recent_rejected=1,
                 timestamps=[time.time()])
         loaded = _make_autoscaler(knob=1.0)
         loaded.load_dynamic_states(source.dump_dynamic_states())
         self.assertTrue(loaded.has_fresh_demand_report())
         self.assertEqual(loaded._outstanding_work(), 4)
+        self.assertEqual(loaded._rejected_in_recent_window, 1)
         self.assertEqual(len(loaded.request_timestamps), 1)
 
     def test_old_report_reads_as_stale_after_load(self):
@@ -1129,6 +1722,27 @@ class TestDynamicStates(unittest.TestCase):
         self.assertFalse(loaded.has_fresh_demand_report())
         self.assertEqual(len(loaded.request_timestamps), 1)
 
+    def test_round_trip_preserves_scale_up_wave_timer(self):
+        source = _make_autoscaler(
+            knob=1,
+            replica_unit='logical',
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=10,
+            scale_up_rate_period_seconds=60,
+        )
+        source._last_scale_up_wave_at = 123.0
+        loaded = _make_autoscaler(
+            knob=1,
+            replica_unit='logical',
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=10,
+            scale_up_rate_period_seconds=60,
+        )
+
+        loaded.load_dynamic_states(source.dump_dynamic_states())
+
+        self.assertEqual(loaded._last_scale_up_wave_at, 123.0)
+
 
 class TestInfo(unittest.TestCase):
     """info() exposes the demand gauges for `sky serve status`."""
@@ -1146,6 +1760,7 @@ class TestInfo(unittest.TestCase):
         self.assertEqual(info['in_flight_total'], 5)
         self.assertEqual(info['queue_depth'], 1)
         self.assertEqual(info['rejected_in_window'], 4)
+        self.assertIsNone(info['rejected_in_recent_window'])
         self.assertIsNotNone(info['report_age_seconds'])
         self.assertGreaterEqual(info['report_age_seconds'], 0)
 

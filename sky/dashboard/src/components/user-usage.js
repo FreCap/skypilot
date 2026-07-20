@@ -128,6 +128,125 @@ export const aggregateUserUsage = (clusters = [], jobs = []) => {
   return usageByUser;
 };
 
+const extractGPUType = (accelerators) => {
+  if (!accelerators) return null;
+
+  let parsed = accelerators;
+  if (typeof accelerators === 'string') {
+    try {
+      const jsonStr = accelerators.replace(/'/g, '"').replace(/None/g, 'null');
+      parsed = JSON.parse(jsonStr);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  if (typeof parsed === 'object' && parsed !== null) {
+    const entries = Object.entries(parsed);
+    if (entries.length > 0) {
+      return entries[0][0];
+    }
+  }
+  return null;
+};
+
+// Build the per-user resource dimensions used by GPU and infrastructure
+// filters. Each snapshot is visited once; aggregate entries support filtering
+// by either dimension without rescanning clusters or jobs during rendering.
+export const buildUsageFilterLookup = (clusters = [], jobs = []) => {
+  const lookup = {};
+
+  const updateLookup = (
+    userId,
+    infra,
+    gpuType,
+    clusterDelta,
+    jobDelta,
+    gpuDelta
+  ) => {
+    if (!userId || !infra) return;
+
+    if (!lookup[userId]) {
+      lookup[userId] = {};
+    }
+    if (!lookup[userId][infra]) {
+      lookup[userId][infra] = {};
+    }
+    if (!lookup[userId]['Total']) {
+      lookup[userId]['Total'] = {};
+    }
+
+    if (!lookup[userId][infra]['Total']) {
+      lookup[userId][infra]['Total'] = {
+        clusterCount: 0,
+        jobCount: 0,
+        gpuCount: 0,
+      };
+    }
+    lookup[userId][infra]['Total'].clusterCount += clusterDelta;
+    lookup[userId][infra]['Total'].jobCount += jobDelta;
+    lookup[userId][infra]['Total'].gpuCount += gpuDelta;
+
+    if (gpuType) {
+      if (!lookup[userId][infra][gpuType]) {
+        lookup[userId][infra][gpuType] = {
+          clusterCount: 0,
+          jobCount: 0,
+          gpuCount: 0,
+        };
+      }
+      lookup[userId][infra][gpuType].clusterCount += clusterDelta;
+      lookup[userId][infra][gpuType].jobCount += jobDelta;
+      lookup[userId][infra][gpuType].gpuCount += gpuDelta;
+
+      if (!lookup[userId]['Total'][gpuType]) {
+        lookup[userId]['Total'][gpuType] = {
+          clusterCount: 0,
+          jobCount: 0,
+          gpuCount: 0,
+        };
+      }
+      lookup[userId]['Total'][gpuType].clusterCount += clusterDelta;
+      lookup[userId]['Total'][gpuType].jobCount += jobDelta;
+      lookup[userId]['Total'][gpuType].gpuCount += gpuDelta;
+    }
+  };
+
+  for (const cluster of clusters) {
+    const userId = cluster.user_hash;
+    if (!userId) continue;
+
+    const gpuType = extractGPUType(cluster.gpus);
+    let gpuCount = 0;
+    if (cluster.status !== 'STOPPED' && cluster.status !== 'TERMINATED') {
+      const gpuCountPerNode = getGPUCount(
+        cluster.gpus,
+        `Cluster ${cluster.cluster}`
+      );
+      gpuCount = gpuCountPerNode * (cluster.num_nodes || 1);
+    }
+    updateLookup(userId, cluster.infra, gpuType, 1, 0, gpuCount);
+  }
+
+  for (const job of jobs) {
+    if (!ACTIVE_JOB_STATUSES.has(job.status)) continue;
+
+    const userId = job.user_hash;
+    if (!userId) continue;
+
+    updateLookup(
+      userId,
+      job.infra,
+      extractGPUType(job.accelerators),
+      0,
+      1,
+      getJobGpuCount(job)
+    );
+  }
+
+  return lookup;
+};
+
 // Helper function to fetch clusters and managed jobs data with independent error handling
 // Uses Promise.allSettled so one failure doesn't affect the other
 export const fetchClustersAndJobs = async () => {

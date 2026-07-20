@@ -11,6 +11,8 @@ The fix re-checks the restart signal immediately before the destructive action.
 These tests pin that: a restart that appears mid-cycle defers the job's
 FAILED_CONTROLLER, while a genuinely dead controller (no restart) still fails.
 """
+import threading
+
 import pytest
 
 from sky.jobs import state as managed_job_state
@@ -87,7 +89,7 @@ def test_defers_failed_controller_when_restart_begins_midcycle(monkeypatch):
     seq = iter([False, True])
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: next(seq))
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert not set_failed_calls, (
         'a job must not be FAILED_CONTROLLER while its controller is restarting'
@@ -104,7 +106,7 @@ def test_marks_failed_controller_when_no_restart(monkeypatch):
             AssertionError('must reuse the sweep snapshot, not refetch tasks')))
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert len(set_failed_calls) == 1, (
         'a genuinely dead controller (no restart) must still fail the job')
@@ -144,10 +146,11 @@ def test_cleanup_reports_every_failed_cluster_termination(monkeypatch):
 
     monkeypatch.setattr(utils, 'terminate_cluster', _terminate)
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
-    # A failure on one cluster must not stop teardown of the others.
-    assert attempted == ['task-a-1', 'task-b-1', 'task-c-1']
+    # A failure on one cluster must not stop teardown of the others. The
+    # terminations run in parallel, so only the attempted set is defined.
+    assert sorted(attempted) == ['task-a-1', 'task-b-1', 'task-c-1']
     assert not handle_prechecks, (
         'terminate_cluster owns the authoritative cluster-row lookup')
     assert len(set_failed_calls) == 1
@@ -191,7 +194,7 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
 
     monkeypatch.setattr(utils, 'terminate_cluster', _record_termination)
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert cleanup_reads == [('job', 1)]
     assert terminated_clusters == ['job-1']
@@ -218,7 +221,7 @@ def test_defers_terminal_write_when_restart_begins_during_cleanup(monkeypatch):
         lambda task_name, job_id: cleanup_reads.append(
             (task_name, job_id)) or f'{task_name}-{job_id}')
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert cleanup_reads == [('job', 1)], 'cluster cleanup should have started'
     assert not set_failed_calls
@@ -247,7 +250,7 @@ def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
             (task_name, job_id)) or f'{task_name}-{job_id}')
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert not cleanup_reads, (
         'cluster cleanup must not start for a job reset for recovery')
@@ -303,7 +306,7 @@ def test_pending_job_skips_controller_status_read(monkeypatch, schedule_state):
                         lambda *a, **k: set_failed_calls.append((a, k)))
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert not get_status_calls, (
         'controller status must not be read for a pid-None pending job')
@@ -362,8 +365,51 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
     monkeypatch.setattr(utils.scheduler, 'job_done',
                         lambda *a, **k: job_done_calls.append((a, k)))
 
-    utils.update_managed_jobs_statuses(job_id=1)
+    utils.update_managed_jobs_statuses(job_ids=[1])
 
     assert seen_task_names == ['extract', 'transform']
     assert len(set_failed_calls) == 1
+    assert len(job_done_calls) == 1
+
+
+def test_cleanup_terminates_task_clusters_in_parallel(monkeypatch):
+    """Multi-task cluster teardowns must overlap, not run serially.
+
+    A single teardown can take minutes; a serial walk over a JobGroup's task
+    clusters holds the refresh tick for the sum of all teardowns and widens
+    the window in which the batched status snapshot goes stale. Each task has
+    a distinct cluster, so the terminations are independent.
+    """
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    info = _make_status_check_info()
+    info[1]['tasks'] = [{
+        'task_id': i,
+        'status': managed_job_state.ManagedJobStatus.RUNNING,
+        'task_name': name,
+    } for i, name in enumerate(['task-a', 'task-b', 'task-c'])]
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        lambda task_name, job_id: f'{task_name}-{job_id}')
+
+    barrier = threading.Barrier(3, timeout=10)
+    terminated = []
+
+    def _terminate(cluster_name):
+        # Every teardown blocks until all three are in flight at once. With
+        # the old serial loop the first call would wait on the barrier alone
+        # and time out.
+        barrier.wait()
+        terminated.append(cluster_name)
+
+    monkeypatch.setattr(utils, 'terminate_cluster', _terminate)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert sorted(terminated) == ['task-a-1', 'task-b-1', 'task-c-1']
+    assert len(set_failed_calls) == 1
+    assert 'cleanup failed' not in set_failed_calls[0][1]['failure_reason']
     assert len(job_done_calls) == 1

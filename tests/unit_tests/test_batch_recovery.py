@@ -258,10 +258,10 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
     assert state.save_batch_states(10, [[0, 4]], 'old-owner')
     owner_locked = threading.Event()
     release_old = threading.Event()
+    takeover_started = threading.Event()
     takeover_done = threading.Event()
     new_launch = mock.Mock()
     errors = []
-    order = []
     original_lock = state._lock_batch_coordinator_owner
 
     def _pause_old_owner(session, job_id, owner_token):
@@ -283,15 +283,14 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
                                      'worker-a',
                                      10,
                                      now=100) == (1, 0)
-            order.append('old-commit')
         except Exception as e:  # pylint: disable=broad-except
             errors.append(e)
 
     def _new_takeover():
         try:
+            takeover_started.set()
             assert state.acquire_batch_coordinator(10,
                                                    'new-owner') == 'old-owner'
-            order.append('takeover-return')
             new_launch()
         except Exception as e:  # pylint: disable=broad-except
             errors.append(e)
@@ -304,14 +303,16 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
     takeover_thread = threading.Thread(target=_new_takeover)
     takeover_thread.start()
 
+    assert takeover_started.wait(timeout=5)
     assert not takeover_done.wait(timeout=0.2)
     new_launch.assert_not_called()
     release_old.set()
     old_thread.join(timeout=5)
     takeover_thread.join(timeout=5)
 
+    assert not old_thread.is_alive()
+    assert not takeover_thread.is_alive()
     assert not errors
-    assert order == ['old-commit', 'takeover-return']
     new_launch.assert_called_once_with()
     assert state.is_batch_coordinator_owner(10, 'new-owner')
 

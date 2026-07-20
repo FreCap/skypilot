@@ -136,7 +136,7 @@ class GcsCloudStorage(CloudStorage):
         name is a prefix of other objects.
         """
         commands = [self._INSTALL_GSUTIL]
-        commands.append(f'{self._gsutil_command} ls -d {url}')
+        commands.append(f'{self._gsutil_command} ls -d {shlex.quote(url)}')
         command = ' && '.join(commands)
         p = subprocess.run(command,
                            stdout=subprocess.PIPE,

@@ -67,6 +67,7 @@ class RequestName(str, enum.Enum):
     SERVE_DOWN = 'serve.down'
     SERVE_TERMINATE_REPLICA = 'serve.terminate_replica'
     SERVE_STATUS = 'serve.status'
+    SERVE_PLACEMENT = 'serve.placement'
     SERVE_LOGS = 'serve.logs'
     SERVE_SYNC_DOWN_LOGS = 'serve.sync_down_logs'
     # Volumes requests

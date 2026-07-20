@@ -1,5 +1,7 @@
 """Tests for the short-lived AWS capacity hints."""
 # pylint: disable=protected-access
+import json
+
 import pytest
 import sqlalchemy
 
@@ -128,3 +130,68 @@ def test_active_filters_candidates(monkeypatch):
     monkeypatch.setattr(capacity_cache.kv_cache, 'get_cache_entry',
                         lambda key: '1' if key == active_cache_key else None)
     assert capacity_cache.active_exhausted_keys([active, inactive]) == {active}
+
+
+def test_service_observation_is_exact_and_redacted(cache_db, monkeypatch):
+    del cache_db
+    now = {'value': 1000.0}
+    monkeypatch.setattr(capacity_cache.time, 'time', lambda: now['value'])
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+    key = _key()
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+
+    capacity_cache.mark_exhausted(key, observation)
+
+    result = capacity_cache.active_service_observations('svc', 'hash-a')
+    assert result == {
+        'available': True,
+        'hints': [{
+            'kind': 'capacity',
+            'region': 'us-east-1',
+            'zone': 'us-east-1a',
+            'instance_type': 'g6.4xlarge',
+            'num_nodes': 1,
+            'observed_at': 1000.0,
+            'expires_at': 1120.0,
+        }],
+        'truncated': False,
+    }
+    assert not capacity_cache.active_service_observations('svc',
+                                                          'hash-b')['hints']
+    assert not capacity_cache.active_service_observations(
+        'other-svc', 'hash-a')['hints']
+    assert '0001' not in json.dumps(result)
+
+
+def test_service_observation_requires_active_canonical_hint(
+        cache_db, monkeypatch):
+    del cache_db
+    now = {'value': 1000.0}
+    monkeypatch.setattr(capacity_cache.time, 'time', lambda: now['value'])
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+    key = _key()
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+    capacity_cache.mark_exhausted(key, observation)
+
+    capacity_cache.clear(key)
+
+    result = capacity_cache.active_service_observations('svc', 'hash-a')
+    assert not result['hints']
+
+
+def test_quota_observation_is_regional(cache_db, monkeypatch):
+    del cache_db
+    now = {'value': 1000.0}
+    monkeypatch.setattr(capacity_cache.time, 'time', lambda: now['value'])
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+
+    capacity_cache.mark_quota_failure(_quota_key(), observation)
+
+    hints = capacity_cache.active_service_observations('svc', 'hash-a')['hints']
+    assert len(hints) == 1
+    hint = hints[0]
+    assert hint['kind'] == 'quota'
+    assert hint['region'] == 'us-east-1'
+    assert hint['zone'] is None
+    assert hint['instance_type'] == 'g6.4xlarge'

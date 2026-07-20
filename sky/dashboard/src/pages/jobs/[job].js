@@ -60,8 +60,7 @@ import PropTypes from 'prop-types';
 function JobDetails() {
   const router = useRouter();
   const { job: jobId, tab } = router.query;
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const { jobData, loading } = useSingleManagedJob(jobId, refreshTrigger);
+  const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
@@ -105,6 +104,7 @@ function JobDetails() {
 
   // Telemetry state
   const [isGrafanaAvailable, setIsGrafanaAvailable] = useState(false);
+  const [telemetryRefreshTrigger, setTelemetryRefreshTrigger] = useState(0);
   // Telemetry task selection for job groups
   const [telemetryTaskIndex, setTelemetryTaskIndex] = useState(0);
   const TELEMETRY_EXPANDED_KEY = 'skypilot-jobs-telemetry-expanded';
@@ -194,14 +194,13 @@ function JobDetails() {
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     try {
-      // Trigger job data refresh
-      setRefreshTrigger((prev) => prev + 1);
       // Trigger logs refresh
       setRefreshLogsFlag((prev) => prev + 1);
       // Trigger controller logs refresh
       setRefreshControllerLogsFlag((prev) => prev + 1);
       // Trigger telemetry refresh
       setTelemetryRefreshTrigger((prev) => prev + 1);
+      await refreshJobData();
     } catch (error) {
       console.error('Error refreshing data:', error);
     } finally {
@@ -662,6 +661,7 @@ function JobDetails() {
                       detailJobData.name
                 }
                 storageKey={TELEMETRY_EXPANDED_KEY}
+                refreshTrigger={telemetryRefreshTrigger}
                 hasGpu={hasAccelerator(telemetryTask?.accelerators)}
                 noMetricsMessage={
                   telemetryTask?.pool

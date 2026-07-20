@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import importlib
+import inspect
 import os
 import socket
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 import requests
 
 import sky
+from sky import admin_policy
 from sky import exceptions
 from sky import models
 from sky import sky_logging
@@ -24,6 +26,16 @@ from sky.utils import admin_policy_utils
 from sky.utils import config_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def test_base_policy_contracts_are_abstract():
+    for policy_class in (admin_policy.PolicyInterface, admin_policy.AdminPolicy,
+                         admin_policy.PolicyTemplate):
+        assert inspect.isabstract(policy_class)
+        with pytest.raises(TypeError, match='abstract'):
+            policy_class()  # pylint: disable=abstract-class-instantiated
+    assert not inspect.isabstract(admin_policy.RestfulAdminPolicy)
+
 
 POLICY_PATH = os.path.join(os.path.dirname(os.path.dirname(sky.__file__)),
                            'examples', 'admin_policy')

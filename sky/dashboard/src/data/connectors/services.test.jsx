@@ -12,10 +12,12 @@ jest.mock('@/data/connectors/client', () => ({
 import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServicePlacement,
   getServiceVersions,
   getServices,
   normalizeReplicaHistory,
   normalizeService,
+  normalizeServicePlacement,
   normalizeReplica,
 } from '@/data/connectors/services';
 
@@ -325,6 +327,30 @@ describe('getServices', () => {
         retention_hours: 72,
         window_start: 1751590000,
         window_end: 1751633200,
+        rejection_history_available: true,
+        request_samples: [
+          {
+            timestamp: 1751633160,
+            request_count: 9,
+            rejected_count: 2,
+          },
+        ],
+        autoscaler_samples: [
+          {
+            timestamp: 1751633160,
+            observed_at: 1751633175,
+            controller_session_id: 'a'.repeat(32),
+            version: 2,
+            replica_unit: 'physical_backend',
+            demand_target: 4,
+            capacity_target: 8,
+            ready_capacity: 6,
+            provisioning_capacity: 2,
+            total_capacity: 9,
+            peak_in_flight: 5,
+            peak_queue_depth: 3,
+          },
+        ],
         samples: [
           {
             timestamp: 1751633160,
@@ -368,6 +394,26 @@ describe('getServices', () => {
           erroredCount: 2,
           stoppingCount: 1,
           totalCount: 7,
+        },
+      ],
+      requestSamples: [
+        { timestamp: 1751633160, requestCount: 9, rejectedCount: 2 },
+      ],
+      rejectionHistoryAvailable: true,
+      autoscalerSamples: [
+        {
+          timestamp: 1751633160,
+          observedAt: 1751633175,
+          controllerSessionId: 'a'.repeat(32),
+          version: 2,
+          replicaUnit: 'physical_backend',
+          demandTarget: 4,
+          capacityTarget: 8,
+          readyCapacity: 6,
+          provisioningCapacity: 2,
+          totalCapacity: 9,
+          peakInFlight: 5,
+          peakQueueDepth: 3,
         },
       ],
     });
@@ -490,7 +536,30 @@ describe('normalizeReplicaHistory', () => {
       ],
       request_samples: [
         { timestamp: '120', request_count: '7' },
+        { timestamp: '180', request_count: 2, rejected_count: null },
         { timestamp: 'bad', request_count: 8 },
+      ],
+      autoscaler_samples: [
+        {
+          timestamp: '120',
+          observed_at: '125',
+          controller_session_id: 'a'.repeat(32),
+          version: 2,
+          replica_unit: 'logical_slot',
+          demand_target: 3,
+          capacity_target: 4,
+          ready_capacity: 2,
+          provisioning_capacity: 1,
+          total_capacity: 4,
+          peak_in_flight: 7,
+          peak_queue_depth: null,
+        },
+        {
+          timestamp: 'bad',
+          observed_at: 125,
+          version: 2,
+          replica_unit: 'logical_slot',
+        },
       ],
       request_window_seconds: 3600,
       requests_last_hour: 7,
@@ -505,7 +574,24 @@ describe('normalizeReplicaHistory', () => {
       }),
     ]);
     expect(history.requestSamples).toEqual([
-      { timestamp: 120, requestCount: 7 },
+      { timestamp: 120, requestCount: 7, rejectedCount: null },
+      { timestamp: 180, requestCount: 2, rejectedCount: null },
+    ]);
+    expect(history.autoscalerSamples).toEqual([
+      {
+        timestamp: 120,
+        observedAt: 125,
+        controllerSessionId: 'a'.repeat(32),
+        version: 2,
+        replicaUnit: 'logical_slot',
+        demandTarget: 3,
+        capacityTarget: 4,
+        readyCapacity: 2,
+        provisioningCapacity: 1,
+        totalCapacity: 4,
+        peakInFlight: 7,
+        peakQueueDepth: null,
+      },
     ]);
     expect(history.requestWindowSeconds).toBe(3600);
     expect(history.requestsLastHour).toBe(7);
@@ -613,5 +699,110 @@ describe('normalizeService / normalizeReplica', () => {
     expect(replica.launched_at).toBeNull();
     expect(replica.ready_at).toBeNull();
     expect(replica.timeToReadySeconds).toBeNull();
+  });
+});
+
+describe('service placement', () => {
+  const rawPlacement = {
+    service_name: 'svc',
+    placer_state: {
+      available: true,
+      enabled: true,
+      retry_seconds: 600,
+      locations: [
+        {
+          cloud: 'AWS',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          accelerators: { L4: 1 },
+          use_spot: true,
+          stored_status: 'PREEMPTED',
+          effective_status: 'ACTIVE',
+          probe_eligible: true,
+          benched_at: 1000,
+          next_probe_at: 1600,
+        },
+      ],
+    },
+    capacity_hints: {
+      available: true,
+      hints: [
+        {
+          kind: 'capacity',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          instance_type: 'g6.4xlarge',
+          num_nodes: 2,
+          expires_at: 1120,
+        },
+      ],
+    },
+    history: {
+      available: true,
+      retention_hours: 24,
+      outcome_counts: { capacity_failed: 1 },
+      next_cursor: 'cursor-a',
+      events: [
+        {
+          event_id: 'event-a',
+          request_id: 'request-a',
+          cluster_name: 'svc-1',
+          attempt_ordinal: 0,
+          observed_at: 1000,
+          outcome: 'capacity_failed',
+          provider: 'AWS',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          instance_type: 'g6.4xlarge',
+          hourly_price: 0.25,
+        },
+      ],
+    },
+  };
+
+  it('normalizes retry, cache, and history fields', () => {
+    const placement = normalizeServicePlacement(rawPlacement);
+
+    expect(placement.serviceName).toBe('svc');
+    expect(placement.placerState.locations[0]).toMatchObject({
+      cloud: 'AWS',
+      probeEligible: true,
+      storedStatus: 'PREEMPTED',
+      effectiveStatus: 'ACTIVE',
+      nextProbeAt: 1600,
+    });
+    expect(placement.capacityHints.hints[0]).toMatchObject({
+      kind: 'capacity',
+      instanceType: 'g6.4xlarge',
+      numNodes: 2,
+    });
+    expect(placement.history.events[0]).toMatchObject({
+      eventId: 'event-a',
+      attemptOrdinal: 0,
+      hourlyPrice: 0.25,
+    });
+  });
+
+  it('dispatches one bounded service placement request', async () => {
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse(rawPlacement));
+
+    const placement = await getServicePlacement({
+      serviceName: 'svc',
+      hours: 12,
+      limit: 10,
+      cursor: 'cursor-a',
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/placement', {
+      service_name: 'svc',
+      hours: 12,
+      limit: 10,
+      cursor: 'cursor-a',
+    });
+    expect(apiClient.get).toHaveBeenCalledWith(
+      `/api/get?request_id=${REQUEST_ID}`
+    );
+    expect(placement.history.events).toHaveLength(1);
   });
 });

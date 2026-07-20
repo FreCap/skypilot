@@ -124,6 +124,91 @@ def test_yaml_round_trip_preserves_knob():
     assert restored.max_replicas == 5
 
 
+def test_yaml_round_trip_preserves_demand_and_wave_policy():
+    spec = _make_spec(
+        min_replicas=1,
+        max_replicas=1000,
+        target_concurrency_per_replica=1,
+        spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+        graceful_drain_async_occupancy=True,
+        target_utilization_percentage=90,
+        expected_request_duration_seconds=30,
+        max_scale_up_rate_percentage=20,
+        scale_up_rate_min_replicas=10,
+        scale_up_rate_period_seconds=60,
+        max_scale_down_rate_percentage=50,
+    )
+
+    config = spec.to_yaml_config()
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+
+    assert restored.target_utilization_percentage == 90
+    assert restored.expected_request_duration_seconds == 30
+    assert restored.max_scale_up_rate_percentage == 20
+    assert restored.scale_up_rate_min_replicas == 10
+    assert restored.scale_up_rate_period_seconds == 60
+    assert restored.max_scale_down_rate_percentage == 50
+    assert restored.copy().to_yaml_config() == config
+
+
+def test_new_defaults_preserve_utilization_and_bound_downscale():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=1,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                      graceful_drain_async_occupancy=True)
+
+    assert spec.target_utilization_percentage == 100
+    assert spec.max_scale_down_rate_percentage == 50
+    policy = spec.to_yaml_config()['replica_policy']
+    assert 'target_utilization_percentage' not in policy
+    assert 'max_scale_down_rate_percentage' not in policy
+
+
+@pytest.mark.parametrize('field,bad_value', [
+    ('target_utilization_percentage', 0),
+    ('target_utilization_percentage', 101),
+    ('target_utilization_percentage', True),
+    ('expected_request_duration_seconds', 0),
+    ('expected_request_duration_seconds', float('inf')),
+    ('max_scale_up_rate_percentage', 0),
+    ('scale_up_rate_min_replicas', 0),
+    ('scale_up_rate_period_seconds', True),
+    ('max_scale_down_rate_percentage', 101),
+])
+def test_invalid_demand_and_wave_policy_rejected(field, bad_value):
+    kwargs = {
+        'min_replicas': 1,
+        'max_replicas': 5,
+        'target_concurrency_per_replica': 1,
+        'spot_placer': spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+        'graceful_drain_async_occupancy': True,
+        field: bad_value,
+    }
+    with pytest.raises(ValueError):
+        _make_spec(**kwargs)
+
+
+def test_partial_scale_up_wave_policy_rejected():
+    with pytest.raises(ValueError, match='must be set together'):
+        _make_spec(
+            min_replicas=1,
+            max_replicas=5,
+            target_concurrency_per_replica=1,
+            spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+            graceful_drain_async_occupancy=True,
+            max_scale_up_rate_percentage=20,
+        )
+
+
+def test_demand_and_wave_policy_requires_logical_replicas():
+    with pytest.raises(ValueError, match='require logical replicas'):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_concurrency_per_replica=1,
+                   target_utilization_percentage=90)
+
+
 def test_yaml_round_trip_omits_unset_knob():
     # An unset knob must not appear in the yaml (older controllers would
     # reject unknown fields during serve update).
@@ -168,6 +253,18 @@ def test_setstate_defaults_knob_for_old_rows():
         service_spec_lib.SkyServiceSpec)
     restored.__setstate__(old_state)
     assert restored.target_concurrency_per_replica is None
+
+
+def test_setstate_preserves_unbounded_downscale_for_old_rows():
+    spec = _make_spec(min_replicas=2)
+    old_state = dict(spec.__dict__)
+    del old_state['_max_scale_down_rate_percentage']
+    restored = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+
+    restored.__setstate__(old_state)
+
+    assert restored.max_scale_down_rate_percentage == 100
 
 
 def test_per_gpu_placer_enables_logical_replicas_without_yaml_unit():
@@ -223,6 +320,32 @@ def test_legacy_per_gpu_copy_does_not_apply_new_logical_validation():
     assert not copied.uses_logical_replicas
 
 
+def test_old_pickled_per_gpu_spec_copy_preserves_unbounded_downscale():
+    current = _make_spec(
+        min_replicas=1,
+        max_replicas=17,
+        target_concurrency_per_replica=1,
+        spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+        graceful_drain_async_occupancy=True,
+    )
+    old_state = dict(current.__dict__)
+    for field in ('_uses_logical_replicas', '_target_utilization_percentage',
+                  '_expected_request_duration_seconds',
+                  '_max_scale_up_rate_percentage',
+                  '_scale_up_rate_min_replicas',
+                  '_scale_up_rate_period_seconds',
+                  '_max_scale_down_rate_percentage'):
+        del old_state[field]
+    legacy = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    legacy.__setstate__(old_state)
+
+    copied = legacy.copy()
+
+    assert not copied.uses_logical_replicas
+    assert copied.max_scale_down_rate_percentage == 100
+
+
 def test_other_placer_keeps_legacy_physical_semantics():
     spec = _make_spec(min_replicas=1,
                       max_replicas=5,
@@ -237,11 +360,15 @@ def test_other_placer_keeps_legacy_physical_semantics():
     ({
         'target_concurrency_per_replica': 1.0,
         'graceful_drain_async_occupancy': True,
-    }, 'target_concurrency_per_replica: 1'),
+    }, 'positive integer'),
     ({
-        'target_concurrency_per_replica': 2,
+        'target_concurrency_per_replica': 2.5,
         'graceful_drain_async_occupancy': True,
-    }, 'target_concurrency_per_replica: 1'),
+    }, 'positive integer'),
+    ({
+        'target_concurrency_per_replica': True,
+        'graceful_drain_async_occupancy': True,
+    }, 'positive integer'),
     ({
         'target_concurrency_per_replica': 1,
     }, 'graceful_drain_async_occupancy: true'),
@@ -252,6 +379,17 @@ def test_per_gpu_placer_rejects_ambiguous_capacity_contract(kwargs, match):
                    max_replicas=5,
                    spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
                    **kwargs)
+
+
+def test_per_gpu_placer_accepts_outstanding_work_saturation():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2,
+                      graceful_drain_async_occupancy=True,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER)
+
+    assert spec.uses_logical_replicas
+    assert spec.target_concurrency_per_replica == 2
 
 
 def test_per_gpu_placer_accepts_reserved_fill_at_spec_level():

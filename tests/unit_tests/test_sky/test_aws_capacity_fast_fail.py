@@ -301,3 +301,30 @@ def test_single_zone_spot_retries_unrelated_errors(monkeypatch):
 
     assert result is launched
     assert calls == ['subnet-a', 'subnet-a']
+
+
+def test_multi_interface_efa_failure_preserves_subnet_retries(monkeypatch):
+    monkeypatch.setattr(aws_instance, 'BOTO_CREATE_MAX_RETRIES', 2)
+    calls = []
+    launched = [object()]
+
+    class _FakeEC2:
+
+        def create_instances(self, **kwargs):
+            calls.append(kwargs['NetworkInterfaces'][0]['SubnetId'])
+            if len(calls) == 1:
+                raise _client_error('InvalidParameterValue')
+            return launched
+
+    result = aws_instance._create_instances(  # pylint: disable=protected-access
+        _FakeEC2(),
+        'cluster',
+        _node_config(['subnet-a', 'subnet-b'], spot=False),
+        {},
+        1,
+        False,
+        32,
+    )
+
+    assert result is launched
+    assert calls == ['subnet-a', 'subnet-b']

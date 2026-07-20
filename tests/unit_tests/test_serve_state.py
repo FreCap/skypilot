@@ -881,6 +881,25 @@ def test_get_services_uses_single_query_for_multiple_rows(_mock_serve_db):
     ]
 
 
+def test_get_num_services_filters_raw_modes_without_deserializing(
+        _mock_serve_db, monkeypatch):
+    assert _add_minimal_service('serve-versioned') is True
+    assert _add_minimal_service('pool-versioned', pool=True) is True
+    _insert_orphan_service_row(_mock_serve_db, 'serve-orphan')
+    _insert_orphan_service_row(_mock_serve_db, 'pool-orphan', pool=True)
+
+    def _unexpected_spec_unpickle(_):
+        raise AssertionError('service counts must not deserialize specs')
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', _unexpected_spec_unpickle)
+    with _count_sql_statements(_mock_serve_db) as counts:
+        assert serve_state.get_num_services() == 4
+        assert serve_state.get_num_services(pool=False) == 2
+        assert serve_state.get_num_services(pool=True) == 2
+
+    assert counts['n'] == 3, counts
+
+
 def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
         _mock_serve_db, monkeypatch):
     assert _add_minimal_service('serve-b',

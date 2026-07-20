@@ -1,13 +1,16 @@
 """Characterization tests for the Azure Blob storage backend facade."""
 
 # pylint: disable=protected-access
+import contextlib
 import pickle
+import shlex
 from unittest import mock
 
 import pytest
 
 from sky import exceptions
 from sky.data import storage as storage_lib
+from sky.data import storage_azure
 
 
 def _azure_store(**attributes) -> storage_lib.AzureBlobStore:
@@ -125,6 +128,77 @@ def test_azure_blob_store_delete_preserves_external_container_with_sub_path():
 
     store._delete_sub_path.assert_called_once_with()
     store._delete_az_bucket.assert_not_called()
+
+
+def test_azure_blob_sync_quotes_paths_and_credentials():
+    store = _azure_store(
+        _bucket_sub_path='prefix $(echo INJECTED)',
+        storage_account_name='account $(echo INJECTED)',
+        storage_account_key='key $(echo INJECTED)',
+    )
+    commands = {}
+
+    def capture_commands(_source_paths, file_command_generator,
+                         dir_command_generator, *_args, **_kwargs):
+        commands['file'] = file_command_generator(
+            '/tmp/base dir', ['file $(echo INJECTED)', 'other file'])
+        commands['dir'] = dir_command_generator('/tmp/source dir',
+                                                'dest $(echo INJECTED)')
+
+    with mock.patch.object(
+            storage_azure.rich_utils,
+            'safe_status',
+            return_value=contextlib.nullcontext()), mock.patch.object(
+                storage_azure.data_utils,
+                'parallel_upload',
+                side_effect=capture_commands), mock.patch.object(
+                    storage_azure.storage_utils,
+                    'get_excluded_files',
+                    return_value=[]), mock.patch.object(
+                        storage_azure.sky_logging,
+                        'generate_tmp_logging_file_path',
+                        return_value='/tmp/storage.log'):
+        store.batch_az_blob_sync(['/tmp/ignored'])
+
+    common_prefix = [
+        'az',
+        'storage',
+        'blob',
+        'sync',
+        '--account-name',
+        store.storage_account_name,
+        '--account-key',
+        store.storage_account_key,
+    ]
+    common_suffix = [
+        '--delete-destination',
+        'false',
+        '--source',
+    ]
+    container_path = f'{store.container_name}/{store._bucket_sub_path}'
+    assert shlex.split(commands['file']) == common_prefix + [
+        '--include-pattern',
+        'file $(echo INJECTED);other file',
+    ] + common_suffix + [
+        '/tmp/base dir',
+        '--container',
+        container_path,
+    ]
+    assert shlex.split(commands['dir']) == common_prefix + [
+        '--exclude-path',
+        '.git/',
+    ] + common_suffix + [
+        '/tmp/source dir',
+        '--container',
+        f'{container_path}/dest $(echo INJECTED)',
+    ]
+
+
+def test_azure_blob_sync_rejects_missing_account_key():
+    store = _azure_store(storage_account_key=None)
+
+    with pytest.raises(RuntimeError, match='key is not initialized'):
+        store.batch_az_blob_sync(['/tmp/source'])
 
 
 def test_azure_blob_store_mount_command_delegates_provider_configuration():

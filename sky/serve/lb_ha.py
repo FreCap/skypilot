@@ -332,11 +332,12 @@ class LbSessionLedger:
 class DemandSnapshot:
     """Durable scale-down-safe evidence retained across one promotion."""
 
-    timestamps: tuple[int, ...]
+    timestamps: tuple[float, ...]
     queue_depth: int
     rejected_in_window: int
     in_flight: dict[str, int] = dataclasses.field(default_factory=dict)
     unknown_in_flight_urls: tuple[str, ...] = ()
+    rejected_in_recent_window: int = 0
 
     @classmethod
     def from_request(cls, request_data: dict[str, Any]) -> DemandSnapshot:
@@ -344,8 +345,8 @@ class DemandSnapshot:
         timestamps = aggregator.get('timestamps', []) if isinstance(
             aggregator, dict) else []
         valid_timestamps = tuple(
-            value for value in timestamps
-            if isinstance(value, int) and not isinstance(value, bool))
+            value for value in timestamps if isinstance(value, (int, float)) and
+            not isinstance(value, bool) and math.isfinite(value) and value >= 0)
 
         def _nonnegative(value: Any) -> int:
             return (value if isinstance(value, int) and
@@ -362,15 +363,20 @@ class DemandSnapshot:
         if not isinstance(unknown, list):
             unknown = []
         return cls(
-            valid_timestamps, _nonnegative(request_data.get('queue_depth')),
-            _nonnegative(request_data.get('rejected_in_window')), in_flight,
-            tuple(sorted(value for value in unknown if isinstance(value, str))))
+            valid_timestamps,
+            _nonnegative(request_data.get('queue_depth')),
+            _nonnegative(request_data.get('rejected_in_window')),
+            in_flight,
+            tuple(sorted(value for value in unknown if isinstance(value, str))),
+            _nonnegative(request_data.get('rejected_in_recent_window')),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             'timestamps': list(self.timestamps),
             'queue_depth': self.queue_depth,
             'rejected_in_window': self.rejected_in_window,
+            'rejected_in_recent_window': self.rejected_in_recent_window,
             'in_flight': self.in_flight,
             'unknown_in_flight_urls': list(self.unknown_in_flight_urls),
         }
@@ -385,6 +391,7 @@ class DemandSnapshot:
             },
             'queue_depth': value.get('queue_depth'),
             'rejected_in_window': value.get('rejected_in_window'),
+            'rejected_in_recent_window': value.get('rejected_in_recent_window'),
             'in_flight': value.get('in_flight'),
             'unknown_in_flight_urls': value.get('unknown_in_flight_urls'),
         })
@@ -403,6 +410,8 @@ class DemandSnapshot:
         merged['queue_depth'] = max(self.queue_depth, current.queue_depth)
         merged['rejected_in_window'] = max(self.rejected_in_window,
                                            current.rejected_in_window)
+        merged['rejected_in_recent_window'] = max(
+            self.rejected_in_recent_window, current.rejected_in_recent_window)
         merged['in_flight'] = {
             url: max(count, current.in_flight.get(url, 0))
             for url, count in self.in_flight.items()

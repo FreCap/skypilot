@@ -1,11 +1,8 @@
 """Setup dependencies & services for instances."""
-import base64
 from collections.abc import Callable
 from concurrent import futures
 import functools
-import gzip
 import hashlib
-import json
 import os
 import shlex
 import time
@@ -20,6 +17,7 @@ from sky.provision import common
 from sky.provision import docker_utils
 from sky.provision import logging as provision_logging
 from sky.provision import metadata_utils
+from sky.provision import ray_commands
 from sky.provision.runtime_recovery import _DISABLE_REBOOT_RECOVERY_ENV_VAR
 from sky.provision.runtime_recovery import _DISABLE_SKYLET_WATCHDOG_ENV_VAR
 from sky.provision.runtime_recovery import _install_runtime_reboot_recovery
@@ -44,15 +42,12 @@ from sky.provision.runtime_recovery import _SKYLET_WATCHDOG_SERVICE_NAME
 from sky.provision.runtime_recovery import _SKYLET_WATCHDOG_TIMER_NAME
 from sky.provision.runtime_recovery import MAYBE_REARM_AUTOSTOP_CMD
 from sky.provision.runtime_recovery import MAYBE_SKYLET_RESTART_CMD
-from sky.skylet import constants
 from sky.usage import constants as usage_constants
 from sky.usage import usage_lib
-from sky.utils import accelerator_registry
 from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import env_options
 from sky.utils import resources_utils
-from sky.utils import source_utils
 from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
@@ -91,23 +86,17 @@ logger = sky_logging.init_logger(__name__)
 
 _MAX_RETRY = 6
 
-# Increase the limit of the number of open files for the raylet process,
-# as the `ulimit` may not take effect at this point, because it requires
-# all the sessions to be reloaded. This is a workaround.
-_RAY_PRLIMIT = (
-    'which prlimit && for id in $(pgrep -f raylet/raylet); '
-    'do sudo prlimit --nofile=1048576:1048576 --pid=$id || true; done;')
-
-DUMP_RAY_PORTS = (f'{constants.SKY_PYTHON_CMD} -c \'import json, os; '
-                  f'runtime_dir = os.path.expanduser(os.environ.get('
-                  f'"{constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}", "~")); '
-                  f'json.dump({constants.SKY_REMOTE_RAY_PORT_DICT_STR}, '
-                  f'open(os.path.join(runtime_dir, '
-                  f'"{constants.SKY_REMOTE_RAY_PORT_FILE}"), "w", '
-                  'encoding="utf-8"))\';')
-
-_HOST_NETWORK_ENV_FILE = '/tmp/sky_host_network_ports.env'
-_HOST_NETWORK_PROBE_TARGET = '/tmp/sky_host_network_probe.py'
+# Compatibility aliases for historical consumers of instance_setup.
+_RAY_PRLIMIT = ray_commands.RAY_PRLIMIT
+DUMP_RAY_PORTS = ray_commands.DUMP_RAY_PORTS
+_HOST_NETWORK_ENV_FILE = ray_commands.HOST_NETWORK_ENV_FILE
+_HOST_NETWORK_PROBE_TARGET = ray_commands.HOST_NETWORK_PROBE_TARGET
+_RAY_PORT_COMMAND = ray_commands.RAY_PORT_COMMAND
+RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
+    ray_commands.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND)
+RAY_HEAD_WAIT_INITIALIZED_COMMAND = (
+    ray_commands.RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+_SHARED_RAY_PORT_FLAGS = ray_commands.SHARED_RAY_PORT_FLAGS
 
 
 @functools.lru_cache(maxsize=1)
@@ -115,15 +104,7 @@ def _host_network_probe_b64() -> str:
     # Cached, not module-level: instance_setup is imported on every `import
     # sky`, but the probe payload is only needed when actually building a
     # launch command, so the read/minify/gzip cost stays off the CLI path.
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        'kubernetes', 'host_network_probe.py')
-    with open(path, encoding='utf-8') as f:
-        source = f.read()
-    minified = source_utils.minify_python_source(source)
-    # Sanity-check: minified source must still parse.
-    compile(minified, path, 'exec')
-    compressed = gzip.compress(minified.encode('utf-8'))
-    return base64.b64encode(compressed).decode('ascii')
+    return ray_commands.host_network_probe_b64()
 
 
 def _host_network_probe_cmd(mode: str) -> str:
@@ -149,53 +130,7 @@ def _host_network_probe_cmd(mode: str) -> str:
     inside the rendered YAML's block-scalar indentation. Gzip cuts the
     payload by ~4x; the source on disk stays readable.
     """
-    assert mode in ('head', 'worker'), mode
-    return (
-        'if [ "${SKYPILOT_HOST_NETWORK:-0}" = "1" ] && '
-        '[ -n "${SKYPILOT_RAY_PORTS_CONFIGMAP_NAME:-}" ]; then '
-        f'echo \'{_host_network_probe_b64()}\' | base64 -d | gunzip > '
-        f'{_HOST_NETWORK_PROBE_TARGET}; '
-        f'{constants.SKY_PYTHON_CMD} {_HOST_NETWORK_PROBE_TARGET} '
-        f'--mode {mode} '
-        f'--env-file {_HOST_NETWORK_ENV_FILE} '
-        '--configmap-name "$SKYPILOT_RAY_PORTS_CONFIGMAP_NAME" '
-        '--configmap-namespace '
-        '"$SKYPILOT_RAY_PORTS_CONFIGMAP_NAMESPACE" || exit 1; '
-        f'set -a; . {_HOST_NETWORK_ENV_FILE}; set +a; '
-        # Delete-then-append rather than sed-in-place: sshd_config files
-        # without an existing Port directive would otherwise keep the
-        # default 22 (where the K8s node's own sshd already listens).
-        'if [ -n "${SKYPILOT_SSHD_PORT:-}" ]; then '
-        'sudo sh -c "'
-        'sed -i -E \'/^[[:space:]]*#?[[:space:]]*Port[[:space:]]+/d\' '
-        '/etc/ssh/sshd_config && '
-        'echo Port ${SKYPILOT_SSHD_PORT} >> /etc/ssh/sshd_config && '
-        'service ssh restart"; '
-        'fi; '
-        'fi; ')
-
-
-_RAY_PORT_COMMAND = (
-    f'{_READ_RAY_PORT_CMD};'
-    f'{constants.SKY_PYTHON_CMD} -c "from sky.utils import message_utils; '
-    'print(message_utils.encode_payload({\'ray_port\': $RAY_PORT}))"')
-
-# Command that calls `ray status` with SkyPilot's Ray port set.
-RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
-    f'{_RAY_PORT_COMMAND}; '
-    f'RAY_ADDRESS=127.0.0.1:$RAY_PORT {constants.SKY_RAY_CMD} status')
-
-# Command that waits for the ray status to be initialized. Otherwise, a later
-# `sky status -r` may fail due to the ray cluster not being ready.
-# Reads SKYPILOT_RAY_PORT (exported by the hostNetwork probe) rather than
-# the constants.RAY_STATUS literal — the probe picks a dynamic port.
-RAY_HEAD_WAIT_INITIALIZED_COMMAND = (
-    'while `RAY_ADDRESS=127.0.0.1:${SKYPILOT_RAY_PORT:-'
-    f'{constants.SKY_REMOTE_RAY_PORT}}} '
-    f'{constants.SKY_RAY_CMD} status | grep -q "No cluster status."`; do '
-    'sleep 0.5; '
-    'echo "Waiting ray cluster to be initialized"; '
-    'done;')
+    return ray_commands.host_network_probe_cmd(mode, _host_network_probe_b64)
 
 
 def _set_usage_run_id_cmd() -> str:
@@ -401,116 +336,26 @@ def _ray_gpu_options(custom_resource: str) -> str:
     For some cases (e.g., within docker container), we need to explicitly set
     --num-gpus to have ray clusters recognize the schedulable GPUs.
     """
-    acc_dict = json.loads(custom_resource)
-    assert len(acc_dict) == 1, acc_dict
-    acc_name, acc_count = list(acc_dict.items())[0]
-    if accelerator_registry.is_schedulable_non_gpu_accelerator(acc_name):
-        return ''
-    # We need to manually set the number of GPUs, as it may not automatically
-    # detect the GPUs within the container.
-    return f' --num-gpus={acc_count}'
-
-
-# Ray port flags shared by the head and worker start commands. The
-# ${VAR:-default} forms take the probed value when the hostNetwork probe
-# ran and the original constant otherwise; the ${VAR:+--flag=...} forms
-# vanish when unset, so non-hostNetwork bootstraps defer to Ray's own
-# defaults. Kept in one place so the head/worker flag sets can't drift.
-_SHARED_RAY_PORT_FLAGS = (
-    '--object-manager-port=${SKYPILOT_RAY_OBJECT_MANAGER_PORT:-8076} '
-    '${SKYPILOT_RAY_NODE_MANAGER_PORT:+'
-    '--node-manager-port=$SKYPILOT_RAY_NODE_MANAGER_PORT} '
-    '${SKYPILOT_RAY_DASHBOARD_AGENT_LISTEN_PORT:+'
-    '--dashboard-agent-listen-port='
-    '$SKYPILOT_RAY_DASHBOARD_AGENT_LISTEN_PORT} '
-    '${SKYPILOT_RAY_RUNTIME_ENV_AGENT_PORT:+'
-    '--runtime-env-agent-port=$SKYPILOT_RAY_RUNTIME_ENV_AGENT_PORT} '
-    '${SKYPILOT_RAY_METRICS_EXPORT_PORT:+'
-    '--metrics-export-port=$SKYPILOT_RAY_METRICS_EXPORT_PORT}')
+    return ray_commands.ray_gpu_options(custom_resource)
 
 
 def ray_head_start_command(custom_resource: str | None,
                            custom_ray_options: dict[str, Any] | None) -> str:
     """Returns the command to start Ray on the head node."""
-    ray_options = (
-        # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
-        f'--disable-usage-stats '
-        f'--port=${{SKYPILOT_RAY_PORT:-{constants.SKY_REMOTE_RAY_PORT}}} '
-        f'--dashboard-port=${{SKYPILOT_RAY_DASHBOARD_PORT:-'
-        f'{constants.SKY_REMOTE_RAY_DASHBOARD_PORT}}} '
-        f'--min-worker-port 11002 '
-        f'{_SHARED_RAY_PORT_FLAGS} '
-        # Head-only: workers don't run the Ray Client server.
-        '${SKYPILOT_RAY_CLIENT_SERVER_PORT:+'
-        '--ray-client-server-port=$SKYPILOT_RAY_CLIENT_SERVER_PORT} '
-        f'--temp-dir={constants.SKY_REMOTE_RAY_TEMPDIR}')
-    if custom_resource:
-        ray_options += f' --resources=\'{custom_resource}\''
-        ray_options += _ray_gpu_options(custom_resource)
-    if custom_ray_options:
-        if 'use_external_ip' in custom_ray_options:
-            custom_ray_options.pop('use_external_ip')
-        for key, value in custom_ray_options.items():
-            ray_options += f' --{key}={value}'
-
-    cmd = (
-        _host_network_probe_cmd('head') + f'{constants.SKY_RAY_CMD} stop; '
-        'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
-        # worker_maximum_startup_concurrency controls the maximum number of
-        # workers that can be started concurrently. However, it also controls
-        # this warning message:
-        # https://github.com/ray-project/ray/blob/d5d03e6e24ae3cfafb87637ade795fb1480636e6/src/ray/raylet/worker_pool.cc#L1535-L1545
-        # maximum_startup_concurrency defaults to the number of CPUs given by
-        # multiprocessing.cpu_count() or manually specified to ray. (See
-        # https://github.com/ray-project/ray/blob/fab26e1813779eb568acba01281c6dd963c13635/python/ray/_private/services.py#L1622-L1624.)
-        # The warning will show when the number of workers is >4x the
-        # maximum_startup_concurrency, so typically 4x CPU count. However, the
-        # job controller uses 0.25cpu reservations, and each job can use two
-        # workers (one for the submitted job and one for remote actors),
-        # resulting in a worker count of 8x CPUs or more. Increase the
-        # worker_maximum_startup_concurrency to 3x CPUs so that we will only see
-        # the warning when the worker count is >12x CPUs.
-        'RAY_worker_maximum_startup_concurrency=$(( 3 * $(nproc --all) )) '
-        f'{constants.SKY_RAY_CMD} start --head {ray_options} || exit 1;' +
-        _RAY_PRLIMIT + DUMP_RAY_PORTS + RAY_HEAD_WAIT_INITIALIZED_COMMAND)
-    return cmd
+    return ray_commands.ray_head_start_command(custom_resource,
+                                               custom_ray_options,
+                                               _host_network_probe_cmd,
+                                               _ray_gpu_options)
 
 
 def ray_worker_start_command(custom_resource: str | None,
                              custom_ray_options: dict[str, Any] | None,
                              no_restart: bool) -> str:
     """Returns the command to start Ray on the worker node."""
-    # SKYPILOT_RAY_PORT is the head's GCS port — exported as a constant
-    # by the K8s template's worker bootstrap, or as the probed value
-    # (read from the head's ConfigMap) by the hostNetwork worker probe.
-    ray_options = ('--address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT} '
-                   f'{_SHARED_RAY_PORT_FLAGS}')
-
-    if custom_resource:
-        ray_options += f' --resources=\'{custom_resource}\''
-        ray_options += _ray_gpu_options(custom_resource)
-
-    if custom_ray_options:
-        for key, value in custom_ray_options.items():
-            ray_options += f' --{key}={value}'
-
-    cmd = (
-        'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
-        f'{constants.SKY_RAY_CMD} start --disable-usage-stats {ray_options} || '
-        'exit 1;' + _RAY_PRLIMIT)
-    if no_restart:
-        # We do not use ray status to check whether ray is running, because
-        # on worker node, if the user started their own ray cluster, ray status
-        # will return 0, i.e., we don't know skypilot's ray cluster is running.
-        # Instead, we check whether the raylet process is running on gcs address
-        # that is connected to the head with the correct port.
-        cmd = (
-            f'ps aux | grep "ray/raylet/raylet" | '
-            'grep "gcs-address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT}" '
-            f'|| {{ {cmd} }}')
-    else:
-        cmd = f'{constants.SKY_RAY_CMD} stop; ' + cmd
-    return _host_network_probe_cmd('worker') + cmd
+    return ray_commands.ray_worker_start_command(custom_resource,
+                                                 custom_ray_options, no_restart,
+                                                 _host_network_probe_cmd,
+                                                 _ray_gpu_options)
 
 
 @common.log_function_start_end

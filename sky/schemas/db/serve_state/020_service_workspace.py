@@ -1,7 +1,7 @@
-"""Persist the user workspace and reconcile former revision 016 layouts.
+"""Persist the user workspace and reconcile former revision 018 layouts.
 
-Revision ID: 018
-Revises: 017
+Revision ID: 020
+Revises: 019
 Create Date: 2026-07-18
 
 """
@@ -11,24 +11,31 @@ from collections.abc import Sequence
 from alembic import op
 import sqlalchemy as sa
 
+from sky.serve import placement_history
+from sky.utils.db import db_utils
+
 # revision identifiers, used by Alembic.
-revision: str = '018'
-down_revision: str | Sequence[str] | None = '017'
+revision: str = '020'
+down_revision: str | Sequence[str] | None = '019'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
 def upgrade():
-    """Persist workspace and converge both former revision 016 schemas."""
+    """Persist workspace and converge both former revision 018 schemas."""
     with op.get_context().autocommit_block():
-        # Before these branches were merged, the managed-image preview used
-        # revision 016 for workspace persistence while improvements used it for
-        # load-balancer cutover authority. A database stamped 016 may therefore
-        # have either schema. Re-applying the nullable/defaulted columns makes
-        # revision 018 converge both histories safely.
+        # Before these branches were merged, the managed-image preview and the
+        # placement-history branch both used revision 018. A preview database
+        # stamped 018 may therefore lack the placement table that current 018
+        # owns. Repair it idempotently before adding the preview's workspace
+        # column so either history converges at revision 020.
+        bind = op.get_bind()
+        if bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            placement_history.serve_placement_events_table.create(
+                bind, checkfirst=True)
         existing_columns = {
             column['name']
-            for column in sa.inspect(op.get_bind()).get_columns('services')
+            for column in sa.inspect(bind).get_columns('services')
         }
         columns = (
             sa.Column('workspace', sa.Text()),
@@ -58,6 +65,6 @@ def upgrade():
 
 
 def downgrade():
-    # Load-balancer columns belong to revision 016 and must survive a downgrade
-    # from 018 to 017. Only the workspace column is owned by this revision.
+    # Placement and autoscaler history belong to revisions 018 and 019. Only
+    # the workspace column is owned by this convergence revision.
     op.drop_column('services', 'workspace')

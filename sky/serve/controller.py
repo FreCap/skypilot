@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from typing import Any, NamedTuple
+import uuid
 
 import colorama
 import fastapi
@@ -129,6 +130,9 @@ class _PendingServiceUpdate(NamedTuple):
     committed_at: float
 
 
+_UPDATE_RETRY_BACKOFF_SECONDS = 5
+
+
 class SkyServeController:
     """SkyServeController: control everything about replica.
 
@@ -152,6 +156,7 @@ class SkyServeController:
         self._service_name = service_name
         self._resource_scope = resource_scope
         self._service_hash = service_hash
+        self._history_session_id = uuid.uuid4().hex
         self._controller_owner = ((controller_pid,
                                    controller_ip) if service_hash is not None or
                                   controller_pid is not None or
@@ -409,8 +414,8 @@ class SkyServeController:
             yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
                 yaml_paths)
             provider_configs = {
-                replica_id: config['provider']
-                for replica_id, config in zip(yaml_replica_ids, yaml_configs)
+                replica_id: config['provider'] for replica_id, config in zip(
+                    yaml_replica_ids, yaml_configs, strict=True)
             }
 
         for info in ready_infos:
@@ -816,13 +821,8 @@ class SkyServeController:
                 if (state is not None and
                         state.phase is not lb_ha.LbCutoverPhase.PREPARING):
                     self._restore_lb_demand_handoff(state.generation)
-                    sampled_urls = set(
-                        request_data.get('occupancy_sampled_urls', []))
-                    complete_report = bool(
-                        getattr(self, '_lb_occupancy_contract_known',
-                                False)) and getattr(
-                                    self, '_lb_expected_occupancy_urls',
-                                    set()).issubset(sampled_urls)
+                    complete_report = self._lb_demand_report_is_complete(
+                        request_data)
                     handoff = getattr(self, '_lb_demand_handoff', None)
                     if handoff is not None:
                         if (complete_report and
@@ -898,6 +898,8 @@ class SkyServeController:
                 'queue_depth': effective_request_data.get('queue_depth'),
                 'rejected_in_window':
                     effective_request_data.get('rejected_in_window'),
+                'rejected_in_recent_window':
+                    effective_request_data.get('rejected_in_recent_window'),
             })
             if (translated_in_flight is not None and getattr(
                     self._autoscaler, 'replica_unit', None) == 'logical'):
@@ -971,7 +973,10 @@ class SkyServeController:
                 self._lb_occupancy_contract_known = True
             # History is incarnation-scoped and never changes runtime state,
             # so it may finish before the final ownership fence even if this
-            # controller loses the service mid-write.
+            # controller loses the service mid-write. Autoscaler history reads
+            # the previously applied authoritative demand snapshot; the next
+            # frequent sync captures the report below without adding an await
+            # after the runtime-mutation fence.
             observed_slots: dict[int, int] = {}
             if authority[1]:
                 observed_slots = self._translate_observed_slots(
@@ -979,8 +984,14 @@ class SkyServeController:
                 if logical_versions is not None:
                     await self._confirm_logical_bridge_capacities(
                         replica_infos, logical_versions, observed_slots)
-            request_history_accepted = await self._persist_request_history(
-                request_data)
+            replica_counts = self._get_replica_counts(replica_infos)
+            history_capacity_hint = self._get_capacity_hint(
+                replica_infos, logical_versions, replica_counts=replica_counts)
+            request_history_accepted, _ = await asyncio.gather(
+                self._persist_request_history(request_data),
+                self._persist_autoscaler_history(replica_counts,
+                                                 history_capacity_hint),
+            )
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             # All awaits, including durable bridge confirmation, are above
@@ -993,14 +1004,14 @@ class SkyServeController:
                 authority,
                 observed_slots,
             )
-            self._replica_counts_snapshot = self._get_replica_counts(
-                replica_infos)
+            self._replica_counts_snapshot = replica_counts
+            capacity_hint = self._get_capacity_hint(
+                replica_infos, logical_versions, replica_counts=replica_counts)
             response_content = {
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
-                'capacity_hint': self._get_capacity_hint(
-                    replica_infos, logical_versions),
+                'capacity_hint': capacity_hint,
                 'request_history_accepted': request_history_accepted,
             }
             if getattr(self, '_lb_ha_enabled', False):
@@ -1039,6 +1050,33 @@ class SkyServeController:
         return lb_ha.occupancy_samples_are_promotable(
             self._lb_expected_occupancy_urls, sample_generations, sample_ages,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+
+    @staticmethod
+    def _lb_demand_report_is_complete(request_data: dict[str, Any]) -> bool:
+        """Whether an authoritative report can age out old demand gauges.
+
+        Occupancy samples need not cover every backend. Missing samples are
+        represented by the current report's unknown set and remain protected
+        individually; they must not preserve stale queue and rejection gauges
+        for the whole fleet indefinitely. Requiring every field keeps a mixed
+        rollout with an older load balancer fail closed.
+        """
+        in_flight = request_data.get('in_flight')
+        if not isinstance(in_flight, dict):
+            return False
+        if any(not isinstance(url, str) or not isinstance(count, int) or
+               isinstance(count, bool) or count < 0
+               for url, count in in_flight.items()):
+            return False
+        for field in ('queue_depth', 'rejected_in_window',
+                      'rejected_in_recent_window'):
+            value = request_data.get(field)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < 0):
+                return False
+        unknown_urls = request_data.get('unknown_in_flight_urls')
+        return (isinstance(unknown_urls, list) and
+                all(isinstance(url, str) for url in unknown_urls))
 
     def _restore_lb_demand_handoff(self, generation: int) -> None:
         handoff = self._lb_demand_handoff
@@ -1611,6 +1649,74 @@ class SkyServeController:
         )
         return True
 
+    async def _persist_autoscaler_history(
+        self,
+        replica_counts: dict[str, int | str],
+        capacity_hint: dict[str, Any],
+    ) -> None:
+        """Persist controller gauges without allowing history to fail sync."""
+        loop = asyncio.get_running_loop()
+        observed_at = time.time()
+        try:
+            await loop.run_in_executor(None, self._record_autoscaler_history,
+                                       replica_counts, capacity_hint,
+                                       observed_at)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to persist autoscaler history for '
+                           f'{self._service_name!r}: '
+                           f'{common_utils.format_exception(e)}')
+
+    def _record_autoscaler_history(
+        self,
+        replica_counts: dict[str, int | str],
+        capacity_hint: dict[str, Any],
+        timestamp: float | None = None,
+    ) -> int:
+        """Persist one minute observation from already-computed sync state."""
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            return 0
+        replica_unit = replica_counts.get('replica_unit')
+        ready_capacity = replica_counts.get('ready_replicas')
+        total_capacity = replica_counts.get('total_replicas')
+        provisioning_capacity = capacity_hint.get('provisioning_replicas')
+        if (not isinstance(replica_unit, str) or
+                replica_unit not in {'physical_backend', 'logical_slot'} or
+                not isinstance(ready_capacity, int) or
+                not isinstance(total_capacity, int) or
+                not isinstance(provisioning_capacity, int)):
+            return 0
+
+        autoscaler_info = self._autoscaler.info()
+        demand_target = self._autoscaler.get_final_target_num_replicas()
+        fill_target = autoscaler_info.get('fill_target')
+        if not isinstance(fill_target, int) or isinstance(fill_target, bool):
+            fill_target = 0
+        capacity_target = max(demand_target, fill_target)
+        peak_in_flight = autoscaler_info.get('in_flight_total')
+        peak_queue_depth = autoscaler_info.get('queue_depth')
+        if not isinstance(peak_in_flight, int) or isinstance(
+                peak_in_flight, bool):
+            peak_in_flight = None
+        if not isinstance(peak_queue_depth, int) or isinstance(
+                peak_queue_depth, bool):
+            peak_queue_depth = None
+        return serve_history.record_autoscaler_snapshot(
+            self._service_name,
+            service_hash,
+            self._history_session_id,
+            version=self._applied_version,
+            replica_unit=replica_unit,
+            demand_target=demand_target,
+            capacity_target=capacity_target,
+            ready_capacity=ready_capacity,
+            provisioning_capacity=provisioning_capacity,
+            total_capacity=total_capacity,
+            peak_in_flight=peak_in_flight,
+            peak_queue_depth=peak_queue_depth,
+            timestamp=timestamp,
+        )
+
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""
         service_hash = getattr(self, '_service_hash', None)
@@ -1654,6 +1760,7 @@ class SkyServeController:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         logical_versions: set[int] | None = None,
+        replica_counts: dict[str, int | str] | None = None,
     ) -> dict[str, Any]:
         """Build the capacity_hint block of the sync response.
 
@@ -1703,7 +1810,13 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
             'configured_max_replicas': self._autoscaler.max_replicas,
         }
-        hint.update(self._get_replica_counts(replica_infos, include_unit=False))
+        if replica_counts is None:
+            replica_counts = self._get_replica_counts(replica_infos)
+        hint.update({
+            key: value
+            for key, value in replica_counts.items()
+            if key != 'replica_unit'
+        })
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -1721,7 +1834,6 @@ class SkyServeController:
     def _get_replica_counts(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
-        include_unit: bool = True,
     ) -> dict[str, int | str]:
         """Return logical capacity and physical backend status aggregates."""
         autoscaler = getattr(self, '_autoscaler', None)
@@ -1762,9 +1874,8 @@ class SkyServeController:
             'physical_total_replicas': physical_total,
             'physical_failed_replicas': physical_failed,
         }
-        if include_unit:
-            counts['replica_unit'] = ('logical_slot'
-                                      if logical else 'physical_backend')
+        counts['replica_unit'] = ('logical_slot'
+                                  if logical else 'physical_backend')
         return counts
 
     @staticmethod
@@ -2154,7 +2265,7 @@ class SkyServeController:
         self._replica_manager.clear_pending_version(update.version)
 
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
-        """Apply one pending update; return whether it converged or vanished."""
+        """Apply one pending update; optionally wait through retry backoff."""
         with self._update_condition:
             while (self._pending_update is None or
                    self._pending_update.version <= self._applied_version):
@@ -2189,6 +2300,14 @@ class SkyServeController:
                          f'{update.version}; {retry_message}: {exception_str}')
             with ux_utils.enable_traceback():
                 logger.error(f'  Traceback: {traceback.format_exc()}')
+            if retry_same_update and wait:
+                # Release the condition during backoff and wake immediately if
+                # a newer commit supersedes this failed update. wait_for()
+                # also closes the commit-before-wait lost-wakeup window.
+                with self._update_condition:
+                    self._update_condition.wait_for(
+                        lambda: self._pending_update is not update,
+                        timeout=_UPDATE_RETRY_BACKOFF_SECONDS)
             return not retry_same_update
 
         with self._update_condition:
@@ -2203,11 +2322,8 @@ class SkyServeController:
 
     def _run_update_reconciler(self) -> None:
         """Continuously converge runtime state to the newest committed spec."""
-        retry_backoff_seconds = 5
         while True:
-            converged = self._reconcile_pending_update_once(wait=True)
-            if not converged:
-                time.sleep(retry_backoff_seconds)
+            self._reconcile_pending_update_once(wait=True)
 
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
@@ -2361,6 +2477,8 @@ class SkyServeController:
                 # preserved: scale-downs still execute at their original
                 # position relative to the upscale batches around them.
                 pending_scale_up: list[dict[str, Any] | None] = []
+                pending_logical_scale_down: list[
+                    autoscalers.LogicalScaleDownTarget] = []
 
                 # The closure is only called within the same outer-loop
                 # iteration that (re)binds pending_scale_up, so capturing the
@@ -2373,10 +2491,25 @@ class SkyServeController:
                             expected_version=expected_version)
                         pending_scale_up.clear()  # noqa: B023
 
+                def _flush_logical_scale_down() -> None:
+                    if not pending_logical_scale_down:  # noqa: B023
+                        return
+                    first = pending_logical_scale_down[0]  # noqa: B023
+                    self._replica_manager.scale_down_logically_batch(
+                        [
+                            target.replica_id for target in  # noqa: B023
+                            pending_logical_scale_down  # noqa: B023
+                        ],  # noqa: B023
+                        first.target_capacity,
+                        first.version,
+                        first.reconcile_generation)
+                    pending_logical_scale_down.clear()  # noqa: B023
+
                 for scaling_option in scaling_options:
                     logger.info(f'Scaling option received: {scaling_option}')
                     if (scaling_option.operator ==
                             autoscalers.AutoscalerDecisionOperator.SCALE_UP):
+                        _flush_logical_scale_down()
                         if isinstance(scaling_option.target,
                                       autoscalers.LogicalScaleTarget):
                             _flush_scale_up()
@@ -2400,12 +2533,21 @@ class SkyServeController:
                         _flush_scale_up()
                         if isinstance(scaling_option.target,
                                       autoscalers.LogicalScaleDownTarget):
-                            self._replica_manager.scale_down_logically(
-                                scaling_option.target.replica_id,
-                                scaling_option.target.target_capacity,
-                                scaling_option.target.version,
-                                scaling_option.target.reconcile_generation)
+                            logical_scale_down_target = scaling_option.target
+                            if pending_logical_scale_down:
+                                first = pending_logical_scale_down[0]
+                                if ((logical_scale_down_target.version,
+                                     logical_scale_down_target.
+                                     reconcile_generation,
+                                     logical_scale_down_target.target_capacity)
+                                        != (first.version,
+                                            first.reconcile_generation,
+                                            first.target_capacity)):
+                                    _flush_logical_scale_down()
+                            pending_logical_scale_down.append(
+                                logical_scale_down_target)
                         else:
+                            _flush_logical_scale_down()
                             assert isinstance(scaling_option.target,
                                               int), scaling_option
                             self._replica_manager.scale_down(
@@ -2415,6 +2557,7 @@ class SkyServeController:
                                     AutoscalerDecisionReason.COST_REBALANCE),
                                 expected_version=decision_version)
                 _flush_scale_up()
+                _flush_logical_scale_down()
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
                 # monitor running.
@@ -2451,6 +2594,22 @@ class SkyServeController:
             # exceed the supervisor's one-second read budget at fleet scale.
             return responses.JSONResponse(content={'status': 'ok'},
                                           status_code=200)
+
+        @self._app.get(
+            serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_placement_state() -> fastapi.Response:
+            placer = self._replica_manager.spot_placer
+            if placer is None:
+                content = {
+                    'available': True,
+                    'enabled': False,
+                    'locations': [],
+                    'truncated': False,
+                }
+            else:
+                content = placer.placement_snapshot()
+            return responses.JSONResponse(content=content, status_code=200)
 
         @self._app.get(
             '/autoscaler/info',

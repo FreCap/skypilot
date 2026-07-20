@@ -10,6 +10,7 @@ import time
 import typing
 from typing import Any
 
+from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
@@ -25,6 +26,8 @@ if typing.TYPE_CHECKING:
     from sky.serve import service_spec
 
 logger = sky_logging.init_logger(__name__)
+
+_LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 
 
 class AutoscalerDecisionOperator(enum.Enum):
@@ -1219,7 +1222,11 @@ class Autoscaler:
                     # and restart.
                     return []
             if (previous_versions and latest_replicas and
-                    all(info.is_terminal for info in latest_replicas)):
+                    all(info.is_terminal for info in latest_replicas) and
+                    any(info.status in
+                        serve_state.ReplicaStatus.failed_statuses() and
+                        not info.status_property.is_scale_down
+                        for info in latest_replicas)):
                 self._notify_rollout_blocked(max(previous_versions))
 
         scaling_decisions = []
@@ -1319,8 +1326,9 @@ class _AutoscalerWithHysteresis(Autoscaler):
             spec.downscale_delay_seconds
             if spec.downscale_delay_seconds is not None else
             constants.AUTOSCALER_DEFAULT_DOWNSCALE_DELAY_SECONDS)
+        self.downscale_delay_seconds: float = float(downscale_delay_seconds)
         self.scale_down_threshold: int = int(
-            downscale_delay_seconds /
+            self.downscale_delay_seconds /
             constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS)
 
     def __init__(self,
@@ -1527,6 +1535,11 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             logger.info(f'Remaining dynamic states: {dynamic_states}')
 
 
+# Distinguishes "caller did not resolve a handle" from a resolved None
+# (cluster row or handle genuinely absent) in the mixin helpers below.
+_UNRESOLVED_HANDLE = object()
+
+
 class _GpuShapeResolverMixin:
     """Shared GPU-shape resolution with a post-launch-only memo.
 
@@ -1559,8 +1572,41 @@ class _GpuShapeResolverMixin:
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
 
+    def _resolve_replica_handles(
+            self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> dict[int, Any]:
+        """Batch-resolve cluster handles for replicas missing a cached memo.
+
+        `ReplicaInfo.handle()` with no record hits the cluster table once per
+        call, and while a replica is provisioning neither the shape nor the
+        cost memo may cache (the record is rewritten per failover attempt), so
+        a selection pass that scores each replica twice would pay 2 reads per
+        provisioning replica. One batched read replaces all of them, and also
+        scores shape and cost from the same record snapshot instead of two
+        reads at different times mid-sort.
+        """
+        uncached = [
+            info for info in replica_infos
+            if info.replica_id not in self._gpu_shape_cache or
+            info.replica_id not in self._replica_cost_cache
+        ]
+        if not uncached:
+            return {}
+        records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in uncached])
+        handles: dict[int, Any] = {}
+        for info in uncached:
+            record = records.get(info.cluster_name)
+            # A missing record means the cluster row is gone; a bare
+            # info.handle() would resolve to None too, just via another read.
+            handles[info.replica_id] = (info.handle(record)
+                                        if record is not None else None)
+        return handles
+
     def _get_hourly_cost_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+            self,
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> float:
         """Hourly cost of a replica's launched resources (0.0 = reserved).
 
         Used to prefer scaling down PAID replicas before zero-cost ones
@@ -1575,7 +1621,8 @@ class _GpuShapeResolverMixin:
         cost = 0.0
         resolved = False
         try:
-            handle = replica_info.handle()
+            if handle is _UNRESOLVED_HANDLE:
+                handle = replica_info.handle()
             if handle is not None:
                 # Coerce: anything non-numeric degrades to 0.0 (shed last).
                 cost = float(handle.launched_resources.get_cost(seconds=3600))
@@ -1591,14 +1638,16 @@ class _GpuShapeResolverMixin:
 
     def _get_gpu_shape_from_replica_info(
             self,
-            replica_info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> tuple[str, int]:
         """Extract (GPU type, GPU count) from ReplicaInfo object."""
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
         gpu_type = 'unknown'
         gpu_count = 1
-        handle = replica_info.handle()
+        if handle is _UNRESOLVED_HANDLE:
+            handle = replica_info.handle()
         if handle is not None:
             accelerators = handle.launched_resources.accelerators
             if accelerators and len(accelerators) > 0:
@@ -2043,6 +2092,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # Create a list of (replica_info, target_qps) tuples
         replica_qps_pairs: list[tuple[replica_managers.ReplicaInfo, float]] = []
 
+        # One batched cluster-table read for every replica the memos cannot
+        # serve; the sort below scores each replica twice (shape + cost).
+        handles = self._resolve_replica_handles(replica_infos)
+
         for info in replica_infos:
             # Include old-version replicas as well so they also get a target_qps
             # assigned. Skip terminal replicas only.
@@ -2050,7 +2103,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
 
             # Get GPU shape directly from replica info
-            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(info)
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
+                info, handles.get(info.replica_id, _UNRESOLVED_HANDLE))
 
             # Use flexible matching logic, weighted by GPU count so
             # smaller-capacity replicas are preferred for scale-down.
@@ -2108,7 +2162,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             key=lambda info: (
                 _status_rank(info),
                 round(replica_qps_map.get(info.replica_id, float('inf')), 9),
-                -self._get_hourly_cost_from_replica_info(info),
+                -self._get_hourly_cost_from_replica_info(
+                    info, handles.get(info.replica_id, _UNRESOLVED_HANDLE)),
                 info.version,
                 -info.replica_id,
             ))
@@ -2174,8 +2229,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     GAUGES over the sync channel (no clear-on-ack batches to lose or
     double-count on controller hiccups).
 
-    The knob `target_concurrency_per_replica` is PER GPU: a replica's
-    capacity is knob x gpu_count, so heterogeneous fleets pack correctly.
+    The knob `target_concurrency_per_replica` is PER GPU. Physical-backend
+    services pack outstanding work onto knob x gpu_count capacities. Logical
+    services publish GPU-slot targets and divide outstanding work by the knob;
+    backend packing happens later from those whole-slot targets.
 
     SIGNAL-GAP RULE: the demand gauges only exist in LB reports. A report
     is fresh iff it carried a non-None in-flight map and is younger than
@@ -2204,6 +2261,30 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.target_concurrency_per_replica: float = float(target_concurrency)
         self.replica_unit: str = getattr(spec, 'replica_unit',
                                          'physical_backend')
+        self.target_utilization_percentage: int = int(
+            getattr(spec, 'target_utilization_percentage', 100))
+        self.expected_request_duration_seconds: float | None = getattr(
+            spec, 'expected_request_duration_seconds', None)
+        self.max_scale_up_rate_percentage: int | None = getattr(
+            spec, 'max_scale_up_rate_percentage', None)
+        self.scale_up_rate_min_replicas: int | None = getattr(
+            spec, 'scale_up_rate_min_replicas', None)
+        self.scale_up_rate_period_seconds: int | None = getattr(
+            spec, 'scale_up_rate_period_seconds', None)
+        # SkyServiceSpec exposes 50 for new specs and restores 100 for old
+        # pickles. Attribute-less test/legacy objects preserve old behavior.
+        self.max_scale_down_rate_percentage: int = int(
+            getattr(spec, 'max_scale_down_rate_percentage', 100))
+        self._last_scale_up_wave_at: float | None = None
+        # Logical downscale hysteresis is elapsed-time based. A nominal
+        # decision tick can stretch substantially while probing a large fleet,
+        # so a tick counter cannot implement a duration contract. This state is
+        # deliberately controller-local and resets conservatively on rebuilds
+        # and service updates.
+        self._downscale_started_at: float | None = None
+        self._raw_target_num_replicas: int = self.target_num_replicas
+        self._latest_committed_capacity: int = 0
+        self._rejected_concurrency: float = 0.0
         # Request timestamps back the arrival floor (the only up-signal
         # available while the demand report is stale), windowed exactly
         # like RequestRateAutoscaler's QPS window.
@@ -2219,6 +2300,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._in_flight_by_replica_id: dict[int, int] | None = None
         self._queue_depth: int = 0
         self._rejected_in_window: int = 0
+        self._rejected_in_recent_window: int | None = None
         # Replica ids whose declared async occupancy could not be sampled.
         # They contribute their full per-version capacity to outstanding work:
         # unknown is a potentially-full replica, never an idle zero.
@@ -2369,6 +2451,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_by_replica_id': {replica_id: int} | None,
             'queue_depth': int | None,
             'rejected_in_window': int | None,
+            'rejected_in_recent_window': int | None,
             'unknown_in_flight_replica_ids': [replica_id, ...],
             'observed_slots_by_replica_id': {replica_id: int},
             'unknown_capacity_replica_ids': [replica_id, ...],
@@ -2400,6 +2483,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._queue_depth = int(queue_depth) if queue_depth is not None else 0
         rejected = request_aggregator_info.get('rejected_in_window')
         self._rejected_in_window = int(rejected) if rejected is not None else 0
+        recent_rejected = request_aggregator_info.get(
+            'rejected_in_recent_window')
+        self._rejected_in_recent_window = (
+            int(recent_rejected) if recent_rejected is not None else None)
         self._unknown_in_flight_replica_ids = {
             int(replica_id) for replica_id in (request_aggregator_info.get(
                 'unknown_in_flight_replica_ids', []) or [])
@@ -2435,6 +2522,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     f'{sum(self._in_flight_by_replica_id.values())}, '
                     f'queue_depth={self._queue_depth}, '
                     f'rejected_in_window={self._rejected_in_window}, '
+                    f'rejected_in_recent_window='
+                    f'{self._rejected_in_recent_window}, '
                     f'unknown_replicas='
                     f'{len(self._unknown_in_flight_replica_ids)}, '
                     f'requests in the last {self.qps_window_size}s: '
@@ -2467,12 +2556,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return float(knob)
 
     def _replica_capacity(self, info: 'replica_managers.ReplicaInfo') -> float:
-        """A replica's capacity in concurrency units (knob x gpu_count).
+        """A replica's capacity in the autoscaler's target units.
 
-        The knob is resolved for the replica's OWN version: after a
-        knob-changing update, old-version replicas keep the capacity
-        they were launched with, so the rolling drain neither over- nor
-        under-states the coverage the kept old set provides.
+        Logical targets are GPU slots, so a physical backend contributes its
+        immutable planned slot width. Physical-backend targets are replica
+        counts, so each replica contributes knob x gpu_count concurrency.
+        The knob is resolved for the replica's OWN version after updates.
         """
         if self.replica_unit == 'logical':
             return float(getattr(info, 'planned_capacity', 1))
@@ -2523,7 +2612,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def get_ready_replica_capacity(self,
                                    info: 'replica_managers.ReplicaInfo') -> int:
         if self.replica_unit == 'logical':
-            return self._ready_capacity(info)
+            # Public status reports materialized GPU inventory. Occupancy
+            # freshness remains a separate safety signal: internal scale-down,
+            # replacement, and retirement paths call `_ready_capacity()`
+            # directly and continue to fail closed on unknown observations.
+            return (max(1, int(self._replica_capacity(info)))
+                    if info.is_ready else 0)
         return super().get_ready_replica_capacity(info)
 
     def _cost_rebalance_replica_capacity(
@@ -2533,6 +2627,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def _cost_rebalance_location_capacity(
             self, location: spot_placer.Location) -> float:
         _, gpu_count = self._location_gpu_shape(location)
+        if self.replica_unit == 'logical':
+            return float(gpu_count)
         return self.target_concurrency_per_replica * gpu_count
 
     def _latest_capacities(
@@ -2548,6 +2644,121 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 capacities.append(capacity)
         capacities.sort(reverse=True)
         return capacities
+
+    def _effective_logical_capacity_per_gpu(self) -> float:
+        return (self.target_concurrency_per_replica *
+                self.target_utilization_percentage / 100.0)
+
+    def _rejected_work(self) -> float:
+        """Convert the retained rejection population to concurrent work."""
+        if (self.replica_unit != 'logical' or
+                self.expected_request_duration_seconds is None):
+            return float(self._rejected_in_window)
+        retained_work = (self._rejected_in_window *
+                         self.expected_request_duration_seconds /
+                         constants.LB_REJECT_WINDOW_SECONDS)
+        if self._rejected_in_recent_window is None:
+            return retained_work
+        recent_work = (self._rejected_in_recent_window *
+                       self.expected_request_duration_seconds /
+                       self.qps_window_size)
+        return max(retained_work, recent_work)
+
+    def _latest_committed_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Latest-version planned slots not already leaving the fleet."""
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if
+            (not info.is_terminal and info.version == self.latest_version and
+             getattr(info.status_property, 'is_scale_down', False) is not True))
+
+    def _limit_logical_scale_up(
+        self,
+        raw_target: int,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Bound one demand-driven target increase to a configured wave."""
+        if (self.replica_unit != 'logical' or
+                self.max_scale_up_rate_percentage is None):
+            return raw_target
+        assert self.scale_up_rate_min_replicas is not None
+        assert self.scale_up_rate_period_seconds is not None
+        now = time.time()
+        if (self._last_scale_up_wave_at is not None and
+                now - self._last_scale_up_wave_at
+                < self.scale_up_rate_period_seconds):
+            return self.target_num_replicas
+        committed = self._latest_committed_logical_capacity(replica_infos)
+        step = max(
+            self.scale_up_rate_min_replicas,
+            math.ceil(committed * self.max_scale_up_rate_percentage / 100.0))
+        return max(self.target_num_replicas, min(raw_target, committed + step))
+
+    def _adopt_scale_up_target(
+        self,
+        raw_target: int,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> None:
+        old_target = self.target_num_replicas
+        committed = (self._latest_committed_logical_capacity(replica_infos)
+                     if self.replica_unit == 'logical' else 0)
+        self.target_num_replicas = self._limit_logical_scale_up(
+            raw_target, replica_infos)
+        # Only an increase that requires capacity beyond what is already
+        # committed consumes the wave timer. Raising a recovered target inside
+        # an already-live fleet does not delay the next real launch wave.
+        if (self.max_scale_up_rate_percentage is not None and
+                self.target_num_replicas > old_target and
+                self.target_num_replicas > committed):
+            self._last_scale_up_wave_at = time.time()
+
+    def _limit_logical_scale_down(
+        self,
+        raw_target: int,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        if self.replica_unit != 'logical':
+            return raw_target
+        committed = self._latest_committed_logical_capacity(replica_infos)
+        allowance = max(
+            1,
+            math.ceil(committed * self.max_scale_down_rate_percentage / 100.0))
+        return max(raw_target, committed - allowance)
+
+    def _reset_downscale_hysteresis(self) -> None:
+        self.downscale_counter = 0
+        self._downscale_started_at = None
+
+    def _downscale_hysteresis_elapsed(self) -> bool:
+        """Whether this lower-target observation completes its delay.
+
+        Logical concurrency policies use elapsed monotonic time. Other
+        concurrency modes retain the legacy decision-count behavior.
+        """
+        self.downscale_counter += 1
+        if self.replica_unit != 'logical':
+            return self.downscale_counter >= self.scale_down_threshold
+        now = time.monotonic()
+        if self._downscale_started_at is None:
+            # Preserve the established one-tick default: the first lower
+            # observation represents the nominal decision interval that just
+            # elapsed. Further progress is real monotonic time, never loop
+            # counts, so slow large-fleet ticks cannot stretch the duration.
+            initial_credit = min(
+                self.downscale_delay_seconds,
+                float(constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS))
+            self._downscale_started_at = now - initial_credit
+        return (now - self._downscale_started_at
+                >= self.downscale_delay_seconds)
+
+    def _downscale_elapsed_seconds(self) -> float:
+        if self._downscale_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._downscale_started_at)
 
     def _outstanding_work(
         self,
@@ -2593,9 +2804,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # protects its own capacity.
             unknown_floor = max(original_unknown_floor,
                                 replacement_unknown_floor)
+        self._rejected_concurrency = self._rejected_work()
         return float(
             sum(self._in_flight_by_replica_id.values()) + self._queue_depth +
-            self._rejected_in_window + unknown_floor)
+            self._rejected_concurrency + unknown_floor)
 
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
@@ -2609,16 +2821,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         latest_capacities = self._latest_capacities(replica_infos)
         if self.replica_unit == 'logical':
-            # One public replica is already one concurrent job slot. Physical
-            # backend packing happens later, after the manager selects exact
-            # 1/4/8-GPU placements.
-            best_capacity = 1.0
+            # Public targets count GPU slots. Each slot absorbs the configured
+            # amount of outstanding work; physical backend packing happens
+            # later, after the manager selects exact 1/4/8-GPU placements.
+            best_capacity = self._effective_logical_capacity_per_gpu()
+            self._latest_committed_capacity = (
+                self._latest_committed_logical_capacity(replica_infos))
         else:
             best_capacity = (latest_capacities[0] if latest_capacities else
                              self.target_concurrency_per_replica)
         self._upscale_pending = False
 
         if not self._fresh_for_tick():
+            if self.replica_unit == 'logical':
+                # A signal gap cannot prove continuous low demand. Require a
+                # complete fresh elapsed window after reports recover.
+                self._reset_downscale_hysteresis()
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
             # ride every sync). Raise-only floor, applied without
             # hysteresis -- while blind we must not delay growth, and we
@@ -2635,14 +2853,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.request_timestamps = self.request_timestamps[index:]
             arrivals = len(self.request_timestamps)
             if arrivals > 0 and best_capacity > 0:
+                arrival_work = float(arrivals)
+                if self.expected_request_duration_seconds is not None:
+                    arrival_work *= (self.expected_request_duration_seconds /
+                                     self.qps_window_size)
                 arrival_floor = self._clip_target_num_replicas(
-                    math.ceil(arrivals / best_capacity))
+                    math.ceil(arrival_work / best_capacity))
                 if arrival_floor > self.target_num_replicas:
                     logger.info(
                         'Concurrency autoscaler signal-stale: raising '
                         f'target to arrival floor {arrival_floor} '
                         f'({arrivals} arrivals / capacity {best_capacity}).')
-                    self.target_num_replicas = arrival_floor
+                    self._raw_target_num_replicas = arrival_floor
+                    self._adopt_scale_up_target(arrival_floor, replica_infos)
             else:
                 logger.info('Concurrency autoscaler signal-stale: holding '
                             f'target at {self.target_num_replicas}.')
@@ -2650,7 +2873,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
-            raw_target_num = math.ceil(outstanding)
+            raw_target_num = math.ceil(outstanding / best_capacity)
         else:
             raw_target_num = 0
             covered = 0.0
@@ -2665,6 +2888,21 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     raw_target_num += math.ceil(remaining / best_capacity)
 
         target_num_replicas = self._clip_target_num_replicas(raw_target_num)
+        self._raw_target_num_replicas = target_num_replicas
+        if (self.replica_unit == 'logical' and
+                self._snap_target_on_next_recompute):
+            # The adopted target is controller-local and rebuilds at
+            # min_replicas, while the latest-version fleet may already be much
+            # larger. Re-establish that committed fleet as the actuation
+            # baseline once, before applying hysteresis and the downscale limit.
+            # Otherwise the first fresh report after a restart can publish a
+            # tiny target and retire the whole live fleet in one tick. Do not
+            # repeat this after the one-shot snap: an adopted downscale target
+            # must remain below committed capacity while retirement catches up.
+            committed = self._latest_committed_logical_capacity(replica_infos)
+            self.target_num_replicas = max(
+                self.target_num_replicas,
+                self._clip_target_num_replicas(committed))
         old_target_num_replicas = self.target_num_replicas
 
         if self._snap_target_on_next_recompute:
@@ -2675,34 +2913,44 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # the configured downscale delay has proved sustained idleness.
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
-            self.downscale_counter = 0
+            self._reset_downscale_hysteresis()
             if target_num_replicas >= self.target_num_replicas:
-                self.target_num_replicas = target_num_replicas
+                self._adopt_scale_up_target(target_num_replicas, replica_infos)
             else:
-                self.downscale_counter = 1
-                if self.downscale_counter >= self.scale_down_threshold:
-                    self.downscale_counter = 0
-                    self.target_num_replicas = target_num_replicas
+                if self._downscale_hysteresis_elapsed():
+                    self._reset_downscale_hysteresis()
+                    self.target_num_replicas = self._limit_logical_scale_down(
+                        target_num_replicas, replica_infos)
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
-            self.target_num_replicas = target_num_replicas
+            self._reset_downscale_hysteresis()
+            self._adopt_scale_up_target(target_num_replicas, replica_infos)
         elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
-            self.downscale_counter = 0
+            self._reset_downscale_hysteresis()
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
-                self.target_num_replicas = target_num_replicas
+                self._adopt_scale_up_target(target_num_replicas, replica_infos)
         elif target_num_replicas < self.target_num_replicas:
-            self.downscale_counter += 1
             self.upscale_counter = 0
-            if self.downscale_counter >= self.scale_down_threshold:
-                self.downscale_counter = 0
-                self.target_num_replicas = target_num_replicas
+            if self._downscale_hysteresis_elapsed():
+                self._reset_downscale_hysteresis()
+                self.target_num_replicas = self._limit_logical_scale_down(
+                    target_num_replicas, replica_infos)
         else:
-            self.upscale_counter = self.downscale_counter = 0
+            self.upscale_counter = 0
+            self._reset_downscale_hysteresis()
 
         self._upscale_pending = (target_num_replicas > self.target_num_replicas)
 
+        if self.replica_unit == 'logical':
+            downscale_status = (
+                f'Downscale observations: {self.downscale_counter}. '
+                f'Downscale elapsed: {self._downscale_elapsed_seconds():.1f}/'
+                f'{self.downscale_delay_seconds:.1f}s. ')
+        else:
+            downscale_status = (f'Downscale counter: {self.downscale_counter}/'
+                                f'{self.scale_down_threshold}. ')
         logger.info(
             f'Concurrency: outstanding work: {outstanding}. '
             f'Latest-version capacities: {latest_capacities}. '
@@ -2711,8 +2959,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             f'Final target number of replicas: {self.target_num_replicas}. '
             f'Upscale counter: {self.upscale_counter}/'
             f'{self.scale_up_threshold}. '
-            f'Downscale counter: {self.downscale_counter}/'
-            f'{self.scale_down_threshold}. ')
+            f'{downscale_status}')
 
     def generate_scaling_decisions(
         self,
@@ -2808,7 +3055,30 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.target_concurrency_per_replica = float(target_concurrency)
             self._knob_by_version[version] = float(target_concurrency)
         self.replica_unit = getattr(spec, 'replica_unit', 'physical_backend')
+        self.target_utilization_percentage = int(
+            getattr(spec, 'target_utilization_percentage', 100))
+        self.expected_request_duration_seconds = getattr(
+            spec, 'expected_request_duration_seconds', None)
+        self.max_scale_up_rate_percentage = getattr(
+            spec, 'max_scale_up_rate_percentage', None)
+        self.scale_up_rate_min_replicas = getattr(spec,
+                                                  'scale_up_rate_min_replicas',
+                                                  None)
+        self.scale_up_rate_period_seconds = getattr(
+            spec, 'scale_up_rate_period_seconds', None)
+        self.max_scale_down_rate_percentage = int(
+            getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
+        self._reset_downscale_hysteresis()
+        if (self.replica_unit == 'logical' and
+                self.max_scale_up_rate_percentage is not None):
+            # target_num_replicas described the previous version's launch
+            # intent.  The new version has no committed capacity yet, so
+            # carrying that target across the update would let its first
+            # reconciliation bypass the scale-up wave and launch the whole
+            # inherited target from zero.  Start at the new minimum; the next
+            # fresh or stale recompute authorizes at most one configured wave.
+            self.target_num_replicas = self.min_replicas
         self._snap_target_on_next_recompute = True
         self._last_logical_target_state = None
 
@@ -2827,40 +3097,71 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         - SIGNAL GAP: no retirements at all while the demand report is
           stale (a rebuilt controller at target=min_replicas would
           otherwise mass-retire a live fleet before the first sync).
-        - Idle-preferred victims: among READY old replicas, busy ones
-          (fresh in-flight > 0 or unknown) are preferentially KEPT as
-          coverage, so the retired remainder skews to idle replicas and
-          mid-job kills are avoided when coverage allows. This is a
-          preference, not a hard gate -- a rolling update must still
-          complete when every old replica is busy.
+        - Idle-only victims: among READY old replicas, busy ones (fresh
+          in-flight > 0 or unknown) are kept as coverage so in-progress jobs
+          are never aborted. They become eligible on a later idle tick.
         """
         if not self._fresh_for_tick():
             return []
-        if self._upscale_pending:
-            logger.info('Concurrency autoscaler suppressing outdated-replica '
-                        'drain while an upscale is pending hysteresis.')
-            return []
-        if self.replica_unit == 'logical':
+        if (self.replica_unit == 'logical' and
+                self.update_mode == serve_utils.UpdateMode.ROLLING):
             old_nonterminal = [
                 info for info in replica_infos
-                if info.version < self.latest_version and not info.is_terminal
+                if (info.version < self.latest_version and not info.is_terminal
+                    and getattr(info.status_property, 'is_scale_down',
+                                False) is not True)
             ]
             if not old_nonterminal:
                 return []
             latest_ready_capacity = sum(
                 self._ready_capacity(info)
                 for info in replica_infos
-                if info.version == self.latest_version)
-            if latest_ready_capacity < self.get_final_target_num_replicas():
-                # The activation bridge deliberately gives legacy backends no
-                # inferred logical width. Launch and observe the complete new
-                # logical target before retiring any old backend.
-                return []
-            return [
-                info.replica_id
-                for info in old_nonterminal
-                if not self._replica_is_busy(info)
+                if (info.version == self.latest_version and getattr(
+                    info.status_property, 'is_scale_down', False) is not True))
+
+            # Old physical rows predate authoritative logical-width reports.
+            # Every READY backend nevertheless represents at least one serving
+            # slot, so counting one slot per old backend is a conservative
+            # coverage floor. Keep enough old READY backends to cover both raw
+            # demand and the adopted target while latest-version observed
+            # logical capacity comes online. This permits incremental rollout
+            # progress even when the complete latest target cannot be placed.
+            coverage_target = max(self.get_final_target_num_replicas(),
+                                  self._raw_target_num_replicas)
+            old_ready = [info for info in old_nonterminal if info.is_ready]
+            required_ready_old = max(0, coverage_target - latest_ready_capacity)
+            excess_ready_old = max(0, len(old_ready) - required_ready_old)
+
+            # Never-served old replicas add no live coverage and can be
+            # retired first. Probe-blipped or occupancy-unknown backends still
+            # count as busy through _replica_is_busy and remain protected.
+            idle_nonready_old = [
+                info for info in old_nonterminal
+                if not info.is_ready and not self._replica_is_busy(info)
             ]
+            idle_ready_old = [
+                info for info in old_ready if not self._replica_is_busy(info)
+            ]
+            batch_limit = _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK
+            selected_nonready = _select_nonterminal_replicas_to_scale_down(
+                min(batch_limit, len(idle_nonready_old)), idle_nonready_old)
+            remaining_limit = batch_limit - len(selected_nonready)
+            selected_ready = _select_nonterminal_replicas_to_scale_down(
+                min(remaining_limit, excess_ready_old, len(idle_ready_old)),
+                idle_ready_old)
+            selected = selected_nonready + selected_ready
+            logger.info(
+                'Logical rolling drain: coverage_target=%s, '
+                'latest_ready_capacity=%s, ready_old=%s, '
+                'required_ready_old=%s, idle_nonready_old=%s, '
+                'selected=%s.', coverage_target, latest_ready_capacity,
+                len(old_ready), required_ready_old, len(idle_nonready_old),
+                len(selected))
+            return selected
+        if self._upscale_pending:
+            logger.info('Concurrency autoscaler suppressing outdated-replica '
+                        'drain while an upscale is pending hysteresis.')
+            return []
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
             return super()._select_outdated_replicas_to_scale_down(
                 replica_infos, active_versions)
@@ -3153,6 +3454,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_total': in_flight_total,
             'queue_depth': self._queue_depth,
             'rejected_in_window': self._rejected_in_window,
+            'rejected_in_recent_window': self._rejected_in_recent_window,
+            'rejected_concurrency': self._rejected_concurrency,
+            'raw_target_num_replicas': self._raw_target_num_replicas,
+            'committed_capacity': self._latest_committed_capacity,
+            'target_utilization_percentage': self.target_utilization_percentage,
+            'latest_scale_up_wave_at': self._last_scale_up_wave_at,
+            'downscale_elapsed_seconds': self._downscale_elapsed_seconds(),
+            'downscale_delay_seconds': self.downscale_delay_seconds,
             'unknown_in_flight_replicas': len(
                 self._unknown_in_flight_replica_ids),
             'report_age_seconds': report_age,
@@ -3169,6 +3478,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_by_replica_id': self._in_flight_by_replica_id,
             'queue_depth': self._queue_depth,
             'rejected_in_window': self._rejected_in_window,
+            'rejected_in_recent_window': self._rejected_in_recent_window,
             'unknown_in_flight_replica_ids': sorted(
                 self._unknown_in_flight_replica_ids),
             'report_received_at': self._report_received_at,
@@ -3178,6 +3488,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self._unknown_capacity_replica_ids),
             'degraded_capacity_since_by_replica_id':
                 self._degraded_capacity_since_by_replica_id,
+            'last_scale_up_wave_at': self._last_scale_up_wave_at,
         }
 
     def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
@@ -3194,6 +3505,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._queue_depth = dynamic_states.pop('queue_depth')
         if 'rejected_in_window' in dynamic_states:
             self._rejected_in_window = dynamic_states.pop('rejected_in_window')
+        if 'rejected_in_recent_window' in dynamic_states:
+            self._rejected_in_recent_window = dynamic_states.pop(
+                'rejected_in_recent_window')
         if 'unknown_in_flight_replica_ids' in dynamic_states:
             self._unknown_in_flight_replica_ids = {
                 int(replica_id) for replica_id in dynamic_states.pop(
@@ -3201,6 +3515,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         if 'report_received_at' in dynamic_states:
             self._report_received_at = dynamic_states.pop('report_received_at')
+        if 'last_scale_up_wave_at' in dynamic_states:
+            self._last_scale_up_wave_at = dynamic_states.pop(
+                'last_scale_up_wave_at')
         if 'reconcile_generation' in dynamic_states:
             self._reconcile_generation = int(
                 dynamic_states.pop('reconcile_generation'))

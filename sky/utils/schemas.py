@@ -340,6 +340,7 @@ def _get_single_resources_schema():
                 }, {
                     'type': 'object',
                     'required': [],
+                    'minProperties': 1,
                     'maxProperties': 1,
                     'additionalProperties': {
                         'type': 'number'
@@ -717,6 +718,7 @@ def get_resources_schema():
                 }, {
                     'type': 'object',
                     'required': [],
+                    'minProperties': 1,
                     'additionalProperties': {
                         'anyOf': [{
                             'type': 'null',

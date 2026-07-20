@@ -480,11 +480,11 @@ def _optimize_file_mounts(tmp_yaml_path: str) -> None:
         # cp <local_src> <local_runtime_files_dir>/<unique name of local_src>.
         full_local_src = str(pathlib.Path(local_src).expanduser())
         unique_name = local_source_to_unique_name[local_src]
-        # !r to add quotes for paths containing spaces.
-        subprocess.run(
-            f'cp -r {full_local_src!r} {local_runtime_files_dir}/{unique_name}',
-            shell=True,
-            check=True)
+        subprocess.run([
+            'cp', '-r', full_local_src,
+            f'{local_runtime_files_dir}/{unique_name}'
+        ],
+                       check=True)
 
     yaml_utils.dump_yaml(tmp_yaml_path, yaml_config)
 
@@ -512,7 +512,7 @@ def path_size_megabytes(path: str) -> int:
                 shlex.quote(str(resolved_path / command_runner.GIT_EXCLUDE)))
     rsync_command = (f'rsync {command_runner.RSYNC_DISPLAY_OPTION} '
                      f'{rsync_filter} '
-                     f'{git_exclude_filter} --dry-run {path!r}')
+                     f'{git_exclude_filter} --dry-run {shlex.quote(path)}')
     rsync_output = ''
     try:
         # rsync sometimes fails `--dry-run` for MacOS' rsync build, however this function is only used to display
@@ -1408,16 +1408,16 @@ def write_cluster_config(
             # Currently only used by Slurm. For other clouds, it is
             # already part of ray_skypilot_installation_commands
             'setup_sky_dirs_commands': constants.SETUP_SKY_DIRS_COMMANDS,
-            'ray_skypilot_installation_commands':
-                (constants.RAY_SKYPILOT_INSTALLATION_COMMANDS.replace(
-                    '{sky_wheel_hash}',
-                    wheel_hash).replace('{cloud}',
-                                        str(cloud).lower())),
+            'ray_skypilot_installation_commands': (
+                constants.RAY_SKYPILOT_INSTALLATION_COMMANDS.replace(
+                    '{sky_wheel_hash}', wheel_hash).replace(
+                        '{cloud}',  # noqa: RUF027
+                        str(cloud).lower())),
             'skypilot_wheel_installation_commands':
                 constants.SKYPILOT_WHEEL_INSTALLATION_COMMANDS.replace(
-                    '{sky_wheel_hash}',
-                    wheel_hash).replace('{cloud}',
-                                        str(cloud).lower()),
+                    '{sky_wheel_hash}', wheel_hash).replace(
+                        '{cloud}',  # noqa: RUF027
+                        str(cloud).lower()),
             'copy_skypilot_templates_commands':
                 constants.COPY_SKYPILOT_TEMPLATES_COMMANDS,
             # Port of Ray (GCS server).
@@ -2079,7 +2079,7 @@ def ssh_credentials_from_handles(
     cluster_yaml_dicts_to_index = {
         cluster_yaml_path: cluster_yaml_dict
         for cluster_yaml_path, cluster_yaml_dict in zip(
-            non_empty_cluster_yaml_paths, cluster_yaml_dicts)
+            non_empty_cluster_yaml_paths, cluster_yaml_dicts, strict=True)
     }
 
     credentials_to_return: list[dict[str, Any]] = []
@@ -3830,7 +3830,13 @@ def check_cluster_available(
         assert record is not None, cluster_name
         return record['handle']
 
-    record = None
+    # Snapshot the record before refreshing: if the refresh discovers the
+    # cluster is gone on the cloud, it deletes the row, and this pre-refresh
+    # snapshot is the only way to tell "just terminated" (with its
+    # preempted/autodowned hints) apart from "never existed".
+    record = global_user_state.get_cluster_from_name(cluster_name,
+                                                     include_user_info=False,
+                                                     summary_response=True)
     try:
         cluster_status, handle = refresh_cluster_status_handle(cluster_name)
     except exceptions.ClusterStatusFetchingError as e:

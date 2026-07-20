@@ -11,6 +11,7 @@ requests = common.LazyImport('requests')
 # Shadeform API configuration
 SHADEFORM_API_BASE = 'https://api.shadeform.ai/v1'
 SHADEFORM_API_KEY_PATH = '~/.shadeform/api_key'
+DEFAULT_HTTP_TIMEOUT_SECONDS = 120
 
 
 def get_api_key() -> str:
@@ -37,8 +38,13 @@ def make_request(method: str, endpoint: str, **kwargs) -> Any:
         'X-API-KEY': get_api_key(),
         'Content-Type': 'application/json',
     }
+    timeout = kwargs.pop('timeout', DEFAULT_HTTP_TIMEOUT_SECONDS)
 
-    response = requests.request(method, url, headers=headers, **kwargs)
+    response = requests.request(method,
+                                url,
+                                headers=headers,
+                                timeout=timeout,
+                                **kwargs)
     response.raise_for_status()
 
     # Some APIs (like delete) return empty responses with just 200 status

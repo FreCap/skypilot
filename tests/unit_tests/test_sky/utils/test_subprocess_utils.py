@@ -468,12 +468,16 @@ class TestKillProcessDaemonTolerates(unittest.TestCase):
     def test_access_denied_does_not_raise(self):
         proc = subprocess.Popen(['sleep', '30'])
         try:
+            daemon_launcher = mock.Mock()
             with mock.patch.object(subprocess_utils,
                                    '_safe_children',
                                    return_value=[]):
-                with mock.patch.object(subprocess_utils.subprocess, 'Popen'):
+                with mock.patch.object(subprocess_utils.subprocess,
+                                       'Popen',
+                                       return_value=daemon_launcher):
                     subprocess_utils.kill_process_daemon(proc.pid,
                                                          use_kill_pg=True)
+            daemon_launcher.wait.assert_called_once_with()
         finally:
             proc.kill()
             proc.wait()

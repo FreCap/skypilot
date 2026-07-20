@@ -247,6 +247,7 @@ class IBMCosStore(AbstractStore):
         """
         sub_path = (f'/{self._bucket_sub_path}'
                     if self._bucket_sub_path else '')
+        remote_prefix = f'{self.rclone_profile_name}:{self.name}{sub_path}'
 
         def get_dir_sync_command(src_dir_path, dest_dir_name) -> str:
             """returns an rclone command that copies a complete folder
@@ -267,11 +268,10 @@ class IBMCosStore(AbstractStore):
 
             # .git directory is excluded from the sync
             # wrapping src_dir_path with "" to support path with spaces
-            src_dir_path = shlex.quote(src_dir_path)
+            remote_path = f'{remote_prefix}/{dest_dir_name}'
             sync_command = ('rclone copy --exclude ".git/*" '
-                            f'{src_dir_path} '
-                            f'{self.rclone_profile_name}:{self.name}{sub_path}'
-                            f'/{dest_dir_name}')
+                            f'{shlex.quote(src_dir_path)} '
+                            f'{shlex.quote(remote_path)}')
             return sync_command
 
         def get_file_sync_command(base_dir_path, file_names) -> str:
@@ -296,10 +296,9 @@ class IBMCosStore(AbstractStore):
                 f'--include {shlex.quote(file_name)}'
                 for file_name in file_names
             ])
-            base_dir_path = shlex.quote(base_dir_path)
             sync_command = ('rclone copy '
-                            f'{includes} {base_dir_path} '
-                            f'{self.rclone_profile_name}:{self.name}{sub_path}')
+                            f'{includes} {shlex.quote(base_dir_path)} '
+                            f'{shlex.quote(remote_prefix)}')
             return sync_command
 
         # Generate message for upload

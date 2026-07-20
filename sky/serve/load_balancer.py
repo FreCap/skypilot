@@ -42,6 +42,9 @@ _ReleasingStreamingResponse.__module__ = __name__
 # gets a fresh client while the old one is still draining, and the two
 # must not share a counter.
 _INFLIGHT_ATTR = '_sky_inflight_requests'
+# Per-client wakeup for the drain task. The counter above remains
+# authoritative; this event only avoids polling after the final release.
+_INFLIGHT_ZERO_EVENT_ATTR = '_sky_inflight_zero_event'
 # Request-local marker for an occupancy-aware queue admission that has not yet
 # been assigned to a concrete replica. It closes the short scheduling gap
 # between the fleet-wide admission decision and per-replica slot reservation.
@@ -200,6 +203,16 @@ class SkyServeLoadBalancer:
     _occupancy_dispatch_generation: dict[str, int] | None = None
     _occupancy_sample_generation: dict[str, int] | None = None
     _occupancy_sample_time: dict[str, float] | None = None
+    # Current-round, generation-valid samples are the only controller-facing
+    # idle proof. The longer-lived maps above may retain a last-good sample for
+    # bounded LB-local admission, but must never cross this boundary.
+    _occupancy_current_round_sampled_urls: set[str] | None = None
+    # Local admission epoch under which each sample was taken. It advances on
+    # every transition into a changed ARMED/ACTIVE role, including role changes
+    # that reuse one controller cutover generation.
+    _occupancy_role_epoch: int = 0
+    _occupancy_sample_role_epoch: dict[str, int] | None = None
+    _occupancy_probe_lock: asyncio.Lock | None = None
     # Optimistic reservations bridge the interval between a fast async
     # acknowledgement and the first post-dispatch occupancy probe. The active
     # attempt count rejects a probe that overtakes an in-progress POST before
@@ -374,6 +387,10 @@ class SkyServeLoadBalancer:
         self._occupancy_dispatch_generation = {}
         self._occupancy_sample_generation = {}
         self._occupancy_sample_time = {}
+        self._occupancy_current_round_sampled_urls = set()
+        self._occupancy_role_epoch = 0
+        self._occupancy_sample_role_epoch = {}
+        self._occupancy_probe_lock = asyncio.Lock()
         self._occupancy_pending_reservations = {}
         self._occupancy_active_attempts = {}
         self._occupancy_unassigned_reservations = 0
@@ -544,6 +561,87 @@ class SkyServeLoadBalancer:
         return bool(config is not None and
                     config.get('use_async_occupancy', False))
 
+    def _occupancy_sample_is_locally_usable_locked(self, url: str) -> bool:
+        """Whether one sample is valid for bounded LB-local admission."""
+        free_slots = getattr(self, '_replica_free_slots', None) or {}
+        if url not in free_slots:
+            return False
+        dispatch_generation = (getattr(self, '_occupancy_dispatch_generation',
+                                       None) or {})
+        sample_generation = (getattr(self, '_occupancy_sample_generation', None)
+                             or {})
+        pending = (getattr(self, '_occupancy_pending_reservations', None) or {})
+        if (sample_generation and
+                sample_generation.get(url) != dispatch_generation.get(
+                    url, 0) and pending.get(url, 0) <= 0):
+            return False
+
+        sample_times = getattr(self, '_occupancy_sample_time', None)
+        if sample_times:
+            sampled_at = sample_times.get(url)
+            if (sampled_at is None or time.monotonic() - sampled_at
+                    > constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS):
+                return False
+
+        sample_roles = getattr(self, '_occupancy_sample_role_epoch', None)
+        if (sample_roles and sample_roles.get(url) != getattr(
+                self, '_occupancy_role_epoch', 0)):
+            return False
+        return True
+
+    def _locally_usable_occupancy_urls_locked(self) -> set[str]:
+        """Return generation-, role-, and age-valid local sample URLs.
+
+        A transient probe miss may retain the previous sample for bounded
+        admission continuity. This view is deliberately broader than the
+        current-round proof exported to the controller, but it never survives
+        a dispatch fence, HA role generation change, or the per-URL TTL.
+        """
+        free_slots = getattr(self, '_replica_free_slots', None) or {}
+        return {
+            url for url in free_slots
+            if self._occupancy_sample_is_locally_usable_locked(url)
+        }
+
+    def _controller_occupancy_proof_urls_locked(self) -> set[str]:
+        """Return only current-round samples safe as controller idle proof."""
+        proof_urls = getattr(self, '_occupancy_current_round_sampled_urls',
+                             None)
+        sample_times = getattr(self, '_occupancy_sample_time', None)
+        if proof_urls is None or (not proof_urls and not sample_times and
+                                  self._replica_occupancy):
+            # Compatibility for older partially initialized test instances.
+            proof_urls = set(self._replica_occupancy)
+        dispatch_generation = (getattr(self, '_occupancy_dispatch_generation',
+                                       None) or {})
+        sample_generation = (getattr(self, '_occupancy_sample_generation', None)
+                             or {})
+        proof_urls = {
+            url for url in proof_urls if url in self._replica_occupancy and
+            (not sample_generation or
+             sample_generation.get(url) == dispatch_generation.get(url, 0))
+        }
+        sample_roles = getattr(self, '_occupancy_sample_role_epoch', None)
+        if sample_roles:
+            role_generation = getattr(self, '_occupancy_role_epoch', 0)
+            proof_urls = {
+                url for url in proof_urls
+                if sample_roles.get(url) == role_generation
+            }
+        return proof_urls
+
+    def _invalidate_occupancy_samples_locked(self) -> None:
+        """Invalidate pre-role-transition samples without losing real work."""
+        self._replica_occupancy = {}
+        self._replica_total_slots = {}
+        self._replica_free_slots = {}
+        self._occupancy_sample_generation = {}
+        self._occupancy_sample_time = {}
+        self._occupancy_current_round_sampled_urls = set()
+        self._occupancy_sample_role_epoch = {}
+        self._occupancy_sampled_off_ready = set()
+        self._load_balancing_policy.set_occupancy({})
+
     def _effective_replica_free_slots_locked(self) -> dict[str, int]:
         """Return last observed free slots minus post-sample reservations.
 
@@ -554,14 +652,18 @@ class SkyServeLoadBalancer:
         """
         pending = self._occupancy_pending_reservations or {}
         observed_free = getattr(self, '_replica_free_slots', {}) or {}
+        usable_urls = self._locally_usable_occupancy_urls_locked()
         return {
             url: max(0, slots - pending.get(url, 0))
             for url, slots in observed_free.items()
+            if url in usable_urls
         }
 
     def _effective_free_slots_for_replica_locked(self, url: str) -> int | None:
         """Return one URL's free slots without scanning the whole fleet."""
         observed_free = getattr(self, '_replica_free_slots', {}) or {}
+        if not self._occupancy_sample_is_locally_usable_locked(url):
+            return None
         slots = observed_free.get(url)
         if slots is None:
             return None
@@ -575,9 +677,11 @@ class SkyServeLoadBalancer:
         dispatch_generation = (self._occupancy_dispatch_generation or
                                {}).get(url, 0)
         sample_generation = (self._occupancy_sample_generation or {}).get(url)
+        locally_usable = self._occupancy_sample_is_locally_usable_locked(url)
         if pending > 0:
             return (observed or 0) + pending
-        if observed is not None and sample_generation == dispatch_generation:
+        if (locally_usable and observed is not None and
+                sample_generation == dispatch_generation):
             return observed
         return None
 
@@ -643,12 +747,18 @@ class SkyServeLoadBalancer:
                 # have not reached selection consume the fleet-wide remainder.
                 effective = self._effective_replica_free_slots_locked()
                 total_slots = getattr(self, '_replica_total_slots', None) or {}
+                hint = self._capacity_hint or {}
+                logical_replicas = hint.get('replica_unit') == 'logical_slot'
+                planned_capacity = hint.get('planned_capacity_by_url', {})
                 # The configured per-replica value remains a hard safety cap,
                 # but a heterogeneous replica contributes its actual probed
-                # slots instead of one replica-count unit. Unknown replicas
-                # contribute no invented capacity.
+                # slots instead of one replica-count unit. Logical mode uses
+                # controller-pinned width for stable queue sizing, while the
+                # effective free-slot sum below remains observation-gated.
+                capacity_by_url = (planned_capacity
+                                   if logical_replicas else total_slots)
                 queue_capacity_units = sum(
-                    min(total_slots.get(url, 0),
+                    min(capacity_by_url.get(url, 0),
                         config['max_concurrency_per_replica'])
                     for url in ready_urls)
                 dispatch_capacity = queue_capacity_units
@@ -1213,7 +1323,12 @@ class SkyServeLoadBalancer:
         """
         with self._client_pool_lock:
             in_flight = self._load_balancing_policy.snapshot_in_flight()
-            occupancy = dict(self._replica_occupancy)
+            proof_urls = self._controller_occupancy_proof_urls_locked()
+            occupancy = {
+                url: count
+                for url, count in self._replica_occupancy.items()
+                if url in proof_urls
+            }
             sampled_off_ready = set(self._occupancy_sampled_off_ready or ())
             capable = set(self._occupancy_capable or ())
             dispatch_generation = dict(self._occupancy_dispatch_generation or
@@ -1245,8 +1360,8 @@ class SkyServeLoadBalancer:
                 url: dispatch_generation.get(url, 0) for url in occupancy
             }
         sampled_urls = sorted(
-            url for url in occupancy
-            if sample_generation.get(url) == dispatch_generation.get(url, 0))
+            url for url in occupancy if url in proof_urls and
+            sample_generation.get(url) == dispatch_generation.get(url, 0))
         sampled_set = set(sampled_urls)
         if in_flight is None:
             return None, routing_urls, [], sampled_urls
@@ -1325,6 +1440,9 @@ class SkyServeLoadBalancer:
             self._reject_fallback_seq += 1
             key = f'_headerless_{self._reject_fallback_seq}'
         self._prune_reject_window()[key] = time.monotonic()
+        request_aggregator = getattr(self, '_request_aggregator', None)
+        if request_aggregator is not None:
+            request_aggregator.add_rejection()
 
     def _clear_rejection(self, request: fastapi.Request) -> None:
         """Release stale backlog pressure once the same stable job lands."""
@@ -1500,6 +1618,13 @@ class SkyServeLoadBalancer:
         """Unique jobs terminally 503'd within the reject window (gauge)."""
         return len(self._prune_reject_window())
 
+    def _rejected_in_recent_window(self) -> int:
+        """Unique rejected jobs refreshed in the autoscaler rate window."""
+        retained = self._prune_reject_window()
+        cutoff = (time.monotonic() -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        return sum(last_seen > cutoff for last_seen in retained.values())
+
     async def _capacity(
             self, request: fastapi.Request) -> fastapi.responses.JSONResponse:
         """Data-plane capacity read: the volatile half of admission sizing.
@@ -1516,13 +1641,12 @@ class SkyServeLoadBalancer:
         it remains null until a controller supporting the field has synced.
 
         CONTRACT for admission readers (deliberate, do not "fix"):
-        - ready_replicas / in_flight / the occupancy aggregates describe
-          MATERIALIZED capacity only, and they are the authoritative
-          floor inputs. With reserved-capacity fill enabled, idle
-          reserved (zero-cost) machines surface here exclusively by
-          becoming ready replicas — the platform is intentionally never
-          told about unmaterialized reserved capacity, so readers need
-          no notion of it and must not grow one.
+        - materialized_slots is stable inventory for the current ready set.
+          ready_replicas / in_flight and the occupancy aggregates remain
+          admission-facing and observation-gated in logical mode. With
+          reserved-capacity fill enabled, idle reserved (zero-cost) machines
+          surface here exclusively by joining the ready set — the platform is
+          intentionally never told about unmaterialized reserved capacity.
         - target_replicas is the DEMAND-side autoscaler target, not a
           capacity statement: under fill, ready_replicas legitimately
           exceeds it (opportunistic zero-cost supply). Admission must
@@ -1545,6 +1669,15 @@ class SkyServeLoadBalancer:
             planned_capacity_by_url = hint.get('planned_capacity_by_url', {})
             logical_urls = ready_set & set(
                 hint.get('logical_replica_urls', planned_capacity_by_url))
+            planned_logical_capacity = {
+                url: planned_capacity_by_url[url]
+                for url in logical_urls
+                if isinstance(planned_capacity_by_url.get(url), int) and
+                not isinstance(planned_capacity_by_url[url], bool) and
+                planned_capacity_by_url[url] > 0
+            }
+            materialized_slots = (sum(planned_logical_capacity.values())
+                                  if logical_replicas else ready_replicas)
             total_slots_by_url = getattr(self, '_replica_total_slots',
                                          None) or {}
             # [boltz fork] Occupancy aggregates, over probed AND ready
@@ -1560,6 +1693,17 @@ class SkyServeLoadBalancer:
                 if url in ready_set and url in total_slots_by_url
             }
             probed_backend_count = len(probed)
+            usable_sample_times = {
+                url: sampled_at
+                for url, sampled_at in
+                (getattr(self, '_occupancy_sample_time', None) or {}).items()
+                if url in probed
+            }
+            oldest_usable_sample_age: float | None = None
+            if usable_sample_times:
+                oldest_usable_sample_age = max(
+                    0.0,
+                    time.monotonic() - min(usable_sample_times.values()))
             probed_replicas = probed_backend_count
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
             logical_plan_is_usable = (not logical_replicas or all(
@@ -1719,7 +1863,15 @@ class SkyServeLoadBalancer:
             # publishes zero admission capacity but must retain a complete
             # routing and occupancy snapshot to remain promotable.
             'routing_backend_count': len(ready_set),
+            # Stable inventory is deliberately separate from admission-facing
+            # ready/current capacity. It is safe for status and diagnostics,
+            # but must never be converted to availability by subtracting work.
+            'materialized_slots': materialized_slots,
             'occupancy_probed_backend_count': probed_backend_count,
+            'occupancy_fresh_backend_count': observed_expected_replicas,
+            'occupancy_unknown_ready_backend_count': max(
+                0, expected_probed_replicas - observed_expected_replicas),
+            'occupancy_oldest_usable_sample_age_seconds': oldest_usable_sample_age,
             'last_sync_age_seconds': last_sync_age,
             'queue_depth': self._queue_depth,
             # Process-local admission counters are required to prove that a
@@ -1733,6 +1885,7 @@ class SkyServeLoadBalancer:
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
             'rejected_in_window': self._rejected_in_window(),
+            'rejected_in_recent_window': self._rejected_in_recent_window(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
             'max_replicas': max_replicas,
@@ -1801,9 +1954,9 @@ class SkyServeLoadBalancer:
     # ready replica and feeds it to (a) the routing policy, which
     # deprioritizes busy replicas instead of discovering them via 429
     # bounces, and (b) /_lb/capacity, so external admission can size on
-    # true free slots. A failed probe marks the replica occupancy-UNKNOWN
-    # (treated as idle by routing, excluded from free-slot aggregates) —
-    # the probe is a hint; the replica's own shedding stays authoritative.
+    # true free slots. A failed probe is controller-UNKNOWN immediately. The
+    # LB may retain its last generation-valid sample for bounded local
+    # routing/admission grace; the replica's own shedding stays authoritative.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1854,7 +2007,16 @@ class SkyServeLoadBalancer:
             return None
 
     async def _probe_replica_occupancy_once(self) -> None:
-        """One probe round: rebuild the occupancy maps from the ready set.
+        """Serialize ordinary and HA-promotion occupancy probe rounds."""
+        probe_lock = getattr(self, '_occupancy_probe_lock', None)
+        if probe_lock is None:
+            probe_lock = asyncio.Lock()
+            self._occupancy_probe_lock = probe_lock
+        async with probe_lock:
+            await self._probe_replica_occupancy_once_unlocked()
+
+    async def _probe_replica_occupancy_once_unlocked(self) -> None:
+        """Run one probe round and age retained ready-backend samples.
 
         Occupancy-capable urls that LEFT the ready set (retiring or
         quarantined) are probed too: their async work must stay observable
@@ -1873,6 +2035,7 @@ class SkyServeLoadBalancer:
                 url: (self._occupancy_dispatch_generation or {}).get(url, 0)
                 for url in probe_urls
             }
+            probe_role_epoch = self._occupancy_role_epoch
         if not probe_urls:
             with self._client_pool_lock:
                 self._replica_occupancy = {}
@@ -1885,6 +2048,8 @@ class SkyServeLoadBalancer:
                 self._occupancy_dispatch_generation = {}
                 self._occupancy_sample_generation = {}
                 self._occupancy_sample_time = {}
+                self._occupancy_current_round_sampled_urls = set()
+                self._occupancy_sample_role_epoch = {}
                 self._occupancy_pending_reservations = {}
                 self._occupancy_active_attempts = {}
                 self._occupancy_off_ready_since = {}
@@ -1935,28 +2100,41 @@ class SkyServeLoadBalancer:
             valid_sample_urls = {
                 url for url in occupancy
                 if probe_generation.get(url, 0) == current_generation.get(
-                    url, 0) and active_attempts.get(url, 0) == 0
+                    url, 0) and active_attempts.get(url, 0) == 0 and
+                probe_role_epoch == self._occupancy_role_epoch
             }
             # Merge only generation-valid results. A probe that races a
             # dispatch must not erase the previous multi-slot baseline: every
             # post-baseline dispatch is already represented by a reservation,
             # so retaining that baseline and subtracting reservations remains
-            # conservative while preserving the other slots. A genuine probe
-            # miss still drops the baseline and fails closed.
+            # conservative while preserving the other slots. A probe miss
+            # retains that baseline only through the bounded per-URL TTL.
             merged_occupancy = dict(self._replica_occupancy)
             merged_total_slots = dict(self._replica_total_slots or {})
             merged_free_slots = dict(self._replica_free_slots)
             merged_sample_generation = dict(self._occupancy_sample_generation or
                                             {})
             merged_sample_time = dict(self._occupancy_sample_time or {})
+            merged_sample_roles = dict(self._occupancy_sample_role_epoch or {})
             pending = dict(self._occupancy_pending_reservations or {})
             missed_urls = set(probe_urls) - set(occupancy)
+            now = time.monotonic()
             for url in missed_urls:
-                merged_occupancy.pop(url, None)
-                merged_total_slots.pop(url, None)
-                merged_free_slots.pop(url, None)
-                merged_sample_generation.pop(url, None)
-                merged_sample_time.pop(url, None)
+                sampled_at = merged_sample_time.get(url)
+                sample_role = merged_sample_roles.get(url)
+                sample_expired = (
+                    url not in ready_set or sampled_at is None or
+                    now - sampled_at
+                    > constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
+                role_changed = (sample_role is not None and
+                                sample_role != self._occupancy_role_epoch)
+                if sample_expired or role_changed:
+                    merged_occupancy.pop(url, None)
+                    merged_total_slots.pop(url, None)
+                    merged_free_slots.pop(url, None)
+                    merged_sample_generation.pop(url, None)
+                    merged_sample_time.pop(url, None)
+                    merged_sample_roles.pop(url, None)
             for url in valid_sample_urls:
                 merged_occupancy[url] = occupancy[url]
                 merged_total_slots[url] = total_slots[url]
@@ -1965,7 +2143,8 @@ class SkyServeLoadBalancer:
                 else:
                     merged_free_slots.pop(url, None)
                 merged_sample_generation[url] = probe_generation.get(url, 0)
-                merged_sample_time[url] = time.monotonic()
+                merged_sample_time[url] = now
+                merged_sample_roles[url] = probe_role_epoch
                 # A probe begun after the trailing fence observes every
                 # accepted local-router reservation, so it becomes the new
                 # authoritative baseline.
@@ -1992,8 +2171,10 @@ class SkyServeLoadBalancer:
             }
             self._occupancy_sample_generation = merged_sample_generation
             self._occupancy_sample_time = merged_sample_time
+            self._occupancy_current_round_sampled_urls = set(valid_sample_urls)
+            self._occupancy_sample_role_epoch = merged_sample_roles
             self._occupancy_pending_reservations = pending
-            self._last_occupancy_probe_time = time.monotonic()
+            self._last_occupancy_probe_time = now
             # A url that EVER reported occupancy is occupancy-capable:
             # its envelope in-flight is meaningless for busyness
             # (fast-ack jobs close the envelope in ms), so a later probe
@@ -2079,6 +2260,17 @@ class SkyServeLoadBalancer:
             self._occupancy_sample_time = {
                 url: sampled_at for url, sampled_at in (
                     self._occupancy_sample_time or {}).items() if url in keep
+            }
+            self._occupancy_current_round_sampled_urls = {
+                url
+                for url in (self._occupancy_current_round_sampled_urls or set())
+                if url in keep
+            }
+            self._occupancy_sample_role_epoch = {
+                url: generation
+                for url, generation in (
+                    self._occupancy_sample_role_epoch or {}).items()
+                if url in keep
             }
             self._occupancy_pending_reservations = {
                 url: count
@@ -2203,6 +2395,7 @@ class SkyServeLoadBalancer:
                 'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,
                 'rejected_in_window': self._rejected_in_window(),
+                'rejected_in_recent_window': self._rejected_in_recent_window(),
             }
             try:
                 # Send request information. Drain the aggregator once for the
@@ -2441,6 +2634,29 @@ class SkyServeLoadBalancer:
                 if not request_batch_accepted:
                     self._request_aggregator.restore(request_batch)
 
+    @staticmethod
+    def _release_client_refcount(client: httpx.AsyncClient) -> None:
+        """Release one request and wake an active drain on the last one."""
+        remaining = getattr(client, _INFLIGHT_ATTR, 1) - 1
+        setattr(client, _INFLIGHT_ATTR, remaining)
+        if remaining <= 0:
+            zero_event = getattr(client, _INFLIGHT_ZERO_EVENT_ATTR, None)
+            if isinstance(zero_event, asyncio.Event):
+                zero_event.set()
+
+    @staticmethod
+    def _client_refcount_zero_event(client: httpx.AsyncClient) -> asyncio.Event:
+        """Return a wakeup whose state reflects the authoritative counter."""
+        zero_event = getattr(client, _INFLIGHT_ZERO_EVENT_ATTR, None)
+        if not isinstance(zero_event, asyncio.Event):
+            zero_event = asyncio.Event()
+            setattr(client, _INFLIGHT_ZERO_EVENT_ATTR, zero_event)
+        if getattr(client, _INFLIGHT_ATTR, 0) > 0:
+            zero_event.clear()
+        else:
+            zero_event.set()
+        return zero_event
+
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
         """Close a pruned replica's client once its in-flight work drains.
@@ -2453,14 +2669,18 @@ class SkyServeLoadBalancer:
         (stream timeout + margin) bounds leaked connections if a counter
         is ever stuck.
         """
-        deadline = (asyncio.get_event_loop().time() +
-                    self._stream_timeout_seconds +
+        loop = asyncio.get_running_loop()
+        deadline = (loop.time() + self._stream_timeout_seconds +
                     constants.LB_DRAIN_CLOSE_GRACE_SECONDS)
-        # Deliberate 1s poll: in-flight tracking is a plain counter attribute
-        # on the httpx client, with no Event to await.
-        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and  # noqa: ASYNC110
-               asyncio.get_event_loop().time() < deadline):
-            await asyncio.sleep(1)
+        while getattr(client, _INFLIGHT_ATTR, 0) > 0:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            zero_event = self._client_refcount_zero_event(client)
+            try:
+                await asyncio.wait_for(zero_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
         inflight = getattr(client, _INFLIGHT_ATTR, 0)
         if inflight > 0:
             logger.warning(f'Closing drained client for {url} with '
@@ -2692,16 +2912,42 @@ class SkyServeLoadBalancer:
                             raise ValueError(
                                 'Controller returned an invalid HA cutover '
                                 'generation.')
-                        self._lb_role = role
-                        self._lb_role_generation = generation
+                        previous_role = self._lb_role
+                        previous_generation = self._lb_role_generation
+                        requires_fresh_occupancy = (
+                            role in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE)
+                            and (role is not previous_role or
+                                 generation != previous_generation))
                         rollout_evidence = body.get('ha_rollout')
-                        self._lb_ha_rollout_evidence = (
-                            rollout_evidence if isinstance(
-                                rollout_evidence, dict) else None)
-                        if role is lb_ha.LbRole.ARMED:
-                            self._armed_generation = generation
-                        else:
-                            self._armed_generation = None
+                        with self._client_pool_lock:
+                            self._lb_role = role
+                            self._lb_role_generation = generation
+                            self._lb_ha_rollout_evidence = (
+                                rollout_evidence if isinstance(
+                                    rollout_evidence, dict) else None)
+                            if role is lb_ha.LbRole.ARMED:
+                                self._armed_generation = generation
+                            else:
+                                self._armed_generation = None
+                            if requires_fresh_occupancy:
+                                # A standby can probe while the old active
+                                # accepts fast-ack work. Advancing the epoch and
+                                # clearing samples under the admission lock
+                                # prevents a crossing probe or request from
+                                # reusing pre-transition free capacity.
+                                self._occupancy_role_epoch += 1
+                                self._invalidate_occupancy_samples_locked()
+                        if requires_fresh_occupancy:
+                            try:
+                                await self._probe_replica_occupancy_once()
+                            except Exception as e:  # pylint: disable=broad-except
+                                # The cleared state is already fail-closed.
+                                # Keep the committed role and let the ordinary
+                                # supervised probe loop recover.
+                                logger.warning(
+                                    'Immediate post-promotion occupancy probe '
+                                    'failed: '
+                                    f'{common_utils.format_exception(e)}')
                         await self._notify_request_queue()
                         return
         except asyncio.TimeoutError:
@@ -2818,8 +3064,7 @@ class SkyServeLoadBalancer:
             if client_refcount_dropped or client is None:
                 return
             client_refcount_dropped = True
-            setattr(client, _INFLIGHT_ATTR,
-                    getattr(client, _INFLIGHT_ATTR, 1) - 1)
+            self._release_client_refcount(client)
 
         try:
             # We defer the get of the client here on purpose, for case when the
@@ -2835,8 +3080,13 @@ class SkyServeLoadBalancer:
             # only after its in-flight work drains (a re-added URL gets a
             # fresh client with its own counter). Decremented exactly once
             # per request alongside the slot release below.
-            setattr(client, _INFLIGHT_ATTR,
-                    getattr(client, _INFLIGHT_ATTR, 0) + 1)
+            inflight = getattr(client, _INFLIGHT_ATTR, 0)
+            if type(inflight) is not int:
+                # Tolerate partially initialized clients during rolling
+                # upgrades and lightweight test doubles. Real clients only
+                # ever carry the integer written below.
+                inflight = 0
+            setattr(client, _INFLIGHT_ATTR, inflight + 1)
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             proxy_request = client.build_request(

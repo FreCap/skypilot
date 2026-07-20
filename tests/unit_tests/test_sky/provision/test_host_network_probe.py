@@ -12,6 +12,8 @@ and are exercised by smoke tests instead.
 """
 import base64
 import gzip
+import hashlib
+import pickle
 import re
 import socket
 
@@ -61,6 +63,56 @@ class TestProbePorts:
 
 class TestRayStartCommands:
     """ray_head_start_command / ray_worker_start_command behavior."""
+
+    def test_facade_callable_identity_is_stable(self):
+        for name in (
+                '_host_network_probe_b64',
+                '_host_network_probe_cmd',
+                '_ray_gpu_options',
+                'ray_head_start_command',
+                'ray_worker_start_command',
+        ):
+            facade_callable = getattr(instance_setup, name)
+            assert facade_callable.__module__ == 'sky.provision.instance_setup'
+            assert pickle.loads(
+                pickle.dumps(facade_callable)) is facade_callable
+
+    def test_generated_commands_are_byte_for_byte_stable(self, monkeypatch):
+        monkeypatch.setattr(instance_setup, '_host_network_probe_cmd',
+                            lambda mode: f'probe:{mode};')
+        head_options = {'num-cpus': 4, 'use_external_ip': True}
+        samples = {
+            'head_default': instance_setup.ray_head_start_command(None, None),
+            'head_gpu': instance_setup.ray_head_start_command(
+                '{"H100": 8}', head_options),
+            'worker_restart': instance_setup.ray_worker_start_command(
+                '{"A100": 4}', {'num-cpus': 8}, False),
+            'worker_no_restart': instance_setup.ray_worker_start_command(
+                None, None, True),
+        }
+        assert {
+            name: hashlib.sha256(value.encode()).hexdigest()
+            for name, value in samples.items()
+        } == {
+            'head_default': '072a8fcf86016bc82dc9d9abd9a08295eb6416cdcf494ff6dc3252dcd06c1ec0',
+            'head_gpu': '5b77a2fb64fda2351403e78ee164891c1c4a5faa0a45d6e63ae9242a1eb65ec9',
+            'worker_restart': 'b6261bf80d5eea19687f6fb057beb870665171c977ac36e535c2675e66589533',
+            'worker_no_restart': 'ec56741f765842a5a4dad58f09b03a1c904793bb99207b75790393e70070a21f',
+        }
+        assert head_options == {'num-cpus': 4}
+
+    def test_command_builders_use_late_bound_facade_helpers(self, monkeypatch):
+        monkeypatch.setattr(instance_setup, '_host_network_probe_cmd',
+                            lambda mode: f'probe:{mode};')
+        monkeypatch.setattr(instance_setup, '_ray_gpu_options',
+                            lambda _: ' --num-gpus=123')
+        head = instance_setup.ray_head_start_command('{"H100": 8}', None)
+        worker = instance_setup.ray_worker_start_command(
+            '{"H100": 8}', None, False)
+        assert head.startswith('probe:head;')
+        assert worker.startswith('probe:worker;')
+        assert '--num-gpus=123' in head
+        assert '--num-gpus=123' in worker
 
     def test_head_uses_default_ports_when_env_vars_unset(self):
         cmd = instance_setup.ray_head_start_command(custom_resource=None,

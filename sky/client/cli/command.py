@@ -2805,8 +2805,7 @@ def logs(
         job_id = int(cur_job_id)
         job_ids_to_query = [int(job_ids[0])]
     else:
-        # job_ids is either None or empty list, so it is safe to cast it here.
-        job_ids_to_query = typing.cast(list[int] | None, job_ids)
+        job_ids_to_query = None
     if status:
         job_statuses = sdk.stream_and_get(
             sdk.job_status(cluster, job_ids_to_query))

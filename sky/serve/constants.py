@@ -176,6 +176,7 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # /autoscaler/info for liveness: serializing a large fleet is legitimate work
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
+CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
 # A fleet-scale readiness sweep can briefly starve the controller event loop
 # even though the constant-time health handler is healthy.  Keep local connect
 # failure detection tight, but allow the lightweight response enough time to
@@ -527,7 +528,8 @@ POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 # v7.0 - Added include_target_num_replicas override so summary-only callers
 #        can skip per-service autoscaler HTTP fetches unless they render it.
 # v8.0 - Added per-GPU logical replica semantics and logical capacity hints.
-SERVE_VERSION = 8
+# v9.0 - Added the authenticated, read-only placement snapshot endpoint.
+SERVE_VERSION = 9
 
 TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
     'The version of service is outdated and does not support manually '

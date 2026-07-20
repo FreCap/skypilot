@@ -187,6 +187,29 @@ class RequestIDMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         return response
 
 
+def _cleanup_download_tmp_once() -> None:
+    """Synchronously delete expired download temporary directories."""
+    tmp_dir = bs.get_blob_storage().download_tmp_base_dir()
+    if tmp_dir is None:
+        # Backend shares the persistent log dir; no separate cleanup needed.
+        return
+    if not os.path.exists(tmp_dir):
+        return
+    cutoff = time.time() - bs.GC_GRACE_SECONDS
+    with os.scandir(tmp_dir) as user_entries:
+        for user_entry in user_entries:
+            if not user_entry.is_dir():
+                continue
+            with os.scandir(user_entry.path) as entries:
+                for entry in entries:
+                    if entry.is_dir():
+                        try:
+                            if entry.stat().st_mtime < cutoff:
+                                shutil.rmtree(entry.path, ignore_errors=True)
+                        except OSError:
+                            pass
+
+
 async def cleanup_download_tmp():
     """Delete expired download tmp directories.
 
@@ -197,24 +220,7 @@ async def cleanup_download_tmp():
     while True:
         await asyncio.sleep(3600)
         try:
-            tmp_dir = bs.get_blob_storage().download_tmp_base_dir()
-            if tmp_dir is None:
-                # Backend shares the persistent log dir; no separate
-                # cleanup needed.
-                continue
-            if not os.path.exists(tmp_dir):
-                continue
-            cutoff = time.time() - bs.GC_GRACE_SECONDS
-            for user_entry in os.scandir(tmp_dir):
-                if not user_entry.is_dir():
-                    continue
-                for entry in os.scandir(user_entry.path):
-                    if entry.is_dir():
-                        try:
-                            if entry.stat().st_mtime < cutoff:
-                                shutil.rmtree(entry.path, ignore_errors=True)
-                        except OSError:
-                            pass
+            await asyncio.to_thread(_cleanup_download_tmp_once)
         except Exception as e:  # pylint: disable=broad-except
             logger.error('Error in cleanup_download_tmp: '
                          f'{common_utils.format_exception(e)}')
@@ -599,6 +605,11 @@ def handle_concurrent_worker_exhausted_error(
         })
 
 
+async def _read_html_template(template_name: str) -> str:
+    template_path = pathlib.Path(__file__).parent / 'html' / template_name
+    return await asyncio.to_thread(template_path.read_text, encoding='utf-8')
+
+
 @app.get('/token')
 async def token(request: fastapi.Request,
                 local_port: int | None = None) -> fastapi.responses.Response:
@@ -607,11 +618,8 @@ async def token(request: fastapi.Request,
     base64_str = _generate_auth_token(request)
     user = _get_auth_user_header(request)
 
-    html_dir = pathlib.Path(__file__).parent / 'html'
-    token_page_path = html_dir / 'token_page.html'
     try:
-        with open(token_page_path, encoding='utf-8') as f:
-            html_content = f.read()
+        html_content = await _read_html_template('token_page.html')
     except FileNotFoundError as e:
         raise fastapi.HTTPException(
             status_code=500, detail='Token page template not found.') from e
@@ -715,10 +723,7 @@ async def authorize_page(
     user_info = html.escape(
         f'Logged in as {user.name}') if user is not None else ''
 
-    html_dir = pathlib.Path(__file__).parent / 'html'
-    authorize_page_path = html_dir / 'authorize_page.html'
-    with open(authorize_page_path, encoding='utf-8') as f:
-        html_content = f.read()
+    html_content = await _read_html_template('authorize_page.html')
 
     html_content = html_content.replace('USER_PLACEHOLDER', user_info)
 
@@ -1194,6 +1199,7 @@ async def logs(
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
     """Tails the logs of a job."""
+    stream_utils.ensure_request_log_storage_available()
     # TODO(zhwu): This should wait for the request on the cluster, e.g., async
     # launch, to finish, so that a user does not need to manually pull the
     # request status.
@@ -1224,10 +1230,9 @@ async def download_logs(
         request: fastapi.Request,
         cluster_jobs_body: payloads.ClusterJobsDownloadLogsBody) -> None:
     """Downloads the logs of a job."""
-    user_hash = cluster_jobs_body.env_vars[constants.USER_ID_ENV_VAR]
-    logs_dir_on_api_server = pathlib.Path(
-        bs.get_blob_storage().download_tmp_dir(user_hash))
-    logs_dir_on_api_server.expanduser().mkdir(parents=True, exist_ok=True)
+    user_hash = common.get_request_user_id(request, cluster_jobs_body)
+    logs_dir_on_api_server = await asyncio.to_thread(
+        common.prepare_download_tmp_dir, user_hash)
     # We should reuse the original request body, so that the env vars, such as
     # user hash, are kept the same.
     cluster_jobs_body.local_dir = str(logs_dir_on_api_server)
@@ -1242,36 +1247,60 @@ async def download_logs(
     )
 
 
-@app.post('/download')
-async def download(download_body: payloads.DownloadBody,
-                   request: fastapi.Request) -> None:
-    """Downloads a folder from the cluster to the local machine."""
-    folder_paths = [
-        pathlib.Path(folder_path) for folder_path in download_body.folder_paths
-    ]
-    user_hash = download_body.env_vars[constants.USER_ID_ENV_VAR]
-    logs_dir_on_api_server = common.api_server_user_logs_dir_prefix(user_hash)
-    download_tmp = bs.get_blob_storage().download_tmp_dir(user_hash)
-    for folder_path in folder_paths:
-        folder_str = str(folder_path)
-        expanded_str = str(folder_path.expanduser())
-        if not (folder_str.startswith(str(logs_dir_on_api_server)) or
-                folder_str.startswith(download_tmp) or
-                expanded_str.startswith(os.path.expanduser(download_tmp))):
+def _is_path_within(path: pathlib.Path, allowed_root: pathlib.Path) -> bool:
+    """Returns whether a resolved path is contained by a resolved root."""
+    try:
+        return os.path.commonpath([path, allowed_root]) == str(allowed_root)
+    except ValueError:
+        # Different drives on Windows cannot have a common path.
+        return False
+
+
+def _resolve_download_paths(
+        folder_path_strings: list[str], logs_dir_on_api_server: pathlib.Path,
+        download_tmp: pathlib.Path) -> tuple[list[pathlib.Path], pathlib.Path]:
+    """Validates requested folders and returns their canonical paths."""
+    resolved_logs_root = logs_dir_on_api_server.expanduser().resolve()
+    allowed_roots = {
+        resolved_logs_root,
+        download_tmp.expanduser().resolve(),
+    }
+    folder_paths = []
+    for folder_path_str in folder_path_strings:
+        folder_path = pathlib.Path(folder_path_str).expanduser().resolve()
+        if not any(
+                _is_path_within(folder_path, allowed_root)
+                for allowed_root in allowed_roots):
             raise fastapi.HTTPException(
                 status_code=400,
                 detail=
                 f'Invalid folder path: {folder_path}; {logs_dir_on_api_server}')
 
-        if not folder_path.expanduser().resolve().exists():
+        if not folder_path.exists():
             raise fastapi.HTTPException(
                 status_code=404, detail=f'Folder not found: {folder_path}')
+        # Keep the canonical path so a symlink cannot be swapped after the
+        # containment check but before the archive is created.
+        folder_paths.append(folder_path)
+    return folder_paths, resolved_logs_root
+
+
+@app.post('/download')
+async def download(download_body: payloads.DownloadBody,
+                   request: fastapi.Request) -> None:
+    """Downloads a folder from the cluster to the local machine."""
+    user_hash = common.get_request_user_id(request, download_body)
+    logs_dir_on_api_server = common.api_server_user_logs_dir_prefix(user_hash)
+    download_tmp = await asyncio.to_thread(common.prepare_download_tmp_dir,
+                                           user_hash)
+    folder_paths, resolved_logs_root = await asyncio.to_thread(
+        _resolve_download_paths, download_body.folder_paths,
+        logs_dir_on_api_server, download_tmp)
 
     # Create a temporary zip file
     log_id = str(uuid.uuid4().hex)
     zip_filename = f'folder_{log_id}.zip'
-    zip_path = pathlib.Path(
-        logs_dir_on_api_server).expanduser().resolve() / zip_filename
+    zip_path = resolved_logs_root / zip_filename
 
     try:
 
@@ -1626,6 +1655,38 @@ async def api_get(request_id: str) -> payloads.RequestPayload:
     return request_task.encode()
 
 
+def _resolve_stream_log_path(log_path: str) -> pathlib.Path:
+    """Resolve and validate a user-supplied log path."""
+    if log_path == constants.API_SERVER_LOGS:
+        resolved_log_path = pathlib.Path(constants.API_SERVER_LOGS).expanduser()
+        if not resolved_log_path.exists():
+            raise fastapi.HTTPException(
+                status_code=404,
+                detail='Server log file does not exist. The API server may '
+                'have been started with `--foreground` - check the '
+                'stdout of API server process, such as: '
+                '`kubectl logs -n api-server-namespace '
+                'api-server-pod-name`')
+        return resolved_log_path
+
+    # This should be a log path under ~/sky_logs.
+    resolved_logs_directory = pathlib.Path(
+        constants.SKY_LOGS_DIRECTORY).expanduser().resolve()
+    resolved_log_path = resolved_logs_directory.joinpath(log_path).resolve()
+    # Make sure the log path is under ~/sky_logs. We calculate the
+    # common path to check if the log path is under ~/sky_logs.
+    # This prevents path traversal using '..'
+    if os.path.commonpath([resolved_log_path, resolved_logs_directory
+                          ]) != str(resolved_logs_directory):
+        raise fastapi.HTTPException(status_code=400,
+                                    detail=f'Unauthorized log path: '
+                                    f'{log_path!r}')
+    if not resolved_log_path.exists():
+        raise fastapi.HTTPException(
+            status_code=404, detail=f'Log path {log_path!r} does not exist')
+    return resolved_log_path
+
+
 @app.get('/api/stream')
 async def stream(
     request: fastapi.Request,
@@ -1703,10 +1764,10 @@ async def stream(
     if use_html:
         # Return HTML page with JavaScript to handle streaming
         stream_url = request.url.include_query_params(format='plain')
-        html_dir = pathlib.Path(__file__).parent / 'html'
-        with open(html_dir / 'log.html', encoding='utf-8') as file:
-            html_content = file.read()
-        html_content = html_content.replace('{stream_url}', str(stream_url))
+        html_content = await _read_html_template('log.html')
+        html_content = html_content.replace(
+            '{stream_url}',  # noqa: RUF027
+            str(stream_url))
 
         nonce = csp_utils.generate_nonce()
         request.state.csp_nonce = nonce
@@ -1736,37 +1797,8 @@ async def stream(
         del request_task
     else:
         assert log_path is not None, (request_id, log_path)
-        if log_path == constants.API_SERVER_LOGS:
-            resolved_log_path = pathlib.Path(
-                constants.API_SERVER_LOGS).expanduser()
-            if not resolved_log_path.exists():
-                raise fastapi.HTTPException(
-                    status_code=404,
-                    detail='Server log file does not exist. The API server may '
-                    'have been started with `--foreground` - check the '
-                    'stdout of API server process, such as: '
-                    '`kubectl logs -n api-server-namespace '
-                    'api-server-pod-name`')
-        else:
-            # This should be a log path under ~/sky_logs.
-            resolved_logs_directory = pathlib.Path(
-                constants.SKY_LOGS_DIRECTORY).expanduser().resolve()
-            resolved_log_path = resolved_logs_directory.joinpath(
-                log_path).resolve()
-            # Make sure the log path is under ~/sky_logs. We calculate the
-            # common path to check if the log path is under ~/sky_logs.
-            # This prevents path traversal using '..'
-            if os.path.commonpath([resolved_log_path, resolved_logs_directory
-                                  ]) != str(resolved_logs_directory):
-                raise fastapi.HTTPException(
-                    status_code=400,
-                    detail=f'Unauthorized log path: {log_path!r}')
-            elif not resolved_log_path.exists():
-                raise fastapi.HTTPException(
-                    status_code=404,
-                    detail=f'Log path {log_path!r} does not exist')
-
-        log_path_to_stream = resolved_log_path
+        log_path_to_stream = await asyncio.to_thread(_resolve_stream_log_path,
+                                                     log_path)
 
     headers = {
         'Cache-Control': 'no-cache, no-transform',
@@ -2190,13 +2222,8 @@ async def create_debug_dump(
     )
 
 
-@app.get('/debug/dump_download/{dump_filename}')
-async def download_debug_dump(
-        dump_filename: str) -> fastapi.responses.FileResponse:
-    """Download a debug dump file.
-
-    The dump file is automatically deleted after the download completes.
-    """
+def _resolve_debug_dump_path(dump_filename: str) -> pathlib.Path:
+    """Resolve and validate a requested debug dump path."""
     dump_dir = pathlib.Path(debug_utils.DEBUG_DUMP_DIR).expanduser()
     dump_path = dump_dir / dump_filename
 
@@ -2211,6 +2238,17 @@ async def download_debug_dump(
     if not dump_path.exists():
         raise fastapi.HTTPException(status_code=404,
                                     detail='Debug dump not found')
+    return dump_path
+
+
+@app.get('/debug/dump_download/{dump_filename}')
+async def download_debug_dump(
+        dump_filename: str) -> fastapi.responses.FileResponse:
+    """Download a debug dump file.
+
+    The dump file is automatically deleted after the download completes.
+    """
+    dump_path = await asyncio.to_thread(_resolve_debug_dump_path, dump_filename)
 
     # Delete the dump file after download completes
     return fastapi.responses.FileResponse(

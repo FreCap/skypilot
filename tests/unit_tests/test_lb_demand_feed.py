@@ -193,6 +193,17 @@ def test_reject_window_ttl_expiry_and_refresh():
     assert lb._rejected_in_window() == 1
 
 
+def test_recent_reject_window_tracks_spikes_separately_from_retention():
+    lb = _make_lb()
+    lb._record_rejection(_request(job_id='recent'))
+    lb._record_rejection(_request(job_id='retained'))
+    lb._reject_last_seen['retained'] = (
+        time.monotonic() - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS - 1)
+
+    assert lb._rejected_in_window() == 2
+    assert lb._rejected_in_recent_window() == 1
+
+
 def test_terminal_503_records_rejection():
     lb = _make_lb()  # empty ready set -> "no ready replicas" exit
     with pytest.raises(fastapi.HTTPException):
@@ -664,6 +675,7 @@ def test_sync_payload_carries_demand_gauges():
     assert body['in_flight'] == {'http://a:8080': 2}
     assert body['queue_depth'] == 3
     assert body['rejected_in_window'] == 1
+    assert body['rejected_in_recent_window'] == 1
     assert 'timestamps' in body['request_aggregator']
     # Gauges are NOT cleared by a successful sync (only the timestamp
     # aggregator keeps clear-on-report semantics).
@@ -711,6 +723,32 @@ def test_sync_payload_proves_valid_occupancy_sample():
     assert captured['json']['occupancy_sampled_urls'] == [url]
     assert captured['json']['total_slots_by_url'] == {url: 4}
     assert captured['json']['occupancy_sample_generation'] == {url: 7}
+
+
+def test_sync_payload_excludes_retained_probe_miss_from_idle_proof():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([url])
+
+    results = [(0, 4, 4), None]
+
+    async def _fetch(session, selected_url):
+        del session
+        assert selected_url == url
+        return results.pop(0)
+
+    lb._fetch_replica_occupancy = _fetch
+    asyncio.run(lb._probe_replica_occupancy_once())
+    asyncio.run(lb._probe_replica_occupancy_once())
+
+    with lb._client_pool_lock:
+        assert lb._effective_replica_free_slots_locked() == {url: 4}
+    captured = _run_sync(lb, {'replica_info': {}})
+    assert url not in (captured['json']['in_flight'] or {})
+    assert captured['json']['unknown_in_flight_urls'] == [url]
+    assert captured['json']['occupancy_sampled_urls'] == []
+    assert captured['json']['total_slots_by_url'] == {}
+    assert captured['json']['occupancy_sample_generation'] == {}
 
 
 def test_old_controller_omission_preserves_async_declaration():

@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import autoscalers
 from sky.serve import controller
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -954,6 +955,50 @@ class TestServiceUpdateReconciler:
         assert status['update_apply_error'] is None
         assert status['update_apply_failures'] == 0
 
+    def test_newer_commit_during_retry_handoff_skips_backoff(self):
+        ctrl = _make_update_controller()
+        notify_calls = []
+
+        def _commit_newer_during_failed_retry(version):
+            notify_calls.append(version)
+            if notify_calls == [2, 2]:
+                ctrl._record_committed_update(  # pylint: disable=protected-access
+                    3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+
+        applied_versions = []
+
+        def _apply(version, *_args):
+            applied_versions.append(version)
+            if version == 2:
+                raise RuntimeError('failed before replacement commit')
+
+        ctrl._replica_manager.notify_version_pending.side_effect = (  # pylint: disable=protected-access
+            _commit_newer_during_failed_retry)
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_apply)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        reconcile_once = ctrl._reconcile_pending_update_once  # pylint: disable=protected-access
+
+        def _stop_after_newer_apply(*, wait=False):
+            converged = reconcile_once(wait=wait)
+            if applied_versions == [2, 3]:
+                raise RuntimeError('stop after newer apply')
+            return converged
+
+        ctrl._reconcile_pending_update_once = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_stop_after_newer_apply)
+        with mock.patch.object(
+                controller.time,
+                'sleep',
+                side_effect=AssertionError('newer update hit retry backoff')), \
+             pytest.raises(RuntimeError, match='stop after newer apply'):
+            ctrl._run_update_reconciler()  # pylint: disable=protected-access
+
+        assert notify_calls == [2, 2, 3]
+        assert applied_versions == [2, 3]
+
     def test_terminal_service_drops_pending_apply(self):
         ctrl = _make_update_controller()
         ctrl._update_still_authorized.return_value = False  # pylint: disable=protected-access
@@ -1367,6 +1412,60 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
 
+    def test_logical_scale_down_waves_are_batched_without_reordering(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 1
+        decision_autoscaler.get_decision_interval.return_value = 0
+
+        def _logical_down(replica_id, generation=7):
+            return autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+                autoscalers.LogicalScaleDownTarget(
+                    version=1,
+                    reconcile_generation=generation,
+                    target_capacity=4,
+                    replica_id=replica_id))
+
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            _logical_down(1),
+            _logical_down(2),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP, None),
+            _logical_down(3),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 99),
+            _logical_down(4, generation=8),
+        ]
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        actuation_calls = [
+            call for call in ctrl._replica_manager.method_calls  # pylint: disable=protected-access
+            if call[0] in ('scale_down_logically_batch', 'scale_up_batch',
+                           'scale_down')
+        ]
+        assert actuation_calls == [
+            mock.call.scale_down_logically_batch([1, 2], 4, 1, 7),
+            mock.call.scale_up_batch([None], expected_version=1),
+            mock.call.scale_down_logically_batch([3], 4, 1, 7),
+            mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
+            mock.call.scale_down_logically_batch([4], 4, 1, 8),
+        ]
+
 
 class TestTranslateInFlight:
     """The LB reports in-flight work keyed by replica url; the autoscaler
@@ -1664,6 +1763,8 @@ class _StatefulDemandAutoscaler:
     def __init__(self) -> None:
         self.replica_unit = 'physical_backend'
         self.latest_version = 1
+        self.max_replicas = 100
+        self.target_num_replicas = 1
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
@@ -1671,6 +1772,19 @@ class _StatefulDemandAutoscaler:
         self.rejected_in_window = 5
         self.collect_calls = 0
         self.reports = []
+
+    def get_final_target_num_replicas(self):
+        return self.target_num_replicas
+
+    def has_recomputed_with_fresh_data(self):
+        return True
+
+    def info(self):
+        return {
+            'target_num_replicas': self.target_num_replicas,
+            'in_flight_total': sum(self.in_flight_by_replica_id.values()),
+            'queue_depth': self.queue_depth,
+        }
 
     def collect_request_information(self, report) -> None:
         self.collect_calls += 1
@@ -1746,6 +1860,7 @@ class TestAuthoritativeLbReportIngestion:
             'unknown_in_flight_urls': [self._URL],
             'queue_depth': 11,
             'rejected_in_window': 13,
+            'rejected_in_recent_window': 8,
             'routing_urls': [self._URL],
             'draining_urls': [self._URL],
         }
@@ -1838,6 +1953,49 @@ class TestAuthoritativeLbReportIngestion:
             'service-hash',
             f"lb-a:{'a' * 32}",
             report['request_history'],
+        )
+
+    def test_autoscaler_history_distinguishes_demand_and_fill_targets(self):
+        ctrl, _, _ = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._history_session_id = 'c' * 32  # pylint: disable=protected-access
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        autoscaler = mock.Mock()
+        autoscaler.get_final_target_num_replicas.return_value = 7
+        autoscaler.info.return_value = {
+            'fill_target': 12,
+            'in_flight_total': 5,
+            'queue_depth': 4,
+        }
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        replica_counts = {
+            'replica_unit': 'physical_backend',
+            'ready_replicas': 9,
+            'total_replicas': 14,
+        }
+        capacity_hint = {'provisioning_replicas': 3}
+
+        with mock.patch.object(controller.serve_history,
+                               'record_autoscaler_snapshot',
+                               return_value=1) as record_history:
+            written = ctrl._record_autoscaler_history(  # pylint: disable=protected-access
+                replica_counts, capacity_hint)
+
+        assert written == 1
+        record_history.assert_called_once_with(
+            'svc',
+            'service-hash',
+            'c' * 32,
+            version=3,
+            replica_unit='physical_backend',
+            demand_target=7,
+            capacity_target=12,
+            ready_capacity=9,
+            provisioning_capacity=3,
+            total_capacity=14,
+            peak_in_flight=5,
+            peak_queue_depth=4,
+            timestamp=None,
         )
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])
@@ -2233,7 +2391,10 @@ class TestAuthoritativeLbReportIngestion:
         ctrl._confirm_logical_bridge_capacities = _capture_confirm  # pylint: disable=protected-access
         ctrl._apply_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
 
-        def _capture_capacity_hint(replica_infos, logical_versions):
+        def _capture_capacity_hint(replica_infos,
+                                   logical_versions,
+                                   replica_counts=None):
+            observed['hint_replica_counts'] = replica_counts
             observed['logical_versions'] = set(logical_versions)
             return {'n': len(replica_infos)}
 
@@ -2272,6 +2433,10 @@ class TestAuthoritativeLbReportIngestion:
         assert observed['ingest_logical_versions'] == {3}
         assert observed['logical_versions'] == {3}
         assert observed['sync_thread'] != event_loop_thread
+        # The sync handler must hand the hint the same counts dict it
+        # snapshotted, so the fleet is aggregated exactly once per sync.
+        assert observed['hint_replica_counts'] is ctrl._replica_counts_snapshot  # pylint: disable=protected-access
+        assert observed['hint_replica_counts'] is not None
 
 
 class _FakeAutoscaler:
@@ -2377,6 +2542,42 @@ class TestGetCapacityHint:
             logical_versions=set())
         assert hint['target_num_replicas'] == 10
         assert hint['max_replicas'] == 20
+
+    def test_capacity_hint_reuses_precomputed_replica_counts(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=5,
+            recomputed=True,
+            latest_version=2)
+        replicas = self._replicas()
+        expected = ctrl._get_replica_counts(replicas)  # pylint: disable=protected-access
+        with mock.patch.object(ctrl, '_get_replica_counts') as counts_mock:
+            hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+                replicas,
+                logical_versions=set(),
+                replica_counts=dict(expected))
+        counts_mock.assert_not_called()
+        assert hint['replica_unit'] == 'physical_backend'
+        for key, value in expected.items():
+            if key != 'replica_unit':
+                assert hint[key] == value
+
+    def test_capacity_hint_computes_counts_once_when_not_provided(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=5,
+            recomputed=True,
+            latest_version=2)
+        replicas = self._replicas()
+        real_counts = ctrl._get_replica_counts  # pylint: disable=protected-access
+        with mock.patch.object(ctrl,
+                               '_get_replica_counts',
+                               side_effect=real_counts) as counts_mock:
+            hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+                replicas,
+                logical_versions=set())
+        assert counts_mock.call_count == 1
+        assert hint['total_replicas'] == 5
 
     def test_logical_hint_sums_persisted_backend_widths(self):
         ctrl = _make_controller()

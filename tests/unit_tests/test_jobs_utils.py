@@ -436,7 +436,7 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
     assert not (tmp_path / '42').exists()
     assert snapshots.call_count == 2
     set_cancelled.assert_not_called()
-    refresh.assert_called_once_with(42)
+    refresh.assert_called_once_with([42])
 
 
 def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
@@ -450,12 +450,15 @@ def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
          mock.patch('sky.jobs.state.get_status') as point_status, \
          mock.patch('sky.jobs.state.get_workspace') as point_workspace, \
          mock.patch('sky.jobs.state.is_legacy_controller_process') as point_legacy, \
-         mock.patch('sky.jobs.utils.update_managed_jobs_statuses'):
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
         result = utils.cancel_jobs_by_id(job_ids=job_ids,
                                          current_workspace='default')
 
     assert result.startswith('Jobs with IDs 1, 2, 3')
     assert snapshots.call_args_list == [mock.call(job_ids), mock.call(job_ids)]
+    # All live jobs must be refreshed in a single batched sweep, not one
+    # sweep per job.
+    assert refresh.call_args_list == [mock.call(job_ids)]
     point_status.assert_not_called()
     point_workspace.assert_not_called()
     point_legacy.assert_not_called()

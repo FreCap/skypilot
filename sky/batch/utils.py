@@ -2,7 +2,6 @@
 
 Includes function serialization and cloud storage helpers.
 """
-import base64
 from collections.abc import Callable
 import hashlib
 import inspect
@@ -11,17 +10,14 @@ import os
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import typing
 from typing import Any
 
 from sky.adaptors import aws
 from sky.adaptors import gcp
 from sky.batch import constants
+from sky.batch import function_serialization
 from sky.data import data_utils
-
-if typing.TYPE_CHECKING:
-    pass
 
 
 def serialize_function(fn: Callable) -> str:
@@ -46,32 +42,8 @@ def serialize_function(fn: Callable) -> str:
     Raises:
         TypeError: If the function source cannot be retrieved.
     """
-    # Get the source code
-    try:
-        source = inspect.getsource(fn)
-    except (TypeError, OSError) as e:
-        raise TypeError(
-            f'Cannot serialize function {fn.__name__}: unable to retrieve '
-            f'source code. Make sure the function is defined in a file '
-            f'(not interactively) and is accessible to inspect.getsource(). '
-            f'Error: {e}') from e
-
-    # Remove leading indentation to make it a top-level definition
-    source = textwrap.dedent(source)
-
-    # Get the function name
-    fn_name = fn.__name__
-
-    # Package as JSON
-    payload = {
-        'type': 'source',
-        'source': source,
-        'name': fn_name,
-        'version': '1.0',  # Serialization format version
-    }
-
-    serialized = json.dumps(payload)
-    return base64.b64encode(serialized.encode('utf-8')).decode('utf-8')
+    return function_serialization.serialize_function(
+        fn, source_getter=inspect.getsource)
 
 
 def deserialize_function(serialized: str) -> Callable:
@@ -90,49 +62,7 @@ def deserialize_function(serialized: str) -> Callable:
     Raises:
         ValueError: If the serialization format is unknown or invalid.
     """
-    decoded = base64.b64decode(serialized.encode('utf-8'))
-    payload = json.loads(decoded)
-
-    if payload.get('type') != 'source':
-        raise ValueError('Unknown or missing serialization type: '
-                         f'{payload.get("type")}. Expected "source".')
-
-    source = payload['source']
-    fn_name = payload['name']
-
-    # Execute the source code in a namespace that includes common imports
-    # The sky.batch module will be available for worker functions
-    namespace = {
-        '__builtins__': __builtins__,
-    }
-
-    # Make sky.batch available (lazy import to avoid circular dependencies)
-    try:
-        import sky.batch  # pylint: disable=unused-import,import-outside-toplevel
-        namespace['sky'] = __import__('sky')
-    except ImportError:
-        # If sky is not available, functions can still use explicit imports
-        pass
-
-    try:
-        exec(source, namespace)  # pylint: disable=exec-used
-    except Exception as e:
-        raise ValueError(
-            f'Failed to execute function source code for {fn_name}. '
-            f'Error: {e}\n\nSource:\n{source}') from e
-
-    if fn_name not in namespace:
-        raise ValueError(
-            f'Function {fn_name} not found in namespace after executing '
-            f'source code. Available names: {list(namespace.keys())}')
-
-    fn = namespace[fn_name]
-    if not callable(fn):
-        raise ValueError(
-            f'Expected {fn_name} to be a callable function, but got '
-            f'{type(fn).__name__}')
-
-    return fn
+    return function_serialization.deserialize_function(serialized)
 
 
 def cloud_path_exists(path: str) -> bool:

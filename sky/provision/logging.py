@@ -21,6 +21,10 @@ config = _LoggingConfig()
 
 @contextlib.contextmanager
 def setup_provision_logging(log_dir: str):
+    fh = None
+    provisioner_logger = None
+    provision_logger = None
+    stream_handler = None
     try:
         # Redirect underlying provision logs to file.
         log_path = os.path.expanduser(os.path.join(log_dir, 'provision.log'))
@@ -51,11 +55,17 @@ def setup_provision_logging(log_dir: str):
         config.log_path = log_abs_path
         yield
     finally:
-        provisioner_logger.removeHandler(fh)
-        provision_logger.removeHandler(fh)
-        provision_logger.removeHandler(stream_handler)
-        stream_handler.close()
-        fh.close()
+        if fh is not None:
+            if provisioner_logger is not None:
+                provisioner_logger.removeHandler(fh)
+            if provision_logger is not None:
+                provision_logger.removeHandler(fh)
+        if stream_handler is not None:
+            if provision_logger is not None:
+                provision_logger.removeHandler(stream_handler)
+            stream_handler.close()
+        if fh is not None:
+            fh.close()
 
 
 def get_log_path() -> pathlib.Path:

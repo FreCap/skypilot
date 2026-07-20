@@ -319,6 +319,21 @@ def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
                                              **kwargs)
 
 
+def get_service_placement_state(service_name: str,
+                                expected_service_hash: str) -> dict[str, Any]:
+    """Read one controller's in-memory placer state with bounded I/O."""
+    response = _get_to_controller_with_retry(
+        service_name,
+        expected_service_hash,
+        constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+        timeout=(1.0, 2.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError('Placement-state response must be an object.')
+    return payload
+
+
 def _get_to_local_controller_with_retry(service_name: str,
                                         controller_owner: _ControllerOwner,
                                         path: str, **kwargs):
@@ -432,6 +447,10 @@ class RequestsAggregator:
         """Add a request to the request aggregator."""
         raise NotImplementedError
 
+    def add_rejection(self) -> None:
+        """Record one terminal load-balancer rejection."""
+        raise NotImplementedError
+
     def clear(self) -> None:
         """Clear all current request aggregator."""
         raise NotImplementedError
@@ -484,6 +503,8 @@ class RequestTimestamp(RequestsAggregator):
         # acknowledged minute advances the same cumulative counter.
         self._request_history: dict[int, int] = {}
         self._acknowledged_request_history: dict[int, int] = {}
+        self._rejection_history: dict[int, int] = {}
+        self._acknowledged_rejection_history: dict[int, int] = {}
         # Pruning rebuilds both bounded history dictionaries. Keep that work on
         # minute boundaries (and controller snapshots), never on every request.
         self._last_pruned_request_history_bucket: int | None = None
@@ -500,11 +521,23 @@ class RequestTimestamp(RequestsAggregator):
         if bucket_start != self._last_pruned_request_history_bucket:
             self._prune_request_history(bucket_start)
 
+    def add_rejection(self) -> None:
+        """Record one terminal 503 in its completion-minute bucket."""
+        timestamp = time.time()
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
+        self._rejection_history[bucket_start] = (
+            self._rejection_history.get(bucket_start, 0) + 1)
+        if bucket_start != self._last_pruned_request_history_bucket:
+            self._prune_request_history(bucket_start)
+
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
+        self._rejection_history.clear()
+        self._acknowledged_rejection_history.clear()
         self._last_pruned_request_history_bucket = None
 
     def _prune_request_history(self, newest_bucket: int) -> None:
@@ -521,6 +554,16 @@ class RequestTimestamp(RequestsAggregator):
             for bucket, count in self._acknowledged_request_history.items()
             if bucket >= oldest_bucket
         }
+        self._rejection_history = {
+            bucket: count
+            for bucket, count in self._rejection_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._acknowledged_rejection_history = {
+            bucket: count
+            for bucket, count in self._acknowledged_rejection_history.items()
+            if bucket >= oldest_bucket
+        }
         self._last_pruned_request_history_bucket = newest_bucket
 
     def request_history_snapshot(self) -> dict[str, Any] | None:
@@ -528,12 +571,23 @@ class RequestTimestamp(RequestsAggregator):
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
         self._prune_request_history(newest_bucket)
-        buckets = [{
-            'bucket_start': bucket,
-            'request_count': count,
-        }
-                   for bucket, count in sorted(self._request_history.items())
-                   if count > self._acknowledged_request_history.get(bucket, 0)]
+        bucket_starts = sorted(
+            set(self._request_history) | set(self._rejection_history))
+        buckets = []
+        for bucket in bucket_starts:
+            request_count = self._request_history.get(bucket, 0)
+            rejected_count = self._rejection_history.get(bucket, 0)
+            if (request_count <= self._acknowledged_request_history.get(
+                    bucket, 0) and
+                    rejected_count <= self._acknowledged_rejection_history.get(
+                        bucket, 0)):
+                continue
+            bucket_payload = {
+                'bucket_start': bucket,
+                'request_count': request_count,
+                'rejected_count': rejected_count,
+            }
+            buckets.append(bucket_payload)
         if not buckets:
             return None
         return {
@@ -554,13 +608,19 @@ class RequestTimestamp(RequestsAggregator):
         for bucket in snapshot.get('buckets', []):
             bucket_start = bucket.get('bucket_start')
             request_count = bucket.get('request_count')
+            rejected_count = bucket.get('rejected_count', 0)
             current_count = self._request_history.get(bucket_start)
-            if current_count is None:
-                continue
-            accepted_count = min(current_count, request_count)
-            self._acknowledged_request_history[bucket_start] = max(
-                accepted_count,
-                self._acknowledged_request_history.get(bucket_start, 0))
+            if current_count is not None:
+                accepted_count = min(current_count, request_count)
+                self._acknowledged_request_history[bucket_start] = max(
+                    accepted_count,
+                    self._acknowledged_request_history.get(bucket_start, 0))
+            current_rejected = self._rejection_history.get(bucket_start)
+            if current_rejected is not None:
+                accepted_rejected = min(current_rejected, rejected_count)
+                self._acknowledged_rejection_history[bucket_start] = max(
+                    accepted_rejected,
+                    self._acknowledged_rejection_history.get(bucket_start, 0))
 
     def drain(self) -> dict[str, Any]:
         """Take the current timestamps, leaving later arrivals untouched."""
@@ -752,14 +812,12 @@ def _validate_consolidation_mode_config(current_is_consolidation_mode: bool,
                 f'{colorama.Style.RESET_ALL}')
     else:
         noun = 'pool' if pool else 'service'
-        all_services = [
-            svc for svc in serve_state.get_services() if svc['pool'] == pool
-        ]
-        if all_services:
+        num_services = serve_state.get_num_services(pool=pool)
+        if num_services:
             logger.warning(
                 f'{colorama.Fore.RED}Consolidation mode for '
                 f'{controller.controller_type} is disabled, but there are '
-                f'still {len(all_services)} {noun}s running. Please terminate '
+                f'still {num_services} {noun}s running. Please terminate '
                 f'those {noun}s first.{colorama.Style.RESET_ALL}')
 
 
@@ -2006,6 +2064,12 @@ def _get_service_status(
                 'in_flight_requests': 'in_flight_total',
                 'request_queue_depth': 'queue_depth',
                 'rejected_requests': 'rejected_in_window',
+                'recent_rejected_requests': 'rejected_in_recent_window',
+                'rejected_concurrency': 'rejected_concurrency',
+                'raw_target_num_replicas': 'raw_target_num_replicas',
+                'committed_capacity': 'committed_capacity',
+                'target_utilization_percentage': 'target_utilization_percentage',
+                'latest_scale_up_wave_at': 'latest_scale_up_wave_at',
                 'request_stats_age_seconds': 'report_age_seconds',
                 'committed_version': 'committed_version',
                 'applied_version': 'applied_version',
@@ -2171,6 +2235,12 @@ def get_service_status_pickled(
             'with_replica_counts': summary_only,
             'with_target_num_replicas': include_target_num_replicas,
         }
+        # Service summaries are metadata-only dashboard snapshots. Avoid
+        # parsing, redacting, and dumping one YAML document per service on
+        # every poll. Pool summaries deliberately keep YAML because pool
+        # lifecycle consumers parse it back into a launchable task.
+        if summary_only and not pool:
+            kwargs['with_yaml'] = False
         return parent_ctx.copy().run(_get_service_status, name, **kwargs)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
@@ -2251,10 +2321,14 @@ def load_version_string(payload: str) -> str:
 
 
 def get_ready_replicas(
-        service_name: str) -> list['replica_managers.ReplicaInfo']:
+    service_name: str,
+    replicas: list['replica_managers.ReplicaInfo'] | None = None
+) -> list['replica_managers.ReplicaInfo']:
     logger.info(f'Get number of replicas for pool {service_name!r}')
+    if replicas is None:
+        replicas = serve_state.get_replica_infos(service_name)
     return [
-        info for info in serve_state.get_replica_infos(service_name)
+        info for info in replicas
         if info.status == serve_state.ReplicaStatus.READY
     ]
 
@@ -2283,11 +2357,15 @@ def _is_empty_resource(resource: 'resources_lib.Resources') -> bool:
 
 
 def get_free_worker_resources(
-        pool: str) -> dict[str, resources_lib.Resources | None] | None:
+    pool: str,
+    replicas: list['replica_managers.ReplicaInfo'] | None = None
+) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
     Args:
         pool: Pool name (service name)
+        replicas: Optional replica snapshot to reuse; fetched from the state
+            store when not provided.
 
     Returns:
         Dictionary mapping cluster_name (worker) to free Resources object (or
@@ -2295,7 +2373,8 @@ def get_free_worker_resources(
     """
 
     free_resources: dict[str, resources_lib.Resources | None] = {}
-    replicas = serve_state.get_replica_infos(pool)
+    if replicas is None:
+        replicas = serve_state.get_replica_infos(pool)
     used_resources_by_cluster = (
         managed_job_state.get_pool_worker_used_resources_by_cluster(pool))
     if used_resources_by_cluster is None:
@@ -2303,11 +2382,18 @@ def get_free_worker_resources(
                        f'{pool!r}; disabling resource-aware scheduling')
         return None
 
+    # Snapshot every worker's cluster record in one batched read; the
+    # per-replica ``handle()`` fallback would issue one cluster-table read
+    # per worker on every scheduling attempt.
+    cluster_records = global_user_state.get_clusters_from_names(
+        [replica_info.cluster_name for replica_info in replicas])
     for replica_info in replicas:
         cluster_name = replica_info.cluster_name
 
         # Get cluster handle
-        handle = replica_info.handle()
+        cluster_record = cluster_records.get(cluster_name)
+        handle = (None if cluster_record is None else
+                  replica_info.handle(cluster_record))
         if handle is None or handle.launched_resources is None:
             free_resources[cluster_name] = None
             continue
@@ -2370,11 +2456,17 @@ def get_next_cluster_name(
 
     with filelock.FileLock(get_service_filelock_path(service_name)):
         logger.debug(f'Get next cluster name for pool {service_name!r}')
-        ready_replicas = get_ready_replicas(service_name)
+        # Read the replica set once and share the snapshot between readiness
+        # filtering and free-resource accounting so the scheduling decision
+        # is made against a single consistent view of the fleet.
+        replicas = serve_state.get_replica_infos(service_name)
+        ready_replicas = get_ready_replicas(service_name, replicas=replicas)
 
         logger.debug(f'Ready replicas: {ready_replicas!r}')
 
         idle_replicas: list[replica_managers.ReplicaInfo] = []
+        # cluster_name -> the task resource option that fit on that worker.
+        chosen_resources: dict[str, resources_lib.Resources] = {}
 
         # If task_resources is provided, use resource-aware scheduling
         # Normalize task_resources to a list
@@ -2396,7 +2488,8 @@ def get_next_cluster_name(
 
         free_resources = None
         if resource_aware:
-            free_resources = get_free_worker_resources(service_name)
+            free_resources = get_free_worker_resources(service_name,
+                                                       replicas=replicas)
             logger.debug(f'Free resources: {free_resources!r}')
             resource_aware = free_resources is not None
         if resource_aware and free_resources is not None:
@@ -2422,22 +2515,22 @@ def get_next_cluster_name(
                                  'resources')
                     continue
 
-                # Check if any of the task resource options fit
-                fits = False
+                # Check if any of the task resource options fit, remembering
+                # which option fit so the selection below does not have to
+                # recompute it.
                 for task_res in task_resources_list:
                     logger.debug(f'Task resources: {task_res!r}')
                     if _task_fits(task_res, free_resources_on_worker):
                         logger.debug(f'Task resources {task_res!r} fits'
                                      ' in free resources '
                                      f'{free_resources_on_worker!r}')
-                        fits = True
+                        chosen_resources[cluster_name] = task_res
+                        idle_replicas.append(replica_info)
                         break
                     else:
                         logger.debug(f'Task resources {task_res!r} does not fit'
                                      ' in free resources '
                                      f'{free_resources_on_worker!r}')
-                if fits:
-                    idle_replicas.append(replica_info)
         # Also fall back to resource unaware scheduling if no idle replicas are
         # found. This might be because our launched resources were improperly
         # set. If that's the case then jobs will fail to schedule in a resource
@@ -2471,21 +2564,12 @@ def get_next_cluster_name(
         # worker. This must happen before releasing the filelock to ensure
         # atomicity with the scheduling decision.
         if resource_aware and len(task_resources_list) > 1:
-            assert free_resources is not None
-            free_resources_on_worker = free_resources.get(
-                replica_info.cluster_name)
-            if free_resources_on_worker is not None:
-                # Find which task resource fits on this worker
-                for task_res in task_resources_list:
-                    if _task_fits(task_res, free_resources_on_worker):
-                        # Update full_resources in database to this specific
-                        # resource
-                        logger.debug(
-                            f'Updating full_resources for job {job_id!r} '
-                            f'to selected resource: {task_res!r}')
-                        managed_job_state.update_job_full_resources(
-                            job_id, task_res.to_yaml_config())
-                        break
+            chosen_res = chosen_resources.get(replica_info.cluster_name)
+            if chosen_res is not None:
+                logger.debug(f'Updating full_resources for job {job_id!r} '
+                             f'to selected resource: {chosen_res!r}')
+                managed_job_state.update_job_full_resources(
+                    job_id, chosen_res.to_yaml_config())
 
         managed_job_state.set_current_cluster_name(job_id,
                                                    replica_info.cluster_name)
@@ -3256,7 +3340,13 @@ def wait_service_registration(
         # has no setup process.
         if not is_consolidation_mode(pool):
             job_status = job_lib.get_status(job_id)
-            if job_status is None or job_status < job_lib.JobStatus.RUNNING:
+            if job_status is not None and job_status.is_terminal():
+                with ux_utils.print_exception_no_traceback():
+                    raise RuntimeError(
+                        f'The controller job for the {noun} {service_name!r} '
+                        f'reached terminal status {job_status.value} before '
+                        'registration completed.')
+            if job_status != job_lib.JobStatus.RUNNING:
                 # Wait for the controller process to finish setting up. It
                 # can be slow if a lot cloud dependencies are being installed.
                 if time.monotonic() > deadline:

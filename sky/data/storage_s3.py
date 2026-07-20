@@ -1,4 +1,5 @@
 """S3-compatible object storage backend implementations."""
+from abc import ABC
 from abc import abstractmethod
 from collections.abc import Callable
 import dataclasses
@@ -55,6 +56,11 @@ _STORAGE_LOG_FILE_NAME = storage_lib.S3_STORAGE_LOG_FILE_NAME
 _S3_COMPATIBLE_STORES = {}
 
 
+def _quote_cli_path(path: str) -> str:
+    """Expand a configured path before making it shell-safe."""
+    return shlex.quote(os.path.expandvars(os.path.expanduser(path)))
+
+
 def register_s3_compatible_store(store_class):
     """Decorator to automatically register S3-compatible stores."""
     store_type = store_class.get_store_type()
@@ -101,7 +107,7 @@ class S3CompatibleConfig:
             self.extra_cli_env = {}
 
 
-class S3CompatibleStore(AbstractStore):
+class S3CompatibleStore(AbstractStore, ABC):
     """Base class for S3-compatible object storage providers.
 
     This class provides a unified interface for all S3-compatible storage
@@ -520,27 +526,31 @@ class S3CompatibleStore(AbstractStore):
             # Build AWS CLI command with provider-specific configuration
             cmd_parts = ['aws s3 sync --no-follow-symlinks --exclude="*"']
             cmd_parts.append(f'{includes} {base_dir_path}')
-            cmd_parts.append(f's3://{self.name}{sub_path}')
+            target_uri = f's3://{self.name}{sub_path}'
+            cmd_parts.append(shlex.quote(target_uri))
 
             # Add provider-specific arguments
             if self.config.get_endpoint_url:
                 cmd_parts.append(
-                    f'--endpoint-url {self.config.get_endpoint_url()}')
+                    f'--endpoint-url '
+                    f'{shlex.quote(self.config.get_endpoint_url())}')
             if self.config.aws_profile:
-                cmd_parts.append(f'--profile={self.config.aws_profile}')
+                cmd_parts.append(
+                    f'--profile {shlex.quote(self.config.aws_profile)}')
             if self.config.extra_cli_args:
-                cmd_parts.extend(self.config.extra_cli_args)
+                cmd_parts.extend(
+                    shlex.quote(arg) for arg in self.config.extra_cli_args)
 
             # Handle credentials file via environment
             cmd = ' '.join(cmd_parts)
             if self.config.credentials_file:
                 cmd = 'AWS_SHARED_CREDENTIALS_FILE=' + \
-                f'{self.config.credentials_file} {cmd}'
+                f'{_quote_cli_path(self.config.credentials_file)} {cmd}'
             if self.config.config_file:
                 cmd = 'AWS_CONFIG_FILE=' + \
-                f'{self.config.config_file} {cmd}'
+                f'{_quote_cli_path(self.config.config_file)} {cmd}'
             for env_key, env_val in (self.config.extra_cli_env or {}).items():
-                cmd = f'{env_key}={env_val} {cmd}'
+                cmd = f'{env_key}={shlex.quote(env_val)} {cmd}'
 
             return cmd
 
@@ -572,25 +582,29 @@ class S3CompatibleStore(AbstractStore):
 
             cmd_parts = ['aws s3 sync --no-follow-symlinks']
             cmd_parts.append(f'{excludes} {src_dir_path}')
-            cmd_parts.append(f's3://{self.name}{sub_path}/{dest_dir_name}')
+            target_uri = f's3://{self.name}{sub_path}/{dest_dir_name}'
+            cmd_parts.append(shlex.quote(target_uri))
 
             if self.config.get_endpoint_url:
                 cmd_parts.append(
-                    f'--endpoint-url {self.config.get_endpoint_url()}')
+                    f'--endpoint-url '
+                    f'{shlex.quote(self.config.get_endpoint_url())}')
             if self.config.aws_profile:
-                cmd_parts.append(f'--profile={self.config.aws_profile}')
+                cmd_parts.append(
+                    f'--profile {shlex.quote(self.config.aws_profile)}')
             if self.config.extra_cli_args:
-                cmd_parts.extend(self.config.extra_cli_args)
+                cmd_parts.extend(
+                    shlex.quote(arg) for arg in self.config.extra_cli_args)
 
             cmd = ' '.join(cmd_parts)
             if self.config.credentials_file:
                 cmd = 'AWS_SHARED_CREDENTIALS_FILE=' + \
-                f'{self.config.credentials_file} {cmd}'
+                f'{_quote_cli_path(self.config.credentials_file)} {cmd}'
             if self.config.config_file:
                 cmd = 'AWS_CONFIG_FILE=' + \
-                f'{self.config.config_file} {cmd}'
+                f'{_quote_cli_path(self.config.config_file)} {cmd}'
             for env_key, env_val in (self.config.extra_cli_env or {}).items():
-                cmd = f'{env_key}={env_val} {cmd}'
+                cmd = f'{env_key}={shlex.quote(env_val)} {cmd}'
 
             return cmd
 
@@ -637,16 +651,19 @@ class S3CompatibleStore(AbstractStore):
             if error_code == '403':
                 command = f'aws s3 ls s3://{self.name}'
                 if self.config.aws_profile:
-                    command += f' --profile={self.config.aws_profile}'
+                    command += (
+                        f' --profile {shlex.quote(self.config.aws_profile)}')
                 if self.config.get_endpoint_url:
                     command += f' --endpoint-url '\
-                        f'{self.config.get_endpoint_url()}'
+                        f'{shlex.quote(self.config.get_endpoint_url())}'
                 if self.config.credentials_file:
-                    command = (f'AWS_SHARED_CREDENTIALS_FILE='
-                               f'{self.config.credentials_file} {command}')
+                    command = (
+                        f'AWS_SHARED_CREDENTIALS_FILE='
+                        f'{_quote_cli_path(self.config.credentials_file)} '
+                        f'{command}')
                 if self.config.config_file:
                     command = 'AWS_CONFIG_FILE=' + \
-                    f'{self.config.config_file} {command}'
+                    f'{_quote_cli_path(self.config.config_file)} {command}'
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketGetError(
                         _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name) +
@@ -706,22 +723,25 @@ class S3CompatibleStore(AbstractStore):
 
     def _delete_bucket(self, bucket_name: str) -> bool:
         """Delete bucket using AWS CLI."""
-        cmd_parts = [f'aws s3 rb s3://{bucket_name} --force']
+        cmd_parts = [f'aws s3 rb {shlex.quote(f"s3://{bucket_name}")} --force']
 
         if self.config.aws_profile:
-            cmd_parts.append(f'--profile={self.config.aws_profile}')
+            cmd_parts.append(
+                f'--profile {shlex.quote(self.config.aws_profile)}')
         if self.config.get_endpoint_url:
-            cmd_parts.append(f'--endpoint-url {self.config.get_endpoint_url()}')
+            cmd_parts.append(f'--endpoint-url '
+                             f'{shlex.quote(self.config.get_endpoint_url())}')
 
         remove_command = ' '.join(cmd_parts)
 
         if self.config.credentials_file:
-            remove_command = (f'AWS_SHARED_CREDENTIALS_FILE='
-                              f'{self.config.credentials_file} '
-                              f'{remove_command}')
+            remove_command = (
+                f'AWS_SHARED_CREDENTIALS_FILE='
+                f'{_quote_cli_path(self.config.credentials_file)} '
+                f'{remove_command}')
         if self.config.config_file:
             remove_command = 'AWS_CONFIG_FILE=' + \
-            f'{self.config.config_file} {remove_command}'
+            f'{_quote_cli_path(self.config.config_file)} {remove_command}'
         return self._execute_remove_command(
             remove_command, bucket_name,
             f'Deleting {self.config.store_type} bucket {bucket_name}',
@@ -766,22 +786,26 @@ class S3CompatibleStore(AbstractStore):
 
     def _delete_bucket_sub_path(self, bucket_name: str, sub_path: str) -> bool:
         """Delete objects in the sub path from the bucket."""
-        cmd_parts = [f'aws s3 rm s3://{bucket_name}/{sub_path}/ --recursive']
+        target_uri = f's3://{bucket_name}/{sub_path}/'
+        cmd_parts = [f'aws s3 rm {shlex.quote(target_uri)} --recursive']
 
         if self.config.aws_profile:
-            cmd_parts.append(f'--profile={self.config.aws_profile}')
+            cmd_parts.append(
+                f'--profile {shlex.quote(self.config.aws_profile)}')
         if self.config.get_endpoint_url:
-            cmd_parts.append(f'--endpoint-url {self.config.get_endpoint_url()}')
+            cmd_parts.append(f'--endpoint-url '
+                             f'{shlex.quote(self.config.get_endpoint_url())}')
 
         remove_command = ' '.join(cmd_parts)
 
         if self.config.credentials_file:
-            remove_command = (f'AWS_SHARED_CREDENTIALS_FILE='
-                              f'{self.config.credentials_file} '
-                              f'{remove_command}')
+            remove_command = (
+                f'AWS_SHARED_CREDENTIALS_FILE='
+                f'{_quote_cli_path(self.config.credentials_file)} '
+                f'{remove_command}')
         if self.config.config_file:
             remove_command = 'AWS_CONFIG_FILE=' + \
-            f'{self.config.config_file} {remove_command}'
+            f'{_quote_cli_path(self.config.config_file)} {remove_command}'
         return self._execute_remove_command(
             remove_command, bucket_name,
             (f'Removing objects from {self.config.store_type} bucket '

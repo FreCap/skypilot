@@ -168,6 +168,13 @@ class TestResourcesSchema(unittest.TestCase):
                     msg=f"Expected priority config {config} to be rejected"):
                 jsonschema.validate(instance=config, schema=resources_schema)
 
+    def test_empty_accelerators_rejected(self):
+        resources_schema = schemas.get_resources_schema()
+
+        with self.assertRaises(jsonschema.exceptions.ValidationError):
+            jsonschema.validate(instance={'accelerators': {}},
+                                schema=resources_schema)
+
 
 class TestWorkspaceSchema(unittest.TestCase):
     """Tests for the workspace schema in schemas.py"""

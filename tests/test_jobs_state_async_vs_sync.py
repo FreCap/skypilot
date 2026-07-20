@@ -44,7 +44,11 @@ def _mock_jobs_db_conn(tmp_path, monkeypatch):
     # Create schema
     state.create_table(engine)
 
-    yield
+    try:
+        yield
+    finally:
+        asyncio.run(async_engine.dispose())
+        engine.dispose()
 
 
 @pytest.fixture
@@ -96,8 +100,7 @@ def _seed_complex_job(_mock_jobs_db_conn) -> int:
 
 def _set_statuses(job_id: int, updates: Dict[int, state.ManagedJobStatus]):
     """Helper to set statuses for specific task_ids for the mocked DB."""
-    engine = state._db_manager.engine
-    assert engine is not None
+    engine = state._db_manager.get_engine()
     from sqlalchemy import and_
     from sqlalchemy import orm as sa_orm
     from sqlalchemy import update
@@ -224,8 +227,7 @@ async def test_schedule_state_transitions_same(_mock_jobs_db_conn):
     # LAUNCHING
     from sqlalchemy import orm as sa_orm
     from sqlalchemy import update as sa_update
-    eng = state._db_manager.engine
-    assert eng is not None
+    eng = state._db_manager.get_engine()
     with sa_orm.Session(eng) as sess:
         sess.execute(
             sa_update(state.job_info_table).where(

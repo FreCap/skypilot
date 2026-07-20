@@ -660,6 +660,33 @@ class TestAwsConfigureList:
 
     @mock.patch('sky.adaptors.aws.get_workspace_profile')
     @mock.patch('subprocess.run')
+    def test_missing_cli_returns_none(self, mock_run, mock_get_profile):
+        """Missing AWS CLI preserves the identity fallback contract."""
+        mock_get_profile.return_value = None
+        mock_run.side_effect = FileNotFoundError
+        aws_mod.AWS._aws_configure_list.cache_clear()
+
+        assert aws_mod.AWS._aws_configure_list() is None
+
+    @mock.patch('sky.adaptors.aws.get_workspace_profile')
+    @mock.patch('subprocess.run')
+    def test_profile_name_passed_as_single_argument(self, mock_run,
+                                                    mock_get_profile):
+        """Profile names with spaces and quotes remain one CLI argument."""
+        mock_run.return_value = mock.Mock(returncode=0, stdout=b'output')
+        profile = 'research team\'s "gpu" account'
+        mock_get_profile.return_value = profile
+        aws_mod.AWS._aws_configure_list.cache_clear()
+
+        aws_mod.AWS._aws_configure_list()
+
+        assert mock_run.call_args.args[0] == [
+            'aws', 'configure', 'list', '--profile', profile
+        ]
+        assert not mock_run.call_args.kwargs.get('shell', False)
+
+    @mock.patch('sky.adaptors.aws.get_workspace_profile')
+    @mock.patch('subprocess.run')
     def test_command_generation_with_profiles(self, mock_run, mock_get_profile):
         """Test command generation with no profile, with profile, and different profiles."""
         mock_result = mock.Mock()
@@ -672,18 +699,21 @@ class TestAwsConfigureList:
         # Test with no profile
         mock_get_profile.return_value = None
         aws_mod.AWS._aws_configure_list()
-        assert mock_run.call_args[0][0] == 'aws configure list'
+        assert mock_run.call_args[0][0] == ['aws', 'configure', 'list']
 
         # Test with profile
         mock_get_profile.return_value = 'dev'
         aws_mod.AWS._aws_configure_list()
-        assert mock_run.call_args[0][0] == 'aws configure list --profile dev'
+        assert mock_run.call_args[0][0] == [
+            'aws', 'configure', 'list', '--profile', 'dev'
+        ]
 
         # Test with different profiles
         mock_get_profile.return_value = 'profile1'
         aws_mod.AWS._aws_configure_list()
-        assert mock_run.call_args[0][
-            0] == 'aws configure list --profile profile1'
+        assert mock_run.call_args[0][0] == [
+            'aws', 'configure', 'list', '--profile', 'profile1'
+        ]
 
     @mock.patch('sky.adaptors.aws.get_workspace_profile')
     @mock.patch('subprocess.run')

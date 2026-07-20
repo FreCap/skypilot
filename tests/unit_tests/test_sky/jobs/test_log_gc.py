@@ -161,3 +161,53 @@ def test_task_cleanup_observes_directory_failure_and_missing_is_success(
     assert 'Failed to clean task logs for job 1, task 0' in caplog.text
     assert (failed.parent / 'tasks').exists()
     assert not (succeeded.parent / 'tasks').exists()
+
+
+def test_controller_cleanup_all_failed_full_batch_ends_round(
+        monkeypatch, tmp_path):
+    paths = {job_id: tmp_path / f'{job_id}.log' for job_id in (1, 2)}
+    for path in paths.values():
+        path.write_text('old log', encoding='utf-8')
+    get_logs = mock.Mock(return_value=[{'job_id': job_id} for job_id in paths])
+    set_cleaned = mock.Mock()
+    monkeypatch.setattr(log_gc.managed_job_state,
+                        'get_controller_logs_to_clean', get_logs)
+    monkeypatch.setattr(log_gc.managed_job_state, 'set_controller_logs_cleaned',
+                        set_cleaned)
+    monkeypatch.setattr(log_gc.managed_job_utils, 'controller_log_file_for_job',
+                        lambda job_id: str(paths[job_id]))
+
+    original_open = builtins.open
+
+    def _open(path, *args, **kwargs):
+        if pathlib.Path(path) in paths.values():
+            raise OSError('read-only filesystem')
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', _open)
+
+    # A full batch with zero progress would be re-selected verbatim; the
+    # round must complete so the caller sleeps until the next interval.
+    assert log_gc._clean_controller_logs_with_retention(60, batch_size=2)
+    assert set_cleaned.call_args.kwargs['job_ids'] == []
+
+
+def test_task_cleanup_all_failed_full_batch_ends_round(monkeypatch, tmp_path):
+    log_files = [tmp_path / f'{job_id}' / 'run.log' for job_id in (1, 2)]
+    for log_file in log_files:
+        log_file.parent.mkdir()
+        log_file.write_text('old log', encoding='utf-8')
+    get_tasks = mock.Mock(return_value=[
+        _task(idx + 1, log_file) for idx, log_file in enumerate(log_files)
+    ])
+    set_cleaned = mock.Mock()
+    monkeypatch.setattr(log_gc.managed_job_state, 'get_task_logs_to_clean',
+                        get_tasks)
+    monkeypatch.setattr(log_gc.managed_job_state, 'set_task_logs_cleaned',
+                        set_cleaned)
+    monkeypatch.setattr(
+        pathlib.Path, 'unlink',
+        mock.Mock(side_effect=PermissionError('operation not permitted')))
+
+    assert log_gc._clean_task_logs_with_retention(60, batch_size=2)
+    assert set_cleaned.call_args.kwargs['tasks'] == []

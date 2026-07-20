@@ -173,7 +173,7 @@ class MutatedUserRequest:
                            mutated_user_request_body.skypilot_config)[0],))
 
 
-class PolicyInterface:
+class PolicyInterface(abc.ABC):
     """Interface for admin-defined policy for user requests."""
 
     @abc.abstractmethod

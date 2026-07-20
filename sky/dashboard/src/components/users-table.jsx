@@ -42,11 +42,9 @@ import {
 } from '@/components/users-batch-dialogs';
 import { filterData } from '@/components/shared/FilterSystem';
 import {
-  ACTIVE_JOB_STATUSES,
   aggregateUserUsage,
+  buildUsageFilterLookup,
   fetchClustersAndJobs,
-  getGPUCount,
-  getJobGpuCount,
 } from '@/components/user-usage';
 
 const parseUsername = (username, userId) => {
@@ -155,143 +153,10 @@ export function UsersTable({
 
         const jobsData = jobsResponse.jobs || [];
 
-        // Build combined lookup dictionary for GPU type and infra filtering
-        // Structure: userId -> infra -> gpuType -> { clusterCount, jobCount, gpuCount }
-        //            userId -> infra -> "Total" -> { clusterCount, jobCount, gpuCount }
-        //            userId -> "Total" -> gpuType -> { clusterCount, jobCount, gpuCount }
-        const newCombinedLookup = {};
-
-        // Helper to extract GPU type from accelerators
-        const extractGPUType = (accelerators) => {
-          if (!accelerators) return null;
-
-          let parsed = accelerators;
-          if (typeof accelerators === 'string') {
-            try {
-              const jsonStr = accelerators
-                .replace(/'/g, '"')
-                .replace(/None/g, 'null');
-              parsed = JSON.parse(jsonStr);
-            } catch (e) {
-              return null;
-            }
-          }
-
-          if (typeof parsed === 'object' && parsed !== null) {
-            const entries = Object.entries(parsed);
-            if (entries.length > 0) {
-              return entries[0][0]; // Return GPU type (the key)
-            }
-          }
-          return null;
-        };
-
-        // Helper to update combined lookup
-        const updateCombinedLookup = (
-          userId,
-          infra,
-          gpuType,
-          clusterDelta,
-          jobDelta,
-          gpuDelta
-        ) => {
-          if (!userId || !infra) return;
-
-          // Initialize user structure
-          if (!newCombinedLookup[userId]) {
-            newCombinedLookup[userId] = {};
-          }
-
-          // Initialize infra structure
-          if (!newCombinedLookup[userId][infra]) {
-            newCombinedLookup[userId][infra] = {};
-          }
-
-          // Initialize cross-infra "Total" structure
-          if (!newCombinedLookup[userId]['Total']) {
-            newCombinedLookup[userId]['Total'] = {};
-          }
-
-          // Update infra -> "Total" (all resources in this infra)
-          if (!newCombinedLookup[userId][infra]['Total']) {
-            newCombinedLookup[userId][infra]['Total'] = {
-              clusterCount: 0,
-              jobCount: 0,
-              gpuCount: 0,
-            };
-          }
-          newCombinedLookup[userId][infra]['Total'].clusterCount +=
-            clusterDelta;
-          newCombinedLookup[userId][infra]['Total'].jobCount += jobDelta;
-          newCombinedLookup[userId][infra]['Total'].gpuCount += gpuDelta;
-
-          // Update infra -> gpuType (specific GPU type in this infra) if gpuType exists
-          if (gpuType) {
-            if (!newCombinedLookup[userId][infra][gpuType]) {
-              newCombinedLookup[userId][infra][gpuType] = {
-                clusterCount: 0,
-                jobCount: 0,
-                gpuCount: 0,
-              };
-            }
-            newCombinedLookup[userId][infra][gpuType].clusterCount +=
-              clusterDelta;
-            newCombinedLookup[userId][infra][gpuType].jobCount += jobDelta;
-            newCombinedLookup[userId][infra][gpuType].gpuCount += gpuDelta;
-
-            // Update "Total" -> gpuType (cross-infra aggregates for this GPU type)
-            if (!newCombinedLookup[userId]['Total'][gpuType]) {
-              newCombinedLookup[userId]['Total'][gpuType] = {
-                clusterCount: 0,
-                jobCount: 0,
-                gpuCount: 0,
-              };
-            }
-            newCombinedLookup[userId]['Total'][gpuType].clusterCount +=
-              clusterDelta;
-            newCombinedLookup[userId]['Total'][gpuType].jobCount += jobDelta;
-            newCombinedLookup[userId]['Total'][gpuType].gpuCount += gpuDelta;
-          }
-        };
-
-        // Process clusters to build lookup
-        for (const cluster of clustersData || []) {
-          const userId = cluster.user_hash;
-          if (!userId) continue;
-
-          const gpuType = extractGPUType(cluster.gpus);
-          const infra = cluster.infra;
-
-          // Count GPUs (only from active clusters)
-          let gpuCount = 0;
-          if (cluster.status !== 'STOPPED' && cluster.status !== 'TERMINATED') {
-            const gpuCountPerNode = getGPUCount(
-              cluster.gpus,
-              `Cluster ${cluster.cluster}`
-            );
-            // Multiply by number of nodes to get total GPU count
-            const numNodes = cluster.num_nodes || 1;
-            gpuCount = gpuCountPerNode * numNodes;
-          }
-
-          updateCombinedLookup(userId, infra, gpuType, 1, 0, gpuCount);
-        }
-
-        // Process jobs to build lookup
-        for (const job of jobsData || []) {
-          if (!ACTIVE_JOB_STATUSES.has(job.status)) continue;
-
-          const userId = job.user_hash;
-          if (!userId) continue;
-
-          const gpuType = extractGPUType(job.accelerators);
-          const infra = job.infra;
-          // The job is always counted toward the (active) job count, but only
-          // contributes GPUs if it has actually been allocated them.
-          const gpuCount = getJobGpuCount(job);
-
-          updateCombinedLookup(userId, infra, gpuType, 0, 1, gpuCount);
-        }
+        const newCombinedLookup = buildUsageFilterLookup(
+          clustersData,
+          jobsData
+        );
 
         // Store the lookup dictionary
         setCombinedLookup(newCombinedLookup);

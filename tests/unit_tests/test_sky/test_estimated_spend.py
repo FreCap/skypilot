@@ -157,6 +157,64 @@ def test_split_interval_at_utc_midnight():
     }
 
 
+def test_cost_projection_facade_and_row_shape():
+    assert estimated_spend.estimate_hourly_cost.__module__ == (
+        'sky.estimated_spend')
+    assert pickle.loads(pickle.dumps(estimated_spend.estimate_hourly_cost)) is (
+        estimated_spend.estimate_hourly_cost)
+
+    day = 1_700_006_400
+    as_of = day + 30 * 3600
+    rows = estimated_spend._build_daily_rows(_source(start=day + 22 * 3600,
+                                                     end=day + 26 * 3600,
+                                                     hourly_cost=3.0,
+                                                     num_nodes=2,
+                                                     use_spot=True),
+                                             as_of=as_of,
+                                             recompute_start=day,
+                                             rate_cache={})
+
+    assert rows == [{
+        'day_start_utc': day,
+        'cluster_hash': 'hash-1',
+        'cluster_name': 'job-cluster-hash-1',
+        'workload_type': 'managed_job',
+        'workload_id': '42',
+        'workload_task_id': 0,
+        'user_hash': 'user-1',
+        'workspace': 'default',
+        'cloud': 'AWS',
+        'region': 'us-east-1',
+        'use_spot': True,
+        'num_nodes': 2,
+        'machine_seconds': 4 * 3600,
+        'catalog_hourly_rate': 6.0,
+        'estimated_cost': 12.0,
+        'exclusion_reason': None,
+        'priced_at': as_of,
+        'updated_at': as_of,
+    }, {
+        'day_start_utc': day + estimated_spend.SECONDS_PER_DAY,
+        'cluster_hash': 'hash-1',
+        'cluster_name': 'job-cluster-hash-1',
+        'workload_type': 'managed_job',
+        'workload_id': '42',
+        'workload_task_id': 0,
+        'user_hash': 'user-1',
+        'workspace': 'default',
+        'cloud': 'AWS',
+        'region': 'us-east-1',
+        'use_spot': True,
+        'num_nodes': 2,
+        'machine_seconds': 4 * 3600,
+        'catalog_hourly_rate': 6.0,
+        'estimated_cost': 12.0,
+        'exclusion_reason': None,
+        'priced_at': as_of,
+        'updated_at': as_of,
+    }]
+
+
 def test_build_rows_uses_machine_uptime_and_node_count():
     day = 1_700_006_400
     rows = estimated_spend._build_daily_rows(_source(start=day + 22 * 3600,

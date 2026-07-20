@@ -641,23 +641,24 @@ class AzureBlobStore(AbstractStore):
                 set to True, the directory is created in the bucket root and
                 contents are uploaded to it.
         """
+        if self.storage_account_key is None:
+            raise RuntimeError('Azure storage account key is not initialized.')
+        storage_account_key = self.storage_account_key
         container_path = (f'{self.container_name}/{self._bucket_sub_path}'
                           if self._bucket_sub_path else self.container_name)
 
         def get_file_sync_command(base_dir_path, file_names) -> str:
-            # shlex.quote is not used for file_names as 'az storage blob sync'
-            # already handles file names with empty spaces when used with
-            # '--include-pattern' option.
             includes_list = ';'.join(file_names)
-            includes = f'--include-pattern "{includes_list}"'
-            base_dir_path = shlex.quote(base_dir_path)
+            includes = f'--include-pattern {shlex.quote(includes_list)}'
             sync_command = (f'az storage blob sync '
-                            f'--account-name {self.storage_account_name} '
-                            f'--account-key {self.storage_account_key} '
+                            f'--account-name '
+                            f'{shlex.quote(self.storage_account_name)} '
+                            f'--account-key '
+                            f'{shlex.quote(storage_account_key)} '
                             f'{includes} '
                             '--delete-destination false '
-                            f'--source {base_dir_path} '
-                            f'--container {container_path}')
+                            f'--source {shlex.quote(base_dir_path)} '
+                            f'--container {shlex.quote(container_path)}')
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name) -> str:
@@ -666,19 +667,21 @@ class AzureBlobStore(AbstractStore):
             excluded_list.append('.git/')
             excludes_list = ';'.join(
                 [file_name.rstrip('*') for file_name in excluded_list])
-            excludes = f'--exclude-path "{excludes_list}"'
-            src_dir_path = shlex.quote(src_dir_path)
+            excludes = f'--exclude-path {shlex.quote(excludes_list)}'
             if dest_dir_name:
-                dest_dir_name = f'/{dest_dir_name}'
+                target_container_path = f'{container_path}/{dest_dir_name}'
             else:
-                dest_dir_name = ''
+                target_container_path = container_path
             sync_command = (f'az storage blob sync '
-                            f'--account-name {self.storage_account_name} '
-                            f'--account-key {self.storage_account_key} '
+                            f'--account-name '
+                            f'{shlex.quote(self.storage_account_name)} '
+                            f'--account-key '
+                            f'{shlex.quote(storage_account_key)} '
                             f'{excludes} '
                             '--delete-destination false '
-                            f'--source {src_dir_path} '
-                            f'--container {container_path}{dest_dir_name}')
+                            f'--source {shlex.quote(src_dir_path)} '
+                            f'--container '
+                            f'{shlex.quote(target_container_path)}')
             return sync_command
 
         # Generate message for upload

@@ -69,7 +69,7 @@ def test_no_merge_when_flag_disabled(monkeypatch):
 
     monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
                         _should_not_be_called)
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _should_not_be_called)
 
     result = core.get_job_events(job_id=1,
@@ -105,20 +105,20 @@ def test_merge_orders_newest_first_and_truncates(monkeypatch):
     ]
     captured = {}
 
-    def _fake_cluster_events(name, event_types, limit=None):
-        captured['name'] = name
+    def _fake_cluster_events(names, event_types, limit=None):
+        captured['names'] = names
         captured['event_types'] = event_types
         captured['limit'] = limit
         return list(cluster_events)
 
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _fake_cluster_events)
 
     result = core.get_job_events(job_id=1, limit=3, include_cluster_events=True)
 
     # Cluster name reconstructed from the per-task name + job id (not the
     # job-level/DAG name 'my-pipeline').
-    assert captured['name'] == 'my-task-1'
+    assert captured['names'] == ['my-task-1']
     # Both the milestone sequence and the finer-grained launch progress are
     # requested.
     assert (set(captured['event_types']) == {
@@ -152,7 +152,7 @@ def test_pool_jobs_skip_merge(monkeypatch):
     def _should_not_be_called(*args, **kwargs):
         raise AssertionError('pool clusters must not be merged')
 
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _should_not_be_called)
 
     result = core.get_job_events(job_id=1, include_cluster_events=True)
@@ -174,7 +174,8 @@ def test_merge_is_best_effort_on_error(monkeypatch):
     def _raise(*args, **kwargs):
         raise RuntimeError('db unavailable')
 
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name', _raise)
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
+                        _raise)
 
     result = core.get_job_events(job_id=1, include_cluster_events=True)
     assert result == job_events
@@ -193,7 +194,7 @@ def test_no_tasks_skips_merge(monkeypatch):
     def _should_not_be_called(*args, **kwargs):
         raise AssertionError('no cluster name -> no merge')
 
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _should_not_be_called)
 
     result = core.get_job_events(job_id=1, include_cluster_events=True)
@@ -219,7 +220,7 @@ def test_merged_events_match_job_event_timezone(monkeypatch):
     monkeypatch.setattr(managed_job_utils, 'generate_managed_job_cluster_name',
                         lambda name, job_id: f'{name}-{job_id}')
     monkeypatch.setattr(
-        global_user_state, 'get_cluster_events_by_name', lambda *a, **k: [{
+        global_user_state, 'get_cluster_events_by_names', lambda *a, **k: [{
             'reason': 'Provisioning',
             'transitioned_at': 200
         }])
@@ -251,16 +252,23 @@ def test_pipeline_uses_per_task_cluster_name(monkeypatch):
                         lambda name, job_id: f'{name}-{job_id}')
 
     queried_names = []
+    batch_calls = 0
 
-    def _fake_cluster_events(name, event_types, limit=None):
+    def _fake_cluster_events(names, event_types, limit=None):
+        nonlocal batch_calls
         del event_types, limit
-        queried_names.append(name)
-        return [{'reason': f'Provisioning {name}', 'transitioned_at': 100}]
+        batch_calls += 1
+        queried_names.extend(names)
+        return [{
+            'reason': f'Provisioning {name}',
+            'transitioned_at': 100
+        } for name in names]
 
-    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
+    monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _fake_cluster_events)
 
     core.get_job_events(job_id=1, include_cluster_events=True)
 
     # Per-task cluster names, not the shared DAG name 'pipe-1'.
     assert queried_names == ['pipe-0-1', 'pipe-1-1']
+    assert batch_calls == 1

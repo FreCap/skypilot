@@ -499,7 +499,7 @@ def kill_process_daemon(process_pid: int, use_kill_pg: bool = False) -> None:
     # daemon script will detach itself from the parent process with
     # fork to avoid being killed by parent process. See the reason we
     # daemonize the process in `sky/skylet/subprocess_daemon.py`.
-    subprocess.Popen(
+    daemon_launcher = subprocess.Popen(
         daemon_cmd,
         # Suppress output
         stdout=subprocess.DEVNULL,
@@ -508,6 +508,10 @@ def kill_process_daemon(process_pid: int, use_kill_pg: bool = False) -> None:
         stdin=subprocess.DEVNULL,
         env=env,
     )
+    # subprocess_daemon double-forks immediately. Reap its short-lived launcher
+    # after the detached grandchild is running so it cannot become a zombie or
+    # emit an unclosed-subprocess ResourceWarning in this process.
+    daemon_launcher.wait()
 
 
 def launch_new_process_tree(cmd: str, log_output: str = '/dev/null') -> int:

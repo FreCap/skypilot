@@ -156,10 +156,9 @@ class Hyperbolic(clouds.Cloud):
     def _check_compute_credentials(cls) -> tuple[bool, str | None]:
         return cls._check_credentials()
 
-    @classmethod
-    def get_credential_file_mounts(cls) -> dict[str, str]:
-        if os.path.exists(cls.API_KEY_PATH):
-            return {cls.API_KEY_PATH: '~/.hyperbolic/api_key'}
+    def get_credential_file_mounts(self) -> dict[str, str]:
+        if os.path.exists(self.API_KEY_PATH):
+            return {self.API_KEY_PATH: '~/.hyperbolic/api_key'}
         return {}
 
     def __repr__(self):

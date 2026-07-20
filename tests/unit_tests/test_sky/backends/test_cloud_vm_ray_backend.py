@@ -3,6 +3,7 @@
 import multiprocessing
 import socket
 import time
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -15,7 +16,41 @@ from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import GangSchedulingStatus
 from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
+from sky.schemas.generated import jobsv1_pb2
 from sky.utils import status_lib
+
+
+def test_set_job_info_encodes_nullable_job_group_roles():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock(is_grpc_enabled_with_flag=True)
+    client = MagicMock()
+    client.set_job_info_without_job_id.return_value = (
+        jobsv1_pb2.SetJobInfoWithoutJobIdResponse(job_ids=[7]))
+
+    with patch.object(cloud_vm_ray_backend, 'SkyletClient',
+                      return_value=client), patch.object(
+                          cloud_vm_ray_backend.backend_utils,
+                          'invoke_skylet_with_retries',
+                          side_effect=lambda callback: callback()):
+        job_ids = backend.set_job_info_without_job_id(
+            handle=handle,
+            name='job',
+            workspace='default',
+            entrypoint='sky jobs launch job.yaml',
+            pool=None,
+            pool_hash=None,
+            user_hash=None,
+            task_ids=[0, 1],
+            task_names=['standalone', 'primary'],
+            resources_str='{}',
+            metadata_jsons=['{}', '{}'],
+            is_primary_in_job_groups=[None, True])
+
+    assert job_ids == [7]
+    request = client.set_job_info_without_job_id.call_args.args[0]
+    assert list(request.is_primary_in_job_groups) == [False, True]
+    assert not request.is_primary_in_job_groups_v2[0].HasField('value')
+    assert request.is_primary_in_job_groups_v2[1].value is True
 
 
 @pytest.mark.parametrize(('workers_ready', 'expected_status'),
@@ -57,6 +92,22 @@ def test_gang_schedule_uses_worker_readiness_result(workers_ready,
                                             num_nodes=2,
                                             log_path='/tmp/provision.log',
                                             nodes_launching_progress_timeout=90)
+
+
+def test_wait_service_registration_rpc_covers_both_phase_budgets():
+    """The RPC deadline must not preempt either server-side wait phase."""
+    client = object.__new__(cloud_vm_ray_backend.SkyletClient)
+    client._serve_stub = MagicMock()  # pylint: disable=protected-access
+    request = MagicMock()
+
+    client.wait_service_registration(request)
+
+    expected_timeout = (
+        cloud_vm_ray_backend.serve_constants.CONTROLLER_SETUP_TIMEOUT_SECONDS +
+        cloud_vm_ray_backend.serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS +
+        10)
+    client._serve_stub.WaitServiceRegistration.assert_called_once_with(  # pylint: disable=protected-access
+        request, timeout=expected_timeout)
 
 
 class TestCloudVmRayBackendTaskRedaction:
@@ -526,6 +577,50 @@ class TestCloudVmRayBackendGetGrpcChannel:
 
         assert clock.sleeps == pytest.approx([0.02])
         assert clock.now == pytest.approx(1.0)
+
+    def test_get_grpc_channel_rechecks_tunnel_after_exclusive_lock(self):
+        """A late lock winner reuses a tunnel refreshed by another process."""
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        stale_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                     pid=self.INITIAL_TUNNEL_PID)
+        fresh_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
+                                     pid=self.INITIAL_TUNNEL_PID + 1)
+
+        class _AcquiredLock:
+
+            def acquire(self, blocking):
+                assert not blocking
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+
+        open_tunnel = MagicMock()
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel',
+                side_effect=[stale_tunnel, fresh_tunnel]), patch.object(
+                    handle, '_open_and_update_skylet_tunnel',
+                    open_tunnel), patch.object(
+                        cloud_vm_ray_backend,
+                        '_is_tunnel_healthy',
+                        side_effect=[False, True]) as is_healthy, patch.object(
+                            cloud_vm_ray_backend.locks,
+                            'get_lock',
+                            return_value=_AcquiredLock()), patch(
+                                'grpc.insecure_channel',
+                                side_effect=lambda addr, options: addr):
+            channel = handle.get_grpc_channel()
+
+        assert channel == f'localhost:{self.INITIAL_TUNNEL_PORT + 1}'
+        assert is_healthy.call_args_list == [
+            call(stale_tunnel),
+            call(fresh_tunnel),
+        ]
+        open_tunnel.assert_not_called()
 
     def test_get_grpc_channel_multiprocess_race_condition(self):
         """Test get_grpc_channel with multiple processes racing for tunnel creation."""

@@ -1,4 +1,5 @@
 """Unit tests for cluster_event accessors in global_user_state."""
+# pylint: disable=protected-access
 import time
 
 import sqlalchemy
@@ -247,6 +248,102 @@ def test_get_cluster_events_multiple_types_merged_and_ordered(
     assert global_user_state.get_cluster_events(
         cluster_name=None, cluster_hash=cluster_hash, event_type=both,
         limit=2) == ['Launching (pulling)', 'Cluster provisioned']
+
+
+def test_get_cluster_events_by_names_global_limit_after_teardown(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('task-a')
+    _add_cluster('task-b')
+    for name, reason, event_type, transitioned_at in [
+        ('task-a', 'a-old', global_user_state.ClusterEventType.STATUS_CHANGE,
+         100),
+        ('task-a', 'a-new', global_user_state.ClusterEventType.LAUNCH_PROGRESS,
+         200),
+        ('task-b', 'b-newest', global_user_state.ClusterEventType.STATUS_CHANGE,
+         300),
+        ('task-b', 'debug-noise', global_user_state.ClusterEventType.DEBUG,
+         400),
+    ]:
+        global_user_state.add_cluster_event(name,
+                                            new_status=None,
+                                            reason=reason,
+                                            event_type=event_type,
+                                            transitioned_at=transitioned_at)
+    global_user_state.remove_cluster('task-a', terminate=True)
+    global_user_state.remove_cluster('task-b', terminate=True)
+
+    # Put the two real names in separate 500-name query chunks. The duplicate
+    # also proves input de-duplication does not duplicate returned events.
+    cluster_names = (['task-a'] + [f'unused-{i}' for i in range(499)] +
+                     ['task-b', 'task-a'])
+    event_types = [
+        global_user_state.ClusterEventType.STATUS_CHANGE,
+        global_user_state.ClusterEventType.LAUNCH_PROGRESS,
+    ]
+    events = global_user_state.get_cluster_events_by_names(cluster_names,
+                                                           event_types,
+                                                           limit=2)
+
+    assert events == [{
+        'reason': 'b-newest',
+        'transitioned_at': 300,
+    }, {
+        'reason': 'a-new',
+        'transitioned_at': 200,
+    }]
+    # SQLAlchemy's existing negative-limit behavior is unbounded. Do not add a
+    # second Python negative slice when merging multiple query chunks.
+    assert global_user_state.get_cluster_events_by_names(
+        cluster_names, event_types, limit=-1) == [{
+            'reason': 'b-newest',
+            'transitioned_at': 300,
+        }, {
+            'reason': 'a-new',
+            'transitioned_at': 200,
+        }, {
+            'reason': 'a-old',
+            'transitioned_at': 100,
+        }]
+
+
+def test_get_cluster_events_by_names_bounds_query_count(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    engine = global_user_state._db_manager.get_engine()
+    counter = {'selects': 0}
+
+    def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                               executemany):
+        del conn, cursor, parameters, context, executemany
+        lowered = statement.lower()
+        if (lowered.lstrip().startswith('select') and
+                'cluster_events' in lowered):
+            counter['selects'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _before_cursor_execute)
+    event_types = [global_user_state.ClusterEventType.STATUS_CHANGE]
+
+    assert global_user_state.get_cluster_events_by_names([], event_types) == []
+    assert global_user_state.get_cluster_events_by_names(['unused'], [],
+                                                         limit=10) == []
+    assert global_user_state.get_cluster_events_by_names(['unused'],
+                                                         event_types,
+                                                         limit=0) == []
+    assert counter['selects'] == 0
+
+    names = [f'task-{i}' for i in range(20)]
+    assert global_user_state.get_cluster_events_by_names(names,
+                                                         event_types,
+                                                         limit=10) == []
+    assert counter['selects'] == 1
+
+    counter['selects'] = 0
+    names = [f'task-{i}' for i in range(501)]
+    assert global_user_state.get_cluster_events_by_names(names,
+                                                         event_types,
+                                                         limit=10) == []
+    assert counter['selects'] == 2
 
 
 def _count_cluster_table_selects(engine):

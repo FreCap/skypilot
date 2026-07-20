@@ -4,6 +4,7 @@ Covers function serialization, remote function validation, and utility
 functions.
 """
 import base64
+import inspect
 import json
 import os
 import tempfile
@@ -48,6 +49,38 @@ def sample_with_helper():
 
 class TestFunctionSerialization:
     """Test source-based function serialization."""
+
+    def test_utils_facade_identity(self):
+        """Serialization callables remain owned by the public utils facade."""
+        assert utils.serialize_function.__module__ == 'sky.batch.utils'
+        assert utils.deserialize_function.__module__ == 'sky.batch.utils'
+
+    def test_serialize_uses_late_bound_utils_source_getter(self):
+        """The facade's inspect patch point controls source projection."""
+        source = 'def projected():\n    return 1\n'
+
+        with patch.object(utils.inspect, 'getsource', return_value=source):
+            serialized = utils.serialize_function(sample_batch_function)
+
+        payload = json.loads(base64.b64decode(serialized))
+        assert payload == {
+            'type': 'source',
+            'source': source,
+            'name': 'sample_batch_function',
+            'version': '1.0',
+        }
+
+    def test_serialized_payload_matches_source_projection(self):
+        """Pin the complete version 1.0 wire payload before extraction."""
+        serialized = utils.serialize_function(sample_batch_function)
+
+        payload = json.loads(base64.b64decode(serialized))
+        assert payload == {
+            'type': 'source',
+            'source': inspect.getsource(sample_batch_function),
+            'name': 'sample_batch_function',
+            'version': '1.0',
+        }
 
     def test_basic_serialization(self):
         """Test that a basic function can be serialized and deserialized."""

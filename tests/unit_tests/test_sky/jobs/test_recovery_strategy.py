@@ -1,4 +1,5 @@
 """Unit tests for sky.jobs.recovery_strategy helpers."""
+# pylint: disable=protected-access
 from unittest import mock
 
 import pytest
@@ -30,6 +31,90 @@ def test_is_oom_failure_is_case_insensitive():
 def test_is_oom_failure_false_for_unrelated():
     assert recovery_strategy._is_oom_failure(
         RuntimeError('/bin/bash: line 1: conda: command not found')) is False
+
+
+class TestPoolRecoveryCancellation:
+    """Pool recovery targets one job without terminating shared capacity."""
+
+    @staticmethod
+    def _executor():
+        executor = recovery_strategy.StrategyExecutor.__new__(
+            recovery_strategy.StrategyExecutor)
+        executor.cluster_name = 'pool-cluster'
+        executor.pool = 'pool'
+        executor.job_id_on_pool_cluster = 7
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_cancels_only_assigned_pool_job(self, monkeypatch):
+        executor = self._executor()
+        lookup = mock.Mock(return_value=mock.sentinel.handle)
+        cancel = mock.Mock(return_value='cancel-request')
+        get = mock.Mock()
+        monkeypatch.setattr(recovery_strategy.global_user_state,
+                            'get_handle_from_cluster_name', lookup)
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.sdk, 'get', get)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        lookup.assert_called_once_with('pool-cluster')
+        cancel.assert_called_once_with(
+            cluster_name='pool-cluster',
+            job_ids=[7],
+            _try_cancel_if_cluster_is_init=True,
+        )
+        get.assert_called_once_with('cancel-request')
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_preserves_shared_pool(self, monkeypatch):
+        executor = self._executor()
+        cancel = mock.Mock(side_effect=RuntimeError('cancel failed'))
+        terminate_cluster = mock.Mock()
+        monkeypatch.setattr(
+            recovery_strategy.global_user_state,
+            'get_handle_from_cluster_name',
+            mock.Mock(return_value=mock.sentinel.handle),
+        )
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.managed_job_utils,
+                            'terminate_cluster', terminate_cluster)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        cancel.assert_called_once()
+        terminate_cluster.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_terminates_dedicated_cluster(
+            self, monkeypatch):
+        executor = self._executor()
+        executor.pool = None
+        cancel = mock.Mock(side_effect=RuntimeError('cancel failed'))
+        terminate_cluster = mock.Mock()
+        monkeypatch.setattr(
+            recovery_strategy.global_user_state,
+            'get_handle_from_cluster_name',
+            mock.Mock(return_value=mock.sentinel.handle),
+        )
+        monkeypatch.setattr(recovery_strategy.sdk, 'cancel', cancel)
+        monkeypatch.setattr(recovery_strategy.managed_job_utils,
+                            'terminate_cluster', terminate_cluster)
+        monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                            'set_internal', mock.Mock())
+
+        await executor._try_cancel_jobs()
+
+        cancel.assert_called_once_with(
+            cluster_name='pool-cluster',
+            all=True,
+            _try_cancel_if_cluster_is_init=True,
+        )
+        terminate_cluster.assert_called_once_with('pool-cluster')
 
 
 class TestSubmittedTimestampHandleSnapshot:
@@ -108,3 +193,114 @@ class TestSubmittedTimestampHandleSnapshot:
         get_timestamp.assert_not_called()
         assert refresh.call_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
         assert get_status.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
+
+
+class TestJobStartWaitPacing:
+    """Every retry of the job-start wait loop must be paced by the gap sleep.
+
+    The loop's contract is MAX_JOB_CHECKING_RETRY polls spread over
+    MAX_JOB_CHECKING_RETRY * JOB_STARTED_STATUS_CHECK_GAP_SECONDS of
+    wall-clock time. Transient-error paths that `continue` must not skip
+    the pacing sleep, or the whole budget burns instantly while the
+    cluster is flaky and triggers a premature relaunch.
+    """
+
+    @staticmethod
+    def _executor():
+        executor = recovery_strategy.StrategyExecutor.__new__(
+            recovery_strategy.StrategyExecutor)
+        executor.cluster_name = 'cluster'
+        executor.backend = mock.MagicMock()
+        executor.job_id_on_pool_cluster = 7
+        return executor
+
+    @staticmethod
+    def _patch_sleep(monkeypatch):
+        sleep = mock.AsyncMock()
+        monkeypatch.setattr(recovery_strategy.asyncio, 'sleep', sleep)
+        return sleep
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_retries_are_paced(self, monkeypatch):
+        executor = self._executor()
+        sleep = self._patch_sleep(monkeypatch)
+        refresh = mock.Mock(side_effect=RuntimeError('network flake'))
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result is None
+        assert refresh.call_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
+        # One pacing sleep between each pair of polls (none before the
+        # first poll).
+        assert sleep.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY - 1
+
+    @pytest.mark.asyncio
+    async def test_transient_job_status_retries_are_paced(self, monkeypatch):
+        executor = self._executor()
+        sleep = self._patch_sleep(monkeypatch)
+        refresh = mock.Mock(return_value=(status_lib.ClusterStatus.UP, None))
+        get_status = mock.AsyncMock(return_value=(None, 'ssh timed out'))
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+        monkeypatch.setattr(managed_job_utils, 'get_job_status', get_status)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result is None
+        assert get_status.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY
+        assert sleep.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY - 1
+
+    @pytest.mark.asyncio
+    async def test_init_wait_still_paced_and_no_leading_sleep(
+            self, monkeypatch):
+        executor = self._executor()
+        sleep = self._patch_sleep(monkeypatch)
+        refresh = mock.Mock(return_value=(status_lib.ClusterStatus.UP, None))
+        get_status = mock.AsyncMock(return_value=(job_lib.JobStatus.INIT, None))
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+        monkeypatch.setattr(managed_job_utils, 'get_job_status', get_status)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result is None
+        assert sleep.await_count == recovery_strategy.MAX_JOB_CHECKING_RETRY - 1
+
+    @pytest.mark.asyncio
+    async def test_preemption_breaks_without_sleeping(self, monkeypatch):
+        executor = self._executor()
+        sleep = self._patch_sleep(monkeypatch)
+        refresh = mock.Mock(return_value=(None, None))
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result is None
+        refresh.assert_called_once()
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_immediate_success_never_sleeps(self, monkeypatch):
+        executor = self._executor()
+        sleep = self._patch_sleep(monkeypatch)
+        refresh = mock.Mock(return_value=(status_lib.ClusterStatus.UP, None))
+        get_status = mock.AsyncMock(return_value=(job_lib.JobStatus.RUNNING,
+                                                  None))
+        handle = mock.MagicMock()
+        monkeypatch.setattr(recovery_strategy.backend_utils,
+                            'refresh_cluster_status_handle', refresh)
+        monkeypatch.setattr(managed_job_utils, 'get_job_status', get_status)
+        monkeypatch.setattr(managed_job_runtime, 'is_registered', lambda: False)
+        monkeypatch.setattr(recovery_strategy.global_user_state,
+                            'get_handle_from_cluster_name',
+                            mock.Mock(return_value=handle))
+        monkeypatch.setattr(managed_job_utils, 'get_job_timestamp',
+                            mock.Mock(return_value=42.0))
+
+        result = await executor._wait_until_job_starts_on_cluster()
+
+        assert result == 42.0
+        sleep.assert_not_awaited()

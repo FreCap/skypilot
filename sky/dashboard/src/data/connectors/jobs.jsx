@@ -594,22 +594,24 @@ export function useManagedJobPools(jobs, jobId) {
   return snapshot.key === poolNamesKey ? snapshot.pools : [];
 }
 
-// Hook for individual job details that reuses the main jobs cache
-// Returns all tasks for a given job_id (supports multi-task jobs)
-export function useSingleManagedJob(jobId, refreshTrigger = 0) {
+// Hook for individual job details that reuses the main jobs cache.
+// Returns all tasks for a given job_id (supports multi-task jobs) and one
+// promise-returning refresh owner for the current route.
+export function useSingleManagedJob(jobId) {
   const [jobData, setJobData] = useState(null);
   const [loadingJobData, setLoadingJobData] = useState(true);
-  // Track the last seen refresh trigger so we only invalidate the cache when
-  // it actually increments (a manual refresh), not on every effect run.
-  const prevRefreshTriggerRef = useRef(refreshTrigger);
+  const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   const loading = loadingJobData;
 
-  useEffect(() => {
-    let isCurrentRequest = true;
-
-    async function fetchJobData() {
+  const fetchJobData = useCallback(
+    async ({ forceRefresh = false } = {}) => {
       if (!jobId) return;
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
 
       try {
         setLoadingJobData(true);
@@ -618,18 +620,11 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
         const cacheArgs = [
           { allUsers: true, allFields: true, jobIDs: [jobId] },
         ];
-        // Drop the cached entry only when the refresh trigger actually
-        // increments (a manual refresh), so the click fetches fresh data.
-        // Guarding on `> 0` instead would also invalidate the new job's
-        // cache when navigating between jobs while the trigger stays elevated
-        // (the parent keeps refreshTrigger state across jobId changes),
-        // defeating the cache on initial load.
-        if (refreshTrigger > prevRefreshTriggerRef.current) {
+        if (forceRefresh) {
           dashboardCache.invalidate(getManagedJobs, cacheArgs);
         }
-        prevRefreshTriggerRef.current = refreshTrigger;
         const allJobsData = await dashboardCache.get(getManagedJobs, cacheArgs);
-        if (!isCurrentRequest) {
+        if (!isCurrentRequest()) {
           return;
         }
 
@@ -651,25 +646,46 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
           });
         }
       } catch (error) {
-        if (!isCurrentRequest) {
+        if (!isCurrentRequest()) {
           return;
         }
         console.error('Error fetching single managed job data:', error);
         setJobData({ jobs: [], controllerStopped: false });
       } finally {
-        if (isCurrentRequest) {
+        if (isCurrentRequest()) {
           setLoadingJobData(false);
         }
       }
+    },
+    [jobId]
+  );
+
+  const refreshJobData = useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.jobId === jobId) {
+      return inFlight.promise;
     }
 
+    const refreshPromise = fetchJobData({ forceRefresh: true }).finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = { jobId, promise: refreshPromise };
+    return refreshPromise;
+  }, [fetchJobData, jobId]);
+
+  useEffect(() => {
     fetchJobData();
     return () => {
-      isCurrentRequest = false;
+      requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.jobId === jobId) {
+        refreshInFlightRef.current = null;
+      }
     };
-  }, [jobId, refreshTrigger]);
+  }, [fetchJobData, jobId]);
 
-  return { jobData, loading };
+  return { jobData, loading, refreshJobData };
 }
 
 export async function streamManagedJobLogs({
@@ -734,6 +750,12 @@ export async function streamManagedJobLogs({
         'POST',
         { signal: requestController.signal }
       );
+      // The API client performs preflight work before starting fetch. If that
+      // work ignored the abort and completed late, do not consume its body.
+      if (requestController.signal.aborted) {
+        await response.body?.cancel?.();
+        return { timeout: false };
+      }
 
       // Stream the logs
       const reader = response.body.getReader();
@@ -799,10 +821,15 @@ export async function streamManagedJobLogs({
     }
   }
 
-  // If inactivity wins, stop and join the losing request before returning.
+  // If inactivity wins, stop and observe the losing request before returning.
   if (result.timeout) {
     requestController.abort();
-    await fetchPromise;
+    // Do not await cleanup here: fetchImmediate can still be blocked in
+    // preflight work that does not observe the request signal. Observe a late
+    // non-abort failure without making the public timeout unbounded.
+    void fetchPromise.catch((error) => {
+      console.warn('Error finishing timed-out log request:', error);
+    });
     showToast(
       `Log request for job ${jobId} timed out after ${inactivityTimeout / 1000}s of inactivity`,
       'warning'

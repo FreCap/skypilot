@@ -8,6 +8,7 @@ import functools
 import os
 import pathlib
 import queue as queue_lib
+import threading
 import time
 from typing import List
 from unittest import mock
@@ -145,9 +146,16 @@ def hijacked_sys_attrs():
     setattr(sys, 'stderr', original_stderr)
 
 
-def dummy_entrypoint(*args, **kwargs):
+_SLOW_ENTRYPOINT_STARTED = threading.Event()
+_SLOW_ENTRYPOINT_RELEASE = threading.Event()
+_SLOW_ENTRYPOINT_FINISHED = threading.Event()
+
+
+def slow_entrypoint():
     """Dummy entrypoint function for testing."""
-    time.sleep(2)
+    _SLOW_ENTRYPOINT_STARTED.set()
+    _SLOW_ENTRYPOINT_RELEASE.wait(timeout=5)
+    _SLOW_ENTRYPOINT_FINISHED.set()
     return 'success'
 
 
@@ -199,6 +207,10 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         isolated_database):
     """Test that context is always cancelled when execute_request_coroutine
     is cancelled."""
+    _SLOW_ENTRYPOINT_STARTED.clear()
+    _SLOW_ENTRYPOINT_RELEASE.clear()
+    _SLOW_ENTRYPOINT_FINISHED.clear()
+
     # Create a mock request
     request = requests_lib.Request(
         request_id='test-request-id',
@@ -206,23 +218,25 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         status=requests_lib.RequestStatus.PENDING,
         created_at=time.time(),
         user_id='test-user-id',
-        entrypoint=dummy_entrypoint,
+        entrypoint=slow_entrypoint,
         request_body=payloads.RequestBody(),
     )
     await requests_lib.create_if_not_exists_async(request)
 
     # Mock the context and its methods
     mock_ctx = mock.Mock()
+    mock_ctx.vars = {}
     mock_ctx.is_canceled.return_value = False
+    mock_ctx.cancel.side_effect = _SLOW_ENTRYPOINT_RELEASE.set
 
     with mock.patch('sky.utils.context.initialize'), \
          mock.patch('sky.utils.context.get', return_value=mock_ctx):
 
         task = executor.execute_request_in_coroutine(request)
 
-        await asyncio.sleep(0.1)
-        task.cancel()
-        await task.task
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_STARTED.wait, 1)
+        await task.cancel()
+        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_FINISHED.wait, 1)
         # Verify the context is actually cancelled
         mock_ctx.cancel.assert_called()
 
@@ -268,10 +282,69 @@ async def test_managed_image_process_failure_log_is_value_free(
     _assert_managed_image_failure_is_value_free(request_id, error_log)
 
 
+@pytest.mark.asyncio
+async def test_coroutine_task_cancel_joins_cleanup_through_repeated_cancel():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def child_task() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+            raise
+
+    child = asyncio.create_task(child_task())
+    cancel_task = asyncio.create_task(executor.CoroutineTask(child).cancel())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    cancel_task.cancel()
+    await asyncio.sleep(0)
+    assert not cancel_task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cancel_task, timeout=1)
+    assert cleanup_finished.is_set()
+    assert child.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_execute_request_coroutine_fails_if_storage_probe_fails():
+    request = requests_lib.Request(
+        request_id='storage-probe-failure',
+        name='sky.logs',
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='test-user-id',
+        entrypoint=mock.Mock(),
+        request_body=payloads.RequestBody(),
+    )
+    mock_ctx = mock.Mock()
+    mock_failure = mock.AsyncMock()
+
+    with mock.patch('sky.utils.context.initialize'), \
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(requests_lib, 'update_status_async',
+                           new_callable=mock.AsyncMock), \
+         mock.patch.object(requests_lib, 'get_request_log_storage_usage',
+                           side_effect=OSError('statvfs failed')), \
+         mock.patch.object(requests_lib, 'set_request_failed_async',
+                           mock_failure):
+        task = executor.execute_request_in_coroutine(request)
+        await task.task
+
+    mock_failure.assert_awaited_once()
+    request.entrypoint.assert_not_called()
+
+
 CALLED_FLAG = [False]
 
 
-def _called_flag_entrypoint(called_flag):
+def flag_entrypoint():
     CALLED_FLAG[0] = True
     return 'ok'
 
@@ -282,7 +355,7 @@ async def test_api_cancel_race_condition(isolated_database):
     CALLED_FLAG[0] = False
     req = requests_lib.Request(request_id='race-cancel-before',
                                name='test-request',
-                               entrypoint=_called_flag_entrypoint,
+                               entrypoint=flag_entrypoint,
                                request_body=payloads.RequestBody(),
                                status=requests_lib.RequestStatus.PENDING,
                                created_at=0.0,
@@ -736,7 +809,10 @@ async def test_request_worker_retry_execution_retryable_error(
 
     monkeypatch.setattr(executor, '_get_queue', mock_get_queue)
 
-    # Mock time.sleep to track calls (but still sleep for very short waits).
+    # Mock only the executor module's view of time. Patching time.sleep on the
+    # shared module object also intercepts FileLock and watchdog sleeps in
+    # background threads, making their polling mutate this test's assertions
+    # and race database teardown.
     # Capture the request status and queue length observed *at the moment*
     # the backoff sleep happens, to pin the ordering: the request must be
     # PENDING (not RUNNING) and not yet re-enqueued before we wait.
@@ -753,7 +829,9 @@ async def test_request_worker_retry_execution_retryable_error(
         status_msg_at_sleep.append(observed.status_msg if observed else None)
         queue_len_at_sleep.append(len(queue_items))
 
-    monkeypatch.setattr('time.sleep', mock_sleep)
+    executor_time = mock.Mock(wraps=time)
+    executor_time.sleep.side_effect = mock_sleep
+    monkeypatch.setattr(executor, 'time', executor_time)
 
     # Create a mock executor that tracks submit_until_success calls
     submit_calls = []

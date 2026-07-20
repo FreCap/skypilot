@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access
 
+import asyncio
 import inspect
 import json
 import pickle
@@ -14,8 +15,10 @@ import pytest
 
 from sky import clouds
 from sky import core
+from sky.metrics import utils as metrics_utils
 from sky.server import constants as server_constants
 from sky.server import server
+from sky.server import ssh_proxy
 from sky.server import websocket_utils
 from sky.utils import context_utils
 from sky.utils import status_lib
@@ -131,3 +134,156 @@ async def test_kubernetes_proxy_redirect_short_circuits_cluster_lookup():
         json.dumps(redirect_info).encode())
     websocket.close.assert_awaited_once_with()
     status.assert_not_called()
+
+
+def _metric_mocks():
+    connection_gauge = mock.Mock()
+    connection_metric = mock.Mock()
+    connection_metric.labels.return_value = connection_gauge
+    close_counter = mock.Mock()
+    close_metric = mock.Mock()
+    close_metric.labels.return_value = close_counter
+    return connection_metric, connection_gauge, close_metric, close_counter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('process_exited', 'ssh_failed', 'expected_reason'),
+    [
+        (True, False, 'KubectlPortForwardExit'),
+        (False, False, 'ClientClosed'),
+        (False, True, 'SSHToPodDisconnected'),
+    ],
+)
+async def test_kubernetes_proxy_records_one_terminal_close(
+        process_exited, ssh_failed, expected_reason):
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(
+            side_effect=ProcessLookupError if process_exited else None),
+        wait=mock.Mock(return_value=0),
+        kill=mock.Mock(),
+    )
+    stdout_reader = SimpleNamespace(
+        readline=mock.AsyncMock(
+            return_value=b'Forwarding from 127.0.0.1:41234 -> 22\n'),
+        read=mock.AsyncMock(return_value=b''),
+    )
+    event_loop = SimpleNamespace(
+        run_in_executor=mock.AsyncMock(side_effect=[proc, 0]),
+        connect_read_pipe=mock.AsyncMock(),
+    )
+    backend_reader = SimpleNamespace(read=mock.AsyncMock(return_value=b''))
+    backend_writer = SimpleNamespace(write=mock.Mock(),
+                                     drain=mock.AsyncMock(),
+                                     close=mock.Mock())
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(asyncio, 'get_running_loop',
+                           return_value=event_loop), \
+         mock.patch.object(asyncio, 'StreamReader',
+                           return_value=stdout_reader), \
+         mock.patch.object(asyncio, 'StreamReaderProtocol'), \
+         mock.patch.object(asyncio, 'open_connection',
+                           new=mock.AsyncMock(return_value=(backend_reader,
+                                                           backend_writer))), \
+         mock.patch.object(websocket_utils, 'run_websocket_proxy',
+                           new=mock.AsyncMock(return_value=ssh_failed)), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        await server.kubernetes_pod_ssh_proxy(websocket, 'cluster')
+
+    connection_gauge.inc.assert_called_once_with()
+    connection_gauge.dec.assert_called_once_with()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason=expected_reason)
+    close_counter.inc.assert_called_once_with()
+    assert event_loop.run_in_executor.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('process_exited', 'ssh_failed', 'expected_reason'),
+    [
+        (True, False, 'SrunProcessExit'),
+        (False, False, 'ClientClosed'),
+        (False, True, 'SSHToSlurmJobDisconnected'),
+    ],
+)
+async def test_slurm_proxy_records_one_terminal_close(process_exited,
+                                                      ssh_failed,
+                                                      expected_reason):
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    head = SimpleNamespace(tags={'job_id': '42'})
+    node = SimpleNamespace(tags={'node': 'node-0'})
+    cluster_info = SimpleNamespace(
+        provider_config={
+            'ssh': {
+                'hostname': 'login',
+                'port': 22,
+                'user': 'sky',
+            }
+        },
+        get_head_instance=mock.Mock(return_value=head),
+        instances={'instance': (node,)},
+    )
+    handle = SimpleNamespace(
+        cached_cluster_info=cluster_info,
+        launched_resources=SimpleNamespace(extract_docker_image=mock.Mock(
+            return_value=None)),
+        cluster_name_on_cloud='cluster-on-cloud',
+    )
+    proc = SimpleNamespace(
+        stdin=SimpleNamespace(write=mock.Mock(),
+                              drain=mock.AsyncMock(),
+                              close=mock.Mock()),
+        stdout=SimpleNamespace(read=mock.AsyncMock(return_value=b'')),
+        stderr=SimpleNamespace(readline=mock.AsyncMock(return_value=b'')),
+        terminate=mock.Mock(
+            side_effect=ProcessLookupError if process_exited else None),
+    )
+    login_runner = mock.Mock()
+    login_runner.ssh_base_command.return_value = ['ssh']
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy.command_runner, 'SSHCommandRunner',
+                           return_value=login_runner), \
+         mock.patch.object(ssh_proxy.slurm_utils, 'srun_sshd_command',
+                           return_value='srun-sshd'), \
+         mock.patch.object(asyncio, 'create_subprocess_shell',
+                           new=mock.AsyncMock(return_value=proc)), \
+         mock.patch.object(websocket_utils, 'run_websocket_proxy',
+                           new=mock.AsyncMock(return_value=ssh_failed)), \
+         mock.patch.object(ssh_proxy.env_options.Options.SHOW_DEBUG_INFO,
+                           'get', return_value=False), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        await server.slurm_job_ssh_proxy(websocket, 'cluster')
+
+    connection_gauge.inc.assert_called_once_with()
+    connection_gauge.dec.assert_called_once_with()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason=expected_reason)
+    close_counter.inc.assert_called_once_with()

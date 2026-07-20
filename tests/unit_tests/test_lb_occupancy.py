@@ -221,6 +221,91 @@ class TestProbeRound(unittest.TestCase):
         self.assertEqual(balancer._replica_occupancy, {A: 0, B: 1})
         self.assertEqual(policy._select_replica(mock.MagicMock(), [A, B]), A)
 
+    def test_probe_miss_retains_local_capacity_but_not_idle_proof(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([A])
+        balancer = _make_balancer(policy)
+        self._run_round(balancer, {A: (0, 4, 4)})
+        self._run_round(balancer, {})
+
+        with balancer._client_pool_lock:
+            self.assertEqual(balancer._effective_replica_free_slots_locked(),
+                             {A: 4})
+        self.assertEqual(policy.occupancy_map, {A: 0})
+        in_flight, _, unknown_urls, sampled_urls = (
+            balancer._in_flight_with_draining())
+        self.assertNotIn(A, in_flight or {})
+        self.assertEqual(unknown_urls, [A])
+        self.assertEqual(sampled_urls, [])
+
+        self._run_round(balancer, {A: (1, 3, 4)})
+        self.assertEqual(balancer._replica_occupancy, {A: 1})
+        self.assertEqual(balancer._in_flight_with_draining()[0], {A: 1})
+
+    def test_sample_expires_per_url_while_probe_loop_is_healthy(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([A, B])
+        balancer = _make_balancer(policy)
+        self._run_round(balancer, {A: (0, 1, 1), B: (0, 1, 1)})
+        balancer._occupancy_sample_time[A] -= (
+            lb_module.constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS + 1)
+
+        self._run_round(balancer, {B: (0, 1, 1)})
+
+        self.assertLess(time.monotonic() - balancer._last_occupancy_probe_time,
+                        1)
+        self.assertNotIn(A, balancer._replica_occupancy)
+        with balancer._client_pool_lock:
+            self.assertEqual(balancer._effective_replica_free_slots_locked(),
+                             {B: 1})
+
+    def test_probe_crossing_role_epoch_cannot_republish_sample(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([A])
+        balancer = _make_balancer(policy)
+
+        async def _run():
+            probe_started = asyncio.Event()
+            finish_probe = asyncio.Event()
+
+            async def _fetch(session, url):
+                del session, url
+                probe_started.set()
+                await finish_probe.wait()
+                return (0, 4, 4)
+
+            balancer._fetch_replica_occupancy = _fetch
+            probe = asyncio.create_task(
+                balancer._probe_replica_occupancy_once())
+            await probe_started.wait()
+            with balancer._client_pool_lock:
+                balancer._occupancy_role_epoch += 1
+                balancer._invalidate_occupancy_samples_locked()
+            finish_probe.set()
+            await probe
+
+        asyncio.run(_run())
+
+        self.assertEqual(balancer._replica_occupancy, {})
+        self.assertEqual(balancer._replica_free_slots, {})
+        self.assertEqual(balancer._occupancy_current_round_sampled_urls, set())
+
+    def test_large_partial_probe_round_keeps_bounded_local_inventory(self):
+        urls = [f'http://worker-{index}:8080' for index in range(342)]
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(urls)
+        balancer = _make_balancer(policy)
+        self._run_round(balancer, {url: (0, 1, 1) for url in urls})
+
+        successful_urls = set(urls[:137])
+        self._run_round(balancer, {url: (0, 1, 1) for url in successful_urls})
+
+        with balancer._client_pool_lock:
+            self.assertEqual(
+                len(balancer._effective_replica_free_slots_locked()), 342)
+            self.assertEqual(balancer._controller_occupancy_proof_urls_locked(),
+                             successful_urls)
+
     def test_probe_round_reaches_fleet_beyond_default_connector_limit(self):
         """Every replica probe must start within the same timeout window."""
 
