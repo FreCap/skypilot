@@ -109,6 +109,10 @@ _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 # batched fetch path while preserving the existing self-fetch behavior for
 # back-compat callers like ReplicaInfo.__repr__.
 _NOT_PROVIDED: Any = object()
+# Sentinel for drain registration's optional pre-resolved replica URL. ``None``
+# is a real batched result: the cluster has no resolvable endpoint and the
+# bounded deadline must remain the only completion path.
+_REPLICA_URL_NOT_PROVIDED: Any = object()
 
 
 def load_task_with_service_spec(
@@ -535,12 +539,13 @@ def _remaining_drain_seconds(started_at: float,
 class _ReplicaDrainTracker:
     """Stateful drain-complete predicate for one retiring replica.
 
-    'Drained' requires SEEN-THEN-CLEAN: some fresh report received after
-    the drain began must have acknowledged the replica's url (in the
-    routing view, the in-flight gauge, the unknown set, or the draining
-    set) before a later fresh report showing it absent-and-idle is
-    trusted -- and both must come from the SAME LB incarnation (the LB
-    ships a per-process session id): a cold LB (restarted mid-drain, its
+    'Drained' requires SEEN-THEN-CLEAN: a fresh authoritative report at
+    retirement selection, or received after the drain began, must have
+    acknowledged the replica's url (in the routing view, the in-flight gauge,
+    the unknown set, or the draining set) before a later fresh report showing
+    it absent-and-idle is trusted -- and both must come from the SAME LB
+    incarnation (the LB ships a per-process session id): a cold LB (restarted
+    mid-drain, its
     draining and occupancy overlays lost) ships empty sets and must not
     'prove' any replica drained, with or without an older incarnation's
     acknowledgement. An explicit idle entry (gauge zero, or a
@@ -565,6 +570,34 @@ class _ReplicaDrainTracker:
         self._seen = False
         self._unknown_tainted = False
         self._session: str | None = None
+        self._seed_from_existing_report()
+
+    def _seed_from_existing_report(self) -> None:
+        """Carry a fresh pre-retirement LB acknowledgement into the drain.
+
+        Route removal is applied in the response to a sync. An idle client can
+        disappear before the next sync, so requiring the newly constructed
+        tracker to observe the url again would force the full drain deadline.
+        The prior report is only an acknowledgement, never a clean proof: a
+        later report from the same LB session must still show the url idle.
+        """
+        report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
+        if report is None:
+            return
+        (received_at, in_flight, routing_urls, unknown_urls, draining_urls,
+         session) = report
+        if routing_urls is None or not isinstance(session, str) or not session:
+            return
+        if (time.monotonic() - received_at
+                > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+            return
+        url = self._replica_url
+        if (url not in routing_urls and url not in unknown_urls and
+                url not in draining_urls and url not in in_flight):
+            return
+        self._session = session
+        self._seen = True
+        self._unknown_tainted = url in unknown_urls
 
     def __call__(self) -> bool:
         report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
@@ -2400,6 +2433,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.preempted or
                 info.cluster_name in orphaned_interruptible_clusters)
         ]
+        waiting_replicas = [
+            info for info in to_down_replicas
+            if (not self._is_legacy_uncertain_logical_retirement(info) and
+                (self._is_recoverable_uncommitted_logical_retirement(info) or
+                 getattr(info.status_property,
+                         'wait_for_idle_before_termination', False) is True))
+        ]
+        recovery_wait_urls: dict[int, str | None] = {}
+        if waiting_replicas and not self._is_pool:
+            try:
+                # One cluster/config snapshot for the whole recovery wave.
+                # Resolving ``info.url`` independently repeats cluster-record
+                # and provider-config reads around each endpoint lookup while
+                # the manager lock blocks every probe and autoscaler tick.
+                recovery_wait_urls = self._resolve_probe_urls(waiting_replicas)
+            except Exception as e:  # pylint: disable=broad-except
+                # URL resolution only enables early drain completion. Keep the
+                # bounded per-replica fallback rather than failing recovery.
+                logger.warning(
+                    'Failed to batch-resolve recovered drain endpoints; '
+                    'falling back to per-replica resolution: '
+                    f'{common_utils.format_exception(e)}')
         legacy_uncertain_ids = getattr(
             self, '_legacy_uncertain_logical_retirement_ids', None)
         if legacy_uncertain_ids is None:
@@ -2428,7 +2483,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # already consumed their idle deadline, but the persisted
                     # wall-clock deadline lets the tracker resume at zero and
                     # fresh recovery evidence remains the admission authority.
-                    self._register_wait_for_idle(replica_info)
+                    replica_url = recovery_wait_urls.get(
+                        replica_info.replica_id, _REPLICA_URL_NOT_PROVIDED)
+                    self._register_wait_for_idle(replica_info,
+                                                 replica_url=replica_url)
                     if (getattr(replica_info.status_property,
                                 'logical_retirement_controller_epoch', None)
                             != self._logical_controller_epoch):
@@ -2436,7 +2494,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 if (getattr(replica_info.status_property,
                             'wait_for_idle_before_termination', False) is True):
-                    self._register_wait_for_idle(replica_info)
+                    replica_url = recovery_wait_urls.get(
+                        replica_info.replica_id, _REPLICA_URL_NOT_PROVIDED)
+                    self._register_wait_for_idle(replica_info,
+                                                 replica_url=replica_url)
                     continue
                 # A scale-down retirement interrupted by a controller restart
                 # re-enters the remaining bounded drain. The cap and wall-clock
@@ -3945,9 +4006,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 is_scale_down=True,
                                 in_flight_drain_cap_seconds=0)
 
-    def _register_wait_for_idle(self,
-                                info: ReplicaInfo,
-                                deadline: float | None = None) -> None:
+    def _register_wait_for_idle(
+            self,
+            info: ReplicaInfo,
+            deadline: float | None = None,
+            replica_url: Any = _REPLICA_URL_NOT_PROVIDED) -> None:
         """Register or conservatively retry a strict economic drain."""
         if info.replica_id in self._wait_for_idle_trackers:
             return
@@ -3971,14 +4034,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                          _remaining_drain_seconds(drain_started_at, drain_cap))
             deadline = drain_started + remaining
         tracker = None
-        try:
-            replica_url = info.url
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Unable to resolve replica '
-                           f'{info.replica_id} url for strict drain: '
-                           f'{common_utils.format_exception(e)}')
-            replica_url = None
+        if replica_url is _REPLICA_URL_NOT_PROVIDED:
+            try:
+                replica_url = info.url
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Unable to resolve replica '
+                               f'{info.replica_id} url for strict drain: '
+                               f'{common_utils.format_exception(e)}')
+                replica_url = None
         if replica_url is not None and not self._is_pool:
+            assert isinstance(replica_url, str), replica_url
             tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
         self._wait_for_idle_trackers[info.replica_id] = (tracker, deadline)
 

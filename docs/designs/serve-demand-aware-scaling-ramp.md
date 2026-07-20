@@ -260,6 +260,38 @@ demand reports continue to prohibit all rolling retirement. A pending logical
 scale-up wave does not block the bridge because the raw-demand side of the
 coverage target already protects work that the adopted target has not reached.
 
+### Drain-proof handoff and recovery
+
+The strict drain tracker requires one authoritative load-balancer incarnation
+to acknowledge a backend before a later clean report can prove that it is
+idle. Route removal can otherwise race the sync cadence: the controller starts
+the tracker immediately after the last report that still listed the backend,
+the load balancer drops an idle client before its next report, and the tracker
+never observes the backend at all. The backend then stays off route until the
+full bounded drain deadline even though the same load balancer had already
+reported it as routable immediately before retirement.
+
+Tracker construction may seed that acknowledgement from the manager's latest
+authoritative, fresh report when the backend appears in the routing,
+in-flight, draining, or unknown-occupancy view. The seed is tied to that exact
+load-balancer session. A later report from the same session must still show the
+backend clean, and a session change clears the seed. A pre-retirement unknown
+occupancy sample also seeds the unknown taint, so absence cannot prove an async
+backend idle; only a later explicit zero can. Stale reports and reports without
+an authoritative routing view never seed a tracker. This relies on the load
+balancer's existing occupancy contract: every routed async backend without a
+fresh gauge appears in the unknown set. The post-retirement drain proof already
+depends on the same contract.
+
+Controller recovery rebuilds trackers for every durable strict idle wait and
+bounded precommit row. Resolving each replica URL independently repeats cluster
+record and provider-config reads around the endpoint lookup while the manager
+lock blocks probing and autoscaling. Recovery instead resolves all waiting
+replica URLs from one batched cluster and provider-config snapshot, then
+registers the trackers from that mapping. Provider endpoint lookup remains per
+replica where required. If the batch fails, recovery falls back to the existing
+per-replica resolution so the optimization cannot weaken cleanup correctness.
+
 ### Launch completion and teardown progress
 
 The replica-manager refresher holds the manager lock while reconciling launch
@@ -517,6 +549,11 @@ rate to 100, then restore the previous control-plane image if required.
   new-version evidence without advertising the whole draining fleet again.
   Repeat the same assertion for controller recovery, including bounded victims
   whose drain deadlines expired while teardown admission was budget-delayed.
+- Verify a fresh pre-retirement routing acknowledgement allows the same LB
+  session's next clean report to finish an idle drain, while stale,
+  non-authoritative, restarted-session, and unknown-occupancy reports remain
+  fail-closed. Verify recovery resolves strict and bounded-precommit drain URLs
+  in one batch and falls back to per-replica resolution if that batch fails.
 - Verify an authoritative HA demand report starts the handoff expiry when all
   demand gauges are present, while incomplete or legacy reports retain the
   previous floor. Missing occupancy samples must still protect those replicas
