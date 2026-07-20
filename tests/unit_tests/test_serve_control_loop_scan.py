@@ -16,6 +16,7 @@ These tests fail on the pre-fix code (the per-replica predicate has no
 ``in_flight`` parameter and the loop scans K times) and pass after it.
 """
 import threading
+from unittest import mock
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -63,6 +64,7 @@ def _build_manager(num_launching: int):
     }
     mgr._down_thread_pool = {}
     mgr._replica_to_request_id = {}
+    mgr._replica_to_launch_cancelled = {}
     return mgr
 
 
@@ -213,6 +215,74 @@ def test_refresh_thread_pool_batches_replica_row_reads(monkeypatch, tmp_path):
     assert reads['batch'] <= 2, (
         f'{reads["batch"]} replica-row reads for {num_launching} queued '
         'launches; expected at most one batch read per thread pool')
+
+
+def test_stale_completed_launch_does_not_block_worker_reconciliation(
+        monkeypatch):
+    """A missing launch row is discarded before spot evidence is read."""
+    stale_replica_id = 1
+    live_replica_id = 2
+    down_replica_id = 3
+    live_info = _pending_replica(live_replica_id)
+    live_info.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.RUNNING)
+    down_info = _pending_replica(down_replica_id)
+    down_info.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    down_info.status_property.sky_down_status = (
+        common_utils.ProcessStatus.RUNNING)
+    location = mock.sentinel.location
+    live_info.get_spot_location = mock.Mock(return_value=location)
+
+    mgr = _build_manager(num_launching=0)
+    mgr._launch_thread_pool = {
+        stale_replica_id: _NotStartedThread(),
+        live_replica_id: _NotStartedThread(),
+    }
+    mgr._down_thread_pool = {down_replica_id: _NotStartedThread()}
+    mgr._replica_to_request_id = {
+        stale_replica_id: 'stale-request',
+        live_replica_id: 'live-request',
+    }
+    mgr._replica_to_launch_cancelled = {stale_replica_id: False}
+    mgr._spot_placer = mock.Mock()
+    mgr._spot_placer.resolve_location.return_value = location
+    infos = {
+        live_replica_id: live_info,
+        down_replica_id: down_info,
+    }
+
+    def _batch(_service_name, replica_ids):
+        return {
+            replica_id: infos[replica_id]
+            for replica_id in replica_ids
+            if replica_id in infos
+        }
+
+    persisted = []
+    finished_downs = []
+    monkeypatch.setattr(serve_state, 'get_replica_infos_from_ids', _batch)
+    monkeypatch.setattr(serve_state, 'get_replica_infos', lambda _svc: [])
+    monkeypatch.setattr(mgr, '_persist_replicas',
+                        lambda updates: persisted.extend(updates))
+    monkeypatch.setattr(
+        mgr, '_handle_sky_down_finish',
+        lambda info, format_exc: finished_downs.append(
+            (info.replica_id, format_exc)))
+    monkeypatch.setattr(mgr, '_reconcile_failed_cleanup', mock.Mock())
+
+    mgr._refresh_thread_pool()
+
+    assert stale_replica_id not in mgr._launch_thread_pool
+    assert stale_replica_id not in mgr._replica_to_request_id
+    assert stale_replica_id not in mgr._replica_to_launch_cancelled
+    assert persisted == [(live_replica_id, live_info)]
+    assert live_replica_id not in mgr._launch_thread_pool
+    assert mgr._spot_placer.set_active.call_args_list == [
+        mock.call(location, selected_at=live_info.created_at)
+    ]
+    assert finished_downs == [(down_replica_id, None)]
+    assert down_replica_id not in mgr._down_thread_pool
 
 
 def test_idle_tick_performs_no_budget_scan(monkeypatch):
