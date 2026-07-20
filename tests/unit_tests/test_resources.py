@@ -808,7 +808,7 @@ def test_image_id_dual_pickle_round_trip():
     assert migrated._docker_image is None
 
     # Version 34 stored Docker identity only in _docker_image.
-    legacy_with_docker = Resources(cloud='aws', container_image='ubuntu:22.04')
+    legacy_with_docker = Resources(cloud='aws', image_id='docker:ubuntu:22.04')
     state = dict(legacy_with_docker.__dict__)
     state.pop('_container_image', None)
     state.pop('_resolved_container_image', None)

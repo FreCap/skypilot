@@ -2,6 +2,7 @@
 
 import collections
 from collections.abc import Iterable
+from typing import Any
 
 import colorama
 
@@ -14,6 +15,9 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.clouds import cloud as sky_cloud
+from sky.container_images import models as container_image_models
+from sky.container_images import runtime as container_image_runtime
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import registry
 from sky.utils import resources_utils
@@ -23,6 +27,56 @@ from sky.utils import ux_utils
 logger = sky_logging.init_logger('sky.optimizer')
 
 _PerCloudCandidates = dict[clouds.Cloud, list[resources_lib.Resources]]
+
+
+def _managed_image_placement(
+        resources: resources_lib.Resources) -> container_image_models.Placement:
+    cloud = resources.cloud
+    assert cloud is not None, resources
+    assert resources.region is not None, resources
+    if isinstance(cloud, clouds.AWS):
+        provider = 'aws'
+        backend = 'aws_vm'
+    elif isinstance(cloud, clouds.Kubernetes):
+        provider = 'aws'
+        backend = 'aws_eks'
+    else:
+        provider = str(cloud).lower()
+        backend = 'direct'
+    architecture = None
+    if resources.instance_type is not None:
+        try:
+            architecture = cloud.get_arch_from_instance_type(
+                resources.instance_type)
+        except NotImplementedError:
+            pass
+    platform = container_image_models.runtime_platform_from_architecture(
+        architecture)
+    host_image_id = None
+    if resources.image_id is not None:
+        host_image_id = resources.image_id.get(resources.region,
+                                               resources.image_id.get(None))
+    return container_image_models.Placement(provider=provider,
+                                            region=resources.region,
+                                            backend=backend,
+                                            platform=platform,
+                                            host_image_id=host_image_id)
+
+
+def _prepare_managed_image_candidates(
+    candidates: list[resources_lib.Resources],
+    cache: dict[tuple[Any, ...], Any],
+) -> list[resources_lib.Resources]:
+    workspace = (skypilot_config.get_active_workspace() or
+                 skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
+    prepared = []
+    for candidate in candidates:
+        placement = _managed_image_placement(candidate)
+        eligible = container_image_runtime.prepare_metadata_only(
+            candidate, placement, workspace, cache)
+        if eligible is not None:
+            prepared.append(eligible)
+    return prepared
 
 
 def filter_out_blocked_launchable_resources(
@@ -193,6 +247,7 @@ def fill_in_launchable_resources(
     cloud_candidates: _PerCloudCandidates = collections.defaultdict(list)
     resource_hints: dict[resources_lib.Resources,
                          list[str]] = collections.defaultdict(list)
+    image_metadata_cache: dict[tuple[Any, ...], Any] = {}
     if blocked_resources is None:
         blocked_resources = []
     for resources in task.resources:
@@ -224,13 +279,22 @@ def fill_in_launchable_resources(
                 # the underlying catalog filtering
                 cheapest = feasible_resources.resources_list[0]
                 # Generate region/zone-specified resources.
-                launchable[resources].extend(
-                    resources_utils.make_launchables_for_valid_region_zones(
-                        cheapest))
+                generated = (resources_utils.
+                             make_launchables_for_valid_region_zones(cheapest))
+                eligible = generated
+                if resources.container_image is not None:
+                    eligible = _prepare_managed_image_candidates(
+                        generated, image_metadata_cache)
+                launchable[resources].extend(eligible)
                 # Each cloud can occur multiple times in feasible_list,
                 # for different region/zone.
-                cloud_candidates[cloud].extend(
-                    feasible_resources.resources_list)
+                if eligible:
+                    cloud_candidates[cloud].extend(
+                        feasible_resources.resources_list)
+                elif resources.container_image is not None:
+                    resource_hints[resources].append(
+                        'Managed container image policy excludes every '
+                        f'candidate on {cloud.display_name()}.')
             else:
                 all_fuzzy_candidates.update(
                     feasible_resources.fuzzy_candidate_list)

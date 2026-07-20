@@ -153,16 +153,8 @@ RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
                             request_names.RequestName.CLUSTER_LAUNCH.value,)
 
-_CONTAINER_IMAGE_REQUEST_NAMES = frozenset(
-    server_constants.REQUEST_NAME_PREFIX + name.value for name in (
-        request_names.RequestName.IMAGE_PUBLISH,
-        request_names.RequestName.IMAGE_REGISTER,
-        request_names.RequestName.IMAGE_PREPARE,
-        request_names.RequestName.IMAGE_STATUS,
-        request_names.RequestName.IMAGE_RETRY,
-    ))
 _CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE = (
-    'Managed container image request failed validation or execution.')
+    'Managed container image task failed validation or execution.')
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -264,8 +256,8 @@ def request_error_requires_sanitization(
     request_body: payloads.RequestBody | None = None,
 ) -> bool:
     """Returns whether errors for this request cross an image boundary."""
-    return (name in _CONTAINER_IMAGE_REQUEST_NAMES or
-            _request_body_uses_container_image(request_body))
+    del name
+    return _request_body_uses_container_image(request_body)
 
 
 def sanitize_request_error(
@@ -1689,6 +1681,22 @@ def _set_value_free_exception_stacktrace(e: BaseException) -> None:
     setattr(e, 'stacktrace', stacktrace)
 
 
+def _mark_container_image_request_terminal(request_id: str) -> None:
+    """Best-effort image-fence observation after request state is durable."""
+    try:
+        # Importing at module load would create requests -> demand_state ->
+        # global_user_state -> server initialization recursion.
+        # pylint: disable=import-outside-toplevel
+        from sky.container_images import demand_state as image_demand_state
+
+        # pylint: enable=import-outside-toplevel
+        image_demand_state.mark_cluster_request_terminal(request_id)
+    except Exception as e:  # pylint: disable=broad-except
+        # Losing this hint is fail-safe: reconciliation retains the fence.
+        logger.warning('Failed to record container image request termination: '
+                       f'{common_utils.format_exception(e)}')
+
+
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     request = get_request(request_id, fields=['name', 'request_body'])
@@ -1701,6 +1709,7 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
         set_exception_stacktrace(e)
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.FAILED, error=e)
+    _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1718,12 +1727,14 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
         set_exception_stacktrace(e)
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.FAILED, error=e)
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.SUCCEEDED, result=result)
+    _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1733,6 +1744,7 @@ async def set_request_succeeded_async(request_id: str,
     """Set a request to succeeded and populate the result."""
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.SUCCEEDED, result=result)
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 @metrics_lib.time_me_async
@@ -1747,6 +1759,7 @@ async def set_request_cancelled_async(request_id: str) -> None:
             return
         request_task.finished_at = time.time()
         request_task.status = RequestStatus.CANCELLED
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 @metrics_lib.time_me

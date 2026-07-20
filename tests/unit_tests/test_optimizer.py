@@ -222,6 +222,7 @@ def test_fill_in_launchable_resources_preserves_candidate_metadata():
     cloud = clouds.AWS()
     requested = mock.Mock()
     requested.cloud = None
+    requested.container_image = None
     requested.validate = mock.Mock()
     requested.no_missing_accel_warnings = False
     cheapest = mock.Mock()

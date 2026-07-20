@@ -2667,6 +2667,28 @@ def get_job_status_with_task_id(job_id: int,
         return ManagedJobStatus(status[0]) if status else None
 
 
+def get_job_task_terminal_states(
+    identities: list[tuple[int, int]],) -> dict[tuple[int, int], bool]:
+    """Returns terminal state for a bounded set of durable job-task owners."""
+    if not identities:
+        return {}
+    if len(identities) > 1000:
+        raise ValueError('Managed-job terminal-state batch is too large.')
+    job_ids = sorted({identity[0] for identity in identities})
+    wanted = set(identities)
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(spot_table.c.spot_job_id, spot_table.c.task_id,
+                              spot_table.c.status).where(
+                                  spot_table.c.spot_job_id.in_(job_ids))).all()
+    return {
+        (int(row[0]), int(row[1])): ManagedJobStatus(row[2]).is_terminal()
+        for row in rows
+        if (int(row[0]), int(row[1])) in wanted
+    }
+
+
 @db_retries.retry_async
 async def get_job_status_with_task_id_async(
         job_id: int, task_id: int) -> ManagedJobStatus | None:

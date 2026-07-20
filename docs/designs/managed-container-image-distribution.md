@@ -1,6 +1,6 @@
 # Managed container image distribution
 
-Status: adversarial review in progress, implementation realignment pending
+Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
@@ -61,11 +61,13 @@ V0 contains:
 - asynchronous canonical and just-in-time regional materialization;
 - one managed AWS ECR adapter for qualified EC2 and EKS runtimes;
 - fixed, Terraform-created AWS repository shards;
-- separate API, copy-worker, lifecycle-worker, and workload identities;
+- separate API, copy-worker, lifecycle-worker, canary-worker, and workload
+  identities;
 - durable deployment demands that fence regional eviction;
 - node-scoped image resolution for multi-GPU and multi-node workloads;
 - bounded paginated APIs and a complete operational Images UI;
-- copy and lifecycle worker Helm deployments, health, metrics, and recovery;
+- copy, lifecycle, and runtime-canary worker Helm deployments, health, metrics,
+  and recovery;
 - PostgreSQL-only central image state; and
 - fleet measurements as an activation gate, not a merge prerequisite.
 
@@ -119,6 +121,7 @@ here.
 | Pull plan | Secret-free, placement-specific READY location snapshot | runtime resolver |
 | Copy worker | Claims copy/verify work and can write manifests | materialization worker |
 | Lifecycle worker | Claims eligible regional eviction work and can delete manifests | lifecycle worker |
+| Canary worker | Runs bounded EC2/EKS pulls through the declared runtime identity | qualification worker |
 
 The implementation is split along those boundaries:
 
@@ -136,8 +139,10 @@ sky/container_images/
   aws.py                    qualified ECR adapter
   copy_worker_service.py    independently deployed copy loop
   lifecycle_worker_service.py independently deployed deletion loop
-  api.py                    typed direct reads and asynchronous mutations
-  state.py                  temporary compatibility facade only
+  canary_worker_service.py  independently deployed runtime-canary loop
+  api_models.py             closed direct-API request and response models
+  server.py                 typed direct reads and asynchronous mutations
+  builder_prototype.py      disabled post-v0 BuildKit/R2/S3 evidence harness
 ```
 
 Repository functions accept a caller-owned SQLAlchemy session and never commit
@@ -325,7 +330,15 @@ workspaces:
       mode: managed_required
       default_profile: gpu-production
       allowed_profiles: [gpu-production]
+      publishers:
+        - 1a2b3c4d5e6f7890
 ```
+
+`publishers` contains stable SkyPilot user IDs, not display names. Administrators
+always have `images:publish`; other users require their exact ID in this list.
+Workspace access alone grants `images:use`, while the viewer role remains
+read-only even if its ID is accidentally listed. An absent list grants no
+non-administrator publication or preparation mutations.
 
 ## Publication contract
 
@@ -505,10 +518,14 @@ publications, and releases.
   selected placement in one resolution attempt.
 - Provider calls and OCI transfers occur only in workers.
 
-The location-intent transaction locks the selected physical shard, then the
-artifact, enforces its regional-location ceiling, reserves count and conservative
-declared bytes once, and inserts or converges the location. An implicit workload
-request cannot fan out beyond the one selected placement.
+The location-intent transaction converges on the immutable target-ring
+fingerprint before selecting a physical shard, locks the selected shard, then
+the artifact, enforces its regional-location ceiling, reserves count and
+conservative declared bytes once, and inserts or converges the location. A
+unique artifact, target-ring fingerprint, and runtime-digest constraint closes
+concurrent shard-selection races. The loser rolls back its shard reservation
+and reloads the winning location. An implicit workload request cannot fan out
+beyond the one selected placement.
 
 Before the first optimization, a metadata-only eligibility pass maps each
 candidate placement to the active profile's declared runtime binding, locality,
@@ -522,9 +539,10 @@ For managed EC2, that metadata includes the exact planned host AMI and instance
 profile. Both must match the binding's qualified regional AMI and principal; a
 request with no host image is pinned to the qualified regional AMI before
 optimization, while a user-supplied host image or role outside that tuple is not
-silently trusted. EKS
-eligibility similarly binds the selected cluster ARN and node group to an
-attested node role. `managed_required` fails closed on a mismatch, while
+silently trusted. EKS eligibility maps the selected SkyPilot Kubernetes context
+to one exact cluster ARN and node-role tuple, then binds the selected cluster
+and node group to that attestation. `managed_required` fails closed on a
+mismatch, while
 `managed_preferred` may use only its otherwise-authorized direct digest path.
 
 When a selected managed target has no READY route, resolution first persists one
@@ -676,14 +694,16 @@ Important constraints include:
 - profile revision state in
   `QUALIFYING|ACTIVE|FAILED|SUPERSEDED|RETIRED`, a monotonically increasing
   desired generation, partial unique desired and active revisions per profile
-  selection scope, and bounded config, Terraform, and capability-attestation
-  hashes plus a daily canary-cost reservation window;
+  selection scope, a bounded secret-free immutable config snapshot and its
+  hash, Terraform and capability-attestation hashes, plus a daily canary-cost
+  reservation window;
 - one row per physical repository shard with immutable fingerprint, hard
   manifest and declared-byte ceilings, reserved/observed counters,
   qualification timestamp, fair-dispatch timestamp and in-flight ceiling,
   reconciliation epoch/cursor, and `READY|FULL|DRIFTED|DISABLED` admission state;
-- unique physical location identity for artifact, physical shard/fingerprint,
-  and runtime digest, independent of profile revision;
+- unique logical location identity for artifact, immutable target-ring
+  fingerprint, and runtime digest, independent of profile revision, plus a
+  separately persisted physical repository-shard fingerprint;
 - canonical versus regional location relationship checks;
 - the exact location transitions and lease combinations above;
 - an inventory epoch marker on each manifest-present location;
@@ -692,8 +712,8 @@ Important constraints include:
   observation/tombstone fields, and
   `WARMING|READY|FAILED|SUPERSEDED|RELEASED` state plus a bounded secret-free plan;
 - one maximum seen/terminal generation watermark per stable consumer owner; and
-- worker kind in `COPY|LIFECYCLE` with bounded heartbeat metadata and bounded
-  provider-token grants.
+- worker kind in `COPY|LIFECYCLE|CANARY` with bounded heartbeat metadata and
+  bounded provider-token grants.
 
 All queue discovery is bounded and indexed by state, retry time, inspection or
 location lease expiry, and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O
@@ -810,16 +830,32 @@ container_registries:
       purposes: [runtime_pull]
       principals:
         - arn:aws:iam::210987654321:role/SkyPilotNodeRole
+      instance_profile: SkyPilotNodeProfile
       credential_helper: amazon-ecr-credential-helper
       qualified_node_images:
         us-east-1: ami-0123456789abcdef0
         us-west-2: ami-0fedcba9876543210
+      canary_authority: compute-canary
+      canary_instance_type: t3.micro
+      canary_subnets:
+        us-east-1: [subnet-0123456789abcdef0]
+        us-west-2: [subnet-0fedcba9876543210]
+      canary_security_groups:
+        us-east-1: [sg-0123456789abcdef0]
+        us-west-2: [sg-0fedcba9876543210]
     aws-eks-pullers:
       kind: aws_eks_kubelet_identity
       purposes: [runtime_pull]
+      canary_authority: compute-canary
       qualified_clusters:
-        - cluster_arn: arn:aws:eks:us-west-2:210987654321:cluster/boltz-gpu
+        - context: boltz-gpu
+          cluster_arn: arn:aws:eks:us-west-2:210987654321:cluster/boltz-gpu
           node_role: arn:aws:iam::210987654321:role/EksNodeRole
+          namespace: skypilot-image-canaries
+    compute-canary:
+      kind: aws_assume_role
+      authority: arn:aws:iam::210987654321:role/SkyPilotImageCanary
+      purposes: [canary_launch]
   profiles:
     gpu-production:
       revision: 1
@@ -836,6 +872,10 @@ container_registries:
         runtime_attestation_max_age_seconds: 86400
         automatic_canaries: true
         max_daily_canary_cost_usd: 5
+        canary_worst_case_cost_usd: 0.10
+        canary_timeout_seconds: 900
+        canary_ref: public.ecr.aws/skypilot/image-canary@sha256:<64-hex>
+        canary_platform: linux/amd64
       canonical:
         region: us-east-1
         registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
@@ -846,6 +886,7 @@ container_registries:
         max_in_flight: 16
         write_authority: registry-copy
         delete_authority: disabled
+        qualification_delete_authority: registry-lifecycle
         runtime_pull:
           aws_vm: aws-vm-pullers
       targets:
@@ -859,6 +900,7 @@ container_registries:
           max_in_flight: 16
           write_authority: registry-copy
           delete_authority: registry-lifecycle
+          qualification_delete_authority: registry-lifecycle
           runtime_pull:
             aws_vm: aws-vm-pullers
             aws_eks: aws-eks-pullers
@@ -888,6 +930,24 @@ Every declared EC2 region/AMI/role tuple and EKS cluster/role tuple needs its ow
 attestation; success for one tuple never qualifies another. Target qualification
 orders canary copy, actual runtime pulls, then lifecycle deletion and exact
 absence, so activation never races cleanup.
+
+The runtime binding also declares the minimum launch tuple needed for an
+automatic canary. EC2 qualification pins one IAM role, instance-profile name,
+AMI, instance type, and bounded regional subnet/security-group allowlist. EKS
+qualification pins one kubeconfig context, cluster ARN, node role, and dedicated
+namespace. The separately referenced `canary_launch` authority may only launch,
+inspect, and tear down these tagged canaries; it has no ECR write or lifecycle
+permission. The fixed digest-pinned `canary_ref` is copied by the copy worker
+into Terraform's non-catalog qualification repository. The canary worker pulls
+that regional digest through the declared runtime identity, and the lifecycle
+worker deletes it through `qualification_delete_authority`. A target cannot use
+its ordinary `delete_authority: disabled` setting to skip qualification cleanup.
+
+`canary_worst_case_cost_usd` is reserved atomically with the operation lease
+before any child launch. It is a conservative operator-set ceiling for one run,
+not an observed bill. `canary_timeout_seconds` bounds launch, pull, observation,
+and teardown. V0 supports only `linux/amd64`; configuration rejects another
+canary platform rather than building or launching an unused architecture.
 
 Each service writes a bounded attestation through its authenticated internal
 endpoint. A canary result includes a single-use nonce and actual-principal
@@ -1300,6 +1360,7 @@ response. Detaching leaves the same operation ID available through the read API.
 
 ```text
 GET /images/catalog?workspace=W&limit=50&cursor=C
+GET /images/publications?workspace=W&state=S&release=R&limit=50&cursor=C
 GET /images/artifacts/{id}?workspace=W
 GET /images/artifacts/{id}/releases?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/sources?workspace=W&limit=50&cursor=C
@@ -1319,6 +1380,13 @@ remain paginated. Profile validation permits at most 128 profiles and 256 target
 per profile. Readiness counts scan at most 10,001 indexed queue rows per target
 and report `at_least: 10000` above that cap; oldest-age lookup is index-bounded.
 No dashboard read creates a generic request row.
+
+The workspace publication feed is required for recovery, not a duplicate
+catalog. A publication that fails while inspecting its source has no artifact
+ID yet, so an artifact-scoped endpoint cannot rediscover it after the initiating
+client detaches. The feed returns bounded reservation and operation projections,
+including unbound PENDING, INSPECTING, and FAILED rows, and is the only way the
+CLI or Dashboard locates such a publication for explicit retry.
 
 ## Security and privacy invariants
 
@@ -1352,7 +1420,8 @@ No dashboard read creates a generic request row.
    old pod remains before feature activation.
 4. Apply Terraform in one dedicated registry account, import its qualification
    manifest, and stage the desired profile revision without activating it.
-5. Deploy one copy worker and one lifecycle worker with separate identities.
+5. Deploy one copy worker, one lifecycle worker, and one runtime-canary worker
+   with separate identities.
 6. Let each worker attest only its own capability, run actual-principal EC2 and
    EKS canaries, and atomically activate the desired generation only after all
    repository, quota, KMS, policy, runtime, and fingerprint evidence is fresh.

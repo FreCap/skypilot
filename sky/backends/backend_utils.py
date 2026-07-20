@@ -1006,6 +1006,17 @@ def write_cluster_config(
             if fnmatch.fnmatchcase(cluster_name, list(profile.keys())[0]):
                 remote_identity = list(profile.values())[0]
                 break
+    resolved_image = to_provision.resolved_container_image
+    managed_instance_profile = (resolved_image.instance_profile
+                                if resolved_image is not None else None)
+    if managed_instance_profile is not None:
+        if (remote_identity_config is not None and
+                remote_identity != managed_instance_profile):
+            raise exceptions.InvalidCloudConfigs(
+                'The managed container image profile requires AWS remote '
+                f'identity {managed_instance_profile!r}, but the effective '
+                f'aws.remote_identity is {remote_identity!r}.')
+        remote_identity = managed_instance_profile
     if remote_identity != schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value:
         # If LOCAL_CREDENTIALS is not specified, we add the cloud to the
         # excluded_clouds set, but we must also check if the cloud supports

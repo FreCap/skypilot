@@ -472,8 +472,8 @@ class Resources:
             # Validate before warning so a rejected legacy value can never be
             # reflected into logs.  The warning itself is intentionally
             # value-free because image references are an untrusted boundary.
-            self._container_image = container_images_lib.ContainerImage(
-                ref=legacy_docker_image)
+            self._container_image = (container_images_lib.ContainerImage.
+                                     from_legacy_ref(legacy_docker_image))
             logger.warning(
                 'Using image_id for a Docker image is deprecated. Use '
                 'container_image instead.')
@@ -955,8 +955,13 @@ class Resources:
         container_image = getattr(self, '_container_image', None)
         resolved_image = getattr(self, '_resolved_container_image', None)
         if container_image is not None:
-            container_image = container_images_lib.ContainerImage.from_config(
-                container_image)
+            if getattr(self, '_container_image_from_legacy_image_id', False):
+                container_image = (
+                    container_images_lib.ContainerImage.from_legacy_ref(
+                        container_image.ref))
+            else:
+                container_image = (container_images_lib.ContainerImage.
+                                   from_config(container_image))
         if resolved_image is not None:
             resolved_image = (container_images_lib.ResolvedContainerImage.
                               from_dict(resolved_image))
@@ -2428,6 +2433,18 @@ class Resources:
                                   placement_changed))
         default_container_image = (None if legacy_container_replaced else
                                    self.container_image)
+        preserve_legacy_container = (self._container_image_from_legacy_image_id
+                                     and not container_image_overridden and
+                                     not image_id_overridden)
+        if preserve_legacy_container:
+            # Re-enter through the public legacy image_id path. Passing the
+            # internal legacy ContainerImage object as container_image would
+            # either bypass or fail the digest-pinned public validation.
+            assert self.container_image is not None
+            assert self.container_image.ref is not None
+            default_image_id = dict(default_image_id or {})
+            default_image_id['docker'] = self.container_image.ref
+            default_container_image = None
         resolved_container_image = (None if pull_plan_invalidated else
                                     self._resolved_container_image)
         default_docker_login_config = (None if pull_plan_invalidated else
@@ -3009,7 +3026,12 @@ class Resources:
         self._validate_container_image_docker_credentials()
         state = self.__dict__.copy()
         if self._container_image is not None:
-            state['_container_image'] = self._container_image.to_yaml_config()
+            if self._container_image_from_legacy_image_id:
+                state['_container_image'] = self._container_image.ref
+            else:
+                state[
+                    '_container_image'] = self._container_image.to_yaml_config(
+                    )
         if self._resolved_container_image is not None:
             state['_resolved_container_image'] = (
                 self._resolved_container_image.to_dict())
@@ -3219,15 +3241,27 @@ class Resources:
                         for key, value in legacy_image_id.items()
                         if not value.startswith('docker:')
                     } or None
-            state['_container_image'] = (container_images_lib.ContainerImage(
-                ref=docker_image) if docker_image is not None else None)
+            state['_container_image'] = (
+                container_images_lib.ContainerImage.from_legacy_ref(
+                    docker_image) if docker_image is not None else None)
             state['_resolved_container_image'] = None
             state['_docker_image'] = docker_image
         else:
             container_image = state.get('_container_image')
             if container_image is not None:
-                state['_container_image'] = (container_images_lib.ContainerImage
-                                             .from_config(container_image))
+                legacy_container_image = bool(
+                    state.get('_container_image_from_legacy_image_id', False))
+                if legacy_container_image:
+                    if not isinstance(container_image, str):
+                        raise ValueError('Legacy Docker image state must be a '
+                                         'string reference.')
+                    state['_container_image'] = (
+                        container_images_lib.ContainerImage.from_legacy_ref(
+                            container_image))
+                else:
+                    state['_container_image'] = (
+                        container_images_lib.ContainerImage.from_config(
+                            container_image))
             resolved = state.get('_resolved_container_image')
             if resolved is not None:
                 state['_resolved_container_image'] = (

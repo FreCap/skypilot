@@ -1,0 +1,385 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- if and (or .Values.imageCopyWorker.enabled .Values.imageLifecycleWorker.enabled .Values.imageCanaryWorker.enabled) (not $databaseConfigured) -}}
+{{- fail "Managed image workers require external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
+{{- end -}}
+{{- if and .Values.imageCopyWorker.enabled (not .Values.imageCopyWorker.serviceAccount.create) (not .Values.imageCopyWorker.serviceAccount.name) -}}
+{{- fail "imageCopyWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- if and .Values.imageLifecycleWorker.enabled (not .Values.imageLifecycleWorker.serviceAccount.create) (not .Values.imageLifecycleWorker.serviceAccount.name) -}}
+{{- fail "imageLifecycleWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
+{{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+
+{{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+  {{- with .Values.imageCopyWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+{{- if .Values.imageCopyWorker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-copy-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+spec:
+  replicas: {{ .Values.imageCopyWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-copy-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-copy-worker
+    spec:
+      serviceAccountName: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-copy-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageCopyWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCopyWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.copy_worker_service"]
+        env:
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageCopyWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageCopyWorker.maxInFlight | quote }}
+        {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+        - name: SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR
+          value: /var/skypilot/image-qualification
+        {{- end }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.imageCopyWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+        - name: qualification-manifests
+          mountPath: /var/skypilot/image-qualification
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+      - name: qualification-manifests
+        configMap:
+          name: {{ .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- end }}
+
+{{- if and .Values.imageLifecycleWorker.enabled .Values.imageLifecycleWorker.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-lifecycle-worker
+  {{- with .Values.imageLifecycleWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+{{- if .Values.imageLifecycleWorker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-lifecycle-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-lifecycle-worker
+spec:
+  replicas: {{ .Values.imageLifecycleWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-lifecycle-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-lifecycle-worker
+    spec:
+      serviceAccountName: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-lifecycle-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageLifecycleWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageLifecycleWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.lifecycle_worker_service"]
+        env:
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageLifecycleWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageLifecycleWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_RETENTION_SECONDS
+          value: {{ .Values.imageLifecycleWorker.retentionSeconds | quote }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.imageLifecycleWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- with .Values.imageLifecycleWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageLifecycleWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageLifecycleWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+
+{{- if and .Values.imageCanaryWorker.enabled .Values.imageCanaryWorker.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-canary-worker
+  {{- with .Values.imageCanaryWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+{{- end }}
+{{- if .Values.imageCanaryWorker.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-canary-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-canary-worker
+spec:
+  replicas: {{ .Values.imageCanaryWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-canary-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-canary-worker
+    spec:
+      serviceAccountName: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-canary-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageCanaryWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCanaryWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.canary_worker_service"]
+        env:
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageCanaryWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageCanaryWorker.maxInFlight | quote }}
+        {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+        - name: KUBECONFIG
+          value: /var/skypilot/kubeconfig/config
+        {{- end }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.imageCanaryWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+        - name: kubeconfig
+          mountPath: /var/skypilot/kubeconfig
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+      - name: kubeconfig
+        secret:
+          secretName: {{ .Values.imageCanaryWorker.kubeconfigSecretName }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

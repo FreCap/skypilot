@@ -676,55 +676,15 @@ def _validate_container_image_config(config: dict[str, Any],
     # Lazy imports avoid adding registry modules to the ordinary CLI import
     # path and avoid a cycle through sky.container_images.config.
     # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as image_config_lib
     from sky.container_images import models as image_models
-    from sky.container_images import providers as image_providers
 
     registries = config.get('container_registries') or {}
-    raw_profiles = registries.get('profiles') or {}
-    profiles: dict[str, image_models.RegistryProfile] = {}
     try:
-        for name, raw_profile in raw_profiles.items():
-            canonical = image_models.RegistryTarget.from_config(
-                'canonical', raw_profile['canonical'])
-            targets = tuple(
-                image_models.RegistryTarget.from_config(target['name'], target)
-                for target in raw_profile.get('targets', ()))
-            target_names = [target.name for target in targets]
-            if len(target_names) != len(set(target_names)):
-                raise ValueError(
-                    f'Registry profile {name!r} contains duplicate target '
-                    'names.')
-            if canonical.name in target_names:
-                raise ValueError(
-                    f'Registry profile {name!r} reserves '
-                    f'{canonical.name!r} for its canonical target.')
-            endpoints = [
-                target.endpoint_identity for target in (canonical, *targets)
-            ]
-            if len(endpoints) != len(set(endpoints)):
-                raise ValueError(
-                    f'Registry profile {name!r} assigns multiple target '
-                    'names to one physical registry endpoint.')
-            profile = image_models.RegistryProfile(
-                name=name,
-                ownership=image_models.RegistryOwnership(
-                    raw_profile['ownership']),
-                realm=raw_profile['realm'],
-                organization=raw_profile.get('organization'),
-                namespace=raw_profile['namespace'],
-                require_digest_at_runtime=raw_profile.get(
-                    'require_digest_at_runtime', True),
-                canonical=canonical,
-                targets=targets,
-                revision=raw_profile['revision'])
-            if not profile.require_digest_at_runtime:
-                raise ValueError(
-                    f'Registry profile {name!r} must require digest-pinned '
-                    'runtime references.')
-            for target in (canonical, *targets):
-                image_providers.get_adapter(
-                    target.provider).validate_target(target)
-            profiles[name] = profile
+        bindings = image_config_lib.parse_access_bindings(
+            registries.get('access_bindings'))
+        profiles = image_config_lib.parse_profiles(registries.get('profiles'),
+                                                   bindings)
 
         default_profile = registries.get('default_profile')
         if default_profile == 'direct':
@@ -733,40 +693,14 @@ def _validate_container_image_config(config: dict[str, Any],
             raise ValueError(
                 f'Default registry profile {default_profile!r} is not '
                 'configured.')
-        for context_name, binding in (registries.get('kubernetes_contexts') or
-                                      {}).items():
-            image_models.validate_control_plane_identifier(
-                binding['registry_provider'],
-                f'Kubernetes context {context_name!r} registry provider')
-            image_models.normalize_registry_region(
-                binding['registry_region'],
-                f'Kubernetes context {context_name!r} registry region',
-                binding['registry_provider'])
-            image_models.normalize_registry_prefix(binding['registry'],
-                                                   context_name)
-
         for workspace, workspace_config in (config.get('workspaces') or
                                             {}).items():
-            image_config = workspace_config.get('container_images')
-            if image_config is None:
+            raw_policy = workspace_config.get('container_images')
+            if raw_policy is None:
                 continue
             image_models.validate_workspace_name(
                 workspace, 'Container image policy workspace')
-            policy = image_models.WorkspaceImagePolicy(
-                mode=image_models.WorkspaceImageMode(
-                    image_config.get('mode', 'managed_preferred')),
-                default_profile=image_config.get('default_profile'),
-                allowed_profiles=tuple(image_config.get('allowed_profiles',
-                                                        ())),
-                locality=image_models.Locality(
-                    image_config.get('locality', 'prefer')),
-                regional_cache_retention_weeks=image_config.get(
-                    'regional_cache_retention_weeks', 8),
-                max_artifacts=image_config.get('max_artifacts', 1_000_000),
-                max_sources_per_artifact=image_config.get(
-                    'max_sources_per_artifact', 128),
-                max_releases_per_artifact=image_config.get(
-                    'max_releases_per_artifact', 128))
+            policy = image_config_lib.parse_workspace_policy(raw_policy)
             selected_profiles = set(policy.allowed_profiles)
             if policy.default_profile is not None:
                 selected_profiles.add(policy.default_profile)

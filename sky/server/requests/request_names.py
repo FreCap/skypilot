@@ -74,12 +74,6 @@ class RequestName(str, enum.Enum):
     VOLUME_LIST = 'volume_list'
     VOLUME_DELETE = 'volume_delete'
     VOLUME_APPLY = 'volume_apply'
-    # Managed container image requests
-    IMAGE_PUBLISH = 'image.publish'
-    IMAGE_REGISTER = 'image.register'
-    IMAGE_STATUS = 'image.status'
-    IMAGE_PREPARE = 'image.prepare'
-    IMAGE_RETRY = 'image.retry'
     # Workspaces requests
     WORKSPACES_GET = 'workspaces.get'
     WORKSPACES_UPDATE = 'workspaces.update'

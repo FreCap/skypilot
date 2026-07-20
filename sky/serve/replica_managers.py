@@ -1949,7 +1949,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         ownership_lost = getattr(self, '_ownership_lost', None)
         return ownership_lost is None or not ownership_lost.is_set()
 
-    def _replica_launch_fence_context(self) -> dict[str, Any] | None:
+    def _replica_launch_fence_context(self,
+                                      service_version: int | None = None
+                                     ) -> dict[str, Any] | None:
         """Owner tuple validated by the API executor before provisioning."""
         if not getattr(self, '_enforce_launch_fence', True):
             # A legacy/non-consolidated controller owns a different Serve DB;
@@ -1968,12 +1970,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
         controller_ip_key = (
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
-        return {
+        fence_context = {
             service_name_key: self._service_name,
             service_hash_key: service_hash,
             controller_pid_key: controller_pid,
             controller_ip_key: controller_ip,
         }
+        if service_version is not None:
+            fence_context[
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY] = (
+                    service_version)
+        return fence_context
 
     def _service_owner_watchdog(self) -> None:
         """Trip one shared launch-cancellation fence on ownership loss."""
@@ -2907,7 +2914,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'exact_resources_override': location is not None,
                 'pre_launch_guard': self._service_is_launch_authorized,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
-                'launch_fence': self._replica_launch_fence_context(),
+                'launch_fence':
+                    self._replica_launch_fence_context(launch_version),
                 'service_spec': launch_spec,
                 'workspace': getattr(
                     self, '_workspace',

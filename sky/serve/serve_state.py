@@ -1674,6 +1674,69 @@ def get_service_runtime_snapshot(
     }
 
 
+def get_service_version_terminal_states(
+    identities: list[tuple[str, int,
+                           str]],) -> dict[tuple[str, int, str], bool]:
+    """Returns authoritative terminal state for bounded service versions.
+
+    Missing entries are intentionally unknown. A service version is live while
+    it is current, routed, or owns any replica row. It becomes terminal only
+    after Serve's own rollout/drain state has moved past it, or after its exact
+    service incarnation is gone.
+    """
+    if not identities:
+        return {}
+    if len(identities) > 1000:
+        raise ValueError('Service-version terminal-state batch is too large.')
+    names = sorted({identity[0] for identity in identities})
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        service_rows = session.execute(
+            sqlalchemy.select(
+                services_table.c.name,
+                services_table.c.hash,
+                services_table.c.status,
+                services_table.c.current_version,
+                services_table.c.active_versions,
+            ).where(services_table.c.name.in_(names))).mappings().all()
+        version_rows = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.service_name,
+                version_specs_table.c.version).where(
+                    version_specs_table.c.service_name.in_(names))).all()
+        replica_rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.service_name, replicas_table.c.version).where(
+                    replicas_table.c.service_name.in_(names))).all()
+    services = {str(row['name']): row for row in service_rows}
+    versions = {(str(row[0]), int(row[1])) for row in version_rows}
+    replicas = {(str(row[0]), int(row[1])) for row in replica_rows}
+    result: dict[tuple[str, int, str], bool] = {}
+    for identity in identities:
+        name, version, service_hash = identity
+        row = services.get(name)
+        if row is None or row['hash'] != service_hash:
+            result[identity] = True
+            continue
+        if ServiceStatus[str(
+                row['status'])] in ServiceStatus.terminal_statuses():
+            result[identity] = True
+            continue
+        if (name, version) not in versions:
+            # A matching live incarnation without the claimed immutable version
+            # is inconsistent, not proof that the owner is terminal.
+            continue
+        current_version = row['current_version']
+        active_versions = (json.loads(row['active_versions'])
+                           if row['active_versions'] else [])
+        if (current_version == version or version in active_versions or
+            (name, version) in replicas):
+            result[identity] = False
+        elif current_version is not None and version < int(current_version):
+            result[identity] = True
+    return result
+
+
 def get_service_status_snapshot(
         service_name: str,
         require_version: bool = False) -> dict[str, Any] | None:

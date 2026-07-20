@@ -508,6 +508,229 @@
         "grafana": {
             "type": "object"
         },
+        "imageCanaryWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "kubeconfigSecretName": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
+        },
+        "imageCopyWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "qualificationManifestConfigMapName": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
+        },
+        "imageLifecycleWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "retentionSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
+        },
         "ingress": {
             "type": "object",
             "properties": {

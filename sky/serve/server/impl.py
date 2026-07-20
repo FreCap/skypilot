@@ -24,7 +24,7 @@ from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.catalog import common as service_catalog_common
-from sky.container_images import state as container_image_state
+from sky.container_images import catalog_state as container_image_catalog_state
 from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
@@ -754,7 +754,8 @@ def _up_impl_body(task: 'task_lib.Task',
                 local_user_config=mutated_user_config,
             ),
         }
-        catalog_authority = container_image_state.get_catalog_authority_id()
+        catalog_authority = (
+            container_image_catalog_state.get_catalog_authority_id())
         assert catalog_authority is not None
         vars_to_fill['controller_envs'][
             constants.CONTAINER_IMAGE_CATALOG_AUTHORITY_ENV_VAR] = (

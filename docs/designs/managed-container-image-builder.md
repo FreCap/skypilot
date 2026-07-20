@@ -59,7 +59,6 @@ setup:
     inputs:
       - requirements.txt
 context:
-  path: .
   include:
     - requirements.txt
     - src/**
@@ -67,11 +66,13 @@ source:
   mode: late_bound
   include:
     - src/**
-platforms:
-  - linux/amd64
+platform: linux/amd64
 output:
+  workspace: research
   distribution: gpu-production
   release: boltz-runtime-2026-07-20
+  staging_repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/skypilot/staging
+  source_auth: registry-copy
 ```
 
 `setup` is intentionally supported as a build layer. It is an explicit build
@@ -232,8 +233,14 @@ worker crashes but is never read by a production API binary. It must demonstrate
    race;
 8. zero secret values in image history, logs, database rows, or attestations.
 
-The prototype may live behind an internal command or test harness. It cannot be
-enabled in the Dashboard or normal client configuration.
+The repository prototype lives in `sky/container_images/builder_prototype.py`.
+It is absent from the public API, SDK, YAML schema, and Dashboard, and its
+maintainer CLI refuses to run unless
+`SKYPILOT_IMAGE_BUILDER_PROTOTYPE=1` is set. The CLI currently validates and
+content-addresses a context only. The coordinator, isolated PostgreSQL schema,
+S3-compatible uploader, fenced BuildKit executor, staging verification, and
+ordinary publication handoff are exercised through the internal harness and
+tests, not enabled as a production service.
 
 ## Productization gate
 

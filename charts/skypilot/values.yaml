@@ -264,6 +264,129 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Managed container image distribution workers. All services are inert unless
+# explicitly enabled and require the same external PostgreSQL database as the
+# API server. They intentionally use independent Kubernetes service accounts so
+# AWS workload identity can grant copy, lifecycle, and canary permissions
+# separately.
+imageCopyWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # Maximum provider-I/O claims handled concurrently by each replica.
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 4
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Optional ConfigMap whose JSON entries are secret-free Terraform
+  # qualification manifests. Entries are ingested asynchronously.
+  # @schema type: [string, null]
+  qualificationManifestConfigMapName: null
+  serviceAccount:
+    # Create the worker service account. Set false with name to use an existing
+    # Terraform-managed account.
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # For example, an eks.amazonaws.com/role-arn IRSA annotation.
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+imageLifecycleWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 4
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Regional cache retention. Canonical manifests are never evicted.
+  # @schema type: [integer]; minimum: 1
+  retentionSeconds: 4838400
+  serviceAccount:
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+imageCanaryWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # Maximum temporary compute canaries handled concurrently by each replica.
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 2
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Optional Secret containing a `config` key with the qualified EKS contexts.
+  # In-cluster-only qualification does not require it.
+  # @schema type: [string, null]
+  kubeconfigSecretName: null
+  serviceAccount:
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # SkyServe (model serving) configuration.
 serve:
   # Portable external load balancer support for controller-owned SkyServe LBs.

@@ -26,7 +26,7 @@ import {
   PieChartIcon,
   RepeatIcon,
 } from '@/components/elements/icons';
-import { Settings, User, Clock, FileCode, Activity } from 'lucide-react';
+import { Settings, User, Clock, FileCode, Activity, Box } from 'lucide-react';
 
 // Map icon names to icon components for plugin nav links
 const ICON_MAP = {
@@ -154,6 +154,14 @@ export function SideBar({ highlighted = 'clusters' }) {
             >
               <BriefcaseIcon className="w-5 h-5 min-w-5" />
               <span>Jobs</span>
+            </Link>
+            <Link
+              href="/images"
+              className={linkStyle(highlighted === 'images')}
+              prefetch={false}
+            >
+              <Box className="w-5 h-5 min-w-5" />
+              <span>Images</span>
             </Link>
           </div>
         </div>
@@ -517,6 +525,15 @@ export function TopBar() {
               </Link>
 
               <Link
+                href="/images"
+                className={getLinkClasses('/images')}
+                prefetch={false}
+              >
+                <Box className="w-4 h-4" />
+                <span>Images</span>
+              </Link>
+
+              <Link
                 href="/volumes"
                 className={getLinkClasses('/volumes')}
                 prefetch={false}
@@ -810,6 +827,16 @@ export function TopBar() {
                 >
                   <Activity className="w-5 h-5 mr-3" />
                   Services
+                </Link>
+
+                <Link
+                  href="/images"
+                  className={getMobileLinkClasses('/images')}
+                  onClick={toggleMobileSidebar}
+                  prefetch={false}
+                >
+                  <Box className="w-5 h-5 mr-3" />
+                  Images
                 </Link>
 
                 <Link

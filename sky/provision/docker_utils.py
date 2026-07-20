@@ -73,12 +73,36 @@ def _extract_region_from_ecr_server(server: str) -> str:
     raise ValueError(f'Invalid ECR server format: {server}')
 
 
+def _credential_helper_config_cmd(server: str) -> str:
+    """Atomically merges one value-free helper route into root's config."""
+    if _ECR_SERVER_PATTERN.fullmatch(server) is None:
+        raise ValueError(
+            'Managed Docker credential helper registry is invalid.')
+    script = ('import json, os, tempfile; '
+              'p="/root/.docker/config.json"; '
+              'c=json.load(open(p)) if os.path.exists(p) else {}; '
+              'assert isinstance(c, dict); '
+              'h=c.setdefault("credHelpers", {}); '
+              'assert isinstance(h, dict); '
+              f'h[{server!r}]="ecr-login"; '
+              'f=tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(p), '
+              'delete=False); '
+              'json.dump(c, f, sort_keys=True, separators=(",", ":")); '
+              'f.write("\\n"); f.flush(); os.fsync(f.fileno()); f.close(); '
+              'os.chmod(f.name, 0o600); os.replace(f.name, p)')
+    return ('command -v docker-credential-ecr-login >/dev/null && '
+            'command -v python3 >/dev/null && '
+            'sudo install -d -m 0700 /root/.docker && '
+            f'sudo python3 -c {shlex.quote(script)}')
+
+
 @dataclasses.dataclass
 class DockerLoginConfig:
     """Config for docker login. Used for pulling from private registries."""
     username: str
     password: str
     server: str
+    credential_helper: str | None = None
 
     def format_image(self, image: str) -> str:
         """Format the image name with the server prefix."""
@@ -309,7 +333,19 @@ class DockerInitializer:
             docker_login_config = DockerLoginConfig(
                 **self.docker_config['docker_login_config'])
 
-            if docker_login_config.password:
+            if docker_login_config.credential_helper is not None:
+                if (docker_login_config.credential_helper != 'ecr-login' or
+                        _ECR_SERVER_PATTERN.fullmatch(
+                            docker_login_config.server) is None):
+                    raise ValueError('Managed Docker credential helper is not '
+                                     'supported for this registry.')
+                # The qualified host image already contains this helper. Only
+                # write its value-free Docker routing entry here. Never install
+                # AWS CLI or persist an ECR bearer token on the workload node.
+                self._run(_credential_helper_config_cmd(
+                    docker_login_config.server),
+                          wait_for_docker_daemon=True)
+            elif docker_login_config.password:
                 # Password is allowed to be empty, in that case, we will not run
                 # the login command, and assume that the image pulling is
                 # authenticated by the IAM permission on the VM.

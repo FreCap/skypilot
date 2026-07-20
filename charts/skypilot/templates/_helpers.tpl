@@ -110,6 +110,31 @@ Create the name of the service account to use
 {{- end -}}
 {{- end -}}
 
+{{/* Managed image workers use intentionally separate workload identities. */}}
+{{- define "skypilot.imageCopyWorkerServiceAccountName" -}}
+{{- if .Values.imageCopyWorker.serviceAccount.name -}}
+{{ .Values.imageCopyWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-copy-worker
+{{- end -}}
+{{- end -}}
+
+{{- define "skypilot.imageLifecycleWorkerServiceAccountName" -}}
+{{- if .Values.imageLifecycleWorker.serviceAccount.name -}}
+{{ .Values.imageLifecycleWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-lifecycle-worker
+{{- end -}}
+{{- end -}}
+
+{{- define "skypilot.imageCanaryWorkerServiceAccountName" -}}
+{{- if .Values.imageCanaryWorker.serviceAccount.name -}}
+{{ .Values.imageCanaryWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-canary-worker
+{{- end -}}
+{{- end -}}
+
 {{/*
 Create the namespace if not exist
 */}}

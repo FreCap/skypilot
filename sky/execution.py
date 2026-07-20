@@ -89,12 +89,16 @@ def _validate_service_replica_launch_fence(
         serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
     service_hash = launch_context.get(
         serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    service_version = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
     controller_pid = launch_context.get(
         serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
     controller_ip = launch_context.get(
         serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
     if (not isinstance(service_name, str) or not service_name or
             not isinstance(service_hash, str) or not service_hash or
+            not (service_version is None or
+                 type(service_version) is int and service_version > 0) or
             not (controller_pid is None or isinstance(controller_pid, int)) or
             not (controller_ip is None or isinstance(controller_ip, str))):
         raise exceptions.RequestCancelled(

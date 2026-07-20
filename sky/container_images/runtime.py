@@ -1,0 +1,473 @@
+"""Provider-free workload resolution and durable warming demand creation."""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import time
+import typing
+
+from sky.container_images import catalog_state
+from sky.container_images import config
+from sky.container_images import demand_state
+from sky.container_images import models
+from sky.container_images import topology_state
+from sky.container_images import transactions
+from sky.provision import docker_utils
+
+if typing.TYPE_CHECKING:
+    from sky import resources as resources_lib
+
+
+class ContainerImageWarmingError(ValueError):
+    """The selected placement is fenced while its exact digest materializes."""
+
+    def __init__(self, demand: demand_state.DemandRecord) -> None:
+        self.demand_id = demand.id
+        self.consumer_generation = demand.consumer_generation
+        super().__init__(
+            'IMAGE_WARMING: registry preparation is still running for '
+            f'demand {demand.id}.')
+
+
+class ContainerImagePreparationFailedError(ValueError):
+    """The selected target reached a closed terminal preparation failure."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _MetadataResolution:
+    """Provider-free eligibility result cached during optimization."""
+    resources: 'resources_lib.Resources'
+    direct: bool
+    profile: models.ManagedRegistryProfile | None = None
+    policy: models.WorkspaceImagePolicy | None = None
+    active: topology_state.ProfileRevisionRecord | None = None
+    artifact: catalog_state.ArtifactRecord | None = None
+    publication: catalog_state.PublicationRecord | None = None
+    target: models.ManagedRegistryTarget | None = None
+    binding: models.RegistryAccessBinding | None = None
+    runtime_principal: str | None = None
+    instance_profile: str | None = None
+
+
+def _policy_fingerprint(active: topology_state.ProfileRevisionRecord,
+                        target: models.ManagedRegistryTarget,
+                        binding: models.RegistryAccessBinding,
+                        backend: str) -> str:
+    payload = {
+        'profile_revision_id': active.id,
+        'config_hash': active.config_hash,
+        'target_fingerprint': target.target_fingerprint,
+        'runtime_binding_fingerprint': binding.fingerprint,
+        'backend': backend,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+
+
+def _published_identity(
+    image: models.ContainerImage, workspace: str, platform: str
+) -> tuple[catalog_state.ArtifactRecord,
+           catalog_state.PublicationRecord] | None:
+    artifact: catalog_state.ArtifactRecord | None = None
+    publication: catalog_state.PublicationRecord | None = None
+    if image.artifact_id is not None:
+        artifact = catalog_state.get_published_artifact(image.artifact_id,
+                                                        workspace)
+    if image.release is not None:
+        release = catalog_state.get_ready_release(image.release, workspace)
+        if release is None or release.image_id is None:
+            return None
+        release_artifact = catalog_state.get_published_artifact(
+            release.image_id, workspace)
+        if release_artifact is None:
+            return None
+        if artifact is not None and artifact.id != release_artifact.id:
+            raise ValueError('Container image selectors identify different '
+                             'published artifacts.')
+        artifact = release_artifact
+        publication = release
+    if image.ref is not None:
+        source_artifact = catalog_state.get_published_artifact_by_source(
+            workspace, image.ref, platform)
+        if source_artifact is None:
+            return None
+        if artifact is not None and artifact.id != source_artifact.id:
+            raise ValueError('Container image selectors identify different '
+                             'published artifacts.')
+        artifact = source_artifact
+    if artifact is None or artifact.platform != platform:
+        return None
+    if publication is None:
+        publication = catalog_state.get_ready_publication_for_artifact(
+            artifact.id, workspace)
+    if publication is None:
+        return None
+    return artifact, publication
+
+
+def _target_for_placement(
+        profile: models.ManagedRegistryProfile,
+        policy: models.WorkspaceImagePolicy,
+        placement: models.Placement) -> models.ManagedRegistryTarget:
+    if placement.provider.lower() != 'aws' or placement.backend not in (
+            'aws_vm', 'aws_eks'):
+        raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+    if placement.backend == 'aws_eks':
+        matching_targets: list[models.ManagedRegistryTarget] = []
+        for candidate in (profile.canonical,) + profile.targets:
+            binding_id = candidate.runtime_binding('aws_eks')
+            if binding_id is None:
+                continue
+            binding = profile.bindings[binding_id]
+            if any(cluster[0] == placement.region
+                   for cluster in binding.qualified_clusters):
+                matching_targets.append(candidate)
+        if len(matching_targets) != 1:
+            raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+        target = matching_targets[0]
+        if (policy.locality == models.Locality.CANONICAL and
+                target is not profile.canonical):
+            raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+        return target
+    if policy.locality == models.Locality.CANONICAL:
+        return profile.canonical
+    local = next((target for target in (profile.canonical,) + profile.targets
+                  if target.region == placement.region), None)
+    if local is not None:
+        return local
+    if policy.locality == models.Locality.REQUIRE:
+        raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+    return profile.canonical
+
+
+def _runtime_binding(
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget, placement: models.Placement
+) -> tuple[models.RegistryAccessBinding, str | None, str | None, str | None]:
+    binding_id = target.runtime_binding(placement.backend)
+    if binding_id is None:
+        raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+    binding = profile.bindings[binding_id]
+    expected_host_image: str | None = None
+    runtime_principal: str | None = None
+    instance_profile: str | None = None
+    if placement.backend == 'aws_vm':
+        if (binding.kind
+                != models.RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY):
+            raise ValueError('QUALIFICATION_FAILED')
+        expected_host_image = dict(binding.qualified_node_images).get(
+            placement.region)
+        if expected_host_image is None:
+            raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+        runtime_principal = binding.principals[0]
+        instance_profile = binding.instance_profile
+        if (placement.host_image_id is not None and
+                placement.host_image_id != expected_host_image):
+            raise ValueError('QUALIFIED_HOST_IMAGE_REQUIRED')
+        if (placement.runtime_principal is not None and
+                placement.runtime_principal not in binding.principals):
+            raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
+    else:
+        if (binding.kind
+                != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY):
+            raise ValueError('QUALIFICATION_FAILED')
+        qualified = next((item for item in binding.qualified_clusters
+                          if item[0] == placement.region), None)
+        if qualified is None:
+            raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
+        _, expected_cluster_arn, expected_node_role, _ = qualified
+        if (placement.kubernetes_cluster_arn not in (None, expected_cluster_arn)
+                or placement.kubernetes_node_role
+                not in (None, expected_node_role)):
+            raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
+    return binding, expected_host_image, runtime_principal, instance_profile
+
+
+def _pin_host_image(resources: 'resources_lib.Resources',
+                    placement: models.Placement,
+                    expected: str | None) -> 'resources_lib.Resources':
+    if expected is None:
+        return resources
+    configured = dict(resources.image_id or {})
+    existing = configured.get(placement.region, configured.get(None))
+    if existing is not None and existing != expected:
+        raise ValueError('QUALIFIED_HOST_IMAGE_REQUIRED')
+    configured.pop(None, None)
+    configured[placement.region] = expected
+    return resources.copy(image_id=configured)
+
+
+def _direct_fallback_allowed(policy: models.WorkspaceImagePolicy,
+                             image: models.ContainerImage) -> bool:
+    return (policy.mode == models.WorkspaceImageMode.MANAGED_PREFERRED and
+            policy.locality == models.Locality.PREFER and image.ref is not None)
+
+
+def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
+                           profile: models.ManagedRegistryProfile,
+                           target: models.ManagedRegistryTarget,
+                           placement: models.Placement,
+                           binding: models.RegistryAccessBinding,
+                           *,
+                           now: int | None = None) -> bool:
+    runtime_id = placement.region
+    key = models.profile_attestation_key('runtime', target.name,
+                                         placement.backend, binding.fingerprint,
+                                         runtime_id)
+    evidence = active.attestations.get(key)
+    current = int(time.time()) if now is None else now
+    return (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
+            evidence.get('target_fingerprint') == target.target_fingerprint and
+            evidence.get('binding_fingerprint') == binding.fingerprint and
+            evidence.get('backend') == placement.backend and
+            evidence.get('runtime_id') == runtime_id and
+            isinstance(evidence.get('observed_at'), int) and
+            0 <= current - evidence['observed_at'] <=
+            profile.qualification.runtime_attestation_max_age_seconds)
+
+
+def _resolve_metadata(
+    resources: 'resources_lib.Resources',
+    placement: models.Placement,
+    workspace: str,
+    cache: dict[tuple[typing.Any, ...], typing.Any] | None = None
+) -> _MetadataResolution:
+    if cache is None:
+        cache = {}
+    image = resources.container_image
+    if (image is None or resources.container_image_from_legacy_image_id or
+            resources.resolved_container_image is not None):
+        return _MetadataResolution(resources=resources, direct=True)
+    profile_key = ('profile', workspace, image.distribution)
+    if profile_key not in cache:
+        cache[profile_key] = config.resolve_profile(image.distribution,
+                                                    workspace)
+    profile, policy = cache[profile_key]
+    if profile is None:
+        return _MetadataResolution(resources=resources,
+                                   direct=True,
+                                   policy=policy)
+    active_key = ('active', workspace, profile.name)
+    if active_key not in cache:
+        cache[active_key] = topology_state.get_active_profile(
+            workspace, profile.name)
+    active = cache[active_key]
+    if (active is None or active.revision != profile.revision or
+            active.config_hash != profile.config_hash):
+        raise ValueError('PROFILE_NOT_ACTIVE')
+    platform = placement.platform or 'linux/amd64'
+    identity_key = ('identity', workspace, image.ref, image.release,
+                    image.artifact_id, platform)
+    if identity_key not in cache:
+        cache[identity_key] = _published_identity(image, workspace, platform)
+    identity = cache[identity_key]
+    if identity is None:
+        if _direct_fallback_allowed(policy, image):
+            return _MetadataResolution(resources=resources,
+                                       direct=True,
+                                       profile=profile,
+                                       policy=policy,
+                                       active=active)
+        raise ValueError('IMAGE_NOT_PUBLISHED: run sky image publish first.')
+    artifact, publication = identity
+    publication_key = ('revision', publication.profile_revision_id)
+    if publication_key not in cache:
+        cache[publication_key] = topology_state.get_profile_revision(
+            publication.profile_revision_id)
+    publication_revision = cache[publication_key]
+    if (publication_revision is None or
+            publication_revision.profile != profile.name):
+        raise ValueError('ARTIFACT_NOT_READY')
+    try:
+        target = _target_for_placement(profile, policy, placement)
+        (binding, expected_host_image, runtime_principal,
+         instance_profile) = _runtime_binding(profile, target, placement)
+        prepared = _pin_host_image(resources, placement, expected_host_image)
+        if not _runtime_binding_fresh(active, profile, target, placement,
+                                      binding):
+            raise ValueError('QUALIFICATION_STALE')
+    except ValueError:
+        if _direct_fallback_allowed(policy, image):
+            return _MetadataResolution(resources=resources,
+                                       direct=True,
+                                       profile=profile,
+                                       policy=policy,
+                                       active=active,
+                                       artifact=artifact,
+                                       publication=publication)
+        raise
+    return _MetadataResolution(resources=prepared,
+                               direct=False,
+                               profile=profile,
+                               policy=policy,
+                               active=active,
+                               artifact=artifact,
+                               publication=publication,
+                               target=target,
+                               binding=binding,
+                               runtime_principal=runtime_principal,
+                               instance_profile=instance_profile)
+
+
+def prepare_metadata_only(
+    resources: 'resources_lib.Resources',
+    placement: models.Placement,
+    workspace: str,
+    cache: dict[tuple[typing.Any, ...], typing.Any] | None = None
+) -> 'resources_lib.Resources | None':
+    """Filters and pins one candidate without provider calls or mutations."""
+    try:
+        return _resolve_metadata(resources, placement, workspace,
+                                 cache).resources
+    except ValueError:
+        return None
+
+
+def _managed_login(
+        target: models.ManagedRegistryTarget,
+        placement: models.Placement) -> docker_utils.DockerLoginConfig | None:
+    if placement.backend != 'aws_vm':
+        return None
+    return docker_utils.DockerLoginConfig(username='',
+                                          password='',
+                                          server=target.registry,
+                                          credential_helper='ecr-login')
+
+
+def resolve_for_placement(resources: 'resources_lib.Resources',
+                          placement: models.Placement,
+                          *,
+                          workspace: str,
+                          consumer_kind: str,
+                          consumer_owner: str,
+                          owner_epoch_token: str,
+                          consumer_metadata: dict[str, typing.Any] |
+                          None = None,
+                          ensure: bool = True) -> 'resources_lib.Resources':
+    """Pins one qualified AWS target or preserves the exact direct path."""
+    image = resources.container_image
+    metadata = _resolve_metadata(resources, placement, workspace)
+    resources = metadata.resources
+    if metadata.direct:
+        return resources
+    assert image is not None
+    assert metadata.profile is not None
+    assert metadata.policy is not None
+    assert metadata.active is not None
+    assert metadata.artifact is not None
+    assert metadata.publication is not None
+    assert metadata.target is not None
+    assert metadata.binding is not None
+    profile = metadata.profile
+    policy = metadata.policy
+    active = metadata.active
+    artifact = metadata.artifact
+    publication = metadata.publication
+    target = metadata.target
+    binding = metadata.binding
+    runtime_principal = metadata.runtime_principal
+    instance_profile = metadata.instance_profile
+    platform = placement.platform or 'linux/amd64'
+    location = topology_state.get_location_for_target(
+        image_id=artifact.id,
+        workspace=workspace,
+        target_fingerprint=target.target_fingerprint,
+        runtime_digest=artifact.runtime_digest)
+    if location is None:
+        if not ensure:
+            return resources
+        if target is profile.canonical:
+            raise ValueError('ARTIFACT_NOT_READY')
+        if publication.canonical_location_id is None:
+            raise ValueError('ARTIFACT_NOT_READY')
+        location = transactions.reserve_regional_location(
+            image_id=artifact.id,
+            workspace=workspace,
+            profile_revision_id=active.id,
+            target_id=target.name,
+            canonical_location_id=publication.canonical_location_id,
+            max_regional_locations=(
+                profile.limits.max_regional_locations_per_artifact))
+    if not ensure:
+        return resources
+    if (policy.mode == models.WorkspaceImageMode.MANAGED_PREFERRED and
+            policy.locality == models.Locality.PREFER and
+            image.ref is not None and
+            location.state != models.ImageLocationState.READY):
+        return resources
+    authority_id = catalog_state.get_catalog_authority_id(create=False)
+    if authority_id is None:
+        raise ValueError('CATALOG_AUTHORITY_UNAVAILABLE')
+    owner_epoch = demand_state.owner_epoch_from_token(owner_epoch_token)
+    placement_payload: dict[str, typing.Any] = {
+        'provider': placement.provider,
+        'region': placement.region,
+        'backend': placement.backend,
+        'platform': platform,
+    }
+    if consumer_metadata:
+        placement_payload['consumer'] = consumer_metadata
+    demand = transactions.create_warming_demand_for_owner_epoch(
+        authority_id=authority_id,
+        workspace=workspace,
+        consumer_kind=consumer_kind,
+        consumer_owner=consumer_owner,
+        target_key=f'{artifact.id}:{target.target_fingerprint}',
+        owner_epoch=owner_epoch,
+        image_id=artifact.id,
+        runtime_digest=artifact.runtime_digest,
+        profile_revision_id=active.id,
+        target_fingerprint=target.target_fingerprint,
+        location_id=location.id,
+        placement=placement_payload)
+    if location.state == models.ImageLocationState.FAILED:
+        demand_state.mark_demand_failed(
+            demand.id, location.error_code or 'IMAGE_PREPARATION_FAILED')
+        raise ContainerImagePreparationFailedError('IMAGE_PREPARATION_FAILED')
+    if location.state != models.ImageLocationState.READY:
+        raise ContainerImageWarmingError(demand)
+    policy_fingerprint = _policy_fingerprint(active, target, binding,
+                                             placement.backend)
+    pull_plan = {
+        'version': 1,
+        'reference': location.target_ref,
+        'runtime_digest': artifact.runtime_digest,
+        'platform': artifact.platform,
+        'distribution': profile.name,
+        'profile_revision_id': active.id,
+        'target_id': target.name,
+        'target_fingerprint': target.target_fingerprint,
+        'auth_strategy': 'ecr_runtime_identity',
+        'credential_helper':
+            ('ecr-login' if placement.backend == 'aws_vm' else None),
+        'runtime_principal': runtime_principal,
+        'instance_profile': instance_profile,
+    }
+    demand = transactions.commit_ready_demand(
+        demand_id=demand.id,
+        consumer_generation=demand.consumer_generation,
+        pull_plan=pull_plan)
+    resolved = models.ResolvedContainerImage(
+        image_id=artifact.id,
+        reference=location.target_ref,
+        target_id=target.name,
+        digest=artifact.runtime_digest,
+        auth_strategy='ecr_runtime_identity',
+        location_id=location.id,
+        distribution=profile.name,
+        profile_revision=active.revision,
+        policy_fingerprint=policy_fingerprint,
+        profile_revision_id=active.id,
+        target_fingerprint=target.target_fingerprint,
+        demand_id=demand.id,
+        demand_generation=demand.consumer_generation,
+        credential_helper=('ecr-login'
+                           if placement.backend == 'aws_vm' else None),
+        runtime_principal=runtime_principal,
+        instance_profile=instance_profile)
+    return resources.copy(_resolved_container_image=resolved,
+                          _docker_login_config=_managed_login(
+                              target, placement))

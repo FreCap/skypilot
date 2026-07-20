@@ -1,5 +1,6 @@
 """Provider-neutral OCI copy and digest verification."""
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -26,17 +27,213 @@ _IMAGE_LAYER_MEDIA_TYPES = frozenset({
     'application/vnd.oci.image.layer.v1.tar',
     'application/vnd.oci.image.layer.v1.tar+gzip',
     'application/vnd.oci.image.layer.v1.tar+zstd',
-    'application/vnd.oci.image.layer.nondistributable.v1.tar',
-    'application/vnd.oci.image.layer.nondistributable.v1.tar+gzip',
     'application/vnd.docker.image.rootfs.diff.tar',
     'application/vnd.docker.image.rootfs.diff.tar.gzip',
-    'application/vnd.docker.image.rootfs.foreign.diff.tar.gzip',
 })
 _OCI_DIGEST_PATTERN = re.compile(
     r'^[a-z0-9]+(?:[+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$')
 _OCI_MEDIA_TYPE_PATTERN = re.compile(
     r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 _MAX_OCI_DESCRIPTOR_STRING_LENGTH = 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class OciDescriptor:
+    """Validated distributable descriptor used by an exact copy."""
+
+    media_type: str
+    digest: str
+    size: int
+
+
+@dataclasses.dataclass(frozen=True)
+class OciContentGraph:
+    """One selected runnable manifest and every exact referenced blob."""
+
+    source_root_digest: str
+    source_root_media_type: str
+    raw_source_root: bytes
+    runtime_digest: str
+    runtime_media_type: str
+    raw_runtime_manifest: bytes
+    platform: str
+    config: OciDescriptor
+    layers: tuple[OciDescriptor, ...]
+    declared_size_bytes: int
+
+    @property
+    def manifest_units(self) -> int:
+        return 1
+
+
+@dataclasses.dataclass(frozen=True)
+class OciInspectionLimits:
+    """Bounds applied before any destination authority is acquired."""
+
+    max_root_bytes: int = 4 * 1024 * 1024
+    max_manifest_bytes: int = 4 * 1024 * 1024
+    max_config_bytes: int = 16 * 1024 * 1024
+    max_layers: int = 1024
+    max_artifact_bytes: int = 100 * 1024 * 1024 * 1024
+
+
+def _sha256(payload: bytes) -> str:
+    return f'sha256:{hashlib.sha256(payload).hexdigest()}'
+
+
+def _mapping(payload: bytes, subject: str) -> dict[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (TypeError, ValueError):
+        raise ValueError(f'{subject} is not valid JSON.') from None
+    if not isinstance(value, dict):
+        raise ValueError(f'{subject} must be a JSON object.')
+    return value
+
+
+def _descriptor(value: Any, subject: str, *,
+                allowed_media_types: frozenset[str]) -> OciDescriptor:
+    validated = OciClient._validate_descriptor(  # pylint: disable=protected-access
+        value, subject)
+    if validated['mediaType'] not in allowed_media_types:
+        raise ValueError(
+            f'{subject} uses unsupported or nondistributable media.')
+    if validated.get('urls') or validated.get('data') is not None:
+        raise ValueError(
+            f'{subject} must not use external URLs or embedded data.')
+    return OciDescriptor(
+        media_type=str(validated['mediaType']),
+        digest=models.validate_sha256_digest(str(validated['digest']),
+                                             f'{subject} digest'),
+        size=int(validated['size']),
+    )
+
+
+def _config_platform(payload: bytes) -> str:
+    value = _mapping(payload, 'OCI image config')
+    operating_system = value.get('os')
+    architecture = value.get('architecture')
+    if not isinstance(operating_system, str) or not isinstance(
+            architecture, str):
+        raise ValueError('OCI image config has no runtime platform.')
+    components = [operating_system, architecture]
+    variant = value.get('variant')
+    if variant is not None:
+        if not isinstance(variant, str):
+            raise ValueError('OCI image config variant must be a string.')
+        components.append(variant)
+    return models.validate_oci_platform('/'.join(components),
+                                        'OCI image config platform')
+
+
+def build_content_graph(
+    *,
+    raw_root: bytes,
+    expected_root_digest: str,
+    requested_platform: str,
+    fetch_manifest: Any,
+    fetch_blob: Any,
+    limits: OciInspectionLimits,
+) -> OciContentGraph:
+    """Selects and proves one runnable child without destination access.
+
+    ``fetch_manifest`` receives a digest and returns exact raw bytes.
+    ``fetch_blob`` does the same for the selected config. Layer payloads are
+    streamed and hash-checked later during copy, but their descriptors and
+    aggregate declared size are closed here.
+    """
+    expected_root_digest = models.validate_sha256_digest(
+        expected_root_digest, 'OCI source root digest')
+    requested_platform = models.validate_oci_platform(requested_platform,
+                                                      'Requested platform')
+    if len(raw_root) > limits.max_root_bytes:
+        raise ValueError('OCI source root exceeds the inspection size limit.')
+    if _sha256(raw_root) != expected_root_digest:
+        raise ValueError(
+            'OCI source root bytes do not match the pinned digest.')
+    root = _mapping(raw_root, 'OCI source root')
+    root_media_type = root.get('mediaType')
+    if root_media_type in _IMAGE_MANIFEST_MEDIA_TYPES:
+        runtime_digest = expected_root_digest
+        runtime_media_type = str(root_media_type)
+        raw_manifest = raw_root
+    elif root_media_type in _IMAGE_INDEX_MEDIA_TYPES:
+        if root.get('schemaVersion') != 2 or root.get(
+                'artifactType') is not None:
+            raise ValueError('OCI source index is not a runnable image index.')
+        manifests = root.get('manifests')
+        if not isinstance(manifests, list):
+            raise ValueError('OCI source index has no manifest descriptors.')
+        matches: list[OciDescriptor] = []
+        for index, raw_descriptor in enumerate(manifests):
+            descriptor = _descriptor(
+                raw_descriptor,
+                f'OCI index descriptor {index}',
+                allowed_media_types=_IMAGE_MANIFEST_MEDIA_TYPES)
+            platform = OciClient._platform_from_mapping(  # pylint: disable=protected-access
+                raw_descriptor.get('platform'))
+            if platform is None:
+                raise ValueError('OCI image index child has no platform.')
+            if platform == requested_platform:
+                matches.append(descriptor)
+        if len(matches) != 1:
+            raise ValueError('OCI image index must contain exactly one '
+                             'runnable child for the requested platform.')
+        selected = matches[0]
+        raw_manifest = fetch_manifest(selected.digest)
+        if not isinstance(raw_manifest, bytes):
+            raise TypeError('OCI manifest reader must return bytes.')
+        if len(raw_manifest) != selected.size or _sha256(
+                raw_manifest) != selected.digest:
+            raise ValueError(
+                'OCI selected child bytes do not match descriptor.')
+        runtime_digest = selected.digest
+        runtime_media_type = selected.media_type
+    else:
+        raise ValueError('OCI source is neither an image manifest nor index.')
+
+    if len(raw_manifest) > limits.max_manifest_bytes:
+        raise ValueError('OCI runtime manifest exceeds the size limit.')
+    manifest = _mapping(raw_manifest, 'OCI runtime manifest')
+    OciClient._validate_image_manifest(  # pylint: disable=protected-access
+        manifest, runtime_media_type)
+    config = _descriptor(manifest.get('config'),
+                         'OCI image config descriptor',
+                         allowed_media_types=_IMAGE_CONFIG_MEDIA_TYPES)
+    if config.size > limits.max_config_bytes:
+        raise ValueError('OCI image config exceeds the size limit.')
+    config_bytes = fetch_blob(config.digest)
+    if (not isinstance(config_bytes, bytes) or
+            len(config_bytes) != config.size or
+            _sha256(config_bytes) != config.digest):
+        raise ValueError('OCI image config bytes do not match descriptor.')
+    platform = _config_platform(config_bytes)
+    if platform != requested_platform:
+        raise ValueError('OCI image config does not match requested platform.')
+    raw_layers = manifest.get('layers')
+    if not isinstance(raw_layers, list) or len(raw_layers) > limits.max_layers:
+        raise ValueError('OCI image layer count exceeds the configured limit.')
+    layers = tuple(
+        _descriptor(layer,
+                    f'OCI image layer descriptor {index}',
+                    allowed_media_types=_IMAGE_LAYER_MEDIA_TYPES)
+        for index, layer in enumerate(raw_layers))
+    declared_size = config.size + sum(layer.size for layer in layers)
+    if declared_size > limits.max_artifact_bytes:
+        raise ValueError(
+            'OCI image exceeds the configured artifact byte limit.')
+    return OciContentGraph(
+        source_root_digest=expected_root_digest,
+        source_root_media_type=str(root_media_type),
+        raw_source_root=raw_root,
+        runtime_digest=runtime_digest,
+        runtime_media_type=runtime_media_type,
+        raw_runtime_manifest=raw_manifest,
+        platform=platform,
+        config=config,
+        layers=layers,
+        declared_size_bytes=declared_size,
+    )
 
 
 class OciClient:

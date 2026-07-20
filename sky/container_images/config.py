@@ -1,31 +1,12 @@
-"""Registry-profile and workspace-policy resolution."""
+"""Strict v0 registry-profile and workspace-policy resolution."""
 
 from typing import Any
 
 from sky import skypilot_config
 from sky.container_images import models
-from sky.container_images import providers
 from sky.skylet import constants
 
 DIRECT_PROFILE = 'direct'
-
-
-def get_kubernetes_registry_binding(
-        context: str) -> tuple[str, str, str, str] | None:
-    """Returns the explicit registry locality/auth binding for a context."""
-    binding = skypilot_config.get_nested(
-        ('container_registries', 'kubernetes_contexts', context),
-        default_value=None)
-    if binding is None:
-        return None
-    registry_prefix = models.normalize_registry_prefix(str(binding['registry']),
-                                                       context)
-    return (str(binding['registry_provider']).lower(),
-            models.normalize_registry_region(
-                binding['registry_region'],
-                'Kubernetes registry binding region',
-                binding['registry_provider']), registry_prefix,
-            str(binding['auth_strategy']))
 
 
 def _workspace_policy_config(workspace: str) -> dict[str, Any]:
@@ -33,14 +14,20 @@ def _workspace_policy_config(workspace: str) -> dict[str, Any]:
         ('workspaces', workspace, 'container_images'), default_value={}) or {}
 
 
-def get_workspace_policy(
-        workspace: str | None = None) -> models.WorkspaceImagePolicy:
-    """Returns the effective image policy for a workspace."""
-    if workspace is None:
-        workspace = (skypilot_config.get_active_workspace() or
-                     constants.SKYPILOT_DEFAULT_WORKSPACE)
-    config = _workspace_policy_config(workspace)
-    retention_weeks = config.get('regional_cache_retention_weeks', 8)
+def parse_workspace_policy(value: Any) -> models.WorkspaceImagePolicy:
+    """Parses one strict workspace image policy from a config snapshot."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError('Workspace container_images must be an object.')
+    unknown = set(value) - {
+        'mode', 'default_profile', 'allowed_profiles', 'publishers', 'locality',
+        'regional_cache_retention_weeks'
+    }
+    if unknown:
+        raise ValueError(
+            'Workspace container_images contains unsupported keys.')
+    retention_weeks = value.get('regional_cache_retention_weeks', 8)
     if (retention_weeks is not None and
         (not isinstance(retention_weeks, int) or
          isinstance(retention_weeks, bool) or retention_weeks <= 0)):
@@ -48,81 +35,290 @@ def get_workspace_policy(
                          'integer or null to disable automatic eviction.')
     return models.WorkspaceImagePolicy(
         mode=models.WorkspaceImageMode(
-            config.get('mode',
-                       models.WorkspaceImageMode.MANAGED_PREFERRED.value)),
-        default_profile=config.get('default_profile'),
-        allowed_profiles=tuple(config.get('allowed_profiles', ())),
+            value.get('mode', models.WorkspaceImageMode.DIRECT.value)),
+        default_profile=value.get('default_profile'),
+        allowed_profiles=tuple(value.get('allowed_profiles', ())),
+        publishers=tuple(value.get('publishers', ())),
         locality=models.Locality(
-            config.get('locality', models.Locality.PREFER.value)),
+            value.get('locality', models.Locality.PREFER.value)),
         regional_cache_retention_weeks=retention_weeks,
-        max_artifacts=config.get('max_artifacts', 1_000_000),
-        max_sources_per_artifact=config.get('max_sources_per_artifact', 128),
-        max_releases_per_artifact=config.get('max_releases_per_artifact', 128),
     )
 
 
-def _profile_from_config(name: str,
-                         config: dict[str, Any]) -> models.RegistryProfile:
-    if 'revision' not in config:
+def get_workspace_policy(
+        workspace: str | None = None) -> models.WorkspaceImagePolicy:
+    """Returns explicit workspace opt-in, defaulting to unchanged direct pulls."""
+    if workspace is None:
+        workspace = (skypilot_config.get_active_workspace() or
+                     constants.SKYPILOT_DEFAULT_WORKSPACE)
+    return parse_workspace_policy(_workspace_policy_config(workspace))
+
+
+def _binding_from_config(name: str,
+                         value: dict[str, Any]) -> models.RegistryAccessBinding:
+    if not isinstance(value, dict):
+        raise ValueError(f'Registry access binding {name!r} must be an object.')
+    try:
+        kind = models.RegistryAccessBindingKind(value['kind'])
+    except (KeyError, ValueError):
         raise ValueError(
-            f'Registry profile {name!r} must declare a positive monotonic '
-            'revision.')
-    require_digest_at_runtime = config.get('require_digest_at_runtime', True)
-    if not require_digest_at_runtime:
+            f'Registry access binding {name!r} has an unsupported kind.'
+        ) from None
+    purposes = tuple(value.get('purposes', ()))
+    common = {'kind', 'purposes'}
+    kwargs: dict[str, Any] = {}
+    if kind == models.RegistryAccessBindingKind.AWS_ASSUME_ROLE:
+        allowed = common | {'authority', 'external_id'}
+        kwargs['authority'] = value.get('authority')
+        kwargs['external_id'] = value.get('external_id')
+    elif kind == models.RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY:
+        allowed = common | {
+            'principals', 'instance_profile', 'credential_helper',
+            'qualified_node_images', 'canary_authority', 'canary_instance_type',
+            'canary_subnets', 'canary_security_groups'
+        }
+        node_images = value.get('qualified_node_images', {})
+        if not isinstance(node_images, dict):
+            raise ValueError('qualified_node_images must map regions to AMIs.')
+        canary_subnets = value.get('canary_subnets', {})
+        canary_security_groups = value.get('canary_security_groups', {})
+        if (not isinstance(canary_subnets, dict) or
+                not isinstance(canary_security_groups, dict)):
+            raise ValueError('EC2 canary networks must map regions to lists.')
+        if (any(not isinstance(items, list)
+                for items in canary_subnets.values()) or
+                any(not isinstance(items, list)
+                    for items in canary_security_groups.values())):
+            raise ValueError('EC2 canary network values must be lists.')
+        kwargs.update(
+            principals=tuple(value.get('principals', ())),
+            instance_profile=value.get('instance_profile'),
+            credential_helper=value.get('credential_helper'),
+            qualified_node_images=tuple(
+                sorted((str(region), str(ami))
+                       for region, ami in node_images.items())),
+            canary_authority=value.get('canary_authority'),
+            canary_instance_type=value.get('canary_instance_type'),
+            canary_subnets=tuple(
+                sorted((str(region), tuple(str(item)
+                                           for item in items))
+                       for region, items in canary_subnets.items())),
+            canary_security_groups=tuple(
+                sorted((str(region), tuple(str(item)
+                                           for item in items))
+                       for region, items in canary_security_groups.items())),
+        )
+    elif kind == models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
+        allowed = common | {'qualified_clusters', 'canary_authority'}
+        clusters = value.get('qualified_clusters', ())
+        if not isinstance(clusters, list):
+            raise ValueError('qualified_clusters must be a list.')
+        qualified_clusters: list[tuple[str, str, str, str]] = []
+        for cluster in clusters:
+            if not isinstance(cluster, dict) or set(cluster) != {
+                    'context', 'cluster_arn', 'node_role', 'namespace'
+            }:
+                raise ValueError(
+                    'Each qualified EKS cluster requires only '
+                    'context, cluster_arn, node_role, and namespace.')
+            qualified_clusters.append(
+                (str(cluster['context']), str(cluster['cluster_arn']),
+                 str(cluster['node_role']), str(cluster['namespace'])))
+        kwargs['qualified_clusters'] = tuple(qualified_clusters)
+        kwargs['canary_authority'] = value.get('canary_authority')
+    else:
+        allowed = common | {'reference'}
+        reference = value.get('reference')
+        if not isinstance(reference, dict):
+            raise ValueError('Docker config binding requires a reference.')
+        kwargs['reference'] = {
+            str(key): str(item) for key, item in reference.items()
+        }
+    if set(value) - allowed:
         raise ValueError(
-            f'Registry profile {name!r} must require digest-pinned runtime '
-            'references. Mutable runtime pulls are not supported.')
-    namespace = config['namespace']
-    if (config['ownership'] == models.RegistryOwnership.MANAGED.value and
-            '{workspace}' not in namespace):
+            f'Registry access binding {name!r} contains unsupported keys.')
+    return models.RegistryAccessBinding(id=name,
+                                        kind=kind,
+                                        purposes=purposes,
+                                        **kwargs)
+
+
+def parse_access_bindings(
+        values: Any) -> dict[str, models.RegistryAccessBinding]:
+    """Parses bounded access bindings without consulting global config."""
+    if values is None:
+        values = {}
+    if not isinstance(values, dict) or len(values) > 256:
+        raise ValueError('container_registries.access_bindings must contain at '
+                         'most 256 named bindings.')
+    return {
+        str(name): _binding_from_config(str(name), value)
+        for name, value in values.items()
+    }
+
+
+def access_bindings() -> dict[str, models.RegistryAccessBinding]:
+    values = skypilot_config.get_nested(
+        ('container_registries', 'access_bindings'), default_value={})
+    return parse_access_bindings(values)
+
+
+def get_source_binding(name: str | None) -> models.RegistryAccessBinding | None:
+    if name is None:
+        return None
+    binding = access_bindings().get(name)
+    if binding is None or 'source_read' not in binding.purposes:
+        raise ValueError('AUTH_BINDING_UNAVAILABLE')
+    return binding
+
+
+def _target_from_config(name: str, value: dict[str, Any], *,
+                        canonical: bool) -> models.ManagedRegistryTarget:
+    if not isinstance(value, dict):
+        raise ValueError(f'Registry target {name!r} must be an object.')
+    allowed = {
+        'region', 'registry', 'repository_prefix', 'shard_count',
+        'max_manifests_per_shard', 'max_declared_bytes_per_shard',
+        'max_in_flight', 'write_authority', 'delete_authority',
+        'qualification_delete_authority', 'runtime_pull'
+    }
+    if not canonical:
+        allowed.add('name')
+    if set(value) != allowed:
         raise ValueError(
-            f'Managed registry profile {name!r} must include the '
-            '{workspace} placeholder in namespace. The current catalog is '
-            'workspace-scoped and cannot safely evict content from a shared '
-            'cross-workspace repository.')
-    canonical_config = config['canonical']
-    canonical = models.RegistryTarget.from_config('canonical', canonical_config)
-    targets = tuple(
-        models.RegistryTarget.from_config(target['name'], target)
-        for target in config.get('targets', ()))
-    target_names = [target.name for target in targets]
-    if len(target_names) != len(set(target_names)):
-        raise ValueError(
-            f'Registry profile {name!r} contains duplicate target names.')
-    if canonical.name in target_names:
-        raise ValueError(
-            f'Registry profile {name!r} reserves {canonical.name!r} for its '
-            'canonical target.')
-    endpoint_identities = [
-        target.endpoint_identity for target in (canonical, *targets)
-    ]
-    if len(endpoint_identities) != len(set(endpoint_identities)):
-        raise ValueError(
-            f'Registry profile {name!r} assigns multiple target names to the '
-            'same physical registry endpoint. Canonical and regional targets '
-            'must be physically distinct so cache eviction cannot delete '
-            'canonical content.')
-    profile = models.RegistryProfile(
+            f'Registry target {name!r} must define the complete v0 contract.')
+    delete_authority = value['delete_authority']
+    if delete_authority == 'disabled':
+        delete_authority = None
+    if canonical and delete_authority is not None:
+        raise ValueError('Canonical registry target deletion must be disabled.')
+    runtime_pull = value['runtime_pull']
+    if not isinstance(runtime_pull, dict):
+        raise ValueError('Registry target runtime_pull must be an object.')
+    return models.ManagedRegistryTarget(
         name=name,
-        ownership=models.RegistryOwnership(config['ownership']),
-        realm=config['realm'],
-        organization=config.get('organization'),
-        namespace=namespace,
-        require_digest_at_runtime=require_digest_at_runtime,
+        region=value['region'],
+        registry=value['registry'],
+        repository_prefix=value['repository_prefix'],
+        shard_count=value['shard_count'],
+        max_manifests_per_shard=value['max_manifests_per_shard'],
+        max_declared_bytes_per_shard=value['max_declared_bytes_per_shard'],
+        max_in_flight=value['max_in_flight'],
+        write_authority=value['write_authority'],
+        delete_authority=delete_authority,
+        qualification_delete_authority=value['qualification_delete_authority'],
+        runtime_pull=tuple(
+            sorted((str(backend), str(binding))
+                   for backend, binding in runtime_pull.items())),
+    )
+
+
+def _profile_from_config(
+    name: str,
+    value: dict[str, Any],
+    all_bindings: dict[str, models.RegistryAccessBinding],
+) -> models.ManagedRegistryProfile:
+    if not isinstance(value, dict):
+        raise ValueError(f'Registry profile {name!r} must be an object.')
+    expected = {
+        'revision', 'ownership', 'provider', 'partition', 'registry_account',
+        'realm', 'limits', 'qualification', 'canonical', 'targets'
+    }
+    if set(value) != expected:
+        raise ValueError(
+            f'Registry profile {name!r} must define the complete v0 contract.')
+    if value['ownership'] != 'managed' or value['provider'] != 'aws':
+        raise ValueError(
+            'Managed distribution v0 supports only managed AWS ECR '
+            'profiles. Other clouds retain direct OCI pulls.')
+    limits = value['limits']
+    if not isinstance(limits, dict) or set(limits) != {
+            'max_artifact_bytes', 'max_releases_per_artifact',
+            'max_regional_locations_per_artifact'
+    }:
+        raise ValueError('Registry profile limits are incomplete.')
+    qualification = value['qualification']
+    if not isinstance(qualification, dict) or set(qualification) != {
+            'runtime_attestation_max_age_seconds', 'automatic_canaries',
+            'max_daily_canary_cost_usd', 'canary_worst_case_cost_usd',
+            'canary_timeout_seconds', 'canary_ref', 'canary_platform'
+    }:
+        raise ValueError('Registry profile qualification policy is incomplete.')
+    canonical = _target_from_config('canonical',
+                                    value['canonical'],
+                                    canonical=True)
+    target_values = value['targets']
+    if not isinstance(target_values, list) or len(target_values) > 255:
+        raise ValueError('Registry profile targets must be a bounded list.')
+    targets_list: list[models.ManagedRegistryTarget] = []
+    for target in target_values:
+        if not isinstance(target, dict) or not isinstance(
+                target.get('name'), str):
+            raise ValueError('Each registry target requires a string name.')
+        targets_list.append(
+            _target_from_config(target['name'], target, canonical=False))
+    targets = tuple(targets_list)
+    binding_ids = {
+        canonical.write_authority,
+        canonical.qualification_delete_authority,
+        *(binding for _, binding in canonical.runtime_pull),
+    }
+    for target in targets:
+        binding_ids.add(target.write_authority)
+        if target.delete_authority is not None:
+            binding_ids.add(target.delete_authority)
+        binding_ids.add(target.qualification_delete_authority)
+        binding_ids.update(binding for _, binding in target.runtime_pull)
+    runtime_binding_ids = {
+        binding for target in (canonical,) + targets
+        for _, binding in target.runtime_pull
+    }
+    for binding_id in runtime_binding_ids:
+        runtime_binding = all_bindings.get(binding_id)
+        if (runtime_binding is not None and
+                runtime_binding.canary_authority is not None):
+            binding_ids.add(runtime_binding.canary_authority)
+    try:
+        referenced_bindings = tuple(
+            all_bindings[binding] for binding in sorted(binding_ids))
+    except KeyError:
+        raise ValueError('Registry profile references an unknown access binding.') \
+            from None
+    return models.ManagedRegistryProfile(
+        name=name,
+        revision=value['revision'],
+        partition=value['partition'],
+        registry_account=value['registry_account'],
+        realm=value['realm'],
+        limits=models.ManagedRegistryLimits(**limits),
+        qualification=models.RegistryQualificationPolicy(**qualification),
         canonical=canonical,
         targets=targets,
-        revision=config['revision'],
+        access_bindings=referenced_bindings,
     )
-    for target in (profile.canonical, *profile.targets):
-        providers.get_adapter(target.provider).validate_target(target)
-    return profile
+
+
+def parse_profiles(
+    values: Any,
+    bindings: dict[str, models.RegistryAccessBinding],
+) -> dict[str, models.ManagedRegistryProfile]:
+    """Parses complete managed profiles from one immutable config value."""
+    if values is None:
+        values = {}
+    if not isinstance(values, dict) or len(values) > 128:
+        raise ValueError('container_registries.profiles must contain at most '
+                         '128 profiles.')
+    return {
+        str(name): _profile_from_config(str(name), value, bindings)
+        for name, value in values.items()
+    }
 
 
 def resolve_profile_name(
     task_profile: str | None,
     workspace: str | None = None,
 ) -> tuple[str | None, models.WorkspaceImagePolicy]:
-    """Resolves profile selection with task, workspace, server precedence."""
+    """Resolves explicit selection before opted-in workspace defaults."""
     if workspace is None:
         workspace = (skypilot_config.get_active_workspace() or
                      constants.SKYPILOT_DEFAULT_WORKSPACE)
@@ -133,65 +329,60 @@ def resolve_profile_name(
     if task_profile == DIRECT_PROFILE:
         if policy.mode == models.WorkspaceImageMode.MANAGED_REQUIRED:
             raise ValueError(
-                f'Workspace {workspace!r} requires managed container images '
-                f'and does not allow profile: {DIRECT_PROFILE}.')
+                'This workspace requires managed container images.')
         return None, policy
-    server_default = skypilot_config.get_nested(
-        ('container_registries', 'default_profile'), default_value=None)
-    if server_default is not None:
-        server_default = models.validate_control_plane_identifier(
-            server_default, 'Default container image distribution')
-    selected = task_profile or policy.default_profile or server_default
+    if task_profile is not None:
+        selected = task_profile
+    elif policy.mode in (models.WorkspaceImageMode.MANAGED_PREFERRED,
+                         models.WorkspaceImageMode.MANAGED_REQUIRED):
+        selected = policy.default_profile or skypilot_config.get_nested(
+            ('container_registries', 'default_profile'), default_value=None)
+    else:
+        selected = None
     if selected == DIRECT_PROFILE:
-        raise ValueError(
-            f'{DIRECT_PROFILE!r} is reserved as an explicit task-level '
-            'managed-image bypass and cannot be a default registry profile.')
+        raise ValueError('direct cannot be configured as a default profile.')
+    if selected is not None:
+        selected = models.validate_control_plane_identifier(
+            selected, 'Container image distribution')
     if (selected is not None and policy.allowed_profiles and
             selected not in policy.allowed_profiles):
         raise ValueError(
-            f'Registry profile {selected!r} is not allowed in workspace '
-            f'{workspace!r}. Allowed profiles: '
-            f'{list(policy.allowed_profiles)!r}.')
-    if (selected is None and
-            policy.mode == models.WorkspaceImageMode.MANAGED_REQUIRED):
-        raise ValueError(
-            f'Workspace {workspace!r} requires managed container images but '
-            'does not select a registry profile.')
+            f'Registry profile {selected!r} is not allowed in this workspace.')
+    if selected is None and policy.mode == models.WorkspaceImageMode.MANAGED_REQUIRED:
+        raise ValueError('This workspace requires a managed registry profile.')
     return selected, policy
 
 
 def resolve_profile(
     task_profile: str | None,
     workspace: str | None = None,
-) -> tuple[models.RegistryProfile | None, models.WorkspaceImagePolicy]:
-    """Returns the selected complete profile and effective workspace policy.
-
-    Profile definitions are intentionally selected atomically.  They never
-    merge with workspace or task dictionaries, which prevents half-overridden
-    identities, namespaces, and registry endpoints.
-    """
+) -> tuple[models.ManagedRegistryProfile | None, models.WorkspaceImagePolicy]:
     name, policy = resolve_profile_name(task_profile, workspace)
     if name is None:
         return None, policy
-    config = skypilot_config.get_nested(
+    value = skypilot_config.get_nested(
         ('container_registries', 'profiles', name), default_value=None)
-    if config is None:
+    if value is None:
         raise ValueError(f'Registry profile {name!r} is not configured.')
-    return _profile_from_config(name, config), policy
+    return _profile_from_config(name, value, access_bindings()), policy
+
+
+def configured_profiles() -> tuple[models.ManagedRegistryProfile, ...]:
+    values = skypilot_config.get_nested(('container_registries', 'profiles'),
+                                        default_value={})
+    profiles = parse_profiles(values, access_bindings())
+    return tuple(profiles[name] for name in sorted(profiles))
 
 
 def validate_managed_source_policy(image: models.ContainerImage,
-                                   profile: models.RegistryProfile | None,
+                                   profile: models.ManagedRegistryProfile |
+                                   None,
                                    policy: models.WorkspaceImagePolicy) -> None:
-    """Validates whether an image source may bypass the managed catalog."""
-    del image  # A fully qualified ref is still an import source, not a bypass.
+    if image.distribution == DIRECT_PROFILE:
+        if policy.mode == models.WorkspaceImageMode.MANAGED_REQUIRED:
+            raise ValueError(
+                'This workspace requires managed container images.')
+        return
     if (policy.mode == models.WorkspaceImageMode.MANAGED_REQUIRED and
             profile is None):
-        raise ValueError('This workspace requires container images to use a '
-                         'managed registry profile.')
-
-
-# TODO(fcapponi): Add organization-aware namespace expansion after the API
-# server has a first-class organization identifier.  Workspace scoping is
-# enforceable today; inventing an organization key here would create a false
-# isolation boundary.
+        raise ValueError('This workspace requires managed container images.')

@@ -37,15 +37,10 @@ _MAX_REPOSITORY_NAME_LENGTH = 255
 _MAX_RELEASE_LENGTH = 128
 _MAX_OCI_PLATFORM_LENGTH = 128
 _MAX_OCI_PLATFORMS = 128
-_MAX_REGISTRY_PROFILE_TARGETS = 128
-_MAX_WORKSPACE_ARTIFACTS = 100_000_000
-_MAX_ARTIFACT_ALIASES = 4096
 _MAX_SIGNED_64_BIT_INTEGER = (1 << 63) - 1
 _RUNTIME_AUTH_STRATEGY_PATTERN = re.compile(
     r'^(?:anonymous|source_config|ecr_runtime_identity|gar_runtime_identity|'
     r'kubernetes_context:node_identity)$')
-_TARGET_PULL_AUTH_STRATEGIES = frozenset(
-    {'anonymous', 'ecr_runtime_identity', 'gar_runtime_identity'})
 _OCI_RUNTIME_ARCHITECTURES = {
     'amd64': 'amd64',
     'x86_64': 'amd64',
@@ -53,14 +48,10 @@ _OCI_RUNTIME_ARCHITECTURES = {
     'aarch64': 'arm64',
 }
 _KNOWN_LINUX_RUNTIME_PLATFORMS = frozenset({'linux/amd64', 'linux/arm64'})
-_REGISTRY_LOCALITY_REGION_PATTERN = re.compile(
-    r'^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,511}$')
 _AWS_REGISTRY_REGION_PATTERN = re.compile(
     r'^[a-z]{2}(?:-[a-z0-9]+){1,3}-[0-9]+$')
 _GCP_STYLE_REGISTRY_REGION_PATTERN = re.compile(
     r'^(?:us|europe|asia|[a-z][a-z0-9]*(?:-[a-z0-9]+)*[0-9])$')
-_REGISTRY_NAMESPACE_PLACEHOLDERS = frozenset(
-    {'organization', 'realm', 'workspace'})
 
 
 def validate_workspace_name(value: Any, subject: str) -> str:
@@ -258,61 +249,6 @@ def validate_registry_repository_path(path: str, subject: str) -> str:
     return path
 
 
-def normalize_registry_namespace_template(namespace: str, realm: str,
-                                          organization: str | None,
-                                          profile_name: str) -> str:
-    """Returns one canonical, renderable managed repository template."""
-    if not isinstance(namespace, str) or not namespace:
-        raise ValueError(
-            f'Registry profile {profile_name!r} needs a namespace template.')
-    normalized = namespace.strip('/')
-    if not normalized:
-        raise ValueError(
-            f'Registry profile {profile_name!r} needs a namespace template.')
-    placeholders = set(re.findall(r'\{([^{}]+)\}', normalized))
-    if ('{' in re.sub(r'\{[^{}]+\}', '', normalized) or
-            '}' in re.sub(r'\{[^{}]+\}', '', normalized) or
-            not placeholders.issubset(_REGISTRY_NAMESPACE_PLACEHOLDERS)):
-        raise ValueError(
-            f'Registry profile {profile_name!r} has an unknown namespace '
-            'placeholder.')
-    realm = validate_registry_repository_path(
-        realm, f'Registry profile {profile_name!r} realm')
-    if organization is not None:
-        organization = validate_registry_repository_path(
-            organization, f'Registry profile {profile_name!r} organization')
-    if 'organization' in placeholders and organization is None:
-        raise ValueError(
-            f'Registry profile {profile_name!r} uses the organization '
-            'namespace placeholder but does not configure organization.')
-    rendered = normalized.replace('{realm}',
-                                  realm).replace('{workspace}', 'workspace')
-    if organization is not None:
-        rendered = rendered.replace('{organization}', organization)
-    validate_registry_repository_path(
-        rendered, f'Registry profile {profile_name!r} namespace')
-    return normalized
-
-
-def normalize_registry_prefix(registry: str, target_name: str) -> str:
-    """Canonicalizes an OCI authority plus optional repository prefix."""
-    registry = registry.rstrip('/')
-    if ('://' in registry or '@' in registry or
-            any(char.isspace() for char in registry) or
-            registry.startswith('/') or not registry):
-        raise ValueError(
-            f'Registry target {target_name!r} must contain only an OCI '
-            'registry host and optional path, without a URL scheme, '
-            'userinfo, or whitespace.')
-    host, separator, path = registry.partition('/')
-    authority = normalize_registry_authority(host, target_name)
-    if not separator:
-        return authority
-    path = validate_registry_repository_path(
-        path, f'Registry target {target_name!r} repository path')
-    return f'{authority}/{path}'
-
-
 def aws_ecr_registry_authority(account: str, region: str) -> str:
     """Returns the partition-correct private ECR registry authority."""
     if (not isinstance(account, str) or
@@ -345,20 +281,482 @@ def normalize_registry_region(value: Any,
     return normalized
 
 
-class RegistryOwnership(enum.Enum):
-    """Whether SkyPilot owns content lifecycle in a registry namespace.
+class RegistryAccessBindingKind(enum.Enum):
+    """V0 credential resolvers with independently qualified purposes."""
 
-    Managed ownership permits creation and regional-cache manifest eviction.
-    Canonical content and catalog records are retained independently.
-    """
+    AWS_ASSUME_ROLE = 'aws_assume_role'
+    AWS_EC2_INSTANCE_IDENTITY = 'aws_ec2_instance_identity'
+    AWS_EKS_KUBELET_IDENTITY = 'aws_eks_kubelet_identity'
+    KUBERNETES_DOCKERCONFIG_SECRET = 'kubernetes_dockerconfig_secret'
 
-    MANAGED = 'managed'
-    EXTERNAL = 'external'
+
+_ACCESS_PURPOSES = frozenset({
+    'source_read',
+    'destination_write',
+    'verify',
+    'runtime_pull',
+    'lifecycle_delete',
+    'canary_launch',
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistryAccessBinding:
+    """Secret-free authority or resolver reference used for one fixed role."""
+
+    id: str
+    kind: RegistryAccessBindingKind
+    purposes: tuple[str, ...]
+    authority: str | None = None
+    external_id: str | None = None
+    reference: dict[str, str] | None = None
+    principals: tuple[str, ...] = ()
+    credential_helper: str | None = None
+    qualified_node_images: tuple[tuple[str, str], ...] = ()
+    instance_profile: str | None = None
+    canary_authority: str | None = None
+    canary_instance_type: str | None = None
+    canary_subnets: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    canary_security_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    qualified_clusters: tuple[tuple[str, str, str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'id',
+            validate_control_plane_identifier(self.id,
+                                              'Registry access binding'))
+        purposes = tuple(self.purposes)
+        if (not purposes or len(purposes) != len(set(purposes)) or
+                not set(purposes) <= _ACCESS_PURPOSES):
+            raise ValueError('Registry access binding purposes are invalid.')
+        object.__setattr__(self, 'purposes', purposes)
+        if self.kind == RegistryAccessBindingKind.AWS_ASSUME_ROLE:
+            if (not isinstance(self.authority, str) or
+                    not self.authority.startswith('arn:')):
+                raise ValueError('AWS assume-role binding requires a role ARN.')
+        elif self.authority is not None or self.external_id is not None:
+            raise ValueError('Only AWS assume-role bindings accept authority '
+                             'or external_id.')
+        if self.kind == RegistryAccessBindingKind.KUBERNETES_DOCKERCONFIG_SECRET:
+            if (self.reference is None or
+                    set(self.reference) != {'namespace', 'name', 'key'}):
+                raise ValueError('Docker config binding requires namespace, '
+                                 'name, and key references.')
+            if set(purposes) != {'source_read'}:
+                raise ValueError('Docker config bindings are source-read only.')
+        elif self.reference is not None:
+            raise ValueError('Only Docker config bindings accept a reference.')
+        if self.kind == RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY:
+            if (set(purposes) != {'runtime_pull'} or
+                    len(self.principals) != 1 or
+                    self.credential_helper != 'amazon-ecr-credential-helper' or
+                    not self.qualified_node_images or
+                    self.instance_profile is None or
+                    self.canary_authority is None or
+                    self.canary_instance_type is None):
+                raise ValueError(
+                    'EC2 runtime binding requires one principal, '
+                    'an instance profile, the ECR helper, regional '
+                    'AMIs, and a canary launch authority.')
+            validate_control_plane_identifier(self.instance_profile,
+                                              'Qualified EC2 instance profile')
+            validate_control_plane_identifier(self.canary_authority,
+                                              'EC2 canary authority')
+            validate_control_plane_identifier(self.canary_instance_type,
+                                              'EC2 canary instance type')
+            node_regions = {region for region, _ in self.qualified_node_images}
+            subnet_regions = {region for region, _ in self.canary_subnets}
+            security_group_regions = {
+                region for region, _ in self.canary_security_groups
+            }
+            if (len(node_regions) != len(self.qualified_node_images) or
+                    len(subnet_regions) != len(self.canary_subnets) or
+                    len(security_group_regions) != len(
+                        self.canary_security_groups) or
+                    subnet_regions != node_regions or
+                    not security_group_regions <= node_regions):
+                raise ValueError('EC2 canary network regions must match the '
+                                 'qualified regional AMIs.')
+            for region, ami in self.qualified_node_images:
+                normalize_registry_region(region, 'Qualified EC2 region', 'aws')
+                if (not isinstance(ami, str) or not ami.startswith('ami-') or
+                        len(ami) > 128):
+                    raise ValueError('Qualified EC2 AMI is invalid.')
+            for _, subnets in self.canary_subnets:
+                if (not subnets or len(subnets) > 32 or
+                        len(subnets) != len(set(subnets)) or
+                        any(not subnet.startswith('subnet-') or
+                            len(subnet) > 128 for subnet in subnets)):
+                    raise ValueError('EC2 canary subnets are invalid.')
+            for _, security_groups in self.canary_security_groups:
+                if (len(security_groups) > 32 or
+                        len(security_groups) != len(set(security_groups)) or
+                        any(not group.startswith('sg-') or len(group) > 128
+                            for group in security_groups)):
+                    raise ValueError('EC2 canary security groups are invalid.')
+        if self.kind == RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
+            if (set(purposes) != {'runtime_pull'} or
+                    not self.qualified_clusters or
+                    self.canary_authority is None):
+                raise ValueError('EKS runtime binding requires qualified '
+                                 'cluster tuples and a canary authority.')
+            validate_control_plane_identifier(self.canary_authority,
+                                              'EKS canary authority')
+            contexts: set[str] = set()
+            for context, cluster_arn, node_role, namespace in self.qualified_clusters:
+                validate_control_plane_identifier(
+                    context, 'Qualified Kubernetes context')
+                if (context in contexts or not cluster_arn.startswith('arn:') or
+                        not node_role.startswith('arn:') or
+                        not isinstance(namespace, str) or not namespace or
+                        len(namespace) > 253 or
+                        any(character.isspace() for character in namespace)):
+                    raise ValueError(
+                        'Qualified EKS cluster tuples are invalid.')
+                contexts.add(context)
+
+    @property
+    def fingerprint(self) -> str:
+        payload = dataclasses.asdict(self)
+        payload['kind'] = self.kind.value
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True,
+                       separators=(',', ':')).encode()).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class ManagedRegistryLimits:
+    """Per-artifact hard limits enforced before provider I/O."""
+    max_artifact_bytes: int
+    max_releases_per_artifact: int
+    max_regional_locations_per_artifact: int
+
+    def __post_init__(self) -> None:
+        for value, subject in (
+            (self.max_artifact_bytes, 'max_artifact_bytes'),
+            (self.max_releases_per_artifact, 'max_releases_per_artifact'),
+            (self.max_regional_locations_per_artifact,
+             'max_regional_locations_per_artifact'),
+        ):
+            if not isinstance(value, int) or isinstance(value,
+                                                        bool) or value <= 0:
+                raise ValueError(
+                    f'Registry profile {subject} must be positive.')
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistryQualificationPolicy:
+    """Freshness, cost, and fixed canary contract for one profile."""
+    runtime_attestation_max_age_seconds: int
+    automatic_canaries: bool
+    max_daily_canary_cost_usd: float
+    canary_worst_case_cost_usd: float
+    canary_timeout_seconds: int
+    canary_ref: str
+    canary_platform: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.runtime_attestation_max_age_seconds, int) or
+                self.runtime_attestation_max_age_seconds <= 0 or
+                not isinstance(self.automatic_canaries, bool) or
+                not isinstance(self.max_daily_canary_cost_usd, (int, float)) or
+                isinstance(self.max_daily_canary_cost_usd, bool) or
+                self.max_daily_canary_cost_usd < 0 or
+                not isinstance(self.canary_worst_case_cost_usd, (int, float)) or
+                isinstance(self.canary_worst_case_cost_usd, bool) or
+                self.canary_worst_case_cost_usd <= 0 or
+                self.canary_worst_case_cost_usd > self.max_daily_canary_cost_usd
+                or not isinstance(self.canary_timeout_seconds, int) or
+                isinstance(self.canary_timeout_seconds, bool) or
+                not 60 <= self.canary_timeout_seconds <= 3600):
+            raise ValueError('Registry qualification policy is invalid.')
+        reference = validate_oci_reference(self.canary_ref,
+                                           'Qualification canary reference')
+        if split_digest(reference)[1] is None:
+            raise ValueError('Qualification canary reference must be '
+                             'digest-pinned.')
+        object.__setattr__(self, 'canary_ref', reference)
+        platform = validate_oci_platform(self.canary_platform,
+                                         'Qualification canary platform')
+        if platform != 'linux/amd64':
+            raise ValueError('Managed image canaries support linux/amd64 only.')
+        object.__setattr__(self, 'canary_platform', platform)
+
+    @property
+    def max_daily_canary_microusd(self) -> int:
+        return int(self.max_daily_canary_cost_usd * 1_000_000)
+
+    @property
+    def canary_worst_case_microusd(self) -> int:
+        return int(self.canary_worst_case_cost_usd * 1_000_000)
+
+
+@dataclasses.dataclass(frozen=True)
+class ManagedRegistryTarget:
+    """One pre-created fixed ECR shard ring and runtime-pull binding."""
+
+    name: str
+    region: str
+    registry: str
+    repository_prefix: str
+    shard_count: int
+    max_manifests_per_shard: int
+    max_declared_bytes_per_shard: int
+    max_in_flight: int
+    write_authority: str
+    delete_authority: str | None
+    qualification_delete_authority: str
+    runtime_pull: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'name',
+            validate_control_plane_identifier(self.name,
+                                              'Registry target name'))
+        object.__setattr__(
+            self, 'region',
+            normalize_registry_region(self.region, 'Registry target region',
+                                      'aws'))
+        object.__setattr__(
+            self, 'registry',
+            normalize_registry_authority(self.registry, self.name))
+        object.__setattr__(
+            self, 'repository_prefix',
+            validate_registry_repository_path(self.repository_prefix,
+                                              'Registry repository prefix'))
+        if not 1 <= self.shard_count <= 256:
+            raise ValueError(
+                'Registry target shard_count must be 1 through 256.')
+        for value, subject in (
+            (self.max_manifests_per_shard, 'max_manifests_per_shard'),
+            (self.max_declared_bytes_per_shard, 'max_declared_bytes_per_shard'),
+            (self.max_in_flight, 'max_in_flight'),
+        ):
+            if not isinstance(value, int) or isinstance(value,
+                                                        bool) or value <= 0:
+                raise ValueError(f'Registry target {subject} must be positive.')
+        runtime_pull = tuple(self.runtime_pull)
+        if (not runtime_pull or len(runtime_pull) != len(set(runtime_pull)) or
+                any(backend not in ('aws_vm', 'aws_eks')
+                    for backend, _ in runtime_pull)):
+            raise ValueError('Registry target runtime_pull is invalid.')
+        object.__setattr__(self, 'runtime_pull', runtime_pull)
+        object.__setattr__(
+            self, 'qualification_delete_authority',
+            validate_control_plane_identifier(
+                self.qualification_delete_authority,
+                'Qualification delete authority'))
+
+    def runtime_binding(self, backend: str) -> str | None:
+        return dict(self.runtime_pull).get(backend)
+
+    @property
+    def target_fingerprint(self) -> str:
+        """Identifies the immutable v0 repository ring, not one shard."""
+        payload = {
+            'provider': 'aws',
+            'registry': self.registry,
+            'repository_prefix': self.repository_prefix,
+            'shard_generation': 0,
+            'shard_count': self.shard_count,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True,
+                       separators=(',', ':')).encode()).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class ManagedRegistryProfile:
+    """Complete immutable AWS managed distribution revision."""
+
+    name: str
+    revision: int
+    partition: str
+    registry_account: str
+    realm: str
+    limits: ManagedRegistryLimits
+    qualification: RegistryQualificationPolicy
+    canonical: ManagedRegistryTarget
+    targets: tuple[ManagedRegistryTarget, ...]
+    access_bindings: tuple[RegistryAccessBinding, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'name',
+            validate_control_plane_identifier(self.name,
+                                              'Registry profile name'))
+        if not isinstance(self.revision, int) or self.revision <= 0:
+            raise ValueError('Registry profile revision must be positive.')
+        if self.partition not in ('aws', 'aws-us-gov', 'aws-cn'):
+            raise ValueError(
+                'Registry profile uses an unsupported AWS partition.')
+        if not re.fullmatch(r'[0-9]{12}', self.registry_account):
+            raise ValueError('Registry profile account must be 12 digits.')
+        validate_control_plane_identifier(self.realm, 'Registry profile realm')
+        targets = (self.canonical,) + tuple(self.targets)
+        names = [target.name for target in targets]
+        regions = [target.region for target in targets]
+        if len(names) != len(set(names)) or len(regions) != len(set(regions)):
+            raise ValueError(
+                'Registry target names and regions must be unique.')
+        bindings = {binding.id: binding for binding in self.access_bindings}
+        if len(bindings) != len(self.access_bindings):
+            raise ValueError('Registry access binding IDs must be unique.')
+        for target in targets:
+            expected = aws_ecr_registry_authority(self.registry_account,
+                                                  target.region)
+            if target.registry != expected:
+                raise ValueError('Registry target authority must match the '
+                                 'dedicated account and region.')
+            write = bindings.get(target.write_authority)
+            if (write is None or 'destination_write' not in write.purposes or
+                    'verify' not in write.purposes):
+                raise ValueError('Registry target write binding is incomplete.')
+            if (target is self.canonical and
+                    'source_read' not in write.purposes):
+                raise ValueError('Canonical registry write binding must also '
+                                 'permit regional source reads.')
+            if target.delete_authority is not None:
+                delete = bindings.get(target.delete_authority)
+                if (delete is None or
+                        'lifecycle_delete' not in delete.purposes or
+                        'verify' not in delete.purposes):
+                    raise ValueError(
+                        'Registry target delete binding is invalid.')
+            qualification_delete = bindings.get(
+                target.qualification_delete_authority)
+            if (qualification_delete is None or
+                    'lifecycle_delete' not in qualification_delete.purposes or
+                    'verify' not in qualification_delete.purposes):
+                raise ValueError('Registry target qualification delete binding '
+                                 'is invalid.')
+            for backend, binding_id in target.runtime_pull:
+                runtime = bindings.get(binding_id)
+                expected_kind = (
+                    RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY
+                    if backend == 'aws_vm' else
+                    RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY)
+                if runtime is None or runtime.kind != expected_kind:
+                    raise ValueError(
+                        'Registry runtime binding kind is invalid.')
+                if (backend == 'aws_vm' and target.region not in dict(
+                        runtime.qualified_node_images)):
+                    raise ValueError('Registry EC2 runtime binding has no '
+                                     'qualified tuple for the target region.')
+                if (backend == 'aws_eks' and not any(
+                        f':{target.region}:' in cluster_arn
+                        for _, cluster_arn, _, _ in runtime.qualified_clusters)
+                   ):
+                    raise ValueError('Registry EKS runtime binding has no '
+                                     'qualified cluster in the target region.')
+                canary = (bindings.get(runtime.canary_authority)
+                          if runtime.canary_authority is not None else None)
+                if (canary is None or canary.kind
+                        != RegistryAccessBindingKind.AWS_ASSUME_ROLE or
+                        'canary_launch' not in canary.purposes):
+                    raise ValueError('Registry runtime canary authority is '
+                                     'invalid.')
+
+    @property
+    def bindings(self) -> dict[str, RegistryAccessBinding]:
+        return {binding.id: binding for binding in self.access_bindings}
+
+    def target(self, name: str) -> ManagedRegistryTarget:
+        for target in (self.canonical,) + self.targets:
+            if target.name == name:
+                return target
+        raise ValueError(f'Unknown registry target {name!r}.')
+
+    def to_snapshot(self) -> dict[str, Any]:
+        """Returns the complete bounded, secret-free immutable worker config."""
+
+        def normalize(value: Any) -> Any:
+            if isinstance(value, enum.Enum):
+                return value.value
+            if dataclasses.is_dataclass(value):
+                return {
+                    field.name: normalize(getattr(value, field.name))
+                    for field in dataclasses.fields(value)
+                }
+            if isinstance(value, tuple):
+                return [normalize(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): normalize(item) for key, item in value.items()}
+            return value
+
+        snapshot = normalize(self)
+        assert isinstance(snapshot, dict)
+        return snapshot
+
+    @classmethod
+    def from_snapshot(cls, value: dict[str, Any]) -> 'ManagedRegistryProfile':
+        """Revalidates a persisted profile snapshot at every worker boundary."""
+        expected = {
+            'name', 'revision', 'partition', 'registry_account', 'realm',
+            'limits', 'qualification', 'canonical', 'targets', 'access_bindings'
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError('Managed registry profile snapshot is invalid.')
+
+        def target(raw: dict[str, Any]) -> ManagedRegistryTarget:
+            payload = dict(raw)
+            payload['runtime_pull'] = tuple(
+                tuple(item) for item in payload['runtime_pull'])
+            return ManagedRegistryTarget(**payload)
+
+        def binding(raw: dict[str, Any]) -> RegistryAccessBinding:
+            payload = dict(raw)
+            payload['kind'] = RegistryAccessBindingKind(payload['kind'])
+            for field in ('purposes', 'principals', 'qualified_node_images'):
+                payload[field] = tuple(
+                    tuple(item) if isinstance(item, list) else item
+                    for item in payload[field])
+            for field in ('canary_subnets', 'canary_security_groups'):
+                payload[field] = tuple(
+                    (item[0], tuple(item[1])) for item in payload[field])
+            payload['qualified_clusters'] = tuple(
+                tuple(item) for item in payload['qualified_clusters'])
+            return RegistryAccessBinding(**payload)
+
+        return cls(
+            name=value['name'],
+            revision=value['revision'],
+            partition=value['partition'],
+            registry_account=value['registry_account'],
+            realm=value['realm'],
+            limits=ManagedRegistryLimits(**value['limits']),
+            qualification=RegistryQualificationPolicy(**value['qualification']),
+            canonical=target(value['canonical']),
+            targets=tuple(target(item) for item in value['targets']),
+            access_bindings=tuple(
+                binding(item) for item in value['access_bindings']),
+        )
+
+    @property
+    def config_hash(self) -> str:
+        payload = self.to_snapshot()
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True,
+                       separators=(',', ':')).encode()).hexdigest()
+
+    @property
+    def physical_manifest_hash(self) -> str:
+        payload = [{
+            'name': target.name,
+            'region': target.region,
+            'registry': target.registry,
+            'repository_prefix': target.repository_prefix,
+            'shard_count': target.shard_count,
+        } for target in (self.canonical,) + self.targets]
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True,
+                       separators=(',', ':')).encode()).hexdigest()
 
 
 class WorkspaceImageMode(enum.Enum):
     """How strongly a workspace requires the managed image catalog."""
 
+    DIRECT = 'direct'
     MANAGED_REQUIRED = 'managed_required'
     MANAGED_PREFERRED = 'managed_preferred'
 
@@ -376,6 +774,7 @@ class ImageLocationState(enum.Enum):
 
     PENDING = 'PENDING'
     COPYING = 'COPYING'
+    VERIFYING = 'VERIFYING'
     READY = 'READY'
     FAILED = 'FAILED'
     MISSING = 'MISSING'
@@ -387,6 +786,7 @@ class ImageLocationErrorCode(enum.Enum):
     """Closed, secret-free diagnostics persisted for image locations."""
 
     COPY_LEASE_EXPIRED = 'copy_lease_expired'
+    VERIFY_LEASE_EXPIRED = 'verify_lease_expired'
     EVICTION_LEASE_EXPIRED = 'eviction_lease_expired'
     DESTINATION_REFERENCE_INVALID = 'destination_reference_invalid'
     DESTINATION_DIGEST_MISMATCH = 'destination_digest_mismatch'
@@ -400,6 +800,66 @@ class ImageLocationErrorCode(enum.Enum):
     EVICTION_REFERENCE_INVALID = 'eviction_reference_invalid'
     EVICTION_FAILED = 'eviction_failed'
     EVICTION_COMPLETION_FENCE_CHANGED = ('eviction_completion_fence_changed')
+    PROVIDER_THROTTLED = 'provider_throttled'
+    PROVIDER_OUTCOME_AMBIGUOUS = 'provider_outcome_ambiguous'
+    SOURCE_CONTENT_UNSUPPORTED = 'source_content_unsupported'
+    SOURCE_PLATFORM_AMBIGUOUS = 'source_platform_ambiguous'
+    SOURCE_PLATFORM_MISSING = 'source_platform_missing'
+
+
+class ImagePublicationState(enum.Enum):
+    """Closed source inspection and canonical publication states."""
+
+    PENDING = 'PENDING'
+    INSPECTING = 'INSPECTING'
+    READY = 'READY'
+    FAILED = 'FAILED'
+
+
+class ImageOperationState(enum.Enum):
+    """Closed public mutation states."""
+
+    PENDING = 'PENDING'
+    RUNNING = 'RUNNING'
+    SUCCEEDED = 'SUCCEEDED'
+    FAILED = 'FAILED'
+
+
+class ImageProfileState(enum.Enum):
+    """Closed immutable profile revision states."""
+
+    QUALIFYING = 'QUALIFYING'
+    ACTIVE = 'ACTIVE'
+    FAILED = 'FAILED'
+    SUPERSEDED = 'SUPERSEDED'
+    RETIRED = 'RETIRED'
+
+
+class ImageShardState(enum.Enum):
+    """Admission state of a pre-provisioned physical repository shard."""
+
+    READY = 'READY'
+    FULL = 'FULL'
+    DRIFTED = 'DRIFTED'
+    DISABLED = 'DISABLED'
+
+
+class ImageDemandState(enum.Enum):
+    """Durable image readiness state for one logical consumer generation."""
+
+    WARMING = 'WARMING'
+    READY = 'READY'
+    FAILED = 'FAILED'
+    SUPERSEDED = 'SUPERSEDED'
+    RELEASED = 'RELEASED'
+
+
+class ImageWorkerKind(enum.Enum):
+    """Independently permissioned worker services."""
+
+    COPY = 'COPY'
+    LIFECYCLE = 'LIFECYCLE'
+    CANARY = 'CANARY'
 
 
 class ImageFallbackReason(enum.Enum):
@@ -561,6 +1021,20 @@ def validate_catalog_id(value: str, subject: str) -> str:
     return str(parsed)
 
 
+def profile_attestation_key(capability: str, *identity: str) -> str:
+    """Returns a stable bounded key for one independently attested tuple."""
+    capability = validate_control_plane_identifier(
+        capability, 'Profile attestation capability')
+    if not identity:
+        return capability
+    if any(not isinstance(item, str) or not item for item in identity):
+        raise ValueError('Profile attestation identity is invalid.')
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=False,
+                   separators=(',', ':')).encode()).hexdigest()
+    return f'{capability}:{digest}'
+
+
 def reference_registry_authority(reference: str, subject: str) -> str:
     """Returns the canonical runtime registry authority for a reference.
 
@@ -584,14 +1058,13 @@ def reference_registry_authority(reference: str, subject: str) -> str:
     return 'docker.io'
 
 
-@dataclasses.dataclass(frozen=True, init=False)
+@dataclasses.dataclass(frozen=True)
 class ContainerImage:
     """A user-facing immutable image selector and distribution override.
 
-    A source reference may be combined with ``release`` to create an immutable
-    human-readable binding on first use. Subsequent tasks can select only the
-    release. ``artifact_id`` is the machine-oriented selector and is exclusive
-    with the other identity fields.
+    A task may prove a published release with its digest-pinned source. It never
+    creates a release. ``artifact_id`` is the machine-oriented selector and is
+    exclusive with the other identity fields.
 
     ``distribution='direct'`` is the explicit escape hatch for a workspace
     using ``managed_preferred``. It is rejected by ``managed_required`` policy.
@@ -601,33 +1074,10 @@ class ContainerImage:
     release: str | None = None
     artifact_id: str | None = None
     distribution: str | None = None
-
-    def __init__(
-        self,
-        ref: str | None = None,
-        release: str | None = None,
-        artifact_id: str | None = None,
-        distribution: str | None = None,
-        *,
-        profile: str | None = None,
-        version: str | None = None,
-    ) -> None:
-        """Constructs a selector, accepting the pre-release keyword aliases."""
-        if (distribution is not None and profile is not None and
-                distribution != profile):
-            raise ValueError('container_image cannot specify conflicting '
-                             'distribution and profile values.')
-        if release is not None and version is not None and release != version:
-            raise ValueError('container_image cannot specify conflicting '
-                             'release and version values.')
-        object.__setattr__(self, 'ref', ref)
-        object.__setattr__(self, 'release',
-                           release if release is not None else version)
-        object.__setattr__(self, 'artifact_id', artifact_id)
-        object.__setattr__(
-            self, 'distribution',
-            distribution if distribution is not None else profile)
-        self.__post_init__()
+    _legacy_direct: bool = dataclasses.field(default=False,
+                                             init=False,
+                                             repr=False,
+                                             compare=False)
 
     def __post_init__(self) -> None:
         if self.artifact_id is not None and (self.ref is not None or
@@ -649,6 +1099,9 @@ class ContainerImage:
                 raise ValueError('container_image.ref must be at most '
                                  f'{_MAX_REFERENCE_LENGTH} characters.')
             ref = validate_oci_reference(ref, 'container_image.ref')
+            if split_digest(ref)[1] is None and not self._legacy_direct:
+                raise ValueError(
+                    'container_image.ref must be pinned by SHA-256 digest.')
             object.__setattr__(self, 'ref', ref)
 
         if self.release is not None:
@@ -665,23 +1118,31 @@ class ContainerImage:
             distribution = validate_control_plane_identifier(
                 self.distribution, 'container_image.distribution')
             object.__setattr__(self, 'distribution', distribution)
+        if self.distribution == 'direct' and (self.ref is None or
+                                              self.release is not None or
+                                              self.artifact_id is not None):
+            raise ValueError(
+                'container_image distribution direct requires only a '
+                'digest-pinned ref.')
 
     @property
     def digest(self) -> str | None:
-        """Returns the pinned digest, or None for a mutable source tag."""
+        """Returns the pinned digest, or None for a catalog-only selector."""
         if self.ref is None:
             return None
         return split_digest(self.ref)[1]
 
-    @property
-    def profile(self) -> str | None:
-        """Compatibility alias for pre-release callers."""
-        return self.distribution
-
-    @property
-    def version(self) -> str | None:
-        """Compatibility alias for pre-release callers."""
-        return self.release
+    @classmethod
+    def from_legacy_ref(cls, ref: str) -> 'ContainerImage':
+        """Builds only the unchanged private ``image_id: docker:`` path."""
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, 'ref', ref)
+        object.__setattr__(instance, 'release', None)
+        object.__setattr__(instance, 'artifact_id', None)
+        object.__setattr__(instance, 'distribution', None)
+        object.__setattr__(instance, '_legacy_direct', True)
+        instance.__post_init__()
+        return instance
 
     @classmethod
     def from_config(
@@ -693,6 +1154,9 @@ class ContainerImage:
             # Reconstruct even frozen instances. A restored object, or one
             # altered with object.__setattr__, must cross the current trust
             # boundary again instead of bypassing validation.
+            if value._legacy_direct:  # pylint: disable=protected-access
+                raise ValueError('Legacy Docker image identity is not valid '
+                                 'container_image input.')
             return cls(ref=value.ref,
                        release=value.release,
                        artifact_id=value.artifact_id,
@@ -702,10 +1166,7 @@ class ContainerImage:
         if not isinstance(value, dict):
             raise ValueError('container_image must be a string or an object '
                              'with ref, release, or artifact_id.')
-        unknown = set(value) - {
-            'ref', 'release', 'artifact_id', 'distribution', 'profile',
-            'version'
-        }
+        unknown = set(value) - {'ref', 'release', 'artifact_id', 'distribution'}
         if unknown:
             raise ValueError('container_image contains unsupported fields.')
         ref = value.get('ref')
@@ -714,18 +1175,10 @@ class ContainerImage:
         artifact_id = value.get('artifact_id')
         if artifact_id is not None and not isinstance(artifact_id, str):
             raise ValueError('container_image.artifact_id must be a string.')
-        distribution = value.get('distribution', value.get('profile'))
-        if ('distribution' in value and 'profile' in value and
-                value['distribution'] != value['profile']):
-            raise ValueError('container_image cannot specify conflicting '
-                             'distribution and profile values.')
+        distribution = value.get('distribution')
         if distribution is not None and not isinstance(distribution, str):
             raise ValueError('container_image.distribution must be a string.')
-        release = value.get('release', value.get('version'))
-        if ('release' in value and 'version' in value and
-                value['release'] != value['version']):
-            raise ValueError('container_image cannot specify conflicting '
-                             'release and version values.')
+        release = value.get('release')
         if release is not None and not isinstance(release, str):
             raise ValueError('container_image.release must be a string.')
         return cls(ref=ref,
@@ -822,305 +1275,15 @@ def validate_operational_image_selector(value: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
-class RegistryLocality:
-    """One compute placement for which a registry target is local."""
-
-    provider: str
-    region: str
-
-    def __post_init__(self) -> None:
-        provider = (self.provider.lower()
-                    if isinstance(self.provider, str) else self.provider)
-        object.__setattr__(
-            self, 'provider',
-            validate_control_plane_identifier(provider,
-                                              'Registry locality provider'))
-        if (not isinstance(self.region, str) or
-                not _REGISTRY_LOCALITY_REGION_PATTERN.fullmatch(self.region)):
-            raise ValueError('Registry locality region must be a bounded, '
-                             'secret-free cloud region or context name.')
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> 'RegistryLocality':
-        if not isinstance(config, dict) or set(config) != {
-                'provider', 'region'
-        }:
-            raise ValueError('Registry locality requires only provider and '
-                             'region.')
-        return cls(provider=config['provider'], region=config['region'])
-
-
-@dataclasses.dataclass(frozen=True)
-class RegistryTarget:
-    """An administrator-configured registry endpoint.
-
-    Manager identity and pull-auth values are strategy names or identity
-    references.  They must never contain tokens or passwords.
-    """
-
-    name: str
-    provider: str
-    region: str
-    account: str | None = None
-    project: str | None = None
-    registry: str | None = None
-    manager_identity: str | None = None
-    pull_auth: str | None = None
-    localities: tuple[RegistryLocality, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, 'name',
-            validate_control_plane_identifier(self.name,
-                                              'Registry target name'))
-        provider = (self.provider.strip().lower() if isinstance(
-            self.provider, str) else self.provider)
-        provider = validate_control_plane_identifier(
-            provider, 'Registry target provider')
-        region = normalize_registry_region(self.region,
-                                           'Registry target region', provider)
-        object.__setattr__(self, 'provider', provider)
-        object.__setattr__(self, 'region', region)
-        for field, subject in (
-            ('account', 'Registry target account'),
-            ('project', 'Registry target project'),
-            ('manager_identity', 'Registry target manager identity'),
-        ):
-            value = getattr(self, field)
-            if value is not None:
-                object.__setattr__(
-                    self, field,
-                    validate_control_plane_identifier(value, subject))
-        localities = tuple(self.localities)
-        if any(not isinstance(locality, RegistryLocality)
-               for locality in localities):
-            raise ValueError('Registry target localities must contain '
-                             'RegistryLocality values.')
-        locality_keys = [(item.provider, item.region) for item in localities]
-        if len(locality_keys) != len(set(locality_keys)):
-            raise ValueError('Registry target localities must be unique.')
-        object.__setattr__(self, 'localities', localities)
-        if (self.pull_auth is not None and
-                self.pull_auth not in _TARGET_PULL_AUTH_STRATEGIES):
-            raise ValueError(
-                'Registry target uses an unsupported pull-auth strategy.')
-        if self.registry is not None:
-            object.__setattr__(
-                self, 'registry',
-                normalize_registry_prefix(self.registry, self.name))
-
-    @property
-    def registry_prefix(self) -> str | None:
-        """Returns one canonical physical registry and repository prefix."""
-        if self.registry is not None:
-            return self.registry
-        if self.provider == 'aws' and self.account:
-            return normalize_registry_prefix(
-                aws_ecr_registry_authority(self.account, self.region),
-                self.name)
-        if self.provider == 'gcp' and self.project:
-            return normalize_registry_prefix(
-                f'{self.region}-docker.pkg.dev/{self.project}', self.name)
-        return None
-
-    @property
-    def endpoint_identity(self) -> tuple[str, ...]:
-        """Returns the physical registry endpoint identity, excluding aliases."""
-        registry_prefix = self.registry_prefix
-        if registry_prefix is not None:
-            return ('registry', registry_prefix)
-        return ('provider', self.provider, self.region, self.account or
-                '', self.project or '')
-
-    @property
-    def adapter_identity(self) -> tuple[str, ...]:
-        """Returns the complete provider and authority interpretation."""
-        return (self.provider, self.region, self.account or '', self.project or
-                '', self.registry or '', self.manager_identity or
-                '', self.pull_auth or
-                '', *(f'{item.provider}:{item.region}'
-                      for item in sorted(self.localities,
-                                         key=lambda item:
-                                         (item.provider, item.region))))
-
-    def is_local_to(self, provider: str, region: str) -> bool:
-        """Returns whether this target is declared local to a placement."""
-        if self.localities:
-            return any(
-                item.provider == provider.lower() and item.region == region
-                for item in self.localities)
-        return self.provider == provider.lower() and self.region == region
-
-    @property
-    def fingerprint(self) -> str:
-        """Returns physical identity, excluding mutable auth configuration."""
-        serialized = json.dumps(self.endpoint_identity,
-                                sort_keys=True,
-                                separators=(',', ':')).encode()
-        return hashlib.sha256(serialized).hexdigest()
-
-    @classmethod
-    def from_config(cls, name: str, config: dict[str, Any]) -> 'RegistryTarget':
-        return cls(name=name,
-                   provider=str(config['provider']).lower(),
-                   region=str(config['region']),
-                   account=config.get('account'),
-                   project=config.get('project'),
-                   registry=config.get('registry'),
-                   manager_identity=config.get('manager_identity'),
-                   pull_auth=config.get('pull_auth'),
-                   localities=tuple(
-                       RegistryLocality.from_config(item)
-                       for item in config.get('localities', ())))
-
-
-@dataclasses.dataclass(frozen=True)
-class RegistryProfile:
-    """A complete, non-mergeable registry distribution profile."""
-
-    name: str
-    ownership: RegistryOwnership
-    realm: str
-    namespace: str
-    require_digest_at_runtime: bool
-    canonical: RegistryTarget
-    revision: int
-    organization: str | None = None
-    targets: tuple[RegistryTarget, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, 'name',
-            validate_control_plane_identifier(self.name,
-                                              'Registry profile name'))
-        if (not isinstance(self.revision, int) or
-                isinstance(self.revision, bool) or self.revision <= 0):
-            raise ValueError('Registry profile revision must be a positive '
-                             'integer.')
-        normalized_namespace = normalize_registry_namespace_template(
-            self.namespace, self.realm, self.organization, self.name)
-        if (self.ownership == RegistryOwnership.MANAGED and
-                '{workspace}' not in normalized_namespace):
-            raise ValueError(
-                f'Managed registry profile {self.name!r} must include the '
-                '{workspace} placeholder in namespace.')
-        object.__setattr__(self, 'namespace', normalized_namespace)
-        if len(self.targets) >= _MAX_REGISTRY_PROFILE_TARGETS:
-            raise ValueError(
-                f'Registry profile {self.name!r} may configure at most '
-                f'{_MAX_REGISTRY_PROFILE_TARGETS - 1} regional targets.')
-
-    @property
-    def fingerprint(self) -> str:
-        """Returns distribution identity without mutable auth configuration."""
-        payload = {
-            'ownership': self.ownership.value,
-            'realm': self.realm,
-            'namespace': self.namespace,
-            'organization': self.organization,
-            'canonical_endpoint': self.canonical.endpoint_identity,
-        }
-        serialized = json.dumps(payload, sort_keys=True,
-                                separators=(',', ':')).encode()
-        return hashlib.sha256(serialized).hexdigest()
-
-    def physical_fingerprint(self, target: RegistryTarget) -> str:
-        """Returns stable identity for content in one physical namespace.
-
-        Only values that can change the rendered destination repository belong
-        here.  Policy and authority changes are versioned separately so they
-        can reuse already-verified bytes without creating a second row for the
-        same OCI manifest reference.
-        """
-        payload: dict[str, Any] = {
-            'namespace': self.namespace,
-            'endpoint': target.endpoint_identity,
-        }
-        if '{realm}' in self.namespace:
-            payload['realm'] = self.realm
-        if '{organization}' in self.namespace:
-            payload['organization'] = self.organization
-        serialized = json.dumps(payload, sort_keys=True,
-                                separators=(',', ':')).encode()
-        return hashlib.sha256(serialized).hexdigest()
-
-    def materialization_fingerprint(self, target: RegistryTarget) -> str:
-        """Compatibility alias for the physical destination fingerprint."""
-        return self.physical_fingerprint(target)
-
-    def policy_fingerprint(self, target: RegistryTarget,
-                           canonical: bool) -> str:
-        """Returns the current authority and runtime-policy revision."""
-        payload = {
-            'profile': self.name,
-            'target': target.name,
-            'physical': self.physical_fingerprint(target),
-            'ownership': self.ownership.value,
-            'canonical': canonical,
-            'realm': self.realm,
-            'namespace': self.namespace,
-            'organization': self.organization,
-            'manager_identity': target.manager_identity,
-            'pull_auth': target.pull_auth,
-            'adapter_identity': target.adapter_identity,
-            'require_digest_at_runtime': self.require_digest_at_runtime,
-        }
-        serialized = json.dumps(payload, sort_keys=True,
-                                separators=(',', ':')).encode()
-        return hashlib.sha256(serialized).hexdigest()
-
-    @property
-    def revision_fingerprint(self) -> str:
-        """Returns the complete config bound to one monotonic revision."""
-        targets: list[dict[str, Any]] = []
-        configured_targets = ((True, self.canonical),) + tuple(
-            (False, target) for target in self.targets)
-        for canonical, target in configured_targets:
-            targets.append({
-                'canonical': canonical,
-                'name': target.name,
-                'physical': self.physical_fingerprint(target),
-                'policy': self.policy_fingerprint(target, canonical),
-                'adapter': target.adapter_identity,
-            })
-        payload = {
-            'name': self.name,
-            'ownership': self.ownership.value,
-            'realm': self.realm,
-            'namespace': self.namespace,
-            'organization': self.organization,
-            'require_digest_at_runtime': self.require_digest_at_runtime,
-            'targets': sorted(targets, key=lambda item: str(item['name'])),
-        }
-        serialized = json.dumps(payload, sort_keys=True,
-                                separators=(',', ':')).encode()
-        return hashlib.sha256(serialized).hexdigest()
-
-    def target(self, target_id: str) -> RegistryTarget:
-        """Returns a configured target by stable target ID."""
-        target_id = validate_control_plane_identifier(target_id,
-                                                      'Registry target name')
-        if target_id == self.canonical.name:
-            return self.canonical
-        for target in self.targets:
-            if target.name == target_id:
-                return target
-        raise ValueError(
-            f'Unknown target {target_id!r} in registry profile {self.name!r}.')
-
-
-@dataclasses.dataclass(frozen=True)
 class WorkspaceImagePolicy:
     """Effective workspace policy for container images."""
 
-    mode: WorkspaceImageMode = WorkspaceImageMode.MANAGED_PREFERRED
+    mode: WorkspaceImageMode = WorkspaceImageMode.DIRECT
     default_profile: str | None = None
     allowed_profiles: tuple[str, ...] = ()
+    publishers: tuple[str, ...] = ()
     locality: Locality = Locality.PREFER
     regional_cache_retention_weeks: int | None = 8
-    max_artifacts: int = 1_000_000
-    max_sources_per_artifact: int = 128
-    max_releases_per_artifact: int = 128
 
     def __post_init__(self) -> None:
         if self.default_profile is not None:
@@ -1129,19 +1292,16 @@ class WorkspaceImagePolicy:
         for profile in self.allowed_profiles:
             validate_control_plane_identifier(profile,
                                               'Workspace allowed distribution')
-        for value, subject, maximum in (
-            (self.max_artifacts, 'Workspace container image artifact quota',
-             _MAX_WORKSPACE_ARTIFACTS),
-            (self.max_sources_per_artifact,
-             'Workspace container image source quota', _MAX_ARTIFACT_ALIASES),
-            (self.max_releases_per_artifact,
-             'Workspace container image release quota', _MAX_ARTIFACT_ALIASES),
-        ):
-            if (not isinstance(value, int) or isinstance(value, bool) or
-                    value <= 0 or value > maximum):
-                raise ValueError(
-                    f'{subject} must be a positive integer no greater than '
-                    f'{maximum}.')
+        if len(self.publishers) > 256 or len(set(self.publishers)) != len(
+                self.publishers):
+            raise ValueError(
+                'Workspace image publishers must be unique and at most 256.')
+        for publisher in self.publishers:
+            if (not isinstance(publisher, str) or not publisher or
+                    len(publisher) > 256 or
+                    any(character.isspace() for character in publisher)):
+                raise ValueError('Workspace image publishers must be bounded '
+                                 'stable user IDs without whitespace.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1156,6 +1316,10 @@ class Placement:
     registry_prefix: str | None = None
     registry_auth_strategy: str | None = None
     platform: str | None = None
+    host_image_id: str | None = None
+    runtime_principal: str | None = None
+    kubernetes_cluster_arn: str | None = None
+    kubernetes_node_role: str | None = None
 
     def __post_init__(self) -> None:
         registry_provider = self.registry_provider
@@ -1176,6 +1340,16 @@ class Placement:
             object.__setattr__(
                 self, 'platform',
                 validate_oci_platform(self.platform, 'Runtime platform'))
+        for value, subject in (
+            (self.host_image_id, 'Placement host image'),
+            (self.runtime_principal, 'Placement runtime principal'),
+            (self.kubernetes_cluster_arn, 'Placement Kubernetes cluster'),
+            (self.kubernetes_node_role, 'Placement Kubernetes node role'),
+        ):
+            if (value is not None and
+                (not isinstance(value, str) or not value or len(value) > 2048 or
+                 any(char.isspace() for char in value))):
+                raise ValueError(f'{subject} must be a bounded identity.')
 
     @property
     def locality_provider(self) -> str:
@@ -1184,70 +1358,6 @@ class Placement:
     @property
     def locality_region(self) -> str:
         return self.registry_region or self.region
-
-
-@dataclasses.dataclass(frozen=True)
-class ImageRoute:
-    """Read-only readiness snapshot for one digest-pinned pull route."""
-
-    image_id: str
-    location_id: str
-    target_id: str
-    distribution: str
-    profile_revision: int
-    policy_fingerprint: str
-    provider: str
-    region: str
-    reference: str
-    digest: str
-    auth_strategy: str | None
-    state: ImageLocationState
-    platforms: tuple[str, ...] = ()
-    canonical: bool = False
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, 'image_id',
-            validate_catalog_id(self.image_id, 'Image route artifact ID'))
-        object.__setattr__(
-            self, 'location_id',
-            validate_catalog_id(self.location_id, 'Image route location ID'))
-        object.__setattr__(
-            self, 'target_id',
-            validate_control_plane_identifier(self.target_id,
-                                              'Image route target'))
-        object.__setattr__(
-            self, 'distribution',
-            validate_control_plane_identifier(self.distribution,
-                                              'Image route distribution'))
-        if (not isinstance(self.profile_revision, int) or
-                isinstance(self.profile_revision, bool) or
-                self.profile_revision <= 0):
-            raise ValueError('Image route profile_revision must be a positive '
-                             'integer.')
-        if not _FINGERPRINT_PATTERN.fullmatch(self.policy_fingerprint):
-            raise ValueError('Image route policy_fingerprint must be a '
-                             'lowercase SHA-256 hex digest.')
-        reference = validate_oci_reference(self.reference,
-                                           'Image route reference')
-        object.__setattr__(self, 'reference', reference)
-        digest = validate_sha256_digest(self.digest, 'Image route digest')
-        object.__setattr__(self, 'digest', digest)
-        _, reference_digest = split_digest(reference)
-        if reference_digest != digest:
-            raise ValueError('Image route reference digest does not match its '
-                             'expected digest.')
-        if (self.auth_strategy is not None and
-                not _RUNTIME_AUTH_STRATEGY_PATTERN.fullmatch(
-                    self.auth_strategy)):
-            raise ValueError('Image route has an invalid runtime pull-auth '
-                             'strategy name.')
-        if self.auth_strategy == 'source_config':
-            raise ValueError('A managed image route cannot use source_config '
-                             'runtime pull authority.')
-        object.__setattr__(
-            self, 'platforms',
-            validate_oci_platforms(self.platforms, 'Image route platforms'))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1263,6 +1373,13 @@ class ResolvedContainerImage:
     distribution: str | None = None
     profile_revision: int | None = None
     policy_fingerprint: str | None = None
+    profile_revision_id: str | None = None
+    target_fingerprint: str | None = None
+    demand_id: str | None = None
+    demand_generation: int | None = None
+    credential_helper: str | None = None
+    runtime_principal: str | None = None
+    instance_profile: str | None = None
     status: str = 'READY'
     fallback_reason: str | None = None
 
@@ -1289,7 +1406,8 @@ class ResolvedContainerImage:
             raise ValueError('Resolved container image requires a valid '
                              'runtime pull-auth strategy name.')
         policy_snapshot = (self.distribution, self.profile_revision,
-                           self.policy_fingerprint)
+                           self.policy_fingerprint, self.profile_revision_id,
+                           self.target_fingerprint)
         if self.location_id is None:
             if self.target_id != 'source' or self.status != 'WARMING':
                 raise ValueError('A resolved image without a managed location '
@@ -1315,6 +1433,8 @@ class ResolvedContainerImage:
             assert self.distribution is not None
             assert self.profile_revision is not None
             assert self.policy_fingerprint is not None
+            assert self.profile_revision_id is not None
+            assert self.target_fingerprint is not None
             object.__setattr__(
                 self, 'distribution',
                 validate_control_plane_identifier(
@@ -1328,9 +1448,43 @@ class ResolvedContainerImage:
                 raise ValueError('Resolved container image '
                                  'policy_fingerprint must be a lowercase '
                                  'SHA-256 hex digest.')
+            object.__setattr__(
+                self, 'profile_revision_id',
+                validate_catalog_id(self.profile_revision_id,
+                                    'Resolved image profile revision ID'))
+            object.__setattr__(
+                self, 'target_fingerprint',
+                validate_fingerprint(self.target_fingerprint,
+                                     'Resolved image target fingerprint'))
             if self.auth_strategy == 'source_config':
                 raise ValueError('A managed resolved container image cannot '
                                  'use source_config runtime pull authority.')
+        demand_values = (self.demand_id, self.demand_generation)
+        if any(value is not None for value in demand_values):
+            if any(value is None for value in demand_values):
+                raise ValueError('Resolved image demand fields are atomic.')
+            assert self.demand_id is not None
+            assert self.demand_generation is not None
+            object.__setattr__(
+                self, 'demand_id',
+                validate_catalog_id(self.demand_id, 'Resolved image demand ID'))
+            if (not isinstance(self.demand_generation, int) or
+                    isinstance(self.demand_generation, bool) or
+                    self.demand_generation < 0):
+                raise ValueError('Resolved image demand generation is invalid.')
+        if self.credential_helper not in (None, 'ecr-login'):
+            raise ValueError('Resolved image credential helper is invalid.')
+        for value, subject in ((self.runtime_principal,
+                                'Resolved runtime principal'),
+                               (self.instance_profile,
+                                'Resolved instance profile')):
+            if (value is not None and
+                (not isinstance(value, str) or not value or len(value) > 2048 or
+                 any(character.isspace() for character in value))):
+                raise ValueError(f'{subject} is invalid.')
+        if ((self.instance_profile is not None) != (self.runtime_principal
+                                                    is not None)):
+            raise ValueError('Resolved EC2 runtime identity fields are atomic.')
         if self.status not in {'READY', 'WARMING'}:
             raise ValueError('Resolved container image status must be READY '
                              'or WARMING.')
@@ -1365,7 +1519,9 @@ class ResolvedContainerImage:
         }
         optional = {
             'location_id', 'distribution', 'profile_revision',
-            'policy_fingerprint', 'status', 'fallback_reason'
+            'policy_fingerprint', 'profile_revision_id', 'target_fingerprint',
+            'demand_id', 'demand_generation', 'credential_helper',
+            'runtime_principal', 'instance_profile', 'status', 'fallback_reason'
         }
         unknown = set(value) - required - optional
         missing = required - set(value)
@@ -1380,7 +1536,8 @@ class ResolvedContainerImage:
                 '_resolved_container_image required fields must be strings.')
         string_optional = {
             'location_id', 'distribution', 'policy_fingerprint', 'status',
-            'fallback_reason'
+            'fallback_reason', 'profile_revision_id', 'target_fingerprint',
+            'demand_id', 'credential_helper'
         }
         for key in string_optional:
             if key in value and value[key] is not None and not isinstance(
@@ -1393,4 +1550,10 @@ class ResolvedContainerImage:
              isinstance(profile_revision, bool))):
             raise ValueError('_resolved_container_image.profile_revision must '
                              'be an integer or null.')
+        demand_generation = value.get('demand_generation')
+        if (demand_generation is not None and
+            (not isinstance(demand_generation, int) or
+             isinstance(demand_generation, bool))):
+            raise ValueError('_resolved_container_image.demand_generation '
+                             'must be an integer or null.')
         return cls(**value)

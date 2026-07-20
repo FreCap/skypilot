@@ -68,6 +68,9 @@ def test_path_size_megabytes_quotes_path(tmp_path):
 @mock.patch('sky.catalog.get_accelerators_from_instance_type',
             return_value={'fake-acc': 2})
 @mock.patch('sky.catalog.get_image_id_from_tag', return_value='fake-image')
+@mock.patch.object(clouds.AWS,
+                   'get_image_root_device_name',
+                   return_value='/dev/sda1')
 @mock.patch.object(clouds.aws, 'DEFAULT_SECURITY_GROUP_NAME', 'fake-default-sg')
 @mock.patch('sky.check.get_cloud_credential_file_mounts',
             return_value='~/.aws/credentials')
@@ -182,6 +185,9 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
 @mock.patch('sky.catalog.get_accelerators_from_instance_type',
             return_value={'fake-acc': 2})
 @mock.patch('sky.catalog.get_image_id_from_tag', return_value='fake-image')
+@mock.patch.object(clouds.AWS,
+                   'get_image_root_device_name',
+                   return_value='/dev/sda1')
 @mock.patch('sky.catalog.get_arch_from_instance_type', return_value='fake-arch')
 @mock.patch('sky.backends.backend_utils._get_yaml_path_from_cluster_name',
             return_value='/tmp/fake/path')

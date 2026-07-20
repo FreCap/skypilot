@@ -48,10 +48,8 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
-from sky.container_images import config as container_images_config
-from sky.container_images import core as container_images_core
 from sky.container_images import models as container_image_models
-from sky.container_images import resolver as container_image_resolver
+from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import storage as storage_lib
 from sky.provision import capacity_cache
@@ -152,25 +150,27 @@ logger = sky_logging.init_logger(__name__)
 def _resolve_container_image_for_placement(
     resources: resources_lib.Resources,
     *,
+    consumer_kind: str,
+    consumer_owner: str,
+    owner_epoch_token: str,
+    consumer_metadata: dict[str, Any],
     ensure: bool = True,
 ) -> resources_lib.Resources:
     """Pins a managed image after optimization and before provisioning."""
     cloud = resources.cloud
     assert cloud is not None, resources
     assert resources.region is not None, resources
-    # SSH node pools inherit Kubernetes because their workload runtime is a
-    # SkyPilot-managed k3s cluster.  Registry authority must therefore follow
-    # the kubelet context binding, not the host transport used to bootstrap
-    # that cluster.
-    backend = ('kubernetes' if isinstance(cloud, clouds.Kubernetes) else 'vm')
-    registry_binding = (container_images_config.get_kubernetes_registry_binding(
-        resources.region) if backend == 'kubernetes' else None)
-    placement_kwargs: dict[str, str] = {}
-    if registry_binding is not None:
-        (placement_kwargs['registry_provider'],
-         placement_kwargs['registry_region'],
-         placement_kwargs['registry_prefix'],
-         placement_kwargs['registry_auth_strategy']) = registry_binding
+    if isinstance(cloud, clouds.AWS):
+        provider = 'aws'
+        backend = 'aws_vm'
+    elif isinstance(cloud, clouds.Kubernetes):
+        # A managed profile may select this context only when its immutable
+        # EKS context/cluster/node-role tuple is active and qualified.
+        provider = 'aws'
+        backend = 'aws_eks'
+    else:
+        provider = str(cloud).lower()
+        backend = 'direct'
     architecture = None
     if resources.instance_type is not None:
         try:
@@ -180,19 +180,34 @@ def _resolve_container_image_for_placement(
             pass
     runtime_platform = (
         container_image_models.runtime_platform_from_architecture(architecture))
-    placement = container_image_models.Placement(provider=str(cloud).lower(),
-                                                 region=resources.region,
-                                                 backend=backend,
-                                                 platform=runtime_platform,
-                                                 **placement_kwargs)
+    configured_host_image = None
+    if resources.image_id is not None:
+        configured_host_image = resources.image_id.get(
+            resources.region, resources.image_id.get(None))
+    placement = container_image_models.Placement(
+        provider=provider,
+        region=resources.region,
+        backend=backend,
+        platform=runtime_platform,
+        host_image_id=(configured_host_image))
+    workspace = (skypilot_config.get_active_workspace() or
+                 constants.SKYPILOT_DEFAULT_WORKSPACE)
     try:
-        return container_images_core.resolve_for_placement(resources,
-                                                           placement,
-                                                           ensure=ensure)
-    except container_image_resolver.ImageRouteUnavailableError as e:
-        # Route readiness is placement-specific. Let the existing provisioning
-        # loop block exactly this candidate and optimize another region/cloud.
-        raise exceptions.ResourcesUnavailableError(str(e)) from e
+        return container_image_runtime.resolve_for_placement(
+            resources,
+            placement,
+            workspace=workspace,
+            consumer_kind=consumer_kind,
+            consumer_owner=consumer_owner,
+            owner_epoch_token=owner_epoch_token,
+            consumer_metadata=consumer_metadata,
+            ensure=ensure)
+    except container_image_runtime.ContainerImageWarmingError as e:
+        raise exceptions.ResourcesUnavailableError(str(e),
+                                                   no_failover=True) from e
+    except container_image_runtime.ContainerImagePreparationFailedError as e:
+        raise exceptions.ResourcesUnavailableError(str(e),
+                                                   no_failover=True) from e
     except ValueError as e:
         # Catalog, profile, and policy errors are not capacity failures. A
         # different placement cannot repair them, so fail without cycling the
@@ -1076,6 +1091,10 @@ def _get_workload_attribution(
         service_name = (launch_context or {}).get(
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
         if isinstance(service_name, str) and service_name:
+            service_version = (launch_context or {}).get(
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+            if type(service_version) is int and service_version > 0:
+                workload_task_id = service_version
             return service_name, workload_task_id
         replica_id = task_envs.get(serve_constants.REPLICA_ID_ENV_VAR)
         replica_suffix = f'-{replica_id}' if replica_id is not None else None
@@ -1094,6 +1113,62 @@ def _get_workload_attribution(
     if task_id_match is not None:
         workload_task_id = int(task_id_match.group(1))
     return workload_id, workload_task_id
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImageDemandAttribution:
+    consumer_kind: str
+    consumer_owner: str
+    owner_epoch_token: str
+    metadata: dict[str, Any]
+
+
+def _get_image_demand_attribution(
+        task: task_lib.Task, cluster_name: str, workload_type: str,
+        launch_context: dict[str, Any] | None) -> _ImageDemandAttribution:
+    """Collapses physical launches onto one logical image target owner."""
+    request_id = common_utils.get_current_request_id()
+    workload_id, workload_task_id = _get_workload_attribution(
+        task, cluster_name, workload_type, launch_context)
+    if workload_type in ('service', 'pool'):
+        service_hash = (launch_context or {}).get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if (isinstance(service_hash, str) and service_hash and
+                workload_task_id is not None):
+            return _ImageDemandAttribution(
+                consumer_kind='service_version',
+                consumer_owner=f'{workload_id}:v{workload_task_id}',
+                owner_epoch_token=f'{service_hash}:v{workload_task_id}',
+                metadata={
+                    'workload_type': workload_type,
+                    'workload_id': workload_id,
+                    'workload_task_id': workload_task_id,
+                    'service_hash': service_hash,
+                })
+    elif workload_type == 'managed_job' and workload_task_id is not None:
+        managed_job_id = (task.envs or {}).get(constants.MANAGED_JOB_ID_ENV_VAR)
+        if managed_job_id is not None:
+            return _ImageDemandAttribution(
+                consumer_kind='managed_job_task',
+                consumer_owner=f'{managed_job_id}:task:{workload_task_id}',
+                owner_epoch_token=request_id,
+                metadata={
+                    'workload_type': workload_type,
+                    'workload_id': str(managed_job_id),
+                    'workload_task_id': workload_task_id,
+                    'request_id': request_id,
+                })
+    # Older Serve controllers do not carry an immutable version in their
+    # launch fence. Keep those and ordinary clusters isolated by physical
+    # cluster generation rather than aggregating against a guessed owner.
+    return _ImageDemandAttribution(consumer_kind='cluster',
+                                   consumer_owner=cluster_name,
+                                   owner_epoch_token=request_id,
+                                   metadata={
+                                       'workload_type': 'cluster',
+                                       'workload_id': cluster_name,
+                                       'request_id': request_id,
+                                   })
 
 
 def _placement_error_code(error: BaseException) -> str | None:
@@ -1514,10 +1589,18 @@ class RetryingVmProvisioner:
         # Quota has passed and the region is now a real launch attempt. This
         # is the first point where ensure-on-use may create materialization
         # intents. Dry runs remain read-only.
+        image_demand = _get_image_demand_attribution(task, cluster_name,
+                                                     self._workload_type,
+                                                     self._extra_launch_context)
         to_provision = typing.cast(
             resources_lib.LaunchableResources,
-            _resolve_container_image_for_placement(to_provision,
-                                                   ensure=not dryrun))
+            _resolve_container_image_for_placement(
+                to_provision,
+                consumer_kind=image_demand.consumer_kind,
+                consumer_owner=image_demand.consumer_owner,
+                owner_epoch_token=image_demand.owner_epoch_token,
+                consumer_metadata=image_demand.metadata,
+                ensure=not dryrun))
 
         insufficient_resources = None
         last_error_reason: str | None = None

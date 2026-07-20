@@ -58,13 +58,7 @@ logger = sky_logging.init_logger(__name__)
 _CONTAINER_IMAGE_TASK_ERROR_MESSAGE = (
     'Invalid managed container image task specification.')
 _MAX_TASK_RESOURCE_CONFIGS = 4096
-_MAX_IMAGE_PREPARE_TARGETS = 128
 _RESOURCE_CANDIDATE_FIELDS = ('any_of', 'ordered')
-_CONTAINER_IMAGE_SPEC_FIELDS = frozenset(
-    {'ref', 'release', 'artifact_id', 'distribution', 'profile', 'version'})
-_SANITIZED_UNSUPPORTED_IMAGE_SPEC = {
-    '__unsupported_container_image_field__': None
-}
 
 
 class ContainerImageTaskValidationError(ValueError):
@@ -379,7 +373,7 @@ def _validate_legacy_image_id(image_id: Any,
     if has_reserved_docker_key and has_docker_image_value:
         raise ValueError
     normalized_references = {
-        container_image_models.ContainerImage(ref=reference).ref
+        container_image_models.ContainerImage.from_legacy_ref(reference).ref
         for reference in docker_references
     }
     if len(normalized_references) > 1:
@@ -1016,182 +1010,6 @@ class VolumeValidateBody(RequestBody):
     labels: dict[str, str] | None = None
     config: dict[str, Any] | None = None
     use_existing: bool | None = None
-
-
-class ContainerImageSpecBody(pydantic.BaseModel):
-    """Credential-free structured container image identity."""
-    model_config = pydantic.ConfigDict(extra='forbid',
-                                       hide_input_in_errors=True)
-
-    ref: str | None = None
-    release: str | None = None
-    artifact_id: str | None = None
-    distribution: str | None = None
-    profile: str | None = pydantic.Field(default=None, exclude=True)
-    version: str | None = pydantic.Field(default=None, exclude=True)
-
-    @pydantic.model_validator(mode='before')
-    @classmethod
-    def reject_unknown_fields(cls, value: Any) -> Any:
-        """Rejects unknown keys without reflecting their untrusted names."""
-        if not isinstance(value, dict):
-            return value
-        if not set(value).issubset(_CONTAINER_IMAGE_SPEC_FIELDS):
-            raise ValueError(
-                'Structured container image has unsupported fields.')
-        return value
-
-    @pydantic.model_validator(mode='after')
-    def validate_identity(self) -> 'ContainerImageSpecBody':
-        """Normalizes and validates before the request can be persisted."""
-        raw_image = {
-            'ref': self.ref,
-            'release': self.release,
-            'artifact_id': self.artifact_id,
-            'distribution': self.distribution,
-            'profile': self.profile,
-            'version': self.version,
-        }
-        image = container_image_models.ContainerImage.from_config({
-            key: value for key, value in raw_image.items() if value is not None
-        })
-        self.ref = image.ref
-        self.release = image.release
-        self.artifact_id = image.artifact_id
-        self.distribution = image.distribution
-        self.profile = None
-        self.version = None
-        return self
-
-
-def _validate_source_image_identity(
-    value: str | ContainerImageSpecBody,) -> str | ContainerImageSpecBody:
-    if isinstance(value, str):
-        normalized = container_image_models.ContainerImage(ref=value)
-        assert normalized.ref is not None
-        return normalized.ref
-    return value
-
-
-def _sanitize_structured_image_fields(value: Any) -> Any:
-    """Drops hostile unknown keys before Pydantic retains validation input."""
-    if (isinstance(value, dict) and
-            not set(value).issubset(_CONTAINER_IMAGE_SPEC_FIELDS)):
-        return dict(_SANITIZED_UNSUPPORTED_IMAGE_SPEC)
-    return value
-
-
-def _validate_operational_image_identity(
-    value: str | ContainerImageSpecBody,) -> str | ContainerImageSpecBody:
-    if isinstance(value, str):
-        return container_image_models.validate_operational_image_selector(value)
-    return value
-
-
-def _validate_optional_image_identity(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = _validate_operational_image_identity(value)
-    assert isinstance(normalized, str)
-    return normalized
-
-
-def _validate_image_distribution(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return container_image_models.validate_control_plane_identifier(
-        value, 'Container image distribution')
-
-
-def _validate_image_target(value: str) -> str:
-    return container_image_models.validate_control_plane_identifier(
-        value, 'Container image target')
-
-
-def _validate_image_workspace(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return container_image_models.validate_workspace_name(
-        value, 'Container image workspace')
-
-
-def _validate_image_targets(values: list[str]) -> list[str]:
-    if not values:
-        raise ValueError('At least one image target must be specified.')
-    if len(values) > _MAX_IMAGE_PREPARE_TARGETS:
-        raise ValueError('Too many image preparation targets were specified.')
-    validated = [_validate_image_target(value) for value in values]
-    if len(validated) != len(set(validated)):
-        raise ValueError('Image preparation targets must be unique.')
-    return validated
-
-
-class ImagePublishBody(RequestBody):
-    """The request body for publishing an immutable container image."""
-    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
-    image: str | ContainerImageSpecBody
-    workspace: str | None = None
-
-    _sanitize_image = pydantic.field_validator(
-        'image', mode='before')(_sanitize_structured_image_fields)
-    _validate_image = pydantic.field_validator('image')(
-        _validate_source_image_identity)
-    _validate_workspace = pydantic.field_validator('workspace')(
-        _validate_image_workspace)
-
-
-# Compatibility alias for clients built against the pre-release spelling.
-ImageRegisterBody = ImagePublishBody
-
-
-class ImageStatusBody(RequestBody):
-    """The request body for listing container image status."""
-    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
-    image: str | None = None
-    workspace: str | None = None
-
-    _validate_image = pydantic.field_validator('image')(
-        _validate_optional_image_identity)
-    _validate_workspace = pydantic.field_validator('workspace')(
-        _validate_image_workspace)
-
-
-class ImagePrepareBody(RequestBody):
-    """The request body for preparing explicit registry targets."""
-    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
-    image: str | ContainerImageSpecBody
-    targets: list[str]
-    distribution: str | None = None
-    workspace: str | None = None
-
-    _sanitize_image = pydantic.field_validator(
-        'image', mode='before')(_sanitize_structured_image_fields)
-    _validate_image = pydantic.field_validator('image')(
-        _validate_operational_image_identity)
-    _validate_targets = pydantic.field_validator('targets')(
-        _validate_image_targets)
-    _validate_distribution = pydantic.field_validator('distribution')(
-        _validate_image_distribution)
-    _validate_workspace = pydantic.field_validator('workspace')(
-        _validate_image_workspace)
-
-
-class ImageRetryBody(RequestBody):
-    """The request body for retrying one failed image target."""
-    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
-    image: str
-    target: str
-    distribution: str | None = None
-    workspace: str | None = None
-
-    _validate_image = pydantic.field_validator('image')(
-        _validate_operational_image_identity)
-    _validate_target = pydantic.field_validator('target')(
-        _validate_image_target)
-    _validate_distribution = pydantic.field_validator('distribution')(
-        _validate_image_distribution)
-    _validate_workspace = pydantic.field_validator('workspace')(
-        _validate_image_workspace)
 
 
 class EndpointsBody(RequestBody):
