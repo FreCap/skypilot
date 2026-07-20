@@ -2152,7 +2152,7 @@ def mark_lb_demand_handoff_complete(
     expected_lifecycle_epoch: int,
     generation: int,
 ) -> float | None:
-    """Record the first complete report from the promoted active."""
+    """Record the promoted active's first complete demand-gauge report."""
     engine = _db_manager.get_engine()
     _require_postgresql_lb_cutover(engine)
     predicates = _lb_cutover_owner_predicates(service_name,

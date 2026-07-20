@@ -235,6 +235,36 @@ def test_demand_handoff_unions_old_and_new_in_flight_evidence():
     assert floored['unknown_in_flight_urls'] == ['unknown-new', 'unknown-old']
 
 
+def test_complete_demand_report_does_not_require_all_occupancy_samples():
+    report = {
+        'in_flight': {
+            'http://replica': 1,
+        },
+        'queue_depth': 0,
+        'rejected_in_window': 3,
+        'rejected_in_recent_window': 1,
+        'unknown_in_flight_urls': ['http://unsampled'],
+        'occupancy_sampled_urls': ['http://replica'],
+    }
+
+    assert controller.SkyServeController._lb_demand_report_is_complete(report)
+
+
+def test_incomplete_demand_report_preserves_handoff_floor():
+    complete = {
+        'in_flight': {},
+        'queue_depth': 0,
+        'rejected_in_window': 0,
+        'rejected_in_recent_window': 0,
+        'unknown_in_flight_urls': [],
+    }
+    for field in complete:
+        report = dict(complete)
+        report[field] = None
+        assert not controller.SkyServeController._lb_demand_report_is_complete(
+            report)
+
+
 def test_ha_kubernetes_contract_has_single_slot_selector_and_disruption_guard():
     service = lb_k8s._build_service_dict('service',
                                          'service-lb',

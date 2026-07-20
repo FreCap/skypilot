@@ -821,13 +821,8 @@ class SkyServeController:
                 if (state is not None and
                         state.phase is not lb_ha.LbCutoverPhase.PREPARING):
                     self._restore_lb_demand_handoff(state.generation)
-                    sampled_urls = set(
-                        request_data.get('occupancy_sampled_urls', []))
-                    complete_report = bool(
-                        getattr(self, '_lb_occupancy_contract_known',
-                                False)) and getattr(
-                                    self, '_lb_expected_occupancy_urls',
-                                    set()).issubset(sampled_urls)
+                    complete_report = self._lb_demand_report_is_complete(
+                        request_data)
                     handoff = getattr(self, '_lb_demand_handoff', None)
                     if handoff is not None:
                         if (complete_report and
@@ -1055,6 +1050,33 @@ class SkyServeController:
         return lb_ha.occupancy_samples_are_promotable(
             self._lb_expected_occupancy_urls, sample_generations, sample_ages,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+
+    @staticmethod
+    def _lb_demand_report_is_complete(request_data: dict[str, Any]) -> bool:
+        """Whether an authoritative report can age out old demand gauges.
+
+        Occupancy samples need not cover every backend. Missing samples are
+        represented by the current report's unknown set and remain protected
+        individually; they must not preserve stale queue and rejection gauges
+        for the whole fleet indefinitely. Requiring every field keeps a mixed
+        rollout with an older load balancer fail closed.
+        """
+        in_flight = request_data.get('in_flight')
+        if not isinstance(in_flight, dict):
+            return False
+        if any(not isinstance(url, str) or not isinstance(count, int) or
+               isinstance(count, bool) or count < 0
+               for url, count in in_flight.items()):
+            return False
+        for field in ('queue_depth', 'rejected_in_window',
+                      'rejected_in_recent_window'):
+            value = request_data.get(field)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < 0):
+                return False
+        unknown_urls = request_data.get('unknown_in_flight_urls')
+        return (isinstance(unknown_urls, list) and
+                all(isinstance(url, str) for url in unknown_urls))
 
     def _restore_lb_demand_handoff(self, generation: int) -> None:
         handoff = self._lb_demand_handoff

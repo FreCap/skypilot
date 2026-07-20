@@ -162,6 +162,22 @@ demand reports continue to prohibit all rolling retirement. A pending logical
 scale-up wave does not block the bridge because the raw-demand side of the
 coverage target already protects work that the adopted target has not reached.
 
+### Load-balancer demand handoff
+
+An HA load-balancer promotion temporarily preserves the previous active slot's
+demand gauges so a cold promoted process cannot prove idle capacity and trigger
+an early drain. The 60-second handoff countdown starts after the promoted,
+authoritative slot reports the complete demand-gauge contract: in-flight work,
+queue depth, retained and recent rejections, and explicit unknown-occupancy
+URLs. It does not wait for every backend occupancy probe to succeed.
+
+Backends missing a fresh occupancy sample remain represented in the current
+report's unknown set and stay individually protected from retirement. Coupling
+the whole demand handoff to complete occupancy would instead let one
+unreachable backend preserve an obsolete queue or rejection snapshot forever.
+Older load balancers that omit any required demand gauge continue to hold the
+handoff floor, preserving mixed-version safety.
+
 ### Scale-down wave
 
 After raw demand remains lower for `downscale_delay_seconds`, ordinary
@@ -243,6 +259,8 @@ hysteresis and reset the counter after each permitted reduction. During a
 logical rolling update, preserve coverage using observed latest-version
 logical capacity plus a conservative one-slot floor per READY old backend, and
 retire eligible old physical backends in batches of at most 20 per tick.
+Start the HA demand-handoff expiry from the first complete authoritative demand
+gauge report even when some backend occupancy samples remain unknown.
 
 ### 4. Production consumer and rollout
 
@@ -331,6 +349,11 @@ rate to 100, then restore the previous control-plane image if required.
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old
   backends, and emits no more than 20 victims per tick.
+- Verify an authoritative HA demand report starts the handoff expiry when all
+  demand gauges are present, while incomplete or legacy reports retain the
+  previous floor. Missing occupancy samples must still protect those replicas
+  through the unknown-occupancy set without preserving stale queue or rejection
+  gauges.
 - Verify failed cleanup and cost-rebalance safety remain unchanged or exempt as
   specified.
 - Run focused Serve tests, format changed files, then rerun the focused suite.
