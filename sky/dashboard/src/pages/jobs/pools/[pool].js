@@ -117,6 +117,7 @@ export default function PoolDetailPage() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState(null);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -153,8 +154,6 @@ export default function PoolDetailPage() {
         setLoading(false);
         setInitialLoading(true);
       }
-      setError(null);
-
       try {
         const poolsResponse = await dashboardCache.get(
           getPoolStatus,
@@ -168,6 +167,7 @@ export default function PoolDetailPage() {
           setError(`Pool ${poolName} not found`);
           setPoolData(null);
         } else {
+          setError(null);
           setPoolData(foundPool);
         }
       } catch (err) {
@@ -194,10 +194,29 @@ export default function PoolDetailPage() {
     ]
   );
 
+  const refreshPoolData = React.useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.poolName === poolName) {
+      return inFlight.promise;
+    }
+
+    dashboardCache.invalidate(getPoolStatus, poolStatusArgs);
+    const refreshPromise = fetchPoolData(true).finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = { poolName, promise: refreshPromise };
+    return refreshPromise;
+  }, [fetchPoolData, poolName, poolStatusArgs]);
+
   useEffect(() => {
     fetchPoolData();
     return () => {
       requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.poolName === poolName) {
+        refreshInFlightRef.current = null;
+      }
     };
   }, [poolName, fetchPoolData]);
 
@@ -374,11 +393,8 @@ export default function PoolDetailPage() {
             <h2 className="text-xl font-semibold mb-2">Error</h2>
             <p>{error || `Pool ${poolName} not found`}</p>
             <button
-              onClick={() => {
-                // Invalidate cache to ensure fresh data
-                dashboardCache.invalidate(getPoolStatus, poolStatusArgs);
-                fetchPoolData(true);
-              }}
+              onClick={refreshPoolData}
+              disabled={loading}
               className="mt-4 bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
             >
               Retry
@@ -417,11 +433,7 @@ export default function PoolDetailPage() {
               </div>
             )}
             <button
-              onClick={() => {
-                // Invalidate cache to ensure fresh data
-                dashboardCache.invalidate(getPoolStatus, poolStatusArgs);
-                fetchPoolData(true);
-              }}
+              onClick={refreshPoolData}
               disabled={loading}
               className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center"
             >

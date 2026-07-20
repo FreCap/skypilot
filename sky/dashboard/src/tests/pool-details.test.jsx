@@ -168,17 +168,21 @@ describe('PoolDetailPage request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 
-  it('refreshes only the current pool cache entry', async () => {
+  it('coalesces duplicate refreshes and releases ownership after success', async () => {
+    const refresh = deferred();
     dashboardCache.get
       .mockResolvedValueOnce({ pools: [pool('pool-a', 'initial')] })
-      .mockResolvedValueOnce({ pools: [pool('pool-a', 'fresh')] });
+      .mockImplementationOnce(() => refresh.promise);
 
     render(<PoolDetailPage />);
     await screen.findByText('initial');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    act(() => {
+      refreshButton.click();
+      refreshButton.click();
+    });
 
-    await screen.findByText('fresh');
     expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
     expect(dashboardCache.invalidate).toHaveBeenCalledWith(getPoolStatus, [
       { poolNames: ['pool-a'] },
@@ -187,5 +191,69 @@ describe('PoolDetailPage request ownership', () => {
     expect(dashboardCache.get).toHaveBeenLastCalledWith(getPoolStatus, [
       { poolNames: ['pool-a'] },
     ]);
+    expect(refreshButton).toBeDisabled();
+
+    await act(async () => {
+      refresh.resolve({ pools: [pool('pool-a', 'fresh')] });
+      await refresh.promise;
+    });
+    expect(await screen.findByText('fresh')).toBeInTheDocument();
+
+    dashboardCache.get.mockResolvedValueOnce({
+      pools: [pool('pool-a', 'newer')],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    expect(await screen.findByText('newer')).toBeInTheDocument();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('coalesces duplicate retries and releases ownership after failure', async () => {
+    const initial = deferred();
+    const retry = deferred();
+    dashboardCache.get
+      .mockImplementationOnce(() => initial.promise)
+      .mockImplementationOnce(() => retry.promise);
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    render(<PoolDetailPage />);
+    await act(async () => {
+      initial.reject(new Error('load failed'));
+      await expect(initial.promise).rejects.toThrow('load failed');
+    });
+    expect(
+      await screen.findByText('Failed to fetch pool data: load failed')
+    ).toBeInTheDocument();
+
+    const retryButton = screen.getByRole('button', { name: 'Retry' });
+    act(() => {
+      retryButton.click();
+      retryButton.click();
+    });
+
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(retryButton).toBeDisabled();
+    expect(
+      screen.getByText('Failed to fetch pool data: load failed')
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      retry.reject(new Error('retry failed'));
+      await expect(retry.promise).rejects.toThrow('retry failed');
+    });
+    expect(
+      await screen.findByText('Failed to fetch pool data: retry failed')
+    ).toBeInTheDocument();
+
+    dashboardCache.get.mockResolvedValueOnce({
+      pools: [pool('pool-a', 'recovered')],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    expect(await screen.findByText('recovered')).toBeInTheDocument();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 });
