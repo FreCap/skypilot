@@ -90,10 +90,14 @@ def _utc_datetime(timestamp: float | None = None) -> datetime.datetime:
 
 
 def reset_request_buffer() -> None:
-    """Start a fresh process-local buffer for one API request execution."""
+    """Start a fresh process-local buffer for one API request execution.
+
+    Events left over from a previous request whose flush failed are kept
+    (bounded by MAX_EVENTS_PER_REQUEST) so the next flush retries them; the
+    deduplicating insert on event_id makes that retry idempotent.
+    """
     global _attempt_count, _buffer_truncated
     with _buffer_lock:
-        _request_events.clear()
         _attempt_count = 0
         _buffer_truncated = False
 
@@ -178,9 +182,32 @@ def _drain_request_buffer() -> tuple[list[dict[str, Any]], bool]:
     return events, truncated
 
 
+def _snapshot_request_buffer() -> tuple[list[dict[str, Any]], bool]:
+    global _buffer_truncated
+    with _buffer_lock:
+        events = list(_request_events)
+        truncated = _buffer_truncated
+        _buffer_truncated = False
+    return events, truncated
+
+
+def _discard_events(events: list[dict[str, Any]]) -> None:
+    event_ids = {event['event_id'] for event in events}
+    with _buffer_lock:
+        _request_events[:] = [
+            event for event in _request_events
+            if event['event_id'] not in event_ids
+        ]
+
+
 def flush_request_buffer() -> int:
-    """Persist the current request buffer once; observability stays optional."""
-    events, truncated = _drain_request_buffer()
+    """Persist the current request buffer once; observability stays optional.
+
+    Events stay buffered until the transaction commits, so a transient
+    database failure raises to the caller without losing them; a later flush
+    retries the same events idempotently.
+    """
+    events, truncated = _snapshot_request_buffer()
     if truncated:
         logger.warning('Placement history capped at %s events for one request.',
                        MAX_EVENTS_PER_REQUEST)
@@ -188,6 +215,8 @@ def flush_request_buffer() -> int:
         return 0
     engine = _postgres_engine()
     if engine is None:
+        # Nothing can ever persist these events; drop them to bound memory.
+        _discard_events(events)
         return 0
     cutoff = _utc_datetime() - datetime.timedelta(hours=RETENTION_HOURS)
     with engine.begin() as connection:
@@ -201,6 +230,7 @@ def flush_request_buffer() -> int:
         connection.execute(
             sqlalchemy.delete(serve_placement_events_table).where(
                 serve_placement_events_table.c.observed_at < cutoff))
+    _discard_events(events)
     return len(events)
 
 
