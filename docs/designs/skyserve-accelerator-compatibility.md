@@ -427,6 +427,13 @@ with the aggregate target/capacity fields. Old rows and mixed-version writers
 use empty maps, which means exact-card history unavailable, not zero capacity.
 No migration backfill invents a historical card assignment.
 
+Each non-empty map envelope also stores the aggregate controller session,
+version, replica unit, traffic/capacity targets, and capacity counts that the
+exact values explain. Readers require both matching observation timestamps and
+an exact aggregate-envelope match before returning the card maps. This second
+fence covers an old HA writer winning an aggregate-only upsert at the same
+PostgreSQL timestamp as a new writer; pressure peaks remain independent.
+
 The history UI keeps one synchronized range and presents three operational
 views:
 

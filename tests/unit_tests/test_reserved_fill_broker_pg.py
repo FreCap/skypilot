@@ -922,10 +922,33 @@ class TestServeStatusHistoryPG:
             },
         }]
 
+        # An old rolling-upgrade writer can win an equal-timestamp upsert while
+        # knowing only aggregate columns. Timestamp equality alone must not
+        # make the prior exact-card map look coherent with its new aggregate.
+        table = serve_history.serve_autoscaler_history_table
+        equal_observed_at = datetime.datetime.fromtimestamp(
+            timestamp + 20, datetime.timezone.utc)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).values(
+                    observed_at=equal_observed_at,
+                    controller_session_id='c' * 32,
+                    demand_target=4,
+                    capacity_target=9,
+                    ready_capacity=7,
+                    provisioning_capacity=1,
+                    total_capacity=11).where(table.c.service_name == 'svc',
+                                             table.c.service_hash == 'hash-a'))
+        equal_mixed = serve_history.get_status_history('svc',
+                                                       timestamp=timestamp +
+                                                       20.5)
+        equal_sample = equal_mixed['autoscaler_samples'][0]
+        assert equal_sample['demand_target'] == 4
+        assert equal_sample['accelerator_breakdown'] is None
+
         # A rolling-upgrade writer that knows only aggregate columns may
         # advance observed_at without touching the new JSONB column. The
         # timestamp fence must hide that stale card assignment.
-        table = serve_history.serve_autoscaler_history_table
         newer_observed_at = datetime.datetime.fromtimestamp(
             timestamp + 21, datetime.timezone.utc)
         with history_engine.begin() as connection:

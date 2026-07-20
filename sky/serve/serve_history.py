@@ -472,6 +472,30 @@ def _normalize_accelerator_breakdown(
     return result
 
 
+def _accelerator_breakdown_aggregate_observation(
+    *,
+    controller_session_id: str,
+    version: int,
+    replica_unit: str,
+    demand_target: int,
+    capacity_target: int,
+    ready_capacity: int,
+    provisioning_capacity: int,
+    total_capacity: int,
+) -> dict[str, Any]:
+    """Return the aggregate fields that an exact-card map explains."""
+    return {
+        'controller_session_id': controller_session_id,
+        'version': version,
+        'replica_unit': replica_unit,
+        'demand_target': demand_target,
+        'capacity_target': capacity_target,
+        'ready_capacity': ready_capacity,
+        'provisioning_capacity': provisioning_capacity,
+        'total_capacity': total_capacity,
+    }
+
+
 def record_autoscaler_snapshot(
     service_name: str,
     service_hash: str,
@@ -529,6 +553,18 @@ def record_autoscaler_snapshot(
     assert total_capacity is not None
     if capacity_target < demand_target:
         raise ValueError('capacity_target must be at least demand_target.')
+    if accelerator_breakdown:
+        accelerator_breakdown['_aggregate_observation'] = (
+            _accelerator_breakdown_aggregate_observation(
+                controller_session_id=controller_session_id,
+                version=version,
+                replica_unit=replica_unit,
+                demand_target=demand_target,
+                capacity_target=capacity_target,
+                ready_capacity=ready_capacity,
+                provisioning_capacity=provisioning_capacity,
+                total_capacity=total_capacity,
+            ))
 
     engine = _postgres_engine()
     if engine is None:
@@ -720,6 +756,28 @@ def get_status_history(
             'request_count': int(row.request_count),
             'rejected_count': rejected_count,
         })
+
+    def exact_breakdown(row: Any) -> dict[str, Any] | None:
+        breakdown = row['accelerator_breakdown']
+        if (not isinstance(breakdown, dict) or not breakdown or
+                row['accelerator_breakdown_observed_at'] != row['observed_at']):
+            return None
+        expected_aggregate = _accelerator_breakdown_aggregate_observation(
+            controller_session_id=row['controller_session_id'],
+            version=row['version'],
+            replica_unit=row['replica_unit'],
+            demand_target=row['demand_target'],
+            capacity_target=row['capacity_target'],
+            ready_capacity=row['ready_capacity'],
+            provisioning_capacity=row['provisioning_capacity'],
+            total_capacity=row['total_capacity'],
+        )
+        if breakdown.get('_aggregate_observation') != expected_aggregate:
+            return None
+        serialized = dict(breakdown)
+        serialized.pop('_aggregate_observation', None)
+        return serialized
+
     autoscaler_samples = [{
         'timestamp': row['bucket_start'].timestamp(),
         'observed_at': row['observed_at'].timestamp(),
@@ -733,10 +791,7 @@ def get_status_history(
         'total_capacity': row['total_capacity'],
         'peak_in_flight': row['peak_in_flight'],
         'peak_queue_depth': row['peak_queue_depth'],
-        'accelerator_breakdown':
-            (row['accelerator_breakdown'] if
-             row['accelerator_breakdown_observed_at'] == row['observed_at'] and
-             row['accelerator_breakdown'] else None),
+        'accelerator_breakdown': exact_breakdown(row),
     } for row in autoscaler_rows]
     current_bucket = observed_at.replace(second=0, microsecond=0)
     request_window_start = current_bucket - datetime.timedelta(
