@@ -237,11 +237,15 @@ def test_other_placer_keeps_legacy_physical_semantics():
     ({
         'target_concurrency_per_replica': 1.0,
         'graceful_drain_async_occupancy': True,
-    }, 'target_concurrency_per_replica: 1'),
+    }, 'positive integer'),
     ({
-        'target_concurrency_per_replica': 2,
+        'target_concurrency_per_replica': 2.5,
         'graceful_drain_async_occupancy': True,
-    }, 'target_concurrency_per_replica: 1'),
+    }, 'positive integer'),
+    ({
+        'target_concurrency_per_replica': True,
+        'graceful_drain_async_occupancy': True,
+    }, 'positive integer'),
     ({
         'target_concurrency_per_replica': 1,
     }, 'graceful_drain_async_occupancy: true'),
@@ -252,6 +256,17 @@ def test_per_gpu_placer_rejects_ambiguous_capacity_contract(kwargs, match):
                    max_replicas=5,
                    spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
                    **kwargs)
+
+
+def test_per_gpu_placer_accepts_outstanding_work_saturation():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2,
+                      graceful_drain_async_occupancy=True,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER)
+
+    assert spec.uses_logical_replicas
+    assert spec.target_concurrency_per_replica == 2
 
 
 def test_per_gpu_placer_accepts_reserved_fill_at_spec_level():

@@ -2226,8 +2226,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     GAUGES over the sync channel (no clear-on-ack batches to lose or
     double-count on controller hiccups).
 
-    The knob `target_concurrency_per_replica` is PER GPU: a replica's
-    capacity is knob x gpu_count, so heterogeneous fleets pack correctly.
+    The knob `target_concurrency_per_replica` is PER GPU. Physical-backend
+    services pack outstanding work onto knob x gpu_count capacities. Logical
+    services publish GPU-slot targets and divide outstanding work by the knob;
+    backend packing happens later from those whole-slot targets.
 
     SIGNAL-GAP RULE: the demand gauges only exist in LB reports. A report
     is fresh iff it carried a non-None in-flight map and is younger than
@@ -2519,12 +2521,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return float(knob)
 
     def _replica_capacity(self, info: 'replica_managers.ReplicaInfo') -> float:
-        """A replica's capacity in concurrency units (knob x gpu_count).
+        """A replica's capacity in the autoscaler's target units.
 
-        The knob is resolved for the replica's OWN version: after a
-        knob-changing update, old-version replicas keep the capacity
-        they were launched with, so the rolling drain neither over- nor
-        under-states the coverage the kept old set provides.
+        Logical targets are GPU slots, so a physical backend contributes its
+        immutable planned slot width. Physical-backend targets are replica
+        counts, so each replica contributes knob x gpu_count concurrency.
+        The knob is resolved for the replica's OWN version after updates.
         """
         if self.replica_unit == 'logical':
             return float(getattr(info, 'planned_capacity', 1))
@@ -2590,6 +2592,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def _cost_rebalance_location_capacity(
             self, location: spot_placer.Location) -> float:
         _, gpu_count = self._location_gpu_shape(location)
+        if self.replica_unit == 'logical':
+            return float(gpu_count)
         return self.target_concurrency_per_replica * gpu_count
 
     def _latest_capacities(
@@ -2666,10 +2670,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         latest_capacities = self._latest_capacities(replica_infos)
         if self.replica_unit == 'logical':
-            # One public replica is already one concurrent job slot. Physical
-            # backend packing happens later, after the manager selects exact
-            # 1/4/8-GPU placements.
-            best_capacity = 1.0
+            # Public targets count GPU slots. Each slot absorbs the configured
+            # amount of outstanding work; physical backend packing happens
+            # later, after the manager selects exact 1/4/8-GPU placements.
+            best_capacity = self.target_concurrency_per_replica
         else:
             best_capacity = (latest_capacities[0] if latest_capacities else
                              self.target_concurrency_per_replica)
@@ -2707,7 +2711,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
-            raw_target_num = math.ceil(outstanding)
+            raw_target_num = math.ceil(outstanding / best_capacity)
         else:
             raw_target_num = 0
             covered = 0.0
