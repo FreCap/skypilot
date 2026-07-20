@@ -2822,16 +2822,18 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     worker_ip_max_attempts=max_attempts,
                     get_internal_ips=True)
 
-        assert len(cluster_feasible_ips) == len(cluster_internal_ips), (
-            f'Cluster {self.cluster_name!r}:'
-            f'Expected same number of internal IPs {cluster_internal_ips}'
-            f' and external IPs {cluster_feasible_ips}.')
+        if len(cluster_feasible_ips) != len(cluster_internal_ips):
+            raise AssertionError(
+                f'Cluster {self.cluster_name!r}:'
+                f'Expected same number of internal IPs {cluster_internal_ips}'
+                f' and external IPs {cluster_feasible_ips}.')
 
         # List of (internal_ip, feasible_ip) tuples for all the nodes in the
         # cluster, sorted by the feasible ips. The feasible ips can be either
         # internal or external ips, depending on the use_internal_ips flag.
         internal_external_ips: list[tuple[str, str]] = list(
-            zip(cluster_internal_ips, cluster_feasible_ips))
+            # Length equality is checked immediately above.
+            zip(cluster_internal_ips, cluster_feasible_ips))  # noqa: B905
 
         # Ensure head node is the first element, then sort based on the
         # external IPs for stableness. Skip for k8s nodes since pods
@@ -2885,8 +2887,14 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             # cluster before #2491 was launched without external SSH ports
             # cached.
             port_list = self.external_ssh_ports()
+            if len(ip_list) != len(port_list):
+                raise ValueError(
+                    f'Cluster {self.cluster_name!r}: expected the same number '
+                    f'of SSH ports {port_list} and IPs {ip_list}.')
             runners = command_runner.SSHCommandRunner.make_runner_list(
-                zip(ip_list, port_list), **ssh_credentials)
+                # Length equality is checked immediately above.
+                zip(ip_list, port_list),  # noqa: B905
+                **ssh_credentials)
             return runners
         if self.cached_cluster_info is None:
             # We have `and self.cached_external_ips is None` here, because
@@ -5332,11 +5340,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 else:
                     raise
 
-        parallel_args = [[runner, *item]
-                         for item in zip(local_log_dirs, remote_log_dirs)
-                         for runner in runners]
+        parallel_args = [
+            [runner, *item]
+            # Both lists are derived from the same `dirs` list.
+            for item in zip(local_log_dirs, remote_log_dirs)  # noqa: B905
+            for runner in runners
+        ]
         subprocess_utils.run_in_parallel(_rsync_down, parallel_args)
-        return dict(zip(job_ids, local_log_dirs))
+        # Both lists are derived from the same `job_to_dir` dictionary.
+        return dict(zip(job_ids, local_log_dirs))  # noqa: B905
 
     @context_utils.cancellation_guard
     def tail_logs(self,
