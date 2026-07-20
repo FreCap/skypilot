@@ -67,12 +67,11 @@ def is_kubeconfig_exec_auth(
 
 def get_kubeconfig_text_for_context(context: str | None = None) -> str:
     """Get the kubeconfig text for the given context."""
-    command = 'kubectl config view --minify'
+    command = ['kubectl', 'config', 'view', '--minify']
     if context is not None:
-        command += f' --context={context}'
+        command.append(f'--context={context}')
 
     proc = subprocess.run(command,
-                          shell=True,
                           check=False,
                           env=os.environ.copy(),
                           capture_output=True)
