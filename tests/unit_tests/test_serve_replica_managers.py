@@ -3328,7 +3328,7 @@ class TestLogicalCapacityPlanning:
         assert not retiring.status_property.is_scale_down
         assert retiring.status_property.sky_down_status is None
 
-    def test_target_growth_waits_for_committed_current_version_capacity(self):
+    def test_target_growth_reactivates_before_provisioning_is_ready(self):
         mgr, retiring, survivor = self._pending_logical_retirement()
         provisioning = replica_managers.ReplicaInfo(replica_id=11,
                                                     cluster_name='svc-11',
@@ -3346,9 +3346,31 @@ class TestLogicalCapacityPlanning:
             mgr._finish_logical_retirement(9, retiring)
 
         mgr._terminate_replica.assert_not_called()
-        mgr._persist_replica.assert_not_called()
-        assert retiring.status_property.is_scale_down
-        assert retiring.status_property.wait_for_idle_before_termination
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert not retiring.status_property.wait_for_idle_before_termination
+
+    def test_target_growth_reactivates_victim_before_idle(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            in_flight_by_replica_id={
+                9: 3,
+                10: 0,
+            })
+        mgr._logical_target = (10, 5, 2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert not retiring.status_property.wait_for_idle_before_termination
 
     def test_target_growth_reactivates_after_committed_capacity_fails(self):
         mgr, retiring, survivor = self._pending_logical_retirement()
@@ -4108,7 +4130,8 @@ class TestLogicalCapacityPlanning:
         assert mgr._logical_retirement_recovery_deadline > expired_deadline
         mgr._persist_replica.assert_not_called()
 
-    def test_recovery_provisioning_coverage_preserves_old_version_drain(self):
+    def test_recovery_reactivates_old_version_before_provisioning_is_ready(
+            self):
         retiring = self._recoverable_logical_retirement(1)
         provisioning = self._ready_backend(2, 4)
         provisioning.version = 2
@@ -4133,10 +4156,10 @@ class TestLogicalCapacityPlanning:
                                return_value=[retiring, provisioning]):
             mgr._reconcile_recovering_logical_retirements()
 
-        assert (retiring.status ==
-                replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
-        assert retiring.status_property.logical_retirement_version == 2
-        assert mgr._recovering_logical_retirement_ids == {1}
+        assert retiring.is_ready
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert not mgr._recovering_logical_retirement_ids
         mgr._persist_replica.assert_called_once_with(1, retiring)
 
     def test_recovery_shortfall_reactivation_is_bounded_per_generation(self):
