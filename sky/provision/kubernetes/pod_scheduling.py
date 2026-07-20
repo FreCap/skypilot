@@ -1,9 +1,19 @@
 """Kubernetes pod scheduling and capacity diagnostics."""
 
+import collections
+import dataclasses
 import datetime
+import hashlib
+import json
+import math
+import os
 import sys
+import tempfile
+import threading
 import time
 from typing import Any
+
+import filelock
 
 from sky import global_user_state
 from sky import sky_logging
@@ -27,8 +37,425 @@ _AUTOSCALE_DETECTED_TIMEOUT_SECONDS = 900  # 15 minutes
 # event even when the user leaves provision_timeout at its short default.
 _AUTOSCALE_INITIAL_MIN_TIMEOUT_SECONDS = 60
 
+# Karpenter reports deterministic NodePool incompatibilities through
+# FailedScheduling Events. Cache the normalized signals per Kubernetes
+# context/namespace so concurrent launches share one Events API read.
+_FAILED_SCHEDULING_EVENT_CACHE_TTL_SECONDS = 2
+_FAILED_SCHEDULING_EVENT_CACHE_MAX_ENTRIES = 64
+_FAILED_SCHEDULING_EVENT_CACHE_MAX_UID_MATCHES = 1024
+_FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION = 1
+_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKETS = 64
+_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKET_MAX_ENTRIES = 8
+_FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR = os.path.join(
+    tempfile.gettempdir(), 'skypilot-failed-scheduling-event-cache')
+
+
+@dataclasses.dataclass
+class _FailedSchedulingEventSnapshot:
+    latest_occurrence: datetime.datetime | None = None
+    gpu_incompatibilities: dict[str, tuple[datetime.datetime,
+                                           str]] = dataclasses.field(
+                                               default_factory=dict)
+
+
+@dataclasses.dataclass
+class _FailedSchedulingEventCacheEntry:
+    refresh_lock: Any = dataclasses.field(default_factory=threading.Lock)
+    cached_at: float | None = None
+    snapshot: _FailedSchedulingEventSnapshot = dataclasses.field(
+        default_factory=_FailedSchedulingEventSnapshot)
+    pins: int = 0
+
+
+_FAILED_SCHEDULING_EVENT_CACHE_LOCK = threading.Lock()
+_FAILED_SCHEDULING_EVENT_CACHE: collections.OrderedDict[
+    tuple[str | None,
+          str], _FailedSchedulingEventCacheEntry] = (collections.OrderedDict())
+
 # Use the historical logger so facade imports and logging behavior stay stable.
 logger = sky_logging.init_logger('sky.provision.kubernetes.instance')
+
+
+def _clear_failed_scheduling_event_cache_for_testing() -> None:
+    with _FAILED_SCHEDULING_EVENT_CACHE_LOCK:
+        _FAILED_SCHEDULING_EVENT_CACHE.clear()
+
+
+def _pin_failed_scheduling_event_cache_entry(
+        context: str | None,
+        namespace: str) -> _FailedSchedulingEventCacheEntry | None:
+    key = (context, namespace)
+    with _FAILED_SCHEDULING_EVENT_CACHE_LOCK:
+        entry = _FAILED_SCHEDULING_EVENT_CACHE.get(key)
+        if entry is not None:
+            entry.pins += 1
+            _FAILED_SCHEDULING_EVENT_CACHE.move_to_end(key)
+            return entry
+
+        if (len(_FAILED_SCHEDULING_EVENT_CACHE)
+                >= _FAILED_SCHEDULING_EVENT_CACHE_MAX_ENTRIES):
+            eviction_key = next(
+                (candidate_key for candidate_key, candidate_entry in
+                 _FAILED_SCHEDULING_EVENT_CACHE.items()
+                 if candidate_entry.pins == 0), None)
+            if eviction_key is None:
+                return None
+            del _FAILED_SCHEDULING_EVENT_CACHE[eviction_key]
+
+        entry = _FailedSchedulingEventCacheEntry(pins=1)
+        _FAILED_SCHEDULING_EVENT_CACHE[key] = entry
+        return entry
+
+
+def _release_failed_scheduling_event_cache_entry(
+        entry: _FailedSchedulingEventCacheEntry) -> None:
+    with _FAILED_SCHEDULING_EVENT_CACHE_LOCK:
+        entry.pins -= 1
+
+
+def _as_aware_utc(timestamp: Any) -> datetime.datetime | None:
+    if not isinstance(timestamp, datetime.datetime):
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=datetime.timezone.utc)
+    return timestamp.astimezone(datetime.timezone.utc)
+
+
+def _failed_scheduling_event_occurrence(event: Any) -> datetime.datetime | None:
+    series = getattr(event, 'series', None)
+    timestamps = [
+        getattr(series, 'last_observed_time', None) if series else None,
+        getattr(event, 'event_time', None),
+        getattr(event, 'last_timestamp', None),
+        getattr(getattr(event, 'metadata', None), 'creation_timestamp', None),
+    ]
+    for timestamp in timestamps:
+        normalized = _as_aware_utc(timestamp)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _karpenter_gpu_incompatibility(
+        event: Any) -> tuple[str, datetime.datetime, str] | None:
+    if (getattr(event, 'reason', None) != 'FailedScheduling' or
+            getattr(event, 'type', None) != 'Warning'):
+        return None
+
+    reporting_component = getattr(event, 'reporting_component', None)
+    source = getattr(event, 'source', None)
+    source_component = getattr(source, 'component', None) if source else None
+    components = (reporting_component, source_component)
+    if not any(
+            isinstance(component, str) and component.lower() == 'karpenter'
+            for component in components):
+        return None
+
+    message = getattr(event, 'message', None)
+    if not isinstance(message, str) or ';' in message:
+        return None
+    lower_message = message.lower()
+    required_fragments = (
+        'incompatible requirements',
+        'nvidia.com/gpu.product',
+        'does not have known values',
+    )
+    if not all(fragment in lower_message for fragment in required_fragments):
+        return None
+
+    involved_object = getattr(event, 'involved_object', None)
+    pod_uid = getattr(involved_object, 'uid', None)
+    occurrence = _failed_scheduling_event_occurrence(event)
+    if not isinstance(pod_uid, str) or occurrence is None:
+        return None
+    return pod_uid, occurrence, message
+
+
+def _refresh_failed_scheduling_event_snapshot(
+        namespace: str, context: str | None) -> _FailedSchedulingEventSnapshot:
+    try:
+        events = kubernetes.core_api(context).list_namespaced_event(
+            namespace=namespace,
+            field_selector='reason=FailedScheduling',
+            _request_timeout=kubernetes.API_TIMEOUT)
+        matches: dict[str, tuple[datetime.datetime, str]] = {}
+        latest_occurrence = None
+        for event in events.items:
+            occurrence = _failed_scheduling_event_occurrence(event)
+            if (occurrence is not None and
+                (latest_occurrence is None or occurrence > latest_occurrence)):
+                latest_occurrence = occurrence
+            match = _karpenter_gpu_incompatibility(event)
+            if match is None:
+                continue
+            pod_uid, occurrence, message = match
+            previous = matches.get(pod_uid)
+            if previous is None or occurrence > previous[0]:
+                matches[pod_uid] = (occurrence, message)
+        newest_matches = sorted(matches.items(),
+                                key=lambda item: item[1][0],
+                                reverse=True)
+        return _FailedSchedulingEventSnapshot(
+            latest_occurrence=latest_occurrence,
+            gpu_incompatibilities=dict(
+                newest_matches[:_FAILED_SCHEDULING_EVENT_CACHE_MAX_UID_MATCHES])
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(
+            f'Failed to inspect Karpenter FailedScheduling events: {e}')
+        return _FailedSchedulingEventSnapshot()
+
+
+def _failed_scheduling_event_shared_cache_identity(context: str | None,
+                                                   namespace: str) -> str:
+    return json.dumps([context, namespace],
+                      ensure_ascii=False,
+                      separators=(',', ':'))
+
+
+def _failed_scheduling_event_shared_cache_paths(
+        context: str | None, namespace: str) -> tuple[str, str, str]:
+    identity = _failed_scheduling_event_shared_cache_identity(
+        context, namespace)
+    digest = hashlib.sha256(identity.encode('utf-8')).digest()
+    bucket = int.from_bytes(
+        digest[:8], 'big') % (_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKETS)
+    prefix = os.path.join(_FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR,
+                          f'bucket-{bucket}')
+    return f'{prefix}.json', f'{prefix}.lock', f'{prefix}.json.tmp'
+
+
+def _serialize_failed_scheduling_event_snapshot(
+        snapshot: _FailedSchedulingEventSnapshot) -> dict[str, Any]:
+    latest_occurrence = (snapshot.latest_occurrence.isoformat()
+                         if snapshot.latest_occurrence is not None else None)
+    matches = [[uid, occurrence.isoformat(), message]
+               for uid, (occurrence,
+                         message) in snapshot.gpu_incompatibilities.items()]
+    return {
+        'latest_occurrence': latest_occurrence,
+        'gpu_incompatibilities': matches,
+    }
+
+
+def _deserialize_failed_scheduling_event_snapshot(
+        value: Any) -> _FailedSchedulingEventSnapshot | None:
+    if not isinstance(value, dict):
+        return None
+    latest_occurrence_value = value.get('latest_occurrence')
+    if latest_occurrence_value is None:
+        latest_occurrence = None
+    elif isinstance(latest_occurrence_value, str):
+        try:
+            latest_occurrence = _as_aware_utc(
+                datetime.datetime.fromisoformat(latest_occurrence_value))
+        except ValueError:
+            return None
+        if latest_occurrence is None:
+            return None
+    else:
+        return None
+
+    match_values = value.get('gpu_incompatibilities')
+    if (not isinstance(match_values, list) or
+            len(match_values) > _FAILED_SCHEDULING_EVENT_CACHE_MAX_UID_MATCHES):
+        return None
+    matches: dict[str, tuple[datetime.datetime, str]] = {}
+    for match_value in match_values:
+        if (not isinstance(match_value, list) or len(match_value) != 3 or
+                not isinstance(match_value[0], str) or
+                not isinstance(match_value[1], str) or
+                not isinstance(match_value[2], str)):
+            return None
+        try:
+            occurrence = _as_aware_utc(
+                datetime.datetime.fromisoformat(match_value[1]))
+        except ValueError:
+            return None
+        if occurrence is None or match_value[0] in matches:
+            return None
+        matches[match_value[0]] = (occurrence, match_value[2])
+    if set(value) != {'latest_occurrence', 'gpu_incompatibilities'}:
+        return None
+    return _FailedSchedulingEventSnapshot(latest_occurrence=latest_occurrence,
+                                          gpu_incompatibilities=matches)
+
+
+def _read_failed_scheduling_event_shared_bucket(
+        bucket_path: str, now: float) -> list[dict[str, Any]] | None:
+    try:
+        with open(bucket_path, encoding='utf-8') as bucket_file:
+            value = json.load(bucket_file)
+    except FileNotFoundError:
+        return []
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (not isinstance(value, dict) or value.get('version')
+            != _FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION or
+            set(value) != {'version', 'entries'}):
+        return None
+    entries = value.get('entries')
+    if (not isinstance(entries, list) or len(entries)
+            > _FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKET_MAX_ENTRIES):
+        return None
+    identities = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+                'identity', 'refreshed_at', 'last_accessed_at', 'snapshot'
+        }:
+            return None
+        identity = entry['identity']
+        refreshed_at = entry['refreshed_at']
+        last_accessed_at = entry['last_accessed_at']
+        if (not isinstance(identity, str) or identity in identities or
+                not isinstance(refreshed_at, (int, float)) or
+                isinstance(refreshed_at, bool) or
+                not math.isfinite(refreshed_at) or refreshed_at < 0 or
+                refreshed_at > now or not isinstance(last_accessed_at,
+                                                     (int, float)) or
+                isinstance(last_accessed_at, bool) or last_accessed_at < 0 or
+                not math.isfinite(last_accessed_at) or last_accessed_at > now or
+                _deserialize_failed_scheduling_event_snapshot(
+                    entry['snapshot']) is None):
+            return None
+        identities.add(identity)
+    return entries
+
+
+def _write_failed_scheduling_event_shared_bucket(
+        bucket_path: str, staging_path: str, entries: list[dict[str,
+                                                                Any]]) -> None:
+    value = {
+        'version': _FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION,
+        'entries': entries,
+    }
+    with open(staging_path, 'w', encoding='utf-8') as staging_file:
+        json.dump(value, staging_file, separators=(',', ':'), sort_keys=True)
+        staging_file.flush()
+        os.fsync(staging_file.fileno())
+    os.replace(staging_path, bucket_path)
+
+
+def _get_failed_scheduling_event_shared_snapshot(
+        namespace: str,
+        context: str | None) -> _FailedSchedulingEventSnapshot | None:
+    identity = _failed_scheduling_event_shared_cache_identity(
+        context, namespace)
+    bucket_path, lock_path, staging_path = (
+        _failed_scheduling_event_shared_cache_paths(context, namespace))
+    try:
+        os.makedirs(_FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR, exist_ok=True)
+        with filelock.FileLock(lock_path, timeout=0):
+            now = time.monotonic()
+            entries = _read_failed_scheduling_event_shared_bucket(
+                bucket_path, now)
+            if entries is None:
+                entries = []
+
+            matching_index = next((index for index, entry in enumerate(entries)
+                                   if entry['identity'] == identity), None)
+            if matching_index is not None:
+                matching_entry = entries[matching_index]
+                age = now - matching_entry['refreshed_at']
+                if age < _FAILED_SCHEDULING_EVENT_CACHE_TTL_SECONDS:
+                    snapshot = _deserialize_failed_scheduling_event_snapshot(
+                        matching_entry['snapshot'])
+                    assert snapshot is not None
+                    matching_entry['last_accessed_at'] = now
+                    _write_failed_scheduling_event_shared_bucket(
+                        bucket_path, staging_path, entries)
+                    return snapshot
+                replacement_index = matching_index
+            elif len(entries) < (
+                    _FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKET_MAX_ENTRIES):
+                replacement_index = len(entries)
+            else:
+                expired_indexes = [
+                    index for index, entry in enumerate(entries)
+                    if now - entry['refreshed_at'] >=
+                    _FAILED_SCHEDULING_EVENT_CACHE_TTL_SECONDS
+                ]
+                if not expired_indexes:
+                    return None
+                replacement_index = min(
+                    expired_indexes,
+                    key=lambda index: entries[index]['last_accessed_at'])
+
+            snapshot = _refresh_failed_scheduling_event_snapshot(
+                namespace, context)
+            refreshed_at = time.monotonic()
+            new_entry = {
+                'identity': identity,
+                'refreshed_at': refreshed_at,
+                'last_accessed_at': refreshed_at,
+                'snapshot':
+                    _serialize_failed_scheduling_event_snapshot(snapshot),
+            }
+            if replacement_index == len(entries):
+                entries.append(new_entry)
+            else:
+                entries[replacement_index] = new_entry
+            _write_failed_scheduling_event_shared_bucket(
+                bucket_path, staging_path, entries)
+            return snapshot
+    except filelock.Timeout:
+        return None
+    except OSError as e:
+        logger.debug(f'Failed to use shared FailedScheduling Event cache: {e}')
+        return None
+
+
+def _get_failed_scheduling_event_snapshot(
+        namespace: str, context: str | None) -> _FailedSchedulingEventSnapshot:
+    entry = _pin_failed_scheduling_event_cache_entry(context, namespace)
+    if entry is None:
+        return _FailedSchedulingEventSnapshot()
+    try:
+        with entry.refresh_lock:
+            now = time.monotonic()
+            if (entry.cached_at is None or now - entry.cached_at
+                    >= _FAILED_SCHEDULING_EVENT_CACHE_TTL_SECONDS):
+                snapshot = _get_failed_scheduling_event_shared_snapshot(
+                    namespace, context)
+                if snapshot is None:
+                    return _FailedSchedulingEventSnapshot()
+                entry.snapshot = snapshot
+                entry.cached_at = time.monotonic()
+            return _FailedSchedulingEventSnapshot(
+                latest_occurrence=entry.snapshot.latest_occurrence,
+                gpu_incompatibilities=dict(
+                    entry.snapshot.gpu_incompatibilities))
+    finally:
+        _release_failed_scheduling_event_cache_entry(entry)
+
+
+def _get_failed_scheduling_event_matches(
+        namespace: str,
+        context: str | None) -> dict[str, tuple[datetime.datetime, str]]:
+    return _get_failed_scheduling_event_snapshot(namespace,
+                                                 context).gpu_incompatibilities
+
+
+def _raise_for_karpenter_gpu_incompatibility(
+        namespace: str, context: str | None, pending_pod_uids: set[str],
+        create_pods_start: datetime.datetime) -> None:
+    if not pending_pod_uids:
+        return
+    cutoff = _as_aware_utc(create_pods_start)
+    if cutoff is None:
+        return
+    matches = _get_failed_scheduling_event_matches(namespace, context)
+    for pod_uid in pending_pod_uids:
+        match = matches.get(pod_uid)
+        if match is None:
+            continue
+        occurrence, message = match
+        if occurrence < cutoff:
+            continue
+        raise config_lib.KubernetesError(
+            'Karpenter cannot provision a node matching the pod GPU product '
+            f'requirement. Details: {message!r}',
+            insufficent_resources=['GPUs'])
 
 
 def _pod_is_scheduled(pod) -> bool:
@@ -429,14 +856,12 @@ def _cluster_maybe_autoscaling(namespace, context, search_start) -> bool:
         A boolean whether the cluster has an autoscaling event or not.
     """
     assert namespace is not None
-
-    try:
-        return _detect_cluster_event_reason_occurred(namespace, context,
-                                                     search_start,
-                                                     'FailedScheduling')
-    except Exception as e:  # pylint: disable=broad-except
-        logger.debug(f'Error occurred while detecting cluster autoscaler: {e}')
+    search_start = _as_aware_utc(search_start)
+    if search_start is None:
         return False
+    snapshot = _get_failed_scheduling_event_snapshot(namespace, context)
+    return (snapshot.latest_occurrence is not None and
+            snapshot.latest_occurrence > search_start)
 
 
 def _update_spinner_message(*, iteration: int, pods: list[Any],
@@ -478,9 +903,12 @@ def _wait_for_pods_to_schedule(namespace, context, new_nodes, timeout: int,
         keys=('autoscaler',),
         default_value=None)
     autoscaler_is_set = autoscaler_type is not None
-    use_heuristic_detection = (autoscaler_is_set and
-                               not kubernetes_enums.KubernetesAutoscalerType(
-                                   autoscaler_type).emits_autoscale_event())
+    configured_autoscaler = (
+        kubernetes_enums.KubernetesAutoscalerType(autoscaler_type)
+        if autoscaler_is_set else None)
+    use_heuristic_detection = (
+        configured_autoscaler is not None and
+        not configured_autoscaler.emits_autoscale_event())
     is_autoscaling = False
     # When a definitive TriggeredScaleUp event is observed, this records the
     # detection moment so that we can extend the deadline — node scale-up is
@@ -553,6 +981,19 @@ def _wait_for_pods_to_schedule(namespace, context, new_nodes, timeout: int,
 
         if all_scheduled:
             return
+
+        # The Event source is authoritative. Karpenter may manage a cluster
+        # even when SkyPilot's optional autoscaler setting is absent.
+        pending_pod_uids = {
+            pod.metadata.uid
+            for pod in pods
+            if (pod.metadata.name in expected_pod_names and
+                pod.status.phase == 'Pending' and not _pod_is_scheduled(pod) and
+                isinstance(pod.metadata.uid, str))
+        }
+        _raise_for_karpenter_gpu_incompatibility(namespace, context,
+                                                 pending_pod_uids,
+                                                 create_pods_start)
 
         # Check if cluster is autoscaling and update spinner message.
         # Minor optimization to not query k8s api after autoscaling
