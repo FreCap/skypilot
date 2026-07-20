@@ -24,6 +24,15 @@ from sky.utils import status_lib
 from sky.utils import yaml_utils
 
 
+def test_add_auth_rejects_unsupported_cloud(tmp_path):
+    cloud = object.__new__(clouds.Cloud)
+    yaml_path = tmp_path / 'cluster.yaml'
+    yaml_utils.dump_yaml(yaml_path, {'auth': {}})
+
+    with pytest.raises(AssertionError):
+        backend_utils._add_auth_to_cluster_config(cloud, str(yaml_path))
+
+
 def test_optimize_file_mounts_quotes_local_sources(monkeypatch, tmp_path):
     source = tmp_path / 'research\'s "final" credentials.json'
     source.write_text('credential', encoding='utf-8')

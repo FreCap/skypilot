@@ -1502,7 +1502,7 @@ def _add_auth_to_cluster_config(cloud: clouds.Cloud, tmp_yaml_path: str):
     elif isinstance(cloud, clouds.Verda):
         config = auth.setup_verda_authentication(config)
     else:
-        assert False, cloud
+        raise AssertionError(cloud)
     yaml_utils.dump_yaml(tmp_yaml_path, config)
 
 
@@ -2695,7 +2695,7 @@ def check_can_clone_disk_and_override_task(
                     f'Cannot clone disk across cloud from {original_cloud} to '
                     f'{task_resources_cloud_str} for resources {task_resources_str}.'
                 )
-        assert False, 'Should not reach here.'
+        raise AssertionError('Should not reach here.')
     # set the new_task_resources to be the same type (list or set) as the
     # original task.resources
     if has_override:
