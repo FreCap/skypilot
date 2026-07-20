@@ -202,7 +202,8 @@ async def _retry_schedule_state_update(
             await session.commit()
             if count == 1 or idempotent:
                 return
-            assert count == 0, (job_id, count)
+            if count != 0:
+                raise AssertionError((job_id, count))
             if count == 0 and attempt > 0 and prior_update_matched:
                 current = await session.execute(
                     sqlalchemy.select(job_info_table.c.schedule_state).where(
@@ -210,7 +211,7 @@ async def _retry_schedule_state_update(
                 row = current.fetchone()
                 if row is not None and row[0] == target_state.value:
                     return
-            assert False, (job_id, count)
+            raise AssertionError((job_id, count))
 
     await db_retries.with_db_retries_async(_op)
 
@@ -1805,7 +1806,8 @@ def scheduler_set_waiting(job_ids: list[int],
             sqlalchemy.and_(
                 job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
         session.commit()
-        assert updated_count == len(job_ids), (job_ids, updated_count)
+        if updated_count != len(job_ids):
+            raise AssertionError((job_ids, updated_count))
 
 
 @db_retries.retry
@@ -2623,8 +2625,8 @@ def scheduler_set_done(job_id: int, idempotent: bool = False) -> None:
                     ManagedJobScheduleState.DONE.value
             })
         session.commit()
-        if not idempotent:
-            assert updated_count == 1, (job_id, updated_count)
+        if not idempotent and updated_count != 1:
+            raise AssertionError((job_id, updated_count))
 
 
 def get_job_schedule_state(job_id: int) -> ManagedJobScheduleState:
