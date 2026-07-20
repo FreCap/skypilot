@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { CircularProgress } from '@mui/material';
 import { ChevronDownIcon, ChevronRightIcon, RotateCwIcon } from 'lucide-react';
 
@@ -14,6 +20,14 @@ import {
 import { formatFullTimestamp } from '@/components/utils';
 import { getServicePlacement } from '@/data/connectors/services';
 
+const ALL_FILTER_VALUE = 'all';
+
+export const LOCATION_AVAILABILITY = {
+  AVAILABLE_SPOT: 'available-spot',
+  AVAILABLE_ON_DEMAND: 'available-on-demand',
+  UNAVAILABLE: 'unavailable',
+};
+
 function timestamp(value) {
   return value ? formatFullTimestamp(new Date(value * 1000)) : '-';
 }
@@ -27,16 +41,132 @@ function relativeExpiry(value) {
 
 export function formatAccelerators(accelerators) {
   if (!accelerators || typeof accelerators !== 'object') return '-';
-  return Object.entries(accelerators)
+  const formatted = Object.entries(accelerators)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, count]) => `${name}:${count}`)
     .join(', ');
+  return formatted || '-';
 }
 
 export function locationDisplayStatus(location) {
   if (location.probeEligible) return 'Probe eligible';
   if (location.storedStatus === 'PREEMPTED') return 'Benched';
   return 'Active';
+}
+
+export function locationAvailability(location) {
+  const effectiveStatus = location.effectiveStatus || location.storedStatus;
+  if (effectiveStatus !== 'ACTIVE') {
+    return LOCATION_AVAILABILITY.UNAVAILABLE;
+  }
+  return location.useSpot
+    ? LOCATION_AVAILABILITY.AVAILABLE_SPOT
+    : LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND;
+}
+
+export function formatHourlyPrice(price) {
+  return Number.isFinite(price)
+    ? `$${price.toFixed(4)}/hr`
+    : 'Price unavailable';
+}
+
+function locationCards(location) {
+  if (!location.accelerators || typeof location.accelerators !== 'object') {
+    return [];
+  }
+  return Object.keys(location.accelerators).sort((left, right) =>
+    left.localeCompare(right)
+  );
+}
+
+export function filterPlacementLocations(locations, filters) {
+  const maxPrice =
+    filters.maxPrice === '' ? null : Number.parseFloat(filters.maxPrice);
+  return locations.filter((location) => {
+    if (
+      filters.provider !== ALL_FILTER_VALUE &&
+      location.cloud !== filters.provider
+    ) {
+      return false;
+    }
+    if (
+      filters.region !== ALL_FILTER_VALUE &&
+      (location.region || '-') !== filters.region
+    ) {
+      return false;
+    }
+    if (
+      filters.card !== ALL_FILTER_VALUE &&
+      !locationCards(location).includes(filters.card)
+    ) {
+      return false;
+    }
+    if (
+      filters.availability !== ALL_FILTER_VALUE &&
+      locationAvailability(location) !== filters.availability
+    ) {
+      return false;
+    }
+    if (maxPrice !== null && Number.isFinite(maxPrice) && maxPrice >= 0) {
+      return (
+        Number.isFinite(location.cachedHourlyCost) &&
+        location.cachedHourlyCost <= maxPrice
+      );
+    }
+    return true;
+  });
+}
+
+export function groupPlacementLocations(locations) {
+  const groups = new Map();
+  locations.forEach((location) => {
+    const provider = location.cloud || 'Unknown';
+    const region = location.region || '-';
+    const key = `${provider}\u0000${region}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        provider,
+        region,
+        available: [],
+        unavailable: [],
+      });
+    }
+    const group = groups.get(key);
+    if (locationAvailability(location) === LOCATION_AVAILABILITY.UNAVAILABLE) {
+      group.unavailable.push(location);
+    } else {
+      group.available.push(location);
+    }
+  });
+
+  const compareLocations = (left, right) => {
+    const cardOrder = formatAccelerators(left.accelerators).localeCompare(
+      formatAccelerators(right.accelerators)
+    );
+    if (cardOrder !== 0) return cardOrder;
+    const leftPrice = Number.isFinite(left.cachedHourlyCost)
+      ? left.cachedHourlyCost
+      : Number.POSITIVE_INFINITY;
+    const rightPrice = Number.isFinite(right.cachedHourlyCost)
+      ? right.cachedHourlyCost
+      : Number.POSITIVE_INFINITY;
+    return (
+      leftPrice - rightPrice ||
+      (left.zone || '').localeCompare(right.zone || '')
+    );
+  };
+
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      available: group.available.sort(compareLocations),
+      unavailable: group.unavailable.sort(compareLocations),
+    }))
+    .sort(
+      (left, right) =>
+        left.provider.localeCompare(right.provider) ||
+        left.region.localeCompare(right.region)
+    );
 }
 
 function StatusPill({ children, tone = 'neutral' }) {
@@ -63,14 +193,141 @@ function SectionUnavailable({ label }) {
   );
 }
 
+function FilterSelect({ label, value, options, onChange }) {
+  return (
+    <label className="min-w-36 text-xs font-medium text-gray-600">
+      <span className="mb-1 block">{label}</span>
+      <select
+        aria-label={`${label} filter`}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-8 w-full rounded-md border border-gray-200 bg-white px-2 text-sm font-normal text-gray-800 focus:border-sky-blue focus:outline-none"
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function locationTooltip(location) {
+  const availability = locationAvailability(location);
+  const availabilityLabel = {
+    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]: 'Available spot',
+    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]: 'Available on-demand',
+    [LOCATION_AVAILABILITY.UNAVAILABLE]: 'Unavailable',
+  }[availability];
+  const details = [
+    `Zone: ${location.zone || '-'}`,
+    `Availability: ${availabilityLabel}`,
+    `Card: ${formatAccelerators(location.accelerators)}`,
+    `Price: ${formatHourlyPrice(location.cachedHourlyCost)}`,
+    `Status: ${locationDisplayStatus(location)}`,
+    `Stored: ${location.storedStatus || '-'} · Effective: ${location.effectiveStatus || '-'}`,
+  ];
+  if (location.nextProbeAt) {
+    details.push(
+      location.probeEligible
+        ? `Probe eligible since ${timestamp(location.nextProbeAt)}`
+        : `Next probe: ${timestamp(location.nextProbeAt)} (${relativeExpiry(location.nextProbeAt)})`
+    );
+  }
+  return details.join('\n');
+}
+
+function LocationChip({ location }) {
+  const availability = locationAvailability(location);
+  const tone = {
+    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]:
+      'border-emerald-200 bg-emerald-50 text-emerald-800',
+    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]:
+      'border-sky-200 bg-sky-50 text-sky-800',
+    [LOCATION_AVAILABILITY.UNAVAILABLE]:
+      'border-red-200 bg-red-50 text-red-800',
+  }[availability];
+  const details = locationTooltip(location);
+  return (
+    <span
+      tabIndex={0}
+      title={details}
+      aria-label={details}
+      className={`inline-flex cursor-help items-center gap-1.5 rounded-md border px-2 py-1 text-xs ${tone}`}
+    >
+      <span className="font-medium">
+        {formatAccelerators(location.accelerators)}
+      </span>
+      <span className="opacity-80">
+        {formatHourlyPrice(location.cachedHourlyCost)}
+      </span>
+    </span>
+  );
+}
+
+function LocationList({ locations }) {
+  if (locations.length === 0) return <span className="text-gray-400">-</span>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {locations.map((location, index) => (
+        <LocationChip
+          key={`${location.zone}-${formatAccelerators(location.accelerators)}-${location.useSpot}-${index}`}
+          location={location}
+        />
+      ))}
+    </div>
+  );
+}
+
 function PlacerStateCard({ state }) {
+  const [filters, setFilters] = useState({
+    provider: ALL_FILTER_VALUE,
+    region: ALL_FILTER_VALUE,
+    card: ALL_FILTER_VALUE,
+    availability: ALL_FILTER_VALUE,
+    maxPrice: '',
+  });
+  const locations = useMemo(() => state.locations || [], [state.locations]);
+  const optionValues = useMemo(() => {
+    const providers = new Set();
+    const regions = new Set();
+    const cards = new Set();
+    locations.forEach((location) => {
+      providers.add(location.cloud || 'Unknown');
+      regions.add(location.region || '-');
+      locationCards(location).forEach((card) => cards.add(card));
+    });
+    return {
+      providers: Array.from(providers).sort(),
+      regions: Array.from(regions).sort(),
+      cards: Array.from(cards).sort(),
+    };
+  }, [locations]);
+  const filteredLocations = useMemo(
+    () => filterPlacementLocations(locations, filters),
+    [locations, filters]
+  );
+  const groups = useMemo(
+    () => groupPlacementLocations(filteredLocations),
+    [filteredLocations]
+  );
+  const setFilter = (name, value) =>
+    setFilters((current) => ({ ...current, [name]: value }));
+  const hasActiveFilters =
+    filters.provider !== ALL_FILTER_VALUE ||
+    filters.region !== ALL_FILTER_VALUE ||
+    filters.card !== ALL_FILTER_VALUE ||
+    filters.availability !== ALL_FILTER_VALUE ||
+    filters.maxPrice !== '';
+
   return (
     <Card>
       <div className="border-b px-4 py-3">
         <h3 className="font-semibold">Service fallback locations</h3>
         <p className="mt-1 text-sm text-gray-500">
-          A benched location becomes eligible for one probe after the retry
-          window.
+          One row per provider and region. Hover a card for its zone, exact
+          availability, and next probe.
         </p>
       </div>
       {!state.available ? (
@@ -84,71 +341,132 @@ function PlacerStateCard({ state }) {
           No placement locations are configured.
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Provider</TableHead>
-                <TableHead>Region / zone</TableHead>
-                <TableHead>Shape</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Next probe</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {state.locations.map((location, index) => {
-                const status = locationDisplayStatus(location);
-                return (
-                  <TableRow
-                    key={`${location.cloud}-${location.region}-${location.zone}-${index}`}
-                  >
-                    <TableCell className="font-medium">
-                      {location.cloud}
-                    </TableCell>
-                    <TableCell>
-                      {location.region || '-'}
-                      {location.zone ? ` / ${location.zone}` : ''}
-                    </TableCell>
-                    <TableCell>
-                      {formatAccelerators(location.accelerators)} ·{' '}
-                      {location.useSpot ? 'Spot' : 'On-demand'}
-                    </TableCell>
-                    <TableCell>
-                      <StatusPill
-                        tone={
-                          status === 'Active'
-                            ? 'active'
-                            : status === 'Benched'
-                              ? 'error'
-                              : 'warning'
-                        }
-                      >
-                        {status}
-                      </StatusPill>
-                      <div className="mt-1 text-xs text-gray-500">
-                        Stored {location.storedStatus || '-'} · Effective{' '}
-                        {location.effectiveStatus || '-'}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {location.benchedAt ? (
-                        <>
-                          <div>Benched {timestamp(location.benchedAt)}</div>
-                          <div className="text-xs text-gray-500">
-                            Probe {timestamp(location.nextProbeAt)} (
-                            {relativeExpiry(location.nextProbeAt)})
-                          </div>
-                        </>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
+        <>
+          <div className="flex flex-wrap items-end gap-2 border-b bg-gray-50/50 px-4 py-3">
+            <FilterSelect
+              label="Provider"
+              value={filters.provider}
+              options={[
+                { value: ALL_FILTER_VALUE, label: 'All providers' },
+                ...optionValues.providers.map((provider) => ({
+                  value: provider,
+                  label: provider,
+                })),
+              ]}
+              onChange={(value) => setFilter('provider', value)}
+            />
+            <FilterSelect
+              label="Region"
+              value={filters.region}
+              options={[
+                { value: ALL_FILTER_VALUE, label: 'All regions' },
+                ...optionValues.regions.map((region) => ({
+                  value: region,
+                  label: region,
+                })),
+              ]}
+              onChange={(value) => setFilter('region', value)}
+            />
+            <FilterSelect
+              label="Card"
+              value={filters.card}
+              options={[
+                { value: ALL_FILTER_VALUE, label: 'All cards' },
+                ...optionValues.cards.map((card) => ({
+                  value: card,
+                  label: card,
+                })),
+              ]}
+              onChange={(value) => setFilter('card', value)}
+            />
+            <FilterSelect
+              label="Availability"
+              value={filters.availability}
+              options={[
+                { value: ALL_FILTER_VALUE, label: 'All availability' },
+                {
+                  value: LOCATION_AVAILABILITY.AVAILABLE_SPOT,
+                  label: 'Available spot',
+                },
+                {
+                  value: LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND,
+                  label: 'Available on-demand',
+                },
+                {
+                  value: LOCATION_AVAILABILITY.UNAVAILABLE,
+                  label: 'Unavailable',
+                },
+              ]}
+              onChange={(value) => setFilter('availability', value)}
+            />
+            <label className="w-36 text-xs font-medium text-gray-600">
+              <span className="mb-1 block">Maximum price</span>
+              <input
+                type="number"
+                min="0"
+                step="0.0001"
+                inputMode="decimal"
+                aria-label="Maximum price filter"
+                placeholder="$/hr"
+                value={filters.maxPrice}
+                onChange={(event) => setFilter('maxPrice', event.target.value)}
+                className="h-8 w-full rounded-md border border-gray-200 bg-white px-2 text-sm font-normal text-gray-800 focus:border-sky-blue focus:outline-none"
+              />
+            </label>
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={() =>
+                  setFilters({
+                    provider: ALL_FILTER_VALUE,
+                    region: ALL_FILTER_VALUE,
+                    card: ALL_FILTER_VALUE,
+                    availability: ALL_FILTER_VALUE,
+                    maxPrice: '',
+                  })
+                }
+                className="h-8 px-2 text-xs font-medium text-sky-blue hover:text-sky-blue-bright"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
+          {groups.length === 0 ? (
+            <div className="p-5 text-sm text-gray-500">
+              No placement locations match these filters.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-52">Provider / region</TableHead>
+                    <TableHead>Available</TableHead>
+                    <TableHead>Unavailable</TableHead>
                   </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </div>
+                </TableHeader>
+                <TableBody>
+                  {groups.map((group) => (
+                    <TableRow key={`${group.provider}-${group.region}`}>
+                      <TableCell>
+                        <div className="font-medium">{group.provider}</div>
+                        <div className="text-xs text-gray-500">
+                          {group.region}
+                        </div>
+                      </TableCell>
+                      <TableCell className="align-top">
+                        <LocationList locations={group.available} />
+                      </TableCell>
+                      <TableCell className="align-top">
+                        <LocationList locations={group.unavailable} />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </>
       )}
       {state.truncated && (
         <div className="border-t px-4 py-2 text-xs text-amber-700">
