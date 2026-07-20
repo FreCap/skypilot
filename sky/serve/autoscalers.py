@@ -2237,10 +2237,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
         scaling_decisions: list[AutoscalerDecision] = []
 
-        target_by_card = self.target_num_replicas_by_accelerator
-        use_card_targets = (bool(target_by_card) and
-                            self.num_overprovision is None and
-                            sum(target_by_card.values()) == target_num_replicas)
+        target_by_card, use_card_targets = (
+            self._actuation_target_by_accelerator(replica_infos))
         if use_card_targets:
             replicas_by_card: dict[str, list[replica_managers.ReplicaInfo]] = {}
             ready_by_card: dict[str, int] = {}
@@ -2348,6 +2346,56 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 cards.append(card)
                 seen.add(card.casefold())
         return cards
+
+    def _actuation_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> tuple[dict[str, int], bool]:
+        """Extend an exact QPS demand target with shaped overprovision."""
+        demand_target = self.target_num_replicas_by_accelerator
+        compatibility_complete = (self._compatibility_demand_complete or
+                                  not self.configured_accelerator_shapes)
+        if (not compatibility_complete or
+                sum(demand_target.values()) != self.target_num_replicas):
+            return {}, False
+        final_target = self.get_final_target_num_replicas()
+        if final_target == self.target_num_replicas:
+            return dict(demand_target), True
+
+        cards = self._configured_cards_from_profiles()
+        ready_zero_cost = {card: 0 for card in cards}
+        ready = {card: 0 for card in cards}
+        provisioning = {card: 0 for card in cards}
+        canonical_by_name = {card.casefold(): card for card in cards}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = canonical_by_name.get(raw_card.casefold())
+            if card is None:
+                continue
+            if info.is_ready:
+                ready[card] += 1
+                if bool(getattr(info, 'is_zero_cost', False)):
+                    ready_zero_cost[card] += 1
+            else:
+                provisioning[card] += 1
+        target = _allocate_compatibility_target(
+            configured_cards=cards,
+            capacities={card: 1.0 for card in cards},
+            floors={},
+            min_replicas=final_target,
+            max_replicas=final_target,
+            demand_profiles=[],
+            fixed_work_by_accelerator={
+                card: float(count) for card, count in demand_target.items()
+            },
+            ready_zero_cost=ready_zero_cost,
+            ready=ready,
+            provisioning=provisioning,
+            free_reserved=self.free_reserved_slots_by_accelerator,
+            cold_order=self._cold_paid_card_order(cards))
+        return target, sum(target.values()) == final_target
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
         """Order cold cards by live paid placement cost when available."""

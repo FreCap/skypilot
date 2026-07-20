@@ -1180,11 +1180,11 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
 class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     """Exact-card demand allocation and graceful transition behavior."""
 
-    def _spec(self, *, max_replicas=4, floors=None):
+    def _spec(self, *, max_replicas=4, floors=None, num_overprovision=None):
         return types.SimpleNamespace(min_replicas=0,
                                      min_replicas_by_accelerator=floors or {},
                                      max_replicas=max_replicas,
-                                     num_overprovision=None,
+                                     num_overprovision=num_overprovision,
                                      target_qps_per_replica={
                                          'L4': 1.0,
                                          'A100': 1.0,
@@ -1360,6 +1360,46 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         decisions = autoscaler._generate_scaling_decisions([])
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].target, {'accelerators': {'A100': 8}})
+
+    def test_num_overprovision_keeps_qps_scale_up_exactly_shaped(self):
+        autoscaler = self._autoscaler(max_replicas=2, num_overprovision=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.compatibility_profiles = self._profiles(50, ['A100'])
+        autoscaler._compatibility_demand_complete = True
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        decisions = autoscaler._generate_scaling_decisions([])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertCountEqual([decision.target for decision in decisions], [{
+            'accelerators': {
+                'A100': 1
+            }
+        }, {
+            'accelerators': {
+                'L4': 1
+            }
+        }])
+
+    def test_num_overprovision_qps_scale_down_preserves_card_floor(self):
+        autoscaler = self._autoscaler(max_replicas=2,
+                                      floors={'A100': 1},
+                                      num_overprovision=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler._compatibility_demand_complete = True
+        replicas = [
+            self._replica(1, 'A100'),
+            self._replica(2, 'L4'),
+            self._replica(3, 'L4'),
+        ]
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+
+        decisions = autoscaler._generate_scaling_decisions(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual([decision.target for decision in decisions], [3])
 
     def test_constrained_peer_gets_a100_and_flexible_peer_gets_l4(self):
         autoscaler = self._autoscaler(max_replicas=2)

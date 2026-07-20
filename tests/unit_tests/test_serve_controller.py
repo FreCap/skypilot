@@ -264,6 +264,16 @@ class TestGetRoutingSpec:
             'request_queue': None,
         }
 
+    def test_routing_spec_preserves_scalar_qps(self):
+        ctrl = _make_controller()
+        spec = _FakeSpec(load_balancing_policy='round_robin',
+                         target_qps_per_replica=2.5,
+                         lb_stream_timeout_seconds=30)
+
+        routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_qps_per_replica'] == 2.5
+
     def test_routing_spec_repeated_calls_do_not_hit_db(self):
         ctrl = _make_controller()
         ctrl._routing_spec = ctrl._build_routing_spec(  # pylint: disable=protected-access
@@ -436,13 +446,15 @@ class TestGetRoutingSpec:
         ctrl = _make_controller()
         assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
 
-    def test_apply_service_update_keeps_old_spec_until_runtime_transition(self):
+    @pytest.mark.parametrize('new_target_qps', [2.5, {'L4': 2.5}])
+    def test_apply_service_update_keeps_old_spec_until_runtime_transition(
+            self, new_target_qps):
         ctrl = _make_controller()
         old_spec = _FakeSpec(load_balancing_policy='round_robin',
                              target_qps_per_replica=None,
                              lb_stream_timeout_seconds=30)
         new_spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
-                             target_qps_per_replica={'L4': 2.5},
+                             target_qps_per_replica=new_target_qps,
                              lb_stream_timeout_seconds=90)
         ctrl._routing_spec = ctrl._build_routing_spec(old_spec)  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
@@ -500,9 +512,7 @@ class TestGetRoutingSpec:
         assert ctrl._applied_version == 2  # pylint: disable=protected-access
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
-            'target_qps_per_replica': {
-                'L4': 2.5
-            },
+            'target_qps_per_replica': new_target_qps,
             'target_concurrency_per_replica': None,
             'stream_timeout_seconds': 90,
             'retriable_status_codes': None,

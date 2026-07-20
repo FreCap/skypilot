@@ -2404,8 +2404,9 @@ class SkyServeController:
             # `load_balancing_policy` resolves None to the default policy
             # name, so the LB always receives a concrete policy to build.
             'load_balancing_policy_name': service_spec.load_balancing_policy,
-            'target_qps_per_replica':
-                (dict(target_qps) if target_qps is not None else None),
+            'target_qps_per_replica': (
+                dict(target_qps) if isinstance(target_qps, dict) else target_qps
+            ),
             # Lets an instance-aware LB weight replicas per-GPU when the
             # service sizes on concurrency (no QPS dict to weight by) --
             # and clear stale QPS weights after an update switches modes.
