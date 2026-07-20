@@ -1662,12 +1662,6 @@ class ReplicaManager:
                                          str | None] | None = None
         self._logical_reconcile_snapshot: LogicalReconcileSnapshot | None = (
             None)
-        # Exact capacity/occupancy evidence paired with _logical_target when
-        # that target is published. A later LB sync may advance the live
-        # snapshot while the autoscaler is waiting for the manager lock; keep
-        # the decision snapshot so a fresh rolling-drain selection is not
-        # erased before it can be persisted.
-        self._logical_target_snapshot: LogicalReconcileSnapshot | None = None
         self._logical_state_lock = threading.RLock()
         self._logical_controller_epoch = uuid.uuid4().hex
         # Degraded replacements are protected from recursively replacing one
@@ -1743,19 +1737,14 @@ class ReplicaManager:
         """Publish the target computed from an exact reconcile generation."""
         with self._logical_state_lock:
             self._logical_target = (version, generation, target_capacity)
-            snapshot = self._logical_reconcile_snapshot
-            self._logical_target_snapshot = (
-                snapshot
-                if snapshot is not None and snapshot.version == version and
-                snapshot.generation == generation else None)
 
-    def _logical_scale_up_fence_holds(
+    def _logical_target_fence_holds(
             self,
             version: int,
             decision_generation: int,
             target_capacity: int,
             require_exact_generation: bool = False) -> bool:
-        """Whether a logical scale-up intent is still authorized.
+        """Whether a logical target intent is still authorized.
 
         Capacity reports may advance while the autoscaler waits for the
         replica-manager lock on a large fleet. A newer snapshot is stronger
@@ -2578,6 +2567,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         prior_yaml_content: exact launch YAML of a recovery row. Recovery must
         not relabel or relaunch an old-version backend with the latest config.
+
+        logical_reconcile_fence_requires_exact_generation: keep bounded
+        unknown-capacity replacement tied to the exact outage observation.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -2835,7 +2827,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if logical_reconcile_fence is not None:
             fence_version, fence_generation, fence_target = (
                 logical_reconcile_fence)
-            if not self._logical_scale_up_fence_holds(
+            if not self._logical_target_fence_holds(
                     fence_version,
                     fence_generation,
                     fence_target,
@@ -2916,7 +2908,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if logical_reconcile_fence is not None:
                 fence_version, fence_generation, fence_target = (
                     logical_reconcile_fence)
-                if not self._logical_scale_up_fence_holds(
+                if not self._logical_target_fence_holds(
                         fence_version,
                         fence_generation,
                         fence_target,
@@ -3424,8 +3416,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale target sent to a physical '
                                'replica service.')
-        if not self._logical_scale_up_fence_holds(version, reconcile_generation,
-                                                  target_capacity):
+        if not self._logical_target_fence_holds(version, reconcile_generation,
+                                                target_capacity):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
@@ -3475,7 +3467,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name)
         used_replica_ids = {info.replica_id for info in existing_replica_infos}
 
-        def _committed_capacity() -> int:
+        def _committed_capacity(
+                capacity_snapshot: LogicalReconcileSnapshot) -> int:
             committed = 0
             for info in existing_replica_infos:
                 if info.is_terminal or info.version != version:
@@ -3488,10 +3481,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # A bounded degraded-recovery decision explicitly
                     # overlaps this uncertain backend without terminating it.
                     continue
-                observed = snapshot.observed_slots_by_replica_id.get(
+                observed = capacity_snapshot.observed_slots_by_replica_id.get(
                     info.replica_id)
-                if (info.is_ready and observed is not None and
-                        info.replica_id not in snapshot.unknown_replica_ids):
+                if (info.is_ready and observed is not None and info.replica_id
+                        not in capacity_snapshot.unknown_replica_ids):
                     if (observed <= 0 and getattr(
                             info, 'unknown_capacity_replacement', False)):
                         # A durably attributed replacement is the one bounded
@@ -3507,7 +3500,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     committed += planned
             return committed
 
-        committed = _committed_capacity()
+        committed = _committed_capacity(snapshot)
         zero_cost_demand_budget = None
         if infos_by_service is not None:
             capacity_replica_infos = [
@@ -3517,14 +3510,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 existing_replica_infos, [None],
                 demand_count_override=target_capacity - committed,
                 capacity_replica_infos=capacity_replica_infos)
-        while committed < target_capacity:
-            if not self._logical_scale_up_fence_holds(
+        while True:
+            if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
                     target_capacity,
                     require_exact_generation=bool(replace_unknown_replica_ids)):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
+                break
+            current_snapshot = self._logical_reconcile_snapshot
+            assert current_snapshot is not None
+            committed = _committed_capacity(current_snapshot)
+            if committed >= target_capacity:
                 break
             before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
@@ -3544,8 +3542,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
-            persisted = existing_replica_infos[-1]
-            committed += int(getattr(persisted, 'planned_capacity', 1))
 
     def notify_version_pending(self, version: int) -> None:
         with self._logical_state_lock:
@@ -4867,31 +4863,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise RuntimeError('Logical scale-down sent to a physical '
                                'replica service.')
         with self._logical_state_lock:
-            snapshot = getattr(self, '_logical_target_snapshot', None)
-            if snapshot is None:
-                # Compatibility for lightweight embedders/tests that publish
-                # the exact current snapshot and target directly instead of
-                # calling publish_logical_target(). This fallback cannot revive
-                # an overwritten production decision because generations only
-                # increase.
-                current_snapshot = self._logical_reconcile_snapshot
-                if (current_snapshot is not None and
-                        current_snapshot.version == version and
-                        current_snapshot.generation == reconcile_generation):
-                    snapshot = current_snapshot
-            pending_version = getattr(self, '_pending_version', None)
-            if (snapshot is None or snapshot.version != version or
-                    snapshot.generation != reconcile_generation or
-                    not self._logical_snapshot_is_fresh(snapshot) or
-                    self.latest_version != version or
-                (pending_version is not None and pending_version > version) or
-                    self._logical_target != (version, reconcile_generation,
-                                             target_capacity)):
+            if not self._logical_target_fence_holds(
+                    version, reconcile_generation, target_capacity):
                 logger.info(
                     'Discarding stale logical scale-down batch for version '
                     f'{version}, generation {reconcile_generation}, target '
                     f'{target_capacity} with {len(replica_ids)} victim(s).')
                 return
+            snapshot = self._logical_reconcile_snapshot
+            assert snapshot is not None
 
             # This is the only fleet read for the whole wave. Resolve victims
             # from the same durable snapshot used for capacity accounting so a
@@ -5698,7 +5678,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         return urls
 
     @with_lock
-    def _probe_all_replicas(self) -> None:
+    def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Readiness probe replicas.
 
         This function will probe all replicas to make sure the service is
@@ -5706,6 +5686,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             (1) the initial delay for each replica;
             (2) the start of the current consecutive-failure window.
         The replica will be terminated if any of the thresholds exceeded.
+
+        Returns:
+            The end-of-round fleet snapshot: every replica row as of the end
+            of this probe round, with rows mutated by teardown/preemption
+            re-read from the DB. Callers can derive the service status from
+            it without re-deserializing the whole fleet.
         """
         # Reset the per-tick spec memo so this probe round reads each version's
         # spec from the DB at most once and never reuses a spec across ticks.
@@ -5718,7 +5704,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if info.status_property.should_track_service_status()
         ]
         if not infos_to_probe:
-            return
+            return infos
         if not self._is_pool:
             versions = {info.version for info in infos_to_probe}
             specs = {
@@ -5811,6 +5797,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             pending_writes: list[tuple[int, ReplicaInfo]] = []
             replicas_to_teardown: list[int] = []
+            preempted_replica_ids: set[int] = set()
             for future_result in probe_results:
                 info, probe_succeeded, probe_time = future_result
                 info.status_property.service_ready_now = probe_succeeded
@@ -5840,6 +5827,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # preemptive marking + teardown).
                         is_preempted = self._handle_preemption(info)
                     if is_preempted:
+                        preempted_replica_ids.add(info.replica_id)
                         continue
 
                     if info.first_not_ready_time is None:
@@ -5899,14 +5887,39 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
 
+        # The round mutated (and persisted) the in-memory `infos` objects, so
+        # they ARE the fresh fleet state -- except the few rows the teardown
+        # paths rewrote through their own DB re-read (_terminate_replica /
+        # _handle_preemption). Re-read only those by id so the returned
+        # snapshot matches a post-round full read without re-deserializing
+        # the whole fleet (a second full unpickle per 10s round is a real
+        # cost at ~1k replicas).
+        mutated_ids = set(replicas_to_teardown) | preempted_replica_ids
+        if not mutated_ids:
+            return infos
+        refreshed = serve_state.get_replica_infos_from_ids(
+            self._service_name, sorted(mutated_ids))
+        snapshot = []
+        for info in infos:
+            if info.replica_id not in mutated_ids:
+                snapshot.append(info)
+                continue
+            refreshed_info = refreshed.get(info.replica_id)
+            # A missing row means the teardown path already removed the
+            # replica record; a post-round full read would not see it either.
+            if refreshed_info is not None:
+                snapshot.append(refreshed_info)
+        return snapshot
+
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
         while True:
             logger.debug('Running replica prober.')
             try:
-                self._probe_all_replicas()
-                replica_infos = serve_state.get_replica_infos(
-                    self._service_name)
+                # Reuse the probe round's end-of-round snapshot instead of
+                # re-reading (and re-deserializing) the whole fleet from the
+                # DB a second time per tick.
+                replica_infos = self._probe_all_replicas()
                 # TODO(zhwu): when there are multiple load balancers, we need
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.

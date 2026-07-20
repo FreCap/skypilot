@@ -348,6 +348,16 @@ def test_incomplete_demand_report_preserves_handoff_floor():
         malformed_queue_report)
 
 
+def test_demand_snapshot_preserves_real_load_balancer_timestamps():
+    snapshot = lb_ha.DemandSnapshot.from_request({
+        'request_aggregator': {
+            'timestamps': [10.25, 20.75],
+        },
+    })
+
+    assert snapshot.timestamps == (10.25, 20.75)
+
+
 def test_ha_kubernetes_contract_has_single_slot_selector_and_disruption_guard():
     service = lb_k8s._build_service_dict('service',
                                          'service-lb',

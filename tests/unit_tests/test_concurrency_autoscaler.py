@@ -612,6 +612,29 @@ class TestLogicalScalingWaves(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
         self.assertEqual(autoscaler.target_num_replicas, 50)
 
+    def test_downscale_target_does_not_rebound_while_retirement_lags(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=2 * interval,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 100)
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
+        # Actuation is asynchronous, so committed capacity can still report
+        # the pre-wave fleet on the next tick. That must not undo the adopted
+        # target while the retirement batch catches up.
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
     def test_arrival_floor_never_lowers_target(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
         autoscaler.target_num_replicas = 7
@@ -1465,6 +1488,50 @@ class TestUpdateVersion(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic([])
         self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
         self.assertEqual(autoscaler.target_num_replicas, 10)
+
+    def test_ramped_update_completes_ramp_to_raw_demand_target(self):
+        # A wave-limited rolling update must (a) bound the first wave
+        # instead of inheriting the old version's large target and
+        # (b) terminate: as committed capacity catches up each wave, the
+        # target strictly increases until it reaches the raw demand target.
+        ramp_kwargs = dict(knob=1.0,
+                           min_replicas=1,
+                           max_replicas=1000,
+                           replica_unit='logical',
+                           max_scale_up_rate_percentage=20,
+                           scale_up_rate_min_replicas=10,
+                           scale_up_rate_period_seconds=60)
+        autoscaler = _make_autoscaler(**ramp_kwargs)
+        autoscaler.target_num_replicas = 1000
+        autoscaler.update_version(2, _spec(**ramp_kwargs),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        now = 100.0
+        with mock.patch.object(autoscalers.time, 'time', return_value=now):
+            autoscaler._set_target_num_replicas_with_concurrency_logic([])
+        # First wave is bounded, not the inherited 1000.
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+
+        # Successive waves: commit the granted capacity, advance the wave
+        # timer, and recompute. 20% growth from 10 reaches 1000 within
+        # 22 waves (10, 20, ..., 50, then x1.2 per wave).
+        for _ in range(21):
+            previous_target = autoscaler.target_num_replicas
+            replicas = [
+                _replica(i + 1, version=2)
+                for i in range(autoscaler.target_num_replicas)
+            ]
+            _report(autoscaler, in_flight={}, queue_depth=1000)
+            now += 60.0
+            with mock.patch.object(autoscalers.time, 'time', return_value=now):
+                autoscaler._set_target_num_replicas_with_concurrency_logic(
+                    replicas)
+            self.assertGreater(autoscaler.target_num_replicas, previous_target)
+            if autoscaler.target_num_replicas == 1000:
+                break
+        self.assertEqual(autoscaler.target_num_replicas, 1000)
 
     def test_old_version_replicas_keep_their_launch_knob(self):
         # A knob-raising update must not inflate old replicas' capacity:
