@@ -59,6 +59,8 @@ class LogicalScaleDownTarget:
     reconcile_generation: int
     target_capacity: int
     replica_id: int
+    target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
+    accelerator_shapes: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass
@@ -945,6 +947,15 @@ class Autoscaler:
         del location
         return 1.0
 
+    def _cost_rebalance_location_is_compatible(
+        self,
+        incumbent: 'replica_managers.ReplicaInfo',
+        location: spot_placer.Location,
+    ) -> bool:
+        """Whether an economic replacement preserves autoscaler policy."""
+        del incumbent, location
+        return True
+
     def _get_hourly_cost_from_replica_info(
             self, replica_info: 'replica_managers.ReplicaInfo') -> float:
         """Resolve whole-replica hourly cost conservatively."""
@@ -1055,6 +1066,9 @@ class Autoscaler:
             if spot_placer.locations_match_placement(incumbent_location,
                                                      location):
                 continue
+            if not self._cost_rebalance_location_is_compatible(
+                    incumbent, location):
+                continue
             candidate_capacity = self._cost_rebalance_location_capacity(
                 location)
             if candidate_capacity + 1e-9 < incumbent_capacity:
@@ -1088,13 +1102,18 @@ class Autoscaler:
         decisions: list[AutoscalerDecision] = []
 
         # Existing pairs are completed even when a later update disables the
-        # policy.  In that case keep the incumbent and drain the replacement;
-        # otherwise wait for replacement readiness, then strictly drain the
-        # incumbent.  COST_REBALANCE means off-route now, terminate only after
-        # the LB proves zero occupancy.
+        # policy or changes the placement contract. In either case keep the
+        # incumbent and drain the replacement; otherwise wait for replacement
+        # readiness, then strictly drain the incumbent. COST_REBALANCE means
+        # off-route now, terminate only after the LB proves zero occupancy.
         for victim_id, replacement in sorted(pairs.items()):
             victim = by_id[victim_id]
-            if self.cost_rebalance:
+            replacement_location = replacement.get_spot_location()
+            replacement_preserves_policy = (
+                replacement_location is not None and
+                self._cost_rebalance_location_is_compatible(
+                    victim, replacement_location))
+            if self.cost_rebalance and replacement_preserves_policy:
                 if (replacement.is_ready and
                         getattr(victim.status_property, 'sky_down_status',
                                 None) is None):
@@ -1692,6 +1711,31 @@ class _GpuShapeResolverMixin:
             self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
                                                               gpu_count)
         return gpu_type, gpu_count
+
+    def _cost_rebalance_location_is_compatible(
+        self,
+        incumbent: 'replica_managers.ReplicaInfo',
+        location: spot_placer.Location,
+    ) -> bool:
+        """Keep authoritative exact-card targets stable during rebalancing."""
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        if not configured_shapes:
+            return True
+        canonical_by_name = {
+            card.casefold(): (card, count)
+            for card, count in configured_shapes.items()
+        }
+        incumbent_card, incumbent_count = (
+            self._get_gpu_shape_from_replica_info(incumbent))
+        candidate_card, candidate_count = Autoscaler._location_gpu_shape(  # pylint: disable=protected-access
+            location)
+        configured = canonical_by_name.get(candidate_card.casefold())
+        if configured is None:
+            return False
+        canonical_card, configured_count = configured
+        return (incumbent_card.casefold() == canonical_card.casefold() and
+                incumbent_count == configured_count and
+                candidate_count == configured_count)
 
 
 def _allocate_compatibility_target(
@@ -2976,7 +3020,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # one-wave replacement incident state.
         self._degraded_capacity_since_by_replica_id: dict[int, float] = {}
         self._logical_state_lock = threading.RLock()
-        self._last_logical_target_state: tuple[int, int, int] | None = None
+        self._last_logical_target_state: (
+            tuple[int, int, int] |
+            tuple[int, int, int, tuple[tuple[str, int], ...],
+                  tuple[tuple[str, int], ...]] | None) = None
         self._gpu_shape_cache: dict[int, tuple[str, int]] = {}
         # Backs the cost-descending victim tiebreak (shed paid spot
         # before zero-cost reserved capacity); pruned with the shape
@@ -3198,7 +3245,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return self._reconcile_generation
 
     @property
-    def logical_target_state(self) -> tuple[int, int, int] | None:
+    def logical_target_state(
+        self,
+    ) -> (tuple[int, int, int] | tuple[int, int, int, tuple[tuple[
+            str, int], ...], tuple[tuple[str, int], ...]] | None):
         """Version, report generation, and target from the last full tick."""
         with self._logical_state_lock:
             return self._last_logical_target_state
@@ -4306,9 +4356,27 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 return decisions
             fenced: list[AutoscalerDecision] = []
             target = self.get_final_target_num_replicas()
-            self._last_logical_target_state = (self.latest_version,
-                                               self._reconcile_generation,
-                                               target)
+            target_by_card, use_card_targets = (
+                self._actuation_target_by_accelerator(replica_infos))
+            target_by_card_state = (tuple(target_by_card.items())
+                                    if use_card_targets else ())
+            shape_state = (tuple(self.configured_accelerator_shapes.items())
+                           if use_card_targets else ())
+            if self.configured_accelerator_shapes and not use_card_targets:
+                # An authoritative exact-card catalog without a complete
+                # compatibility report cannot safely authorize aggregate-only
+                # retirement. None tells the controller to revoke any target
+                # published by an earlier complete generation.
+                self._last_logical_target_state = None
+            elif use_card_targets:
+                self._last_logical_target_state = (self.latest_version,
+                                                   self._reconcile_generation,
+                                                   target, target_by_card_state,
+                                                   shape_state)
+            else:
+                self._last_logical_target_state = (self.latest_version,
+                                                   self._reconcile_generation,
+                                                   target)
             for decision in decisions:
                 if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN
                         and isinstance(decision.target, int)):
@@ -4320,7 +4388,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             version=self.latest_version,
                             reconcile_generation=self._reconcile_generation,
                             target_capacity=target,
-                            replica_id=decision.target),
+                            replica_id=decision.target,
+                            target_capacity_by_accelerator=(
+                                target_by_card_state),
+                            accelerator_shapes=shape_state),
                         reason=decision.reason)
                 fenced.append(decision)
             return fenced
@@ -4873,7 +4944,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         version=self.latest_version,
                         reconcile_generation=self._reconcile_generation,
                         target_capacity=target,
-                        replica_id=info.replica_id)))
+                        replica_id=info.replica_id,
+                        target_capacity_by_accelerator=(tuple(
+                            target_by_card.items()) if use_card_targets else
+                                                        ()),
+                        accelerator_shapes=(tuple(
+                            self.configured_accelerator_shapes.items())
+                                            if use_card_targets else ()))))
         return decisions
 
     def _select_victims_capacity_and_cost_aware(

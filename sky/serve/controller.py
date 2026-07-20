@@ -2954,6 +2954,12 @@ class SkyServeController:
                     if target_state is not None:
                         self._replica_manager.publish_logical_target(
                             *target_state)
+                    elif decision_autoscaler.configured_accelerator_shapes:
+                        # Exact-card retirement must fail closed while the LB
+                        # compatibility report is incomplete. Explicitly
+                        # revoke an earlier generation as well as suppressing
+                        # this tick's aggregate-only intent.
+                        self._replica_manager.invalidate_logical_target()
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -2984,6 +2990,14 @@ class SkyServeController:
                     if not pending_logical_scale_down:  # noqa: B023
                         return
                     first = pending_logical_scale_down[0]  # noqa: B023
+                    exact_target_kwargs: dict[str, Any] = {}
+                    if (first.target_capacity_by_accelerator or
+                            first.accelerator_shapes):
+                        exact_target_kwargs = {
+                            'target_capacity_by_accelerator':
+                                first.target_capacity_by_accelerator,
+                            'accelerator_shapes': first.accelerator_shapes,
+                        }
                     self._replica_manager.scale_down_logically_batch(
                         [
                             target.replica_id for target in  # noqa: B023
@@ -2991,7 +3005,8 @@ class SkyServeController:
                         ],  # noqa: B023
                         first.target_capacity,
                         first.version,
-                        first.reconcile_generation)
+                        first.reconcile_generation,
+                        **exact_target_kwargs)
                     pending_logical_scale_down.clear()  # noqa: B023
 
                 for scaling_option in scaling_options:
@@ -3035,10 +3050,16 @@ class SkyServeController:
                                 if ((logical_scale_down_target.version,
                                      logical_scale_down_target.
                                      reconcile_generation,
-                                     logical_scale_down_target.target_capacity)
-                                        != (first.version,
-                                            first.reconcile_generation,
-                                            first.target_capacity)):
+                                     logical_scale_down_target.target_capacity,
+                                     logical_scale_down_target.
+                                     target_capacity_by_accelerator,
+                                     logical_scale_down_target.
+                                     accelerator_shapes) != (
+                                         first.version,
+                                         first.reconcile_generation,
+                                         first.target_capacity,
+                                         first.target_capacity_by_accelerator,
+                                         first.accelerator_shapes)):
                                     _flush_logical_scale_down()
                             pending_logical_scale_down.append(
                                 logical_scale_down_target)

@@ -1561,6 +1561,37 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
 
+    def test_incomplete_exact_logical_tick_revokes_prior_target(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)
+        decision_autoscaler.latest_version = 1
+        decision_autoscaler.replica_unit = 'logical'
+        decision_autoscaler.logical_target_state = None
+        decision_autoscaler.configured_accelerator_shapes = {
+            'L4': 1,
+            'A100': 1,
+        }
+        decision_autoscaler.generate_scaling_decisions.return_value = []
+        decision_autoscaler.get_decision_interval.return_value = 0
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.invalidate_logical_target.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
         decision_autoscaler = mock.Mock()

@@ -458,6 +458,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(len(downs), 1)
         self.assertIsInstance(downs[0], autoscalers.LogicalScaleDownTarget)
         self.assertEqual(downs[0].replica_id, 1)
+        self.assertEqual(downs[0].target_capacity_by_accelerator, ())
+        self.assertEqual(downs[0].accelerator_shapes, (('L4', 1), ('A100', 1)))
 
     def test_physical_card_migration_drains_zero_target_card_when_ready(self):
         autoscaler = _make_autoscaler(max_replicas=2)
@@ -1300,6 +1302,32 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
         _decisions(autoscaler, [])
         self.assertEqual(autoscaler.logical_target_state, (1, 5, 9))
 
+    def test_incomplete_exact_report_revokes_logical_target(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=30,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=4)
+        _decisions(autoscaler, [])
+        self.assertIsNotNone(autoscaler.logical_target_state)
+
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=False,
+                generation=5)
+        _decisions(autoscaler, [])
+
+        self.assertIsNone(autoscaler.logical_target_state)
+
     def test_existing_eight_slot_backend_emits_one_capacity_target(self):
         autoscaler = _make_autoscaler(knob=1,
                                       max_replicas=30,
@@ -1393,6 +1421,48 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                                                reconcile_generation=7,
                                                target_capacity=8,
                                                replica_id=1))
+
+    def test_cost_rebalance_cross_card_pair_retires_replacement(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      min_replicas=1,
+                                      max_replicas=2,
+                                      min_replicas_by_accelerator={'A100': 1},
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.cost_rebalance = True
+        victim = _replica(1, card='A100', planned_capacity=1)
+        replacement = _replica(2, card='L4', planned_capacity=1)
+        victim.get_spot_location.return_value = types.SimpleNamespace(
+            accelerators={'A100': 1})
+        replacement.get_spot_location.return_value = types.SimpleNamespace(
+            accelerators={'L4': 1})
+        replacement.cost_rebalance_for_replica_id = 1
+        victim.status_property.sky_down_status = None
+        replacement.status_property.sky_down_status = None
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=8)
+
+        decisions = _decisions(autoscaler, [victim, replacement])
+        rebalance_downs = [
+            decision for decision in decisions if decision.reason ==
+            autoscalers.AutoscalerDecisionReason.COST_REBALANCE
+        ]
+        self.assertEqual(len(rebalance_downs), 1)
+        self.assertEqual(rebalance_downs[0].target.replica_id, 2)
+        self.assertEqual(
+            dict(rebalance_downs[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
 
     def test_capacities_eight_and_four_are_stable_at_target_nine(self):
         autoscaler = _make_autoscaler(knob=1,

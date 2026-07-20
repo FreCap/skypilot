@@ -210,6 +210,58 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]
 
+    def test_exact_card_catalog_blocks_cross_card_replacement(self):
+        scaler = _autoscaler()
+        scaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        placer, _, _, replicas = self._fleet(candidate_cost=0.0)
+        scaler.set_spot_placer(placer)
+        _report(scaler, replicas)
+
+        assert not [
+            decision for decision in _decisions(scaler, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
+
+    def test_exact_card_catalog_allows_same_card_replacement(self):
+        scaler = _autoscaler()
+        scaler.set_configured_accelerator_shapes({'L4': 1})
+        paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+        cheap = make_location('research',
+                              accelerators={'L4': 1},
+                              use_spot=False)
+        scaler.set_spot_placer(make_placer({paid: 1.0, cheap: 0.0}))
+        replicas = [_Replica(1, paid, 1.0), _Replica(2, paid, 1.0)]
+        _report(scaler, replicas)
+
+        launches = [
+            decision for decision in _decisions(scaler, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
+        assert len(launches) == 1
+        assert launches[0].target['region'] == cheap.region
+
+    def test_persisted_cross_card_pair_keeps_incumbent(self):
+        scaler = _autoscaler()
+        scaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+        cheap = make_location('research',
+                              accelerators={'A100': 1},
+                              use_spot=False)
+        scaler.set_spot_placer(make_placer({paid: 1.0, cheap: 0.0}))
+        victim = _Replica(1, paid, 1.0)
+        peer = _Replica(2, paid, 1.0)
+        replacement = _Replica(3, cheap, 0.0, replacement_for=1)
+        replicas = [victim, peer, replacement]
+        _report(scaler, replicas)
+
+        strict = [
+            decision for decision in _decisions(scaler, replicas)
+            if decision.reason ==
+            autoscalers.AutoscalerDecisionReason.COST_REBALANCE
+        ]
+        assert [(decision.operator, decision.target) for decision in strict
+               ] == [(autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 3)]
+
     def test_stabilization_requires_continuous_eligibility(self, monkeypatch):
         now = [100.0]
         monkeypatch.setattr(autoscalers.time, 'monotonic', lambda: now[0])

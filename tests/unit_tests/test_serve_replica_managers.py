@@ -2967,7 +2967,8 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 7, 9)
+        mgr.publish_logical_target(1, 7, 9, (('L4', 1), ('A100', 8)),
+                                   (('L4', 1), ('A100', 8)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         overrides = []
 
@@ -4380,6 +4381,123 @@ class TestLogicalCapacityPlanning:
         defer.assert_called_once_with(2,
                                       logical_retirement=(1, 3, 8),
                                       replica_info=four)
+
+    def test_manager_rejects_same_total_wrong_card_retirement(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        l4 = self._ready_backend(1, 1)
+        a100 = self._ready_backend(2, 1)
+        l4.resources_override = {'accelerators': {'L4': 1}}
+        a100.resources_override = {'accelerators': {'A100': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={
+                    1: 1,
+                    2: 1,
+                },
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        target_by_card = (('L4', 1),)
+        shapes = (('L4', 1), ('A100', 1))
+        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[l4, a100]):
+            mgr.scale_down_logically(1, 1, 1, 3, target_by_card, shapes)
+
+        defer.assert_not_called()
+
+    def test_manager_accepts_exact_card_zero_target_retirement(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        l4 = self._ready_backend(1, 1)
+        l4.resources_override = {'accelerators': {'L4': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={1: 1},
+                in_flight_by_replica_id={1: 0},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        shapes = (('L4', 1), ('A100', 1))
+        mgr._logical_target = (1, 3, 0, (), shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[l4]):
+            mgr.scale_down_logically(1, 0, 1, 3, (), shapes)
+
+        defer.assert_called_once_with(1,
+                                      logical_retirement=(1, 3, 0),
+                                      replica_info=l4)
+
+    def test_manager_retires_old_card_removed_from_exact_catalog(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        old_a100 = self._ready_backend(1, 1)
+        old_a100.version = 0
+        old_a100.resources_override = {'accelerators': {'A100': 1}}
+        h100 = self._ready_backend(2, 1)
+        h100.resources_override = {'accelerators': {'H100': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={
+                    1: 1,
+                    2: 1,
+                },
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        target_by_card = (('H100', 1),)
+        shapes = (('H100', 1),)
+        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[old_a100, h100]):
+            mgr.scale_down_logically(1, 1, 1, 3, target_by_card, shapes)
+
+        defer.assert_called_once_with(1,
+                                      logical_retirement=(1, 3, 1),
+                                      replica_info=old_a100)
+
+    def test_invalidate_logical_target_blocks_recovery_adoption(self):
+        retiring = self._recoverable_logical_retirement(1)
+        survivor = self._ready_backend(2, 1)
+        retiring.resources_override = {'accelerators': {'L4': 1}}
+        survivor.resources_override = {'accelerators': {'A100': 1}}
+        mgr = self._logical_recovery_manager([retiring], survivor)
+        mgr._logical_target = (1, 5, 1, (('L4', 1),), (('L4', 1), ('A100', 1)))
+
+        mgr.invalidate_logical_target()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        mgr._persist_replica.assert_not_called()
+        assert retiring.status_property.logical_retirement_controller_epoch == (
+            'old-controller-epoch')
+        assert 1 in mgr._recovering_logical_retirement_ids
 
     @pytest.mark.parametrize('victim_still_present', [True, False])
     def test_logical_retirement_uses_one_fleet_snapshot(self,

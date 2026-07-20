@@ -156,6 +156,12 @@ service:
 - `demand_target_by_accelerator` includes the hard per-card floor and its entries sum to the existing aggregate `target_num_replicas`.
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
+- Economic cost rebalancing may move a replica to a cheaper provider, region,
+  or cluster only when the replacement preserves the same exact accelerator ID
+  and the service's configured GPU-count shape. Generic services without an
+  authoritative exact-card catalog retain legacy cross-card rebalancing. A
+  persisted replacement pair that no longer matches the active catalog is
+  unwound by retaining the incumbent and gracefully retiring the replacement.
 - For this first version, require one GPU-count shape per exact accelerator ID in a multi-card service. Reject ambiguous configurations such as both `A100:1` and `A100:8` under one `A100` floor until the public identity is extended to an exact card-plus-count shape.
 - Exact-card compatibility and per-card floors support either dict
   `target_qps_per_replica` or `target_concurrency_per_replica`, and require
@@ -318,10 +324,18 @@ SkyPilot changes:
 - Update autoscaler decisions to carry exact accelerator resource overrides on ordinary demand scale-up, not only reserved-fill scale-up.
 - Make scale-down exact-card-aware and enforce both aggregate and per-card hard floors under the existing graceful delays.
 - Carry the per-card logical target through `LogicalScaleTarget` and the
-  replica-manager reconciliation fence. Logical placement may pack several
-  slots into one compatible physical backend, but it must not satisfy one
-  card's shortfall with another card. Logical retirement must prove both the
-  aggregate target and every exact-card target remain covered.
+  controller publication, `LogicalScaleDownTarget`, and replica-manager
+  reconciliation fence. Logical placement may pack several slots into one
+  compatible physical backend, but it must not satisfy one card's shortfall
+  with another card. Logical retirement, including controller-restart and HA
+  recovery, must prove both the aggregate target and every exact-card target
+  remain covered by ready or durably committed capacity. When an exact-card
+  catalog exists but the compatibility report is incomplete, the controller
+  explicitly revokes retirement authority, so an aggregate target or an older
+  exact target cannot authorize adoption or teardown. During a catalog-
+  changing rollout, an old-version card removed from the new catalog may
+  retire once aggregate capacity and every new exact-card target remain
+  covered; it does not have to masquerade as a current compatible card.
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
 - Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
