@@ -1,4574 +1,605 @@
-# SkyPilot Managed Container Image Distribution
+# Managed container image distribution
 
-_Created: 2026-07-13_
+Status: accepted reshape, implementation in progress
 
-_Reshaped: 2026-07-14; PostgreSQL-only persistence correction: 2026-07-17;
-product, dashboard, lifecycle, and infrastructure reshape: 2026-07-19;
-cross-system contract correction: 2026-07-20_
+Owner: SkyPilot control plane
 
-_Status: distribution implementation in progress; builder productization is
-evidence-gated; final exact-head acceptance pending_
+Last updated: 2026-07-20
 
 ## Decision
 
-SkyPilot should expose an immutable container artifact abstraction, not a
-registry-copy abstraction. A user selects content with a digest, release, or
-artifact ID. A workspace distribution policy decides where that content is
-materialized. A concrete deployment pins one verified physical location and
-keeps a durable reference to it.
+SkyPilot will provide a small, portable image-distribution control plane built
+on standard OCI registries. An image is identified by an immutable digest. An
+explicit publication operation adopts that digest, prepares one canonical
+registry location asynchronously, and makes an optional human-readable release
+visible only after the canonical location is verified READY. Workload
+deployment consumes published identity and may request one placement-specific
+cache intent. Deployment never discovers a mutable tag, registers a source, or
+publishes a release.
 
-This mirrors the useful part of Modal's model:
+The first managed provider is AWS ECR. GCP, Kubernetes, Nebius, and other
+providers use externally provisioned OCI profiles until their own managed
+adapter, infrastructure, IAM, and negative tests qualify. Cloudflare R2 and
+other S3-compatible object stores may hold build contexts, logs, attestations,
+or model artifacts, but are not represented as OCI registries.
 
-- the declared image produces immutable content identity;
-- content identity is independent from deployment names and infrastructure;
-- preparation is content-addressed and idempotent;
-- a deployment records a stable version rather than following a mutable tag;
-- caches are populated lazily at a real placement boundary;
-- build or copy work is isolated from request-serving workers.
+This is intentionally not a clone of Modal's runtime. Modal controls a global
+content-addressed filesystem, lazy loading, and snapshot mechanisms. Portable
+SkyPilot v0 provides safer immutable publication, placement-aware caching, and
+operational automation. It makes a cold-start performance claim only after a
+representative fleet benchmark proves one.
 
-Modal's named-image interface sharpens one more boundary that SkyPilot should
-copy: image publication is independent from latency-sensitive compute startup.
-Publishing a named Modal Image completes before callers adopt it, and an
-already deployed Function does not change until it is redeployed. SkyPilot's
-portable equivalent separates source registration from release publication.
-`register` records immutable content and queues canonical preparation.
-`publish` reserves a release, but exposes that release to deployment only when
-the canonical digest is verified READY. An independent `prepare` operation
-warms selected placement caches. A task resolving an existing release never
-discovers source content, initiates a build, or observes a half-published name.
+## Why this is worth building
 
-SkyPilot must remain honest about the runtime difference. Modal controls its
-container runtime and can use lazy filesystems, memory snapshots, and a global
-execution fabric. SkyPilot spans ordinary Docker, containerd, VMs, and many
-Kubernetes clusters. The initial implementation therefore publishes normal
-OCI manifests and layers to registries near the selected compute. It does not
-claim to provide lazy layer loading or memory snapshots.
+Large services currently pay repeatedly for cross-region pulls and ad hoc image
+preparation. Operators cannot tell whether a digest is ready in a target region,
+which identity may copy or delete it, or which deployment still references it.
+The smallest useful product centralizes those answers while leaving bytes in
+ordinary registries:
 
-## Product outcome and release boundaries
+1. publish one exact digest before deployment;
+2. materialize only observed or explicitly requested locations;
+3. keep copy work off API and placement workers;
+4. pin one verified location into each durable deployment;
+5. make warming, failure, retry, and worker readiness visible; and
+6. evict only unreferenced regional cache manifests with a separate identity.
 
-This is a permanent control-plane product, so its data-plane components are
-independently deployable after additive API/schema expansion and earn
-production support separately. One PR may implement more
-than one slice, but a passing slice cannot conceal an unfinished one:
+The honest baseline remains CI-built digest-pinned images in an existing
+registry. A managed profile must beat that baseline in either measured startup
+performance or operator effort before activation.
 
-1. **Catalog foundation:** immutable identity, PostgreSQL state, placement
-   validation, durable references, and provider-neutral copy state.
-2. **AWS distribution slice:** one end-to-end ECR adapter, independently
-   deployed copy and lifecycle workers with separate identities, AWS bootstrap
-   modules, manual lifecycle controls, and restart/rollback evidence.
-3. **Images product surface:** direct bounded read APIs and the complete
-   dashboard catalog/detail/actions experience. This is useful with external
-   profiles as well as the managed AWS slice.
-4. **Managed-builder prototype:** a separate major feature and design, linked
-   below. Its first deliverable is a narrow, non-public prototype that reuses
-   catalog identity but creates no central migration, task syntax, durable
-   controller, or dashboard Build action. Durable productization follows only
-   after the representative-workload worth and executor-feasibility gates pass.
-5. **Provider extensions:** GAR, Nebius or generic OCI, and an experimental
-   Cloudflare-backed OCI registry qualify independently. Raw R2 is never a
-   registry.
+## Release boundaries
 
-The first production claim is deliberately narrower than the complete schema:
-an immutable catalog plus externally provisioned profiles and one managed AWS
-ECR path. Other provider adapters remain external-only until their own
-provisioning, authentication, ownership, deletion, and integration tests pass.
+### V0
 
-Before converting a large fleet, benchmark three paths with the same digest,
-instance types, regions, and cold node caches: direct cross-region pull, an
-operator-prewarmed digest, and managed on-demand preparation. At 100, 500, and
-1,000 replicas, record image-ready p50/p95/p99, total rollout time, bytes sent
-across regions, registry throttles, pull failures, API admission latency, copy
-jobs, and operator actions. Every activation mode requires:
+V0 contains:
 
-- it creates at most one successful materialization per requested physical
-  target rather than per replica;
-- placement admission adds no provider call and no more than 250 ms p95 over
-  the digest-pinned control;
-- registry throttles plus terminal pull failures stay below 0.1%; and
-- publication plus one prepare command replaces per-region image-copy
-  scripting without weakening exact-digest or rollback guarantees.
+- digest-only source adoption and immutable release publication;
+- account-level default profiles and workspace policy/allowlists;
+- asynchronous canonical and just-in-time regional materialization;
+- one managed AWS ECR adapter and externally provisioned generic profiles;
+- fixed, Terraform-created AWS repository shards;
+- separate API, copy-worker, lifecycle-worker, and workload identities;
+- durable deployment references and reference-aware regional eviction;
+- node-scoped image resolution for multi-GPU and multi-node workloads;
+- bounded paginated APIs and a complete operational Images UI;
+- copy and lifecycle worker Helm deployments, health, metrics, and recovery;
+- PostgreSQL-only central image state; and
+- fleet measurements as an activation gate, not a merge prerequisite.
 
-The **performance mode** additionally requires image-ready p95 at least 40%
-below direct cross-region pulls and within 10% of explicit prewarming. It may be
-described as a cold-start improvement.
+### Explicit post-v0 seams
 
-The **operations mode** makes no speed claim. Against a written baseline it
-must remove every per-region copy command after one publish/prepare action,
-reduce rollout operator steps by at least 75%, complete three injected
-copy/verification/restart recoveries without manual registry mutation, cut
-median recovery time by at least 50% and below 15 minutes, and send no more than
-5% additional cross-region bytes versus explicit prewarming. It may be
-described only as safer automation and observability.
+The design preserves interfaces for, but v0 does not productize:
 
-If the managed path passes neither mode, the distribution worker is not enabled
-for that fleet. These are activation gates, not claims inferred from unit tests.
+- a managed builder with content-addressed layer cache and late-bound source;
+- R2-backed build contexts, logs, attestations, and model objects;
+- credential-aware mutable-tag resolution in an isolated metadata worker;
+- managed GAR, Nebius, or other provider provisioning;
+- mutable named channels with one generationed deployment snapshot;
+- repository-generation expansion beyond the fixed Terraform layout;
+- OCI indexes and additional architectures selected from declared targets;
+- lazy snapshotter integrations and a separate model-data plane; and
+- memory or GPU snapshots.
 
-## PostgreSQL persistence and migration posture
+The linked
+[`managed-container-image-builder.md`](managed-container-image-builder.md)
+owns the builder seam. It may produce only the READY artifact contract defined
+here.
 
-Managed image catalog, queue, lease, and durable-reference state belongs to the
-central API-server database and is PostgreSQL-only. Local request, controller,
-or skylet databases that still officially use SQLite are separate components
-and remain unchanged. Every managed-image state entry point fails closed when
-its catalog engine is not PostgreSQL, and managed-image correctness tests use a
-real PostgreSQL server.
+### Not part of this product
 
-There is no deployed legacy managed-image schema to correct. At this design
-freeze, pull request 368 is open, has no merge commit, migration 023 exists
-only on its feature branch, and the base branch contains no
-`023_container_images.py`. The branch must not be deployed before this final
-schema lands. If that evidence changes, merge is blocked and a separate
-evidence-backed corrective migration must be designed; this document does not
-pretend an unshipped schema is already immutable.
+- raw R2 bucket references as runtime images;
+- eager copy to every configured region;
+- transparent mid-pull registry failover;
+- build inference from arbitrary task `setup` commands;
+- one image pull or copy per GPU process;
+- speculative ARM64 or GPU-specific builds;
+- browser-executed Terraform;
+- an internal proprietary registry; or
+- claims of Modal-style lazy startup on an ordinary OCI runtime.
 
-Migration 023 is therefore rewritten now and frozen at merge. It uses literal
-Alembic `op.create_table`, constraint, and index operations rather than
-`create_all()` against live SQLAlchemy metadata. It owns exactly these durable
-distribution tables:
+## Terminology and ownership
+
+| Concept | Meaning | Owner |
+| --- | --- | --- |
+| Artifact | Workspace-scoped immutable OCI digest | catalog repository |
+| Source | Exact digest-pinned OCI reference used to import an artifact | publication service |
+| Publication | Requested adoption and optional release reservation | publication service |
+| Release | Human-readable immutable alias visible only after verification | publication service |
+| Profile | Complete registry topology and policy snapshot | server configuration |
+| Location | One digest in one physical registry target | materialization service |
+| Pull plan | Secret-free, placement-specific READY location snapshot | runtime resolver |
+| Reference | Durable consumer fence preventing location eviction | reference service |
+| Copy worker | Claims copy/verify work and can write manifests | materialization worker |
+| Lifecycle worker | Claims eligible regional eviction work and can delete manifests | lifecycle worker |
+
+The implementation is split along those boundaries:
+
+```text
+sky/container_images/
+  models.py                 value objects and validators
+  config.py                 profile and workspace policy snapshots
+  catalog_state.py          artifact, source, publication, release persistence
+  materialization_state.py  location, lease, verification, and retry persistence
+  reference_state.py        durable consumer references and eviction eligibility
+  publication.py            explicit publication service
+  runtime.py                read-only workload resolution and warming dependency
+  providers.py              portable adapter contracts
+  aws.py                    qualified ECR adapter
+  copy_worker_service.py    independently deployed copy loop
+  lifecycle_worker_service.py independently deployed deletion loop
+  api.py                    typed direct reads and asynchronous mutations
+  state.py                  temporary compatibility facade only
+```
+
+Business services never issue raw SQL outside the repository module they own.
+Provider adapters do no catalog writes. API handlers create intent or project
+state, but never copy or delete content.
+
+## User interface
+
+### Workload YAML
+
+The public field is `resources.container_image`. A scalar is the direct OCI
+source form:
+
+```yaml
+resources:
+  container_image: ghcr.io/boltz-bio/boltz@sha256:<64-hex-digest>
+```
+
+The object form selects one immutable identity and optionally a distribution:
+
+```yaml
+resources:
+  container_image:
+    release: boltz-2.4.1
+    distribution: gpu-production
+```
+
+Supported keys are exactly:
+
+- `ref`: one digest-pinned OCI reference;
+- `release`: one immutable workspace release;
+- `artifact_id`: one SkyPilot artifact UUID; and
+- `distribution`: one configured profile or the explicit `direct` escape hatch.
+
+`artifact_id` is exclusive with `ref` and `release`. `ref` and `release` may be
+combined only to prove that an already published release has the expected
+source. A task cannot create that release. The unreleased `profile` and
+`version` aliases are removed.
+
+The legacy `image_id: docker:...` form retains direct-pull behavior. It does not
+opt into managed distribution and is not silently reinterpreted by a server
+default.
+
+### CLI and SDK
+
+```text
+sky image publish SOURCE@sha256:DIGEST \
+    --release NAME --distribution PROFILE [--no-wait]
+sky image status [SELECTOR] [--workspace W]
+sky image prepare SELECTOR --distribution PROFILE --target TARGET... [--no-wait]
+sky image retry SELECTOR --distribution PROFILE --target TARGET [--no-wait]
+```
+
+`publish` is the only public source-adoption operation. There is no `register`
+alias. With `--no-wait`, it returns the asynchronous request and publication
+identifier immediately. Without it, the client waits for canonical verification
+and returns the public release. Request retry uses an idempotency key.
+
+`prepare` creates only the explicitly selected target intent. If the target
+depends on a canonical location that is not READY, it returns the canonical
+dependency and does not create a second intent in that call.
+
+### Defaults
+
+Selection precedence is:
+
+1. task `distribution`;
+2. workspace `container_images.default_profile`; and
+3. server `container_registries.default_profile`.
+
+Profiles are complete atomic objects. Workspace configuration may select a
+default, restrict `allowed_profiles`, and choose:
+
+- `managed_required`: unknown or unready managed identity waits or fails closed;
+- `managed_preferred`: an exact request-supplied digest may pull directly while
+  a known artifact location warms; or
+- absence of image policy: preserve direct behavior.
+
+Locality is `prefer`, `require`, or `canonical`. `direct` is allowed only as an
+explicit task choice under `managed_preferred`.
+
+## Publication contract
+
+Publication is independent of workload deployment.
+
+1. Validate a digest-pinned source, release, workspace, and complete active
+   profile before persistence.
+2. In one transaction, converge the artifact and source, reserve the release as
+   PENDING, and create or reuse one canonical location intent.
+3. A copy worker claims the canonical location with a random fenced lease,
+   obtains short-lived credentials, copies the exact digest, and verifies the
+   destination digest and OCI platform metadata.
+4. The completion transaction marks the location READY and changes matching
+   PENDING release reservations to READY. Only then can release lookup return
+   the artifact.
+5. A terminal pre-READY copy failure marks the reservation FAILED without
+   exposing the release. Retry returns the same reservation to PENDING.
+
+An existing READY release is immutable. A conflicting digest is rejected. A
+failed replacement never changes another release or any deployment already
+pinned to an older artifact.
+
+Mutable tags are rejected in v0. Documentation must not promise tag resolution.
+A later isolated resolver may accept a credential reference, resolve a tag to a
+digest, discard the credential, and submit the same publication transaction.
+
+## Deployment and warming contract
+
+Workload resolution is read-only with respect to artifacts, sources,
+publications, and releases.
+
+- An unknown `release` or `artifact_id` fails with `IMAGE_NOT_PUBLISHED`.
+- An unknown digest `ref` under `managed_required` fails with the same closed
+  error and points to `sky image publish`.
+- An unknown digest `ref` under `managed_preferred` may remain a direct pull. It
+  does not create catalog state.
+- A known artifact may create at most one missing location intent for the
+  selected placement in one resolution attempt.
+- Provider calls and OCI transfers occur only in workers.
+
+When `locality: require` has no READY local route, the resolver raises the typed
+`ContainerImageWarmingError`. It carries artifact, profile, target, location,
+and retry metadata but no credential or raw untrusted value. The provisioning
+loop treats it as a pending execution dependency with `no_failover=True`.
+SkyServe and managed jobs keep retrying the same selected placement. A normal
+launch uses the existing `--retry-until-up` behavior or reports the precise
+prepare command. The dashboard and cluster events say `IMAGE_WARMING`, not
+`resources unavailable`.
+
+With `managed_preferred` plus `locality: prefer`, the exact request-supplied
+digest can be used immediately if its pull authentication is valid for the
+placement. Release-only and artifact-only selectors never infer or expose a
+source fallback.
+
+The runtime commits a secret-free pull plan only after a READY route is selected.
+It rechecks profile revision, target fingerprint, digest, platform, auth strategy,
+and location state at the durable cluster commit. Restarts keep a still-valid
+plan or atomically replace it with another READY plan. They never persist a
+WARMING fallback as managed locality.
+
+## Multi-node, multi-GPU, and architecture behavior
+
+Image distribution is node-scoped. One EC2 instance with eight GPUs pulls one
+image through its container runtime cache. Starting one process per GPU is the
+workload or serving runtime's responsibility. Distribution does not multiply
+copy work by GPU count, replica process count, or task rank.
+
+A multi-node task stores one pull plan per placement shape, not per GPU. All
+nodes in that placement use the same digest. Kubernetes still creates pods
+normally and relies on node-level containerd caching.
+
+V0 supports only a single verified image manifest per publication. The worker
+records its nonempty OCI platform set. Placement fails closed when a known
+runtime architecture is not covered. Unknown architecture may use an artifact
+only when the cloud/backend binding declares a finite platform set and the
+artifact covers it. V0 does not build ARM64 speculatively. A later OCI-index
+feature must model parent and child manifest ownership before publication.
+
+## PostgreSQL data model
+
+Central image state is PostgreSQL-only. Local and controller databases retain
+their existing SQLite support.
+
+Migration 023 is a literal additive migration. It does not import live ORM
+metadata. It creates only:
 
 ```text
 container_image_catalog
-container_image_workspace_quotas
-container_image_profile_heads
 container_image_profile_revisions
-container_image_target_custodies
-container_image_realm_generations
-container_image_realm_allocations
-container_image_registry_limiters
-container_image_registry_permit_leases
 container_images
 container_image_sources
-container_image_publications
 container_image_releases
 container_image_locations
 container_image_references
-container_image_catalog_summaries
-container_image_catalog_facets
+container_image_workers
 ```
 
-The literal DDL includes every foreign key, named check, partial uniqueness
-constraint, queue/claim index, active-revision join index, and catalog-query
-index described below. The catalog singleton includes the nonnegative central
-config generation, 64-hex image-config digest, nullable single-global
-`active_image_config_apply_id`, and a bounded JSONB apply-result ledger used by
-the atomic activation protocol, plus checked non-releasable
-`lifetime_profile_name_count` from 0 through 1,024,
-`minimum_image_api_version` initialized to 62 and the monotonic
-`distribution_state_ever_created`/`builder_state_ever_created` booleans
-initialized FALSE. A named migration-023 trigger rejects either flag changing
-from TRUE to FALSE. The first durable distribution mutation sets the
-distribution flag while holding the phase-1 catalog lock; named BEFORE triggers
-on distribution-owned rows reject creation before that flag is TRUE. Every
-image read, mutation, worker claim, heartbeat, and finalizer takes the shared
-compatibility advisory transaction lock and checks the singleton fence before
-it can decode or write polymorphic location/provenance state. Each ledger entry
-contains a UUIDv7 idempotency key, request hash, proposed config generation and
-digest, changed profile keys, quiesce generations, deadline, closed
-`QUIESCING|COMMITTED|CANCELLED|TIMED_OUT` state, nullable committed generation
-and digest, nullable last-heartbeat time, and completion time. A database check
-caps it at 256 entries.
-Unexpired entries are never evicted, and a full ledger fails before mutation
-rather than weakening crash or lost-response recovery. Realm rows
-and allocations include the generation-qualified prefix fields and physical
-prefix uniqueness described below. The preexisting central `config_yaml` table
-is updated in the same transaction but is not recreated or counted as an image
-table. Migration 023 nevertheless owns one compatibility guard on that table.
-The migration Job first upgrades the separate config history through revision
-001, sets its version declaration, and takes `ACCESS EXCLUSIVE` on
-`config_yaml`; an old write either commits before this lock or begins after the
-guard exists, never across it. Before enabling the guard it inserts the
-mandatory `api_server_config` row with an empty mapping only when the row is
-absent. It then installs a named
-`trg_config_yaml_image_writer_fence` `BEFORE INSERT OR UPDATE OR DELETE`
-trigger, the `pol_config_yaml_image_reader_fence` forced-RLS policy, and the
-schema-qualified `container_image_require_api_62()`,
-`container_image_require_current_api()`, and
-`container_image_guard_config_write()` functions with pinned search paths. The
-trigger rejects every
-writer whose session API version is below the catalog's
-`minimum_image_api_version`, and it rejects deletion of the mandatory
-row. The RLS predicate raises, rather than filtering the row, when the session
-API version is absent, malformed, or below 62. `ENABLE ROW LEVEL SECURITY` plus
-`FORCE ROW LEVEL SECURITY` makes the predicate apply to the table owner too.
-Migration activation fails unless the effective application role is neither a
-superuser nor `BYPASSRLS`, the policy is forced, and the mandatory row is
-visible through a version-62 session.
-
-API 62 sets the transaction-independent custom PostgreSQL setting
-`skypilot.api_version=62` on every synchronous and asynchronous connection
-before its first application statement, including fresh connections after pool
-recycle. Alembic's separately constructed migration connection sets the same
-value at the start of 023 before it enables the guard. The setting is a
-compatibility declaration, not an authorization credential. API 61 and older
-binaries do not set it, so their mandatory startup/config-reload query raises at
-the database boundary and they cannot fall back to file configuration. The
-write trigger additionally fences an already-running old writer that was
-waiting on the config row.
-
-At revision 023 or later, every synchronous and asynchronous pool checkout runs
-a short transaction that takes the fixed shared compatibility advisory lock and
-calls `container_image_require_current_api()`. Every image read transaction,
-mutation, queue claim, heartbeat, finalizer, config reload, and readiness check
-repeats that sequence before touching image state; the transaction keeps the
-shared advisory lock until its image statements commit, then follows the normal
-phase-1 singleton lock mode required by that operation. Schema migration and
-whole-config activation take the exclusive form of that same advisory lock.
-Concurrent image operations remain mutually compatible,
-but a migration waits for all short in-flight image transactions and prevents a
-new one from crossing its fence update. A connection checked out before a fence
-change is not trusted by a later operation. Against the explicitly tolerated
-revision-022 ceiling, the checkout instead proves that all image routes are
-closed because the singleton and function do not exist yet.
-
-The config-row read policy remains the fixed API-62 bootstrap guard, while the
-config write trigger and every image-plane operation follow
-`minimum_image_api_version`. Thus an API-62 binary cannot read image state,
-write API-63 image configuration, or remain ready after the fence advances,
-even though ordinary version-62 config reads still have a decodable schema.
-New migration code also rejects a database revision newer than its compiled
-target instead of treating it as current. API startup performs that check for
-every central Alembic history before readiness, not only on the first lazy table
-access; the sole lower-revision exception is an explicit deployment schema
-ceiling with its corresponding feature routes closed.
-
-Migration 023 creates external-OCI-only artifact provenance and
-SOURCE-only canonical origins. It never creates the obsolete single-counter
-`container_image_workspace_catalogs` table or artifact-level source columns.
-There is no launchability backfill, `LEGACY_REPUBLISH_REQUIRED`, or epoch table.
-
-Migration 024 is not part of the distribution release. It is designed and
-tested only after the builder prototype passes its pre-product worth and
-executor-feasibility gate. Its complete table and constraint inventory lives in
-the builder design. Applying an unused migration or exposing disabled build UI
-is not treated as harmless because both create permanent compatibility and
-support obligations.
-
-Migration 024 is additive while the builder is disabled, but API 62 is not
-declared compatible with revision 024. An existing deployment first rolls every
-API, controller, copy-worker, and lifecycle-worker image-plane process to API 63
-against a temporary revision-023 auto-migration ceiling. API 63 reports builder
-routes `IMAGE_SCHEMA_PENDING` but continues revision-023 distribution work
-through a frozen 023 common-column projection that never selects or writes a
-024-added column or enum. Distribution queries name their columns explicitly;
-they do not use a superset ORM `SELECT *` or live reflection.
-
-The live-version and database-session preflight must report no API-62 image-plane
-process, but it is an operational check rather than the safety fence. The
-dedicated Job takes the exclusive compatibility advisory transaction lock,
-waits for all earlier shared image transactions, locks the catalog singleton
-`FOR UPDATE`, rechecks exact revision 023, and in one PostgreSQL transaction
-sets `minimum_image_api_version = 63`, applies 024, and stamps revision 024. It
-writes no BUILD producer, state, or lease value. Rollback of any DDL also rolls
-back the fence. After commit, every API-62 pool checkout, image transaction, and
-readiness probe fails at the database boundary. An API-62 process that started
-after the preflight either finished a shared transaction before the exclusive
-lock or observes fence 63 afterward; it cannot survive the migration through a
-TOCTOU window.
-
-API-63 processes verify exact revision 024 before the ceiling is removed, and
-the same image rolls once more so every process starts with the 024 projection
-before builder activation. During that short restart overlap, revision-023
-projection processes remain valid against the additive 024 schema and still
-cannot emit BUILD state. API-63 builder activation verifies the already-63
-image-plane fence and healthy capability evidence; it does not change the
-schema-compatibility fence. The first transaction that creates any
-migration-024 row or BUILD-owned value sets `builder_state_ever_created` TRUE
-under that same phase-1 lock before acquiring later-phase rows. Migration 024
-installs named BEFORE triggers on every builder table and every BUILD-bearing
-column that reject the value unless the flag is already TRUE; the monotonic
-migration-023 trigger makes the historical witness irreversible.
-
-A pre-witness return to API 62 is likewise a schema rollback, never a fence-only
-change. With builder admission disabled, the supported rollback stops API-63
-and builder/image-worker database sessions for a short maintenance window. The
-024 downgrade takes the exclusive compatibility advisory lock and all affected
-tables in global order, requires `builder_state_ever_created = FALSE`, and proves the
-absence of every 024 row and BUILD-owned value. Only then does one transaction
-restore `minimum_image_api_version = 62`, remove the 024 schema changes,
-and stamp revision 023 before API 62 starts. Any witness or owned value raises
-in PostgreSQL and preserves revision 024 plus the image-plane fence. Once builder
-state exists, rollback is only to a migration-024-aware API-63 binary with
-builder admission disabled; API-62 image-plane and schema rollback are
-permanently forbidden. Unrelated operations remain available during an API-63
-binary rollback, outside the explicitly requested pre-witness schema-downgrade
-window.
-
-The current pull request deliberately couples the API-62 distribution code,
-literal migration 023, task YAML syntax for immutable image selection, AWS
-copy/lifecycle workers, Terraform modules, and Images catalog UI into one merge
-train. Those code/schema pieces do not pretend to be independently mergeable.
-Their
-data-plane activation and provider support claims remain independent:
-
-1. for an existing deployment, roll out API-version-62 code with the central
-   state schema explicitly capped at 022 and all image surfaces disabled; every
-   new process already declares version 62 on its database connections;
-2. after every API replica reports version 62, run the dedicated migration Job
-   through the existing application database URI to apply literal 023, then
-   remove the temporary schema ceiling; a clean install may apply 023 before
-   its first API process starts;
-3. verify exact schema, compatibility guard, constraints, queue plans, API/UI
-   behavior, and external
-   exact-digest adoption;
-4. deploy the independently scalable AWS copy and lifecycle workers with
-   their separate identities; and
-5. activate each managed realm only after its registry, identity, capacity, and
-   fault-injection gates pass.
-
-The schema ceiling is a deployment-only compatibility control, not a general
-user setting, accepted revision, or second schema authority. It only caps the
-highest revision that API startup may apply automatically. API 62 accepts its
-compiled revision 023 normally and temporarily tolerates revision 022 only
-while image surfaces are disabled, reporting `IMAGE_SCHEMA_PENDING` for those
-routes. It rejects any revision above its compiled target. The migration Job
-verifies the live replica-version set and refuses to apply 023 while a below-62
-API pod remains. Every version-62 config write and the migration Job take the
-same fixed PostgreSQL advisory transaction lock and re-read the state revision
-before choosing the 022 compatibility writer or 023 atomic writer, so no write
-can straddle that change. Leaving the auto-upgrade ceiling in place after the
-database reaches 023 is harmless but visible; Helm removes it in the same
-release operation. This two-step existing-install rollout avoids applying the
-forced-RLS guard while an older serving pod is still expected to accept
-traffic.
-
-Rollback below API 62 is a guarded schema rollback, not a binary-only rollback.
-It is allowed only while `distribution_state_ever_created = FALSE`,
-`builder_state_ever_created = FALSE`, the image configuration is absent, the
-apply ledger is empty, and every migration-023-owned child table is empty. The
-PostgreSQL downgrade takes one fixed advisory transaction lock, then takes
-`ACCESS EXCLUSIVE` on `config_yaml` and locks the mandatory config row, catalog
-singleton, and all image tables in global order.
-It rechecks those conditions inside that transaction before dropping the
-config trigger/RLS policy/functions and the 17 tables and stamping revision
-022. Any witness or owned row raises from the database and leaves both schema
-and guard intact. The supported Helm/manual rollback first disables image
-admission, stops API and image-worker database sessions for this short
-maintenance window, runs that guarded downgrade, and only then starts a
-below-62 binary. This prevents a version-62 writer from recreating state across
-the downgrade boundary. After either monotonic flag becomes TRUE, rollback is
-only to a migration-aware binary at or above its minimum image-plane fence.
-
-Future image migrations use ordinary expand, dual-read/write where needed,
-backfill, and contract phases. They do not inherit a standing right to revoke
-the shared application database role or stop unrelated clusters, requests,
-jobs, and Serve state outside an explicitly requested pre-activation schema
-downgrade.
-
-## The reshape
-
-The original design coupled logical image identity to a registry profile and
-stored one release version on the image row. That made an authentication or
-endpoint configuration revision look like new content and prevented one
-artifact from having multiple useful release names. It also treated
-preparation as an explicit side operation instead of a normal consequence of
-deploying immutable content.
-
-The model is now eight independent durable concepts:
-
-```text
-Artifact                 immutable content
-  digest                 runtime identity
-  producer metadata      import/build lineage
-  lifecycle              active/tombstoned/purging/purged
-       |
-       +---- Source       exact import alias -> artifact
-       |
-       +---- Release      immutable human name -> artifact
-       |
-       +---- Publication  reserved name -> READY release
-       |
-       +---- Location     artifact bytes at one physical destination
-                 |
-                 +---- Policy revision  current auth/lifecycle authority
-                 |
-                 +---- Reference  durable consumer -> READY location
-
-Catalog authority        UUID identifying the exact control-plane database
-```
-
-An administrator configures distributions and runtime bindings, but neither
-is part of artifact identity:
-
-```text
-Distribution profile     placement and materialization policy
-Registry target          physical endpoint identity
-Kubernetes binding       context-specific pull capability
-Runtime pull plan        one secret-free, digest-pinned selected location
-```
-
-A managed runtime pull plan also snapshots the distribution name, complete
-profile revision, target policy fingerprint, location ID, and runtime auth
-strategy. Those fields are launch authority, not advisory diagnostics. They
-travel together through serialization and are checked together at restart and
-cluster-handle commit boundaries.
-
-The policy fingerprint does not authenticate the other fields by itself. At
-the final commit, SkyPilot reloads the complete normalized profile selected by
-the serialized task, recomputes the target policy fingerprint and
-physical destination fingerprint plus the placement-specific auth strategy,
-and compares the active revision's complete fingerprint under the shared
-generation lock. This prevents an internal caller from combining a current
-location and policy hash with either a different physical destination or a
-different otherwise valid auth-strategy name. The same transaction proves that
-every supplied artifact ID, source alias, and release selector is bound to that
-artifact.
-
-The same final check deterministically renders the expected managed OCI
-reference from the current target, realm generation, stored shard allocation,
-workspace, and artifact digest. Source bindings select immutable import
-provenance but never contribute a repository path. Before creating the first
-location for one `(realm_generation, workspace, artifact)`, SkyPilot locks that
-workspace's realm allocation, chooses the least-filled shard with hard reserved
-capacity, stores its two-hex index on the location, and increments the shard
-reservation in the same transaction. The full digest identifies the manifest
-inside that repository but never chooses the shard. There is no single fixed
-shard count: the realm chooses any feasible count from 1 through the public v1
-ceiling of 256 using both repository-count and images-per-repository quotas.
-This bounds provider resources without placing all artifacts under one
-images-per-repository quota or assuming adversarial digests are uniformly
-distributed. A READY row and pull plan cannot agree on a
-different digest-matching registry reference and thereby bypass the physical
-destination fingerprint, and rotating a failed import to an equivalent mirror
-cannot rename existing canonical or regional content.
-
-Changing a manager identity or pull-auth strategy within one ownership kind does
-not create a new artifact or physical location. It transfers an explicit policy
-revision onto the same verified bytes only while no copy, verify, build,
-eviction, purge, or retirement operation owns the row. Existing durable
-consumers keep the stable location ID and their persisted plan; new launches and
-restarts resolve the new policy. Ownership kind is physical custody, not a
-mutable policy label. Changing `EXTERNAL` to `MANAGED` or `MANAGED` to
-`EXTERNAL` always creates
-a disjoint realm generation, repository-generation prefix, target custody, and
-physical location. Changing the canonical registry authority, complete
-repository-generation prefix, realm generation, shard policy, or rendered
-workspace namespace likewise creates a new physical location so old and new
-routes can coexist during migration.
-
-The following is the target module split created by this PR, not a claim about
-the branch's current file tree. The foundation currently has `state.py`,
-`providers.py`, `worker.py`, and `resolver.py`. During productization,
-`models.py` and `config.py` retain pure validated contracts; new read
-pagination, publication, and lifecycle SQL move to `catalog_state.py`,
-`publication_state.py`, and `lifecycle_state.py`; and `runtime.py` takes the
-pull-plan work from `resolver.py`. A small transaction helper accepts the
-caller's PostgreSQL connection for the one cluster-handle/reference atomic
-commit; `global_user_state.py` does not grow a second image state machine.
-Provider-neutral capability interfaces move from `providers.py` to
-`provider_adapters/base.py`, AWS behavior lands in `provider_adapters/aws.py`,
-and `worker_service.py` wraps the reconciler from `worker.py` as the independent
-process. Each extraction preserves behavior under focused tests before the next
-boundary moves.
-Dashboard response schemas are projections over these services, not direct SQL
-or raw configuration. The separately designed builder uses `build_state.py`
-and its own controller.
-
-## CLI, SDK, and task interface
-
-Source registration and release publication are explicit and never fan
-content out to every region:
-
-```text
-sky image register ghcr.io/boltz-bio/boltz@sha256:<digest> \
-    --distribution global-gpu
-
-sky image publish ghcr.io/boltz-bio/boltz@sha256:<digest> \
-    --release boltz-2.1.0 \
-    --distribution global-gpu [--no-wait]
-
-sky image publish --artifact-id 019f5a80-8bc9-7cf2-9fa8-0123456789ab \
-    --release boltz-2.1.0 \
-    --distribution global-gpu [--no-wait]
-```
-
-`register` records artifact identity and source alias, requires the selected
-active profile generation, lazily allocates the workspace's managed realm when
-needed, creates the canonical materialization intent, and returns its current
-state. For a managed profile that intent imports from an anonymous
-or worker-authorized source. For an external profile, the same typed operation
-is destination adoption: it returns the deterministic digest-pinned canonical
-destination and `AWAITING_EXTERNAL_PUSH`, never acquires source credentials or
-copies from the source. The operator pushes the exact digest out of band; the
-worker only inspects destination bytes and transitions READY after full
-digest/platform verification. `publish` does the same work and also creates a durable
-release reservation. The public `container_image_releases` row is bound only
-in the same transaction that verifies the canonical location READY. Until
-then, release lookup returns a closed `PUBLICATION_PENDING` result, never a
-source fallback or a launchable half-release. Canonical success or failure
-settles every exact PENDING publication bound to that location in one bounded
-transaction, never an arbitrary reservation. Failure marks them FAILED without
-exposing a release; an authorized retry reuses its existing reservation and
-resolves the distribution's current canonical route. Physical profile
-replacement detaches old pending routes through the same publication lifecycle
-contract below. Conflicting reservations fail before catalog mutation, while
-identical concurrent requests converge through database uniqueness.
-
-The publish request is a typed one-of between `source_ref` and `artifact_id`.
-Source publication performs registration as above. Artifact publication never
-creates or selects a source alias: it locks an ACTIVE artifact and requires an
-exact canonical READY location under the requested active distribution, then
-enters the same reservation and READY fast-path finalizer. It is intended for
-builder output and previously registered content. A missing route returns
-`CANONICAL_NOT_READY` without queuing an import from historical provenance.
-`distribution` is required for artifact publication unless exactly one active
-READY canonical profile is eligible; zero or multiple eligible profiles fail
-closed. Supplying both selectors, neither selector, or a source and artifact
-whose digests merely happen to match is invalid rather than ambiguous.
-
-The SDK exposes distinct `publish_source()` and `publish_artifact()` helpers
-over the one request schema. CLI parsing and the dashboard Publish dialog use
-the same one-of. Reservation quota, RBAC, wait behavior, audit, and idempotency
-are identical after selector resolution.
-
-Publishing an additional release for content whose exact canonical location is
-already READY does not wait for a nonexistent future completion event. The
-reservation transaction takes the same profile, artifact, canonical,
-publication, and release locks, runs the shared READY validator, inserts the
-release, and returns a READY publication immediately. An existing same-digest
-release is idempotent. Worker completion and this fast path call one finalizer,
-which locks and settles all at-most-256 exact-location PENDING reservations, so
-neither can bypass revision, platform, digest, lifecycle, or quota checks or
-strand a sibling release name.
-
-The CLI waits for READY by default by polling a direct bounded publication
-resource; `--no-wait` returns the publication ID and current state. Neither the
-API request executor nor a deployment worker is held while OCI transfer runs.
-SDK callers receive the publication resource and can use the same wait helper.
-The asynchronous mutation request is terminal once it has durably created the
-intent and reservation. Publication status is the truthful completion surface.
-
-Regional preparation is a separate operator choice. Prepare validates every
-requested target before registering a new source or creating any location
-intent, so a misspelled later target cannot leave a partial registration or
-only an earlier subset of targets. Because this interface has not shipped,
-`register` is no longer a compatibility alias for `publish`; it is the explicit
-source-only primitive. Both remain API-versioned together.
-
-The equivalent task-level first use is a digest-pinned source plus an optional
-release publication request. It uses the same registration and reservation
-transaction, then adds only the placement-specific regional intent after
-placement:
-
-```yaml
-resources:
-  container_image:
-    ref: ghcr.io/boltz-bio/boltz@sha256:<digest>
-    release: boltz-2.1.0
-```
-
-That first launch may use only its request-scoped digest-pinned source while
-canonical preparation is pending and policy permits fallback. It never treats
-the requested release as available. After canonical verification publishes the
-release, later tasks may select the release or artifact without restating the
-source:
-
-```yaml
-resources:
-  container_image:
-    release: boltz-2.1.0
-```
-
-```yaml
-resources:
-  container_image:
-    artifact_id: 019f5a80-8bc9-7cf2-9fa8-0123456789ab
-```
-
-The optional `distribution` chooses an allowed administrator-defined profile:
-
-```yaml
-resources:
-  container_image:
-    release: boltz-2.1.0
-    distribution: global-gpu
-```
-
-`distribution: direct` is a reserved task-level escape hatch. It selects no
-registry profile, preserves the existing digest-pinned source pull, is allowed
-only by `managed_preferred`, and is rejected by `managed_required`. It cannot be
-defined as a profile, selected as a server/workspace default, or used for a
-release-only or artifact-only selector. Digest-pinned runtime references are an
-unconditional managed-image invariant. The unreleased
-`require_digest_at_runtime` profile key is removed rather than exposing a
-boolean whose only valid value is `true`; configuration containing it is
-rejected with a migration message.
-
-`profile` and `version` remain accepted configuration and Python-constructor
-compatibility aliases while this unreleased feature is reshaped. New
-serialization emits `distribution` and `release`. The existing
-`resources.image_id: docker:...` form remains a
-deprecated compatibility input; cloud machine images continue to use
-`image_id`. A resource created through that legacy spelling is serialized back
-through `image_id` when talking to an old server. An explicitly authored
-`container_image` requires API version 62, so a new client cannot silently
-send an unknown field to an old server.
-
-Compatibility is explicit: clients below 62 cannot serialize
-`resources.container_image` or call image SDK methods; a 62 client down-converts
-only legacy `image_id: docker:...` when talking to an older server; servers at
-62 keep legacy response fields decodable by old clients; and rolling the server
-back below 62 requires the locked 023-to-022 downgrade before the catalog's
-monotonic distribution-state witness becomes TRUE. A below-62 binary cannot
-start against revision 023 because PostgreSQL rejects its mandatory config
-read. After any managed-image state has existed, the oldest rollback target is
-a migration-023-aware API-62 binary. A new client receives a version error before
-request persistence, not an unknown-field failure from an old server.
-
-`Resources.container_image` is keyword-only and appended after every existing
-constructor parameter. This keeps the complete pre-feature positional calling
-convention unchanged, including `disk_size` and the internal compatibility
-arguments, while preventing the new field from creating another positional
-ABI slot.
-
-`Resources.copy()` preserves the old replacement semantics. When the current
-container image came from legacy `image_id: docker:...`, an explicit
-`image_id` override replaces or clears that derived container identity and
-invalidates its resolved pull plan and Docker login. A separately authored
-`container_image` remains independent from cloud-machine `image_id` changes.
-
-The current request path accepts only digest-pinned managed sources. Mutable
-tag resolution is deliberately rejected until a credential-aware metadata
-worker can resolve tags outside the API process. This avoids network and
-credential work in request handlers and avoids pretending a mutable tag is an
-immutable artifact.
-
-There is deliberately no mutable `latest` release. Modal can safely update a
-named-image pointer because an App deployment snapshots a new Function version
-and existing deployed Functions keep their previous image. SkyPilot should add
-a mutable channel only with one generationed deployment snapshot shared by
-clusters, managed jobs, and SkyServe. Resolving a mutable channel independently
-for every replica or restart would make one logical service version run mixed
-artifacts.
-
-SkyServe applies that snapshot rule to every immutable selector today. After
-admin policy and before a service version or controller request is persisted,
-all resource candidates resolve to one artifact ID and the durable task YAML is
-rewritten to that artifact ID while retaining each candidate's distribution.
-Different source or release spellings may converge to the same artifact, but a
-managed/direct mixture, a candidate without an image, or two different
-artifacts is rejected. Candidate identity resolution is read-only, so a
-rejected service leaves no artifact, alias, publication, profile-generation, or
-canonical intent rows for a worker to import. After convergence, every
-first-use source alias, release reservation, profile generation, and canonical
-intent is registered in one ordered database transaction; a later binding
-conflict rolls back the whole candidate set. The durable version stores the
-artifact ID, not a pending release. Replicas then wait for the managed artifact
-route instead of independently falling back to the source. Canonical completion
-publishes any reserved release independently. This gives one content snapshot
-per service version across heterogeneous `any_of` placements.
-
-Multi-candidate publication uses global transaction phases rather than
-locking one candidate end to end. Every batch follows the canonical table below:
-quota, profile/custody, digest advisory keys, artifacts, sources, canonical and
-regional locations, references, publications, then releases. Keys are sorted
-within every phase. Thus
-two convergent batches whose source order maps the same two release labels to
-opposite digests cannot hold one release while waiting on the other; one batch
-commits and the other receives the intended immutable-release conflict.
-
-Release labels use the OCI tag grammar: one to 128 ASCII letters, digits,
-underscores, periods, or hyphens, starting with a letter, digit, or underscore.
-They cannot be URLs, paths, credentials, whitespace, or terminal control
-sequences. The same value-free model validation runs for API requests, task
-YAML, pickle restoration, state writes, and catalog responses before a release
-can be persisted or rendered by the CLI.
-
-Artifact and location IDs use canonical RFC UUID text. Distribution and target
-names use one to 128 ASCII letters, digits, underscores, periods, or hyphens,
-starting with a letter or digit. URL syntax, userinfo, paths, whitespace, and
-terminal controls therefore cannot masquerade as control-plane identifiers.
-The grammar is enforced before request persistence and again at config, task
-YAML, pickle, state-write, runtime-plan, and response-decoding boundaries.
-
-Operational commands accept a bare selector only when it resolves to one
-artifact across the artifact-ID, release, and source namespaces. Callers can
-select the namespace explicitly with `artifact_id=<id>`, `release=<name>`, or
-`ref=<oci-reference>`. This avoids silent precedence when, for example, a
-release label is textually equal to another artifact's UUID. The dashboard and
-SDK always send a typed selector, so adding a later UUID-shaped release cannot
-retroactively reinterpret an existing action. The prepare
-command's `--release` binding is valid only with a source reference; it rejects
-explicit release and artifact selectors instead of replacing their identity.
-The status table prints the full artifact ID, so its ARTIFACT value can be
-copied directly into status, prepare, or retry. A bare digest-pinned OCI source
-remains a source registration request even if its digest already identifies an
-artifact; prepare records that additional immutable alias instead of silently
-rewriting it to an artifact-only lookup.
-
-Every source reference is validated before persistence as a Docker/OCI image
-reference. URL schemes, userinfo, queries, fragments, backslashes,
-percent-encoded material, invalid authorities, and invalid repository or tag
-grammar are rejected, and repository names obey Docker's 255-character limit.
-The worker completion boundary repeats the same validation and canonicalizes
-the authority before a destination reference can become READY. Runtime route
-and resolved pull-plan models also validate and canonicalize references and
-accept only declared auth-strategy names before YAML, pickle, or controller
-state can carry them. Credential-bearing URLs can never become catalog state,
-status output, or a source-fallback plan.
-
-## Managed builder boundary
-
-Distribution alone does not remove repeated runtime setup, but builder context
-custody, private-base authentication, cache retention, and execution isolation
-are not registry-copy concerns. The managed builder is therefore specified in
-the independent canonical design
-[`managed-container-image-builder.md`](managed-container-image-builder.md).
-It reuses immutable catalog output and release publication but owns separate
-API, PostgreSQL metadata, object-store custody, BuildKit workers, logs, quotas,
-retry, and garbage collection. Builder tables live in `build_state.py`, not in
-the already large distribution `state.py`.
-
-The distribution slice does not claim builder readiness merely because the
-artifact model has producer fields. A task may select a READY build output, but
-placement never executes build work. The Boltz L4 fleet uses `linux/amd64`
-only; ARM64 is built only after an actual placement or explicit target asks for
-it. Clouds and regions cause copies of one compatible OCI artifact, not
-different builds.
-
-The pre-migration prototype is confined to the reserved admin-only
-`image-builder-prototype` workspace and external ownership profile. It cannot
-write a digest into a product-builder workspace, so later native convergence is
-not blocked by an `external_oci` artifact lacking a READY managed output route.
-Cross-workspace reuse remains an ordinary exact-digest adoption.
-
-Immutable releases remain the default human name. A future mutable channel is
-accepted only after a generationed `(channel, generation, artifact_id)`
-snapshot is stored in the central PostgreSQL record for a cluster, managed-job
-controller request, or SkyServe version before any replica starts. Promotion
-creates a new generation and never mutates a running deployment. Channels stay
-outside both initial designs until every consumer has that shared snapshot
-boundary.
-
-## Dashboard product surface
-
-Managed images are a first-class dashboard resource. `Images` appears in the
-desktop and mobile navigation beside `Volumes` and opens `/images`. The page is
-workspace-scoped and uses the same accessible-workspace resolver as the rest of
-the dashboard; it never assumes that every user can access `default`.
-
-The catalog view contains:
-
-- an accessible workspace selector whose value is reflected in the URL;
-- a cursor-paginated artifact table, ordered by `(created_at, id)` descending;
-- exact selector search for artifact ID, immutable release, or OCI source;
-- server-side filters for location state, distribution, and target;
-- digest, lifecycle, publications, releases, source count, platforms,
-  compressed size, producer,
-  location-health summary, and created/updated timestamps;
-- explicit loading, empty, permission-denied, unsupported-old-server, and
-  retryable-error states; and
-- responsive cards on narrow screens rather than a horizontally unusable
-  table.
-
-Selecting a row opens `/images/[artifact]`. The detail view shows the complete
-immutable identity, all bounded source and release aliases, bounded publication
-counts/latest state, producer provenance, and aggregate location health.
-Publication history and locations use separate cursor-paginated tables; neither
-is embedded as an unbounded detail array. The location table defaults to current
-active profile revisions and can include retained historical rows. Location rows
-expose distribution, target,
-canonical status, policy revision, state, attempts, next retry, last
-verification, last use, immutable reference, digest, and closed diagnostic
-code. Historical rows additionally show policy-transfer or physical-retirement
-kind, rollback-grace deadline, regional/canonical progress, external
-acknowledgement requirement, retained custody revision, and whether quota has
-been released. Fingerprints are available behind a diagnostic disclosure, not
-used as primary labels.
-Publication rows expose release, distribution, route revision, state, closed
-error, current or scalar last-attempted location, retry generation, and retained
-reservation/lifetime status. An eligible FAILED `PROFILE_SUPERSEDED` row offers
-a workspace-authorized Retry action that resolves the current route; a removed
-distribution explains that the administrator must restore it or release the
-name before publishing elsewhere.
-
-Authorized workspace users can open dialogs for the existing safe operations:
-
-- **Register** accepts a digest-pinned source and optional allowed
-  distribution, creating no release; for an external profile it displays the
-  deterministic destination, adoption state, and out-of-band push guidance;
-- **Publish** accepts exactly one digest-pinned source or artifact ID, a
-  required immutable release, and an allowed distribution; READY build rows
-  open it prefilled with their artifact and output distribution;
-- **Prepare** accepts an existing selector, one or more configured targets,
-  and an optional distribution; and
-- **Retry location** is enabled only for an eligible failed or missing target;
-  **Retry publication** is enabled only for an eligible never-READY reservation
-  and reuses its existing quota slots.
-
-Dialogs validate locally, submit through the existing asynchronous request
-protocol, show request progress, retain a failure for correction, close only
-on success, and refresh the affected catalog row. Repeated clicks are disabled
-while a request is active. The first dashboard deliberately has no delete,
-evict, release-rebind, or mutable-tag action. A separate admin-only
-tombstone/purge API exists for legal and cost operations, but its preconditions
-and consequences are too sharp for a catalog row action.
-
-The page also shows the workspace's effective image policy and a secret-free
-registry topology: profile name and revision, managed/external ownership,
-literal namespace root, canonical target, regional targets, provider, region,
-registry prefix when known, locality declarations, and runtime pull strategy
-name. Quota cards distinguish lifetime distinct-digest and publication-generation
-usage from releasable materialized-byte, publication-record, and location-record
-usage, and warn that purge or history compaction restores neither lifetime slot.
-It excludes manager identities,
-credential references, tokens, raw
-configuration, and every unrelated SkyPilot setting. Administrators also
-receive a complete **Settings > Image distribution** panel, not a raw-YAML-only
-escape hatch. It lists profiles, realm generation/shards, workspace
-defaults/allowlists/quotas, target custody state, capability probes, and
-Terraform inventory/output status. It also shows ACTIVE and REMOVED profile
-heads, highest revision, retained revisions out of 64, compaction blockers, and
-lifetime profile names out of 1,024. Create/edit forms cover every supported
-profile, target, Kubernetes/VM binding, and workspace policy field; credential
-references are selected by name and secret values are never fetched. The editor
-shows the normalized secret-free diff/fingerprint, requires an explicit
-monotonic revision on semantic changes, validates endpoint/locality ambiguity
-and quota feasibility server-side, and explicitly labels whether the change is
-an in-place policy transfer or a new physical generation. For the latter it
-shows the disjoint prefix, rollback grace, pending custody/retirement counts,
-blocked references or leases, and closed operator runbook without blocking the
-config apply on background cleanup. If current operation leases must drain, the
-editor displays the durable apply ID, `QUIESCING` state, remaining lease kinds,
-deadline, and Cancel action; it follows the same apply after navigation or page
-reload and offers Retry only after a closed cancellation or timeout. While the
-single global apply is active, every other editor is disabled and links that
-same application resource rather than creating disjoint heartbeat work. It applies
-through the managed-image generation-fenced activation protocol described
-below. The raw Settings
-editor invokes that same transaction whenever its diff touches an image
-section. It offers YAML preview/export for GitOps users. It does
-not run Terraform or create cloud resources from the browser; it links exact
-module/preflight commands and refreshes observed readiness. Read-only users see
-only the topology projection above.
-
-### Dashboard API contract
-
-The asynchronous `GET /images` and existing SDK/CLI response shape remain
-compatible. Without an exact selector it has a hard 1,000-artifact response
-ceiling and fails with `IMAGE_STATUS_REQUIRES_PAGINATION` instead of returning a
-partial result; large catalogs use the direct catalog API. The dashboard adds
-direct, authenticated bounded reads and one bounded admin activation protocol:
-
-```text
-GET /images/catalog?workspace=W&limit=50&cursor=C[&selector=S]
-GET /images/catalog?workspace=W&limit=50&cursor=C&lifecycle=ACTIVE
-GET /images/catalog?workspace=W&limit=50&cursor=C&distribution=P
-    [&target=T]
-GET /images/catalog?workspace=W&limit=50&cursor=C&distribution=P&state=READY
-    [&target=T]
-GET /images/catalog?workspace=W&limit=50&cursor=C&distribution=P&state=READY
-    &target=T&canonical=true
-GET /images/artifacts/{artifact_id}?workspace=W
-GET /images/artifacts/{artifact_id}/locations?workspace=W&limit=50&cursor=C
-    [&current_only=true]
-GET /images/artifacts/{artifact_id}/publications?workspace=W&limit=50&cursor=C
-GET /images/profiles?workspace=W
-GET /images/publications/{publication_id}?workspace=W
-GET /images/admin/config
-POST /images/admin/config/validate
-POST /images/admin/config/apply
-GET /images/admin/config/applications/{apply_id}
-POST /images/admin/config/applications/{apply_id}/cancel
-```
-
-These FastAPI routes are synchronous `def` handlers so blocking PostgreSQL
-work runs in the framework threadpool. They return typed responses directly
-and never create request rows, executor work, or unbounded logs. Catalog
-lifecycle and publication mutations remain on the existing asynchronous
-request protocol. Admin config apply uses the bounded catalog apply ledger and
-profile-head quiesce tokens described below, not the generic request table. A
-dashboard tab therefore performs bounded reads, not a stream of request-table
-writes.
-
-The five `/images/admin/config` routes are admin-only typed projections over
-the managed-image activation protocol shared with the raw configuration
-editor. GET returns only image
-distribution sections plus capability/infrastructure status. Validate accepts a
-complete proposed image subsection, normalizes it, performs parser/profile/
-quota checks, and returns a secret-free diff without mutation. Apply requires
-that diff's hash, the current config generation, and a UUIDv7 idempotency key,
-rejects a stale generation, and updates only those sections. It returns
-`200 APPLIED` when the fast path commits immediately or `202 QUIESCING` with an
-application resource when live leases must drain. The status route reads that
-bounded durable resource, and cancellation clears only its generation-fenced
-tokens before returning a terminal result. Repeating the same key and request
-returns the same resource and state across API restarts. It cannot read or
-replace secret values. A different apply while the catalog active ID is non-NULL
-returns `409 IMAGE_CONFIG_APPLY_IN_PROGRESS` with that ID; GET includes its
-status plus the bounded revision/name-retention counters. These
-routes do not create a second source of configuration truth. The ordinary raw
-Settings editor detects an image-section diff, produces the same normalized
-proposal and hash, and calls the same activation helper rather than the legacy
-best-effort reload hook.
-
-`/images/catalog` returns `ContainerImageCatalogPage` with `items`, an opaque
-`next_cursor`, and `has_more`. The cursor contains a signed, expiring, versioned,
-value-validated keyset boundary and is never a raw SQL fragment or offset. For
-every distribution-filtered shape it also binds the resolved active profile
-revision and central config generation. A later page rechecks both under the
-catalog singleton/profile head; if either changed it returns
-`IMAGE_CATALOG_CURSOR_STALE` and the UI restarts at page one instead of mixing
-facets from two generations. `limit` defaults to
-50 and is bounded to 200. A selector is resolved by the same ambiguity-safe
-artifact/release/source logic as operational commands. The accepted list-filter
-matrix is exact: no filters; lifecycle only; distribution only;
-distribution-plus-target; distribution-plus-state;
-distribution-plus-state-plus-target; and
-distribution-plus-state-plus-target-plus-canonical. Canonical therefore
-requires both state and target. These shapes use the transactionally maintained
-catalog-facet indexes described below. They never walk the artifact ordering
-index hoping to encounter a selective match and never load the whole workspace
-in memory. Each page joins its one-row summaries and batch-loads bounded aliases;
-it never materializes every location row for the page. Catalog polling refreshes only the first visible
-page every 15 seconds while the tab is visible, backs off after errors, and
-never resets the user's cursor or open dialog. Detail polling uses the direct artifact
-endpoint, and publish progress uses the direct publication endpoint. Target or
-state without distribution, canonical without distribution/state/target, and
-every other filter combination is rejected before database access. An exact
-selector is mutually exclusive with every list filter.
-
-`/images/profiles` returns `ContainerImageProfileSummary` for only the resolved
-workspace. It is produced from validated profile models and a dedicated
-response schema, not by redacting or returning the raw configuration tree.
-Every read and mutation resolves and authorizes the requested workspace before
-database access or scheduling. SkyPilot currently has exactly three global
-roles, so the image contract does not invent a workspace-admin role:
-
-| Operation | viewer | user | admin |
-| --- | --- | --- | --- |
-| catalog, detail, provenance, attempts, diagnostics | workspace read | workspace read | all accessible |
-| secret-free profile topology and pull strategy | workspace read | workspace read | all accessible |
-| publication status and redacted build metadata | workspace read | workspace read | all accessible |
-| sensitive build inputs and bounded build logs | denied | workspace read | all accessible |
-| register, publish, prepare, retry, build | denied | workspace write plus quota | allowed |
-| retry a paid transfer | denied | workspace write plus quota | allowed |
-| edit raw registry configuration | denied | denied | allowed through Settings |
-| tombstone, retry purge, cancel or release a failed publication name | denied | denied | allowed |
-
-Workspace authorization is enforced independently of role. Image mutations
-consume the workspace's image-byte, artifact, copy-attempt, and build budgets;
-the user role cannot bypass them by calling retry. Profile summaries never
-contain manager identities, credential references, raw config, or tokens.
-Route-coverage tests enumerate every image endpoint for all three roles and
-cross-workspace access.
-
-The viewer allowlist uses explicit route patterns, not an assumed `/images`
-prefix grant: `GET /images`, `GET /images/catalog`,
-`GET /images/artifacts/:artifact_id`,
-`GET /images/artifacts/:artifact_id/locations`,
-`GET /images/artifacts/:artifact_id/publications`, `GET /images/profiles`, and
-`GET /images/publications/:publication_id`. Builder read routes are enumerated
-separately in its implementation. Every new image route is denied to viewers
-until deliberately added and covered.
-
-The detail endpoint is bounded to one typed artifact ID and returns neither a
-location nor publication-history array. Aliases remain bounded by their
-per-artifact quotas, and only publication counts/latest state are embedded.
-The location endpoint uses `(current_revision, updated_at, id)` keyset ordering,
-a default of 50, a hard limit of 200, and indexed current/history predicates.
-With `current_only=true`, its cursor binds the central config generation and
-fails stale after any image-profile activation; historical pagination does not
-depend on profile heads.
-The publication endpoint uses `(created_at, id)` descending with the same limits
-and an artifact-prefixed index.
-Historical nonreferenced rows are compacted after 90 days by default, and the
-workspace `max_location_records` quota is a hard backstop. If alias quotas later
-grow beyond the detail response cap, aliases receive their own cursor endpoints
-rather than weakening the bound.
-
-Dashboard tests cover connector query encoding and direct-read polling, stale
-response suppression when workspaces change, all dialog success and failure
-paths, permission and old-server states, cursor navigation, filters, location
-status rendering, responsive behavior, and keyboard-accessible dialogs. The
-release gate includes `npm run lint`, targeted Jest tests, and a production
-`npm run build`, followed by a manual browser pass against a PostgreSQL API
-server with READY, WARMING, FAILED, and empty workspaces.
-
-## Administrator interface
-
-Registry endpoints and credentials stay out of model YAML:
+The catalog singleton contains only a stable authority UUID and creation time.
+There is no forced RLS policy, API-version GUC, database-wide advisory lock,
+global configuration apply ledger, realm generation, dynamic shard allocation,
+catalog projection, facet table, or custom lifetime quota in v0.
+
+Important constraints include:
+
+- unique `(workspace, source_digest)` artifact identity;
+- unique `(workspace, source_ref)` source alias;
+- unique `(workspace, release)` reservation;
+- release state in `PENDING|READY|FAILED`;
+- READY release requires a canonical location ID for the same artifact;
+- unique physical location identity for artifact/profile/target/fingerprint;
+- canonical versus regional dependency checks;
+- closed location state and lease combinations;
+- unique durable consumer reference; and
+- worker kind in `COPY|LIFECYCLE` with bounded heartbeat metadata.
+
+All queue discovery is bounded and indexed by state, retry time, lease expiry,
+and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O occurs outside the
+claim transaction. Completion validates the random lease token after acquiring
+the row lock and reading the current clock.
+
+The downgrade drops the tables only when all are empty and the feature has no
+active profile. Otherwise it fails closed. Because the feature has not shipped,
+there is no compatibility reason to preserve the earlier branch-only schema.
+
+## Registry profiles
+
+A profile is a complete immutable revision:
 
 ```yaml
 container_registries:
-  default_profile: global-gpu
+  default_profile: gpu-production
   profiles:
-    global-gpu:
+    gpu-production:
       revision: 1
       ownership: managed
-      realm: boltz-production
-      realm_generation: 1
-      repository_shards: 16
-      namespace_root: skypilot/boltz
-      retirement_grace_hours: 24
+      provider: aws
       canonical:
-        provider: aws
-        account: "699..."
+        account: "123456789012"
         region: us-east-1
-        manager_identity: registry-manager
-        lifecycle_identity: registry-lifecycle
+        registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+        repository_prefix: skypilot-images
+        shard_count: 16
         pull_auth: ecr_runtime_identity
       targets:
-        - name: aws-us-west-2
-          provider: aws
-          account: "699..."
+        - name: us-west-2
+          account: "123456789012"
           region: us-west-2
-          manager_identity: registry-manager
-          lifecycle_identity: registry-lifecycle
+          registry: 123456789012.dkr.ecr.us-west-2.amazonaws.com
+          repository_prefix: skypilot-images
+          shard_count: 16
           pull_auth: ecr_runtime_identity
-        - name: aws-eu-west-1
-          provider: aws
-          account: "699..."
-          region: eu-west-1
-          manager_identity: registry-manager
-          lifecycle_identity: registry-lifecycle
-          pull_auth: ecr_runtime_identity
-    gcp-external:
-      revision: 1
-      ownership: external
-      realm: boltz-gcp
-      realm_generation: 1
-      repository_shards: 1
-      namespace_root: skypilot/boltz-gcp
-      canonical:
-        provider: gcp
-        project: skypilot-images
-        region: us-central1
-        registry: us-central1-docker.pkg.dev/skypilot-images
-        manager_identity: external-registry-writer
-        pull_auth: gar_runtime_identity
 ```
 
-Workspace policy supplies a default and constrains behavior:
+Externally provisioned profiles use `ownership: external`, an OCI registry
+provider binding, and no deletion authority. Kubernetes contexts explicitly map
+to one registry target and pull-auth strategy. VM targets declare the provider
+and region localities they satisfy. A generic endpoint is never declared local
+merely because it is reachable.
 
-```yaml
-workspaces:
-  default:
-    container_images:
-      mode: managed_preferred      # managed_preferred | managed_required
-      default_profile: global-gpu
-      allowed_profiles: [global-gpu, gcp-external]
-      locality: prefer             # prefer | require | canonical
-      regional_cache_retention_weeks: 8
-      max_artifacts: 1000000          # lifetime distinct digests in workspace
-      max_platforms_per_artifact: 1   # Boltz L4 fleet is linux/amd64 only
-      max_sources_per_artifact: 128
-      max_releases_per_artifact: 128
-      max_lifetime_publication_generations_per_artifact: 256
-      max_release_reservations: 2000000
-      max_lifetime_publication_generations: 4000000
-      max_publication_records: 2000000
-      max_location_records: 5000000
-      max_retained_locations_per_artifact: 512
-      max_materialized_bytes: null  # null disables the optional byte budget
-      max_user_retry_generations_per_location: 3
-```
+Semantic changes require a higher explicit revision. Existing durable pull
+plans remain valid while their exact target and auth contract remains usable.
+New placement uses only the active revision. Config validation checks every
+profile atomically before activation and rejects ambiguous locality, duplicate
+targets, or incompatible authentication. V0 uses the existing server config
+reload path and feature-gated rolling deployment. It does not create a second
+global configuration transaction protocol.
 
-Validation requires `max_lifetime_publication_generations_per_artifact` to be at
-least `max_releases_per_artifact`, `max_publication_records` to be at least
-`max_release_reservations`, and the workspace lifetime-generation limit to be at
-least both retained publication records and release reservations. Successful
-immutable names cannot consume an impossible record budget. The per-artifact
-lifetime setting is capped at 256 by the parser and database check. Lower
-operational limits use release/retained-record quotas, not an internally
-contradictory lifetime ceiling.
-`retirement_grace_hours` is bounded from 1 through 168, defaults to 24 when
-omitted, and never makes activation wait for grace or cleanup.
-`max_retained_locations_per_artifact` is bounded from 256 through the database
-hard maximum 512. The separate profile target ceiling remains 128.
+## AWS managed slice
 
-Defaults mean models do not repeat registry choices. A task-level
-`distribution` is an override within the workspace allowlist, not a credential
-or endpoint declaration. `realm_generation` and `repository_shards` are copied
-from managed Terraform output or an external owner's validated inventory and
-are immutable after the first allocation.
-`namespace_root` is a literal, lowercase OCI repository path. It contains no
-braces, placeholders, empty segments, `.` or `..` segments, leading/trailing
-separator, or repeated separator. Every segment and the complete value use a
-bounded portable grammar validated before activation. A workspace is likewise
-one bounded OCI-safe segment and never contains a separator.
+### Fixed repository layout
 
-At activation, one provider-neutral canonicalizer parses either an explicit or
-provider-derived registry reference into a normalized `host[:port]` authority
-and optional repository base path. It validates provider/account/region/project
-metadata against that result but never includes those adapter labels in
-physical uniqueness. It joins the base path, literal `namespace_root`, and
-`g<realm_generation>` into one complete canonical repository-generation prefix.
-Thus spelling `registry.example/a` plus root `b`, or
-`registry.example` plus root `a/b`, yields the same reserved physical prefix.
-
-SkyPilot, not administrator string interpolation, appends one universal
-injective layout for managed and external profiles:
-`<repository-generation-prefix>/<workspace>/shard-<two-hex-index>`.
-An external owner may choose one shard but does not get a shorter renderer.
-Generation is an unsigned decimal rendered with the literal `g` prefix before
-the workspace, and every shard index is exactly two lowercase hex digits from
-`00` through `ff`, bounded by the immutable shard count. Because every profile
-uses the same suffix segment count, equality of rendered repository paths
-requires equal canonical authority and generation prefix followed by equal
-workspace and stored shard index. Changing one tuple member cannot render the
-same path, and a longer configured root cannot absorb the fixed suffix.
-
-More than one distribution may reference one capacity realm only when every
-canonical `(registry authority, repository-generation prefix)` is disjoint. A
-policy-only revision of the same distribution may reference its exact existing
-realm-generation row only when authority, complete prefix, shard policy,
-renderer, and ownership kind are identical; this is POLICY_TRANSFER, not a new
-reservation. Activation rejects every new physical generation whose prefix
-overlaps an ACTIVE, DRAINING, or RETIRED target custody/realm generation, even
-when provider adapters, endpoint/base-path splits, or account metadata differ,
-because historical purge or retirement authority must not race newly assigned
-bytes. For each bounded
-submitted target, the activation transaction performs one exact indexed
-reservation lookup/insert under sorted realm locks. The database unique key
-makes concurrent activations converge or conflict without scanning historical
-custody or using a stale preflight. It never enumerates workspaces because the
-universal suffix is injective. A RETIRED prefix becomes reusable only after no
-location, DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN outcome, manifest audit
-record, or purge/retirement lease remains
-and its reservation has been explicitly compacted. The canonical authority,
-complete repository-generation prefix, and immutable shard policy are always
-part of destination identity even if adapter metadata happens to repeat.
-The general parser ceiling remains 128 platforms for external profiles, whose
-owner controls deletion dependencies. A v0 managed profile admits exactly one
-platform and one OCI/Docker schema-2 image manifest as the artifact root. It
-rejects an image index before repository provisioning or location intent, even
-if the index contains only one runnable child. Supporting managed indexes later
-requires physical-repository parent/child dependency authority and ordered
-deletion, not a larger parser setting.
-
-Ownership applies to the complete profile. Mixed managed/external targets are
-forbidden because one profile-level lifecycle policy cannot safely authorize
-only some destructive operations. Cross-cloud services use separate
-distributions that resolve to the same artifact ID, such as `global-gpu` for
-managed AWS and `gcp-external` for externally provisioned GAR. A future
-target-scoped ownership model would require target-scoped manager generations
-and is not implied by this schema.
-
-Ownership kind is immutable for a realm generation, target custody, and
-location. An ownership-kind change is admitted only as a new physical
-generation. In particular, external bytes are never relabeled managed: the new
-managed generation must pass the same empty-prefix and exclusive-writer gate as
-every other managed generation, then copy or adopt content into its newly
-reserved locations. A managed-to-external transition similarly uses a new
-externally controlled prefix while SkyPilot retains the old managed custody and
-guard until historical retirement completes. Only identity, pull-auth, and
-other policy rotation within one unchanged ownership kind can reuse physical
-bytes.
-
-The image configuration admits at most 256 distributions and 128 total targets
-per distribution, counting the canonical target plus every regional target.
-Validation rejects a larger proposal before the apply transaction.
-Consequently replacing the whole image section advances at most 256 global head
-rows, independent of the number of workspaces or artifacts.
-
-The workspace quota row tracks artifact, active release-name-reservation,
-lifetime publication-generation, retained publication-record, and
-location-record counts plus bytes reserved for physical materializations.
-Artifact, publication, and location-intent creation reserve count quota in their
-transaction. One
-publication consumes one workspace and one per-artifact lifetime-generation
-slot, both non-releasable, plus the active digest-bound name reservations and one retained
-publication-record slot before copy work begins. At most 256 lifetime
-publication generations may ever refer to one artifact. A RELEASED generation
-restores only the active name reservation; its lifetime slots remain charged
-forever and its retained record remains charged until terminal-history
-compaction. Finalizing its release
-does not consume a second slot, and FAILED or CANCELLED state does not free
-either permanently digest-bound reservation. Before registry I/O, the worker
-inspects exact manifest size and atomically writes that location's nullable
-`charged_materialized_bytes` while incrementing the workspace byte counter. A
-configured maximum is enforced in that transaction; a race that loses quota
-does not begin the copy or publish a release. Ambiguous and failed managed
-outcomes retain that charge. Confirmed eviction or purge clears it exactly once,
-while location-record quota is released only when an orphaned
-historical row or terminal publication is compacted under its audit retention
-policy. Compaction first writes the bounded immutable outcome to the audit sink,
-then removes the query row and releases only retained publication-record or
-location-record quota. User retries
-increment a per-location generation counter and require an admin after the
-workspace limit. The authoritative repair equation is
-`workspace.materialized_bytes =
-COALESCE(SUM(container_image_locations.charged_materialized_bytes), 0)` over
-non-null rows
-in that workspace. A workspace-scoped operator reconciliation locks the quota
-row, computes that sum through the workspace/charge index, and repairs only that
-row; it never scans or locks another workspace. Quota counters are never trusted
-to authorize a negative count.
-
-`revision` is a positive monotonic administrator-controlled generation for the
-complete profile. Any endpoint, ownership, manager identity, lifecycle identity,
-runtime auth, namespace root, realm generation, shard count, or target edit must
-increment it. The complete revision fingerprint includes all of those fields.
-`container_image_profile_heads` stores one permanent head/tombstone per
-distribution name with closed ACTIVE or REMOVED state, nullable active revision
-and fingerprint, non-releasable `highest_revision`, and checked
-`retained_revision_count` from 0 through 64. The catalog admits at most 256
-ACTIVE distributions and 1,024 lifetime distinct distribution names; first use
-increments a non-releasable catalog counter, so removed-name tombstones cannot
-grow without bound. Recreating a removed name requires a revision strictly
-greater than its retained highest value. A profile edit is therefore
-constant-work regardless of workspace count; workspace policy and realm
-allocation remain separate rows and are checked at admission.
-`container_image_profile_revisions` retains at most 64 accepted secret-free
-normalized revisions per distribution plus its checked total target count from
-1 through 128, immutable contract, nullable superseded time, and bounded
-compaction-not-before time. A 65th revision fails before config mutation with
-`IMAGE_PROFILE_REVISION_RETENTION_FULL` until the exact-profile compactor frees
-an eligible old row, and
-`container_image_target_custodies` retains each revision/target's provider,
-account/project, endpoint policy metadata, provider-neutral canonical registry
-authority/repository-generation prefix, physical root fingerprint, ownership
-kind/tags, immutable registry-guard generation and normalized contract digest,
-versioned manager-credential reference/principal fingerprint,
-and distinct nullable versioned lifecycle-credential reference/principal
-fingerprint. Those contract fields are immutable. Its mutable operational fields
-are closed `transition_kind NONE|POLICY_TRANSFER|PHYSICAL_RETIREMENT`,
-`custody_state ACTIVE|DRAINING|RETIRED`, nonnegative `open_location_count`,
-monotonic `retirement_generation`, nonnegative
-`retirement_enrolled_count`, nullable `retire_not_before`, a durable
-`retirement_scan_after_location_id` keyset cursor, `retirement_next_scan_at`, and
-a nonnegative `retirement_scan_attempt_count` plus closed error code and fenced
-scan lease owner/token/expiry triple. `POLICY_TRANSFER` means the same
-physical root and ownership kind may move exact operation-lease-free rows to the
-new revision without deletion while preserving durable references on the stable
-location ID. `PHYSICAL_RETIREMENT` means old bytes must be
-retired under this custody before its root reservation can be compacted.
-Physical retirement uses a validated profile-level grace that defaults to 24
-hours and is bounded from one hour through seven days. Activation sets
-`retire_not_before` from database time and commits without waiting for it.
-Its `(id, ownership_kind)` pair is unique for the location composite foreign
-key. Location insert increments `open_location_count` in the same transaction;
-policy transfer moves one count between exact custodies; location compaction
-decrements it once. A custody cannot become RETIRED while the counter is
-nonzero, and a bounded repair counts the custody-prefixed location index under
-that custody lock.
-Named checks require ACTIVE with transition NONE and no scan lease; DRAINING
-POLICY_TRANSFER with null grace and non-null next-scan time; DRAINING
-PHYSICAL_RETIREMENT with a positive generation and non-null grace/next-scan
-time; either DRAINING kind with an all-null or structurally complete scan lease;
-and RETIRED with zero open locations and no scan lease. Activation of
-PHYSICAL_RETIREMENT increments the generation and resets enrolled count to zero;
-the first and each later enrollment increment the count under the custody lock.
-A custody retry generation is monotonic and an attempt reset is accepted only
-through its fenced admin mutation.
-Secrets remain in the configured secret provider. A credential reference may
-be retired only after every location, delete-unknown or
-retire-delete-unknown row, and audit-retained manifest owned by that custody is
-settled. Every production managed custody snapshot requires a distinct
-lifecycle identity because superseded physical generations include canonical manifests;
-artifact purge remains a separately authorized admin operation. External
-custody requires the lifecycle identity to be null. Activation resolves each
-symbolic config name to an immutable
-secret-provider generation and expected cloud principal; config-name reuse
-cannot retarget historical custody. Ordinary eviction, artifact purge, and
-physical retirement use the location's historical lifecycle credential
-generation, availability repair uses
-its historical manager generation, and each verifies the expected caller
-principal before provider I/O. Neither substitutes current profile credentials.
-
-An older API or worker replica cannot roll the policy back, two different
-configurations cannot claim the same revision, and sustained worker traffic
-cannot starve an accepted profile edit. Provider capability probes remain
-outside every database transaction. Apply first attempts a fast path: one short
-transaction takes the config/catalog and sorted changed-profile locks, then runs
-four exact profile-prefixed `LIMIT 1` probes for live COPY, EXTERNAL_VERIFY,
-ordinary EVICT, and READY VERIFY leases. Migration 024 adds a fifth probe for a
-live BUILD_OUTPUT lease. It first requires the catalog's global active-apply ID
-to be NULL or idempotently equal. If all probes are empty, that transaction inserts the
-immutable snapshots and atomically advances config and heads.
-
-If any probe is nonempty, the same short transaction does not update config or
-active revisions. Instead it increments each changed head's monotonic
-`quiesce_generation`, stores a complete generation-fenced quiesce token and
-deadline on those heads, records one `QUIESCING` apply-ledger entry, and sets the
-catalog singleton's nullable `active_image_config_apply_id` before returning
-`202`. That scalar is the database-enforced single global nonterminal apply
-authority. A different apply fails with `IMAGE_CONFIG_APPLY_IN_PROGRESS` and
-the active resource ID even when it touches disjoint profiles; an identical
-idempotency key returns that resource. Every later ordinary COPY,
-EXTERNAL_VERIFY, EVICT, READY VERIFY,
-or BUILD_OUTPUT claim locks its exact profile head and declines the claim while
-a nonexpired token covers that active revision. Historical
-PURGE_DELETE/PURGE_INSPECT and RETIRE_DELETE/RETIRE_INSPECT work uses retained
-custody and is deliberately unaffected. An already owned ordinary lease may
-heartbeat and finalize, but its worker checks the quiesce token between bounded
-provider calls, starts no additional call after observing it, and either settles
-or safely surrenders before the overall deadline. Every provider call has an
-explicit timeout shorter than the remaining operation lease.
-
-A leaderless database-only activation reconciler runs as a dedicated
-high-priority loop in every API replica and can observe only that one global
-active ID. Each cycle first takes a nonblocking session advisory lock derived
-from the apply UUID, so one replica heartbeats while another can take the next
-cycle immediately after process or connection loss. Every five seconds it
-attempts one sorted primary-key batch heartbeat
-of all at-most-256 covered heads with a five-second lock timeout and ten-second
-statement timeout. A healthy coordinator must complete one batch no later than
-15 seconds after the prior success; missing that service objective fails its
-managed-image readiness and alerts, while the 60-second lease leaves multiple
-bounded retries before claims can resume. Heartbeat has no provider I/O, no
-catalog population scan, and no per-workspace work; it records bounded
-`last_heartbeat_at` evidence on the sole ledger entry. After heartbeat, the loop
-runs the same five uncapped `LIMIT 1` probes without retaining database locks
-between attempts. The overall apply deadline defaults to 30 minutes and is
-validated from 5 minutes through 2 hours. Once all probes are empty, one final
-short transaction locks
-the config/catalog and all changed heads in global order, verifies the proposal,
-config generation, evidence generations, apply ID, quiesce generations, token
-hashes, and unexpired deadline, repeats the five probes, and atomically inserts
-snapshots, advances config and heads, clears the tokens, and records COMMITTED.
-It also clears `active_image_config_apply_id` in that commit. No claim can enter
-after that locked recheck. There is no polling or provider I/O while database
-locks are held.
-
-If all coordinators disappear, the short quiesce lease expires and ordinary work
-may resume. On restart, the pending ledger entry reacquires every changed head
-in sorted order by advancing its quiesce generation and replacing the complete
-token vector; a claim that entered during the outage is then allowed to drain.
-Thus progress is guaranteed after one coordinator remains healthy, without
-making API availability an image-work availability dependency. Cancellation or
-deadline expiry locks the same heads, clears only a matching current token, and
-records CANCELLED or TIMED_OUT while clearing the matching catalog active ID. A
-stale coordinator or old token can neither activate nor clear a later apply.
-The single-global-apply rule deliberately trades rare administrator config
-parallelism for a provable heartbeat and atomic multi-profile contract.
-
-Migration 023 creates one activation-only partial index for each ordinary kind,
-keyed `(distribution, profile_revision, lease_expires_at, id)`. Their literal
-predicates require the kind's structurally complete lease and
-`purge_generation = 0 AND retirement_generation = 0`, deliberately contain no
-`attempt_count` predicate, and the query adds the half-open
-`lease_expires_at > :locked_now` bound. Migration 024 adds the BUILD_OUTPUT
-index with the same rules. A live twentieth claim therefore remains visible
-even though its future expired-reclaim path requires operator action. Keeping
-the activation kinds separate lets PostgreSQL use exact partial indexes instead
-of scanning an OR-shaped profile predicate. The four migration-023 names are
-`ix_ci_loc_activate_copy`, `ix_ci_loc_activate_external_verify`,
-`ix_ci_loc_activate_evict`, and `ix_ci_loc_activate_verify`; migration 024 adds
-`ix_ci_loc_activate_build_output`. Their exact predicates are:
-
-| Activation index | Literal predicate |
-| --- | --- |
-| COPY | `ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0 AND state = 'COPYING' AND lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| EXTERNAL_VERIFY | `ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0 AND state = 'VERIFYING' AND lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| EVICT | `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation = 0 AND retirement_generation = 0 AND state = 'EVICTING' AND lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| VERIFY | `purge_generation = 0 AND retirement_generation = 0 AND state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| BUILD_OUTPUT, migration 024 | `ownership_kind = 'MANAGED' AND canonical IS TRUE AND purge_generation = 0 AND retirement_generation = 0 AND origin_kind = 'BUILD' AND state = 'COPYING' AND lease_kind = 'BUILD_OUTPUT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-
-No predicate contains `attempt_count`, `next_retry_at`, or a database clock.
-Each probe binds the exact old active revision and adds
-`lease_expires_at > :locked_now`. Activation inserts the immutable
-revision/custody snapshot, changes only the head authority row, and marks at most
-the profile's 128 superseded target custodies DRAINING with the appropriate
-transition kind. PHYSICAL_RETIREMENT increments each affected custody's
-retirement generation exactly once and resets its enrolled count;
-POLICY_TRANSFER does not change either value. It never
-rewrites the dominant location population. Old rows
-become unavailable immediately through the head join. A bounded
-historical-generation reconciler later scans each DRAINING custody by its durable
-location-ID cursor. For `POLICY_TRANSFER`, it transfers one exact row only while
-no materialization, verification, build-publication, eviction, purge, or
-retirement operation owns it; durable consumer references remain attached to
-the stable row. For `PHYSICAL_RETIREMENT`, activation has incremented the
-custody's positive retirement generation and the reconciler enrolls
-the exact row into the disjoint retirement state machine after rollback grace
-and reference fences pass. Every complete ordinary lease encountered after
-activation is necessarily expired. Under the exact row lock, the historical
-reconciler turns uncertain COPY into retryable FAILED, uncertain EVICT into
-MISSING, an expired READY VERIFY into READY with a deferred request, and expired
-EXTERNAL_VERIFY into AWAITING_EXTERNAL_PUSH with bounded diagnostic state. It
-repairs malformed ordinary lease triples through the same conservative helper,
-then transfers or enrolls on a later scan. Impossible ownership is never cleared
-or relabeled. BUILD_OUTPUT, artifact PURGE_DELETE/PURGE_INSPECT, and retirement
-leases are settled only by their owning state machines. Expiry is half-open: a lease is owned only while
-`expires_at > now`, and is reclaimable at `expires_at <= now`. Named checks
-allow only COPY or BUILD_OUTPUT on COPYING, EXTERNAL_VERIFY on VERIFYING, EVICT
-or PURGE_DELETE on EVICTING, VERIFY on requested READY, PURGE_INSPECT on
-DELETE_UNKNOWN, RETIRE_DELETE on RETIRING, and RETIRE_INSPECT on
-RETIRE_DELETE_UNKNOWN. Activation counts only its five ordinary/build kinds;
-every other pair is historical work that does not require the active head. A
-lost canonical manifest or exact-second late worker
-therefore cannot deadlock or mutate the repair revision. A broken historical
-credential keeps its custody in DRAINING with an operator-visible closed error
-and blocks retirement or purge completion; it is never silently replaced by
-unrelated current authority. Config rollback is always a new profile revision
-strictly above the permanent highest value; it never moves the head backward.
-That new revision may reuse a DRAINING historical physical root only while the
-old custody has `retirement_enrolled_count = 0`, no scan/delete lease exists,
-and no physical delete has started. Activation creates the new revision's
-custody on that retained realm, changes the old custody from
-PHYSICAL_RETIREMENT to POLICY_TRANSFER, preserves its monotonic retirement
-generation, clears canceled grace/due fields, and fences any old scan token.
-The bounded transfer worker then moves exact rows to the new custody. After
-that boundary reuse fails closed with
-`IMAGE_GENERATION_RETIREMENT_STARTED`. There is no
-implicit revision or synthetic legacy fingerprint in either the configuration
-parser or location API. The final revision compare-and-swap must affect exactly
-one row; a concurrent activation is surfaced for retry rather than silently
-reported as applied.
-
-### Atomic configuration and profile activation
-
-The central PostgreSQL configuration row and global image profile heads are one
-authority boundary. Migration 023 extends the singleton
-`container_image_catalog` row with `active_config_generation`,
-`active_image_config_digest`, nullable `active_image_config_apply_id`,
-checked non-releasable `lifetime_profile_name_count`,
-`minimum_image_api_version`, and
-the monotonic `distribution_state_ever_created` and
-`builder_state_ever_created` witnesses, plus `config_apply_results`, the bounded
-JSONB apply-result ledger described above. Apply keys are UUIDv7 values, are
-accepted only within bounded clock skew and a 24-hour request/retry window, and
-remain recoverable for that complete window. Each entry is at most 64 KiB,
-contains at most 256 sorted changed profiles, and stores only hashes and bounded
-closed diagnostics. The transaction removes only terminal expired oldest
-entries; it never removes QUIESCING work. If 256 unexpired entries remain it
-returns `IMAGE_CONFIG_APPLY_LEDGER_FULL` before changing any row.
-Named catalog checks and the config-write trigger require the active apply ID to
-be NULL or to identify the ledger's sole QUIESCING entry; no second QUIESCING
-entry can be inserted. Terminal transition and scalar clearing are one update.
-The database-backed API-server config writer is refactored so every whole-config
-update locks the existing `config_yaml` row and this catalog singleton first,
-compares both the submitted generation and prior complete-config digest, and
-commits through one caller-owned PostgreSQL session. The migration-023 trigger
-rejects the legacy one-statement writer before it can enter this lock protocol,
-including when that statement began waiting before a distribution activation
-committed. A file- or PVC-backed API server may edit ordinary local
-configuration, but it cannot activate managed images; managed-image activation
-requires the central PostgreSQL config row.
-
-Validation and provider capability probes run before the transaction and
-produce bounded, secret-free evidence digests. The shared helper rereads and
-normalizes the complete proposed config, verifies its diff hash and evidence
-generations, rejects more than 256 active or changed profiles or 128 targets per profile,
-and follows the fast-path or durable-quiesce protocol above. The immediate or
-final activation transaction inserts immutable realm, profile-revision, and
-custody rows, advances each changed distribution's one global profile head,
-writes the complete YAML value, and increments the singleton generation/digest
-in one commit. For a new name it checks and permanently increments the 1,024
-lifetime-name counter. For an edit it requires the submitted revision above the
-head's non-releasable highest value and retained count below 64, marks the prior
-revision superseded, and increments both retained count and highest revision.
-Removal marks the old revision superseded and head REMOVED without inserting a
-replacement revision. All changed profile keys are sorted. An unchanged physical root and
-ownership kind selects POLICY_TRANSFER; every root or ownership change selects
-PHYSICAL_RETIREMENT and a disjoint realm generation. Removing a profile first
-moves its at-most-128 retained target custodies to DRAINING with
-PHYSICAL_RETIREMENT and is rejected only when the new config would orphan
-required current authority. Existing durable consumers retain their exact old
-rows until they release them. No cloud, registry, filesystem, ConfigMap, or
-secret-provider I/O occurs under the transaction.
-
-Both the typed image editor and raw Settings editor use this helper. A raw edit
-that does not change image configuration still takes the same config-row
-compare-and-swap, so it cannot overwrite a concurrent image activation. If it
-changes the generation expected by a QUIESCING apply, its transaction locks that
-apply's bounded sorted heads, clears only matching tokens, and records CANCELLED
-while clearing the catalog active ID before committing the newer config; it
-never leaves an orphaned quiesce. A
-repeated idempotency key with the same request hash returns the current
-QUIESCING or terminal result from any unexpired ledger entry, even after later
-applies. Reuse with different bytes fails closed, while a key older than the
-retry window is rejected rather than becoming reusable after ledger expiry. A
-crash before the initial transaction commits creates no apply. A crash after a
-QUIESCING commit is recovered from the ledger and head tokens. A crash or lost
-response after final commit is recovered from the recorded generation and
-idempotency result, so config revision 2 with profile head 1, or the reverse, is
-not a representable state.
-
-Quiesce creation, cancellation, and final commit emit PostgreSQL `NOTIFY` only
-as a wakeup. Every API and worker replica
-also polls the singleton generation, reloads the complete DB config, validates
-its digest, and records the locally loaded generation. Managed-image request
-admission, queue claim, and final transition compare that generation under the
-phase-1 catalog lock; a stale or failed replica returns
-`IMAGE_CONFIG_RELOAD_PENDING` or skips work until it converges. Ordinary
-non-image operations remain available. The in-process reload hook and
-Kubernetes ConfigMap mirror are post-commit conveniences, never authority and
-never a way to advance a profile head. Activation remains disabled during a
-mixed-version rollout until every participating API, controller, and worker
-advertises this generation protocol.
-
-All profiles accept only the literal `namespace_root` and the fixed
-generation/workspace/assigned-shard renderer above. Arbitrary templates and the shorter
-legacy external layout are rejected.
-Cross-workspace physical deduplication would require a global reference and
-eviction authority model; the workspace-scoped catalog deliberately refuses to
-pretend it has one. Profile validation rejects a namespace root whose fixed
-canonical repository-generation prefix overlaps another retained realm
-generation on the same normalized registry authority. The activation
-transaction's provider-neutral unique prefix reservation rejects concurrent or
-historical overlap even when no profile
-head currently points at the retained custody.
-
-Kubernetes is explicit because a registry being close to a cluster does not
-prove that its nodes or service accounts can pull it:
-
-```yaml
-container_registries:
-  kubernetes_contexts:
-    production-eks:
-      registry_provider: aws
-      registry_region: us-east-1
-      registry: 699....dkr.ecr.us-east-1.amazonaws.com
-      auth_strategy: node_identity
-      runtime_platforms: [linux/amd64]
-    research-gke:
-      registry_provider: gcp
-      registry_region: us-central1
-      registry: us-central1-docker.pkg.dev/skypilot-images
-      auth_strategy: node_identity
-      runtime_platforms: [linux/amd64]
-  vm_bindings:
-    - provider: nebius
-      region: eu-north1
-      instance_type: gpu-h100-sxm
-      registry: registry.example.internal/skypilot
-      auth_strategy: anonymous
-      runtime_platforms: [linux/amd64]
-```
-
-These bindings are assertions about pre-bootstrapped runtime access to one
-exact normalized registry prefix. `node_identity` specifically means the
-kubelet or node identity used for image pulls, not a pod service account. Pod
-service-account credentials become available only after the image has already
-been pulled and therefore cannot authorize this operation. Provider and region
-alone are not authority. Binding regions are stripped, lowercased, validated
-against the registry provider's bounded region grammar at admission, and
-revalidated on the concrete placement. An exact Kubernetes binding takes
-precedence over target-level anonymous access because it is the more specific
-runtime authority:
-two ECR accounts or GAR projects in one region may have different access. The
-current implementation does not advertise a pull-secret strategy because it
-does not yet carry a secret name into the pod template. A future
-secret-reference binding must name an existing secret and inject only that
-name, never the credential value.
-
-Runtime platform is an admission fact, not a best-effort hint. SkyPilot first
-uses the concrete cloud catalog architecture. When a VM provider or Kubernetes
-context cannot prove it, an exact context or `(provider, region,
-instance_type)` binding must declare the finite `runtime_platforms` set. The
-artifact must cover every declared platform. A missing binding fails closed;
-an unknown placement never accepts an AMD64-only or ARM64-only image merely
-because either platform is common. Providers such as Nebius should implement
-their catalog architecture mapping so ordinary configurations do not need an
-override. Bindings are assertions administrators can audit and test, not
-architecture guesses in the registry resolver.
-
-VM placement intentionally does not infer an ECR account or GAR project from
-API-server credentials because the remote workload identity can differ and may
-have cross-account access. Profile admission rejects two targets whose
-effective locality overlaps on the same provider and region, even if their
-aliases sort deterministically. Administrators split those endpoints into
-separate distributions. This moves ambiguity to configuration validation
-rather than discovering it during a launch. Exact Kubernetes and VM bindings
-still prove pull authority and runtime platform, but they do not make an
-ambiguous distribution valid.
-
-Raw R2 object storage is not an OCI registry. An OCI-compatible registry whose
-blob store is backed by R2 can be configured as a generic target. R2 can also
-remain an explicit rollback archive, but it is not a transparent Docker pull
-fallback.
-
-## Restart and policy-rotation semantics
-
-The pre-provision INIT transaction pins the exact pull plan and durable
-location reference before that plan is rendered into a VM or Kubernetes
-runtime. The READY transition is a continuation of the same launch and must
-preserve that execution state. If an administrator activates a new profile
-revision while provisioning is in progress, it applies to later launches and
-restarts; SkyPilot must not rewrite the durable handle to a route the running
-runtime never received. This also keeps the INIT reference as the eviction
-fence for the bytes actually in use.
-
-A resolved managed route is reusable only while its distribution, profile
-revision, policy fingerprint, physical destination fingerprint, target alias,
-placement-specific runtime auth, the derived runtime login instruction, digest,
-reference, and READY location all still agree with the current catalog and
-complete administrator profile. A
-policy-only edit such as an ECR pull-auth rotation may reuse the same verified
-bytes and stable location ID, but it still produces a new resolved pull plan.
-The old serialized auth or login instruction is never carried forward.
-Docker-compatible source references without an explicit registry authority
-retain their user-facing shorthand but derive `docker.io` as their runtime
-authority. This makes digest-pinned Docker Hub fallback portable across VM and
-Kubernetes backends instead of failing with an untyped missing-authority
-assertion.
-SSH node pools use SSH only as their control transport: workloads run as k3s
-pods, so registry selection, pull identity, and restored-pod enforcement treat
-them as Kubernetes rather than VM Docker. Kubernetes restoration resolves the
-active head node type and rewrites exactly its `ray-node` container; an unused
-default node type cannot mask a divergent active runtime image.
-
-Restart resolution drops and recomputes a stale or unavailable plan from the
-immutable artifact selector. It may select another verified location under the
-current policy. A WARMING source fallback is likewise per-attempt rather than
-permanent: a later restart upgrades to a managed READY route when one exists.
-The final cluster transaction locks the exact location and active profile
-revision, compares every policy-snapshot field, and replaces the durable
-location reference only with the cluster-handle update. A direct caller with a
-stale handle therefore rolls back without leaving either a cluster row or an
-image reference. It also recomputes runtime pull authority and the exact
-`DockerLoginConfig` from the concrete VM or Kubernetes placement and current
-context binding. Only a non-launch status refresh carrying the exact selector,
-resolved plan, provider/backend/region, login instruction, and location
-reference already stored in the durable handle may skip revalidation. Naming
-the same location with changed placement, auth, login, or selector state is not
-a no-op.
-
-A locationless WARMING plan is checked at the same persistence boundary. It is
-valid only for the exact digest-pinned source selector durably bound to the
-artifact, while the live workspace policy remains `managed_preferred` with
-`locality: prefer`. Release-only and artifact-only selectors, unresolved
-managed selectors, mismatched login servers, and inline credentials cannot be
-persisted as source fallbacks. The same cluster-handle transaction inserts its
-artifact/source `SOURCE_FALLBACK` consumer reference; failure of either write
-rolls back both. The source reference and concrete placement
-also deterministically derive the runtime pull authority: ECR on an AWS VM
-pins `ecr_runtime_identity` and its exact value-free ECR login instruction,
-GAR on a GCP VM pins the equivalent GAR identity, and Kubernetes requires an
-exact configured registry-prefix binding. A recognized private cloud registry
-on any other placement fails closed before provisioning instead of attempting
-an anonymous pull. Arbitrary OCI authorities retain the existing direct-source
-contract because privacy cannot be inferred from their host name.
-
-Node provisioning may last minutes. The READY commit therefore reads the
-durable INIT handle and preserves the plan only when the complete execution
-state and existing location reference are identical to the handle that was
-actually rendered. It does not re-resolve against a revision activated during
-provisioning. A same-physical, same-ownership POLICY_TRANSFER preserves that
-stable location reference and does not rewrite the INIT plan. A later real
-restart re-resolves before rendering and atomically moves the handle and
-reference to the current revision.
-
-## Durable data model and authority
-
-### `container_image_workspace_quotas`
-
-One row per workspace stores `artifact_count`, `release_reservation_count`,
-non-releasable `publication_generation_count`, retained
-`publication_record_count`, `location_record_count`, and `materialized_bytes`
-as nonnegative counters plus update time. `materialized_bytes` means reserved
-logical compressed bytes for every location whose
-`charged_materialized_bytes` is non-null, including failed or ambiguous
-materializations, rather than only READY bytes. PostgreSQL
-check constraints reject negative or signed-64-bit-overflow values. All quota
-authorizations lock this row before the artifact/location they may create, so
-concurrent users cannot oversubscribe a limit. Policy limits remain validated
-configuration rather than database state; changing a limit does not rewrite
-the counters. `artifact_count` is deliberately a lifetime distinct-digest count:
-creating the first `(workspace, digest)` increments it exactly once, and
-tombstone, purge, audit compaction, or release removal never decrements it. A
-workspace that exhausts this v0 safety bound must receive an explicit quota
-increase or use a new workspace. The byte counter is reconstructible exactly as
-the indexed sum of non-null per-location charges. Materialized-byte and
-compactable child-record counters are released under their narrower
-proved-absence rules. Every newly
-inserted publication row increments `publication_generation_count` exactly
-once, and no release, retry, purge, audit compaction, or row deletion decrements
-it. `release_reservation_count` is reconstructible as the indexed count of this
-workspace's publications whose state is not RELEASED, including READY, FAILED,
-and CANCELLED. `publication_generation_count` is the finite bound on the
-immutable audit history.
-
-### `container_image_catalog_summaries` and `container_image_catalog_facets`
-
-Dashboard scale uses explicit read projections, not a selective walk over the
-artifact index. One summary row per artifact stores revision-independent source,
-release, publication-state, and latest-change counters. Current-location counts
-are intentionally not stored there because profile activation must remain O(1).
-A facet row mirrors each physical location's workspace, artifact ID, artifact
-creation key, lifecycle, distribution, profile revision, custody ID, target,
-canonical flag, and closed state. A current query joins its revision to the
-small `container_image_profile_heads` authority, so one head update immediately
-excludes all old-revision facets without rewriting them. Facets contain no
-registry credential, endpoint, or source value.
-
-Every location insert/state transition and artifact/publication lifecycle
-mutation updates its facet or summary in the same PostgreSQL transaction under
-the shared lock order. These projections are read acceleration, not lifecycle
-authority. Application transactions and nonnegative checks prevent ordinary
-drift, but they do not pretend to prove cross-table equality. A scheduled
-integrity check compares bounded artifact pages to source rows, emits drift
-metrics, and a fenced operator repair rebuilds one artifact or one keyset page.
-Dashboard results may be temporarily stale under detected projection drift;
-launch, purge, quota, and worker decisions never read these tables.
-
-The catalog API accepts only these indexed filter shapes: no filter; lifecycle
-alone; distribution alone; distribution plus target; distribution plus state;
-distribution plus state and target; or distribution plus state, target, and
-canonical. Target or state without distribution, canonical without all three
-predecessors, and every other combination is a 400 error. Exact artifact,
-release, and source selectors use their authority indexes. Literal migration
-023 creates these two artifact-ordering indexes for the first two shapes:
+Terraform creates every v0 repository before profile activation. For each
+declared workspace, region, and shard index, the name is deterministic:
 
 ```text
-ix_container_images_catalog_order
-  (workspace, created_at DESC, id DESC)
-ix_container_images_catalog_lifecycle_order
-  (workspace, lifecycle, created_at DESC, id DESC)
+<prefix>/<workspace>/s<two-hex-index>
 ```
 
-It also creates the five exact facet indexes below, with ordering columns
-immediately after every shape's equality keys:
+The shard is selected by stable digest hashing. `shard_count` is immutable for a
+profile revision and must be between 1 and 256. Capacity is checked during
+Terraform planning against the applied ECR repository and images-per-repository
+quotas with explicit headroom. Supporting a million retained manifests normally
+requires multiple fixed shards. Expanding beyond the layout creates a new
+post-v0 profile revision and explicit migration; v0 does not create repositories
+during placement or copy.
+
+No Terraform action copies image content. Canonical and regional manifests are
+created only from durable intents.
+
+### IAM boundary
+
+The module creates or accepts four distinct roles:
+
+- API role: metadata reads and intent writes in PostgreSQL, no ECR writes;
+- copy-worker role: ECR read, layer upload, and `PutImage` in the fixed prefix,
+  no manifest deletion or repository administration;
+- lifecycle-worker role: describe and `BatchDeleteImage` for eligible regional
+  cache manifests, no push or repository deletion; and
+- workload role: token and pull operations only.
+
+Repository creation/deletion, registry-policy mutation, IAM, KMS, and account
+administration stay with Terraform. The module may manage an ECR registry V2
+policy only when it is the declared sole owner. Otherwise the profile is
+external and SkyPilot makes no managed-custody claim.
+
+Negative tests grant a probe principal broad identity permissions and prove the
+resource boundary still rejects writes outside the copy role, deletes outside
+the lifecycle role, and every repository deletion path.
+
+### Terraform deliverables
 
 ```text
-ix_ci_facets_distribution_order
-(workspace, distribution, profile_revision,
- artifact_created_at DESC, artifact_id DESC)
-ix_ci_facets_distribution_target_order
-(workspace, distribution, profile_revision, target,
- artifact_created_at DESC, artifact_id DESC)
-ix_ci_facets_distribution_state_order
-(workspace, distribution, profile_revision, state,
- artifact_created_at DESC, artifact_id DESC)
-ix_ci_facets_distribution_state_target_order
-(workspace, distribution, profile_revision, state, target,
- artifact_created_at DESC, artifact_id DESC)
-ix_ci_facets_distribution_state_target_canonical_order
-(workspace, distribution, profile_revision, state, target, canonical,
- artifact_created_at DESC, artifact_id DESC)
-```
-
-A descending artifact cursor adds the strict row predicate
-`(created_at, id) < (:created_at, :id)`; a facet cursor uses
-`(artifact_created_at, artifact_id) < (:created_at, :id)` after the complete
-equality prefix. The cursor payload binds the normalized filter tuple, so it
-cannot be replayed against another shape. Checked-in PostgreSQL plans must name
-the corresponding index for first-page, deep-page, and zero-match queries.
-Neither the unfiltered nor lifecycle-only plan may sequentially scan the
-workspace population at one million rows.
-
-A distribution query first loads its one permanent head, requires
-`head_state = 'ACTIVE'`, then uses that exact active revision in the matching facet index;
-it never scans historical revisions or an unbounded set of profile heads.
-Filtered queries deduplicate one bounded page of artifact IDs, then load
-artifacts and revision-independent summaries in a fixed number of statements.
-An artifact's authoritative retained `location_count` is locked on insertion
-and has a database check of 0 through 512; workspace policy may set a lower
-limit no smaller than 256. This permits one complete 128-target generation to
-coexist with its replacement and bounds four complete generations while
-30-day retirement audit retention is pending. A fifth full generation fails
-location intent with `IMAGE_RETAINED_LOCATION_LIMIT` until retirement compacts
-older rows; activation itself still performs no artifact scan. Separately, a
-profile revision stores a checked target count of at most 128, and a uniqueness
-constraint admits at most one location per `(artifact_id, target_custody_id)`.
-Those database-backed facts cap qualifying current-revision facets at 128 per
-artifact even though retained history is larger. Unfiltered pages use the
-artifact ordering index directly.
-
-### `container_image_realm_generations` and `container_image_realm_allocations`
-
-One immutable realm-generation target row stores the provider-neutral canonical
-registry `host[:port]`, complete repository-generation prefix, owning
-distribution, immutable `ownership_kind`, provider-policy metadata,
-Terraform-declared or externally attested workspace capacity, shard count from
-1 through 256, fixed two-hex renderer, quota/inventory snapshot digest, and
-registry-guard ownership identity, which excludes rotatable manager and runtime
-credential generations. Canonical and regional
-targets receive separate rows, while policy-only profile revisions reuse the
-same row. This existing table is the physical-root reservation, not an
-additional eighteenth table.
-
-A uniqueness constraint over `(canonical_registry_authority,
-canonical_repository_generation_prefix)` admits exactly one owning distribution
-and one immutable shard policy until the row is compacted. It deliberately
-excludes provider, account/project, region, configured endpoint/root split, and
-shard count, so alternate adapter descriptions or different shard counts cannot
-reserve the same `shard-00` repository twice.
-
-One allocation row per `(realm_generation_id, workspace)` reserves a stable
-workspace namespace slot. It stores immutable shard count, the fully rendered
-workspace prefix, hard per-shard manifest capacities, and current
-reserved-manifest counts as bounded arrays of exactly that shard count. Every
-element is a nonnegative BIGINT and each reservation is checked against its
-matching hard capacity. V0 managed generation prefixes begin empty, so there is
-no imported baseline-manifest vector to reconcile. Profile activation locks and
-validates the immutable realm generation but creates no workspace rows. First
-use locks the realm and creates the allocation before any repository or
-location intent, so activation never fans out over configured or historical
-workspaces.
-
-First location creation for one artifact locks that allocation in phase 2,
-reuses any existing `(realm_generation_id, workspace, image_id)` location
-mapping, or chooses the shard with the lowest
-`reserved_manifest_count` and then lowest index among those below capacity. It
-increments that shard reservation and creates the
-location with `assigned_shard_index` in the same transaction. A uniqueness
-constraint on that triple makes concurrent identical creation converge. The
-allocation row serializes only this short first-location transaction; provider
-I/O and launch do not hold it. Reservation is released only when exact manifest
-absence is proved and the terminal location is compacted. EVICTED locations
-that may rematerialize retain both mapping and reservation. Adversarial digest
-prefixes therefore cannot bias placement or exceed a repository's hard count.
-
-The bounded activation transaction locks realm reservations and global heads in
-their shared order, preventing two distributions from authorizing the same
-rendered physical destination; sharing
-capacity metadata never implies shared location authority. Realm and allocation
-rows are retained while any artifact, location, publication, delete-unknown or
-retire-delete-unknown outcome, purge or retirement lease, target custody, or
-manifest audit tombstone uses them. Explicit compaction deletes the reservation
-only after those exact absence checks and after every custody using it has
-reached RETIRED and completed audit retention. This is capacity
-authority only, not cloud state; the provider adapter still proves repository
-ownership and handles quota drift.
-
-### `container_image_registry_limiters` and
-`container_image_registry_permit_leases`
-
-Registry rate authority is global per `(provider, account, region,
-operation_class)`, not per pod. One limiter row stores the applied quota
-snapshot, conservative token capacity/refill rate, last-refill timestamp,
-available weighted tokens, shared penalty-until time, `live_permit_count`,
-`live_permit_weight`, and configured `max_live_permits` no greater than the hard
-4,096 ceiling for
-`AUTH_TOKEN`, `METADATA_READ`, `REPOSITORY_MUTATION`, `LAYER_CHECK`,
-`LAYER_READ`, `LAYER_INITIATE`, `LAYER_PART`, `LAYER_COMPLETE`,
-`MANIFEST_READ`, `MANIFEST_PUT`, `VERIFY`, and `DELETE`. Each admitted provider
-operation creates one live-only permit row with ID, limiter ID, owner,
-random-token hash, resource ID, positive weight, acquisition time, and expiry.
-It contains no closed state, response body, or retained outcome history.
-
-Acquisition locks the limiter, refills its rate tokens from elapsed database
-time, and reclaims at most 64 expired permits through the exact
-`(limiter_id, expires_at, id)` index. It probes `LIMIT 65`; if another expired
-row remains it commits only the bounded cleanup and returns retryable
-`REGISTRY_PERMIT_RECLAIM_PENDING`. Otherwise it checks the shared penalty,
-available rate tokens, live weight, configured live count, and hard 4,096 count,
-then consumes the rate token and inserts one permit atomically. A named insert
-trigger updates the locked parent's live count/weight only when both bounds
-remain valid, so direct or buggy insertion cannot exceed the database limit and
-an insertion failure rolls back token consumption. Completion locks the limiter
-then the exact permit, applies a success or throttle observation to the limiter,
-deletes the row, and lets the named delete trigger decrement live count/weight
-in the same short transaction. It never closes or retains a permit. A throttle
-extends the shared penalty and lowers the effective refill rate under bounded
-recovery.
-
-Rate-token consumption is not refunded on normal completion, expiry, crash, or
-pre-call surrender; elapsed-time refill is the only rate authority. Live
-count/weight separately bound concurrent in-flight calls. Permit expiry is
-longer than a provider call's explicit SDK timeout plus completion margin, is
-never heartbeated, and is checked with half-open database time. A worker crash
-therefore releases only concurrency after expiry and cannot double-spend rate
-capacity. A completion whose permit was already swept is fenced from all
-counter or penalty mutation and emits a stale-completion metric.
-
-An unlocked global sweeper discovers at most 256 expired IDs through
-`(expires_at, id) INCLUDE (limiter_id, weight)`, groups them by sorted limiter,
-then uses one short transaction per limiter that locks the parent before its
-exact permit rows. This bounds idle-limiter cleanup without reversing lock
-order. The two required indexes are
-`ix_ci_registry_permits_limiter_expiry (limiter_id, expires_at, id)` and
-`ix_ci_registry_permits_global_expiry (expires_at, id) INCLUDE (limiter_id,
-weight)`. Counter repair locks one limiter and scans only its exact at-most-4,096
-live rows. Independently expirable permit rows remain the ownership authority;
-the checked parent counters are a transactionally maintained admission bound,
-not a substitute for them.
-
-Every ECR API call made by the distribution worker or trusted publisher
-acquires its matching permit immediately before that call. The closed adapter
-mapping is literal: `GetAuthorizationToken` maps to `AUTH_TOKEN`;
-`DescribeRepositories`, `ListTagsForResource`, `GetRepositoryPolicy`, and
-`GetLifecyclePolicy` to `METADATA_READ`;
-`CreateRepository`, `TagResource`, `PutImageScanningConfiguration`,
-`PutImageTagMutability`, `SetRepositoryPolicy`, and `PutLifecyclePolicy` to
-`REPOSITORY_MUTATION`; `BatchCheckLayerAvailability`,
-`GetDownloadUrlForLayer`, `InitiateLayerUpload`, `UploadLayerPart`, and
-`CompleteLayerUpload` to their corresponding layer classes; `BatchGetImage` to
-`MANIFEST_READ`; `PutImage` to `MANIFEST_PUT`; `DescribeImages` and
-`ListImages` to `VERIFY`; and only `BatchDeleteImage` to `DELETE`.
-`DeleteRepository` is deliberately unmapped and is runtime-rejected before an
-SDK invocation, including for the lifecycle identity. Adding
-an ECR call without registering an operation class fails an adapter test and a
-runtime assertion before the SDK invocation. Authorization tokens are cached
-only until their bounded refresh margin and every mint is paced. Service
-Quotas, CloudWatch, Terraform, and the explicit operator inventory command are
-control-plane probes with their own bounded AWS SDK retry policy, not hidden
-data-plane calls covered by this invariant.
-
-The v1 copy/publisher adapters traverse a bounded manifest graph and own
-the ECR layer and manifest APIs directly, so they can pace actual calls. They do
-not hand credentialed pushes to an opaque subprocess. A local delay estimator
-may smooth polling, but it never admits a provider call without one exact live
-PostgreSQL permit. Scaling worker replicas therefore increases parallelism only
-while shared account/region budget remains. Permit acquisition is independent
-worker work and never blocks placement admission. Provider
-throttle metrics and CloudWatch usage remain operational feedback; the design
-does not claim to control calls made by external clients using the same AWS
-account.
-
-### `container_images`
-
-One row per `(workspace, digest)`:
-
-- stable artifact ID;
-- digest, bounded unique OCI `os/architecture[/variant]` platform set, and
-  nonnegative signed-64-bit compressed size backed by a PostgreSQL `BIGINT`;
-- closed initial producer kind (`external_oci` or `managed_build`), optional
-  64-hex producer spec hash, and optional bounded builder-version identifier;
-  later same-digest build convergence is recorded on the build without
-  rewriting this initial provenance;
-- lifecycle state (`ACTIVE`, `TOMBSTONED`, `PURGING`, or `PURGED`), tombstone
-  actor/reason/time, and purge completion time;
-- nonnegative active `active_release_reservation_count` capped by
-  `max_releases_per_artifact`, lifetime `publication_generation_count` capped at
-  256, retained `publication_record_count` capped at 256, and `location_count`
-  capped at 512, maintained under the artifact lock for bounded child records;
-- timestamps and creator hash;
-- no profile, endpoint, runtime auth, or credential data.
-
-The row and digest uniqueness survive PURGED forever. This is both the
-nonresurrection witness and the hard bound on historical artifact cardinality;
-no compactor replaces it with an uncounted tombstone table or frees its lifetime
-artifact slot. Catalog plans and quotas therefore include every retained
-lifecycle state, not only ACTIVE content. Its publication-generation counter is
-likewise monotonic and remains after publication query rows are compacted.
-
-Literal migration 023 creates no artifact-level `source_ref` or
-`resolved_source_ref` columns. Immutable aliases live only in
-`container_image_sources`; a managed-build artifact may have none. No artifact
-lookup, destination renderer, runtime validator, or fallback infers a source
-from the artifact row.
-
-Migration 023 creates the producer columns with an exact named check that
-allows only `external_oci` and requires both builder-specific fields NULL.
-Migration 024 drops that named check and installs the final one-of check:
-`external_oci` still requires both builder fields NULL, while `managed_build`
-requires a lowercase 64-hex producer spec hash and nonempty bounded builder
-version. Content convergence never rewrites an existing artifact's initial
-producer tuple. Migration 024 therefore permits a BUILD-origin canonical
-location to reference a build even when the artifact's immutable initial
-producer remains `external_oci`; origin proves that location's bytes, not who
-first registered the workspace digest.
-
-`active_release_reservation_count` is the artifact-local authority for active
-publication names. It equals the bounded indexed count of that artifact's
-publication rows whose state is not RELEASED. Reservation creation increments
-it once in the same workspace-quota/artifact transaction that increments the
-workspace active reservation, both lifetime generation counters, and both
-retained-record counters. A never-READY RELEASED transaction decrements the two
-active counters exactly once and no other transition decrements them. READY,
-FAILED, and CANCELLED remain charged. A fenced operator repair locks the
-workspace quota then artifact and recomputes the per-artifact count through
-`ix_container_image_publications_artifact_order`; at most 256 rows exist, so it
-never performs an unbounded scan or trusts a negative repair result.
-
-### `container_image_sources`
-
-One immutable source alias bound to one artifact. Multiple digest-pinned
-sources may resolve to the same content. Fallback is authorized only by the
-exact source in the current request; a release or artifact selector never
-inherits the first historical source stored on the artifact.
-
-### `container_image_releases`
-
-One immutable workspace-scoped name bound to one artifact. Multiple release
-names may point to the same content. Literal migration 023 creates a release
-row only through canonical READY finalization and records its authorizing
-publication plus `published_location_id`, physical fingerprint, and audit hash
-as immutable scalar evidence, not as a live location foreign key. Runtime
-resolution uses the release's artifact ID and current profile, never that
-historical location. Pending intent exists only in
-`container_image_publications`. Rebinding an existing successful release to a
-different digest fails. Selectors require an ACTIVE artifact, so pending or
-tombstoned content cannot be newly adopted.
-
-### `container_image_publications`
-
-One durable reservation generation per `(workspace, release)`, with at most one
-non-RELEASED generation active while a release is pending:
-
-```text
-id, workspace, release, image_id, distribution, route_profile_revision,
-retry_source_id NULL, completed_source_id NULL,
-canonical_location_id NULL, completed_location_id NULL,
-last_attempted_location_id NULL,
-completed_location_fingerprint NULL, completed_location_audit_hash NULL,
-state PENDING|READY|FAILED|CANCELLED|RELEASED,
-attempt_count, retry_generation, reservation_generation,
-error_code,
-created_by, created_at, updated_at, completed_at NULL,
-released_by/reason/at NULL
-```
-
-Migration 023 creates
-`ix_container_image_publications_artifact_order` on
-`(workspace, image_id, created_at DESC, id DESC)` for the bounded history
-endpoint. Its cursor adds `(created_at, id) < (:created_at, :id)` after the exact
-workspace/artifact prefix. It also creates
-`ix_ci_publications_pending_location (canonical_location_id, id) WHERE state =
-'PENDING' AND canonical_location_id IS NOT NULL` so canonical completion finds
-only its exact bounded finalizer set. The artifact's hard 256-publication limit
-is an independent upper bound on every failure, detachment, and repair pass.
-
-`canonical_location_id` is the only live location foreign key and exists only
-while a never-READY publication may still finalize or retry against that exact
-route. `distribution` and `route_profile_revision` are bounded scalar routing
-evidence, not foreign keys that retain historical revisions. Source-backed
-publication also retains only its exact explicitly submitted immutable
-`retry_source_id`; artifact-backed publication stores NULL and never inherits an
-artifact alias. READY completion
-moves its UUID into `completed_location_id`, stores the bounded physical
-fingerprint/audit hash, clears the live foreign key, and creates the release's
-matching scalar evidence in the same transaction. The completed ID is an audit
-identifier, not a foreign key or runtime route. READY moves any retry source ID
-to scalar `completed_source_id`. Never-READY RELEASED clears its
-live foreign key after all finalizer/lease fences. A supersession detachment
-moves the old UUID to scalar `last_attempted_location_id` and clears the foreign
-key. Therefore permanent release
-and bounded publication history preserve provenance without pinning a retired
-location row or realm allocation forever.
-
-The reservation prevents two digests from racing for a name without making the
-name launchable. Canonical READY completion follows the global phases through
-artifact and canonical location, then locks every exact-location PENDING
-publication and its release-name key in sorted order. It verifies the exact
-digest and active profile revision, inserts every immutable release, and marks
-all matching publications READY in one transaction. Quota was reserved before
-copy, and uniqueness rejected conflicting names, so one valid sibling cannot be
-silently omitted. Canonical terminal failure uses the same bounded publication
-set and marks every matching PENDING row FAILED with one closed code while
-keeping each reservation for authorized retry. An administrator may cancel only a
-terminal FAILED publication with no release row; cancellation is audited and
-stores any live route as scalar `last_attempted_location_id`, clears that
-foreign key, and keeps the digest reservation so a same-digest retry can
-reactivate it. A
-successful READY release is permanently bound. Named checks require PENDING to
-carry a live canonical ID; READY and RELEASED to have none; CANCELLED to have
-none; and FAILED either to retain a retryable exact route or to have closed
-`PROFILE_SUPERSEDED` with a scalar last-attempted ID and no live foreign key.
-
-An authorized publication retry locks quota, current profile head, artifact,
-current canonical route, and the publication in global order. It requires the
-same workspace, artifact, release, and distribution, increments
-`retry_generation`, updates scalar `route_profile_revision`, binds the current
-canonical location, clears the prior terminal route code, and returns the same row to
-PENDING without consuming another name, lifetime-generation, or record slot. If
-no current canonical intent exists, only a source-backed reservation may create
-one from its exact stored source; an artifact-backed reservation returns
-`CANONICAL_NOT_READY` and never selects a historical alias. Repeating the
-original source publish with a different explicit digest-equivalent alias may
-rotate `retry_source_id` under the same no-live-lease and generation fences. A
-READY current route invokes the all-matching finalizer immediately; a removed
-distribution fails closed until the caller explicitly republishes under a
-valid distribution after releasing the old name. The CLI/SDK and dashboard
-surface this as publication Retry, not as a registry-location retry.
-
-For a publication that has never created a release row, an admin-only
-`release-name` operation is the typo and wrong-digest escape hatch. It resolves
-the publication ID without locking, then locks quota, the permanent profile
-head/tombstone, artifact,
-canonical location if present, publication, and active-name release key in the
-global order; it requires
-FAILED or CANCELLED, no durable consumer, no live lease, and no release row;
-records actor, reason, time, and terminal `RELEASED`; decrements only workspace
-`release_reservation_count` and artifact
-`active_release_reservation_count`, never either lifetime generation counter;
-stores any retry source as scalar completed-source audit evidence, clears its
-live `retry_source_id` and `canonical_location_id`; and removes only that generation from the partial unique
-active-name index. A later publication may reuse the text with a new
-`reservation_generation` only while both lifetime limits permit it. Every worker and finalizer is fenced by
-publication ID and generation, so a late callback for the released reservation
-cannot bind the reused name. Audit history is never deleted and remains finite
-under the non-releasable workspace and per-artifact generation bounds. Publication status
-is directly readable by ID and workspace with no asynchronous request row.
-
-Creating the reservation locks its workspace quota row and artifact, checks
-`max_release_reservations`, `max_releases_per_artifact`,
-`max_lifetime_publication_generations`,
-`max_lifetime_publication_generations_per_artifact`, and
-`max_publication_records`. It consumes the two non-releasable lifetime
-generation slots, the two active name-reservation slots, and one retained
-publication-record slot before any copy is queued. The active name slots remain
-charged through FAILED and CANCELLED and are restored only by the never-READY
-RELEASED transaction above. The lifetime slots are never restored. Only a
-never-READY RELEASED query row is eligible for publication compaction; its
-record slot remains charged until retention passes, the closed outcome is
-durably written to audit, and the row is deleted. READY rows remain while their
-immutable release points at them. A workspace or artifact at either lifetime or
-retained-record limit fails before copy work rather than accumulating unbounded
-typo/reuse history.
-Workspace active-reservation repair is the indexed count of publication rows in
-that workspace whose state is not RELEASED; artifact repair is the same count
-under the exact artifact prefix. Neither repair infers an active reservation
-from a retained RELEASED row.
-Reactivation increments
-`retry_generation` on the same row and consumes retry-attempt budget, but never
-consumes another generation, name, or record slot. Consequently the READY finalizer cannot finish a
-paid transfer and then fail because another caller exhausted release quota.
-
-Reservation creation invokes that same finalization transaction immediately
-when the exact canonical location is already READY under the active profile.
-It never depends on a later worker callback to publish an additional name for
-existing bytes.
-
-### `container_image_locations`
-
-One row per artifact and materialization identity:
-
-- stable location ID;
-- denormalized workspace plus artifact ID, protected by the artifact binding and
-  used by bounded queue and quota-repair indexes;
-- distribution name and target display name;
-- lowercase 64-hex physical destination fingerprint, separate lowercase
-  64-hex policy fingerprint, profile revision, target-custody ID, realm
-  generation ID, immutable shard count, stored `assigned_shard_index`, and
-  rendered canonical repository path;
-- closed `ownership_kind MANAGED|EXTERNAL`, protected by a composite foreign
-  key `(target_custody_id, ownership_kind)` to the immutable custody snapshot;
-- canonical flag, exact expected digest, and for a regional copy the exact
-  canonical location ID for the same revision;
-- `canonical_dependency_ready BOOLEAN NOT NULL DEFAULT FALSE`; canonical rows
-  are constrained to FALSE, while a regional row stores the transactionally
-  maintained readiness projection of its exact canonical location;
-- `purge_generation`, `purge_attempt_count`, `purge_requested_at`,
-  `purge_next_retry_at`, and
-  `purge_dependents_settled BOOLEAN NOT NULL DEFAULT FALSE`; the last field is
-  meaningful only on a canonical row and becomes TRUE transactionally when all
-  exact regional/external children have reached their required purge terminal;
-- `retirement_generation`, `retirement_attempt_count`,
-  `retirement_requested_at`, `retirement_next_retry_at`, and
-  `retirement_dependents_settled BOOLEAN NOT NULL DEFAULT FALSE`, plus closed
-  reason `SUPERSEDED_PHYSICAL_GENERATION`; these fields belong only to
-  historical physical-generation retirement and never share a nonzero
-  generation with artifact purge;
-- nullable closed `external_ack_kind PURGE|RETIRE`, matching generation,
-  bounded actor, time, non-secret evidence reference, and immutable audit hash;
-  the tuple is all-null outside an acknowledged external terminal and exactly
-  matches the one nonzero lifecycle generation inside it;
-- for a canonical location, closed `origin_kind SOURCE|BUILD` plus exactly one
-  immutable `source_id` or `build_id`; regional rows inherit this provenance
-  through their exact canonical location and carry neither field themselves;
-- secret-free digest-pinned destination reference;
-- nullable nonnegative `charged_materialized_bytes BIGINT`; NULL is the sole
-  uncharged representation, while a non-null value, including zero, is the
-  authoritative workspace quota charge for this physical location;
-- state; closed migration-023 lease kind
-  `COPY|VERIFY|EXTERNAL_VERIFY|EVICT|PURGE_DELETE|PURGE_INSPECT|RETIRE_DELETE|RETIRE_INSPECT`;
-  fenced lease; retry, verification, use, eviction, and retirement metadata.
-  Migration 024 adds
-  `BUILD_RESERVED` plus the generation/attempt/token-bound `BUILD_OUTPUT` lease
-  kind.
-
-Migration 023 adds a partial workspace-first index on
-`(workspace, charged_materialized_bytes, id) WHERE charged_materialized_bytes IS
-NOT NULL` and a named nonnegative check. The workspace counter and location
-field change in the same phase-2/phase-8 transaction. The field has these closed
-transitions:
-
-| Location path | Byte-charge transition |
-| --- | --- |
-| new managed SOURCE canonical or regional intent | starts NULL; after exact source inspection and before any registry authority or I/O, NULL becomes the exact logical compressed size and the workspace counter increases once |
-| new external adoption intent | starts NULL; successful destination verification reserves the exact size in the READY transaction, while absence, mismatch, or `EXTERNAL_BYTE_QUOTA_EXCEEDED` leaves it NULL |
-| migration-024 BUILD_RESERVED output | the reservation transaction sets the exact independently verified staging size before publisher authority or canonical I/O |
-| COPY, VERIFY, EXTERNAL_VERIFY, READY, FAILED, MISSING, EVICTING, DELETE_UNKNOWN, RETIRING, or RETIRE_DELETE_UNKNOWN | preserves the existing NULL or non-null value; retry never charges a non-null row twice, and verification loss never guesses that bytes disappeared |
-| rematerialization of an EVICTED uncharged location | rechecks current quota and sets the exact charge before new I/O |
-| confirmed managed eviction/purge/retirement or exact external purge/retirement acknowledgement | atomically clears a non-null charge and decrements the workspace counter once; a repeated terminal transition observes NULL and is a no-op |
-| location compaction | allowed only while the field is NULL |
-
-Once non-null, the byte value is immutable until confirmed absence clears it. A
-later inspection that computes a different size fails closed rather than
-rewriting quota evidence. Deterministic pre-I/O cancellation may release a
-charge only through the same fenced absence-inspection terminal transition;
-ordinary failure alone never does. Workspace repair takes the quota lock and
-sums this field, so an uncharged external quota failure, an ambiguous managed
-copy, and a BUILD_RESERVED output are distinguishable after any crash.
-
-The physical fingerprint excludes profile and target aliases, provider adapter
-labels, account/project/region metadata, and auth configuration. It includes
-only the provider-neutral canonical registry authority, complete
-repository-generation prefix, workspace, immutable shard policy, stored
-assigned shard index, and full rendered repository. The destination reference
-is derived from exactly those physical fields and the full artifact digest;
-neither digest bits nor an adapter-specific endpoint decomposition can alter the
-stored shard. One physical
-destination cannot be canonical in one profile
-and an evictable cache in another. A uniqueness constraint also prevents two
-logical locations for one artifact from publishing the same physical manifest
-reference. Renaming a target alias in a new profile revision transfers that
-same physical row under the revision lock; it does not manufacture a duplicate
-location or reject an otherwise unchanged endpoint. This transfer is legal only
-when old and new custody have the same ownership kind and physical root. An
-ownership-kind change can never satisfy the row-transfer predicate.
-
-A named PostgreSQL check requires a canonical row to have
-`canonical_location_id IS NULL` and
-`canonical_dependency_ready = FALSE`, and a regional row to have a non-null
-`canonical_location_id` plus `purge_dependents_settled = FALSE`. A regional
-insert locks its exact canonical row and
-initializes the projection from `canonical.state = 'READY'` only when the
-canonical location belongs to the same artifact and profile revision. Every
-canonical transition into READY updates all of its exact current-revision
-regional children to TRUE in the same transaction; every transition out of
-READY updates them to FALSE before commit. The database-enforced maximum of 128
-target custodies in one profile revision makes that exact-revision fan-out
-bounded. Claims still lock and recheck
-the canonical row, so this field accelerates discovery but never replaces
-authority. A keyset integrity job detects and repairs false-negative or
-historically corrupt projections one bounded artifact page at a time; it never
-permits a false positive to pass the final lock fence.
-
-Purge initialization increments one artifact-scoped generation, stamps every
-location's `purge_generation`/`purge_requested_at`, and sets canonical
-`purge_dependents_settled` TRUE only when it has zero children, otherwise FALSE,
-in the same bounded transaction. Regional managed completion and external
-acknowledgement lock their exact canonical and set the flag TRUE only when every
-child in that purge generation is EVICTED or EXTERNAL_PURGED. Any retry or
-reopened child clears it. Canonical purge claims
-use the projection only for discovery, then lock/recheck the artifact and all
-at-most-512 retained locations. Lease-kind checks keep the lifecycle worker's
-ordinary EVICT, PURGE_DELETE/PURGE_INSPECT, and RETIRE_DELETE/RETIRE_INSPECT
-reconcilers disjoint; the copy worker cannot claim any delete kind.
-
-A PostgreSQL check constraint also enforces the origin one-of. Migration 023
-installs a named
-SOURCE-only constraint: canonical rows require one non-null `source_id`, and
-regional rows carry no origin field. Additive migration 024 adds the nullable
-`build_id` foreign key, drops that exact named
-constraint, and installs the complete check: a canonical is either SOURCE with
-only `source_id` or BUILD with only `build_id`, while a regional row has
-`origin_kind`, `source_id`, and `build_id` all NULL. Managed destination
-rendering accepts only the canonical target, workspace, stored shard allocation,
-and artifact digest, never a source reference, so both origins produce the same
-immutable physical identity. Runtime
-validation, regional
-copy, and purge lock the canonical origin and prove either an immutable source
-record resolving to the artifact digest or a READY build whose output artifact
-and digest match. Builder completion follows the shared global lock phases. It
-revalidates its fenced build and output tokens after acquiring those locks.
-Audit and compact purge provenance retain the closed origin kind and a
-nonreversible source/build identifier hash.
-
-A failed or pending SOURCE canonical import is not permanently tied to the artifact's
-first source alias. Publishing a later digest-equivalent source atomically
-rotates the canonical location's source-record binding only while it is
-non-READY and has no live lease. Rotation clears expired ownership and returns
-the row to PENDING with a fresh retry budget. A live lease rejects and rolls
-back the publication; after exact expiry, the old lease token cannot complete.
-A later release, artifact, prepare, retry, or launch selector with no explicit
-source preserves that established canonical source binding. The earliest
-immutable source is selected only while creating a brand-new canonical row;
-source-less ensures never rotate an existing A-to-B binding back to A. A BUILD
-origin is immutable and never participates in source rotation.
-A READY canonical location keeps the provenance that produced its verified
-destination. Workers, runtime route validation, and the final atomic cluster
-commit validate that origin binding against the artifact digest rather than
-the artifact's historical first-source fields. Managed
-destination repositories are independently selected by the realm allocation's
-stored balanced shard index, and manifests remain content-addressed by the full
-digest.
-Rotating a failed canonical import between digest-equivalent source
-repositories therefore preserves every canonical and regional destination
-reference.
-
-A physical profile revision can coexist with an earlier READY location. A
-policy-only revision reuses the location but is accepted by workers and route
-resolution only after an explicit lease-free transfer. Old durable consumers
-continue to name their pinned location until they terminate.
-
-### `container_image_profile_heads`, `container_image_profile_revisions`, and
-`container_image_target_custodies`
-
-One permanent global head row per lifetime distribution name stores
-`head_state ACTIVE|REMOVED`, nullable active revision/fingerprint, positive
-non-releasable `highest_revision`, checked `retained_revision_count` from 0
-through 64, monotonic nonnegative `quiesce_generation`, and an all-null or
-structurally complete quiesce tuple: apply ID, random-token hash, proposed head
-state, proposed revision/fingerprint, request hash, requester fingerprint, lease
-expiry, and overall deadline. Named checks require ACTIVE to have an exact
-retained revision no greater than `highest_revision`, REMOVED to have no active
-revision/fingerprint, positive generations for a present tuple, proposed
-revision/fingerprint exactly for an ACTIVE target and NULL for a REMOVED target,
-bounded hashes, lease expiry no later than its deadline, and all tuple fields
-NULL when no token exists. Expiry uses a locked database timestamp and is never
-embedded in a check constraint. Immutable revision and target-custody rows
-preserve the secret-free historical contract until bounded compaction above.
-Workspace
-authorization and allocation are separate and never multiply head updates.
-Profile activation inserts the new snapshots, increments the retained count and
-highest revision, and advances the single head in the immediate or
-quiesce-finalization transaction. Removal marks the prior revision superseded
-and the head REMOVED without deleting its tombstone. Queue claims,
-READY publication, new managed-location references, retry, verification, and
-eviction join a location's revision to the active head. Regional claims also
-require their exact bound canonical location to be READY. Purge is the deliberate
-exception: it uses the row's retained custody even after that revision is no
-longer active.
-
-Availability-creating or ownership-acquiring transactions hold `FOR KEY SHARE`
-on the exact head/revision rows after rejecting an unexpired matching quiesce
-tuple. Profile apply, quiesce heartbeat/reacquisition, cancellation, and final
-activation take `FOR UPDATE` on every changed head in sorted order, so they
-linearize after earlier work and before later work. Finalizers for work claimed
-before quiescence remain allowed and are fenced by their ordinary lease token.
-A final
-transition depending on a regional route takes `FOR SHARE` on its exact READY
-canonical before updating the regional row. The canonical lock, not a correlated
-statement-snapshot predicate, serializes canonical loss against regional
-readiness and durable acquisition. Queue claims use an unlocked index probe,
-then reacquire all rows through the global order below with the final candidate
-using `SKIP LOCKED` and a conditional primary-key update.
-
-### `container_image_references`
-
-One durable consumer reference per `(workspace, consumer_type, consumer_id)`
-always points to an artifact. `MANAGED_LOCATION` references additionally point
-to a READY location. `SOURCE_FALLBACK` references instead point to the exact
-immutable source alias and retain the value-free runtime authority and concrete
-placement fingerprint. The cluster-handle transaction creates either form, so
-a locationless WARMING launch is visible to tombstone and purge. Cluster stop
-retains it because a stopped cluster can restart. A restart atomically replaces
-it when the pull plan changes, and cluster termination removes it. Eviction
-checks location references; artifact lifecycle checks both forms.
-
-The API server catalog is authoritative. Its database stores a randomly
-generated catalog UUID. Every dedicated SkyServe and managed-jobs controller
-receives that UUID and must open the database containing the exact same UUID.
-Merely opening some PostgreSQL database is insufficient. A controller-local
-database is unsupported for managed image state and fails before artifact or
-location mutation; consolidated controllers naturally share the API server
-catalog.
-
-### Global PostgreSQL lock order
-
-Every image mutation, helper, callback, repair path, and multi-candidate batch
-uses the same phases, with keys sorted lexicographically inside each phase:
-
-| Phase | Rows or locks |
-| --- | --- |
-| 0 | fixed compatibility advisory transaction lock, shared by every image transaction/check and exclusive for whole-config writes or schema migration |
-| 1 | central `config_yaml` row when needed, then catalog singleton/config generation |
-| 2 | distribution workspace quota, builder workspace quota, builder UTC-day usage, then realm generation/allocation |
-| 3 | profile head, immutable revision, and target custody |
-| 4 | workspace/digest advisory keys |
-| 5 | artifacts |
-| 6 | producer rows: sources, then builds |
-| 7 | context uploads and part evidence, context manifests/object custody, then build-cache records |
-| 8 | canonical locations, then regional locations |
-| 9 | consumer references |
-| 10 | build attempts, build-output leases, staging custody, then build-log segment metadata |
-| 11 | publications |
-| 12 | releases |
-| 13 | catalog summaries and facets |
-| 14 | audit/outbox append rows |
-
-Within a phase, table rank is the order shown and primary keys are sorted
-lexicographically; a multi-workspace operation sorts workspace before table
-rank. Object-store keys and staging references are custody fields on their phase
-7 or phase 10 owner row, never an independently locked hidden resource.
-Registry limiter and permit rows use their own short transaction, lock limiter
-then permit key, and are never held with any catalog phase. No provider,
-Kubernetes, secret-provider, filesystem, or object-store I/O occurs while
-holding these locks.
-
-A path that does not need an earlier phase simply starts at its first required
-phase; it may never acquire an earlier phase afterward. All foreign keys and
-candidate IDs are discovered without locks before the mutation begins, then
-revalidated after acquisition. Release-name recovery, tombstone, builder
-finalization, publication fast paths, and batch publication all follow this
-order. Batch work locks all keys in one phase before moving to the next. The
-shared builder contract maps its mixed paths explicitly: resolve miss uses
-1/2/5/6/7, bundle commit uses 1/2/3/5/6/7/8/9, scheduler admission uses
-1/2/6/10, cache-hit validation uses 1/3/5/6/8/10, and retry/reactivation uses
-1/2/3/5/6/7/8/9/10. Intake cancellation
-uses 1/2/6/7; active cancellation that has output custody uses
-1/2/3/5/6/7/8/9/10/13/14. Output publication uses
-1/2/3/4/5/6/8/10/13/14, and artifact tombstone/purge walks
-1/2/5/6/7/8/9/10/11/12/13/14. Every managed-image mutation and worker claim
-takes `FOR KEY SHARE` on the phase-1 catalog singleton and verifies its locally
-loaded config generation plus `minimum_image_api_version`; bounded reads
-check the same version before decoding polymorphic state. A first-state writer
-takes `FOR UPDATE` instead, monotonically sets the appropriate distribution or
-builder witness before later phases, and cannot clear it. Config apply takes
-the phase-0 advisory lock, then `FOR UPDATE` on the config row and singleton in
-that exact order, and updates at most the bounded number of distribution heads
-present in the submitted image section, never one row per workspace. No path
-that already holds the catalog singleton may acquire the config row. A
-transaction may omit other
-unused phases but never reorder the ones it uses. Concurrency tests exercise every adjacent
-overlap and the full crossed mixed-path graph. This table is the authority over
-prose in both canonical designs.
-
-## Deployment lifecycle
-
-```text
-task selector
-  -> resolve an existing artifact or atomically register a source-backed one
-  -> quota and candidate checks
-  -> actual placement chosen
-  -> ensure canonical and matching local materialization intent
-  -> resolve a secret-free digest-pinned pull plan
-  -> atomically persist cluster handle and durable location reference
-  -> provision runtime with the pinned plan
-```
-
-Optimizer enumeration and dry runs are read-only. They never create
-repositories, rows, or copy jobs. Ensure-on-use runs only after quota checks
-and with a concrete provider/region or Kubernetes context.
-
-With `managed_preferred` and `locality: prefer`, the first launch can use the
-original digest-pinned source while canonical and regional materializations
-are `WARMING`. This is the latency-friendly path: useful work starts now and
-future launches become local. No database row claims that the source fallback
-is a managed READY location. Persisted fallback state uses the closed
-`managed_route_warming` reason code, never resolver or provider exception text.
-
-With `managed_required`, `locality: require`, or `locality: canonical`, the
-required verified route must be READY before provisioning. This is the
-predictable large-fleet path. A Boltz fleet rollout should explicitly prepare
-the target regions and gate scale-up on verified readiness.
-
-Every newly selected managed route is row-locked, touched, and referenced in
-the same database transaction as its cluster handle. This serializes launch
-against eviction. If the route stops being READY or owns a verification lease,
-or if a regional route's exact canonical origin is no longer READY, both writes
-roll back. Standalone durable-reference acquisition applies the same canonical
-row lock. If it linearizes first, canonical loss waits for the reference
-transaction to commit; if canonical loss linearizes first, the reference is
-rejected. A normal refresh of a cluster already referencing the same location
-is a no-op for image state, so transient repair cannot mark a running cluster
-UNKNOWN and a 1,000-node fleet does not rewrite two catalog rows per status
-cycle. Replacing the handle with a direct image releases the previous reference
-in that same transaction. A real launch or restart always revalidates READY,
-profile revision, exact canonical readiness, and the pinned reference even when
-the prior handle points to the same location; only `is_launch=False` status
-refreshes use the no-op path.
-
-## Materialization lifecycle
-
-Canonical and regional copies use the same location state machine:
-
-```text
-PENDING -> COPYING -> READY
-                 \-> FAILED
-READY -> MISSING -> COPYING
-READY -> EVICTING -> EVICTED -> PENDING
-
-external adoption:
-AWAITING_EXTERNAL_PUSH -> VERIFYING -> READY
-                         |            \-> FAILED
-                         \-> AWAITING_EXTERNAL_PUSH
-FAILED -> AWAITING_EXTERNAL_PUSH      # authorized retry
-
-builder-owned canonical publication (migration 024):
-BUILD_RESERVED -> COPYING -> READY
-                         \-> FAILED
-
-admin or qualified abandoned-build purge only:
-PENDING|BUILD_RESERVED|FAILED|MISSING|READY|EVICTED
-  -> PURGE_PENDING -> EVICTING -> EVICTED
-                                               \-> DELETE_UNKNOWN
-DELETE_UNKNOWN -> inspection -> EVICTED|PURGE_PENDING|DELETE_UNKNOWN
-
-external admin purge only:
-PENDING|AWAITING_EXTERNAL_PUSH|VERIFYING|FAILED|MISSING|READY|EVICTED
-  -> EXTERNAL_PURGE_PENDING
-EXTERNAL_PURGE_PENDING -> EXTERNAL_PURGED
-
-superseded managed physical generation only:
-PENDING|FAILED|MISSING|READY|EVICTED
-  -> RETIRE_PENDING -> RETIRING -> RETIRED
-                                      \-> RETIRE_DELETE_UNKNOWN
-RETIRE_DELETE_UNKNOWN
-  -> inspection -> RETIRED|RETIRE_PENDING|RETIRE_DELETE_UNKNOWN
-
-superseded external physical generation only:
-PENDING|AWAITING_EXTERNAL_PUSH|FAILED|MISSING|READY|EVICTED
-  -> EXTERNAL_RETIRE_PENDING -> EXTERNAL_RETIRED
-```
-
-External-adoption claims use the ordinary fenced lease fields while VERIFYING.
-Exact absence or a transient registry error returns to
-`AWAITING_EXTERNAL_PUSH` with bounded backoff; a digest/platform mismatch or
-byte-quota denial is FAILED with a closed code. No transition downloads from
-the source or writes registry content.
-
-An external location can enter `EXTERNAL_PURGE_PENDING` only with no live
-lease or durable reference and while its artifact is PURGING. A VERIFYING row
-must first settle or lose its fenced verification lease; an
-`AWAITING_EXTERNAL_PUSH` row that was never materialized may be acknowledged
-only with exact provider absence evidence or an external-owner attestation that
-is explicit about never-pushed content. External regional locations are
-acknowledged before their external canonical location. The admin acknowledgement
-transaction locks artifact then location, rechecks external ownership, lifecycle,
-zero references, and ordering, and stores bounded `acknowledged_by`,
-`acknowledged_at`, `evidence_reference`, and its audit hash before setting
-`EXTERNAL_PURGED`. Repeating the same acknowledgement is idempotent; changing a
-terminal acknowledgement is rejected and requires a separate audited correction
-event that does not make content managed. There is no automatic retry or delete
-callback for external rows: failed out-of-band work remains
-`EXTERNAL_PURGE_PENDING` until an admin truthfully acknowledges it. Schema checks
-forbid external purge states on managed locations and managed purge states on
-external locations.
-
-Retirement terminal states are intentionally different from EVICTED and
-artifact-purge terminals. RETIRED and EXTERNAL_RETIRED cannot rematerialize,
-cannot be selected by a current head, and become compactable only after audit
-retention. External retirement uses the same bounded evidence and
-never-pushed-attestation semantics as external purge, but its acknowledgement is
-fenced by location ID plus retirement generation, stores
-`external_ack_kind=RETIRE`, and leaves the ACTIVE or TOMBSTONED artifact itself
-intact. Repeating the same generation/evidence hash is idempotent; changing
-terminal evidence requires a separate audited correction event. There is no
-automatic external delete callback.
-
-Workers claim by stable location ID with an owner, token, and lease expiry.
-Heartbeats extend only the matching claim. Completion is fenced by the token.
-Migration 023 requires one of the closed distribution lease kinds above;
-migration 024 extends that enum with BUILD_OUTPUT. The distribution worker never
-claims a BUILD_RESERVED row or a `BUILD_OUTPUT` lease; only the builder
-controller may reclaim that generation/attempt/token-bound publication. A
-BUILD_RESERVED or
-COPYING builder row must settle to FAILED before lifecycle cleanup can claim
-it, and no purge claim can coexist with its live lease.
-Copying is content-addressed and idempotent. READY requires exact destination
-root-digest equality plus a nonempty, bounded OCI platform set. For a managed
-profile the root must be one OCI or normalized Docker schema-2 image manifest;
-its image config supplies exactly one matching platform. The worker rejects an
-OCI image index, Docker manifest list, root `artifactType`, attached artifact,
-or referrer before repository provisioning or copy. This keeps
-`BatchDeleteImage(root_digest)` dependency-safe inside an exclusively managed
-repository: it removes only one image manifest, while shared layers remain
-provider-managed and cannot invalidate another root. An external profile may
-verify a bounded runnable index because SkyPilot never automatically deletes
-its content; every image-child descriptor must then have a valid digest, exact
-fetched-byte size, platform, schema-v2 runnable child manifest, and matching
-child config platform. One malformed image child fails the complete external
-index even when another child is valid. Recognized attached attestation or
-signature descriptors are ignored as platform evidence.
-Digest-only callbacks cannot publish READY, including through external
-adoption, and the catalog completion boundary repeats the nonempty check. A
-forced retry leaves a READY reference usable while an independent verification
-lease is pending. Only a confirmed mismatch changes it to MISSING; transient
-inspection failures retain READY and retry with backoff.
-The first canonical completion stores artifact-wide platform and compressed
-size evidence under an artifact row lock. Later canonical completions may fill
-an unknown size but otherwise must agree exactly with the established platform
-set and known size; disagreement fails that location without changing the
-artifact. Canonical dependency transitions update
-`canonical_dependency_ready` only on children bound to that exact canonical ID
-and profile revision, so an old generation cannot be re-enabled by a new
-generation's completion. Creation, completion, mismatch, eviction, purge, and
-repair tests cover both TRUE-to-FALSE and FALSE-to-TRUE propagation in the same
-transaction as the authoritative canonical transition.
-
-The OCI copy primitive verifies the digest-pinned destination before every
-push. A retry therefore succeeds without rewriting a deterministic tag when a
-prior attempt committed it before losing its lease or completing verification,
-including registries that enforce tag immutability. Any ambiguous copy failure
-is followed by one fresh destination inspection and is accepted only when the
-exact expected digest is present; otherwise the copy remains failed and
-retryable.
-
-The implementation now provides three data-plane primitives:
-
-- adopt and verify an externally populated materialization;
-- copy canonical content to a destination through an injected OCI copy and
-  verification operation;
-- revalidate a READY reference in place without making healthy content
-  unavailable.
-
-A bounded copy-worker `reconcile_once` loop atomically selects one indexed due
-row at a time, orders canonical before regional materializations, reclaims
-expired COPY/VERIFY leases, retries eligible managed FAILED or MISSING content
-with exponential per-location jitter, and processes requested READY
-verification. A separate lifecycle-worker `evict_once` loop exclusively lists,
-claims, heartbeats, inspects, and completes ordinary regional EVICT work.
-PENDING, expired COPYING,
-FAILED or MISSING retry, and requested READY verification each have a partial
-profile-prefixed queue index whose predicate excludes the exhausted automatic
-attempt budget. Fresh work and deferred retries use disjoint indexes: fresh
-verification is ordered by request time, deferred verification by
-`next_retry_at`, fresh eviction by last use, and deferred eviction by
-`next_retry_at`. Listing and atomic claiming use the same state-specific queue
-probes rather than an OR-shaped whole-catalog query. Absent or partially
-written historical lease triples have separate incomplete-lease queues;
-structurally complete expired leases remain in expiry-ordered queues. A crash
-after claim 20 is therefore terminal for automatic
-work but not stranded: the exact operator retry path repairs expired COPYING or
-EVICTING ownership conservatively, resets the budget, and rematerializes the
-digest. Each owning worker rotates its queue kinds in process, so each probe
-reads one ordered index entry without letting continuous work starve retry or
-verification. READY verification additionally requires
-a published target reference at both probe and claim time, so a corrupt row
-cannot reach the worker as a nominally verifiable route. Every claim and retry
-deadline reads a
-fresh clock value, so a long earlier transfer cannot make later leases or
-retries stale before they start. A background heartbeat in the owning service
-extends copy, inspect, and delete leases. Losing a lease sets a cancellation
-event consumed by the
-OCI subprocess and prevents publication or destructive completion. Provider
-credential callbacks execute only inside the isolated worker process.
-
-Workers read at most 16 active profile generations per operation through a
-primary-key keyset page and a process-local cursor, then perform a two-phase
-claim. Reconciliation listing, reconciliation claiming, eviction listing, and
-eviction claiming use independent cursors. End-of-table wrap is another
-bounded keyset query, never an `OFFSET` or full-table materialization. Repeated
-calls therefore revisit every profile while each call retains a fixed work
-budget at the parser's 256-active-profile ceiling. Purge discovery instead uses
-its global eligible-work indexes below and never enumerates retained custody or
-inflates this active-head scan.
-Each cursor also rotates the returned page, preserving alternating profile
-fairness when a small catalog wraps on every call.
-For regional work, the first phase starts from state-specific partial indexes
-containing only rows whose denormalized exact-canonical dependency is READY.
-The READY dependency is therefore an index predicate, not a filter that the
-optimizer can satisfy by scanning dependency-blocked regional rows.
-Migration 023 spells the partial predicates literally. Every ordinary managed
-automatic-work canonical index begins with:
-
-```text
-ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0
-  AND canonical IS TRUE AND attempt_count < 20
-```
-
-Every ordinary managed automatic-work regional index begins with:
-
-```text
-ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0
-  AND canonical IS FALSE AND canonical_dependency_ready IS TRUE
-  AND attempt_count < 20
-```
-
-They are keyed
-`(distribution, profile_revision, <order-column>, id)`, matching the worker's
-exact active-profile cursor. The remaining predicate suffixes are exact:
-
-| Queue family | Literal predicate suffix |
-| --- | --- |
-| pending fresh | `state = 'PENDING' AND next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| pending deferred | `state = 'PENDING' AND next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| copy lease | `state = 'COPYING' AND lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| incomplete copy lease | `state = 'COPYING' AND (lease_kind IS NULL OR lease_kind = 'COPY') AND NOT (lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` |
-| failed or missing retry | `state IN ('FAILED', 'MISSING') AND next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL`; canonical form also requires `origin_kind = 'SOURCE'` |
-| verification fresh | `state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| verification deferred | `state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| verification lease | `state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| incomplete verification lease | `state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND (lease_kind IS NULL OR lease_kind = 'VERIFY') AND NOT (lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL) AND NOT (lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` |
-| eviction fresh, regional only | `auto_evict IS TRUE AND state = 'READY' AND next_retry_at IS NULL AND verification_requested_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| eviction deferred, regional only | `auto_evict IS TRUE AND state = 'READY' AND next_retry_at IS NOT NULL AND verification_requested_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` |
-| eviction lease, regional only | `auto_evict IS TRUE AND state = 'EVICTING' AND lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| incomplete eviction lease, regional only | `auto_evict IS TRUE AND state = 'EVICTING' AND (lease_kind IS NULL OR lease_kind = 'EVICT') AND NOT (lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` |
-
-The canonical `origin_kind = 'SOURCE'` retry fence prevents migration-024 BUILD
-outputs from being adopted by ordinary copy repair. `BUILD_RESERVED`, COPYING
-with `BUILD_OUTPUT`, and failed BUILD-origin canonical rows remain exclusively
-builder-owned. Verification of an already READY BUILD-origin route may use the
-ordinary `VERIFY` queue because it performs no source reconstruction.
-
-The ordered columns contain the corresponding due timestamp followed by `id`;
-`next_retry_at <= :now` and `lease_expires_at <= :now` remain runtime scan bounds
-because PostgreSQL partial predicates cannot contain the changing database
-clock. The `< 20` base is confined to fresh/retry and complete or incomplete
-automatic-reclaim indexes. It is absent from the five activation-only live-lease
-indexes above.
-
-External adoption has separately named automatic-work canonical and regional
-indexes. Their
-keys are `(distribution, profile_revision, <order-column>, id)`, so each probe
-binds the exact active profile returned by the bounded profile-head cursor and
-does not need an unbounded workspace enumeration. The canonical base is:
-
-```text
-ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0
-  AND canonical IS TRUE AND attempt_count < 20
-```
-
-The regional base is:
-
-```text
-ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0
-  AND canonical IS FALSE AND canonical_dependency_ready IS TRUE
-  AND attempt_count < 20
-```
-
-Exact suffixes and ordering columns are:
-
-| External queue | Literal predicate suffix | Order column |
-| --- | --- | --- |
-| adoption fresh | `state = 'AWAITING_EXTERNAL_PUSH' AND verification_requested_at IS NOT NULL AND next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `verification_requested_at` |
-| adoption deferred | `state = 'AWAITING_EXTERNAL_PUSH' AND verification_requested_at IS NOT NULL AND next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `next_retry_at` |
-| verification lease | `state = 'VERIFYING' AND lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
-| incomplete verification lease | `state = 'VERIFYING' AND (lease_kind IS NULL OR lease_kind = 'EXTERNAL_VERIFY') AND NOT (lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
-
-The eight literal names, in the same row order as the table above, are:
-
-```text
-ix_ci_loc_ext_canonical_fresh
-ix_ci_loc_ext_canonical_deferred
-ix_ci_loc_ext_canonical_lease
-ix_ci_loc_ext_canonical_incomplete
-ix_ci_loc_ext_regional_fresh
-ix_ci_loc_ext_regional_deferred
-ix_ci_loc_ext_regional_lease
-ix_ci_loc_ext_regional_incomplete
-```
-
-Purge indexes never join the active profile head and never enumerate retained
-custody. Each of the sixteen state-specific partial indexes is global across
-custodies, keyed `(<order-column>, id)` and including `target_custody_id`,
-`artifact_id`, and `canonical_location_id` for index-only discovery. Listing
-and claiming keep independent queue-kind keyset cursors; a lost cursor or worker
-restart begins again at the oldest globally eligible item, not at the first of
-possibly millions of empty custodies. Discovery work is therefore proportional
-to eligible or contended locations in that queue, never to total historical
-custody cardinality. Regional predicates begin
-`ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation > 0
-AND retirement_generation = 0 AND purge_attempt_count < 20`;
-canonical predicates begin the literal base:
-
-```text
-ownership_kind = 'MANAGED' AND canonical IS TRUE
-  AND purge_dependents_settled IS TRUE
-  AND purge_generation > 0 AND retirement_generation = 0
-  AND purge_attempt_count < 20
-```
-
-Exact suffixes and ordering columns are:
-
-| Purge queue | Literal predicate suffix | Order column |
-| --- | --- | --- |
-| delete fresh | `state = 'PURGE_PENDING' AND purge_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `purge_requested_at` |
-| delete deferred | `state = 'PURGE_PENDING' AND purge_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `purge_next_retry_at` |
-| delete lease | `state = 'EVICTING' AND lease_kind = 'PURGE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
-| incomplete delete lease | `state = 'EVICTING' AND (lease_kind IS NULL OR lease_kind = 'PURGE_DELETE') AND NOT (lease_kind = 'PURGE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
-| inspect fresh | `state = 'DELETE_UNKNOWN' AND purge_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `purge_requested_at` |
-| inspect deferred | `state = 'DELETE_UNKNOWN' AND purge_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `purge_next_retry_at` |
-| inspection lease | `state = 'DELETE_UNKNOWN' AND lease_kind = 'PURGE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
-| incomplete inspection lease | `state = 'DELETE_UNKNOWN' AND (lease_kind IS NULL OR lease_kind = 'PURGE_INSPECT') AND NOT (lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL) AND NOT (lease_kind = 'PURGE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
-
-The sixteen literal names are:
-
-```text
-ix_ci_loc_purge_regional_delete_fresh
-ix_ci_loc_purge_regional_delete_deferred
-ix_ci_loc_purge_regional_delete_lease
-ix_ci_loc_purge_regional_delete_incomplete
-ix_ci_loc_purge_regional_inspect_fresh
-ix_ci_loc_purge_regional_inspect_deferred
-ix_ci_loc_purge_regional_inspect_lease
-ix_ci_loc_purge_regional_inspect_incomplete
-ix_ci_loc_purge_canonical_delete_fresh
-ix_ci_loc_purge_canonical_delete_deferred
-ix_ci_loc_purge_canonical_delete_lease
-ix_ci_loc_purge_canonical_delete_incomplete
-ix_ci_loc_purge_canonical_inspect_fresh
-ix_ci_loc_purge_canonical_inspect_deferred
-ix_ci_loc_purge_canonical_inspect_lease
-ix_ci_loc_purge_canonical_inspect_incomplete
-```
-
-Migration 023 spells out every definition; it does not derive them from live
-metadata.
-
-### Historical physical-generation retirement
-
-Profile activation and artifact purge are different lifecycle authorities. A
-profile change may make an old physical generation unreachable while the
-artifact remains ACTIVE, so it cannot rely on the artifact's PURGING state or
-reuse `purge_generation`. Migration 023 therefore creates a disjoint bounded
-retirement workset on the existing custody and location rows, not an eighteenth
-table.
-
-Activation marks only the at-most-128 superseded target custodies. A single
-global partial index
-`ix_ci_target_custody_retirement_due(retirement_next_scan_at, id)` includes
-`transition_kind`, `retirement_generation`, and the durable scan cursor and has
-the literal predicate `custody_state = 'DRAINING' AND transition_kind <> 'NONE'
-AND retirement_scan_attempt_count < 20`.
-The claim adds `retirement_next_scan_at <= :now` and takes a fenced short scan
-lease. The worker reads at most 128 locations from
-`(target_custody_id, id)`, persists the last visited ID, wraps once, and never
-enumerates other custodies. Reference release or lease settlement wakes only the
-exact custody by moving its next-scan time forward. `open_location_count` is
-decremented only by exact location compaction, not merely by enrolling or
-deleting bytes. Successful page progress resets scan failures; claim 20 requires
-the exact admin retry that increments the custody retry generation and resets
-only this scan budget.
-
-Each scanned location first runs a bounded publication-lifecycle pass before
-rollback grace or byte deletion. After locking custody, artifact, and location,
-it locks the artifact's at-most-256 publications in sorted order. For
-PHYSICAL_RETIREMENT, every PENDING row whose live `canonical_location_id`
-matches the old location becomes FAILED with closed `PROFILE_SUPERSEDED`; every
-matching FAILED row receives that same current code, and every matching
-CANCELLED row is detached as well. The transaction preserves
-the prior diagnostic in audit, stores the old UUID as scalar
-`last_attempted_location_id`, increments `retry_generation` to fence an already
-dispatched finalizer, and clears the live foreign key without releasing active
-name, lifetime-generation, or record quota. It may run immediately after the
-head change, so a publication does not display PENDING throughout rollback
-grace. Retry later resolves that distribution's current canonical route. A
-stale finalizer fails both the inactive-head check and the publication
-generation check.
-
-For `POLICY_TRANSFER`, the worker locks old custody, new custody, artifact,
-canonical, and exact location in the global order. It may replace the location's
-custody/profile/policy fields only when physical fingerprint, realm generation,
-ownership kind, artifact digest, and rendered destination are unchanged; no
-ordinary, build, purge, or retirement lease exists; and neither custody has
-started physical retirement. Every publication still carrying this live
-location is locked in the publication phase and has its scalar
-`route_profile_revision` advanced to the new revision in the same transaction.
-Durable consumers remain attached to the same location ID and keep their
-already persisted execution plan. The transaction
-decrements old and increments new `open_location_count`. It does not change byte
-charge, shard reservation, or provider content. A failed predicate leaves the
-row on the old custody for another bounded scan.
-
-For `PHYSICAL_RETIREMENT`, the enrollment transaction locks the same exact
-objects and requires all of the following: rollback grace has passed; no active
-head uses the old custody; the artifact is ACTIVE or TOMBSTONED, never PURGING or
-PURGED; no durable location reference exists; the bounded detachment pass has
-left no publication live-location foreign key or finalizer bound to the old
-location; and no ordinary, BUILD_OUTPUT, artifact-purge, or
-retirement lease is live. For a BUILD-origin canonical it invokes the registered
-location-lifecycle extension inside this transaction before changing the row.
-It then copies the custody's exact positive generation to the previously-zero
-location retirement generation, increments `retirement_enrolled_count`, sets
-reason `SUPERSEDED_PHYSICAL_GENERATION`, and enters RETIRE_PENDING or
-EXTERNAL_RETIRE_PENDING. Regional children enroll
-and terminate before their
-exact canonical. A canonical becomes claimable only after a locked recheck of
-all at-most-128 children sets `retirement_dependents_settled` TRUE.
-
-Managed retirement has sixteen global state-and-due partial indexes, exactly
-parallel to artifact purge but with `retirement_*` fields and no active-head or
-custody-first scan. Each is keyed `(<order-column>, id)` and includes
-`target_custody_id`, `artifact_id`, and `canonical_location_id`. The regional
-base is:
-
-```text
-ownership_kind = 'MANAGED' AND canonical IS FALSE
-  AND purge_generation = 0 AND retirement_generation > 0
-  AND retirement_attempt_count < 20
-```
-
-The canonical base is:
-
-```text
-ownership_kind = 'MANAGED' AND canonical IS TRUE
-  AND retirement_dependents_settled IS TRUE
-  AND purge_generation = 0 AND retirement_generation > 0
-  AND retirement_attempt_count < 20
-```
-
-The exact suffixes and order columns are:
-
-| Retirement queue | Literal predicate suffix | Order column |
-| --- | --- | --- |
-| delete fresh | `state = 'RETIRE_PENDING' AND retirement_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_requested_at` |
-| delete deferred | `state = 'RETIRE_PENDING' AND retirement_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_next_retry_at` |
-| delete lease | `state = 'RETIRING' AND lease_kind = 'RETIRE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
-| incomplete delete lease | `state = 'RETIRING' AND (lease_kind IS NULL OR lease_kind = 'RETIRE_DELETE') AND NOT (lease_kind = 'RETIRE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
-| inspect fresh | `state = 'RETIRE_DELETE_UNKNOWN' AND retirement_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_requested_at` |
-| inspect deferred | `state = 'RETIRE_DELETE_UNKNOWN' AND retirement_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_next_retry_at` |
-| inspection lease | `state = 'RETIRE_DELETE_UNKNOWN' AND lease_kind = 'RETIRE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
-| incomplete inspection lease | `state = 'RETIRE_DELETE_UNKNOWN' AND (lease_kind IS NULL OR lease_kind = 'RETIRE_INSPECT') AND NOT (lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL) AND NOT (lease_kind = 'RETIRE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
-
-The literal names, in that row order for regional then canonical, are:
-
-```text
-ix_ci_loc_retire_regional_delete_fresh
-ix_ci_loc_retire_regional_delete_deferred
-ix_ci_loc_retire_regional_delete_lease
-ix_ci_loc_retire_regional_delete_incomplete
-ix_ci_loc_retire_regional_inspect_fresh
-ix_ci_loc_retire_regional_inspect_deferred
-ix_ci_loc_retire_regional_inspect_lease
-ix_ci_loc_retire_regional_inspect_incomplete
-ix_ci_loc_retire_canonical_delete_fresh
-ix_ci_loc_retire_canonical_delete_deferred
-ix_ci_loc_retire_canonical_delete_lease
-ix_ci_loc_retire_canonical_delete_incomplete
-ix_ci_loc_retire_canonical_inspect_fresh
-ix_ci_loc_retire_canonical_inspect_deferred
-ix_ci_loc_retire_canonical_inspect_lease
-ix_ci_loc_retire_canonical_inspect_incomplete
-```
-
-The managed worker uses the retained old lifecycle identity and guard, performs only
-exact-digest manifest delete or inspection, and never deletes a repository.
-Ambiguous delete enters RETIRE_DELETE_UNKNOWN. Exact proved absence atomically
-enters RETIRED, clears a non-null byte charge, and decrements the workspace byte
-counter once. External retirement is never automatically claimed. An admin must
-record bounded deletion evidence or a truthful never-pushed attestation before
-EXTERNAL_RETIRED clears the charge. Artifact purge and retirement cannot race:
-if PURGING wins first, the retirement scanner skips the artifact and artifact
-purge owns all unenrolled locations; if any location has a nonterminal
-retirement generation, `sky image purge` fails closed with
-`IMAGE_RETIREMENT_IN_PROGRESS` until that generation settles. Already terminal
-RETIRED or EXTERNAL_RETIRED rows are proved-absent inputs to later artifact
-purge and are never restamped. Tombstone may coexist because it creates no
-delete lease.
-
-After the fixed v0 30-day retirement audit retention, a keyset-bounded
-compactor locks workspace quota, realm allocation, custody, artifact, canonical,
-and exact terminal location. It requires RETIRED or EXTERNAL_RETIRED, a NULL byte
-charge, zero durable references and leases, and committed compact audit evidence.
-It also proves no publication live-location foreign key or producer-extension
-pointer remains; completed publication/release audit UUIDs are deliberately not
-foreign keys. It removes the facet/location, decrements workspace `location_record_count`,
-artifact `location_count`, custody `open_location_count`, and the exact shard
-reservation once. When a DRAINING custody reaches zero locations, has no scan
-lease or audit reference, and retention has passed, it becomes RETIRED and may
-be compacted. Realm/prefix reservation compaction additionally requires no
-custody, allocation, location, or audit reference. RETIRED locations are never
-rematerialized, unlike ordinary EVICTED cache rows.
-
-Profile-revision retention is a separate final bounded step. Supersession or
-profile removal stamps the old immutable revision with `superseded_at` and a
-30-day `compact_not_before`; removal leaves the permanent head in REMOVED state
-with no active revision. Migration 023 creates
-`ix_ci_profile_revisions_compaction_due (compact_not_before, distribution,
-revision) WHERE superseded_at IS NOT NULL`. The compactor discovers at most 64
-due rows, then locks catalog, exact head, and revision. It requires that the row
-is not active or a quiesce target; no target custody, location, live publication
-route, or nonterminal/retained apply-ledger entry depends on it; required audit
-evidence already contains the normalized fingerprint rather than depending on
-the row; and every related custody/realm retention fence above has completed.
-Publication and release scalar revision/fingerprint evidence is not a foreign
-key and remains interpretable without the operational row. It then deletes the
-revision and decrements the head's checked retained count exactly once.
-
-The permanent head preserves `highest_revision` and `quiesce_generation`, so
-compaction never permits revision reuse, stale coordinator success, or an older
-config rollback. A first-ever distribution name atomically increments the
-catalog's checked non-releasable lifetime-name counter; a removed head is never
-deleted. Head-count repair scans only that distribution's exact at-most-64
-revision index. These two hard bounds cap both revision rows and removed-name
-tombstones independently of configuration churn.
-
-The due queries add `next_retry_at <= :now`, `purge_next_retry_at <= :now`,
-`retirement_next_scan_at <= :now`, `retirement_next_retry_at <= :now`, or
-`lease_expires_at <= :now` as index scan bounds. Claim 20 is excluded from
-automatic work but remains repairable through the exact authorized retry, which
-increments the appropriate retry generation and resets only that queue's
-attempt counter. The composite custody foreign key makes the denormalized
-ownership kind authoritative. Named location checks make the queue families
-disjoint: ordinary managed states require MANAGED custody and
-both generations zero; external adoption states require EXTERNAL custody and
-both generations zero; managed and external artifact-purge states require their
-matching custody, `purge_generation > 0`, and `retirement_generation = 0`;
-managed and external retirement states require their matching custody,
-`purge_generation = 0`, and `retirement_generation > 0`.
-COPY/VERIFY/EVICT, EXTERNAL_VERIFY, PURGE_DELETE/PURGE_INSPECT, and
-RETIRE_DELETE/RETIRE_INSPECT leases are accepted only in their respective family
-and state. Migration 024 atomically replaces those named checks and affected
-partial indexes so `BUILD_RESERVED`, a BUILD-origin COPYING/FAILED row, and a
-`BUILD_OUTPUT` lease are builder-only and remain excluded from every ordinary
-repair predicate. PostgreSQL partial-index planner matching for every family,
-including zero-eligible and late-eligible populations, is checked in rather
-than assumed.
-The second phase for availability work takes the shared profile-generation lock,
-the exact canonical lock, and the regional row lock in the established order.
-For purge or retirement, the corresponding global index first yields an
-unlocked location ID and its retained custody ID; the claim transaction then
-locks that exact custody in phase 3, artifact in phase 5, and
-canonical/regional locations in phase 8 before rechecking every predicate.
-PostgreSQL uses `FOR UPDATE SKIP LOCKED` for the final row lock. Workers that initially route to the same row seek forward
-through the relevant global or profile index until they claim distinct work,
-with a hard per-queue seek budget so a single claim cannot retain earlier locks
-across an unbounded race set.
-Claiming never groups or sorts the full eligible location queue. Reconcilers
-take compatible `FOR KEY SHARE` locks on
-one generation, so hundreds of workers can claim different rows in the same
-dominant profile. Activation may wait only for one already-running short claim
-transaction to release its row lock; after obtaining the lock it fails fast on
-any committed live lease instead of waiting for lease completion. A worker that
-finds a generation under activation or exhausts
-its rows continues through the remainder of its bounded page; the next call
-starts after that page, so later profiles remain reachable without making one
-operation proportional to catalog cardinality. Eviction uses the same
-two-phase seek protocol and separate profile-prefixed READY and expired-lease
-indexes.
-Unchanged profile/location ensures take the shared generation lock; only a new
-or conflicting generation takes the exclusive activation lock. Fleet launches
-therefore serialize only when they target the same physical location row or an
-administrator is actually changing the profile.
-
-SkyServe placement identity retains a field-tagged tuple of every immutable
-container selector field (`ref`, `release`, and `artifact_id`) plus the
-distribution override. Equal text in different selector namespaces cannot
-collapse two `any_of` candidates, and a combined ref-plus-release selector is
-distinct from a ref-only selector. Once a service version is accepted, those
-candidate selectors are snapshotted to one artifact ID before persistence, so
-placement differences cannot make replicas in one version adopt different
-content.
-
-The concrete post-optimization placement carries a finite Linux OCI platform
-set from its cloud catalog or exact administrator runtime binding. READY route
-snapshots carry the artifact's verified platform set. The artifact must cover
-every possible placement platform; a mismatch is a placement-specific
-unavailable route, allowing normal cloud or region failover. The check repeats
-in the atomic cluster-handle/reference commit so an internal or stale caller
-cannot persist an incompatible plan. If neither the provider nor an exact
-binding can produce that finite set, admission fails closed. Unknown is never
-guessed and never treated as compatible. A proved runtime never treats missing
-READY platform metadata as compatible, while pre-READY artifacts may retain an
-empty platform field only as explicit metadata-not-yet-imported state for the
-request-scoped source fallback.
-GCP records Compute Engine's machine-type architecture in its generated
-catalog and implements the same cloud abstraction used by placement and
-durable-handle fencing. Pre-architecture GCP catalogs have a bounded
-compatibility mapping for their known Arm families, so T2A, C4A, N4A, and A4X
-cannot silently become unknown architecture.
-
-An empty pre-READY platform set is not a verified managed route, but it also
-does not make the caller's exact digest-pinned source incompatible. Under the
-explicit managed-preferred plus prefer policy, warming resolution and its
-durable commit may therefore use that source while metadata remains empty.
-Nonempty verified metadata that excludes the runtime still fails before
-fallback, and every READY or pinned managed route still requires proof.
-Bootstrap tools used for runtime registry authentication, including AWS CLI
-v2 for ECR, select their binary from the node architecture.
-
-Regional verification discovery, claim, and completion, plus eviction claim
-and completion, all recheck the exact `canonical_location_id` at the same
-profile revision. An eviction error before the delete callback preserves
-READY. Once deletion may have started, any ambiguous outcome transitions the
-regional row to MISSING rather than asserting that a potentially deleted
-manifest is still READY.
-
-The generic OCI execution layer uses bounded subprocesses and digest-only
-verification and deletion. Registry writes use a deterministic immutable
-`sha256-<hex>` tag because standard registry pushes are tag-addressed; runtime
-plans and durable locations expose only the verified digest reference. It
-never transports layers through the API server. The exact rendered shard
-repository is passed to the provider adapter for ownership-aware provisioning
-and short-lived credential scoping, and those provider responsibilities must
-be completed before declaring a managed profile production-ready. The complete
-rendered destination is validated against OCI grammar and Docker's
-repository-name limit before repository provisioning, credential issuance, or
-copy I/O begins.
-
-Deletion has its own provider adapter authorization. A YAML profile declaration
-with `ownership: managed` is necessary but never sufficient: immediately before
-the delete callback, the adapter must prove that SkyPilot owns the exact
-repository under the configured realm. Until an AWS, GCP, Nebius, or generic
-adapter can verify provider ownership metadata, automatic eviction for that
-adapter fails closed before registry I/O and leaves the regional route READY.
-
-## Administrative lifecycle and retention
-
-A million-artifact catalog cannot retain canonical customer content forever.
-The first production slice therefore has a safe manual erasure path even though
-the dashboard intentionally has no delete button:
-
-```text
-sky image tombstone --artifact-id UUID --reason CODE --yes
-sky image purge --artifact-id UUID [--retry] --yes   # admin only
-sky image purge acknowledge-external --artifact-id UUID \
-    --location-id UUID --evidence-reference REF --yes
-sky image retirement retry --custody-id UUID --yes                 # admin
-sky image retirement retry --location-id UUID --yes                # admin
-sky image retirement acknowledge-external --location-id UUID \
-    --generation N --evidence-reference REF --yes                       # admin
-```
-
-Tombstone is an admin-only PostgreSQL transaction. It follows the global lock
-order through artifact, source/build producer, locations, references,
-publications, and releases; rejects any live durable consumer, live
-data-plane or build-publication lease, or active publication; marks the artifact
-TOMBSTONED; and makes all selectors unavailable for new launches.
-
-The catalog defines a narrow `CatalogLifecycleExtension` protocol whose
-`retire_outputs_in_session(session, artifact_id)` and
-`retire_location_in_session(session, artifact_id, location_id)` callbacks
-receive the existing transaction. Producer modules register implementations at
-API startup; catalog lifecycle code never imports `build_state.py`. SOURCE
-artifacts and SOURCE-origin locations need no callback. A managed-build artifact
-or BUILD-origin location fails closed with
-`PRODUCER_LIFECYCLE_EXTENSION_UNAVAILABLE` rather than committing partial
-lifecycle state. Migration 024 and API-63 startup register the builder
-implementation even when the separate build controller is disabled. Artifact
-tombstone changes every READY build producing that artifact to OUTPUT_RETIRED.
-Before physical-generation retirement enrolls a BUILD-origin location, the
-location callback either repoints the build to an already READY current-profile
-location for the same build and digest or changes that build to OUTPUT_RETIRED;
-it never leaves a READY cache entry pointing at retiring bytes. Both changes are
-in the caller's transaction. Build cache-hit transactions independently read
-the output ID, lock artifact then build row, and revalidate lifecycle as defense
-in depth. Tombstone preserves
-immutable identity and actor-attributed audit metadata. Existing running
-consumers are a hard precondition failure, never a force flag.
-
-Purge first rejects any nonterminal historical-generation retirement. It then
-changes TOMBSTONED to PURGING and queues every remaining managed regional and
-canonical location for deletion, regional first. External locations enter
-`EXTERNAL_PURGE_PENDING` and require an admin to record a bounded, non-secret evidence
-reference after the external owner deletes them. Already terminal RETIRED or
-EXTERNAL_RETIRED locations remain disjoint and count as proved absent. Every worker
-attempt rechecks lifecycle state, zero references, exact digest, active profile
-revision for availability work, or the location's retained historical custody
-for purge work, plus provider capability and repository ownership immediately before
-registry I/O. Ambiguous managed deletion enters `DELETE_UNKNOWN`, distinct from
-ordinary availability `MISSING`. It blocks canonical deletion, quota release,
-and PURGED. A fenced inspection transitions it to EVICTED only after an exact
-digest lookup proves absence, or back to purge-pending when the manifest still
-exists; inconclusive inspection remains DELETE_UNKNOWN. A preexisting MISSING
-row requires the same absence proof. There is no acknowledgement override for
-managed content. Canonical deletion is allowed only after every managed
-regional location is EVICTED and every external location is acknowledged.
-
-PURGED is committed only when every SkyPilot-controlled manifest reference has
-been proven absent, every managed location is EVICTED or RETIRED, every external
-location is `EXTERNAL_PURGED` or EXTERNAL_RETIRED, and every location's
-`charged_materialized_bytes` is NULL.
-The location terminal transactions have already decremented the workspace
-counter, so artifact finalization never performs a second byte release. This
-proves loss of runtime reachability
-through SkyPilot, not physical blob erasure: managed v0 roots are single image
-manifests, and ECR or another registry may retain their unreferenced shared
-layers until provider garbage collection.
-SkyPilot never labels this state legal byte erasure unless a provider-specific
-extension supplies an auditable blob-GC guarantee or artifact-scoped encryption
-destruction. Successful release rows remain as nonresolving tombstones so a
-name that was ever launchable can never be reused. RELEASED never-launchable
-publication generations remain in bounded audit history and no longer hold the
-active name reservation; an explicit new generation is allowed only while both
-lifetime counters have headroom. Raw source
-references and operational details are cleared under retention policy, leaving
-only nonreversible hashes when audit policy requires provenance. The retained
-PURGED artifact row remains the canonical digest tombstone and keeps its
-lifetime artifact slot. Compact audit records retain artifact ID/digest,
-successful release bindings and released-reservation generations, closed
-deletion outcomes, timestamps, and audit events. Confirmed purge releases only
-materialized-byte and eligible child-record quota, never `artifact_count`.
-Failed purges retain a closed error and can be retried by an admin.
-Automatic regional cache retention continues to evict only noncanonical
-unreferenced content. Automatic canonical purge remains out of scope except for
-the narrow migration-024 abandoned-build rule: after retention, a system actor
-may tombstone a `managed_build` artifact only when every producing build is
-FAILED or CANCELLED, every output lease is settled, and there is no release,
-publication, source alias, durable reference, or READY build. It records
-`BUILD_OUTPUT_ABANDONED` and then invokes the same artifact-scoped purge engine,
-ownership checks, DELETE_UNKNOWN recovery, and audit path as an administrator.
-
-Default retention is explicit: never-READY RELEASED publication query rows are
-retained for 30 days under the hard workspace/per-artifact record quotas; READY
-rows remain referenced by their immutable releases, and FAILED/CANCELLED rows
-remain while their active name reservation exists. Copy and purge attempt
-diagnostics are retained for 90 days, and compact audit records follow the
-platform audit policy. Publication compaction is keyset-bounded and releases
-exactly one retained-record slot only after the audit write commits; it never
-releases a lifetime generation slot. The catalog exposes aggregate
-retained bytes and tombstoned age so administrators can act before workspace
-quotas are exhausted. No cleanup deletes a row with a live lease or durable
-reference.
-
-## Provisioning and registry replication
-
-SkyPilot should provision registry repositories automatically only inside a
-pre-bootstrapped, explicitly managed realm. Bootstrap remains an administrator
-operation because accounts, projects, organization policy, KMS, audit policy,
-and IAM trust are outside a workload scheduler's safe authority.
-
-The manager identity may receive:
-
-- repository or registry namespace creation;
-- content push and exact-digest verification;
-- read-only ownership-tag inspection.
-
-It must not receive:
-
-- account, project, IAM, or KMS administration;
-- repository deletion;
-- any regional or canonical manifest deletion;
-- mutation of colliding resources without SkyPilot ownership metadata.
-
-Every manifest deletion uses a separate lifecycle identity. It can delete only
-inside ownership-tagged SkyPilot repositories after the central database has
-issued an ordinary regional EVICT, artifact-purge, or physical-retirement lease.
-Ordinary eviction is limited to an active profile's noncanonical cache;
-artifact purge is admin opt-in; superseded-generation retirement is automatic
-only after its configured grace and zero-reference fences. The ordinary API,
-copy worker, builder, runtime identities, and workloads cannot assume this
-role. Repository deletion remains forbidden even to the lifecycle identity.
-
-### Lifecycle executor and identity boundary
-
-The API is an intent writer, not a deletion executor. `sky image purge` moves
-the artifact to PURGING and creates the ordered location work in PostgreSQL; no
-API handler or generic request executor performs deletion. The copy worker
-cannot claim EVICT, artifact-purge, or retirement work and has no delete
-permission. Helm installs one separate, independently scalable
-`image-lifecycle-worker` Deployment running
-`python -m sky.container_images.lifecycle_worker_service`. It has a dedicated
-Kubernetes ServiceAccount and, on AWS, a dedicated IRSA role that the API,
-copy-worker ServiceAccount, builder, and workloads cannot assume.
-
-The deployment runs three disjoint reconcilers. The ordinary-eviction
-reconciler claims only active-profile MANAGED, noncanonical locations with
-`purge_generation = 0`, `retirement_generation = 0`, `auto_evict = TRUE`, and
-READY/EVICTING state with lease kind EVICT. It rechecks zero durable references,
-retention age, exact digest, current custody, and its exact READY canonical
-dependency before delete and completion. The artifact-purge reconciler
-claims only locations belonging to a PURGING artifact and in `PURGE_PENDING`,
-`EVICTING`, or `DELETE_UNKNOWN`. The historical-generation reconciler claims a
-DRAINING target custody scan lease and managed locations in `RETIRE_PENDING`,
-`RETIRING`, or `RETIRE_DELETE_UNKNOWN`; external retirement remains
-administrator-acknowledged. All three use the exact target-custody ID and its
-immutable `lifecycle_identity` credential generation plus principal
-fingerprint, artifact/location ID, the matching zero or positive lifecycle
-generation, expected digest, owner, random token, and lease expiry. Their state,
-generation, lease-kind, and canonical predicates cannot translate one work kind
-into another.
-The global state-and-due partial indexes above are the only automatic discovery
-paths; they reveal eligible location or custody IDs without scanning historical
-custody cardinality, then the claim locks the row's one exact retained custody.
-Purge and retirement regional work is claimable first. A canonical claim is
-eligible only after a locked recheck proves every managed regional location has
-the terminal required by its work kind and every external location has its
-matching acknowledged terminal. Provider I/O occurs after
-the short claim transaction. Claim and completion lock the catalog fence,
-retained target custody, artifact, canonical location, then regional locations
-in the global order and revalidate the token and evidence. A shutdown
-before provider I/O may surrender its lease; after a delete call starts, it
-must leave the lease to expire so restart recovery inspects the digest and uses
-DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN rather than guessing success.
-
-The lifecycle role's ECR surface is closed. It may use
-`DescribeRepositories`, `ListTagsForResource`, `DescribeImages`, `ListImages`,
-and `BatchDeleteImage`, mapped respectively to the shared `METADATA_READ`,
-`VERIFY`, and `DELETE` limiter classes. It cannot mint registry authorization
-tokens, create a repository, upload a layer or manifest, mutate
-tags/policies/scanning/encryption, or call `DeleteRepository`. The adapter
-rejects every unmapped SDK method before invocation, and the IAM policy repeats
-that boundary. Exact custody's distinct lifecycle-credential reference and
-ownership tags, not the active profile or manager credential, select the role
-and repository authority. Removing or rotating a profile cannot erase that
-reference while any purgeable manifest or uncertain outcome remains.
-
-Helm values expose `lifecycleWorker.enabled`, `replicaCount`, `maxInFlight`, lease
-and heartbeat periods, ServiceAccount name/annotations, resources, probes,
-metrics, and optional metrics-backed autoscaling separately from the copy
-worker. It defaults disabled so the additive code can deploy before feature
-activation. Activation of any production managed custody requires the deployed
-worker, its dedicated identity, and healthy capability evidence; enabling
-`auto_evict` additionally requires its EVICT reconciler readiness. Metrics
-distinguish ordinary eviction, artifact purge, and generation retirement and
-include custody scan depth/age, eviction/purge/retirement queue depth/age,
-regional/canonical claims, delete and inspection latency,
-DELETE_UNKNOWN and RETIRE_DELETE_UNKNOWN age, lease loss, limiter wait/throttle,
-and closed outcomes. Rollback disables new
-claims, drains or expires existing leases, and leaves PostgreSQL intent for a
-compatible lifecycle worker. Restart tests kill the worker before a call, after an
-ambiguous call, and before completion, proving eventual inspection without a
-double-authority path.
-
-Do not copy every image to every configured region. The intended strategy is:
-
-1. create canonical intent when an artifact is first used;
-2. create a regional intent only for an observed placement or explicit
-   prepare request;
-3. use explicit worker copies in v1; evaluate native replication only through
-   a later tracked-eager contract;
-4. call a location READY only after verifying the exact digest in that region;
-5. evict unused managed regional content after policy retention, never while
-   a durable consumer references it.
-
-Provider-native replication may reduce later controller work, but an
-untracked provider rule is not a READY image and violates lazy quota authority.
-V1 does not enable it. Any later tracked-eager implementation must create and
-charge all destination intents before the source push, then wait for exact
-digest visibility; asynchronous results remain COPYING or WARMING until
-verified.
-
-### First managed provider: AWS ECR
-
-The AWS adapter implements one complete path before any other provider is
-called managed. `ensure_repository` describes the stored assigned shard, creates
-it only when absent with required realm/workspace/manager tags, and rejects a
-name collision whose tags, encryption, mutability, or scan policy do not match.
-Create permission is bounded by repository prefix and required request tags.
-The adapter never changes a colliding repository into compliance.
-
-A repository-policy allowlist alone is insufficient in a same-account ECR
-registry because an identity policy may independently allow writes. Managed AWS
-mode therefore requires ECR
-[registry-policy scope V2](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry-permissions.html)
-and an account/region registry policy that is enforced on all ECR requests.
-Before any managed-prefix
-repository exists, Terraform installs explicit `Deny` statements with
-`Principal: "*"` and `ArnNotEquals` conditions on `aws:PrincipalArn`:
-
-- manifest/layer mutation under the exact managed repository prefix is denied
-  except to the current distribution copy role and one fixed reserved trusted
-  builder-publisher principal;
-- `BatchDeleteImage` is denied except to the distinct lifecycle role;
-- repository policy/tag/mutability/scanning configuration changes under that
-  prefix are denied except to the Terraform control role;
-- lifecycle-policy creation and repository deletion under that prefix are
-  denied to every principal; and
-- `PutRegistryPolicy`, `DeleteRegistryPolicy`, and changing
-  `REGISTRY_POLICY_SCOPE` are denied except to the Terraform control role; the
-  `PutAccountSetting` statement is narrowed by
-  `ecr:AccountSetting = REGISTRY_POLICY_SCOPE` and does not freeze unrelated
-  account settings.
-
-The write action set includes `InitiateLayerUpload`, `UploadLayerPart`,
-`CompleteLayerUpload`, `PutImage`, `ReplicateImage`, and
-`BatchImportUpstreamImage`, so native replication and pull-through import cannot
-create untracked content. The copy role is excluded from delete, the lifecycle role
-is excluded from write, runtime roles are pull-only, and the control role has no
-image mutation or repository-delete grant. The policy uses AWS's recommended
-[`ArnNotEquals` form](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notprincipal.html)
-rather than `NotPrincipal`. Explicit deny overrides any
-same-account identity allow.
-
-The future publisher ARN may be a fixed deny exception at bootstrap, but that
-exception is not an `Allow`: no role trust or identity permission is created by
-the distribution release. Builder qualification later activates the separately
-managed principal without rewriting the guard contract around existing bytes.
-
-Activation verifies V2 scope, the exact normalized registry-policy digest,
-negative authorization probes, empty-prefix inventory, and repository custody;
-every copy/lifecycle mutation and periodic custody check revalidates the stored
-policy generation/digest before provider I/O. Any drift freezes the managed
-realm. Thus the single-manifest capacity and deletion claims never assume an
-externally writable repository.
-
-For writes, the worker assumes a short-lived copy role with an artifact-target
-session name and repository-scoped session policy, then obtains the normal ECR
-authorization token. ECR tokens are registry scoped, but the effective STS/IAM
-permissions remain limited to the exact repository actions. Source and
-destination authority are acquired independently; no destination credential is
-sent to a source registry. Tokens live only in worker memory and subprocess
-stdin/environment for the bounded copy, are redacted from process diagnostics,
-and never enter PostgreSQL, task YAML, or logs.
-
-V1 canonical import accepts only an anonymous digest-pinned source or a
-provider source reachable through the configured worker identity. It has no
-user-supplied generic OCI credential schema and cannot privately pull GHCR or
-another external registry merely because the destination is managed. Private
-external content is pushed to the configured canonical destination out of band
-and enters through the exact-digest external-adoption primitive. A later source
-credential broker is a separate security feature. Unsupported private imports
-fail before a copy lease and never persist rejected credential material.
-
-External adoption reserves artifact and location-record quota at intent time.
-Because size is unknown until inspection, READY completion locks the workspace
-quota and reserves verified bytes before adopting; insufficient byte budget
-sets `FAILED` with closed `EXTERNAL_BYTE_QUOTA_EXCEEDED`, never a false READY
-row. An authorized retry returns that same location to
-`AWAITING_EXTERNAL_PUSH` after quota changes; the external owner may instead
-delete the bytes out of band. Register, publish, retry, and diagnostics use the
-ordinary workspace RBAC and audit paths.
-The API and UI never return registry credentials or claim that SkyPilot pushed
-external content.
-
-The adapter uses exact manifest digest reads before and after copy. Managed
-publication rejects an OCI index or Docker manifest list before repository
-creation, permit acquisition, or copy, while external adoption may verify one
-under the external-only contract above. A matching existing single-manifest
-digest is an idempotent success. A mismatch can never overwrite a managed
-immutable tag. Runtime EC2 uses the workload role's ECR pull actions;
-Kubernetes uses an exact node-identity context binding. Regional eviction and
-admin purge delete only the exact manifest digest after ownership checks;
-repository deletion is never granted. Integration tests cover create, adopt,
-copy, verify, pull, rotate, delete, managed index/list rejection before any
-repository or permit mutation, external-only index verification, shared-layer
-safety, tag collision, wrong account/region, expired STS, and every denied IAM
-action.
-
-### Infrastructure modules and activation
-
-The first production bootstrap is AWS-specific and delivered as composable
-Terraform rather than hidden placement-time side effects. These are target
-paths created and validated by this PR; the current branch has no
-`infra/terraform` tree:
-
-```text
-infra/terraform/modules/aws-control-plane
-infra/terraform/modules/aws-vm-pool
 infra/terraform/modules/aws-image-distribution
-infra/terraform/examples/aws-dedicated-account
+infra/terraform/modules/aws-image-worker-identity
+infra/terraform/examples/aws-dedicated-skypilot-account
 ```
 
-`aws-control-plane` creates distinct API, copy-worker, and lifecycle-worker
-identities plus policy attachment points; it never lets the API or copy worker
-assume the lifecycle role. `aws-vm-pool` creates workload identities and ECR pull
-permissions without assuming one GPU per VM. `aws-image-distribution` creates
-the managed realm, one account/region guard prefix, V2 registry policy,
-KMS/log/metric policy when requested, least-privilege copy and lifecycle policies,
-ownership tags, and the exact role/config outputs consumed by the two Helm
-Deployments, including `copy_worker_role_arn`,
-`lifecycle_worker_role_arn`, normalized registry authorities, guard-policy
-digests, and ready-to-paste secret-free profile target fragments. Every managed
-repository-generation prefix must be beneath that
-guard prefix, so one bounded policy statement set protects all realm
-generations instead of growing per artifact or workspace. The separately gated
-builder design owns any later `aws-image-builder` module. PostgreSQL remains the
-work queue, so the distribution module does not create a second SQS or
-dead-letter source of truth.
+The distribution module accepts account ID, regions, workspaces, prefix, fixed
+shard count, encryption/scanning settings, quota headroom, and optional existing
+role ARNs. It outputs secret-free profile YAML, repository ARNs, role ARNs, and
+readiness checks. The example composes PostgreSQL/API infrastructure already
+owned by the platform with these modules. It does not duplicate database state.
 
-The recommended dedicated-account mode makes this module the sole Terraform
-owner of the complete registry policy in each enabled region. An existing
-account remains supported only when its registry policy is imported into the
-same Terraform state, any unrelated statements are supplied as bounded typed
-inputs, and every other policy writer is retired before activation. The
-module's explicit denies cannot be weakened by those additional allow
-statements, and its self-protection statement prevents later mutation by any
-principal except the control role. If policy ownership cannot be consolidated,
-that account is external-profile-only; SkyPilot does not claim managed custody
-from periodic observation. Existing source repositories outside the guard
-prefix remain unaffected and usable.
+## Worker services
 
-The modules create no per-image resources and copy no content. The AWS adapter
-creates a deterministic ECR shard repository just in time under the
-pre-authorized realm, using request tags and a bounded repository-name prefix,
-then verifies those ownership tags before mutation. This happens in the copy
-worker, never during placement admission. A dedicated-account example wires
-all enabled regions while preserving region-level opt-in.
-
-Shard sizing is a two-sided feasibility proof for every physical registry
-target. The immutable realm shard count is any integer from 1 through the public
-v1 ceiling of 256. This bounds repository fan-out; fixed two-hex indices keep
-rendering stable without coupling allocation to digest bits. The module reads
-applied ECR repository and images-per-repository quotas through
-[Service Quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html);
-AWS currently marks both limits adjustable.
-An accompanying read-only `sky image infrastructure inventory aws` preflight
-uses paginated ECR APIs to emit a timestamped, account/region-bound JSON file
-with existing repository and per-repository manifest counts. Terraform accepts
-that audited file plus explicit safety headroom, workspace capacity, and the
-lifetime maximum distinct artifacts per workspace. A stale, wrong-account,
-incomplete, or omitted inventory fails activation unless the
-account is explicitly asserted empty through a separately audited bootstrap
-mode. The inventory must prove a complete listing under the provider-neutral
-canonical repository-generation prefix, including every recognized existing
-workspace/shard repository. V0 activates a managed generation only when that
-complete prefix contains zero manifests. Existing compliant empty repositories
-may be retained, but an incomplete page, nonempty repository, unrecognized
-writer, or unparseable repository fails closed. Existing images elsewhere in
-the account remain valid immutable sources or external-profile content; they
-are never silently adopted into the managed generation.
-
-The V2 registry explicit-deny boundary admits manifest publication only from
-the copy worker and, after a later policy generation, the separately gated
-trusted builder publisher. Both reject OCI indexes in v0. The lifecycle identity is
-delete-only and runtime identities are pull-only. Activation and periodic
-custody checks freeze on any boundary drift, so an identity-policy allow cannot
-bypass durable reservations with an out-of-band manifest. Every managed v0
-artifact consumes exactly one root image-manifest unit; shared layers do not
-reduce this conservative manifest count. For each candidate count `S`, the hard
-additional capacity of every initially empty shard is:
+Helm exposes two disabled-by-default deployments:
 
 ```text
-capacity[i] = applied_images_per_repository_quota
-              - image_headroom[i]
+imageCopyWorker.enabled
+imageCopyWorker.replicaCount
+imageCopyWorker.maxInFlight
+imageCopyWorker.serviceAccount
+
+imageLifecycleWorker.enabled
+imageLifecycleWorker.replicaCount
+imageLifecycleWorker.maxInFlight
+imageLifecycleWorker.serviceAccount
 ```
 
-Every capacity must be nonnegative and
-`sum(capacity[0:S]) >= max_artifacts`. Terraform exports the exact capacity
-vector; PostgreSQL stores it on each workspace realm allocation and rejects an
-increment above the selected shard's capacity. The least-filled allocator and
-the hard per-shard check, not a statistical digest assumption, are the capacity
-proof.
+Each pod registers a random worker ID and periodically upserts a bounded
+heartbeat with kind, version, started time, last-success time, and current
+in-flight count. The UI treats a heartbeat as stale after three periods. Stale
+rows are compacted. Heartbeats contain no hostname, token, ARN, or credential.
 
-The regional repository budget must simultaneously prove:
+Copy-worker concurrency is bounded by its pod setting and provider throttling.
+Adding replicas increases claim throughput safely because leases and
+`SKIP LOCKED` prevent duplicate authority. Lifecycle workers claim only
+reference-free, noncanonical, managed locations past retention. They inspect
+the exact digest after ambiguous deletion and never delete a repository.
+
+Shutdown stops new claims, cancels work that has not started provider I/O, and
+lets leases expire after ambiguous I/O. Restart recovery verifies actual
+registry state before completion or retry.
+
+## Dashboard
+
+The Dashboard contains a first-class Images navigation item and two complete
+surfaces.
+
+### Images catalog and detail
+
+All authorized users can:
+
+- select a workspace;
+- page artifacts with digest, releases, platforms, size, and updated time;
+- filter by release, digest, distribution, target, and location state;
+- open artifact detail with sources, release reservations, locations, errors,
+  references, and publication history;
+- start Publish, Prepare, Retry publication, and Retry location actions when
+  authorized;
+- follow asynchronous request progress without duplicate submission; and
+- see empty, loading, stale-cursor, permission, old-server, and error states.
+
+The UI never fetches credentials or raw server configuration. It displays
+bounded, code-valued errors and copyable remediation commands.
+
+### Image distribution readiness
+
+Administrators get a read-only Settings panel showing:
+
+- active secret-free profile revisions and workspace defaults/allowlists;
+- Terraform-produced repository and role readiness;
+- copy and lifecycle worker healthy/stale counts;
+- queue depth and oldest pending/retry age by profile/target; and
+- capability failures that prevent managed-profile activation.
+
+V0 deliberately has no browser profile editor. Operators change versioned
+configuration and Terraform through normal GitOps, then use the panel to verify
+convergence. This removes a second configuration transaction system without
+making the feature raw-YAML-only operationally.
+
+### Direct read API
 
 ```text
-inventoried_total_repositories
-  + (workspace_capacity * S - compliant_empty_managed_repositories)
-  + repository_headroom
-<= applied_repository_quota
+GET /images/catalog?workspace=W&limit=50&cursor=C
+GET /images/artifacts/{id}?workspace=W
+GET /images/artifacts/{id}/releases?workspace=W&limit=50&cursor=C
+GET /images/artifacts/{id}/locations?workspace=W&limit=50&cursor=C
+GET /images/profiles?workspace=W
+GET /images/workers?workspace=W
 ```
 
-Every retained empty managed repository must be one of the planned rendered
-names, so the subtraction is nonnegative and cannot hide unrelated resources.
-Workspace `max_artifacts` is a lifetime distinct-digest bound and never falls
-after purge or compaction, so retained tombstones cannot hide catalog demand.
-Terraform selects or validates the smallest feasible `S` at or below 256 and
-fails activation when the total hard manifest capacity and repository budget do
-not intersect. More shards relieve image density but consume repository quota;
-separate realms or approved quota increases are the escape hatch.
+Reads use opaque versioned keyset cursors bound to workspace and filters. Limit
+is 1 through 100. A cursor from another workspace, filter, profile revision, or
+server version fails closed. Responses bound associations; detail collections
+remain paginated. No dashboard read creates a generic request row.
 
-For the documented Boltz AMD64 example, one million retained single-manifest
-artifacts and an applied 100,000-images-per-repository quota require at least 10
-repositories before headroom; the smallest exact feasible count may be larger
-after the per-shard headroom vector is applied. This is an example calculation,
-not an assumed account quota. The module always uses live applied values and
-refuses an infeasible plan.
+## Security and privacy invariants
 
-The secret-free Terraform output records the exact applied quota snapshot,
-inventory digest/time, sizing inputs, selected shard count, exact capacity
-vector, compliant empty-repository count, `workspace_capacity`, and realm
-generation.
-PostgreSQL reserves one durable realm slot before a workspace can first use a
-managed profile; capacity exhaustion fails before repository I/O with
-`REGISTRY_WORKSPACE_CAPACITY_EXHAUSTED`. Removing a workspace does not silently
-reuse its namespace slot while retained artifacts exist. A first-location
-allocation fails before location or repository I/O with
-`REGISTRY_SHARD_CAPACITY_EXHAUSTED` when no stored shard has a free reservation.
-Activation and every just-in-time repository creation recheck stored capacity
-against provider drift;
-closed `REPOSITORY_QUOTA_EXHAUSTED` and
-`IMAGES_PER_REPOSITORY_QUOTA_EXHAUSTED` outcomes are retryable and point to the
-quota/headroom runbook.
-
-An existing namespace root never silently changes shard count. Capacity
-expansion creates a new realm generation whose fixed `g<realm_generation>`
-segment produces a different repository prefix, plus a new profile revision.
-Activation proves the new prefix does not overlap any retained generation
-before it directs new writes there. New placement resolves only the new head;
-existing durably pinned consumers keep their old READY route, new content is
-prepared lazily on observed use, and old references drain without an eager
-rewrite. Only then
-does the disjoint historical physical-generation retirement engine delete and
-compact the old generation under its retained custody. Artifact purge is not
-required and the artifact remains ACTIVE. Rollback may reactivate the old head
-during the default 24-hour grace only before retirement stamps its first
-location; afterward rollback fails closed and must activate another new
-generation. The migration has no all-artifact eager-copy step.
-
-Terraform outputs a secret-free profile fragment without `revision`, plus the
-complete normalized `profile_fingerprint`. The administrator supplies the
-monotonic revision in SkyPilot config. CI rejects a fingerprint change without
-a revision increment. Terraform cannot infer or mutate the active generation
-stored in PostgreSQL, so it never pretends a content hash is that generation.
-The outputs also include role ARNs, registry prefixes, and runtime policy
-attachments, but never credentials.
-
-Provider-native pull-through cache remains a possible source accelerator only
-when its upstream, account, region, encryption, and immutability behavior
-matches the profile; a miss still creates durable intent and READY still
-requires exact verification. Native ECR cross-region replication is excluded
-from v1 because prefix rules replicate every matching new push, create content
-without per-artifact lazy intent or byte reservation, and do not mirror delete
-lifecycle. A future explicit `replication_mode: tracked_eager` would have to
-reserve every destination location and worst-case byte/manifest quota before
-canonical push, reconcile each result, and delete each destination explicitly.
-It is not a transparent optimization of lazy placement.
-
-Placement remains nonblocking under the default `locality: prefer` policy:
-
-1. one bounded PostgreSQL read chooses a READY local location when available;
-2. otherwise it enqueues an idempotent local intent without waiting for
-   repository creation, copy, or verification; and
-3. it immediately uses an already READY authorized canonical route, or the
-   exact digest-pinned source only when that source was present in this request.
-
-A release-only or artifact-only selector with no READY route fails fast with a
-closed `IMAGE_WARMING` result and a publication or preparation ID. It never
-inherits a historical source alias. This is nonblocking but not fictitious
-availability: callers may wait on the direct status resource or prepare before
-fleet deployment.
-
-Only `locality: require` waits for the selected target, and that wait is
-visible, cancellable, and bounded by the normal deployment timeout. Provider
-API latency, registry throttling, and a failed warm therefore cannot add hidden
-latency to ordinary deployment admission. Workers scale independently from
-the API service. The Helm chart installs a separate `Deployment`, not an API
-sidecar, running `python -m sky.container_images.worker_service`. It has
-configurable replicas, graceful lease release, readiness/liveness probes, and
-`max_in_flight` per pod, plus a local delay estimator that cannot authorize a
-provider call without the shared PostgreSQL registry permit. The
-default is not a hidden global concurrency of five. Queue depth, oldest due
-age, and bytes in flight drive an operator-set replica count or an optional
-metrics-backed autoscaler. One image copied to three targets creates three jobs
-whether the fleet has one GPU or 1,000; GPU replica count is not itself
-copy-worker concurrency.
-
-The provider adapter is a capability boundary. Each provider advertises
-namespace provisioning, short-lived copy authentication, pull authentication,
-verification, native replication, an enforceable exclusive mutation boundary,
-ownership proof, and deletion support. A
-profile cannot enable an operation the adapter does not prove. The AWS ECR
-adapter is the first managed implementation: repository creation, short-lived
-writer authentication, exact digest verification, runtime pull identity,
-ownership proof, and manifest deletion all have integration and negative-IAM
-tests. GCP, Nebius, and generic OCI begin as `ownership: external`; their
-operators provision namespaces and credentials, and SkyPilot may copy only
-through an explicitly implemented capability. Core catalog, resolver, and
-worker state contain no Nebius-specific branch. No provider becomes managed
-from an allowlist that same-account or same-project identities can bypass.
-
-Cloudflare is experimental until an official OCI registry product exposes
-documented repository ownership, scoped credentials, pull compatibility, and
-deletion APIs that pass a production pull test. An operator may configure such
-an endpoint through the generic external OCI adapter. Terraform does not claim
-to provision it automatically. Raw R2 remains suitable for the builder's
-S3-compatible context/bounded-log store or an explicit rollback archive, never
-as a BuildKit registry cache or runtime image fallback. A separately deployed
-OCI Distribution service may use R2 for staging/cache blobs only after the
-builder-specific conformance gate; clients still speak OCI to that service,
-not S3 to R2.
-
-## Runtime and multi-GPU behavior
-
-Distribution is node-scoped. An EC2 instance with four GPUs pulls one image
-for the node. The workload entrypoint or process supervisor starts one model
-process per visible GPU when that topology is desired. Registry code must not
-copy or pull the image four times.
-
-On Kubernetes, one pod per GPU is expressed through replica count and GPU
-requests. Registry resolution happens per workload template; normal node-level
-containerd caching deduplicates layer pulls. SkyPilot does not invent
-Kubernetes pods on raw VMs.
-
-Cloud conditionals should be confined to two adapter boundaries:
-
-- materialization: namespace ownership/provisioning and short-lived writer
-  credentials;
-- runtime: provider/backend-specific pull capability and secret-free auth
-  strategy.
-
-Artifact, release, location, reference, lease, retry, and resolver logic stay
-provider-neutral.
-
-## Safety and failure semantics
-
-- Serialized tasks, launch handles, database rows, status responses, and logs
-  contain strategy names and references, never tokens or passwords.
-- Legacy Docker `image_id` references are validated and canonicalized before a
-  value-free deprecation warning is emitted. Rejected references produce no
-  warning, and ambiguity errors never interpolate the untrusted image values.
-- Explicit `container_image` tasks reject nonempty inline Docker username or
-  password credentials at resource construction, atomic task mutation,
-  serialization, pickle restoration, server preflight, final request-row
-  encoding, and cluster-handle persistence. This rule spans all resource
-  alternatives and restored v35+ resources, and is reapplied before pickle
-  bytes are allocated; legacy `image_id: docker:...` tasks retain their
-  compatibility path. Managed routes use public access or server-side workload
-  identity instead of serializing registry secrets.
-- Image-route request validation never reflects rejected raw inputs or
-  Pydantic contexts in 422 responses; query-model failures use the same
-  value-free boundary.
-- Uvicorn access logging strips the complete query string before formatting,
-  so rejected selectors and workspace values cannot reach access logs before
-  route validation. Structured task YAML validates the shape of `any_of` and
-  `ordered` wrappers plus every direct and alternative `container_image` field
-  before generic JSON-schema reporting, then collapses failures to one
-  value-free error without an exception cause.
-- Release labels use one secret-free OCI-tag grammar at model, API, YAML,
-  pickle, state, and catalog-response boundaries, and invalid values are never
-  reflected into terminal-facing errors.
-- Artifact/location UUIDs and distribution/target identifiers use bounded,
-  secret-free grammars across request, config, YAML, pickle, state, runtime,
-  and response boundaries; response validators hide rejected input values.
-- Restartable managed pull plans carry and atomically validate their complete
-  distribution policy snapshot; policy-only auth changes cannot reuse stale
-  serialized authority.
-- Image routes and resolved runtime plans enforce the same secret-free OCI
-  reference grammar and a closed set of auth-strategy names at construction.
-- Mutable managed tags fail before catalog registration.
-- Digest mismatch never publishes READY.
-- `managed_preferred` may fall back only to the explicitly supplied pinned
-  source and only when policy permits it.
-- Private cross-cloud canonical fallback is infeasible unless the placement
-  declares a safe runtime pull strategy.
-- A failed regional warm does not interrupt a running source or canonical
-  pull; it is visible as FAILED for later retry.
-- Canonical content is never an automatic eviction candidate.
-- External locations are never automatically deleted.
-- Managed regional eviction rechecks age, state, ownership, digest, lease, and
-  durable references at the claim and completion boundaries. Completion also
-  requires the exact canonical origin to remain READY.
-- The generic durable-reference API refuses `consumer_type: cluster`. Cluster
-  references use the cluster-handle transaction, keeping one lock ordering and
-  preventing a generic-reference versus cluster-commit inversion.
-- Explicit and provider-derived registry authorities share one canonicalizer
-  for DNS case, trailing DNS dots, IPv4/IPv6 spelling, and the default HTTPS
-port before identity comparison and reference rendering. Configured and
-rendered repository paths use the OCI lowercase component grammar; managed
-  artifact paths use the realm generation's quota-proved stored balanced shard
-  index, and invalid paths are rejected rather than rewritten.
-
-## Operational surfaces
-
-```text
-sky image register REF [--distribution NAME]
-sky image publish REF --release RELEASE [--distribution NAME] [--no-wait]
-sky image publish --artifact-id UUID --release RELEASE \
-    --distribution NAME [--no-wait]
-sky image status [ARTIFACT|RELEASE|REF]
-sky image prepare IMAGE --targets TARGET[,TARGET...] [--distribution NAME]
-sky image retry IMAGE --target TARGET
-sky image publication retry PUBLICATION_ID [--no-wait]
-sky image infrastructure inventory aws --account ACCOUNT --regions R[,R...] \
-    --output inventory.json                         # admin/read-only
-sky image publication release-name PUBLICATION_ID --reason CODE --yes # admin
-sky image tombstone --artifact-id UUID --reason CODE --yes       # admin
-sky image purge --artifact-id UUID [--retry] --yes               # admin
-sky image retirement retry --custody-id UUID --yes                # admin
-sky image retirement retry --location-id UUID --yes               # admin
-sky image retirement acknowledge-external --location-id UUID \
-    --generation N --evidence-reference REF --yes                # admin
-```
-
-`register` establishes immutable catalog identity and canonical intent.
-`publish` resolves exactly one source or artifact selector, reserves a release,
-and by default waits client-side until canonical verification atomically makes
-that release available. Artifact publication never synthesizes source
-provenance. `prepare` establishes
-requested physical-cache intent. No operation waits inside the API executor
-for OCI transfer, and none copies to unrequested regions.
-`publication retry` reuses one never-READY reservation, resolves its stored
-distribution through the current active head, and either finalizes a READY route
-or returns it to PENDING on that current canonical location. It never retargets
-the name to a different artifact or distribution and consumes no new lifetime
-slot.
-
-Bare operational selectors remain untyped through CLI and HTTP transport.
-The server resolves artifact, release, and source candidates together. The
-distribution override is a separate prepare field, so adding
-`--distribution` cannot silently reinterpret a release as a source reference.
-When a selector includes both `ref` and `release`, both fields must identify the
-same digest and preparation always registers or validates the source alias;
-neither identity field may be silently ignored.
-
-Status reports artifact identity, source aliases, releases, producer metadata,
-and every materialization with location ID, distribution, endpoint revision,
-canonical flag, state, attempts, verification time, use time, and a closed
-diagnostic code. Copy callbacks are untrusted metadata producers: platform
-strings and compressed size are bounded before READY persistence, validated
-again when catalog rows are decoded, and validated a third time by the response
-model. Producer metadata follows the same three-boundary rule: producer kind is
-closed, the optional producer spec hash is 64 hexadecimal characters, and the
-optional builder version uses a bounded control-plane identifier. Registry
-control values use closed or bounded secret-free grammars. Every
-status-exposed location string, including both fingerprints, is revalidated
-when its catalog row is decoded and when its response model is constructed.
-Image workspace values use SkyPilot's established bounded workspace grammar
-at request, catalog-write, catalog-decode, direct-core, and response
-boundaries. A workspace-resolution denial or ambiguity is translated before
-scheduling into a closed value-free 403 or 422 response.
-The image CLI passes `--workspace` through the explicit SDK/HTTP workspace
-field for publish, status, prepare, and retry; it does not rely on the generic
-client config override being interpreted by these purpose-built routes.
-Direct core calls default the workspace only when the caller supplies `None`;
-an explicit empty or otherwise invalid value is rejected before any catalog
-read or write.
-Provider validation errors never interpolate rejected values. As a final
-defense, task-bearing launch, exec, optimize, managed-jobs, pool, and Serve
-payloads preflight every `resources.container_image` selector and every
-effective legacy Docker `resources.image_id` form, including the reserved
-`docker` key, `docker:` values, Kubernetes interpretation, and inherited
-`any_of` or `ordered` candidates, before the raw YAML can enter the request
-database. The candidate traversal is iterative, bounded, and cycle-safe for
-YAML aliases. Rejected task inputs use the same value-free 422 boundary as
-image routes. Every direct image request and every task or DAG using either
-modern or legacy container-image syntax replaces terminal exceptions with one
-closed, value-free error before executor logging, request-database persistence,
-or `/api/get` encoding. Provider exceptions and caller-supplied strings are
-never serialized into logs, the catalog, launch state, async request database,
-or terminal API response. Config, CLI override, Task, DAG, Jobs recovery, and
-Serve snapshot parsing reject malformed YAML with a fixed value-free error;
-administrator config and task/DAG entrypoints also reject duplicate mapping
-keys before PyYAML can silently weaken the effective policy. Duplicate errors
-never reflect the key text. The YAML node-graph scan tracks active and visited
-node identities, rejects recursive aliases, and enforces a fixed edge budget
-so alias cycles or amplification cannot recurse or consume unbounded work.
-Unfiltered legacy status remains bounded for SDK compatibility. Large catalogs
-use the direct keyset-paginated catalog endpoint. Sources, releases, and
-locations are loaded in three batch queries rather than three queries per
-artifact. Artifact,
-source, creation-order,
-materialization-queue, verification-queue, and eviction-queue lookups are
-indexed so hot paths do not scan a million-row catalog. Canonical and regional
-queue indexes are separate so PostgreSQL cannot prefer a global due-order
-index that filters every blocked regional row. Workspace is denormalized onto
-each location row specifically so queue probes do not join through artifact
-identity. No frozen performance result is claimed until the repository contains
-the reproducible PostgreSQL fixture, captured plans, database settings, host
-description, and raw result artifact. The release gate requires those plans to
-use the READY-canonical and canonical-location-prefixed regional partial indexes
-without scanning dependency-blocked rows. The same fixture freezes every
-external-adoption, purge, target-custody retirement-scan, and location-retirement
-queue plan, including canonical dependency blocking, zero eligible rows,
-claim-20 exclusion, and a late eligible row behind one million ineligible rows.
-A separate PostgreSQL page-advance regression places work beyond the first
-eight 16-profile pages and proves reconciliation and eviction listing plus
-atomic claiming eventually reach it.
-
-Dashboard catalog scale is a separate gate from worker-queue scale. A frozen
-PostgreSQL 16 fixture with one million lifetime-counted artifacts, including
-large ACTIVE, TOMBSTONED, PURGING, and PURGED populations, captures
-`EXPLAIN (ANALYZE, BUFFERS)` and wall time for the first page, a deep keyset
-page, exact artifact/release/source selectors, every explicitly supported
-filter shape above, zero-match filters, and the fixed-query
-alias/location-summary batch load. The same fixture covers first, deep,
-current-only, and historical location-detail pages for the highest-cardinality
-artifact. Each request must issue a constant number of SQL statements, avoid
-disk spill and sequential million-row scans, and complete under 200 ms p95 on
-the release benchmark host. An unfiltered page may examine at most twice its
-artifact limit. A distribution-filtered page first resolves one profile head,
-must use the exact active-revision facet index, and may examine at most
-`limit * 128` qualifying facet rows under the database-enforced revision target
-count plus artifact/custody uniqueness to deduplicate one page. An exact zero-match probe is an index-only
-lookup over one distribution and revision. State-only queries do not exist, so
-historical facets and an unbounded number of profile heads cannot invalidate the
-claim. Executor memory stays below 64 MiB. The fixture also injects
-projection drift, proves authority paths ignore it, verifies detection, and
-exercises bounded repair. A quota regression proves purge and compaction never
-free a lifetime digest slot or permit recreation of a PURGED digest. Evidence
-records PostgreSQL settings and hardware; a unit test alone is not accepted as
-proof.
-
-The worker deployment must expose queue depth, claim age, copy bytes and
-duration, verification mismatch, retry count, source-fallback selection,
-canonical selection, regional selection, and eviction outcome. A production
-rollout is incomplete until this worker is deployed independently from API
-request executors and restart recovery is exercised.
+- Runtime references are digest-pinned.
+- Credential values never enter YAML, PostgreSQL, request rows, logs, command
+  arguments, API responses, or dashboard state.
+- Source authentication is a named secret reference resolved only inside the
+  isolated worker. V0 supports only source paths with a qualified implementation.
+- Provider errors are mapped to bounded codes before persistence.
+- API, copy, lifecycle, and workload identities are non-interchangeable.
+- Managed deletion is allowed only for noncanonical regional content with no
+  live durable reference.
+- External profiles never grant SkyPilot deletion authority.
+- Workspace authorization is checked before selector lookup to avoid existence
+  disclosure.
 
 ## Rollout
 
-### Foundation implemented on this branch
+1. Merge literal schema, typed API, worker images, UI, Terraform, and tests with
+   managed profiles disabled.
+2. Deploy API replicas and run migration 023.
+3. Apply Terraform in a dedicated AWS account or an isolated fixed prefix.
+4. Deploy one copy worker and one lifecycle worker with separate identities.
+5. Activate one profile for one test workspace and publish one digest.
+6. Verify publish, warming, pull, restart, retry, and reference-fenced eviction.
+7. Convert the Boltz L4 test fleet and compare direct cross-region pulls,
+   operator-prewarmed images, and managed JIT locations.
+8. Enable production only if the operations or performance gate passes.
 
-- first-class `resources.container_image` and compatibility normalization;
-- source registration and the original publication/prepare foundation, with
-  the corrected READY-gated release reservation still to be implemented;
-- all-target prepare prevalidation before any catalog mutation;
-- immutable artifact and many-release identity;
-- physically revisioned canonical/regional locations with independent policy
-  revisions, monotonic catalog generations, and exact canonical bindings;
-- fenced copy and eviction leases;
-- constant-work profile activation plus lazy exact-row settlement of expired
-  copy and eviction transitions without requiring the old canonical manifest;
-- half-open lease expiry, semantic lease-state constraints, and inactive-token
-  clearing across exact profile transfer;
-- exact-digest external adoption and copy primitives;
-- bounded per-process profile and queue-kind rotation, state-specific partial
-  canonical and regional indexes, PostgreSQL dependency-first lateral probes,
-  compatible shared generation locks, and two-phase seek-forward
-  reconciliation and eviction without whole-queue aggregation or blocked-row
-  scans;
-- 16-profile primary-key keyset pages with independent operation cursors,
-  bounded end-of-catalog wrap at the 256-profile ceiling, and
-  reconciliation/eviction later-page liveness proofs;
-- denormalized workspace queue routing and the indexes required by the pending
-  checked-in million-row PostgreSQL benchmark;
-- heartbeat cancellation, jittered retry backoff, and READY revalidation
-  primitives;
-- ensure-on-use after quota checks, with dry-run and optimizer purity;
-- immediate pinned-source fallback with visible WARMING state;
-- one immutable SkyServe artifact snapshot per service version across all
-  resource candidates, taken before version/controller persistence;
-- placement-aware OCI platform filtering, final durable architecture fencing,
-  and architecture-aware ECR tooling bootstrap;
-- explicit Kubernetes context pull bindings;
-- durable launch references and reference-aware eviction;
-- provider-proved deletion authority and fail-closed managed eviction;
-- atomic cluster-handle/reference persistence, refresh no-ops, exact
-  controller catalog authority, and old-server legacy image down-conversion;
-- final-commit selector, complete-profile, placement-auth, derived-login, source
-  fallback, and revision-fingerprint validation, plus a complete execution-state
-  refresh fence, INIT-to-READY execution-plan preservation, and current-policy
-  re-resolution on later stopped-cluster restarts;
-- REST, SDK, CLI, schema, database migration, and focused unit coverage.
+Rollback disables new publication and worker claims, keeps existing digest pull
+plans usable, and preserves PostgreSQL intent. External digest-pinned profiles
+remain the escape hatch. A migration downgrade is permitted only before any
+image row exists.
 
-### Productization in the current implementation round
+## Acceptance gates
 
-- [ ] Rewrite migration 023 as the frozen literal 17-table PostgreSQL schema,
-  including config-generation authority, the forced config compatibility guard,
-  guarded downgrade, realm-prefix uniqueness, projections, limiters,
-  constraints, and exact indexes.
-- [ ] Add the Helm/manual 022-ceiling compatibility rollout and dedicated 023
-  migration Job, with exact live-version preflight and clean-install behavior.
-- [ ] Replace best-effort image config reload with the shared central-config,
-  starvation-free profile-head quiesce/finalization protocol, replica
-  convergence, and crash tests.
-- [ ] Add READY-gated publication reservations and client-side wait semantics;
-  remove launchability of pending releases.
-- [ ] Fail closed for unknown runtime architectures unless an exact runtime
-  binding proves a finite platform set covered by the artifact.
-- [ ] Add cursor-paginated catalog and secret-free profile-summary APIs.
-- [ ] Add transactionally maintained summaries/facets for only the closed query
-  shapes and check in their million-row PostgreSQL plans before activation.
-- [ ] Build the complete Images dashboard, artifact detail, safe actions,
-  workspace handling, responsive states, and dashboard test/build coverage.
-- [ ] Add admin-only tombstone/purge state, CLI/API, audit, retry, AWS ownership
-  fencing, historical-generation retirement/compaction, and the separately
-  authorized lifecycle reconciler without a dashboard delete action.
-- [ ] Implement the complete AWS ECR capability slice and reusable AWS control
-  plane, VM-pool, image-distribution, and dedicated-account Terraform example,
-  including generation-qualified balanced shard allocation and the closed
-  per-call ECR limiter map.
-- [ ] Deploy independently scalable copy and lifecycle workers through Helm, with
-  separate identities, metrics, configurable concurrency, probes, restart
-  recovery, and rollback runbooks.
-- [ ] Implement only the managed-builder prototype and evidence gate described
-  in `managed-container-image-builder.md`; do not add migration 024, public
-  build syntax, durable builder workers, or Build UI before it passes.
-- [ ] Run the focused backend/dashboard/Terraform suites, formatting, dashboard
-  production build, and manual PostgreSQL/browser verification.
-- [ ] Capture the independent million-artifact catalog plans and the AWS
-  integration/negative-IAM evidence. Treat large-fleet timing as an activation
-  gate when real fleet capacity is available.
-- [ ] Pass the exhaustive paired design gate before implementation, then freeze
-  the verified implementation and pass the exhaustive paired exact-head
-  acceptance gate described below.
+### Core invariants
 
-### Activation sequence keeps the first operational slice small
+- A workload using a release performs no source registration or release
+  mutation, and no provider call in the API or placement process.
+- A release lookup returns nothing until its canonical location is READY.
+- A failed publication leaves every prior release and deployment launchable.
+- One placement attempt creates at most one location intent and warming never
+  causes cloud or region failover.
+- Copy crashes before and after manifest publication converge to one verified
+  digest.
+- At 1,000 replicas and eight GPUs per node, copy cardinality equals requested
+  physical targets, not replicas, nodes, or GPUs.
+- Regional eviction cannot pass a concurrent reference acquisition or canonical
+  dependency fence.
 
-The code, schema, typed API, and complete UI are reviewed and merged together,
-but every new surface defaults disabled. An existing deployment first rolls all
-API replicas to version 62 against the temporary 022 schema ceiling, then the
-dedicated Job applies migration 023 with workers and managed profile creation
-off. The next phase enables bounded catalog reads and the Images UI only after
-schema/guard parity and checked-in query plans pass. The following phase enables
-the typed editor only after config/head crash recovery and replica-generation
-convergence pass. The first data-plane canary is one managed AWS realm
-generation, one fixed shard plan, canonical publication, and one locality
-target. Additional regions and worker replicas may scale that same generation
-after limiter evidence. Creating a second realm generation is a separate canary
-after old-generation drain and prefix-nonoverlap tests.
+### Required verification
 
-This staging does not omit the requested UI or large-catalog implementation
-from the release artifact. It prevents an unproven dashboard projection,
-configuration editor, million-row claim, or shard-expansion path from becoming
-production authority merely because its code was deployed. The digest-only
-external profile remains the rollback path at every phase.
+- real PostgreSQL migration, concurrency, lease, retry, and downgrade tests;
+- old-server/new-client and new-server/old-client feature-gate tests;
+- AWS integration plus negative IAM tests;
+- `terraform fmt -check`, `terraform validate`, and plans for one and multiple
+  regions with fixed shards;
+- worker kill/restart tests around every provider-I/O boundary;
+- Jest interaction, pagination, permission, responsive, and stale-state tests;
+- a production Next.js build;
+- repository formatting and focused backend tests; and
+- 100, 500, and 1,000-replica timing evidence before a speed claim.
 
-### Required before a managed production profile
+Managed production activation requires either:
 
-- isolated mutable-tag resolver/import worker, or keep the digest-only API;
-- independently deployed materialization and lifecycle reconcilers using their
-  closed lease/backoff loops and separate identities, plus metrics and restart
-  exercises;
-- provider namespace provisioning, short-lived copy credentials, and exact
-  manifest deletion authorization for each advertised managed provider;
-- completed manual canonical lifecycle and purge-recovery exercise;
-- Kubernetes secret-name injection if that auth mode is advertised;
-- READY periodic revalidation plus the bounded policy-transfer and historical
-  physical-generation retirement engines, global due indexes, external
-  acknowledgement, audit retention, and custody/realm compaction;
-- PostgreSQL migration tests;
-- old-client/new-server and new-client/old-server compatibility validation;
-- full provider integration tests, including negative IAM tests.
+- image-ready p95 at least 40 percent lower than direct cross-region pull with
+  no regression above 10 percent versus operator-prewarmed nodes; or
+- no material speed claim, but verified automatic preparation, zero credential
+  leakage, bounded recovery, and at least 95 percent reduction in manual image
+  preparation steps.
 
-### Boltz L4 fleet conversion
+## Adversarial review protocol
 
-1. Publish the existing Boltz digest under an immutable release.
-2. Adopt or prepare canonical ECR and verify the exact digest.
-3. Prepare the AWS location through the managed slice. Use externally
-   provisioned profiles for GCP and Nebius until their adapters qualify.
-4. Run one-instance pull and process-topology canaries in each backend.
-5. Compare cold-start time and registry throttling at 100, 500, and 1,000
-   replicas against direct cross-region and operator-prewarmed controls.
-6. Gate fleet scale-up on `locality: require` readiness.
-7. Keep the R2 archive as a bounded rollback path during soak, then remove the
-   per-cloud archive/load workaround.
+Each material design or implementation change is reviewed at one immutable git
+commit by both Codex 5.6 and Claude Fable. A round counts only when both inspect
+the same commit and return `PURSUE`, `RESHAPE`, or `DROP`. An unavailable model is
+reported and is not replaced. Findings are fixed as one coherent batch before
+the next round. Completion requires three consecutive paired `PURSUE` rounds,
+with no more than six additional paired rounds in this review cycle.
 
-## Test strategy
-
-Unit tests must cover:
-
-- register creating immutable identity and canonical intent without a release;
-  publish creating a unique durable reservation while leaving release lookup
-  unavailable until exact canonical READY completion atomically inserts the
-  release and marks publication READY; failed, retried, cancelled, conflicting,
-  identical concurrent, and admin RELEASED generations preserve those
-  invariants; a never-READY name can be released only under every stated
-  precondition, restores quota once, and rejects stale finalizers, while a name
-  that was ever READY remains immutable; workspace and per-artifact publication
-  active-reservation counters increment and decrement atomically, never underflow,
-  and repair to the exact non-RELEASED indexed counts, including retained
-  RELEASED rows that consume neither active counter; workspace and per-artifact
-  publication lifetime-generation caps cannot be bypassed or released by
-  repeated RELEASED generations, retained-record caps remain independent, and
-  keyset-bounded post-retention compaction writes audit before releasing exactly
-  one retained-record slot and zero lifetime slots; READY finalization moves the
-  live canonical foreign key to immutable scalar audit evidence, never-READY
-  RELEASED clears it, and permanent release/publication history does not pin
-  physical-generation compaction; canonical success and failure atomically
-  settle every exact-location PENDING sibling under the 256-row bound;
-  physical supersession immediately fences finalizers, changes matching
-  PENDING/FAILED routes to `PROFILE_SUPERSEDED`, detaches every matching live
-  foreign key without releasing quota, and publication retry binds the current
-  route or fails cleanly for a REMOVED distribution; source-backed retry may
-  create a missing current intent only from its exact stored explicit source,
-  while artifact-backed retry never inherits an alias;
-  publishing another release for an already READY canonical route finalizes
-  immediately through the same locked validator;
-  artifact-ID publication creates no source row, requires one authorized ACTIVE
-  READY canonical distribution, shares reservation quota and finalization, and
-  rejects selector/distribution ambiguity;
-  prepare remains the only explicit regional fan-out operation;
-- fresh real-PostgreSQL 022-to-023 migration from frozen literal DDL, exact
-  parity with checked-in distribution metadata, the exact 17-table inventory
-  listed above with every named check/index/foreign key, including active
-  artifact release reservations, the pending-location publication index,
-  single-global active config apply, lifetime profile-name and retained-revision
-  bounds, revision compaction index, custody transition/scan authority, disjoint
-  location retirement generations, and all retirement due indexes; absence of
-  obsolete legacy tables/columns, the API-62 minimum-image-plane fence, both monotonic
-  state-ever-created witnesses and TRUE-to-FALSE trigger, atomic first
-  distribution-state marking, and no live-metadata imports. A version-61-style
-  connection without the custom setting cannot read or write the mandatory
-  config row and its server bootstrap fails; sync/async version-62 connections
-  survive pool recycle; a superuser or `BYPASSRLS` application role is rejected;
-  SQL instrumentation enumerates every image read, mutation, worker claim,
-  heartbeat, finalizer, config reload, pool-checkout, and readiness entry point
-  and proves it takes the shared compatibility lock and current-API check;
-  the staged 022 rollout keeps image routes closed; and the dedicated Job
-  refuses migration while a below-62 live replica remains. A locked clean
-  downgrade restores 022, while either witness, any owned row, image config,
-  or an old/new writer race makes downgrade fail in PostgreSQL with the RLS
-  guard and revision intact. The separately gated builder
-  release owns its later 022-to-023-to-024 parity and pre-024 compatibility
-  probe;
-- the named 023 external-OCI-only producer and SOURCE-only origin constraints.
-  Their future atomic 024 replacement, build-token locking, and BUILD provenance
-  are builder-release gates rather than distribution activation claims;
-- scalar/object selectors and compatibility aliases;
-- combined source-plus-release selectors validate both identities and register
-  every supplied source alias;
-- explicit operational selector namespaces, rejection of cross-namespace
-  ambiguity, acceptance only when a bare value matches the artifact, release,
-  or OCI-source grammar, and value-free rejection of all other values before
-  request persistence or terminal errors;
-- strict secret-free OCI source-reference grammar before model, API, or state
-  persistence, at Docker's repository-length boundary, and again at worker
-  destination construction, runtime-plan construction, and completion;
-- secret-free immutable release grammar across model, REST, task YAML, pickle,
-  state, and status response boundaries, including credential URL and terminal
-  control regressions;
-- canonical artifact/location UUIDs and bounded distribution/target names at
-  model, REST, config, task YAML, pickle, state, runtime-plan, and response
-  boundaries, including credential URL and terminal-control rejection without
-  reflected values;
-- structured publish and prepare dictionaries sanitize unsupported keys before
-  Pydantic can retain their names or values in local validation details, and
-  malformed registry authorities clear raw parser cause chains across
-  Resources, OCI, and administrator-config entrypoints;
-- bounded provider, region, account, project, manager-identity, and closed
-  pull-auth configuration at model and adapter boundaries, plus value-free
-  terminal persistence and `/api/get` round trips for every image request name;
-- rejection of mixed managed/external ownership in one profile and of
-  overlapping target locality at configuration admission;
-- reserved `distribution: direct` accepted only as an explicit
-  managed-preferred source bypass, rejected as a profile/default or under
-  managed-required, and removal/rejection of the no-op
-  `require_digest_at_runtime` key while all managed runtime references remain
-  digest pinned;
-- pre-persistence, value-free task-YAML validation across launch, exec,
-  optimize, managed jobs, pools, and Serve for both `container_image` and every
-  effective legacy Docker `image_id` form, plus actual-router 422 matrices for
-  direct, `any_of`, and `ordered` resources and process/coroutine terminal-error
-  regressions proving credential-bearing image values and provider errors
-  cannot cross logs, the request database, or the API;
-- malformed config, CLI override, Task, DAG, Jobs, and Serve YAML fails closed
-  with no parser value or cause-chain reflection, while duplicate administrator
-  policy and task keys are rejected before effective-value selection, with
-  value-free duplicate errors, recursive-alias rejection, and a fixed graph
-  budget;
-- direct construction and local DAG parsing regressions proving legacy Docker
-  validation precedes its value-free deprecation warning, plus value-free
-  ambiguity errors;
-- implicit Docker Hub digest-pinned fallback on VM and Kubernetes, plus inline
-  Docker credential rejection across direct, inherited, and sibling resource
-  alternatives, all eight task-bearing bodies and routers, atomic local task
-  mutation, final request-row persistence, restored explicit-direct v35+
-  resources, YAML export, pickle encode/decode, and cluster-handle persistence,
-  with a legacy Docker `image_id` round-trip compatibility proof;
-- conservative validation and terminal classification of unprefixed legacy
-  `image_id` values whenever cloud selection can still choose Kubernetes,
-  including `infra: '*'` and `infra: '*/region'` through the same
-  `InfraInfo` wildcard parser used by `Resources`, and every registered
-  Kubernetes-derived cloud such as SSH node pools through registry class
-  semantics, while an explicitly non-Kubernetes cloud image remains outside
-  the container-image error boundary;
-- separate raw-field credential-shape scanning from effective runtime
-  classification: inherited non-container clouds retain valid provider VM
-  image syntax such as Azure marketplace and community IDs, while unsafe raw
-  values are rejected even if a child later overrides them and unconstrained
-  leaves are still conservatively treated as Kubernetes-eligible;
-- bounded unique OCI platform metadata and compressed size at callback, READY
-  persistence, catalog decode, and response boundaries, with secret-bearing
-  platform text neither persisted nor reflected;
-- rejection of digest-only copy and external-adoption callbacks, rejection of
-  direct READY completion with an empty platform set, managed-profile rejection
-  of OCI indexes/manifest lists before repository or permit work, exact
-  single-manifest config platform extraction, and no empty-platform match for a
-  known runtime. External-only index tests cover root artifact-index rejection,
-  exact descriptor-size verification, one common structural boundary for every
-  root, config, layer, image-child, and non-image descriptor, and whole-index
-  failure for malformed image children beside a valid child while structurally
-  valid referrers remain ignored;
-- external-profile register and publish returning the deterministic destination
-  in `AWAITING_EXTERNAL_PUSH`, never issuing source credentials or copy I/O,
-  exact-destination verification and retry transitions, byte-quota denial
-  entering FAILED with `EXTERNAL_BYTE_QUOTA_EXCEEDED` and returning to
-  AWAITING_EXTERNAL_PUSH only through authorized retry, never false READY, and
-  managed-profile register retaining import semantics;
-- known AMD64/ARM64 placement filtering before provisioning, external-profile
-  multi-platform coverage of every allowed placement architecture, managed
-  single-platform rejection when candidates span architectures, fail-closed
-  unbound Kubernetes/Nebius/generic placements, exact admin-binding acceptance,
-  final cluster-commit architecture fencing, and architecture-aware ECR AWS CLI
-  bootstrap, including GCP catalog architecture propagation and T2A
-  preprovision plus durable-commit rejection;
-- policy-authorized WARMING fallback with a known runtime and empty pre-READY
-  metadata, while a nonempty incompatible platform set remains rejected;
-- real-PostgreSQL persistence of compressed sizes at `2**31` and the maximum
-  signed-64-bit value, plus migration metadata compiling the column as
-  `BIGINT`;
-- immutable artifact-wide platform and compressed-size evidence, with
-  serialized real-PostgreSQL conflicting canonical completions proving exactly
-  one winner and a failed loser, plus same-transaction
-  `canonical_dependency_ready` transitions in both directions, initialization
-  under the exact canonical lock, literal regional partial-index selection,
-  final canonical recheck, and bounded false-negative drift repair;
-- all prepare targets validated before source publication or any location
-  intent, with an invalid later target leaving no catalog state;
-- release immutability and multiple aliases for one digest;
-- auth rotation preserving artifact/location identity;
-- auth rotation refreshing a stopped pull plan on the same physical bytes,
-  with stale direct cluster-handle persistence rolling back atomically;
-- stopped-cluster YAML restoration preserving the freshly resolved VM and
-  Kubernetes image reference while deleting an obsolete runtime login, with
-  named-container matching that fails closed instead of overwriting sidecars;
-- Kubernetes pod-config composition cannot replace the managed `ray-node` or
-  HA initialization image while leaving catalog state pinned to other bytes;
-- rejection of an independently changed auth strategy paired with an otherwise
-  current location/policy snapshot, including through the status-refresh path;
-- rejection of a changed runtime login instruction paired with an otherwise
-  current managed plan, including through the status-refresh path;
-- final cluster-commit rejection of a READY row whose physical destination
-  fingerprint does not match its current normalized registry target;
-- final cluster-commit rejection of a digest-matching target reference that is
-  not the deterministic managed reference for the artifact and target;
-- exact source-registry authority binding for WARMING login instructions;
-- AWS ECR and GCP GAR adapter rejection of registry authorities outside the
-  configured account, project, and region;
-- exact Kubernetes context-to-registry-prefix authorization, including
-  rejection of another account or project in the same region;
-- Kubernetes binding-region normalization and provider-bounded admission,
-  plus exact binding authority taking precedence over anonymous target access
-  for AWS, GCP, Nebius, and generic registries;
-- first-use Kubernetes target selection filters same-region targets by exact
-  runtime pull capability before deterministic name ordering, including when
-  a lexicographically earlier anonymous locality sibling is also accessible;
-- same-region ECR-account or GAR-project ambiguity on VM placements fails
-  before creating catalog intents, while exact Kubernetes bindings still
-  select the authorized endpoint;
-- profile rotation between INIT and READY preserves the already-rendered pull
-  plan and its original durable reference;
-- final cluster-commit validation of artifact, source-alias, and release
-  selector bindings;
-- canonical and regional READY references surviving an A-to-B canonical source
-  rotation across different source repositories, with the existing regional
-  route remaining selectable and successfully revalidated;
-- two different digests sharing one immutable shard repository while a locked
-  allocation chooses and stores the least-filled capacity-eligible two-hex shard
-  index independent of digest bits; concurrent first-location creation reserves
-  exactly once, adversarial same-prefix digests remain balanced, a full shard is
-  skipped, and aggregate exhaustion fails before location or repository I/O;
-  literal namespace-root parsing and the universal managed/external
-  `<root>/g<generation>/<workspace>/shard-<index>` layout are injective for
-  adversarial root-depth/workspace combinations and reject arbitrary or shorter
-  external templates; a provider-neutral `(registry host:port, complete
-  repository-generation prefix)` reservation makes explicit/derived registries,
-  provider aliases, and endpoint/root decompositions collide physically;
-  different shard counts cannot overlap on shard zero; only an exact
-  same-distribution, same-ownership POLICY_TRANSFER may reuse its existing realm
-  row, while every new physical generation rejects overlap with active heads and
-  retained ACTIVE/DRAINING/RETIRED custody, including through one shared
-  capacity realm, concurrent reservation inserts, and historical purge or
-  retirement authority; and
-  copy I/O writing through a deterministic immutable tag before digest-only
-  verification;
-- final cluster-commit acceptance of release and digest-equivalent source
-  selectors after a failed canonical import rotates to a new immutable source
-  binding, with prepare, retry, release, artifact, explicit-source, and
-  active-B-lease ensures proving no source-less path reverts to source A;
-- final cluster-commit rejection of release-only, artifact-only, mismatched,
-  policy-disallowed, credential-bearing, and unresolved WARMING fallbacks;
-- canonical endpoint normalization and complete provider-policy identity;
-- monotonic profile generations, stale-replica rollback rejection, and
-  active-lease revision fencing, including real PostgreSQL activation/claim
-  interleavings in which a committed live lease returns `202 QUIESCING`, its
-  generation-fenced head token blocks sustained new claim producers, the owner
-  finalizes, and the leaderless reconciler commits without polling under
-  config/catalog/head locks; an exactly expired token or operation lease cannot
-  let a stale claimant, finalizer, coordinator, cancellation, or timeout mutate
-  a later generation; API crash/restart reacquires a pending multi-profile apply,
-  a deliberate coordinator outage lets work resume, and one stable coordinator
-  subsequently drains and commits; a second global apply is rejected with the
-  first resource even for disjoint profiles, while one 256-head apply completes
-  sorted batch heartbeats inside the 15-second service objective under the
-  five/ten-second lock/statement timeouts and readiness watchdog; a live twentieth
-  COPY, VERIFY, EVICT, or EXTERNAL_VERIFY claim remains visible through its
-  uncapped activation-only index while its expired automatic-reclaim index is
-  correctly exhausted, and migration 024 proves the same for BUILD_OUTPUT;
-- expired COPYING and EVICTING settlement after canonical loss, followed by
-  successful profile repair in real PostgreSQL;
-- exact-expiry READY verification fencing and malformed future COPY lease
-  settlement in real PostgreSQL;
-- absent and partially populated historical COPYING/EVICTING lease triples are
-  visible to both list and indexed automatic claim paths and are repaired into
-  complete fenced ownership;
-- impossible READY ownership is rejected by the schema and repaired at the
-  unchanged-generation exact-row boundary for historical corruption;
-- dominant-profile activation rewrites only the at-most-128 superseded custody
-  heads, not untouched location rows, while old generations remain immediately
-  unavailable to new placement in PostgreSQL;
-- exact regional-to-canonical revision binding across endpoint migrations;
-- final exact-canonical fencing for standalone and cluster-handle references;
-- real PostgreSQL overlaps in which those transactions hold the canonical row
-  while waiting on a locked regional row, proving canonical loss serializes;
-- field-tagged Serve placement identity across ref, release, artifact ID, and
-  combined ref-plus-release selectors;
-- SkyServe version snapshot convergence across different selectors for one
-  artifact, plus rejection of mixed content, mixed managed/direct semantics,
-  and missing-image candidates before durable version creation, with zero
-  catalog writes for rejected first-use candidates, atomic same-digest
-  multi-source publication, and whole-batch rollback proofs in real PostgreSQL,
-  plus a forced crossed-release PostgreSQL overlap proving global
-  phased lock order yields one success and one value conflict without a
-  database deadlock;
-- manager/auth policy transfer within one ownership kind reusing the same
-  physical row after operation-lease fences while preserving durable references
-  and persisted INIT plans, while EXTERNAL-to-MANAGED and
-  MANAGED-to-EXTERNAL changes allocate a disjoint empty generation and never
-  relabel bytes;
-- target-alias rename reusing the same physical row under a new revision;
-- endpoint revision producing a distinct materialization;
-- fail-closed managed-required dry runs and no optimizer mutation;
-- ensure-on-use and WARMING source fallback;
-- exact ECR, GAR, and Kubernetes source-fallback runtime identity, plus
-  fail-closed off-provider private-source placement;
-- restart-time upgrade from a WARMING source fallback to a READY managed route;
-- locality and Kubernetes context capability;
-- exact-digest adoption/copy and READY revalidation;
-- immutable-tag-safe OCI recovery after committed-but-unverified copies and
-  ambiguous copy failures, with exact-digest acceptance and mismatched-digest
-  rejection;
-- lease expiry, stale-token fencing, and idempotent recovery;
-- claim-20 worker crashes remain excluded from automatic queues while an exact
-  operator retry repairs COPY and EVICT uncertainty and resets the budget;
-- lease heartbeat cancellation and non-synchronized retry timing;
-- atomic one-row claims without contention being reported as failure;
-- corrupt READY rows without a target reference excluded from verification at
-  both listing and claim boundaries;
-- bounded rotating profile and state-queue claims with no reconciliation or
-  eviction eligible-queue `GROUP BY` or whole-queue sort, including
-  simultaneous PostgreSQL claims from one profile while every worker holds the
-  shared generation fence;
-- partial reconciliation and eviction index predicates exclude exhausted
-  automatic attempts, including zero-eligible PostgreSQL proofs;
-- disjoint fresh and deferred verification/eviction queues, state-specific
-  uncapped activation-only active-lease probes, PostgreSQL partial-index plans,
-  and bounded
-  `EXPLAIN ANALYZE` behavior for activation plus all list/claim paths;
-- all eight canonical/regional external-adoption, all sixteen
-  regional/canonical purge, all sixteen regional/canonical physical-retirement,
-  and the global custody-retirement-scan partial indexes use their frozen
-  literal predicates, profile-first or global due-work keys, ordering columns, attempt counters,
-  due-time scan bounds, lease-kind checks, and independent keyset cursors;
-  exact-profile external probes require no workspace enumeration, and
-  million-row zero/late-eligible plans cannot scan blocked dependencies, active
-  heads, empty retained custodies for historical purge, or another queue family;
-  with one due purge or retirement behind one million retained custodies,
-  discovery reads the one global eligible entry before locking only its exact
-  custody, and worker restart does not reintroduce custody-cardinality work;
-- named location checks and partial indexes make ordinary MANAGED,
-  EXTERNAL-adoption, MANAGED-purge, EXTERNAL-purge, MANAGED-retirement,
-  EXTERNAL-retirement, and migration-024 BUILD families disjoint by ownership,
-  purge/retirement generation, state, origin, and exact lease kind;
-  malformed/incomplete recovery finds only its own family, ordinary COPY never
-  claims BUILD_OUTPUT, ordinary EVICT never claims PURGE_DELETE or
-  RETIRE_DELETE, and external FAILED rows never enter managed FAILED/MISSING
-  retry;
-- large-profile PostgreSQL keyset page-advance liveness for reconciliation
-  listing and claiming;
-- seek-forward PostgreSQL eviction collisions in which eight workers initially
-  route to one oldest row and still claim eight distinct locations;
-- one-million-row PostgreSQL 16 `EXPLAIN ANALYZE` and end-to-end claim
-  benchmarks for reconciliation and eviction, including zero-eligible and
-  late-eligible queues whose due regional rows have non-READY canonical
-  dependencies;
-- complete multi-profile reselection when earlier profiles are fully locked;
-- constant-query unfiltered status association loading;
-- fresh per-item claim and retry timestamps across long reconciliation batches;
-- durable cluster references across stop and termination;
-- locationless WARMING source-fallback references across launch, stop,
-  restart-to-managed replacement, tombstone rejection, and termination, with
-  cluster handle plus artifact/source reference committed atomically;
-- generic-reference rejection of cluster consumers reserved for the atomic
-  cluster-handle transaction, for both acquire and release;
-- metadata-only cluster-handle updates reject any image execution-state change
-  that would bypass the atomic cluster/reference transaction;
-- no-op cluster refresh during location repair and verification fencing for
-  new references;
-- same-handle real relaunch revalidating a location that became MISSING;
-- READY continuation preserving the INIT plan after a policy revision activates
-  during provisioning, followed by current-revision resolution on restart;
-- exact catalog UUID enforcement for Serve and managed-jobs controllers;
-- reference-aware regional eviction and canonical protection;
-- provider ownership proof before any destructive registry callback;
-- endpoint, namespace, account, manager-identity, distinct lifecycle-identity, and
-  credential-reference rotation retaining historical target custody and its
-  physical-root reservation until old locations, audit manifests, leases, and
-  DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN outcomes drain, including purge and
-  physical retirement through only that old lifecycle authority; same-root,
-  same-ownership policy transfer moves counts and authority without byte or
-  shard changes, while a root or ownership change uses a disjoint generation;
-- one global profile-head update immediately excluding old-revision facets in
-  every workspace without population rewrites or workspace-count fan-out, plus
-  projection drift detection/repair and authority-path independence;
-- the complete batch-publication, finalizer, release-name, tombstone, and future
-  builder 14-phase lock graph, including both quota rows, daily usage, context
-  uploads/objects/cache, attempts/output/staging/logs, running as real PostgreSQL
-  overlaps without ABBA deadlock;
-- one limiter row with multiple independent live-only permit leases, per-lease
-  expiry and fencing, completion-time deletion, no rate-token refund, the hard
-  4,096 per-limiter row/count/weight bound, `LIMIT 65` acquisition cleanup,
-  `LIMIT 256` global expiry discovery, exact limiter-first lock order, counter
-  repair, stale-completion behavior, and both required expiry indexes; the
-  literal mapping for every admitted data-plane ECR call,
-  `BatchDeleteImage` as the only delete call, runtime rejection of
-  `DeleteRepository`, shared throttle penalty, and external-account traffic
-  explicitly outside the guarantee;
-- admin-only tombstone rejection with live references, leases, or publications;
-  selector invisibility after commit; deterministic regional-before-canonical
-  purge; the exact `AWAITING_EXTERNAL_PUSH|VERIFYING ->
-  EXTERNAL_PURGE_PENDING -> EXTERNAL_PURGED` acknowledgement
-  schema, ordering, idempotence, correction audit, and managed/external state
-  constraints; exact ownership and digest fences; DELETE_UNKNOWN and
-  preexisting MISSING absence inspection; retry; build-output lease exclusion
-  plus narrowly qualified `BUILD_OUTPUT_ABANDONED`; audit retention; every
-  SOURCE, external, BUILD_RESERVED, failure, retry, verification-loss, eviction,
-  and purge byte-charge transition; per-location quota release only after proved
-  deletion or exact external acknowledgement, with PURGED requiring every charge
-  NULL; workspace repair equaling the sum of non-null per-location charges;
-  lifetime artifact count and PURGED digest row never released or resurrected
-  while byte/child quota is released exactly once; and absence of delete actions
-  from the dashboard;
-- superseded-generation retirement for ACTIVE and TOMBSTONED artifacts, with
-  regional-before-canonical managed deletion, retained old custody, exact
-  external acknowledgement, nonterminal-retirement versus artifact-purge
-  exclusion, terminal-retirement reuse as purge absence evidence, charge
-  clearing, nonrematerializable terminal states, 30-day audit retention, one
-  complete 128-target generation coexisting with its replacement under the
-  512-row retained hard cap, a fifth full generation failing before location
-  insertion without an activation scan, exact
-  location/custody/allocation/realm compaction, rollback only before first
-  enrollment through a new higher profile revision plus the old custody's
-  monotonic generation/enrolled-count fence, never a backward head move,
-  registered BUILD-origin location retirement that atomically
-  repoints an exact READY replacement or marks its cache output retired, and one
-  blocked due retirement behind one million retained custodies; bounded
-  publication detachment before grace, policy-transfer route revision updates,
-  64-row-per-profile revision retention, due-index compaction only after every
-  operational reference and audit fence, permanent highest-revision/quiesce
-  tombstones, and the non-releasable 1,024 lifetime-name bound;
-- purge API intent-only behavior; a separately deployed lifecycle
-  ServiceAccount/role exclusively claiming disjoint ordinary regional EVICT,
-  PURGING, and managed historical-retirement work; inability of API/copy
-  identities to delete or assume that role; exact retained
-  `lifecycle_identity` selection; same-generation
-  `purge_dependents_settled` propagation and final at-most-512-row lock recheck;
-  closed read plus `BatchDeleteImage` IAM/limiter mapping; runtime
-  rejection of repository deletion and every unmapped call; and before-call,
-  ambiguous-after-call, completion, graceful-drain, lease-expiry, restart, and
-  rollback recovery;
-- secret-free serialization across API and launch state;
-- closed diagnostic and source-fallback codes rejecting free-form secrets;
-- conservative redaction when `workspaces` or a workspace entry is malformed,
-  before generic schema validation can reflect the rejected value;
-- conservative whole-subtree redaction and value-free rejection when a
-  workspace mapping key is not a bounded valid workspace name, including
-  credential-shaped, non-string, and overlong keys;
-- database-backed server config passing the same duplicate-key, schema, and
-  semantic admission boundary as file-backed config, with value-free failures;
-- raw and typed config updates racing through one generation-fenced activation
-  protocol, atomic config-YAML/profile-head/custody/realm final commit,
-  256-entry/24-hour apply-ledger saturation including pending entries, later
-  applies followed by an earlier lost-response retry, idempotency-key conflict,
-  stale/future UUIDv7 rejection, immediate fast-path commit, sustained claim
-  pressure, the single-global-active-apply check, a maximum-size 256-profile
-  quiesce heartbeat batch, exact 15-second watchdog behavior, exact
-  token/operation expiry races, API crash
-  before intent and after intent/final commit, coordinator restart/reacquisition,
-  quiesce heartbeat loss, cancel/timeout versus finalizer races, stale
-  coordinator fencing, unrelated raw-edit cancellation, urgent credential
-  rotation, and NOTIFY loss; rejection above 256 active/changed distributions,
-  128 targets, 64 retained revisions, or 1,024 lifetime profile names before
-  mutation, REMOVED-name recreation only above the permanent highest revision,
-  bounded revision-count repair/compaction, constant head-update count across
-  one and one million workspaces, stale replica fail-closed behavior, and
-  eventual poll-based convergence without a representable config/head split;
-- staged API-63-at-023 builder rollout, migration-Job rejection while any API-62
-  process/session remains, exact 023 common-column SQL projection across the
-  additive migration, and a forced API-62-start/check-out/image-operation race
-  against the exclusive 024 transaction proving the shared transaction lock and
-  atomic minimum-image-plane-fence update admit no TOCTOU survivor; an API-62
-  claim committed just before that lock may finish only its out-of-transaction
-  provider call, while its heartbeat/finalizer is rejected and API 63 recovers
-  the fenced lease after expiry;
-  revision-024 restart/verification and API-62 readiness rejection against 024;
-  the already-63 fence before the first BUILD value; expired old-lease recovery;
-  atomic first-state setting of
-  the irreversible builder witness; rejection of 024 or BUILD writes while it
-  is FALSE and of TRUE-to-FALSE updates; guarded pre-witness 024-to-023
-  downgrade plus fence restoration; and permanent API-62 image-plane/schema
-  rollback rejection after any 024-owned state;
-- status selectors and workspaces validated before an SDK creates HTTP query
-  parameters, so client HTTP errors cannot retain rejected values;
-- server-owned workspace, registry, database, daemon, and controller policy
-  removed before a request body is durably persisted, while preserving the
-  existing client-side override compatibility contract;
-- server-managed `_resolved_container_image` state rejected at the root and in
-  every `any_of` or `ordered` candidate before task schema validation;
-- every lease claim, heartbeat, completion, failure, verification, retry, and
-  eviction transition reading wall time only after its complete row-lock set,
-  with stale-token proofs for all transition classes;
-- PostgreSQL publication, preparation, and location creation converging under
-  concurrent identical publications;
-- PostgreSQL FAILED and MISSING retry probes using the intended partial queue
-  index, proven with the actual SQLAlchemy query and `EXPLAIN`;
-- reference-heavy eviction discovery bounded to fixed keyset pages, eventually
-  reaching later unreferenced work, and retaining an active-reference fence in
-  the final locked claim statement;
-- eviction keyset pages completing one bounded cyclic pass when a persisted
-  cursor starts inside the due set, so a suffix candidate that loses its final
-  fence cannot hide an eligible prefix candidate until a later worker poll;
-- restart resolution and final durable cluster commit rechecking the current
-  workspace locality policy, while the exact persisted INIT-to-UP continuation
-  remains the only policy-rotation exception;
-- node-scoped behavior for multi-GPU resources.
-
-Builder coverage and release gates are owned by
-[`managed-container-image-builder.md`](managed-container-image-builder.md).
-Distribution tests consume only its verified READY artifact contract.
-
-Dashboard and catalog coverage additionally proves:
-
-- keyset pagination has no duplicates or omissions across equal timestamps,
-  rejects malformed/version-mismatched cursors without reflecting input, binds
-  distribution pages and current-only location pages to their resolved
-  profile/config generation, and returns a closed stale-cursor result rather
-  than mixing pages across activation;
-- workspace, selector, lifecycle, distribution, target, state, canonical, and
-  limit validation occurs before request persistence; only the exact seven
-  list-filter shapes are accepted, canonical requires distribution/state/target,
-  every rejected combination performs no database access, legacy unfiltered
-  status fails rather than truncates beyond 1,000 artifacts, and each accepted
-  zero-match or selective query uses its declared index prefix;
-- catalog pages batch-load associations in constant query count and exercise
-  indexed artifact/facet/summary plans at million-artifact scale; every
-  location/lifecycle mutation updates its projection transactionally, profile
-  head changes take effect through revision joins without facet rewrites, and
-  injected projection drift is detected, ignored by authority paths, and
-  converged by bounded repair;
-- catalog pages return bounded location/publication aggregates while current and
-  historical detail locations plus retained publication history use their exact
-  indexes and duplicate-free keyset pagination; detail never embeds unbounded
-  publication generations, lifetime versus retained-record limits render
-  separately, and compaction visibly restores only the retained-record count;
-  publication rows render `PROFILE_SUPERSEDED`, scalar last-attempted route, and
-  eligible Retry, including a closed removed-distribution state;
-- profile summaries omit manager identities, credential references, and raw
-  configuration while preserving useful topology;
-- stale workspace responses cannot overwrite a newer selection;
-- publish, prepare, location-retry, and publication-retry dialogs handle
-  pending/success/failure and prevent duplicate submissions;
-- the admin Image distribution editor round-trips every profile/binding/policy
-  field, validates and previews a generation-fenced diff, never exposes secret
-  values, distinguishes policy transfer from physical-generation replacement,
-  and reports infrastructure/capability plus bounded retirement progress and
-  blockers without waiting for cleanup; it preserves a QUIESCING application
-  across reload, displays lease kinds/deadline, disables duplicate submission,
-  links every competing editor to the one global application, renders ACTIVE and
-  REMOVED heads plus 64-revision/1,024-name retention usage, and proves cancel,
-  timeout, retry, terminal, compaction-blocked, and stale-token states; and
-- navigation, responsive rendering, keyboard focus, empty/error/permission,
-  and old-server states pass Jest and a production Next.js build.
-
-Terraform validation additionally runs `terraform fmt -check`, `terraform
-validate`, static least-privilege assertions, and plans for single-region,
-multi-region, and existing-ECR-account configurations with an empty dedicated
-managed prefix. Plans must prove no image-content fan-out, no account-wide
-administrative grants, no repository deletion
-permission, no API/copy-worker manifest delete permission, a separately
-assumable lifecycle role with only the closed inspection and
-`BatchDeleteImage` surface, V2 registry-policy scope, one guarded policy owner,
-the exact write/delete/custody/self-protection deny matrix under the common
-managed prefix, the 10,240-byte policy ceiling, and no placement-time resource
-dependency. Boundary plans cover each account/region's
-applied repository and image quotas, existing repositories and manifests,
-safety headroom, the lifetime single-manifest artifact bound, the feasible shard
-interval at or below 256, exact capacity vectors, audited complete inventory,
-managed-prefix nonemptiness rejection, durable workspace slot, balanced
-transactional shard reservations under adversarial digests, capacity
-exhaustion, provider-neutral canonical prefix rendering and collision
-rejection, realm-generation prefix expansion, and provider-quota drift error
-mapping. Negative tests assume a same-account probe role with an otherwise
-broad ECR identity allow and prove the registry explicit deny still rejects
-layer upload, `PutImage`, replication/import, `BatchDeleteImage`, custody
-mutation, registry-policy replacement/deletion, and V2-scope downgrade under
-the guard prefix. Source repositories outside the prefix remain usable, and
-policy drift freezes the realm before another mutation. Positive tests prove
-copy publication only
-through the copy role and every ordinary/purge/retirement manifest deletion only
-through the lifecycle role. Tests also prove v1 rejects native
-replication configuration instead of creating untracked regional content.
-
-Concurrency tests run multiple copy-worker and lifecycle-worker replicas against one
-account/region. They prove per-operation limiter/lease bounds, independent crash
-expiry, throttle penalties, fair progress across operation classes, identity
-separation, and that autoscaling pods cannot multiply repository, layer,
-manifest, verify, or delete authority.
-The later trusted builder publisher must pass the same suite before activation.
-
-Release gates additionally require PostgreSQL migration tests, AWS provider
-integration and negative-IAM tests, worker/API restart tests, external-profile
-pull tests, and lifecycle recovery. Measured 100, 500, and 1,000-replica
-cold-start evidence is a managed-profile production-activation gate, not a
-source-code merge or disabled-feature release gate; until capacity is available,
-the managed profile remains disabled and no performance claim is made.
-
-## Explicit non-goals
-
-- a general artifact store for model weights or arbitrary files;
-- lazy container filesystems or memory snapshots;
-- organization/account creation, organization policy, or cross-account trust
-  bootstrap outside the supplied least-privilege modules;
-- automatic repository or canonical deletion outside the exact
-  abandoned-build lifecycle rule;
-- copying all artifacts to all regions;
-- transparent mid-pull registry failover;
-- treating R2 buckets as OCI registries;
-- managed-profile OCI indexes or manifest lists before physical-repository
-  parent/child dependency authority exists;
-- per-GPU process orchestration inside registry distribution;
-- automatic discovery of a VM's eventual registry account/project identity;
-- a mutable named-image channel without a shared generationed deployment
-  snapshot across clusters, managed jobs, and SkyServe;
-- claiming Modal-style lazy filesystem startup without an explicitly detected
-  compatible VM or Kubernetes node snapshotter.
-
-## Review protocol
-
-This design and implementation are being challenged independently by Codex
-5.6 and Claude Fable. A review round is valid only when the reviewer inspects
-the current plan, code, diff, and tests and returns one of `PURSUE`, `RESHAPE`,
-or `DROP` with evidence. Repeating an unchanged review to accumulate a streak is
-not evidence.
-
-There are exactly two gates. Before productization code begins, both reviewers
-challenge the same exact design commit and linked builder design for product
-worth, Modal comparison, component boundaries, API compatibility,
-million-artifact behavior, multi-cloud portability, security, operability, and
-rollout. After implementation and the complete focused suite, both reviewers
-inspect the same frozen implementation head, including the plan, full diff,
-tests, dashboard build, Terraform evidence, and remaining operational gates.
-Each gate passes only when both independent reviewers return `PURSUE` on that
-exact snapshot. An unavailable reviewer is reported as an external blocker and
-is not silently replaced by another model.
-
-Every reviewer must audit the whole snapshot by invariant, enumerate all
-reproducible findings and nearby instances of each defect class, and continue
-after finding the first blocker. A `RESHAPE` or `DROP` lets all active reviews
-finish; findings are deduplicated, resolved as one coherent batch, and covered
-by table-driven or cross-boundary tests where an invariant is shared. A
-materially changed snapshot receives one new paired review. Pure evidence or
-comment updates do not manufacture another round. The final acceptance brief
-records the exact Git tree hash and may not treat unimplemented infrastructure
-as production ready.
+Round 1 at `c1a8ce729c82cc606eef5cfd62abdf9fa9d7fd8e` returned Codex `RESHAPE`.
+Fable was unavailable because its CLI account reported no usage credits, so the
+round is not counted as paired. This document incorporates the decision-changing
+Codex findings: narrow v0, read-only deployment publication, typed warming,
+READY-gated releases, fixed Terraform repositories, early component separation,
+removal of unreleased aliases, and a narrow complete UI.
