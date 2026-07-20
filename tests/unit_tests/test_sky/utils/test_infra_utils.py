@@ -77,6 +77,15 @@ class TestInfraUtils(unittest.TestCase):
                                    msg=f'Expected error for {infra_str!r}'):
                 infra_utils.InfraInfo.from_str(infra_str)
 
+    def test_none_cloud_rejected(self):
+        """Test that the none cloud sentinel is rejected at runtime."""
+        for cloud in ('none', 'None', 'NONE'):
+            with self.assertRaisesRegex(ValueError, 'cloud must be specified'):
+                infra_utils.InfraInfo(cloud=cloud)
+
+        with self.assertRaisesRegex(ValueError, 'cloud must be specified'):
+            infra_utils.InfraInfo.from_str('none')
+
     def test_to_str(self):
         """Test the to_str function with various inputs."""
         test_cases = [
