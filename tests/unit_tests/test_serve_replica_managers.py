@@ -3844,6 +3844,47 @@ class TestLogicalCapacityPlanning:
         assert mgr._recovering_logical_retirement_ids == set(range(21, 26))
         assert mgr._logical_retirement_reactivation_generation == 5
 
+    def test_recovery_partial_failure_consumes_generation_wave(self):
+        candidates = [
+            self._recoverable_logical_retirement(replica_id)
+            for replica_id in range(1, 26)
+        ]
+        survivor = self._ready_backend(100, 1)
+        survivor.version = 2
+        mgr = self._logical_recovery_manager(candidates, survivor, target=25)
+        mgr.latest_version = 2
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            version=2,
+            observed_slots_by_replica_id={100: 1},
+            in_flight_by_replica_id={
+                **{
+                    info.replica_id: 0 for info in candidates
+                }, 100: 0
+            })
+        mgr._logical_target = (2, 5, 25)
+        mgr._persist_replica.side_effect = [None] * 19 + [
+            RuntimeError('database unavailable')
+        ]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=candidates + [survivor]), \
+             pytest.raises(RuntimeError, match='database unavailable'):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert mgr._persist_replica.call_count == 20
+        assert mgr._logical_retirement_reactivation_generation == 5
+        assert mgr._recovering_logical_retirement_ids == set(range(20, 26))
+
+        mgr._persist_replica.reset_mock(side_effect=True)
+        mgr._persist_replica.side_effect = None
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=candidates + [survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+        mgr._persist_replica.assert_not_called()
+
     def test_recovery_adoption_persist_failure_stays_off_route_for_retry(self):
         retiring = self._recoverable_logical_retirement(1)
         survivor = self._ready_backend(2, 1)

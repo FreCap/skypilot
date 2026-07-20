@@ -4518,6 +4518,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     key=lambda candidate:
                     (candidate.version != self.latest_version, candidate.
                      replica_id))
+                # Consume this generation before the first write. A partial or
+                # commit-ambiguous failure must not let the next refresh reuse
+                # the same evidence to exceed the per-generation wave bound.
+                self._logical_retirement_reactivation_generation = (
+                    snapshot.generation)
                 for info in ordered_candidates:
                     self._abort_logical_retirement(
                         info, 'current capacity is below the recovered target')
@@ -4532,8 +4537,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                        ):
                         break
                 if reactivated_count:
-                    self._logical_retirement_reactivation_generation = (
-                        snapshot.generation)
                     logger.info(
                         f'Reactivated {reactivated_count} recovered logical '
                         f'retirements ({reactivated_capacity} conservative '
