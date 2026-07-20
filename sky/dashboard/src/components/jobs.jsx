@@ -24,10 +24,11 @@ import {
   renderPoolLink,
 } from '@/components/utils';
 import { PoolsTable } from '@/components/pools-table';
+import { Status2Actions } from '@/components/job-log-actions';
 import { UI_CONFIG } from '@/lib/config';
 import { getPoolStatus } from '@/data/connectors/jobs';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
-import { getClusters, downloadJobLogs } from '@/data/connectors/clusters';
+import { getClusters } from '@/data/connectors/clusters';
 import { getWorkspaces } from '@/data/connectors/workspaces';
 import { getUsers } from '@/data/connectors/users';
 import { apiClient, getCurrentUserInfo } from '@/data/connectors/client';
@@ -38,20 +39,15 @@ import {
   LastUpdatedTimestamp,
 } from '@/components/utils';
 import {
-  FileSearchIcon,
   RotateCwIcon,
   MonitorPlay,
   RefreshCcw,
-  Download,
   ChevronDownIcon,
   ChevronRightIcon,
   CheckIcon,
   InfoIcon,
 } from 'lucide-react';
-import {
-  handleJobAction,
-  downloadManagedJobLogs,
-} from '@/data/connectors/jobs';
+import { handleJobAction } from '@/data/connectors/jobs';
 import { ConfirmationModal } from '@/components/elements/modals';
 import { isJobController } from '@/data/utils';
 import { StatusBadge, getStatusStyle } from '@/components/elements/StatusBadge';
@@ -82,7 +78,7 @@ import {
   updateFiltersByURLParams as sharedUpdateFiltersByURLParams,
   evaluateCondition,
 } from '@/components/shared/FilterSystem';
-import { trackJobAction, trackFilterUsed } from '@/lib/analytics';
+import { trackFilterUsed } from '@/lib/analytics';
 
 export {
   filterJobsByName,
@@ -92,6 +88,7 @@ export {
   getAggregatedStatus,
   statusGroups,
 } from '@/components/job-domain';
+export { Status2Actions } from '@/components/job-log-actions';
 
 // Statuses shown as primary chips on the Statuses filter bar.
 // Ordered along the typical job lifecycle (STARTING → RUNNING →
@@ -2541,83 +2538,6 @@ export function ManagedJobsTable({
 // Helper function to get status-specific styling
 function getBadgeStyle(status) {
   return getStatusStyle(status);
-}
-
-export function Status2Actions({
-  withLabel = false,
-  jobParent,
-  jobId,
-  managed,
-  workspace = 'default',
-}) {
-  const router = useRouter();
-
-  const handleLogsClick = (e, type) => {
-    e.preventDefault();
-    e.stopPropagation();
-    trackJobAction('view_logs', { jobId });
-    router.push({
-      pathname: `${jobParent}/${jobId}`,
-      query: { tab: type },
-    });
-  };
-
-  const handleDownloadLogs = (e, controller = false) => {
-    e.preventDefault();
-    e.stopPropagation();
-    trackJobAction('download_logs', { jobId });
-
-    if (managed) {
-      // For managed jobs
-      downloadManagedJobLogs({
-        jobId: parseInt(jobId),
-        controller: controller,
-      });
-    } else {
-      // For cluster jobs, extract cluster name from jobParent
-      const clusterNameMatch = jobParent.match(/\/clusters\/(.+)/);
-      if (clusterNameMatch) {
-        const clusterName = clusterNameMatch[1];
-        downloadJobLogs({
-          clusterName: clusterName,
-          jobIds: [jobId],
-          workspace: workspace,
-        });
-      }
-    }
-  };
-
-  return (
-    <div className="flex items-center space-x-2">
-      <Tooltip
-        key="logs"
-        content="View Job Logs"
-        className="capitalize text-sm text-muted-foreground"
-      >
-        <button
-          onClick={(e) => handleLogsClick(e, 'logs')}
-          className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
-        >
-          <FileSearchIcon className="w-4 h-4" />
-          {withLabel && <span className="ml-1.5">Logs</span>}
-        </button>
-      </Tooltip>
-      <Tooltip
-        key="downloadlogs"
-        content="Download All Task Logs (zip)"
-        className="capitalize text-sm text-muted-foreground"
-      >
-        <button
-          onClick={(e) => handleDownloadLogs(e, false)}
-          className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
-          title="Download logs"
-        >
-          <Download className="w-4 h-4" />
-          {withLabel && <span className="ml-1.5">Download</span>}
-        </button>
-      </Tooltip>
-    </div>
-  );
 }
 
 export function ClusterJobs({
