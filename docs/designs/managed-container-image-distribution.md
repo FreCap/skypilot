@@ -148,8 +148,10 @@ container_image_catalog_facets
 The literal DDL includes every foreign key, named check, partial uniqueness
 constraint, queue/claim index, active-revision join index, and catalog-query
 index described below. The catalog singleton includes the nonnegative central
-config generation, 64-hex image-config digest, and a bounded JSONB apply-result
-ledger used by the atomic activation protocol, plus
+config generation, 64-hex image-config digest, nullable single-global
+`active_image_config_apply_id`, and a bounded JSONB apply-result ledger used by
+the atomic activation protocol, plus checked non-releasable
+`lifetime_profile_name_count` from 0 through 1,024,
 `minimum_image_api_version` initialized to 62 and the monotonic
 `distribution_state_ever_created`/`builder_state_ever_created` booleans
 initialized FALSE. A named migration-023 trigger rejects either flag changing
@@ -162,7 +164,8 @@ it can decode or write polymorphic location/provenance state. Each ledger entry
 contains a UUIDv7 idempotency key, request hash, proposed config generation and
 digest, changed profile keys, quiesce generations, deadline, closed
 `QUIESCING|COMMITTED|CANCELLED|TIMED_OUT` state, nullable committed generation
-and digest, and completion time. A database check caps it at 256 entries.
+and digest, nullable last-heartbeat time, and completion time. A database check
+caps it at 256 entries.
 Unexpired entries are never evicted, and a full ledger fails before mutation
 rather than weakening crash or lost-response recovery. Realm rows
 and allocations include the generation-qualified prefix fields and physical
@@ -490,9 +493,13 @@ digest/platform verification. `publish` does the same work and also creates a du
 release reservation. The public `container_image_releases` row is bound only
 in the same transaction that verifies the canonical location READY. Until
 then, release lookup returns a closed `PUBLICATION_PENDING` result, never a
-source fallback or a launchable half-release. A canonical failure marks the
-publication FAILED without exposing the release; an authorized retry reuses
-the reservation. Conflicting reservations fail before catalog mutation, while
+source fallback or a launchable half-release. Canonical success or failure
+settles every exact PENDING publication bound to that location in one bounded
+transaction, never an arbitrary reservation. Failure marks them FAILED without
+exposing a release; an authorized retry reuses its existing reservation and
+resolves the distribution's current canonical route. Physical profile
+replacement detaches old pending routes through the same publication lifecycle
+contract below. Conflicting reservations fail before catalog mutation, while
 identical concurrent requests converge through database uniqueness.
 
 The publish request is a typed one-of between `source_ref` and `artifact_id`.
@@ -518,7 +525,9 @@ reservation transaction takes the same profile, artifact, canonical,
 publication, and release locks, runs the shared READY validator, inserts the
 release, and returns a READY publication immediately. An existing same-digest
 release is idempotent. Worker completion and this fast path call one finalizer,
-so neither can bypass revision, platform, digest, lifecycle, or quota checks.
+which locks and settles all at-most-256 exact-location PENDING reservations, so
+neither can bypass revision, platform, digest, lifecycle, or quota checks or
+strand a sibling release name.
 
 The CLI waits for READY by default by polling a direct bounded publication
 resource; `--no-wait` returns the publication ID and current state. Neither the
@@ -764,6 +773,12 @@ kind, rollback-grace deadline, regional/canonical progress, external
 acknowledgement requirement, retained custody revision, and whether quota has
 been released. Fingerprints are available behind a diagnostic disclosure, not
 used as primary labels.
+Publication rows expose release, distribution, route revision, state, closed
+error, current or scalar last-attempted location, retry generation, and retained
+reservation/lifetime status. An eligible FAILED `PROFILE_SUPERSEDED` row offers
+a workspace-authorized Retry action that resolves the current route; a removed
+distribution explains that the administrator must restore it or release the
+name before publishing elsewhere.
 
 Authorized workspace users can open dialogs for the existing safe operations:
 
@@ -775,7 +790,9 @@ Authorized workspace users can open dialogs for the existing safe operations:
   open it prefilled with their artifact and output distribution;
 - **Prepare** accepts an existing selector, one or more configured targets,
   and an optional distribution; and
-- **Retry** is enabled only for an eligible failed or missing target.
+- **Retry location** is enabled only for an eligible failed or missing target;
+  **Retry publication** is enabled only for an eligible never-READY reservation
+  and reuses its existing quota slots.
 
 Dialogs validate locally, submit through the existing asynchronous request
 protocol, show request progress, retain a failure for correction, close only
@@ -798,7 +815,9 @@ configuration, and every unrelated SkyPilot setting. Administrators also
 receive a complete **Settings > Image distribution** panel, not a raw-YAML-only
 escape hatch. It lists profiles, realm generation/shards, workspace
 defaults/allowlists/quotas, target custody state, capability probes, and
-Terraform inventory/output status. Create/edit forms cover every supported
+Terraform inventory/output status. It also shows ACTIVE and REMOVED profile
+heads, highest revision, retained revisions out of 64, compaction blockers, and
+lifetime profile names out of 1,024. Create/edit forms cover every supported
 profile, target, Kubernetes/VM binding, and workspace policy field; credential
 references are selected by name and secret values are never fetched. The editor
 shows the normalized secret-free diff/fingerprint, requires an explicit
@@ -810,7 +829,9 @@ blocked references or leases, and closed operator runbook without blocking the
 config apply on background cleanup. If current operation leases must drain, the
 editor displays the durable apply ID, `QUIESCING` state, remaining lease kinds,
 deadline, and Cancel action; it follows the same apply after navigation or page
-reload and offers Retry only after a closed cancellation or timeout. It applies
+reload and offers Retry only after a closed cancellation or timeout. While the
+single global apply is active, every other editor is disabled and links that
+same application resource rather than creating disjoint heartbeat work. It applies
 through the managed-image generation-fenced activation protocol described
 below. The raw Settings
 editor invokes that same transaction whenever its diff touches an image
@@ -871,7 +892,9 @@ application resource when live leases must drain. The status route reads that
 bounded durable resource, and cancellation clears only its generation-fenced
 tokens before returning a terminal result. Repeating the same key and request
 returns the same resource and state across API restarts. It cannot read or
-replace secret values. These
+replace secret values. A different apply while the catalog active ID is non-NULL
+returns `409 IMAGE_CONFIG_APPLY_IN_PROGRESS` with that ID; GET includes its
+status plus the bounded revision/name-retention counters. These
 routes do not create a second source of configuration truth. The ordinary raw
 Settings editor detects an image-section diff, produces the same normalized
 proposal and hash, and calls the same activation helper rather than the legacy
@@ -1175,12 +1198,22 @@ to authorize a negative count.
 complete profile. Any endpoint, ownership, manager identity, lifecycle identity,
 runtime auth, namespace root, realm generation, shard count, or target edit must
 increment it. The complete revision fingerprint includes all of those fields.
-`container_image_profile_heads` stores
-one global active revision and fingerprint per distribution. A profile edit is
-therefore constant-work regardless of workspace count; workspace policy and
-realm allocation remain separate rows and are checked at admission.
-`container_image_profile_revisions` retains every accepted secret-free
-normalized revision plus its checked total target count from 1 through 128, and
+`container_image_profile_heads` stores one permanent head/tombstone per
+distribution name with closed ACTIVE or REMOVED state, nullable active revision
+and fingerprint, non-releasable `highest_revision`, and checked
+`retained_revision_count` from 0 through 64. The catalog admits at most 256
+ACTIVE distributions and 1,024 lifetime distinct distribution names; first use
+increments a non-releasable catalog counter, so removed-name tombstones cannot
+grow without bound. Recreating a removed name requires a revision strictly
+greater than its retained highest value. A profile edit is therefore
+constant-work regardless of workspace count; workspace policy and realm
+allocation remain separate rows and are checked at admission.
+`container_image_profile_revisions` retains at most 64 accepted secret-free
+normalized revisions per distribution plus its checked total target count from
+1 through 128, immutable contract, nullable superseded time, and bounded
+compaction-not-before time. A 65th revision fails before config mutation with
+`IMAGE_PROFILE_REVISION_RETENTION_FULL` until the exact-profile compactor frees
+an eligible old row, and
 `container_image_target_custodies` retains each revision/target's provider,
 account/project, endpoint policy metadata, provider-neutral canonical registry
 authority/repository-generation prefix, physical root fingerprint, ownership
@@ -1239,14 +1272,20 @@ outside every database transaction. Apply first attempts a fast path: one short
 transaction takes the config/catalog and sorted changed-profile locks, then runs
 four exact profile-prefixed `LIMIT 1` probes for live COPY, EXTERNAL_VERIFY,
 ordinary EVICT, and READY VERIFY leases. Migration 024 adds a fifth probe for a
-live BUILD_OUTPUT lease. If all probes are empty, that transaction inserts the
+live BUILD_OUTPUT lease. It first requires the catalog's global active-apply ID
+to be NULL or idempotently equal. If all probes are empty, that transaction inserts the
 immutable snapshots and atomically advances config and heads.
 
 If any probe is nonempty, the same short transaction does not update config or
 active revisions. Instead it increments each changed head's monotonic
 `quiesce_generation`, stores a complete generation-fenced quiesce token and
-deadline on those heads, and records one `QUIESCING` apply-ledger entry before
-returning `202`. Every later ordinary COPY, EXTERNAL_VERIFY, EVICT, READY VERIFY,
+deadline on those heads, records one `QUIESCING` apply-ledger entry, and sets the
+catalog singleton's nullable `active_image_config_apply_id` before returning
+`202`. That scalar is the database-enforced single global nonterminal apply
+authority. A different apply fails with `IMAGE_CONFIG_APPLY_IN_PROGRESS` and
+the active resource ID even when it touches disjoint profiles; an identical
+idempotency key returns that resource. Every later ordinary COPY,
+EXTERNAL_VERIFY, EVICT, READY VERIFY,
 or BUILD_OUTPUT claim locks its exact profile head and declines the claim while
 a nonexpired token covers that active revision. Historical
 PURGE_DELETE/PURGE_INSPECT and RETIRE_DELETE/RETIRE_INSPECT work uses retained
@@ -1256,18 +1295,30 @@ provider calls, starts no additional call after observing it, and either settles
 or safely surrenders before the overall deadline. Every provider call has an
 explicit timeout shorter than the remaining operation lease.
 
-A leaderless database-only activation reconciler, folded into the existing API
-config-generation poll loop, handles at most one pending apply per tick. It
-heartbeats the 60-second quiesce lease every 15 seconds and runs the same five
-uncapped `LIMIT 1` probes without retaining database locks between attempts. The
-overall apply deadline defaults to 30 minutes and is validated from 5 minutes
-through 2 hours. Once all probes are empty, one final short transaction locks
+A leaderless database-only activation reconciler runs as a dedicated
+high-priority loop in every API replica and can observe only that one global
+active ID. Each cycle first takes a nonblocking session advisory lock derived
+from the apply UUID, so one replica heartbeats while another can take the next
+cycle immediately after process or connection loss. Every five seconds it
+attempts one sorted primary-key batch heartbeat
+of all at-most-256 covered heads with a five-second lock timeout and ten-second
+statement timeout. A healthy coordinator must complete one batch no later than
+15 seconds after the prior success; missing that service objective fails its
+managed-image readiness and alerts, while the 60-second lease leaves multiple
+bounded retries before claims can resume. Heartbeat has no provider I/O, no
+catalog population scan, and no per-workspace work; it records bounded
+`last_heartbeat_at` evidence on the sole ledger entry. After heartbeat, the loop
+runs the same five uncapped `LIMIT 1` probes without retaining database locks
+between attempts. The overall apply deadline defaults to 30 minutes and is
+validated from 5 minutes through 2 hours. Once all probes are empty, one final
+short transaction locks
 the config/catalog and all changed heads in global order, verifies the proposal,
 config generation, evidence generations, apply ID, quiesce generations, token
 hashes, and unexpired deadline, repeats the five probes, and atomically inserts
 snapshots, advances config and heads, clears the tokens, and records COMMITTED.
-No claim can enter after that locked recheck. There is no polling or provider I/O
-while database locks are held.
+It also clears `active_image_config_apply_id` in that commit. No claim can enter
+after that locked recheck. There is no polling or provider I/O while database
+locks are held.
 
 If all coordinators disappear, the short quiesce lease expires and ordinary work
 may resume. On restart, the pending ledger entry reacquires every changed head
@@ -1276,11 +1327,10 @@ token vector; a claim that entered during the outage is then allowed to drain.
 Thus progress is guaranteed after one coordinator remains healthy, without
 making API availability an image-work availability dependency. Cancellation or
 deadline expiry locks the same heads, clears only a matching current token, and
-records CANCELLED or TIMED_OUT. A stale coordinator or old token can neither
-activate nor clear a later apply. At most one nonterminal apply may cover a
-profile; overlapping proposals fail closed with
-`IMAGE_PROFILE_APPLY_IN_PROGRESS`, while an idempotent retry returns the existing
-resource.
+records CANCELLED or TIMED_OUT while clearing the matching catalog active ID. A
+stale coordinator or old token can neither activate nor clear a later apply.
+The single-global-apply rule deliberately trades rare administrator config
+parallelism for a provable heartbeat and atomic multi-profile contract.
 
 Migration 023 creates one activation-only partial index for each ordinary kind,
 keyed `(distribution, profile_revision, lease_expires_at, id)`. Their literal
@@ -1340,11 +1390,16 @@ lost canonical manifest or exact-second late worker
 therefore cannot deadlock or mutate the repair revision. A broken historical
 credential keeps its custody in DRAINING with an operator-visible closed error
 and blocks retirement or purge completion; it is never silently replaced by
-unrelated current authority. Config rollback may reactivate a DRAINING custody
-only while `retirement_enrolled_count = 0`, no scan/delete lease exists, and no
-physical delete has started. It preserves the monotonic custody generation,
-clears the canceled transition/grace/due fields, and fences any old scan token.
-After that boundary it fails closed with
+unrelated current authority. Config rollback is always a new profile revision
+strictly above the permanent highest value; it never moves the head backward.
+That new revision may reuse a DRAINING historical physical root only while the
+old custody has `retirement_enrolled_count = 0`, no scan/delete lease exists,
+and no physical delete has started. Activation creates the new revision's
+custody on that retained realm, changes the old custody from
+PHYSICAL_RETIREMENT to POLICY_TRANSFER, preserves its monotonic retirement
+generation, clears canceled grace/due fields, and fences any old scan token.
+The bounded transfer worker then moves exact rows to the new custody. After
+that boundary reuse fails closed with
 `IMAGE_GENERATION_RETIREMENT_STARTED`. There is no
 implicit revision or synthetic legacy fingerprint in either the configuration
 parser or location API. The final revision compare-and-swap must affect exactly
@@ -1356,7 +1411,9 @@ reported as applied.
 The central PostgreSQL configuration row and global image profile heads are one
 authority boundary. Migration 023 extends the singleton
 `container_image_catalog` row with `active_config_generation`,
-`active_image_config_digest`, `minimum_image_api_version`, and
+`active_image_config_digest`, nullable `active_image_config_apply_id`,
+checked non-releasable `lifetime_profile_name_count`,
+`minimum_image_api_version`, and
 the monotonic `distribution_state_ever_created` and
 `builder_state_ever_created` witnesses, plus `config_apply_results`, the bounded
 JSONB apply-result ledger described above. Apply keys are UUIDv7 values, are
@@ -1366,6 +1423,9 @@ contains at most 256 sorted changed profiles, and stores only hashes and bounded
 closed diagnostics. The transaction removes only terminal expired oldest
 entries; it never removes QUIESCING work. If 256 unexpired entries remain it
 returns `IMAGE_CONFIG_APPLY_LEDGER_FULL` before changing any row.
+Named catalog checks and the config-write trigger require the active apply ID to
+be NULL or to identify the ledger's sole QUIESCING entry; no second QUIESCING
+entry can be inserted. Terminal transition and scalar clearing are one update.
 The database-backed API-server config writer is refactored so every whole-config
 update locks the existing `config_yaml` row and this catalog singleton first,
 compares both the submitted generation and prior complete-config digest, and
@@ -1379,12 +1439,17 @@ requires the central PostgreSQL config row.
 Validation and provider capability probes run before the transaction and
 produce bounded, secret-free evidence digests. The shared helper rereads and
 normalizes the complete proposed config, verifies its diff hash and evidence
-generations, rejects more than 256 changed profiles or 128 targets per profile,
+generations, rejects more than 256 active or changed profiles or 128 targets per profile,
 and follows the fast-path or durable-quiesce protocol above. The immediate or
 final activation transaction inserts immutable realm, profile-revision, and
 custody rows, advances each changed distribution's one global profile head,
 writes the complete YAML value, and increments the singleton generation/digest
-in one commit. All changed profile keys are sorted. An unchanged physical root and
+in one commit. For a new name it checks and permanently increments the 1,024
+lifetime-name counter. For an edit it requires the submitted revision above the
+head's non-releasable highest value and retained count below 64, marks the prior
+revision superseded, and increments both retained count and highest revision.
+Removal marks the old revision superseded and head REMOVED without inserting a
+replacement revision. All changed profile keys are sorted. An unchanged physical root and
 ownership kind selects POLICY_TRANSFER; every root or ownership change selects
 PHYSICAL_RETIREMENT and a disjoint realm generation. Removing a profile first
 moves its at-most-128 retained target custodies to DRAINING with
@@ -1398,7 +1463,8 @@ that does not change image configuration still takes the same config-row
 compare-and-swap, so it cannot overwrite a concurrent image activation. If it
 changes the generation expected by a QUIESCING apply, its transaction locks that
 apply's bounded sorted heads, clears only matching tokens, and records CANCELLED
-before committing the newer config; it never leaves an orphaned quiesce. A
+while clearing the catalog active ID before committing the newer config; it
+never leaves an orphaned quiesce. A
 repeated idempotency key with the same request hash returns the current
 QUIESCING or terminal result from any unexpired ledger entry, even after later
 applies. Reuse with different bytes fails closed, while a key older than the
@@ -1672,8 +1738,8 @@ the corresponding index for first-page, deep-page, and zero-match queries.
 Neither the unfiltered nor lifecycle-only plan may sequentially scan the
 workspace population at one million rows.
 
-A distribution query first loads its one global active head, then uses that
-exact revision in the exact matching facet index;
+A distribution query first loads its one permanent head, requires
+`head_state = 'ACTIVE'`, then uses that exact active revision in the matching facet index;
 it never scans historical revisions or an unbounded set of profile heads.
 Filtered queries deduplicate one bounded page of artifact IDs, then load
 artifacts and revision-independent summaries in a fixed number of statements.
@@ -1914,8 +1980,10 @@ One durable reservation generation per `(workspace, release)`, with at most one
 non-RELEASED generation active while a release is pending:
 
 ```text
-id, workspace, release, image_id,
+id, workspace, release, image_id, distribution, route_profile_revision,
+retry_source_id NULL, completed_source_id NULL,
 canonical_location_id NULL, completed_location_id NULL,
+last_attempted_location_id NULL,
 completed_location_fingerprint NULL, completed_location_audit_hash NULL,
 state PENDING|READY|FAILED|CANCELLED|RELEASED,
 attempt_count, retry_generation, reservation_generation,
@@ -1928,38 +1996,77 @@ Migration 023 creates
 `ix_container_image_publications_artifact_order` on
 `(workspace, image_id, created_at DESC, id DESC)` for the bounded history
 endpoint. Its cursor adds `(created_at, id) < (:created_at, :id)` after the exact
-workspace/artifact prefix.
+workspace/artifact prefix. It also creates
+`ix_ci_publications_pending_location (canonical_location_id, id) WHERE state =
+'PENDING' AND canonical_location_id IS NOT NULL` so canonical completion finds
+only its exact bounded finalizer set. The artifact's hard 256-publication limit
+is an independent upper bound on every failure, detachment, and repair pass.
 
 `canonical_location_id` is the only live location foreign key and exists only
-while a never-READY publication may still finalize or retry. READY completion
+while a never-READY publication may still finalize or retry against that exact
+route. `distribution` and `route_profile_revision` are bounded scalar routing
+evidence, not foreign keys that retain historical revisions. Source-backed
+publication also retains only its exact explicitly submitted immutable
+`retry_source_id`; artifact-backed publication stores NULL and never inherits an
+artifact alias. READY completion
 moves its UUID into `completed_location_id`, stores the bounded physical
 fingerprint/audit hash, clears the live foreign key, and creates the release's
 matching scalar evidence in the same transaction. The completed ID is an audit
-identifier, not a foreign key or runtime route. Never-READY RELEASED clears its
-live foreign key after all finalizer/lease fences. Therefore permanent release
+identifier, not a foreign key or runtime route. READY moves any retry source ID
+to scalar `completed_source_id`. Never-READY RELEASED clears its
+live foreign key after all finalizer/lease fences. A supersession detachment
+moves the old UUID to scalar `last_attempted_location_id` and clears the foreign
+key. Therefore permanent release
 and bounded publication history preserve provenance without pinning a retired
 location row or realm allocation forever.
 
 The reservation prevents two digests from racing for a name without making the
 name launchable. Canonical READY completion follows the global phases through
-artifact, canonical location, publication, and release, then verifies the exact
-digest and active profile revision, inserts the immutable release, and marks
-the publication READY in one transaction. Failure records a closed code but
-keeps the reservation for authorized retry. An administrator may cancel only a
+artifact and canonical location, then locks every exact-location PENDING
+publication and its release-name key in sorted order. It verifies the exact
+digest and active profile revision, inserts every immutable release, and marks
+all matching publications READY in one transaction. Quota was reserved before
+copy, and uniqueness rejected conflicting names, so one valid sibling cannot be
+silently omitted. Canonical terminal failure uses the same bounded publication
+set and marks every matching PENDING row FAILED with one closed code while
+keeping each reservation for authorized retry. An administrator may cancel only a
 terminal FAILED publication with no release row; cancellation is audited and
-keeps the digest reservation so a same-digest retry can reactivate it. A
-successful READY release is permanently bound.
+stores any live route as scalar `last_attempted_location_id`, clears that
+foreign key, and keeps the digest reservation so a same-digest retry can
+reactivate it. A
+successful READY release is permanently bound. Named checks require PENDING to
+carry a live canonical ID; READY and RELEASED to have none; CANCELLED to have
+none; and FAILED either to retain a retryable exact route or to have closed
+`PROFILE_SUPERSEDED` with a scalar last-attempted ID and no live foreign key.
+
+An authorized publication retry locks quota, current profile head, artifact,
+current canonical route, and the publication in global order. It requires the
+same workspace, artifact, release, and distribution, increments
+`retry_generation`, updates scalar `route_profile_revision`, binds the current
+canonical location, clears the prior terminal route code, and returns the same row to
+PENDING without consuming another name, lifetime-generation, or record slot. If
+no current canonical intent exists, only a source-backed reservation may create
+one from its exact stored source; an artifact-backed reservation returns
+`CANONICAL_NOT_READY` and never selects a historical alias. Repeating the
+original source publish with a different explicit digest-equivalent alias may
+rotate `retry_source_id` under the same no-live-lease and generation fences. A
+READY current route invokes the all-matching finalizer immediately; a removed
+distribution fails closed until the caller explicitly republishes under a
+valid distribution after releasing the old name. The CLI/SDK and dashboard
+surface this as publication Retry, not as a registry-location retry.
 
 For a publication that has never created a release row, an admin-only
 `release-name` operation is the typo and wrong-digest escape hatch. It resolves
-the publication ID without locking, then locks quota, profile, artifact,
+the publication ID without locking, then locks quota, the permanent profile
+head/tombstone, artifact,
 canonical location if present, publication, and active-name release key in the
 global order; it requires
 FAILED or CANCELLED, no durable consumer, no live lease, and no release row;
 records actor, reason, time, and terminal `RELEASED`; decrements only workspace
 `release_reservation_count` and artifact
 `active_release_reservation_count`, never either lifetime generation counter;
-clears its live `canonical_location_id`; and removes only that generation from the partial unique
+stores any retry source as scalar completed-source audit evidence, clears its
+live `retry_source_id` and `canonical_location_id`; and removes only that generation from the partial unique
 active-name index. A later publication may reuse the text with a new
 `reservation_generation` only while both lifetime limits permit it. Every worker and finalizer is fenced by
 publication ID and generation, so a late callback for the released reservation
@@ -2163,18 +2270,26 @@ continue to name their pinned location until they terminate.
 ### `container_image_profile_heads`, `container_image_profile_revisions`, and
 `container_image_target_custodies`
 
-One global head row per distribution stores the active revision, complete
-fingerprint, monotonic nonnegative `quiesce_generation`, and an all-null or
-structurally complete quiesce tuple: apply ID, random-token hash, proposed
-revision/fingerprint, request hash, requester fingerprint, lease expiry, and
-overall deadline. Named checks require positive generations for a present
-tuple, bounded hashes, lease expiry no later than its deadline, and all fields
+One permanent global head row per lifetime distribution name stores
+`head_state ACTIVE|REMOVED`, nullable active revision/fingerprint, positive
+non-releasable `highest_revision`, checked `retained_revision_count` from 0
+through 64, monotonic nonnegative `quiesce_generation`, and an all-null or
+structurally complete quiesce tuple: apply ID, random-token hash, proposed head
+state, proposed revision/fingerprint, request hash, requester fingerprint, lease
+expiry, and overall deadline. Named checks require ACTIVE to have an exact
+retained revision no greater than `highest_revision`, REMOVED to have no active
+revision/fingerprint, positive generations for a present tuple, proposed
+revision/fingerprint exactly for an ACTIVE target and NULL for a REMOVED target,
+bounded hashes, lease expiry no later than its deadline, and all tuple fields
 NULL when no token exists. Expiry uses a locked database timestamp and is never
 embedded in a check constraint. Immutable revision and target-custody rows
-preserve the secret-free historical contract described above. Workspace
+preserve the secret-free historical contract until bounded compaction above.
+Workspace
 authorization and allocation are separate and never multiply head updates.
-Profile activation inserts the new snapshots and advances the single head in
-the immediate or quiesce-finalization transaction. Queue claims,
+Profile activation inserts the new snapshots, increments the retained count and
+highest revision, and advances the single head in the immediate or
+quiesce-finalization transaction. Removal marks the prior revision superseded
+and the head REMOVED without deleting its tombstone. Queue claims,
 READY publication, new managed-location references, retry, verification, and
 eviction join a location's revision to the active head. Regional claims also
 require their exact bound canonical location to be READY. Purge is the deliberate
@@ -2673,13 +2788,32 @@ deleting bytes. Successful page progress resets scan failures; claim 20 requires
 the exact admin retry that increments the custody retry generation and resets
 only this scan budget.
 
+Each scanned location first runs a bounded publication-lifecycle pass before
+rollback grace or byte deletion. After locking custody, artifact, and location,
+it locks the artifact's at-most-256 publications in sorted order. For
+PHYSICAL_RETIREMENT, every PENDING row whose live `canonical_location_id`
+matches the old location becomes FAILED with closed `PROFILE_SUPERSEDED`; every
+matching FAILED row receives that same current code, and every matching
+CANCELLED row is detached as well. The transaction preserves
+the prior diagnostic in audit, stores the old UUID as scalar
+`last_attempted_location_id`, increments `retry_generation` to fence an already
+dispatched finalizer, and clears the live foreign key without releasing active
+name, lifetime-generation, or record quota. It may run immediately after the
+head change, so a publication does not display PENDING throughout rollback
+grace. Retry later resolves that distribution's current canonical route. A
+stale finalizer fails both the inactive-head check and the publication
+generation check.
+
 For `POLICY_TRANSFER`, the worker locks old custody, new custody, artifact,
 canonical, and exact location in the global order. It may replace the location's
 custody/profile/policy fields only when physical fingerprint, realm generation,
 ownership kind, artifact digest, and rendered destination are unchanged; no
 ordinary, build, purge, or retirement lease exists; and neither custody has
-started physical retirement. Durable consumers remain attached to the same
-location ID and keep their already persisted execution plan. The transaction
+started physical retirement. Every publication still carrying this live
+location is locked in the publication phase and has its scalar
+`route_profile_revision` advanced to the new revision in the same transaction.
+Durable consumers remain attached to the same location ID and keep their
+already persisted execution plan. The transaction
 decrements old and increments new `open_location_count`. It does not change byte
 charge, shard reservation, or provider content. A failed predicate leaves the
 row on the old custody for another bounded scan.
@@ -2687,8 +2821,9 @@ row on the old custody for another bounded scan.
 For `PHYSICAL_RETIREMENT`, the enrollment transaction locks the same exact
 objects and requires all of the following: rollback grace has passed; no active
 head uses the old custody; the artifact is ACTIVE or TOMBSTONED, never PURGING or
-PURGED; no durable location reference exists; no active publication or finalizer
-is bound to the old location; and no ordinary, BUILD_OUTPUT, artifact-purge, or
+PURGED; no durable location reference exists; the bounded detachment pass has
+left no publication live-location foreign key or finalizer bound to the old
+location; and no ordinary, BUILD_OUTPUT, artifact-purge, or
 retirement lease is live. For a BUILD-origin canonical it invokes the registered
 location-lifecycle extension inside this transaction before changing the row.
 It then copies the custody's exact positive generation to the previously-zero
@@ -2782,6 +2917,29 @@ lease or audit reference, and retention has passed, it becomes RETIRED and may
 be compacted. Realm/prefix reservation compaction additionally requires no
 custody, allocation, location, or audit reference. RETIRED locations are never
 rematerialized, unlike ordinary EVICTED cache rows.
+
+Profile-revision retention is a separate final bounded step. Supersession or
+profile removal stamps the old immutable revision with `superseded_at` and a
+30-day `compact_not_before`; removal leaves the permanent head in REMOVED state
+with no active revision. Migration 023 creates
+`ix_ci_profile_revisions_compaction_due (compact_not_before, distribution,
+revision) WHERE superseded_at IS NOT NULL`. The compactor discovers at most 64
+due rows, then locks catalog, exact head, and revision. It requires that the row
+is not active or a quiesce target; no target custody, location, live publication
+route, or nonterminal/retained apply-ledger entry depends on it; required audit
+evidence already contains the normalized fingerprint rather than depending on
+the row; and every related custody/realm retention fence above has completed.
+Publication and release scalar revision/fingerprint evidence is not a foreign
+key and remains interpretable without the operational row. It then deletes the
+revision and decrements the head's checked retained count exactly once.
+
+The permanent head preserves `highest_revision` and `quiesce_generation`, so
+compaction never permits revision reuse, stale coordinator success, or an older
+config rollback. A first-ever distribution name atomically increments the
+catalog's checked non-releasable lifetime-name counter; a removed head is never
+deleted. Head-count repair scans only that distribution's exact at-most-64
+revision index. These two hard bounds cap both revision rows and removed-name
+tombstones independently of configuration churn.
 
 The due queries add `next_retry_at <= :now`, `purge_next_retry_at <= :now`,
 `retirement_next_scan_at <= :now`, `retirement_next_retry_at <= :now`, or
@@ -3530,6 +3688,7 @@ sky image publish --artifact-id UUID --release RELEASE \
 sky image status [ARTIFACT|RELEASE|REF]
 sky image prepare IMAGE --targets TARGET[,TARGET...] [--distribution NAME]
 sky image retry IMAGE --target TARGET
+sky image publication retry PUBLICATION_ID [--no-wait]
 sky image infrastructure inventory aws --account ACCOUNT --regions R[,R...] \
     --output inventory.json                         # admin/read-only
 sky image publication release-name PUBLICATION_ID --reason CODE --yes # admin
@@ -3548,6 +3707,11 @@ that release available. Artifact publication never synthesizes source
 provenance. `prepare` establishes
 requested physical-cache intent. No operation waits inside the API executor
 for OCI transfer, and none copies to unrequested regions.
+`publication retry` reuses one never-READY reservation, resolves its stored
+distribution through the current active head, and either finalizes a READY route
+or returns it to PENDING on that current canonical location. It never retargets
+the name to a different artifact or distribution and consumes no new lifetime
+slot.
 
 Bare operational selectors remain untyped through CLI and HTTP transport.
 The server resolves artifact, release, and source candidates together. The
@@ -3811,7 +3975,14 @@ Unit tests must cover:
   one retained-record slot and zero lifetime slots; READY finalization moves the
   live canonical foreign key to immutable scalar audit evidence, never-READY
   RELEASED clears it, and permanent release/publication history does not pin
-  physical-generation compaction;
+  physical-generation compaction; canonical success and failure atomically
+  settle every exact-location PENDING sibling under the 256-row bound;
+  physical supersession immediately fences finalizers, changes matching
+  PENDING/FAILED routes to `PROFILE_SUPERSEDED`, detaches every matching live
+  foreign key without releasing quota, and publication retry binds the current
+  route or fails cleanly for a REMOVED distribution; source-backed retry may
+  create a missing current intent only from its exact stored explicit source,
+  while artifact-backed retry never inherits an alias;
   publishing another release for an already READY canonical route finalizes
   immediately through the same locked validator;
   artifact-ID publication creates no source row, requires one authorized ACTIVE
@@ -3821,7 +3992,9 @@ Unit tests must cover:
 - fresh real-PostgreSQL 022-to-023 migration from frozen literal DDL, exact
   parity with checked-in distribution metadata, the exact 17-table inventory
   listed above with every named check/index/foreign key, including active
-  artifact release reservations, custody transition/scan authority, disjoint
+  artifact release reservations, the pending-location publication index,
+  single-global active config apply, lifetime profile-name and retained-revision
+  bounds, revision compaction index, custody transition/scan authority, disjoint
   location retirement generations, and all retirement due indexes; absence of
   obsolete legacy tables/columns, the API-62 minimum-image-plane fence, both monotonic
   state-ever-created witnesses and TRUE-to-FALSE trigger, atomic first
@@ -4016,7 +4189,10 @@ Unit tests must cover:
   let a stale claimant, finalizer, coordinator, cancellation, or timeout mutate
   a later generation; API crash/restart reacquires a pending multi-profile apply,
   a deliberate coordinator outage lets work resume, and one stable coordinator
-  subsequently drains and commits; a live twentieth
+  subsequently drains and commits; a second global apply is rejected with the
+  first resource even for disjoint profiles, while one 256-head apply completes
+  sorted batch heartbeats inside the 15-second service objective under the
+  five/ten-second lock/statement timeouts and readiness watchdog; a live twentieth
   COPY, VERIFY, EVICT, or EXTERNAL_VERIFY claim remains visible through its
   uncapped activation-only index while its expired automatic-reclaim index is
   correctly exhausted, and migration 024 proves the same for BUILD_OUTPUT;
@@ -4126,11 +4302,11 @@ Unit tests must cover:
 - exact catalog UUID enforcement for Serve and managed-jobs controllers;
 - reference-aware regional eviction and canonical protection;
 - provider ownership proof before any destructive registry callback;
-- endpoint, namespace, account, manager-identity, distinct purge-identity, and
+- endpoint, namespace, account, manager-identity, distinct lifecycle-identity, and
   credential-reference rotation retaining historical target custody and its
   physical-root reservation until old locations, audit manifests, leases, and
   DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN outcomes drain, including purge and
-  physical retirement through only that old purge authority; same-root,
+  physical retirement through only that old lifecycle authority; same-root,
   same-ownership policy transfer moves counts and authority without byte or
   shard changes, while a root or ownership change uses a disjoint generation;
 - one global profile-head update immediately excluding old-revision facets in
@@ -4173,10 +4349,15 @@ Unit tests must cover:
   512-row retained hard cap, a fifth full generation failing before location
   insertion without an activation scan, exact
   location/custody/allocation/realm compaction, rollback only before first
-  enrollment through the custody's monotonic generation/enrolled-count fence,
+  enrollment through a new higher profile revision plus the old custody's
+  monotonic generation/enrolled-count fence, never a backward head move,
   registered BUILD-origin location retirement that atomically
   repoints an exact READY replacement or marks its cache output retired, and one
-  blocked due retirement behind one million retained custodies;
+  blocked due retirement behind one million retained custodies; bounded
+  publication detachment before grace, policy-transfer route revision updates,
+  64-row-per-profile revision retention, due-index compaction only after every
+  operational reference and audit fence, permanent highest-revision/quiesce
+  tombstones, and the non-releasable 1,024 lifetime-name bound;
 - purge API intent-only behavior; a separately deployed lifecycle
   ServiceAccount/role exclusively claiming disjoint ordinary regional EVICT,
   PURGING, and managed historical-retirement work; inability of API/copy
@@ -4201,14 +4382,18 @@ Unit tests must cover:
   256-entry/24-hour apply-ledger saturation including pending entries, later
   applies followed by an earlier lost-response retry, idempotency-key conflict,
   stale/future UUIDv7 rejection, immediate fast-path commit, sustained claim
-  pressure, multi-profile quiesce, exact token/operation expiry races, API crash
+  pressure, the single-global-active-apply check, a maximum-size 256-profile
+  quiesce heartbeat batch, exact 15-second watchdog behavior, exact
+  token/operation expiry races, API crash
   before intent and after intent/final commit, coordinator restart/reacquisition,
   quiesce heartbeat loss, cancel/timeout versus finalizer races, stale
   coordinator fencing, unrelated raw-edit cancellation, urgent credential
-  rotation, and NOTIFY loss; rejection above 256 distributions or 128 targets
-  before locking, constant head-update count across one and one million
-  workspaces, stale replica fail-closed behavior, and eventual poll-based
-  convergence without a representable config/head split;
+  rotation, and NOTIFY loss; rejection above 256 active/changed distributions,
+  128 targets, 64 retained revisions, or 1,024 lifetime profile names before
+  mutation, REMOVED-name recreation only above the permanent highest revision,
+  bounded revision-count repair/compaction, constant head-update count across
+  one and one million workspaces, stale replica fail-closed behavior, and
+  eventual poll-based convergence without a representable config/head split;
 - staged API-63-at-023 builder rollout, migration-Job rejection while any API-62
   process/session remains, exact 023 common-column SQL projection across the
   additive migration, and a forced API-62-start/check-out/image-operation race
@@ -4277,18 +4462,22 @@ Dashboard and catalog coverage additionally proves:
   indexes and duplicate-free keyset pagination; detail never embeds unbounded
   publication generations, lifetime versus retained-record limits render
   separately, and compaction visibly restores only the retained-record count;
+  publication rows render `PROFILE_SUPERSEDED`, scalar last-attempted route, and
+  eligible Retry, including a closed removed-distribution state;
 - profile summaries omit manager identities, credential references, and raw
   configuration while preserving useful topology;
 - stale workspace responses cannot overwrite a newer selection;
-- publish, prepare, and retry dialogs handle pending/success/failure and prevent
-  duplicate submissions;
+- publish, prepare, location-retry, and publication-retry dialogs handle
+  pending/success/failure and prevent duplicate submissions;
 - the admin Image distribution editor round-trips every profile/binding/policy
   field, validates and previews a generation-fenced diff, never exposes secret
   values, distinguishes policy transfer from physical-generation replacement,
   and reports infrastructure/capability plus bounded retirement progress and
   blockers without waiting for cleanup; it preserves a QUIESCING application
   across reload, displays lease kinds/deadline, disables duplicate submission,
-  and proves cancel, timeout, retry, terminal, and stale-token states; and
+  links every competing editor to the one global application, renders ACTIVE and
+  REMOVED heads plus 64-revision/1,024-name retention usage, and proves cancel,
+  timeout, retry, terminal, compaction-blocked, and stale-token states; and
 - navigation, responsive rendering, keyboard focus, empty/error/permission,
   and old-server states pass Jest and a production Next.js build.
 
