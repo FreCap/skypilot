@@ -6,7 +6,6 @@ import pathlib
 import shutil
 import threading
 import time
-from typing import Optional, Set, Tuple
 
 import filelock
 
@@ -100,10 +99,10 @@ def gc_task_logs_for_job():
         time.sleep(_next_gc_interval(task_logs_retention))
 
 
-def _clean_controller_logs_with_retention(
-        retention_seconds: int,
-        batch_size: int = 100,
-        failed_job_ids: Optional[Set[int]] = None):
+def _clean_controller_logs_with_retention(retention_seconds: int,
+                                          batch_size: int = 100,
+                                          failed_job_ids: set[int] |
+                                          None = None):
     """Clean controller logs with retention.
 
     Args:
@@ -161,10 +160,10 @@ def _clean_controller_logs_with_retention(
     return complete
 
 
-def _clean_task_logs_with_retention(
-        retention_seconds: int,
-        batch_size: int = 100,
-        failed_tasks: Optional[Set[Tuple[int, int]]] = None):
+def _clean_task_logs_with_retention(retention_seconds: int,
+                                    batch_size: int = 100,
+                                    failed_tasks: set[tuple[int, int]] |
+                                    None = None):
     """Clean task logs with retention.
 
     Args:

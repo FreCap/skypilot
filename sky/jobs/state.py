@@ -2582,7 +2582,7 @@ def get_all_job_ids_by_name(name: str | None) -> list[int]:
 def get_task_logs_to_clean(
     retention_seconds: int,
     batch_size: int,
-    exclude_tasks: Optional[Collection[tuple[int, int]]] = None
+    exclude_tasks: Collection[tuple[int, int]] | None = None
 ) -> list[dict[str, Any]]:
     """Get the logs of job tasks to clean.
 
@@ -2633,8 +2633,7 @@ def get_task_logs_to_clean(
 def get_controller_logs_to_clean(
         retention_seconds: int,
         batch_size: int,
-        exclude_job_ids: Optional[Collection[int]] = None
-) -> list[dict[str, Any]]:
+        exclude_job_ids: Collection[int] | None = None) -> list[dict[str, Any]]:
     """Get the controller logs to clean.
 
     The controller logs will only cleaned when:
