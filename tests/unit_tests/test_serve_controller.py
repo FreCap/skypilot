@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import autoscalers
 from sky.serve import controller
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1399,6 +1400,60 @@ class TestAutoscalerRuntimeSnapshot:
 
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
+
+    def test_logical_scale_down_waves_are_batched_without_reordering(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 1
+        decision_autoscaler.get_decision_interval.return_value = 0
+
+        def _logical_down(replica_id, generation=7):
+            return autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+                autoscalers.LogicalScaleDownTarget(
+                    version=1,
+                    reconcile_generation=generation,
+                    target_capacity=4,
+                    replica_id=replica_id))
+
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            _logical_down(1),
+            _logical_down(2),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP, None),
+            _logical_down(3),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 99),
+            _logical_down(4, generation=8),
+        ]
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        actuation_calls = [
+            call for call in ctrl._replica_manager.method_calls  # pylint: disable=protected-access
+            if call[0] in ('scale_down_logically_batch', 'scale_up_batch',
+                           'scale_down')
+        ]
+        assert actuation_calls == [
+            mock.call.scale_down_logically_batch([1, 2], 4, 1, 7),
+            mock.call.scale_up_batch([None], expected_version=1),
+            mock.call.scale_down_logically_batch([3], 4, 1, 7),
+            mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
+            mock.call.scale_down_logically_batch([4], 4, 1, 8),
+        ]
 
 
 class TestTranslateInFlight:

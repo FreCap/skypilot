@@ -1784,6 +1784,18 @@ class ReplicaManager:
         """Retire one backend only if the logical coverage fence still holds."""
         raise NotImplementedError
 
+    def scale_down_logically_batch(self, replica_ids: list[int],
+                                   target_capacity: int, version: int,
+                                   reconcile_generation: int) -> None:
+        """Retire logical backends selected from one reconcile generation.
+
+        Subclasses may override to amortize synchronization and fleet reads.
+        The compatibility path preserves the singleton behavior.
+        """
+        for replica_id in replica_ids:
+            self.scale_down_logically(replica_id, target_capacity, version,
+                                      reconcile_generation)
+
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
         raise NotImplementedError
@@ -3889,10 +3901,14 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _defer_scale_down_until_idle(
             self,
             replica_id: int,
-            logical_retirement: tuple[int, int, int] | None = None) -> None:
+            logical_retirement: tuple[int, int, int] | None = None,
+            *,
+            replica_info: ReplicaInfo | None = None) -> None:
         """Persist off-route state without admitting termination yet."""
-        info = serve_state.get_replica_info_from_id(self._service_name,
-                                                    replica_id)
+        info = replica_info
+        if info is None:
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
         if info is None:
             return
         if (getattr(info.status_property, 'wait_for_idle_before_termination',
@@ -4720,96 +4736,125 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 purge=purge,
                                 in_flight_drain_cap_seconds=drain_cap)
 
-    @with_lock
     def scale_down_logically(self, replica_id: int, target_capacity: int,
                              version: int, reconcile_generation: int) -> None:
-        with self._logical_state_lock:
-            self._scale_down_logically_locked(replica_id, target_capacity,
-                                              version, reconcile_generation)
+        self.scale_down_logically_batch([replica_id], target_capacity, version,
+                                        reconcile_generation)
 
-    def _scale_down_logically_locked(self, replica_id: int,
-                                     target_capacity: int, version: int,
-                                     reconcile_generation: int) -> None:
-        """Accept one logical retirement only against the current snapshot."""
+    @with_lock
+    def scale_down_logically_batch(self, replica_ids: list[int],
+                                   target_capacity: int, version: int,
+                                   reconcile_generation: int) -> None:
+        """Accept one logical retirement wave from one fleet snapshot."""
+        if not replica_ids:
+            return
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale-down sent to a physical '
                                'replica service.')
-        snapshot = self._logical_reconcile_snapshot
-        if (snapshot is None or snapshot.version != version or
-                snapshot.generation != reconcile_generation or
-                not self._logical_snapshot_is_fresh(snapshot) or
-                self.latest_version != version or self._logical_target
-                != (version, reconcile_generation, target_capacity)):
-            logger.info('Discarding stale logical scale-down intent for '
-                        f'replica {replica_id}.')
-            return
-        # Missing and terminal replica states do not become live again for the
-        # same replica id. Preserve their O(1) point-read fast path: a full
-        # fleet scan is unnecessary when no retirement can be accepted.
-        info = serve_state.get_replica_info_from_id(self._service_name,
-                                                    replica_id)
-        if info is None or info.is_terminal:
-            return
-
-        # A live victim still needs the full-fleet capacity proof. Locate it in
-        # that same snapshot so a concurrent durable transition cannot leave us
-        # validating fleet capacity against a newer row while acting on the
-        # older point-read victim above.
-        replica_infos = serve_state.get_replica_infos(self._service_name)
-        info = None
-        ready_capacity = 0
-        committed_capacity = 0
-        for candidate in replica_infos:
-            if candidate.replica_id == replica_id:
-                info = candidate
-            if candidate.is_terminal or candidate.version != version:
-                continue
-            if (candidate.replica_id != replica_id and getattr(
-                    candidate.status_property, 'is_scale_down', False) is True):
-                continue
-            planned = int(getattr(candidate, 'planned_capacity', 1))
-            observed = snapshot.observed_slots_by_replica_id.get(
-                candidate.replica_id)
-            if (candidate.is_ready and observed is not None and
-                    candidate.replica_id not in snapshot.unknown_replica_ids):
-                width = min(planned, observed)
-                committed_capacity += width
-                ready_capacity += width
-            else:
-                committed_capacity += planned
-
-        if info is None or info.is_terminal:
-            return
-
-        has_served = (info.status_property.first_ready_time is not None and
-                      info.status_property.first_ready_time >= 0)
-        if not has_served:
-            victim_width = (int(getattr(info, 'planned_capacity', 1))
-                            if info.version == version else 0)
-            if committed_capacity - victim_width < target_capacity:
+        with self._logical_state_lock:
+            snapshot = self._logical_reconcile_snapshot
+            pending_version = getattr(self, '_pending_version', None)
+            if (snapshot is None or snapshot.version != version or
+                    snapshot.generation != reconcile_generation or
+                    not self._logical_snapshot_is_fresh(snapshot) or
+                    self.latest_version != version or
+                (pending_version is not None and pending_version > version) or
+                    self._logical_target != (version, reconcile_generation,
+                                             target_capacity)):
+                logger.info(
+                    'Discarding stale logical scale-down batch for version '
+                    f'{version}, generation {reconcile_generation}, target '
+                    f'{target_capacity} with {len(replica_ids)} victim(s).')
                 return
-            self._terminate_replica(replica_id,
-                                    sync_down_logs=False,
-                                    replica_drain_delay_seconds=0,
-                                    is_scale_down=True,
-                                    in_flight_drain_cap_seconds=0)
-            return
 
-        if (replica_id in snapshot.unknown_replica_ids or
-                snapshot.in_flight_by_replica_id.get(replica_id) != 0):
-            return
-        victim_ready_width = 0
-        if info.version == version:
-            observed = snapshot.observed_slots_by_replica_id.get(replica_id)
-            if observed is None:
-                return
-            victim_ready_width = min(int(getattr(info, 'planned_capacity', 1)),
-                                     observed)
-        if ready_capacity - victim_ready_width < target_capacity:
-            return
-        self._defer_scale_down_until_idle(
-            replica_id,
-            logical_retirement=(version, reconcile_generation, target_capacity))
+            # This is the only fleet read for the whole wave. Resolve victims
+            # from the same durable snapshot used for capacity accounting so a
+            # concurrent row transition cannot mix two proofs.
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            infos_by_id = {info.replica_id: info for info in replica_infos}
+            ready_capacity = 0
+            committed_capacity = 0
+            capacity_by_id: dict[int, tuple[int, int]] = {}
+            for candidate in replica_infos:
+                committed_width = 0
+                ready_width = 0
+                if (not candidate.is_terminal and
+                        candidate.version == version and
+                        getattr(candidate.status_property, 'is_scale_down',
+                                False) is not True):
+                    planned = int(getattr(candidate, 'planned_capacity', 1))
+                    observed = snapshot.observed_slots_by_replica_id.get(
+                        candidate.replica_id)
+                    if (candidate.is_ready and observed is not None and
+                            candidate.replica_id
+                            not in snapshot.unknown_replica_ids):
+                        ready_width = min(planned, observed)
+                        committed_width = ready_width
+                    else:
+                        committed_width = planned
+                    ready_capacity += ready_width
+                    committed_capacity += committed_width
+                capacity_by_id[candidate.replica_id] = (committed_width,
+                                                        ready_width)
+
+            accepted = 0
+            seen_ids: set[int] = set()
+            for replica_id in replica_ids:
+                if replica_id in seen_ids:
+                    continue
+                seen_ids.add(replica_id)
+                info = infos_by_id.get(replica_id)
+                if (info is None or info.is_terminal or getattr(
+                        info.status_property, 'is_scale_down', False) is True):
+                    continue
+
+                committed_width, ready_width = capacity_by_id.get(
+                    replica_id, (0, 0))
+                has_served = (info.status_property.first_ready_time is not None
+                              and info.status_property.first_ready_time >= 0)
+                if not has_served:
+                    victim_width = (int(getattr(info, 'planned_capacity', 1))
+                                    if info.version == version else 0)
+                    if committed_capacity - victim_width < target_capacity:
+                        continue
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                else:
+                    if (replica_id in snapshot.unknown_replica_ids or
+                            snapshot.in_flight_by_replica_id.get(replica_id)
+                            != 0):
+                        continue
+                    victim_ready_width = 0
+                    if info.version == version:
+                        observed = snapshot.observed_slots_by_replica_id.get(
+                            replica_id)
+                        if observed is None:
+                            continue
+                        victim_ready_width = min(
+                            int(getattr(info, 'planned_capacity', 1)), observed)
+                    if ready_capacity - victim_ready_width < target_capacity:
+                        continue
+                    self._defer_scale_down_until_idle(
+                        replica_id,
+                        logical_retirement=(version, reconcile_generation,
+                                            target_capacity),
+                        replica_info=info)
+
+                # Only mutate the in-memory proof after durable acceptance.
+                # If persistence raises, the exception aborts the remainder and
+                # the next autoscaler tick retries under a fresh fence.
+                committed_capacity -= committed_width
+                ready_capacity -= ready_width
+                accepted += 1
+
+            logger.info(
+                'Logical scale-down batch completed for version '
+                f'{version}, generation {reconcile_generation}, target '
+                f'{target_capacity}: requested={len(replica_ids)}, '
+                f'accepted={accepted}, skipped={len(replica_ids) - accepted}.')
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.

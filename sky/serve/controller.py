@@ -2455,6 +2455,8 @@ class SkyServeController:
                 # preserved: scale-downs still execute at their original
                 # position relative to the upscale batches around them.
                 pending_scale_up: list[dict[str, Any] | None] = []
+                pending_logical_scale_down: list[
+                    autoscalers.LogicalScaleDownTarget] = []
 
                 # The closure is only called within the same outer-loop
                 # iteration that (re)binds pending_scale_up, so capturing the
@@ -2467,10 +2469,25 @@ class SkyServeController:
                             expected_version=expected_version)
                         pending_scale_up.clear()  # noqa: B023
 
+                def _flush_logical_scale_down() -> None:
+                    if not pending_logical_scale_down:  # noqa: B023
+                        return
+                    first = pending_logical_scale_down[0]  # noqa: B023
+                    self._replica_manager.scale_down_logically_batch(
+                        [
+                            target.replica_id for target in  # noqa: B023
+                            pending_logical_scale_down  # noqa: B023
+                        ],  # noqa: B023
+                        first.target_capacity,
+                        first.version,
+                        first.reconcile_generation)
+                    pending_logical_scale_down.clear()  # noqa: B023
+
                 for scaling_option in scaling_options:
                     logger.info(f'Scaling option received: {scaling_option}')
                     if (scaling_option.operator ==
                             autoscalers.AutoscalerDecisionOperator.SCALE_UP):
+                        _flush_logical_scale_down()
                         if isinstance(scaling_option.target,
                                       autoscalers.LogicalScaleTarget):
                             _flush_scale_up()
@@ -2494,12 +2511,21 @@ class SkyServeController:
                         _flush_scale_up()
                         if isinstance(scaling_option.target,
                                       autoscalers.LogicalScaleDownTarget):
-                            self._replica_manager.scale_down_logically(
-                                scaling_option.target.replica_id,
-                                scaling_option.target.target_capacity,
-                                scaling_option.target.version,
-                                scaling_option.target.reconcile_generation)
+                            logical_scale_down_target = scaling_option.target
+                            if pending_logical_scale_down:
+                                first = pending_logical_scale_down[0]
+                                if ((logical_scale_down_target.version,
+                                     logical_scale_down_target.
+                                     reconcile_generation,
+                                     logical_scale_down_target.target_capacity)
+                                        != (first.version,
+                                            first.reconcile_generation,
+                                            first.target_capacity)):
+                                    _flush_logical_scale_down()
+                            pending_logical_scale_down.append(
+                                logical_scale_down_target)
                         else:
+                            _flush_logical_scale_down()
                             assert isinstance(scaling_option.target,
                                               int), scaling_option
                             self._replica_manager.scale_down(
@@ -2509,6 +2535,7 @@ class SkyServeController:
                                     AutoscalerDecisionReason.COST_REBALANCE),
                                 expected_version=decision_version)
                 _flush_scale_up()
+                _flush_logical_scale_down()
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
                 # monitor running.
