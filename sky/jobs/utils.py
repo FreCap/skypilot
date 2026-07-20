@@ -595,22 +595,34 @@ def update_managed_jobs_statuses(job_id: int | None = None):
         on the failure path and keeps cleanup keyed off ``task_name``, which is
         what the controller uses to name task clusters.
         """
-        error_msgs = []
         if pool is not None:
             return None
+        cluster_names = []
         for task in tasks:
             cluster_name = generate_managed_job_cluster_name(
                 task['task_name'], job_id)
-            if cluster_name is None:
-                continue
+            if cluster_name is not None:
+                cluster_names.append(cluster_name)
+
+        def _terminate_one(cluster_name: str) -> str | None:
             try:
                 terminate_cluster(cluster_name)
+                return None
             except Exception as e:  # pylint: disable=broad-except
                 error_msg = (
                     f'Failed to terminate cluster {cluster_name}: '
                     f'{common_utils.format_exception(e, use_bracket=True)}')
                 logger.exception(error_msg, exc_info=e)
-                error_msgs.append(error_msg)
+                return error_msg
+
+        # Terminate the task clusters in parallel: each task in a JobGroup has
+        # a distinct cluster, and a single teardown can take minutes, so a
+        # serial walk holds up the whole refresh tick and widens the window in
+        # which the batched status snapshot goes stale.
+        error_msgs = [
+            msg for msg in subprocess_utils.run_in_parallel(
+                _terminate_one, cluster_names) if msg is not None
+        ]
         if not error_msgs:
             return None
         return '; '.join(error_msgs)

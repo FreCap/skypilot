@@ -42,6 +42,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.metrics import utils as metrics_utils
+from sky.serve import placement_history
 from sky.server import clean_env as clean_env_module
 from sky.server import common as server_common
 from sky.server import config as server_config
@@ -782,6 +783,7 @@ def _request_execution_wrapper(request_id: str,
     global _in_request_execution  # pylint: disable=global-statement
     try:
         _in_request_execution = True
+        placement_history.reset_request_buffer()
         # As soon as the request is updated with the executor PID, we can
         # receive SIGTERM from cancellation. So, we update the request inside
         # the try block to ensure we have the KeyboardInterrupt handling.
@@ -877,6 +879,13 @@ def _request_execution_wrapper(request_id: str,
     finally:
         _in_request_execution = False
         _restore_output()
+        try:
+            placement_history.flush_request_buffer()
+        except Exception as e:  # pylint: disable=broad-except
+            # Placement history is observability. Its PostgreSQL write runs
+            # after the request result is durable and must never alter it.
+            logger.warning('Failed to flush placement history: '
+                           f'{common_utils.format_exception(e)}')
         try:
             # Capture the peak RSS before GC.
             peak_rss = max(proc.memory_info().rss, metrics_lib.peak_rss_bytes)

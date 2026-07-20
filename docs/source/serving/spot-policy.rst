@@ -104,10 +104,13 @@ instance-shape lists. Configured cloud and region constraints still apply.
 ``dynamic_fallback`` continues to compare raw hourly machine prices. Use the
 per-GPU policy only when each configured GPU contributes one equivalent serving
 slot. The policy automatically makes ``min_replicas``, ``max_replicas``, and
-the autoscaler target count those slots, while the selected physical backend
-shape stays internal to SkyServe. Multiple accelerator models can be supplied
-as separate ``any_of`` entries; supported widths are discovered independently
-for each model.
+the autoscaler target count logical GPU slots, while the selected physical
+backend shape stays internal to SkyServe. A positive integer
+``target_concurrency_per_replica`` controls how many outstanding requests
+(including queued and recently rejected work) map to each slot; it does not
+change the occupancy-gated execution concurrency. Multiple accelerator models
+can be supplied as separate ``any_of`` entries; supported widths are discovered
+independently for each model.
 Non-spot entries and cluster-backed clouds such as Kubernetes remain at their
 explicitly configured count. SkyPilot does not inspect those live cluster APIs
 to discover additional shapes.

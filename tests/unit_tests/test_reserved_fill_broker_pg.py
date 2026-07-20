@@ -38,6 +38,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 import test_reserved_fill_broker as sqlite_suite
 
 from sky.serve import lb_ha
+from sky.serve import placement_history
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
@@ -312,6 +313,7 @@ class TestMigrationChainPG:
                     'demand_capacity_observations',
                     'serve_replica_status_history',
                     'serve_request_activity_history',
+                    'serve_placement_events',
                 }.issubset(tables), tables
                 service_columns = {
                     column['name']
@@ -505,9 +507,64 @@ def history_engine(pg_server, monkeypatch):
     engine = create_engine(url)
     serve_state.Base.metadata.create_all(engine)
     serve_history.metadata.create_all(engine)
+    placement_history.metadata.create_all(engine)
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    placement_history.reset_request_buffer()
     yield engine
+    placement_history.reset_request_buffer()
     engine.dispose()
+
+
+class TestServePlacementHistoryPG:
+
+    def test_flush_pages_and_scopes_exact_incarnation(self, history_engine):
+        del history_engine  # Fixture initializes the PostgreSQL metadata.
+        now = time.time()
+        for timestamp, service_hash, outcome in [
+            (now, 'hash-a', 'capacity_failed'),
+            (now + 1, 'hash-a', 'succeeded'),
+            (now + 2, 'hash-b', 'quota_failed'),
+        ]:
+            assert placement_history.record_event(
+                service_name='svc',
+                service_hash=service_hash,
+                request_id='request-a',
+                cluster_name='svc-1',
+                outcome=outcome,
+                provider='AWS',
+                region='us-east-1',
+                zone='us-east-1a',
+                instance_type='g6.4xlarge',
+                num_nodes=1,
+                hourly_price=0.25,
+                error_summary='\x1b[31m capacity\n unavailable \x1b[0m',
+                timestamp=timestamp)
+
+        assert placement_history.flush_request_buffer() == 3
+        first = placement_history.get_history('svc',
+                                              'hash-a',
+                                              limit=1,
+                                              timestamp=now + 3)
+        assert [event['outcome'] for event in first['events']] == ['succeeded']
+        assert first['next_cursor'] is not None
+        second = placement_history.get_history('svc',
+                                               'hash-a',
+                                               limit=1,
+                                               cursor=first['next_cursor'],
+                                               timestamp=now + 3)
+        assert [event['outcome'] for event in second['events']
+               ] == ['capacity_failed']
+        assert second['events'][0]['error_summary'] == 'capacity unavailable'
+        assert first['outcome_counts'] == {
+            'capacity_failed': 1,
+            'succeeded': 1,
+        }
+
+        recreated = placement_history.get_history('svc',
+                                                  'hash-b',
+                                                  timestamp=now + 3)
+        assert [event['outcome'] for event in recreated['events']
+               ] == ['quota_failed']
 
 
 class TestServeStatusHistoryPG:

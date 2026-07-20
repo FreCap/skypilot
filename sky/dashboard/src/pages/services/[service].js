@@ -37,6 +37,7 @@ import {
 import { EndpointCell, formatUptime } from '@/components/services';
 import { ServeHistorySection } from '@/components/serve-history';
 import { ServiceVersionHistory } from '@/components/service-version-history';
+import { ServicePlacement } from '@/components/service-placement';
 import { useMobile } from '@/hooks/useMobile';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
@@ -261,7 +262,9 @@ export function useServiceDetails({ serviceName }) {
 function ServiceDetails() {
   const router = useRouter();
   const { service: serviceName } = router.query;
-  const activeTab = router.query.tab === 'versions' ? 'versions' : 'overview';
+  const activeTab = ['versions', 'placement'].includes(router.query.tab)
+    ? router.query.tab
+    : 'overview';
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
@@ -322,7 +325,7 @@ function ServiceDetails() {
                 <span className="ml-2 text-gray-500">Loading...</span>
               </div>
             )}
-            {serviceData && (
+            {serviceData && activeTab !== 'placement' && (
               <Tooltip
                 content="Refresh"
                 className="text-sm text-muted-foreground"
@@ -345,6 +348,11 @@ function ServiceDetails() {
             {[
               { id: 'overview', label: 'Overview', suffix: '' },
               { id: 'versions', label: 'Versions', suffix: '?tab=versions' },
+              {
+                id: 'placement',
+                label: 'Placement',
+                suffix: '?tab=placement',
+              },
             ].map((tab) => (
               <Link
                 key={tab.id}
@@ -375,6 +383,8 @@ function ServiceDetails() {
               serviceName={serviceName}
               onElectionComplete={refreshData}
             />
+          ) : activeTab === 'placement' ? (
+            <ServicePlacement serviceName={serviceName} />
           ) : (
             <>
               <ServiceDetailCard

@@ -3,6 +3,7 @@
 import collections
 import dataclasses
 import enum
+import math
 import os
 import re
 import time
@@ -47,6 +48,7 @@ _LIVE_ACCELERATOR_CATALOG_CLOUDS = frozenset({'kubernetes', 'slurm', 'ssh'})
 # location with one probe launch per TTL window.
 _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
+_PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 
 
 def _normalize_image_id(
@@ -122,6 +124,11 @@ class Location:
         if self.ephemeral_storage is not None:
             parts.append(f'ephemeral_storage={self.ephemeral_storage}')
         return '|'.join(parts)
+
+    def sort_key(self) -> tuple[str, str, str, str, bool]:
+        """Return a deterministic key for displaying placement state."""
+        return (str(self.cloud), self.region, self.zone or
+                '', self._accel_key(), self.use_spot)
 
     def __eq__(self, other) -> bool:
         if isinstance(other, Location):
@@ -683,6 +690,55 @@ class SpotPlacer:
 
     def active_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
+
+    def placement_snapshot(
+            self,
+            limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS) -> dict[str, Any]:
+        """Serialize already-resident retry state without provider calls."""
+        if (not isinstance(limit, int) or isinstance(limit, bool) or
+                limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
+            raise ValueError(f'limit must be an integer from 1 to '
+                             f'{_PLACEMENT_SNAPSHOT_MAX_LOCATIONS}.')
+        now = time.time()
+        retry_seconds = _preemption_retry_seconds()
+        locations = sorted(self.location2status,
+                           key=lambda location: location.sort_key())
+        entries = []
+        for location in locations[:limit]:
+            stored_status = self.location2status[location]
+            benched_at = self.location2preempted_at.get(location)
+            next_probe_at = None
+            effective_status = stored_status
+            if (stored_status == LocationStatus.PREEMPTED and
+                    benched_at is not None):
+                next_probe_at = benched_at + retry_seconds
+                if now >= next_probe_at:
+                    effective_status = LocationStatus.ACTIVE
+            cached_cost = self.location2cost.get(location)
+            if cached_cost is not None and not math.isfinite(cached_cost):
+                cached_cost = None
+            entries.append({
+                'cloud': str(location.cloud),
+                'region': location.region,
+                'zone': location.zone,
+                'accelerators': location.accelerators,
+                'use_spot': location.use_spot,
+                'stored_status': stored_status.value,
+                'effective_status': effective_status.value,
+                'probe_eligible': (stored_status == LocationStatus.PREEMPTED and
+                                   effective_status == LocationStatus.ACTIVE),
+                'benched_at': benched_at,
+                'next_probe_at': next_probe_at,
+                'cached_hourly_cost': cached_cost,
+            })
+        return {
+            'available': True,
+            'enabled': True,
+            'retry_seconds': retry_seconds,
+            'observed_at': now,
+            'locations': entries,
+            'truncated': len(locations) > limit,
+        }
 
     def is_active_location(self, location: Location) -> bool:
         """Whether a known location is currently selectable."""

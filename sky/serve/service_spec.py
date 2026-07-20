@@ -284,13 +284,13 @@ class SkyServiceSpec:
             spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER)
         if uses_logical_replicas:
             if (not isinstance(target_concurrency_per_replica, int) or
-                    isinstance(target_concurrency_per_replica, bool) or
-                    target_concurrency_per_replica != 1):
+                    isinstance(target_concurrency_per_replica, bool)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
-                        'dynamic_fallback_per_gpu currently requires '
-                        'target_concurrency_per_replica: 1 so one logical '
-                        'replica is exactly one concurrent job slot.')
+                        'dynamic_fallback_per_gpu requires '
+                        'target_concurrency_per_replica to be a positive '
+                        'integer so logical GPU targets remain whole slots. '
+                        f'Got: {target_concurrency_per_replica!r}')
             if graceful_drain_async_occupancy is not True:
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(

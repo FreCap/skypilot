@@ -2734,6 +2734,22 @@ class SkyServeController:
                                           status_code=200)
 
         @self._app.get(
+            serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_placement_state() -> fastapi.Response:
+            placer = self._replica_manager.spot_placer
+            if placer is None:
+                content = {
+                    'available': True,
+                    'enabled': False,
+                    'locations': [],
+                    'truncated': False,
+                }
+            else:
+                content = placer.placement_snapshot()
+            return responses.JSONResponse(content=content, status_code=200)
+
+        @self._app.get(
             '/autoscaler/info',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def get_autoscaler_info() -> fastapi.Response:

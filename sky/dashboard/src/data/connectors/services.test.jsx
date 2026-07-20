@@ -12,10 +12,12 @@ jest.mock('@/data/connectors/client', () => ({
 import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServicePlacement,
   getServiceVersions,
   getServices,
   normalizeReplicaHistory,
   normalizeService,
+  normalizeServicePlacement,
   normalizeReplica,
 } from '@/data/connectors/services';
 
@@ -653,5 +655,110 @@ describe('normalizeService / normalizeReplica', () => {
     expect(replica.launched_at).toBeNull();
     expect(replica.ready_at).toBeNull();
     expect(replica.timeToReadySeconds).toBeNull();
+  });
+});
+
+describe('service placement', () => {
+  const rawPlacement = {
+    service_name: 'svc',
+    placer_state: {
+      available: true,
+      enabled: true,
+      retry_seconds: 600,
+      locations: [
+        {
+          cloud: 'AWS',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          accelerators: { L4: 1 },
+          use_spot: true,
+          stored_status: 'PREEMPTED',
+          effective_status: 'ACTIVE',
+          probe_eligible: true,
+          benched_at: 1000,
+          next_probe_at: 1600,
+        },
+      ],
+    },
+    capacity_hints: {
+      available: true,
+      hints: [
+        {
+          kind: 'capacity',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          instance_type: 'g6.4xlarge',
+          num_nodes: 2,
+          expires_at: 1120,
+        },
+      ],
+    },
+    history: {
+      available: true,
+      retention_hours: 24,
+      outcome_counts: { capacity_failed: 1 },
+      next_cursor: 'cursor-a',
+      events: [
+        {
+          event_id: 'event-a',
+          request_id: 'request-a',
+          cluster_name: 'svc-1',
+          attempt_ordinal: 0,
+          observed_at: 1000,
+          outcome: 'capacity_failed',
+          provider: 'AWS',
+          region: 'us-east-1',
+          zone: 'us-east-1a',
+          instance_type: 'g6.4xlarge',
+          hourly_price: 0.25,
+        },
+      ],
+    },
+  };
+
+  it('normalizes retry, cache, and history fields', () => {
+    const placement = normalizeServicePlacement(rawPlacement);
+
+    expect(placement.serviceName).toBe('svc');
+    expect(placement.placerState.locations[0]).toMatchObject({
+      cloud: 'AWS',
+      probeEligible: true,
+      storedStatus: 'PREEMPTED',
+      effectiveStatus: 'ACTIVE',
+      nextProbeAt: 1600,
+    });
+    expect(placement.capacityHints.hints[0]).toMatchObject({
+      kind: 'capacity',
+      instanceType: 'g6.4xlarge',
+      numNodes: 2,
+    });
+    expect(placement.history.events[0]).toMatchObject({
+      eventId: 'event-a',
+      attemptOrdinal: 0,
+      hourlyPrice: 0.25,
+    });
+  });
+
+  it('dispatches one bounded service placement request', async () => {
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse(rawPlacement));
+
+    const placement = await getServicePlacement({
+      serviceName: 'svc',
+      hours: 12,
+      limit: 10,
+      cursor: 'cursor-a',
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/placement', {
+      service_name: 'svc',
+      hours: 12,
+      limit: 10,
+      cursor: 'cursor-a',
+    });
+    expect(apiClient.get).toHaveBeenCalledWith(
+      `/api/get?request_id=${REQUEST_ID}`
+    );
+    expect(placement.history.events).toHaveLength(1);
   });
 });

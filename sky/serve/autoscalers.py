@@ -10,6 +10,7 @@ import time
 import typing
 from typing import Any
 
+from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
@@ -1544,6 +1545,11 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             logger.info(f'Remaining dynamic states: {dynamic_states}')
 
 
+# Distinguishes "caller did not resolve a handle" from a resolved None
+# (cluster row or handle genuinely absent) in the mixin helpers below.
+_UNRESOLVED_HANDLE = object()
+
+
 class _GpuShapeResolverMixin:
     """Shared GPU-shape resolution with a post-launch-only memo.
 
@@ -1576,8 +1582,41 @@ class _GpuShapeResolverMixin:
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
 
+    def _resolve_replica_handles(
+            self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> dict[int, Any]:
+        """Batch-resolve cluster handles for replicas missing a cached memo.
+
+        `ReplicaInfo.handle()` with no record hits the cluster table once per
+        call, and while a replica is provisioning neither the shape nor the
+        cost memo may cache (the record is rewritten per failover attempt), so
+        a selection pass that scores each replica twice would pay 2 reads per
+        provisioning replica. One batched read replaces all of them, and also
+        scores shape and cost from the same record snapshot instead of two
+        reads at different times mid-sort.
+        """
+        uncached = [
+            info for info in replica_infos
+            if info.replica_id not in self._gpu_shape_cache or
+            info.replica_id not in self._replica_cost_cache
+        ]
+        if not uncached:
+            return {}
+        records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in uncached])
+        handles: dict[int, Any] = {}
+        for info in uncached:
+            record = records.get(info.cluster_name)
+            # A missing record means the cluster row is gone; a bare
+            # info.handle() would resolve to None too, just via another read.
+            handles[info.replica_id] = (info.handle(record)
+                                        if record is not None else None)
+        return handles
+
     def _get_hourly_cost_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+            self,
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> float:
         """Hourly cost of a replica's launched resources (0.0 = reserved).
 
         Used to prefer scaling down PAID replicas before zero-cost ones
@@ -1592,7 +1631,8 @@ class _GpuShapeResolverMixin:
         cost = 0.0
         resolved = False
         try:
-            handle = replica_info.handle()
+            if handle is _UNRESOLVED_HANDLE:
+                handle = replica_info.handle()
             if handle is not None:
                 # Coerce: anything non-numeric degrades to 0.0 (shed last).
                 cost = float(handle.launched_resources.get_cost(seconds=3600))
@@ -1608,14 +1648,16 @@ class _GpuShapeResolverMixin:
 
     def _get_gpu_shape_from_replica_info(
             self,
-            replica_info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+            replica_info: 'replica_managers.ReplicaInfo',
+            handle: Any = _UNRESOLVED_HANDLE) -> tuple[str, int]:
         """Extract (GPU type, GPU count) from ReplicaInfo object."""
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
         gpu_type = 'unknown'
         gpu_count = 1
-        handle = replica_info.handle()
+        if handle is _UNRESOLVED_HANDLE:
+            handle = replica_info.handle()
         if handle is not None:
             accelerators = handle.launched_resources.accelerators
             if accelerators and len(accelerators) > 0:
@@ -2428,6 +2470,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # Create a list of (replica_info, target_qps) tuples
         replica_qps_pairs: list[tuple[replica_managers.ReplicaInfo, float]] = []
 
+        # One batched cluster-table read for every replica the memos cannot
+        # serve; the sort below scores each replica twice (shape + cost).
+        handles = self._resolve_replica_handles(replica_infos)
+
         for info in replica_infos:
             # Include old-version replicas as well so they also get a target_qps
             # assigned. Skip terminal replicas only.
@@ -2435,7 +2481,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
 
             # Get GPU shape directly from replica info
-            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(info)
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
+                info, handles.get(info.replica_id, _UNRESOLVED_HANDLE))
 
             # Use flexible matching logic, weighted by GPU count so
             # smaller-capacity replicas are preferred for scale-down.
@@ -2493,7 +2540,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             key=lambda info: (
                 _status_rank(info),
                 round(replica_qps_map.get(info.replica_id, float('inf')), 9),
-                -self._get_hourly_cost_from_replica_info(info),
+                -self._get_hourly_cost_from_replica_info(
+                    info, handles.get(info.replica_id, _UNRESOLVED_HANDLE)),
                 info.version,
                 -info.replica_id,
             ))
@@ -2559,8 +2607,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     GAUGES over the sync channel (no clear-on-ack batches to lose or
     double-count on controller hiccups).
 
-    The knob `target_concurrency_per_replica` is PER GPU: a replica's
-    capacity is knob x gpu_count, so heterogeneous fleets pack correctly.
+    The knob `target_concurrency_per_replica` is PER GPU. Physical-backend
+    services pack outstanding work onto knob x gpu_count capacities. Logical
+    services publish GPU-slot targets and divide outstanding work by the knob;
+    backend packing happens later from those whole-slot targets.
 
     SIGNAL-GAP RULE: the demand gauges only exist in LB reports. A report
     is fresh iff it carried a non-None in-flight map and is younger than
@@ -2852,12 +2902,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return float(knob)
 
     def _replica_capacity(self, info: 'replica_managers.ReplicaInfo') -> float:
-        """A replica's capacity in concurrency units (knob x gpu_count).
+        """A replica's capacity in the autoscaler's target units.
 
-        The knob is resolved for the replica's OWN version: after a
-        knob-changing update, old-version replicas keep the capacity
-        they were launched with, so the rolling drain neither over- nor
-        under-states the coverage the kept old set provides.
+        Logical targets are GPU slots, so a physical backend contributes its
+        immutable planned slot width. Physical-backend targets are replica
+        counts, so each replica contributes knob x gpu_count concurrency.
+        The knob is resolved for the replica's OWN version after updates.
         """
         if self.replica_unit == 'logical':
             return float(getattr(info, 'planned_capacity', 1))
@@ -2923,6 +2973,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def _cost_rebalance_location_capacity(
             self, location: spot_placer.Location) -> float:
         _, gpu_count = self._location_gpu_shape(location)
+        if self.replica_unit == 'logical':
+            return float(gpu_count)
         return self.target_concurrency_per_replica * gpu_count
 
     def _latest_capacities(
@@ -2999,10 +3051,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         latest_capacities = self._latest_capacities(replica_infos)
         if self.replica_unit == 'logical':
-            # One public replica is already one concurrent job slot. Physical
-            # backend packing happens later, after the manager selects exact
-            # 1/4/8-GPU placements.
-            best_capacity = 1.0
+            # Public targets count GPU slots. Each slot absorbs the configured
+            # amount of outstanding work; physical backend packing happens
+            # later, after the manager selects exact 1/4/8-GPU placements.
+            best_capacity = self.target_concurrency_per_replica
         else:
             best_capacity = (latest_capacities[0] if latest_capacities else
                              self.target_concurrency_per_replica)
@@ -3040,7 +3092,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
-            raw_target_num = math.ceil(outstanding)
+            raw_target_num = math.ceil(outstanding / best_capacity)
         else:
             raw_target_num = 0
             covered = 0.0

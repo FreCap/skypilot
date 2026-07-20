@@ -5394,37 +5394,74 @@ class SkyPilotReplicaManager(ReplicaManager):
         The lock is re-acquired only on the failure-handling paths (preemption
         and user-code failure); those paths may still run a cloud status
         refresh or a log sync while holding it.
+
+        The SSH fetches run in a thread pool (like ``_probe_all_replicas``):
+        a serial walk lets one hung replica delay failure detection for every
+        replica after it, scaling the round as O(N * per-replica SSH). The
+        failure-handling branches still run serially, consuming results in
+        latest-version-first order, and each re-reads fresh state under
+        ``self.lock`` before acting.
         """
         infos = serve_state.get_replica_infos(self._service_name)
-        # A setup error in a new version is commonly version-wide. Sample one
-        # trackable latest-version replica before the serial full-fleet walk so
-        # a bad rollout is stopped without waiting behind every old replica.
+        # Snapshot every replica's cluster record in one batched read; the
+        # per-replica ``info.handle()`` fallback would issue one cluster-table
+        # read per replica per fetch round.
+        cluster_records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in infos])
+        # A setup error in a new version is commonly version-wide. Consume one
+        # trackable latest-version replica's result before the rest of the
+        # fleet so a bad rollout is stopped without waiting behind every old
+        # replica.
         for index, info in enumerate(infos):
             if (info.version == self.latest_version and
                     info.status_property.should_track_service_status()):
                 infos.insert(0, infos.pop(index))
                 break
+        # We use backend API to avoid usage collection in the
+        # sdk.job_status. The backend object is stateless; construct it
+        # once for the whole walk.
+        backend = backends.CloudVmRayBackend()
+        to_fetch: list[tuple[ReplicaInfo, Any]] = []
         for info in infos:
             if not info.status_property.should_track_service_status():
                 continue
-            # We use backend API to avoid usage collection in the
-            # sdk.job_status.
-            backend = backends.CloudVmRayBackend()
-            handle = info.handle()
+            cluster_record = cluster_records.get(info.cluster_name)
+            handle = None if cluster_record is None else info.handle(
+                cluster_record)
             if handle is None:
                 # The walk runs lock-free, so the replica's cluster record can
                 # vanish mid-walk (a scale-down or preemption cleanup
                 # completing after the snapshot was taken). Skip it; the next
                 # round re-snapshots.
                 continue
-            # Use None to fetch latest job, which stands for user task job
-            job_ids = [1] if self._is_pool else None
+            to_fetch.append((info, handle))
+        if not to_fetch:
+            return
+        # Use None to fetch latest job, which stands for user task job
+        job_ids = [1] if self._is_pool else None
+
+        def _get_job_status(handle):
+            # SSH into the replica's head node -- intentionally OUTSIDE
+            # self.lock so an unreachable replica cannot wedge the round.
+            return backend.get_job_status(handle, job_ids, stream_logs=False)
+
+        # The fetches are pure I/O; run them in parallel so one hung SSH
+        # (preempted spot) delays only its own replica's result, not the
+        # whole fleet's failure detection.
+        num_fetch_threads = min(len(to_fetch),
+                                self._PROBE_ROUND_MAX_PARALLELISM)
+        with mp_pool.ThreadPool(num_fetch_threads) as pool:
+            fetch_results = [(info, pool.apply_async(_get_job_status,
+                                                     (handle,)))
+                             for info, handle in to_fetch]
+            self._handle_job_status_results(fetch_results)
+
+    def _handle_job_status_results(
+            self, fetch_results: list[tuple[ReplicaInfo, Any]]) -> None:
+        """Consume the parallel job-status fetches, in submission order."""
+        for info, result in fetch_results:
             try:
-                # SSH into the replica's head node -- intentionally OUTSIDE
-                # self.lock so an unreachable replica cannot wedge the loop.
-                job_statuses = backend.get_job_status(handle,
-                                                      job_ids,
-                                                      stream_logs=False)
+                job_statuses = result.get()
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
                 # cluster is preempted.
@@ -5440,12 +5477,27 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if not fresh.status_property.should_track_service_status():
                         continue
                     is_preempted = self._handle_preemption(fresh)
-                if is_preempted:
-                    continue
-                # Re-raise the exception if it is not preempted.
-                raise
-            job_status = job_statuses[1] if self._is_pool else list(
-                job_statuses.values())[0]
+                # Whether preempted or not, move on to the next replica: a
+                # replica whose job status cannot be fetched (e.g. a
+                # persistently broken but reachable node) must not abort the
+                # walk and starve failure detection for every replica after
+                # it. The outer fetcher used to swallow the re-raise anyway,
+                # so skipping here loses nothing.
+                if not is_preempted:
+                    logger.error(
+                        'Failed to fetch job status for replica '
+                        f'{info.replica_id} (cluster {info.cluster_name}); '
+                        'skipping it this round.')
+                continue
+            if self._is_pool:
+                job_status = job_statuses.get(1)
+            else:
+                job_status = next(iter(job_statuses.values()), None)
+            if job_status is None:
+                # No job record on the replica (e.g. the job table was
+                # wiped by a recovery, or the job has not been submitted
+                # yet). Nothing to conclude; re-check next round.
+                continue
             if job_status in job_lib.JobStatus.user_code_failure_states():
                 with self.lock:
                     # Re-read under the lock: another thread (e.g. scale_down)

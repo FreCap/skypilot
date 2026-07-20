@@ -10,6 +10,15 @@ from sky.client.common import _compute_zip_blob_id
 from sky.data import storage_utils
 
 
+def test_file_upload_timeout_bounds_every_network_phase():
+    timeout = client_common._file_upload_http_timeout()  # pylint: disable=protected-access
+
+    assert timeout.connect == client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS
+    assert timeout.read == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+    assert timeout.write == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+    assert timeout.pool == client_common.FILE_UPLOAD_HTTP_TIMEOUT_SECONDS
+
+
 def test_setup_upload_logger_preserves_file_handler_error(monkeypatch):
 
     def raise_file_handler_error(*args, **kwargs):

@@ -5239,3 +5239,95 @@ class TestRecoverySingleSnapshot:
         assert seen_snapshots == [infos]
         assert seen_snapshots[0] is infos
         assert seen_recovery_modes == [True]
+
+
+class TestRefreshThreadPoolUnfencedLaunch:
+    """`_refresh_thread_pool` must convert an unfenced external-LB launch
+    failure into one unrecoverable replica and keep that control-plane
+    failure out of spot-placement evidence.
+
+    This guards the manager-side half of the fix in PR #524: the client-side
+    pre-check raises `_UnfencedExternalLbLaunchError`, but only this pass turns
+    it into `user_app_failed` (so the autoscaler stops appending rows) and
+    excludes it from `failed_spot_locations` / `failed_spot_availability` (so a
+    missing owner fence does not bench an otherwise-usable location). A generic
+    launch failure must still behave the old way.
+    """
+
+    def _run(self, thread_exception):
+        replica_id = 7
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._is_pool = False
+        manager.lock = threading.Lock()
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = False
+        launch_thread.format_exc = 'boom traceback'
+        launch_thread.exception = thread_exception
+        manager._launch_thread_pool[replica_id] = launch_thread
+        manager._replica_to_request_id[replica_id] = 'req'
+
+        location = mock.Mock(name='location')
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        manager._spot_placer = placer
+
+        info = mock.Mock()
+        info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        info.status_property = replica_managers.ReplicaStatusProperty()
+        info.get_spot_location.return_value = location
+        info.created_at = 100.0
+
+        persisted = []
+        terminated = []
+        with mock.patch.object(
+                manager, '_reconcile_legacy_uncertain_logical_retirements'), \
+             mock.patch.object(
+                 manager, '_reconcile_recovering_logical_retirements'), \
+             mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 manager, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(
+                 manager, '_persist_replica',
+                 side_effect=lambda rid, i: persisted.append((rid, i))), \
+             mock.patch.object(
+                 manager, '_terminate_replica',
+                 side_effect=lambda rid, **_k: terminated.append(rid)), \
+             mock.patch.object(manager, '_reconcile_failed_cleanup'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos',
+                 return_value=[]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state'
+                 '.get_replica_infos_from_ids',
+                 return_value={replica_id: info}):
+            manager._refresh_thread_pool()
+
+        return info, placer, terminated
+
+    def test_unfenced_failure_is_unrecoverable_and_not_benched(self):
+        info, placer, terminated = self._run(
+            replica_managers._UnfencedExternalLbLaunchError('no fence'))
+        # Unrecoverable so the autoscaler stops recreating replica rows.
+        assert info.status_property.user_app_failed is True
+        assert info.status_property.unrecoverable_failure() is True
+        # A missing owner fence is a control-plane failure, not a location
+        # problem: the location must not be benched.
+        placer.set_preemptive.assert_not_called()
+        assert info.status_property.failed_spot_availability is False
+        assert terminated == [7]
+
+    def test_generic_failure_still_benches_location_and_stays_recoverable(self):
+        info, placer, terminated = self._run(RuntimeError('transient'))
+        # An ordinary launch failure keeps the historical behavior: the
+        # location is benched and the replica remains recoverable.
+        assert info.status_property.user_app_failed is False
+        placer.set_preemptive.assert_called_once_with(mock.ANY)
+        assert info.status_property.failed_spot_availability is True
+        assert terminated == [7]

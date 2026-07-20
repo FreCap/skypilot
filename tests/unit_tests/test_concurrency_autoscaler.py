@@ -2,8 +2,9 @@
 
 The concurrency autoscaler sizes the fleet by OUTSTANDING WORK (in-flight
 + queued + recently-rejected jobs, reported by the LB as gauges) instead
-of request rate, packs demand onto per-GPU capacities (knob x gpu_count),
-and never shrinks the fleet while its demand signal is stale (a rebuilt
+of request rate. Physical targets pack demand onto per-GPU capacities;
+logical targets divide demand by the per-GPU saturation knob and publish GPU
+slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
 # pylint: disable=protected-access
@@ -199,6 +200,28 @@ class TestTargetMath(unittest.TestCase):
         self._recompute(autoscaler, [])
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_logical_saturation_divides_all_outstanding_work(self):
+        autoscaler = _make_autoscaler(knob=2,
+                                      replica_unit='logical',
+                                      min_replicas=0)
+        replicas = [
+            _replica(1, planned_capacity=1),
+            _replica(2, planned_capacity=1),
+        ]
+        _report(autoscaler,
+                in_flight={
+                    1: 1,
+                    2: 0
+                },
+                queue_depth=2,
+                rejected=4,
+                unknown=(2,))
+
+        self._recompute(autoscaler, replicas)
+
+        # (1 in flight + 2 queued + 4 rejected + 1 unknown) / 2 per GPU.
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+
     def test_unknown_async_occupancy_adds_full_capacity_floor(self):
         # Two declared async replicas missed their occupancy probes. Their
         # envelope zeros cannot erase potentially-full work; two additional
@@ -371,6 +394,20 @@ class TestSignalGap(unittest.TestCase):
         self.assertEqual(len(_scale_ups(decisions)), 4)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_logical_arrival_floor_uses_saturation_target(self):
+        autoscaler = _make_autoscaler(knob=2,
+                                      min_replicas=1,
+                                      replica_unit='logical')
+        replicas = [_replica(1)]
+        now = time.time()
+        autoscaler.collect_request_information({'timestamps': [now - 1] * 5})
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        self.assertEqual(_scale_ups(decisions)[0].target.target_capacity, 3)
+
     def test_arrival_floor_never_lowers_target(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
         autoscaler.target_num_replicas = 7
@@ -395,7 +432,16 @@ class TestSignalGap(unittest.TestCase):
 
 
 class TestLogicalReplicaSemantics(unittest.TestCase):
-    """Logical targets are job slots; physical shapes remain indivisible."""
+    """Logical targets are GPU slots; physical shapes remain indivisible."""
+
+    def test_cost_rebalance_location_capacity_stays_in_gpu_slots(self):
+        autoscaler = _make_autoscaler(knob=2, replica_unit='logical')
+        location = mock.Mock()
+        with mock.patch.object(autoscaler,
+                               '_location_gpu_shape',
+                               return_value=('L4', 8)):
+            self.assertEqual(
+                autoscaler._cost_rebalance_location_capacity(location), 8)
 
     def test_scale_from_zero_emits_one_capacity_target(self):
         autoscaler = _make_autoscaler(knob=1,

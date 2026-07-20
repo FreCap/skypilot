@@ -13,10 +13,12 @@ from sky.serve import serve_utils
 def _mock_pool_replica(replica_id: int,
                        cluster_name: str,
                        *,
-                       launched_resources=None):
+                       launched_resources=None,
+                       status=serve_state.ReplicaStatus.READY):
     replica = mock.Mock()
     replica.replica_id = replica_id
     replica.cluster_name = cluster_name
+    replica.status = status
     handle = None
     if launched_resources is not None:
         handle = mock.Mock()
@@ -36,6 +38,16 @@ def test_get_free_worker_resources_uses_grouped_pool_resource_lookup():
                            'get_replica_infos',
                            return_value=[replica_a, replica_b]), \
          mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             side_effect=lambda names:
+             {name: {'handle': object()} for name in names}) as get_clusters, \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_handle_from_cluster_name',
+             side_effect=AssertionError(
+                 'per-worker cluster-record read used')), \
+         mock.patch.object(
              serve_utils.managed_job_state,
              'get_pool_worker_used_resources_by_cluster',
              return_value={
@@ -53,6 +65,7 @@ def test_get_free_worker_resources_uses_grouped_pool_resource_lookup():
         free_resources = serve_utils.get_free_worker_resources('pool-a')
 
     grouped_usage.assert_called_once_with('pool-a')
+    get_clusters.assert_called_once_with(['replica-a', 'replica-b'])
     assert free_resources is not None
     assert float(free_resources['replica-a'].cpus) == pytest.approx(6.0)
     assert free_resources['replica-b'].is_empty()
@@ -79,8 +92,8 @@ def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
                                'replica-busy': None,
                                'replica-idle': None,
                            }), \
-         mock.patch.object(serve_utils,
-                           'get_ready_replicas',
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
                            return_value=[busy, idle]), \
          mock.patch.object(
              serve_utils.managed_job_state,
@@ -128,8 +141,8 @@ def test_get_next_cluster_name_skips_resource_scan_without_constraints(
                            'FileLock',
                            side_effect=lambda _path: contextlib.
                            nullcontext()), \
-         mock.patch.object(serve_utils,
-                           'get_ready_replicas',
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
                            return_value=[busy, idle]), \
          mock.patch.object(
              serve_utils,
@@ -170,8 +183,8 @@ def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
                            'FileLock',
                            side_effect=lambda _path: contextlib.
                            nullcontext()), \
-         mock.patch.object(serve_utils,
-                           'get_ready_replicas',
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
                            return_value=[constrained, roomy]), \
          mock.patch.object(
              serve_utils,
@@ -192,7 +205,131 @@ def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
         selected = serve_utils.get_next_cluster_name(
             'pool-a', job_id=23, task_resources=Resources(cpus='2'))
 
-    free_resources.assert_called_once_with('pool-a')
+    free_resources.assert_called_once_with('pool-a',
+                                           replicas=[constrained, roomy])
     assert selected == 'replica-roomy'
     set_cluster.assert_called_once_with(23, 'replica-roomy')
     set_infra.assert_not_called()
+
+
+def test_get_next_cluster_name_reads_replica_snapshot_once():
+    """The scheduling decision must use one consistent replica snapshot."""
+    worker = _mock_pool_replica(1,
+                                'replica-a',
+                                launched_resources=Resources(cpus='8'))
+    not_ready = _mock_pool_replica(
+        2,
+        'replica-b',
+        launched_resources=Resources(cpus='8'),
+        status=serve_state.ReplicaStatus.PROVISIONING)
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[worker, not_ready]) as replica_reads, \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={}), \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra'):
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=31, task_resources=Resources(cpus='2'))
+
+    # Readiness filtering and free-resource accounting share one DB read.
+    replica_reads.assert_called_once_with('pool-a')
+    assert selected == 'replica-a'
+    set_cluster.assert_called_once_with(31, 'replica-a')
+
+
+def test_get_next_cluster_name_persists_chosen_heterogeneous_resource():
+    """The persisted full_resources must be the option that fit."""
+    worker = _mock_pool_replica(1, 'replica-a')
+    big = Resources(cpus='8')
+    small = Resources(cpus='2')
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[worker]), \
+         mock.patch.object(serve_utils,
+                           'get_free_worker_resources',
+                           return_value={
+                               'replica-a': Resources(cpus='4'),
+                           }), \
+         mock.patch.object(serve_utils,
+                           '_task_fits',
+                           wraps=serve_utils._task_fits  # pylint: disable=protected-access
+                          ) as task_fits, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'update_job_full_resources') as update_full, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra'):
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=41, task_resources=[big, small])
+
+    assert selected == 'replica-a'
+    set_cluster.assert_called_once_with(41, 'replica-a')
+    update_full.assert_called_once_with(41, small.to_yaml_config())
+    # The fit decision is computed once per option during candidate
+    # enumeration and not recomputed for the selected worker.
+    assert task_fits.call_count == 2
+
+
+def test_get_free_worker_resources_skips_worker_missing_cluster_record():
+    """A worker whose cluster record is absent from the batched snapshot
+    (terminated between snapshot and walk) maps to None without a fallback
+    per-name cluster read."""
+    replica_a = _mock_pool_replica(1,
+                                   'replica-a',
+                                   launched_resources=Resources(cpus='8'))
+    replica_gone = _mock_pool_replica(2, 'replica-gone')
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[replica_a, replica_gone]), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             return_value={
+                 'replica-a': {'handle': object()},
+                 'replica-gone': None,
+             }), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_handle_from_cluster_name',
+             side_effect=AssertionError(
+                 'missing record must not trigger a per-name read')), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={'replica-a': Resources(cpus='2')}):
+        free_resources = serve_utils.get_free_worker_resources('pool-a')
+
+    assert free_resources is not None
+    assert float(free_resources['replica-a'].cpus) == pytest.approx(6.0)
+    assert free_resources['replica-gone'] is None
+    replica_gone.handle.assert_not_called()
