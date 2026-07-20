@@ -479,11 +479,11 @@ def _optimize_file_mounts(tmp_yaml_path: str) -> None:
         # cp <local_src> <local_runtime_files_dir>/<unique name of local_src>.
         full_local_src = str(pathlib.Path(local_src).expanduser())
         unique_name = local_source_to_unique_name[local_src]
-        # !r to add quotes for paths containing spaces.
-        subprocess.run(
-            f'cp -r {full_local_src!r} {local_runtime_files_dir}/{unique_name}',
-            shell=True,
-            check=True)
+        subprocess.run([
+            'cp', '-r', full_local_src,
+            f'{local_runtime_files_dir}/{unique_name}'
+        ],
+                       check=True)
 
     yaml_utils.dump_yaml(tmp_yaml_path, yaml_config)
 
@@ -511,7 +511,7 @@ def path_size_megabytes(path: str) -> int:
                 shlex.quote(str(resolved_path / command_runner.GIT_EXCLUDE)))
     rsync_command = (f'rsync {command_runner.RSYNC_DISPLAY_OPTION} '
                      f'{rsync_filter} '
-                     f'{git_exclude_filter} --dry-run {path!r}')
+                     f'{git_exclude_filter} --dry-run {shlex.quote(path)}')
     rsync_output = ''
     try:
         # rsync sometimes fails `--dry-run` for MacOS' rsync build, however this function is only used to display
