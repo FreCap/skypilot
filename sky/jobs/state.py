@@ -411,19 +411,18 @@ def set_failed(
     fields_to_set: dict[str, Any] = {
         spot_table.c.status: failure_type.value,
         spot_table.c.failure_reason: failure_reason,
+        # For tasks that are RECOVERING, set last_recovered_at to the
+        # end_time, so that end_at - last_recovered_at does not inflate the
+        # job duration with time spent in the failed recovery attempt. The
+        # CASE keeps this per-row: other tasks of a multi-task job keep
+        # their own last_recovered_at.
+        spot_table.c.last_recovered_at: sqlalchemy.case(
+            (spot_table.c.status
+             == ManagedJobStatus.RECOVERING.value, end_time),
+            else_=spot_table.c.last_recovered_at),
     }
     updated = False
     with orm.Session(engine) as session:
-        # Get previous status
-        previous_status = session.execute(
-            sqlalchemy.select(spot_table.c.status).where(
-                spot_table.c.spot_job_id == job_id)).fetchone()[0]
-        previous_status = ManagedJobStatus(previous_status)
-        if previous_status == ManagedJobStatus.RECOVERING:
-            # If the job is recovering, we should set the last_recovered_at to
-            # the end_time, so that the end_at - last_recovered_at will not be
-            # affect the job duration calculation.
-            fields_to_set[spot_table.c.last_recovered_at] = end_time
         where_conditions = [spot_table.c.spot_job_id == job_id]
         if task_id is not None:
             where_conditions.append(spot_table.c.task_id == task_id)
@@ -2295,15 +2294,12 @@ async def set_failed_async(
         fields_to_set: dict[str, Any] = {
             spot_table.c.status: failure_type.value,
             spot_table.c.failure_reason: failure_reason,
+            # Per-row RECOVERING adjustment; see set_failed for rationale.
+            spot_table.c.last_recovered_at: sqlalchemy.case(
+                (spot_table.c.status
+                 == ManagedJobStatus.RECOVERING.value, end_time),
+                else_=spot_table.c.last_recovered_at),
         }
-        # Get previous status
-        result = await session.execute(
-            sqlalchemy.select(
-                spot_table.c.status).where(spot_table.c.spot_job_id == job_id))
-        previous_status_row = result.fetchone()
-        previous_status = ManagedJobStatus(previous_status_row[0])
-        if previous_status == ManagedJobStatus.RECOVERING:
-            fields_to_set[spot_table.c.last_recovered_at] = end_time
         where_conditions = [spot_table.c.spot_job_id == job_id]
         if task_id is not None:
             where_conditions.append(spot_table.c.task_id == task_id)

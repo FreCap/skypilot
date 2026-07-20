@@ -1486,3 +1486,146 @@ class TestGetJobsStatusCheckInfo:
 
         assert set(info) == set(job_ids)
         assert select_count == expected_chunks
+
+
+class TestSetFailedRecoveringAdjustment:
+    """set_failed/set_failed_async must adjust last_recovered_at per row.
+
+    Regression: the previous implementation read a single unordered status
+    row for the whole job to decide whether to rewrite last_recovered_at.
+    For a multi-task job whose first-yielded row was a terminal task, a
+    RECOVERING later task kept its stale last_recovered_at, inflating the
+    computed job duration. The adjustment must apply exactly to rows that
+    are RECOVERING at update time.
+    """
+
+    STALE = 1000.0
+    END = 5000.0
+
+    def _seed_multi_task(self, engine):
+        # Task 0 finished long ago; task 1 is mid-recovery. Insertion order
+        # makes task 0 the row an unordered fetchone() would return.
+        with engine.begin() as conn:
+            conn.execute(state.spot_table.insert().values(
+                spot_job_id=1,
+                task_id=0,
+                job_name='t0',
+                status=state.ManagedJobStatus.SUCCEEDED.value,
+                last_recovered_at=self.STALE,
+                end_at=2000.0))
+            conn.execute(state.spot_table.insert().values(
+                spot_job_id=1,
+                task_id=1,
+                job_name='t1',
+                status=state.ManagedJobStatus.RECOVERING.value,
+                last_recovered_at=self.STALE))
+
+    def _rows(self, engine):
+        with engine.begin() as conn:
+            res = conn.execute(state.spot_table.select().order_by(
+                state.spot_table.c.task_id)).fetchall()
+        return {r.task_id: r for r in res}
+
+    def test_sync_multi_task_recovering_row_adjusted(
+            self, _mock_managed_jobs_db_conn):
+        engine = _mock_managed_jobs_db_conn
+        self._seed_multi_task(engine)
+        state.set_failed(1,
+                         task_id=None,
+                         failure_type=state.ManagedJobStatus.FAILED_CONTROLLER,
+                         failure_reason='controller died',
+                         end_time=self.END,
+                         override_terminal=True)
+        rows = self._rows(engine)
+        # RECOVERING task gets the adjustment; terminal task keeps its own
+        # last_recovered_at and end_at (coalesce).
+        assert rows[1].last_recovered_at == self.END
+        assert rows[0].last_recovered_at == self.STALE
+        assert rows[0].end_at == 2000.0
+        assert rows[1].end_at == self.END
+        assert rows[1].status == (
+            state.ManagedJobStatus.FAILED_CONTROLLER.value)
+
+    def test_async_multi_task_recovering_row_adjusted(
+            self, _mock_managed_jobs_db_conn):
+        engine = _mock_managed_jobs_db_conn
+        self._seed_multi_task(engine)
+
+        asyncio.run(
+            state.set_failed_async(
+                1,
+                task_id=None,
+                failure_type=state.ManagedJobStatus.FAILED_CONTROLLER,
+                failure_reason='controller died',
+                end_time=self.END,
+                override_terminal=True))
+        rows = self._rows(engine)
+        assert rows[1].last_recovered_at == self.END
+        assert rows[0].last_recovered_at == self.STALE
+
+    def test_sync_single_task_recovering_still_adjusted(
+            self, _mock_managed_jobs_db_conn):
+        engine = _mock_managed_jobs_db_conn
+        with engine.begin() as conn:
+            conn.execute(state.spot_table.insert().values(
+                spot_job_id=2,
+                task_id=0,
+                job_name='solo',
+                status=state.ManagedJobStatus.RECOVERING.value,
+                last_recovered_at=self.STALE))
+        state.set_failed(2,
+                         task_id=0,
+                         failure_type=state.ManagedJobStatus.FAILED,
+                         failure_reason='boom',
+                         end_time=self.END)
+        rows = self._rows(engine)
+        assert rows[0].last_recovered_at == self.END
+
+    def test_sync_non_recovering_keeps_last_recovered_at(
+            self, _mock_managed_jobs_db_conn):
+        engine = _mock_managed_jobs_db_conn
+        with engine.begin() as conn:
+            conn.execute(state.spot_table.insert().values(
+                spot_job_id=3,
+                task_id=0,
+                job_name='run',
+                status=state.ManagedJobStatus.RUNNING.value,
+                last_recovered_at=self.STALE))
+        state.set_failed(3,
+                         task_id=0,
+                         failure_type=state.ManagedJobStatus.FAILED,
+                         failure_reason='boom',
+                         end_time=self.END)
+        rows = self._rows(engine)
+        assert rows[0].last_recovered_at == self.STALE
+
+    def test_sync_no_extra_select_without_override(self,
+                                                   _mock_managed_jobs_db_conn):
+        # The whole-job status pre-select is gone: without override_terminal,
+        # set_failed must not issue any SELECT at all.
+        engine = _mock_managed_jobs_db_conn
+        with engine.begin() as conn:
+            conn.execute(state.spot_table.insert().values(
+                spot_job_id=4,
+                task_id=0,
+                job_name='perf',
+                status=state.ManagedJobStatus.RUNNING.value,
+                last_recovered_at=self.STALE))
+
+        selects = []
+
+        def _before_cursor_execute(_conn, _cursor, statement, *_args):
+            if statement.lstrip().upper().startswith('SELECT'):
+                selects.append(statement)
+
+        event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
+        try:
+            state.set_failed(4,
+                             task_id=0,
+                             failure_type=state.ManagedJobStatus.FAILED,
+                             failure_reason='boom',
+                             end_time=self.END)
+        finally:
+            event.remove(engine, 'before_cursor_execute',
+                         _before_cursor_execute)
+        assert not selects
