@@ -4106,11 +4106,10 @@ class TestCreatePodFinalizerHandling:
         core_api_mock.delete_namespaced_pod.assert_not_called()
         assert core_api_mock.create_namespaced_pod.call_count == 2
 
-    def test_asserts_pod_is_terminating(self, monkeypatch):
+    def test_rejects_non_terminating_pod(self, monkeypatch):
         """The helper is only valid for a terminating pod; if the read returns a
 
-        live pod (no deletionTimestamp), the precondition assert fires rather
-        than force-deleting a healthy pod.
+        live pod (no deletionTimestamp), fail rather than force-deleting it.
         """
         conflict = self._conflict_exc()
         live_pod = mock.MagicMock()
@@ -4126,7 +4125,8 @@ class TestCreatePodFinalizerHandling:
                             lambda *a, **k: FakeApiException)
 
         pod_spec = {'metadata': {'name': 't-reco-head'}, 'spec': {}}
-        with pytest.raises(AssertionError):
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Refusing to force-remove'):
             instance._create_namespaced_pod_with_retries(
                 'default', pod_spec, None)
         # Must not have touched the live pod.
