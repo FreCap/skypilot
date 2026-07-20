@@ -4828,7 +4828,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                               == common_utils.ProcessStatus.SCHEDULED and
                               down_thread is not None and
                               not down_thread.is_alive())
-            if not waiting_for_idle and not queued_logical:
+            # A bounded precommit retirement recovered across a controller
+            # restart has wait_for_idle False and no rebuilt down worker, yet
+            # its tracker is the only path that resumes teardown once recovery
+            # releases the row; evicting it would strand the replica off route
+            # with its cluster still up.
+            recoverable_logical = (
+                down_thread is None and
+                (replica_id in getattr(
+                    self, '_recovering_logical_retirement_ids', set()) or
+                 self._is_recoverable_uncommitted_logical_retirement(info)))
+            if (not waiting_for_idle and not queued_logical and
+                    not recoverable_logical):
                 self._wait_for_idle_trackers.pop(replica_id, None)
                 continue
             if queued_logical:
