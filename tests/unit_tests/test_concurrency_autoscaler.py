@@ -34,7 +34,9 @@ def _spec(knob=1.0,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
           scale_up_rate_period_seconds=None,
-          max_scale_down_rate_percentage=100):
+          max_scale_down_rate_percentage=100,
+          adaptive_scale_up=None,
+          lb_request_queue=None):
     # Default delays resolve to one decision interval -> hysteresis
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
@@ -50,6 +52,8 @@ def _spec(knob=1.0,
         max_scale_up_rate_percentage=max_scale_up_rate_percentage,
         scale_up_rate_min_replicas=scale_up_rate_min_replicas,
         scale_up_rate_period_seconds=scale_up_rate_period_seconds,
+        adaptive_scale_up=adaptive_scale_up,
+        lb_request_queue=lb_request_queue,
         max_scale_down_rate_percentage=max_scale_down_rate_percentage,
         upscale_delay_seconds=(upscale_delay_seconds if upscale_delay_seconds
                                is not None else interval),
@@ -96,7 +100,16 @@ def _report(autoscaler,
             unknown=(),
             unknown_capacity=None,
             observed_slots=None,
-            generation=1):
+            generation=1,
+            queue_depth_by_priority=None,
+            rejected_by_priority=None,
+            recent_rejected_by_priority=None,
+            unique_arrivals_60s=None,
+            unique_arrivals_300s=None,
+            headerless_arrivals_60s=None,
+            headerless_arrivals_300s=None,
+            arrival_tracking_saturated=False,
+            pressure_report_is_floored=False):
     report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
@@ -110,6 +123,25 @@ def _report(autoscaler,
     }
     if recent_rejected is not None:
         report['rejected_in_recent_window'] = recent_rejected
+    if queue_depth_by_priority is not None:
+        report['queue_depth_by_priority'] = queue_depth_by_priority
+    if rejected_by_priority is not None:
+        report['rejected_in_window_by_priority'] = rejected_by_priority
+    if recent_rejected_by_priority is not None:
+        report['rejected_in_recent_window_by_priority'] = (
+            recent_rejected_by_priority)
+    if unique_arrivals_60s is not None:
+        report['unique_job_arrivals_60s'] = unique_arrivals_60s
+    if unique_arrivals_300s is not None:
+        report['unique_job_arrivals_300s'] = unique_arrivals_300s
+    if headerless_arrivals_60s is not None:
+        report['headerless_arrivals_60s'] = headerless_arrivals_60s
+    if headerless_arrivals_300s is not None:
+        report['headerless_arrivals_300s'] = headerless_arrivals_300s
+    if arrival_tracking_saturated:
+        report['offered_arrival_tracking_saturated'] = True
+    if pressure_report_is_floored:
+        report['pressure_report_is_floored'] = True
     autoscaler.collect_request_information(report)
 
 
@@ -356,6 +388,118 @@ class TestTargetMath(unittest.TestCase):
         self._recompute(autoscaler, replicas)
         self.assertEqual(autoscaler.target_num_replicas, 1)
 
+    def test_priority_patience_weights_retained_queue_work(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }, {
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                })
+
+        self._recompute(autoscaler, [])
+
+        # 100 * 30/600 + 10 * 30/60 = 10 units of draining work.
+        self.assertEqual(autoscaler._weighted_queue_work, 10)
+        self.assertEqual(autoscaler.target_num_replicas, 12)
+
+    def test_priority_patience_falls_back_to_aggregate_queue(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }],
+            },
+        )
+        _report(autoscaler, in_flight={}, queue_depth=110)
+
+        self._recompute(autoscaler, [])
+
+        self.assertEqual(autoscaler._weighted_queue_work, 110)
+        self.assertEqual(autoscaler.target_num_replicas, 123)
+
+    def test_partial_priority_map_cannot_erase_ha_aggregate_floor(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            expected_request_duration_seconds=30,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=7,
+                queue_depth_by_priority={})
+
+        self._recompute(autoscaler, [])
+
+        self.assertEqual(autoscaler._weighted_queue_work, 7)
+        self.assertEqual(autoscaler.target_num_replicas, 7)
+
+    def test_deduplicated_arrival_floor_uses_short_and_long_windows(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        _report(autoscaler,
+                in_flight={},
+                unique_arrivals_60s=120,
+                unique_arrivals_300s=300,
+                headerless_arrivals_60s=0,
+                headerless_arrivals_300s=0)
+
+        self._recompute(autoscaler, [])
+
+        # The one-minute floor is 60 work units and dominates the five-minute
+        # floor of 34.5. At 90% target utilization this requires 67 slots.
+        self.assertEqual(autoscaler._arrival_floor_target, 67)
+        self.assertEqual(autoscaler.target_num_replicas, 67)
+
+        _report(autoscaler,
+                in_flight={},
+                unique_arrivals_60s=0,
+                unique_arrivals_300s=600,
+                headerless_arrivals_60s=0,
+                headerless_arrivals_300s=0)
+        autoscaler._set_target_num_replicas_with_concurrency_logic([])
+        # 15% headroom keeps 69 work units for the five-minute burst, or 77
+        # slots at 90% target utilization.
+        self.assertEqual(autoscaler._arrival_floor_target, 77)
+        self.assertEqual(autoscaler.target_num_replicas, 77)
+
 
 class TestSignalGap(unittest.TestCase):
     """No shrink of any kind while the demand report is stale."""
@@ -558,6 +702,118 @@ class TestLogicalScalingWaves(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler.target_num_replicas, 120)
+
+    def test_sustained_pressure_uses_adaptive_wave_without_skipping_pacing(
+            self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0), mock.patch.object(
+                                   autoscalers.time,
+                                   'time',
+                                   return_value=1000.0) as wall_clock:
+            _report(autoscaler, in_flight={}, queue_depth=100)
+            _report(autoscaler, in_flight={}, queue_depth=200)
+            _report(autoscaler, in_flight={}, queue_depth=500)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 200)
+
+            # Adaptive mode changes wave size, not the shared 60-second timer.
+            wall_clock.return_value = 1059.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 200)
+
+    def test_floored_handoff_report_cannot_complete_pressure_streak(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler, in_flight={}, queue_depth=100)
+            _report(autoscaler, in_flight={}, queue_depth=110)
+            self.assertEqual(autoscaler._pressure_streak, 1)
+            _report(autoscaler,
+                    in_flight={},
+                    queue_depth=120,
+                    pressure_report_is_floored=True)
+            self.assertEqual(autoscaler._pressure_streak, 0)
+            _report(autoscaler, in_flight={}, queue_depth=130)
+            self.assertEqual(autoscaler._pressure_streak, 1)
+            self.assertFalse(autoscaler._adaptive_scale_up_active())
+            _report(autoscaler, in_flight={}, queue_depth=140)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+    def test_stable_rejection_population_is_not_repeated_pressure(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        _report(autoscaler, in_flight={}, recent_rejected=10)
+        _report(autoscaler, in_flight={}, recent_rejected=11)
+        self.assertTrue(autoscaler._pressure_latched)
+        self.assertEqual(autoscaler._pressure_streak, 1)
+        _report(autoscaler, in_flight={}, recent_rejected=11)
+        self.assertEqual(autoscaler._pressure_streak, 0)
+        self.assertFalse(autoscaler._adaptive_scale_up_active())
+
+    def test_new_pressure_vetoes_downscale_once_then_requires_new_delta(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas},
+                    queue_depth=1)
+            clock.return_value = 380.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            self.assertEqual(autoscaler._downscale_veto_reason, 'queue_depth')
+            self.assertIsNone(autoscaler._downscale_started_at)
+
+            # The unchanged nonzero queue is demand in the target, but it is
+            # not another pressure delta and cannot veto the next quiet window.
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas},
+                    queue_depth=1)
+            clock.return_value = 400.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 680.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 50)
 
     def test_stale_arrival_floor_obeys_scale_up_wave(self):
         autoscaler = self._ramped_autoscaler()
@@ -825,6 +1081,80 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
 
         self.assertEqual(_decisions(autoscaler, [backend]), [])
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_downscale_limits_ready_fleet_and_pending_cohort_independently(
+            self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=1000,
+            replica_unit='logical',
+            max_scale_down_rate_percentage=50,
+        )
+        ready = [_replica(i + 1) for i in range(124)]
+        pending = [
+            _replica(125 + i, status=serve_state.ReplicaStatus.PENDING)
+            for i in range(109)
+        ]
+        replicas = ready + pending
+        autoscaler.target_num_replicas = 233
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in ready},
+                queue_depth=129,
+                observed_slots={replica.replica_id: 1 for replica in ready})
+
+        decisions = _decisions(autoscaler, replicas)
+        pending_downs = [
+            decision.target.replica_id
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN and
+            decision.target.replica_id >= 125
+        ]
+
+        self.assertEqual(autoscaler.target_num_replicas, 129)
+        self.assertEqual(autoscaler._pending_retention_floor, 54)
+        self.assertEqual(len(pending_downs), 55)
+        self.assertFalse(
+            any(decision.target.replica_id < 125 for decision in decisions))
+
+        # Reconciliation can run repeatedly before the first cancellation
+        # finishes. Once those victims are marked, the frozen 54-slot floor
+        # prevents a second tick from spending another 50% of the remainder.
+        for replica in pending:
+            if replica.replica_id in pending_downs:
+                replica.status_property.is_scale_down = True
+        self.assertEqual(_decisions(autoscaler, replicas), [])
+
+    def test_pending_budget_skips_indivisible_victim_that_would_overspend(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=100,
+            replica_unit='logical',
+            max_scale_down_rate_percentage=50,
+        )
+        ready = [_replica(i + 1) for i in range(6)]
+        pending_one = _replica(7,
+                               status=serve_state.ReplicaStatus.PENDING,
+                               planned_capacity=1)
+        pending_four = _replica(8,
+                                gpu_count=4,
+                                status=serve_state.ReplicaStatus.PENDING,
+                                planned_capacity=4)
+        replicas = ready + [pending_one, pending_four]
+        autoscaler.target_num_replicas = 11
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in ready},
+                queue_depth=8,
+                observed_slots={replica.replica_id: 1 for replica in ready})
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._pending_retention_floor, 2)
+        self.assertEqual([decision.target.replica_id for decision in decisions],
+                         [7])
 
     def test_scale_down_removes_only_backend_with_safe_coverage(self):
         autoscaler = _make_autoscaler(knob=1,

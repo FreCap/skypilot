@@ -142,6 +142,27 @@ def get_service_schema():
                                 'type': 'number',
                                 'exclusiveMinimum': 0,
                             },
+                            'timeout_seconds_by_priority': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'object',
+                                    'required': [
+                                        'min_priority', 'timeout_seconds'
+                                    ],
+                                    'additionalProperties': False,
+                                    'properties': {
+                                        'min_priority': {
+                                            'type': 'integer',
+                                            'minimum': 0,
+                                            'maximum': 100,
+                                        },
+                                        'timeout_seconds': {
+                                            'type': 'number',
+                                            'exclusiveMinimum': 0,
+                                        },
+                                    },
+                                },
+                            },
                             'max_request_body_bytes': {
                                 'type': 'integer',
                                 'minimum': 1,
@@ -262,6 +283,29 @@ def get_service_schema():
                     'scale_up_rate_period_seconds': {
                         'type': 'integer',
                         'minimum': 1,
+                    },
+                    'adaptive_scale_up': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'max_scale_up_rate_percentage': {
+                                'type': 'integer',
+                                'minimum': 1,
+                                'maximum': 100,
+                            },
+                            'scale_up_rate_min_replicas': {
+                                'type': 'integer',
+                                'minimum': 1,
+                            },
+                            'pressure_observations': {
+                                'type': 'integer',
+                                'minimum': 1,
+                            },
+                            'hold_seconds': {
+                                'type': 'number',
+                                'exclusiveMinimum': 0,
+                            },
+                        },
                     },
                     'max_scale_down_rate_percentage': {
                         'type': 'integer',
