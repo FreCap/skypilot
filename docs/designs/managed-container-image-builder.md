@@ -18,12 +18,25 @@ PostgreSQL metadata, workers, quotas, security, and release gates.
 
 The first delivery is intentionally not this permanent product surface. A
 non-public prototype runs the pinned build graph, sandbox, internal OCI staging,
-trusted publication, and representative Boltz/non-Python benchmarks without a
-central migration, task field, durable controller, or dashboard mutation. Only
+verified external adoption, and representative Boltz/non-Python benchmarks
+without a central migration, task field, durable controller, or dashboard
+mutation. Only
 after that prototype passes the pre-product gate below may migration 024,
 API-version-63 syntax, the controller, and Build UX be implemented. This avoids
 turning an unproven convenience into a permanent compatibility and security
 obligation.
+
+The prototype has one deliberate seam into the shipped distribution product.
+After its independent verifier accepts an immutable staging digest, its harness
+uses the existing external exact-digest adoption flow through a dedicated
+`ownership: external` output profile, pushes that digest to the returned
+canonical destination with prototype-scoped credentials, and waits for ordinary
+destination verification. The resulting catalog artifact is `external_oci`.
+The prototype does not write `managed_build`, BUILD origin, `BUILD_RESERVED`,
+build-output leases, or any central builder row. Its restart/fault evidence
+lives in an isolated prototype journal or test harness that is disposable with
+the prototype, not in migration 023. Migration 024 is the only path that later
+introduces native durable build provenance and publication authority.
 
 The useful Modal-like property is that construction is declared and cached
 independently from replica startup. Placement never runs a Docker build or
@@ -357,6 +370,12 @@ persistence.
 
 ## Component boundaries
 
+The following is the post-gate product topology. During the prototype, the
+builder client/API/PostgreSQL product surfaces and native BUILD-publication tail
+do not exist. A private harness drives the pinned Job and verifier, journals
+only prototype-local evidence, then crosses into the released system solely
+through external exact-digest adoption as described above.
+
 ```text
 client context scanner
   -> cache resolve, then scoped upload session only on miss
@@ -389,6 +408,14 @@ No build executes in the API process, generic request executor, Serve or jobs
 controller, distribution worker, cluster head, or accelerator-bearing workload
 replica. Builder code does not enter `sky/container_images/state.py` beyond the
 small catalog transaction interface.
+
+For the pre-gate prototype, even that catalog transaction interface is absent.
+The trusted verifier may call the ordinary external-adoption API as a client,
+but it has no in-process access to catalog tables and no authority to claim BUILD
+origin. A crash before the push leaves only prototype staging/journal state. A
+crash after push is recovered by idempotently inspecting the destination and
+retrying the same external-adoption request. This proves the data plane without
+smuggling migration-024 semantics into migration 023.
 
 ## Context custody and object storage
 
@@ -1417,6 +1444,9 @@ Delivery has a pre-product decision point:
    context encoder, plus the default-deny namespace, projected pod identity,
    refreshable capability broker, and deterministic NetworkPolicy/Job bundle,
    but no migration 024, durable public API, product controller, or Build UI;
+   publish verified output only through external exact-digest adoption as an
+   `external_oci` artifact, with restart evidence in a disposable isolated
+   harness journal;
 3. run the prototype on representative Boltz and one non-Python workload
    against external CI, including Docker/OCI base vectors and hostile sandbox
    conformance; and
