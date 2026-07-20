@@ -509,7 +509,7 @@ class GCP(clouds.Cloud):
             if ok:
                 return disk_tier
             start_index += 1
-        assert False, 'Low disk tier should always be supported on GCP.'
+        raise AssertionError('Low disk tier should always be supported on GCP.')
 
     @staticmethod
     def _get_gpu_image_id(acc: str) -> str:
@@ -1459,7 +1459,7 @@ class GCP(clouds.Cloud):
                      **kwargs) -> list['status_lib.ClusterStatus']:
         """Query the status of a cluster."""
         # TODO(suquark): deprecate this method
-        assert False, 'This code path should not be used.'
+        raise AssertionError('This code path should not be used.')
 
     @classmethod
     def create_image_from_cluster(cls,
