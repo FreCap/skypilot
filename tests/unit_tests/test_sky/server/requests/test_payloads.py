@@ -1,9 +1,45 @@
 """Unit tests for sky.server.requests.payloads module."""
+import types
+from unittest import mock
+
+import pytest
+
+from sky import serve
 from sky import skypilot_config
 from sky.serve import constants as serve_constants
 from sky.server.requests import payloads
 from sky.skylet import constants
 from sky.usage import usage_lib
+
+
+@pytest.mark.parametrize(('body_type', 'body_kwargs'), [
+    (payloads.ServeUpBody, {
+        'task': 'name: task',
+        'service_name': 'service',
+    }),
+    (payloads.ServeUpdateBody, {
+        'task': 'name: task',
+        'service_name': 'service',
+        'mode': serve.UpdateMode.ROLLING,
+    }),
+    (payloads.JobsPoolApplyBody, {
+        'task': 'name: task',
+        'workers': 1,
+        'pool_name': 'pool',
+        'mode': serve.UpdateMode.ROLLING,
+    }),
+],
+                         ids=['serve-up', 'serve-update', 'jobs-pool-apply'])
+def test_single_task_payloads_reject_multiple_tasks(body_type, body_kwargs):
+    body = body_type(**body_kwargs)
+    dag = types.SimpleNamespace(
+        tasks=[mock.sentinel.first, mock.sentinel.second])
+
+    with mock.patch.object(payloads.common,
+                           'process_mounts_in_task_on_api_server',
+                           return_value=dag):
+        with pytest.raises(ValueError, match='Must only specify one task'):
+            body.to_kwargs()
 
 
 def test_request_body_env_vars_includes_expected_keys(monkeypatch):

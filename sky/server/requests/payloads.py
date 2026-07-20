@@ -739,9 +739,9 @@ class ServeUpBody(RequestBody):
             self.env_vars,
             workdir_only=False,
             file_mounts_blob_id=self.file_mounts_blob_id)
-        assert len(
-            dag.tasks) == 1, ('Must only specify one task in the DAG for '
-                              'a service.', dag)
+        if len(dag.tasks) != 1:
+            raise ValueError('Must only specify one task in the DAG for '
+                             f'a service. Found {len(dag.tasks)} tasks.')
         kwargs['task'] = dag.tasks[0]
         kwargs['submitted_yaml_content'] = self.task
         return kwargs
@@ -760,9 +760,9 @@ class ServeUpdateBody(RequestBody):
             self.env_vars,
             workdir_only=False,
             file_mounts_blob_id=self.file_mounts_blob_id)
-        assert len(
-            dag.tasks) == 1, ('Must only specify one task in the DAG for '
-                              'a service.', dag)
+        if len(dag.tasks) != 1:
+            raise ValueError('Must only specify one task in the DAG for '
+                             f'a service. Found {len(dag.tasks)} tasks.')
         kwargs['task'] = dag.tasks[0]
         kwargs['submitted_yaml_content'] = self.task
         return kwargs
@@ -945,9 +945,9 @@ class JobsPoolApplyBody(RequestBody):
                 self.env_vars,
                 workdir_only=False,
                 file_mounts_blob_id=self.file_mounts_blob_id)
-            assert len(
-                dag.tasks) == 1, ('Must only specify one task in the DAG for '
-                                  'a pool.', dag)
+            if len(dag.tasks) != 1:
+                raise ValueError('Must only specify one task in the DAG for '
+                                 f'a pool. Found {len(dag.tasks)} tasks.')
             kwargs['task'] = dag.tasks[0]
         else:
             kwargs['task'] = None
