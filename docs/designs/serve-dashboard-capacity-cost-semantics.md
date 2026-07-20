@@ -25,8 +25,10 @@ estimated hourly cost long after their provider resources are gone.
   their maximum.
 - Label `total_capacity` as non-failed tracked capacity, including stopping and
   preempted rows.
-- Describe detail-card denominators as ready versus non-failed capacity and
-  failed counts as history.
+- Describe detail-card denominators as ready versus non-failed capacity. Treat
+  the failed aggregate as a mixed bucket: it includes completed failure history
+  as well as `FAILED_CLEANUP` and `UNKNOWN` rows whose provider cleanup may
+  still be uncertain.
 - Estimate cost only for rows with plausible current provider billability:
   provisioning, starting, ready, not ready, stopping, cleanup-failed, unknown,
   and any future status not explicitly known to be non-billable.
@@ -49,8 +51,10 @@ reasons. This is intentionally an exclusion list: an unknown future status is
 safer to include than to silently understate possible spend.
 
 In the history chart and details card, update labels and explanatory copy to
-match the backend definitions. Failed rows remain available in replica history
-and are not deleted by this change.
+match the backend definitions. Failed rows remain available and are not deleted
+by this change. Since the existing aggregate does not separate completed
+failure history from cleanup-uncertain rows, its label must preserve both
+possibilities rather than calling every failed row historical.
 
 ## Alternatives considered
 

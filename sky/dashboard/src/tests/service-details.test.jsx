@@ -400,8 +400,14 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(
       screen.getByText(/1\/2 physical backends \(ready\/non-failed\)/)
     ).toBeTruthy();
-    expect(screen.getByText(/4 failed slots in history/)).toBeTruthy();
-    expect(screen.getByText(/1 failed backends in history/)).toBeTruthy();
+    expect(
+      screen.getByText(/4 failed or cleanup-uncertain slots, including history/)
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        /1 failed or cleanup-uncertain backend, including history/
+      )
+    ).toBeTruthy();
     expect(screen.queryByText('Replicas (ready/non-failed)')).toBeNull();
   });
 
