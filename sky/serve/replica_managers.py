@@ -3482,7 +3482,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._pending_version = version
 
     def _handoff_logical_retirements_for_version_update(
-            self, replica_infos: list[ReplicaInfo]) -> None:
+            self, replica_infos: list[ReplicaInfo]) -> set[int]:
         """Keep uncommitted drains off route across an in-process update.
 
         A pending version freezes old-version retirement admission. Once the
@@ -3499,7 +3499,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._is_recoverable_uncommitted_logical_retirement(info)
         }
         if not retiring_ids:
-            return
+            return set()
         with self._logical_state_lock:
             self._logical_controller_epoch = uuid.uuid4().hex
             recovering_ids = getattr(self, '_recovering_logical_retirement_ids',
@@ -3515,6 +3515,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         logger.info(
             'Handing off %s uncommitted logical retirements to version-update '
             'recovery without returning them to routing.', len(retiring_ids))
+        return retiring_ids
 
     def clear_pending_version(self, version: int) -> None:
         with self._logical_state_lock:
@@ -5983,8 +5984,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                new_task.num_nodes)
 
         replica_infos = serve_state.get_replica_infos(self._service_name)
+        handed_off_retirement_ids: set[int] = set()
         if self._uses_logical_replicas and new_uses_logical_replicas:
-            self._handoff_logical_retirements_for_version_update(replica_infos)
+            handed_off_retirement_ids = (
+                self._handoff_logical_retirements_for_version_update(
+                    replica_infos))
 
         self.latest_version = version
         self.yaml_content = new_yaml_content
@@ -6017,9 +6021,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             new_config.get('resources', {}).pop('any_of', [])))
 
         prior_versions = sorted({
-            info.version
-            for info in replica_infos
-            if info.version < version and not info.is_terminal
+            info.version for info in replica_infos if info.version < version and
+            (not info.is_terminal or
+             info.replica_id in handed_off_retirement_ids)
         })
         prior_yaml_contents = (serve_state.get_yaml_contents(
             self._service_name, prior_versions) if prior_versions else {})
@@ -6044,7 +6048,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 resources_utils.normalize_any_of_resources_config(
                     old_config.get('resources', {}).pop('any_of', [])))
         for info in replica_infos:
-            if info.version < version and not info.is_terminal:
+            reusable_retirement = (info.replica_id in handed_off_retirement_ids)
+            if (info.version < version and
+                (not info.is_terminal or reusable_retirement)):
                 prior_spec = prior_specs.get(info.version)
                 prior_is_logical = (getattr(prior_spec, 'uses_logical_replicas',
                                             False) is True)
@@ -6079,6 +6085,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'because its runtime config is unchanged.',
                         info.replica_id, info.version, version)
                     info.version = version
+                    if reusable_retirement:
+                        # Keep the recovery shape internally consistent while
+                        # the old authority epoch prevents admission. Fresh
+                        # vNext evidence will either re-fence this victim or
+                        # reactivate only the capacity now required.
+                        info.status_property.logical_retirement_version = (
+                            version)
                     self._persist_replica(info.replica_id, info)
                 else:
                     logger.info(

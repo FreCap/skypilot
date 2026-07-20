@@ -1303,7 +1303,8 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         assert mgr._logical_controller_epoch != old_epoch
         assert mgr._recovering_logical_retirement_ids == {1}
         assert retiring.status_property.is_scale_down
-        assert retiring.status_property.logical_retirement_version == 1
+        assert retiring.version == 2
+        assert retiring.status_property.logical_retirement_version == 2
         assert (retiring.status_property.logical_retirement_controller_epoch ==
                 old_epoch)
         assert survivor.version == 2

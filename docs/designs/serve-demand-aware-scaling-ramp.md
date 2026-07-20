@@ -180,10 +180,14 @@ deadlines and are handed to the same bounded recovery path used after a
 controller restart; they may be re-fenced only after the new version publishes
 a fresh target and capacity snapshot. If that snapshot proves a current-version
 capacity shortfall, recovery may reactivate only the capacity needed to cover
-the shortfall. The existing bounded recovery timeout remains the availability
-fallback if an update cannot publish that evidence at all. During a successful
-policy-only or runtime-equivalent update, asynchronously draining backends must
-therefore stay off route instead of the whole old fleet becoming READY again.
+the shortfall. Runtime-equivalent uncommitted victims are relabelled to the new
+version while remaining off route, so they can satisfy such a shortfall without
+a replacement launch; irreversibly committed victims keep their original
+version and finish teardown. The existing bounded recovery timeout remains the
+availability fallback if an update cannot publish that evidence at all. During
+a successful policy-only or runtime-equivalent update, asynchronously draining
+backends must therefore stay off route instead of the whole old fleet becoming
+READY again.
 
 The 20-backend cap bounds each transition without tying rollout progress to a
 wall-clock rate limit. If five new logical slots become ready, up to five
