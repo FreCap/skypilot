@@ -4066,12 +4066,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             return 'abort'
         if target_generation != snapshot.generation:
             return 'wait'
-        if current_target > selection_target:
-            return 'abort'
         if (require_victim_idle and
                 not self._logical_retirement_victim_is_idle(info, snapshot)):
             return 'wait'
 
+        # A same-version demand rebound does not invalidate every accepted
+        # retirement. Recompute against the current target instead. Since
+        # _logical_ready_capacity excludes all off-route rows, callers abort
+        # and reactivate only enough victims to cover a real shortfall; the
+        # remainder can continue draining without fleet-wide churn.
         ready_capacity = self._logical_ready_capacity(
             serve_state.get_replica_infos(self._service_name), snapshot,
             version, {info.replica_id})

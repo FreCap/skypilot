@@ -130,12 +130,25 @@ interval, so an exact-generation fence can discard every scale-up or retirement
 batch forever. While the exact published
 `(version, decision_generation, target)` remains current, actuation may use any
 fresh capacity snapshot from the same version whose generation is at least the
-decision generation. A newer published target or version still supersedes the
-intent. Scale-up rechecks the fence and newest committed capacity before each
-replica row is persisted. Scale-down recomputes coverage and verifies each
-selected victim is still known idle in the newest snapshot before marking it
-off-route. Scale-down counts one conservative slot per ready old-version
-backend, but backends already off route never count toward coverage.
+decision generation. A newer published target or version still supersedes an
+unaccepted batch. Scale-up rechecks the fence and newest committed capacity
+before each replica row is persisted. Scale-down recomputes coverage and
+verifies each selected victim is still known idle in the newest snapshot before
+marking it off-route. Scale-down counts one conservative slot per ready
+old-version backend, but backends already off route never count toward
+coverage.
+
+A same-version target change does not blanket-cancel retirements that were
+already durably accepted and taken off route. Before irreversible teardown,
+each accepted retirement uses the newest fresh snapshot and current target to
+recompute coverage without that victim. If current non-retiring coverage is
+sufficient, the retirement remains valid. If it is insufficient, only enough
+accepted retirements are reactivated to cover the current shortfall; later
+victims then re-evaluate against that restored capacity. A version change,
+pending newer version, stale demand snapshot, or unavailable current target
+continues to block or abort retirement as appropriate. This preserves demand
+rebound safety without allowing a small target fluctuation to reactivate an
+entire large drain wave.
 Unknown-capacity replacement stays tied to the exact decision generation; a
 newer snapshot may narrow or cancel the set but cannot authorize new overlap
 from stale evidence.
@@ -323,9 +336,9 @@ Keep the public load-balancer endpoint unchanged.
 
 Monitor through 08:00 EST. Success means the applied target follows actual
 in-flight work plus duration-normalized rejection pressure, target increases
-obey the 10-or-20-percent per-minute ceiling, ordinary downscale obeys the
-five-minute 50-percent waves, and physical capacity converges without request
-or error regression.
+obey the configured minimum-or-percentage per-minute ceiling, ordinary
+downscale obeys the five-minute 50-percent waves, and physical capacity
+converges without request or error regression.
 
 ## Alternatives considered
 
@@ -402,8 +415,10 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify provisioning capacity is committed and prevents duplicate waves.
 - Verify continuously advancing load-balancer snapshots cannot starve a
   still-current logical scale-up or retirement target, while a newer target or
-  version still fences it before persistence. Retirement must recompute
-  coverage and idle evidence from the newest snapshot.
+  version still fences an unaccepted batch before persistence. An accepted
+  same-version retirement must recompute coverage and idle evidence from the
+  newest target and snapshot, keeping covered victims off route and
+  reactivating only the capacity required for a shortfall.
 - Verify a backend that recovered between the decision snapshot and actuation
   is removed from the unknown-capacity replacement set.
 - Verify final manager admission and teardown fences count one slot per ready

@@ -2957,6 +2957,88 @@ class TestLogicalCapacityPlanning:
         mgr._terminate_replica = mock.Mock()
         return mgr, retiring, survivor
 
+    def test_accepted_retirement_survives_covered_target_growth(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        second_survivor = self._ready_backend(11, 1)
+        second_survivor.version = 10
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            observed_slots_by_replica_id={
+                10: 1,
+                11: 1,
+            },
+            in_flight_by_replica_id={
+                9: 0,
+                10: 0,
+                11: 0,
+            })
+        mgr._logical_target = (10, 5, 2)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[retiring, survivor, second_survivor]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_called_once_with(
+            9,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+        assert retiring.status_property.is_scale_down
+
+    def test_target_growth_reactivates_only_capacity_shortfall(self):
+        mgr, first_retiring, first_survivor = (
+            self._pending_logical_retirement())
+        second_retiring = self._ready_backend(8, 1)
+        second_retiring.version = 9
+        second_status = second_retiring.status_property
+        first_status = first_retiring.status_property
+        second_status.is_scale_down = True
+        second_status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        second_status.wait_for_idle_before_termination = True
+        second_status.logical_retirement_version = 10
+        second_status.logical_retirement_controller_epoch = (
+            'test-controller-epoch')
+        second_status.logical_retirement_generation = 4
+        second_status.logical_retirement_target_capacity = 1
+        second_status.logical_retirement_confirmed_generation = None
+        second_survivor = self._ready_backend(11, 1)
+        second_survivor.version = 10
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            observed_slots_by_replica_id={
+                10: 1,
+                11: 1,
+            },
+            in_flight_by_replica_id={
+                8: 0,
+                9: 0,
+                10: 0,
+                11: 0,
+            })
+        mgr._logical_target = (10, 5, 3)
+        fleet = [
+            first_retiring, second_retiring, first_survivor, second_survivor
+        ]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=fleet):
+            mgr._finish_logical_retirement(9, first_retiring)
+            mgr._finish_logical_retirement(8, second_retiring)
+
+        assert not first_status.is_scale_down
+        assert first_status.sky_down_status is None
+        assert second_status.is_scale_down
+        mgr._terminate_replica.assert_called_once_with(
+            8,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+
     def _recoverable_logical_retirement(self,
                                         replica_id,
                                         width=1,
@@ -4259,7 +4341,7 @@ class TestLogicalCapacityPlanning:
 
             # A late busy report invalidates the ordinary idle proof. The
             # original deadline must still promote only an outdated backend;
-            # same-version or grown-target retirement is cancelled.
+            # a same-version or uncovered grown-target retirement is cancelled.
             now[0] = 200.0
             mgr._logical_reconcile_snapshot = dataclasses.replace(
                 mgr._logical_reconcile_snapshot,
