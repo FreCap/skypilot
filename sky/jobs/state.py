@@ -1,11 +1,9 @@
 """The database for managed jobs status."""
 # TODO(zhwu): maybe use file based status instead of database, so
 # that we can easily switch to a s3-based storage.
-import asyncio
 import collections
 from collections.abc import Awaitable
 from collections.abc import Callable
-import datetime
 import json
 import time
 from typing import Any, Optional
@@ -20,12 +18,12 @@ from sky import exceptions
 from sky import resources as resources_lib
 from sky import sky_logging
 from sky.jobs import batch_state
+from sky.jobs import state_events
 from sky.jobs import state_queries
 from sky.jobs import state_schema
 from sky.jobs import state_storage
 from sky.jobs.state_schema import api_access_token_table
 from sky.jobs.state_schema import ha_recovery_script_table
-from sky.jobs.state_schema import job_events_table
 from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
 from sky.jobs.status_types import ControllerPidRecord
@@ -47,10 +45,6 @@ logger = sky_logging.init_logger(__name__)
 
 _DB_RETRY_TIMES = 30
 
-# 30 days retention for job events
-DEFAULT_JOB_EVENT_RETENTION_HOURS = 30 * 24.0
-# Run the job event retention daemon every hour
-JOB_EVENT_DAEMON_INTERVAL_SECONDS = 3600
 # Bound parameters per token upsert while keeping all chunks in one transaction.
 _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
 
@@ -58,6 +52,7 @@ _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
 Base = state_schema.Base
 batch_state_table = state_schema.batch_state_table
 batch_worker_table = state_schema.batch_worker_table
+job_events_table = state_schema.job_events_table
 
 # Keep the historical query facade as direct aliases.
 # pylint: disable=protected-access
@@ -67,6 +62,25 @@ _batch_progress_subquery = state_queries._batch_progress_subquery
 create_table = state_storage.create_table
 _db_manager = state_storage.db_manager
 migration_utils = state_storage.migration_utils
+
+# Keep the historical job-event facade as direct aliases.
+DEFAULT_JOB_EVENT_RETENTION_HOURS = (
+    state_events.DEFAULT_JOB_EVENT_RETENTION_HOURS)
+JOB_EVENT_DAEMON_INTERVAL_SECONDS = (
+    state_events.JOB_EVENT_DAEMON_INTERVAL_SECONDS)
+# pylint: disable=protected-access
+_get_all_task_ids_async = state_events._get_all_task_ids_async
+_get_latest_event_reasons = state_events._get_latest_event_reasons
+# pylint: enable=protected-access
+add_job_event = state_events.add_job_event
+add_job_event_async = state_events.add_job_event_async
+get_job_events = state_events.get_job_events
+get_latest_recovery_and_pending_reasons = (
+    state_events.get_latest_recovery_and_pending_reasons)
+get_latest_recovery_reasons = state_events.get_latest_recovery_reasons
+cleanup_job_events_with_retention_async = (
+    state_events.cleanup_job_events_with_retention_async)
+job_event_retention_daemon = state_events.job_event_retention_daemon
 
 # Keep the historical Batch persistence facade as direct aliases.
 BatchLifecycleTransition = batch_state.BatchLifecycleTransition
@@ -2661,240 +2675,3 @@ def set_controller_logs_cleaned(job_ids: list[int], logs_cleaned_at: float):
                 job_info_table.c.spot_job_id.in_(job_ids)).values(
                     controller_logs_cleaned_at=logs_cleaned_at))
         session.commit()
-
-
-def add_job_event(job_id: int,
-                  task_id: int | None,
-                  new_status: ManagedJobStatus,
-                  reason: str,
-                  timestamp: datetime.datetime | None = None) -> None:
-    """Add a job event record to the audit log.
-
-    Args:
-        job_id: The spot_job_id of the managed job.
-        task_id: The task_id within the managed job. If None, adds a
-            job-level event that applies to all tasks.
-        new_status: The new status being transitioned to. Can be a
-            ManagedJobStatus enum.
-        reason: A description of why the event occurred.
-        timestamp: The timestamp of the event. If None, uses current time.
-    """
-    if timestamp is None:
-        timestamp = datetime.datetime.now()
-
-    status_value = new_status.value
-
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.execute(job_events_table.insert().values(
-            spot_job_id=job_id,
-            task_id=task_id,  # Can be None for job-level events
-            new_status=status_value,
-            reason=reason,
-            timestamp=timestamp,
-        ))
-        session.commit()
-
-
-async def _get_all_task_ids_async(job_id: int) -> list[int]:
-    """Get all task IDs for a job (async version)."""
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        result = await session.execute(
-            sqlalchemy.select(spot_table.c.task_id).where(
-                spot_table.c.spot_job_id == job_id).order_by(
-                    spot_table.c.task_id.asc()))
-        return [row[0] for row in result.fetchall()]
-
-
-@db_retries.retry_async
-async def add_job_event_async(
-        job_id: int,
-        task_id: int | None,
-        new_status: ManagedJobStatus,
-        reason: str,
-        code: str | None = None,
-        timestamp: datetime.datetime | None = None) -> None:
-    """Add a job event record to the audit log (async version).
-
-    Args:
-        job_id: The spot_job_id of the managed job.
-        task_id: The task_id within the managed job. If None, adds a
-            job-level event that applies to all tasks.
-        new_status: The new status being transitioned to. Can be a
-            ManagedJobStatus enum.
-        reason: A description of why the event occurred.
-        code: Optional error category code for failures.
-        timestamp: The timestamp of the event. If None, uses current time.
-    """
-    if timestamp is None:
-        timestamp = datetime.datetime.now()
-
-    status_value = new_status.value
-
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        await session.execute(job_events_table.insert().values(
-            spot_job_id=job_id,
-            task_id=task_id,  # Can be None for job-level events
-            new_status=status_value,
-            code=code,
-            reason=reason,
-            timestamp=timestamp,
-        ))
-        await session.commit()
-
-
-def get_job_events(job_id: int,
-                   task_id: int | None = None,
-                   limit: int | None = None) -> list[dict[str, Any]]:
-    """Get task events for a managed job.
-
-    Args:
-        job_id: The spot_job_id of the managed job.
-        task_id: Optional task_id to filter by. If None, returns events
-            for all tasks. If specified, returns events for that task plus
-            job-level events (where task_id is None).
-        limit: Optional limit on number of events to return. If specified,
-            returns the most recent N events.
-
-    Returns:
-        List of event records, ordered by timestamp descending
-        (most recent first) if limit is specified, otherwise ascending.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = sqlalchemy.select(
-            job_events_table.c.spot_job_id,
-            job_events_table.c.task_id,
-            job_events_table.c.new_status,
-            job_events_table.c.code,
-            job_events_table.c.reason,
-            job_events_table.c.timestamp,
-        ).where(job_events_table.c.spot_job_id == job_id)
-
-        if task_id is not None:
-            # Include events for the specific task AND job-level events
-            # (task_id is None)
-            query = query.where(
-                sqlalchemy.or_(job_events_table.c.task_id == task_id,
-                               job_events_table.c.task_id.is_(None)))
-
-        # Order by timestamp descending to get most recent first
-        query = query.order_by(job_events_table.c.timestamp.desc())
-
-        if limit is not None:
-            query = query.limit(limit)
-
-        rows = session.execute(query).fetchall()
-    return [{
-        'spot_job_id': row[0],
-        'task_id': row[1],
-        'new_status': ManagedJobStatus(row[2]),
-        'code': row[3],
-        'reason': row[4],
-        'timestamp': row[5],
-    } for row in rows]
-
-
-def _get_latest_event_reasons(
-    job_ids_by_status: dict[ManagedJobStatus, list[int]]
-) -> dict[ManagedJobStatus, dict[int, str]]:
-    """Return the latest event reason for each requested status and job."""
-    reasons: dict[ManagedJobStatus, dict[int, str]] = {
-        status: {} for status in job_ids_by_status
-    }
-    conditions = [
-        sqlalchemy.and_(
-            job_events_table.c.new_status == status.value,
-            job_events_table.c.spot_job_id.in_(job_ids),
-        ) for status, job_ids in job_ids_by_status.items() if job_ids
-    ]
-    if not conditions:
-        return reasons
-
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        ranked_events = sqlalchemy.select(
-            job_events_table.c.spot_job_id.label('spot_job_id'),
-            job_events_table.c.new_status.label('new_status'),
-            job_events_table.c.reason.label('reason'),
-            sqlalchemy.func.row_number().over(
-                partition_by=(job_events_table.c.spot_job_id,
-                              job_events_table.c.new_status),
-                order_by=(
-                    job_events_table.c.timestamp.desc(),
-                    job_events_table.c.id.desc(),
-                ),
-            ).label('rank'),
-        ).where(sqlalchemy.or_(*conditions)).subquery('ranked_job_events')
-        rows = session.execute(
-            sqlalchemy.select(
-                ranked_events.c.spot_job_id,
-                ranked_events.c.new_status,
-                ranked_events.c.reason,
-            ).where(
-                sqlalchemy.and_(
-                    ranked_events.c.rank == 1,
-                    ranked_events.c.reason.is_not(None),
-                    ranked_events.c.reason != '',
-                ))).fetchall()
-    for spot_job_id, new_status, reason in rows:
-        reasons[ManagedJobStatus(new_status)][spot_job_id] = reason
-    return reasons
-
-
-def get_latest_recovery_and_pending_reasons(
-        recovering_job_ids: list[int],
-        pending_job_ids: list[int]) -> tuple[dict[int, str], dict[int, str]]:
-    """Return latest recovery and pending reasons in one database query."""
-    reasons = _get_latest_event_reasons({
-        ManagedJobStatus.RECOVERING: recovering_job_ids,
-        ManagedJobStatus.PENDING: pending_job_ids,
-    })
-    return (reasons[ManagedJobStatus.RECOVERING],
-            reasons[ManagedJobStatus.PENDING])
-
-
-def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
-    """Return {job_id: reason} for the latest RECOVERING event per job."""
-    recovery_reasons, _ = get_latest_recovery_and_pending_reasons(job_ids, [])
-    return recovery_reasons
-
-
-async def cleanup_job_events_with_retention_async(
-        retention_hours: float) -> None:
-    """Delete job events older than the retention period.
-
-    Args:
-        retention_hours: Number of hours to retain job events.
-    """
-    engine = await _db_manager.get_async_engine()
-    cutoff_time = datetime.datetime.now() - datetime.timedelta(
-        hours=retention_hours)
-
-    async with sql_async.AsyncSession(engine) as session:
-        result = await session.execute(
-            sqlalchemy.delete(job_events_table).where(
-                job_events_table.c.timestamp < cutoff_time))
-        count = result.rowcount
-        if count > 0:
-            logger.debug(f'Deleted {count} job events older than '
-                         f'{retention_hours} hours.')
-        await session.commit()
-
-
-async def job_event_retention_daemon():
-    """Garbage collect job events periodically."""
-    while True:
-        logger.info('Running job event retention daemon...')
-        try:
-            await cleanup_job_events_with_retention_async(
-                DEFAULT_JOB_EVENT_RETENTION_HOURS)
-        except asyncio.CancelledError:
-            logger.info('Job event retention daemon cancelled')
-            break
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f'Error running job event retention daemon: {e}')
-
-        await asyncio.sleep(JOB_EVENT_DAEMON_INTERVAL_SECONDS)

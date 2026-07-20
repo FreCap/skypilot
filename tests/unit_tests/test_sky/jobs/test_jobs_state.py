@@ -980,6 +980,42 @@ class TestGetLatestRecoveryReasons:
         assert state.get_latest_recovery_reasons([1]) == {}
 
 
+def test_job_event_timeline_async_write_and_retention(
+        _mock_managed_jobs_db_conn):
+    now = datetime.datetime.now()
+    old = now - datetime.timedelta(hours=2)
+    state.add_job_event(1,
+                        None,
+                        state.ManagedJobStatus.PENDING,
+                        'job queued',
+                        timestamp=old)
+    state.add_job_event(1,
+                        0,
+                        state.ManagedJobStatus.STARTING,
+                        'task starting',
+                        timestamp=now)
+    asyncio.run(
+        state.add_job_event_async(1,
+                                  0,
+                                  state.ManagedJobStatus.FAILED,
+                                  'task failed',
+                                  code='runtime',
+                                  timestamp=now +
+                                  datetime.timedelta(seconds=1)))
+
+    task_events = state.get_job_events(1, task_id=0)
+    assert [event['reason'] for event in task_events
+           ] == ['task failed', 'task starting', 'job queued']
+    assert task_events[0]['new_status'] is state.ManagedJobStatus.FAILED
+    assert task_events[0]['code'] == 'runtime'
+
+    asyncio.run(state.cleanup_job_events_with_retention_async(1))
+
+    remaining_events = state.get_job_events(1)
+    assert [event['reason'] for event in remaining_events
+           ] == ['task failed', 'task starting']
+
+
 # Fixed epoch timestamps (seconds) for the time-range fixture. submitted_at is
 # stored as epoch seconds (a sqlalchemy.Float column), matching time.time().
 _T100 = 100.0
