@@ -1273,6 +1273,139 @@ class TestRollingDrain(unittest.TestCase):
         self.assertEqual(
             autoscaler._select_outdated_replicas_to_scale_down(old, [1]), [])
 
+    def _logical_mid_update(self,
+                            target,
+                            raw_target,
+                            update_mode=serve_utils.UpdateMode.ROLLING):
+        autoscaler = _make_autoscaler(knob=1.0,
+                                      min_replicas=1,
+                                      max_replicas=1000,
+                                      replica_unit='logical')
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0,
+                  min_replicas=1,
+                  max_replicas=1000,
+                  replica_unit='logical'), update_mode)
+        autoscaler.target_num_replicas = target
+        autoscaler._raw_target_num_replicas = raw_target
+        return autoscaler
+
+    def test_logical_rollout_retires_before_latest_reaches_target(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        autoscaler._upscale_pending = True
+        old = [_replica(i, version=1) for i in range(1, 41)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        # Five observed new slots permit five conservative old-backend
+        # retirements. The rollout does not wait for all 40 new slots or for
+        # the adopted scale-up wave to catch raw demand.
+        self.assertEqual(len(retired), 5)
+        self.assertTrue(
+            set(retired).issubset({info.replica_id for info in old}))
+
+    def test_logical_blue_green_waits_for_complete_latest_target(self):
+        autoscaler = self._logical_mid_update(
+            target=40,
+            raw_target=40,
+            update_mode=serve_utils.UpdateMode.BLUE_GREEN)
+        old = [_replica(i, version=1) for i in range(1, 41)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(retired, [])
+
+    def test_logical_rollout_batches_proven_old_excess(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        old = [_replica(i, version=1) for i in range(1, 101)]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        # Sixty-five old READY backends are proven excess, but one decision
+        # tick removes at most the bounded physical batch.
+        self.assertEqual(len(retired), 20)
+
+    def test_logical_rollout_preserves_raw_demand_and_drops_nonready(self):
+        autoscaler = self._logical_mid_update(target=10, raw_target=40)
+        ready_old = [_replica(i, version=1) for i in range(1, 36)]
+        nonready_old = [
+            _replica(i,
+                     version=1,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for i in range(36, 41)
+        ]
+        new_ready = _replica(101, version=2, planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in ready_old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            ready_old + nonready_old + [new_ready], [1, 2])
+
+        # The adopted rollout ramp is only 10, but raw demand keeps all 35
+        # READY old backends as the coverage floor. Never-served old launches
+        # add no coverage and are retired first.
+        self.assertEqual(set(retired),
+                         {info.replica_id for info in nonready_old})
+
+    def test_logical_rollout_protects_busy_and_unknown_old_backends(self):
+        autoscaler = self._logical_mid_update(target=1, raw_target=1)
+        old = [_replica(i, version=1) for i in range(1, 31)]
+        new_ready = _replica(101, version=2)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    1: 1,
+                    101: 0,
+                },
+                unknown=(2,),
+                observed_slots={101: 1})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(len(retired), 20)
+        self.assertNotIn(1, retired)
+        self.assertNotIn(2, retired)
+
 
 class TestUpdateVersion(unittest.TestCase):
     """Version updates re-read the knob; stale versions are inert."""
