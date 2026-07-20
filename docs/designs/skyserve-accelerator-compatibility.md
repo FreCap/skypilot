@@ -329,12 +329,14 @@ SkyPilot changes:
   compatible physical backend, but it must not satisfy one card's shortfall
   with another card. Logical retirement, including controller-restart and HA
   recovery, must prove both the aggregate target and every exact-card target
-  remain covered by ready or durably committed capacity. When an exact-card
-  catalog exists but the compatibility report is incomplete, the controller
-  explicitly revokes retirement authority, so an aggregate target or an older
-  exact target cannot authorize adoption or teardown. During a catalog-
-  changing rollout, an old-version card removed from the new catalog may
-  retire once aggregate capacity and every new exact-card target remain
+  remain covered by ready capacity. Durably committed provisioning capacity
+  suppresses duplicate launches, but does not keep a healthy uncommitted drain
+  off route when its exact card has a ready-capacity shortfall. When an exact-
+  card catalog exists but the compatibility report is incomplete, the
+  controller explicitly revokes retirement authority, so an aggregate target
+  or an older exact target cannot authorize adoption or teardown. During a
+  catalog-changing rollout, an old-version card removed from the new catalog
+  may retire once aggregate capacity and every new exact-card target remain
   covered; it does not have to masquerade as a current compatible card.
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.

@@ -4455,15 +4455,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             return 'abort'
         if snapshot.generation < target_generation:
             return 'wait'
-        if (require_victim_idle and
-                not self._logical_retirement_victim_is_idle(info, snapshot)):
-            return 'wait'
 
         # A same-version demand rebound does not invalidate every accepted
         # retirement. Recompute against the current target instead. Since
         # _logical_ready_capacity excludes all off-route rows, callers abort
         # and reactivate only enough victims to cover a real shortfall; the
-        # remainder can continue draining without fleet-wide churn.
+        # remainder can continue draining without fleet-wide churn. Check
+        # route coverage before the victim's idle proof: idleness gates
+        # destructive teardown, not re-advertising a still-running backend.
         replica_infos = serve_state.get_replica_infos(self._service_name)
         excluded_ids = {info.replica_id}
         ready_capacity = self._logical_ready_capacity(replica_infos, snapshot,
@@ -4474,26 +4473,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         ready_covers_target = (ready_capacity >= current_target and
                                self._logical_card_capacity_covers(
                                    ready_by_accelerator, target_by_accelerator))
-        if ready_covers_target:
-            return 'safe'
-        committed_capacity = self._logical_committed_capacity(
-            replica_infos, snapshot, version, excluded_ids)
-        committed_by_accelerator = (
-            self._logical_committed_capacity_by_accelerator(
-                replica_infos, snapshot, version, excluded_ids,
-                accelerator_shapes) if accelerator_shapes else {})
-        committed_covers_target = (committed_capacity >= current_target and
-                                   self._logical_card_capacity_covers(
-                                       committed_by_accelerator,
-                                       target_by_accelerator))
-        if committed_covers_target:
-            # A scale-up decision may already have persisted enough
-            # current-version capacity even though those backends are not
-            # ready yet. Keep the old victim off route while that capacity
-            # materializes instead of duplicating the scale-up by
-            # re-advertising the retiring fleet.
+        if not ready_covers_target:
+            return 'abort'
+        if (require_victim_idle and
+                not self._logical_retirement_victim_is_idle(info, snapshot)):
             return 'wait'
-        return 'abort'
+        return 'safe'
 
     @staticmethod
     def _logical_ready_capacity(
@@ -4591,85 +4576,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             ready[card] += min(int(getattr(candidate, 'planned_capacity', 1)),
                                observed)
         return ready
-
-    @staticmethod
-    def _logical_committed_capacity(
-            replica_infos: list[ReplicaInfo],
-            snapshot: LogicalReconcileSnapshot, version: int,
-            excluded_replica_ids: set[int] | frozenset[int]) -> int:
-        """Return non-retiring capacity already pinned to the target.
-
-        Ready old-version backends contribute the same conservative one-slot
-        bridge as the final retirement fence. Current-version backends use
-        their observed width when it is fresh and their immutable planned
-        width only while they are still provisioning. A READY backend with
-        unknown capacity remains unavailable for a retirement coverage proof.
-        """
-        committed_capacity = 0
-        for candidate in replica_infos:
-            if (candidate.replica_id in excluded_replica_ids or
-                    candidate.is_terminal or
-                    getattr(candidate.status_property, 'is_scale_down',
-                            False) is True):
-                continue
-            if candidate.version < version:
-                if candidate.is_ready:
-                    committed_capacity += 1
-                continue
-            if candidate.version != version:
-                continue
-            planned = int(getattr(candidate, 'planned_capacity', 1))
-            observed = snapshot.observed_slots_by_replica_id.get(
-                candidate.replica_id)
-            if not candidate.is_ready:
-                if candidate.status_property.first_ready_time is None:
-                    committed_capacity += planned
-                continue
-            if (observed is None or
-                    candidate.replica_id in snapshot.unknown_replica_ids):
-                continue
-            committed_capacity += min(planned, max(0, observed))
-        return committed_capacity
-
-    @classmethod
-    def _logical_committed_capacity_by_accelerator(
-        cls,
-        replica_infos: list[ReplicaInfo],
-        snapshot: LogicalReconcileSnapshot,
-        version: int,
-        excluded_replica_ids: set[int] | frozenset[int],
-        accelerator_shapes: LogicalAcceleratorState,
-    ) -> dict[str, int]:
-        """Return non-retiring committed capacity by exact card."""
-        committed = {card: 0 for card, _ in accelerator_shapes}
-        for candidate in replica_infos:
-            if (candidate.replica_id in excluded_replica_ids or
-                    candidate.is_terminal or
-                    getattr(candidate.status_property, 'is_scale_down',
-                            False) is True or candidate.version > version):
-                continue
-            card = cls._logical_replica_accelerator(
-                candidate,
-                accelerator_shapes,
-                require_configured_shape=(candidate.version == version))
-            if card is None:
-                continue
-            if candidate.version < version:
-                if candidate.is_ready:
-                    committed[card] += 1
-                continue
-            planned = int(getattr(candidate, 'planned_capacity', 1))
-            observed = snapshot.observed_slots_by_replica_id.get(
-                candidate.replica_id)
-            if not candidate.is_ready:
-                if candidate.status_property.first_ready_time is None:
-                    committed[card] += planned
-                continue
-            if (observed is None or
-                    candidate.replica_id in snapshot.unknown_replica_ids):
-                continue
-            committed[card] += min(planned, max(0, observed))
-        return committed
 
     @staticmethod
     def _logical_card_capacity_covers(
@@ -5053,27 +4959,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._clear_logical_retirement_recovery_if_done()
                 return
 
-            committed_capacity = self._logical_committed_capacity(
+            ready_capacity = self._logical_ready_capacity(
                 replica_infos, snapshot, self.latest_version,
                 frozenset(recovering_ids))
-            committed_by_accelerator = (
-                self._logical_committed_capacity_by_accelerator(
-                    replica_infos, snapshot, self.latest_version,
-                    frozenset(recovering_ids), accelerator_shapes)
-                if accelerator_shapes else {})
+            ready_by_accelerator = (self._logical_ready_capacity_by_accelerator(
+                replica_infos, snapshot, self.latest_version,
+                frozenset(recovering_ids), accelerator_shapes)
+                                    if accelerator_shapes else {})
             shortfall_by_accelerator = {
-                card: max(0, target - committed_by_accelerator.get(card, 0))
+                card: max(0, target - ready_by_accelerator.get(card, 0))
                 for card, target in target_by_accelerator
             }
-            if (committed_capacity < current_target or
+            if (ready_capacity < current_target or
                     any(shortfall_by_accelerator.values())):
-                shortfall = max(0, current_target - committed_capacity)
+                shortfall = max(0, current_target - ready_capacity)
                 reactivated_capacity = 0
                 reactivated_count = 0
                 # Prefer current-version victims because their immutable
                 # logical width is authoritative.  Old-version victims remain
                 # a valid availability bridge, but count as one conservative
-                # slot each, matching _logical_committed_capacity.
+                # slot each, matching _logical_ready_capacity.
                 ordered_candidates = sorted(
                     candidates,
                     key=lambda candidate:
@@ -5099,7 +5004,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 shortfall_by_accelerator.get(card, 0) <= 0):
                             continue
                     self._abort_logical_retirement(
-                        info, 'current capacity is below the recovered target')
+                        info,
+                        'current ready capacity is below the recovered target')
                     recovering_ids.discard(info.replica_id)
                     reactivated_capacity += candidate_capacity
                     if target_by_accelerator:
@@ -5108,8 +5014,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             0,
                             shortfall_by_accelerator[card] - candidate_capacity)
                     reactivated_count += 1
-                    aggregate_covered = (committed_capacity +
-                                         reactivated_capacity >= current_target)
+                    aggregate_covered = (ready_capacity + reactivated_capacity
+                                         >= current_target)
                     cards_covered = not any(shortfall_by_accelerator.values())
                     if ((aggregate_covered and cards_covered) or
                             reactivated_count >=
@@ -5121,8 +5027,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'Reactivated {reactivated_count} recovered logical '
                         f'retirements ({reactivated_capacity} conservative '
                         'slots) '
-                        f'to cover aggregate shortfall {shortfall} and '
-                        f'exact-card shortfalls {shortfall_by_accelerator}; '
+                        f'to cover a {shortfall}-slot aggregate and '
+                        f'exact-card ready-capacity shortfalls '
+                        f'{shortfall_by_accelerator}; '
                         'waiting for a newer observed-capacity generation.')
                 self._clear_logical_retirement_recovery_if_done()
                 return
