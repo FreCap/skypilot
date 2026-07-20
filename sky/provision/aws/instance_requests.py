@@ -169,9 +169,9 @@ def create_instances(
                     len(subnet_ids))
     per_subnet_tries = max_tries // num_subnets
     errors: list[dict[str, str]] = []
-    for i in range(max_tries):
+    for attempt_index in range(max_tries):
         # Try each subnet for per_subnet_tries times.
-        subnet_id = subnet_ids[i // per_subnet_tries]
+        subnet_id = subnet_ids[attempt_index // per_subnet_tries]
         try:
             network_interfaces = [{
                 'SubnetId': subnet_id,
@@ -194,17 +194,18 @@ def create_instances(
             # public IP in this case.
             if max_efa_interfaces > 1 and not associate_public_ip_address:
                 instance_type = conf['InstanceType']
-                for i in range(1, max_efa_interfaces):
+                for network_card_index in range(1, max_efa_interfaces):
                     interface_type = 'efa-only'
                     # Special handling for P5 instances
                     # Refer to https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-acc-inst-types.html#efa-for-p5 for more details. # pylint: disable=line-too-long
                     if (instance_type == 'p5.48xlarge' or
                             instance_type == 'p5e.48xlarge'):
-                        interface_type = 'efa' if i % 4 == 0 else 'efa-only'
+                        interface_type = ('efa' if network_card_index %
+                                          4 == 0 else 'efa-only')
                     network_interfaces.append({
                         'SubnetId': subnet_id,
                         'DeviceIndex': 1,
-                        'NetworkCardIndex': i,
+                        'NetworkCardIndex': network_card_index,
                         'AssociatePublicIpAddress': False,
                         'Groups': security_group_ids,
                         'InterfaceType': interface_type,
@@ -226,7 +227,8 @@ def create_instances(
                                  (is_known_single_zone_spot and error_code
                                   == _INSUFFICIENT_CAPACITY_ERROR_CODE))
             echo = logger.debug
-            if is_terminal_error or (i + 1) % per_subnet_tries == 0:
+            if (is_terminal_error or
+                (attempt_index + 1) % per_subnet_tries == 0):
                 # Print the warning only once per subnet
                 echo = logger.warning
             echo(f'create_instances: Attempt failed with {exc}')
@@ -236,7 +238,7 @@ def create_instances(
                 error.errors = errors
                 error.requested_count = count
                 raise error from exc
-            if (i + 1) >= max_tries:
+            if (attempt_index + 1) >= max_tries:
                 error = common.ProvisionerError(
                     'Failed to launch instances. Max attempts exceeded.')
                 error.errors = errors
