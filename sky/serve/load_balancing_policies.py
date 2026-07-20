@@ -286,7 +286,15 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             # (phantom capacity that would attract traffic on re-add).
             if replica_url not in self.load_map:
                 return
-            if (token is not None and token != self._generation[replica_url]):
+            if token is None:
+                # pre_execute_hook never accounted this request (the URL
+                # was pruned at dispatch time and it returned None), so
+                # there is no slot to release. Decrementing here would
+                # steal a live request's slot if the URL was re-added in
+                # between (ABA via the None token bypassing the
+                # generation guard below).
+                return
+            if token != self._generation[replica_url]:
                 # The increment belonged to a PREVIOUS generation of this
                 # URL (pruned and re-added since): releasing here would
                 # steal a slot from the new generation's streams (ABA).
