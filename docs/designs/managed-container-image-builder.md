@@ -98,8 +98,9 @@ programmatically constructed task must provide either an absolute root or an
 explicit absolute `base_dir`; a relative root without that base is rejected.
 The scanner resolves the root once, applies includes beneath that root, and
 rejects any resolved include or symlink target that escapes it. Neither the
-root nor `base_dir` is serialized to the server. Preflight replaces them with
-the committed context manifest ID and normalized build spec.
+root nor `base_dir` is serialized to the server. After scanning, build resolve
+replaces them with the logical root-manifest digest and, on a miss, the eventual
+committed context manifest ID.
 
 The builder API accepts only an ACTIVE catalog artifact with a compatible READY
 managed route as its base. It never resolves a public registry, performs DNS,
@@ -295,21 +296,35 @@ pending-upload count/bytes after confirmed cleanup, and leaves the unique build
 history for audited retry. No base or active-execution reference exists before
 context commit.
 
-Embedded task builds use a server-issued policy-preflight token. Before scanning
-the filesystem, the client sends the task's value-only build declaration to a
-bounded endpoint that runs server-side admin policy, validates every effective
+Embedded task builds use a server-issued static policy-preflight token. Before
+scanning the filesystem, the client sends the task's value-only declaration to
+a bounded endpoint that runs server-side admin policy, validates every effective
 resource candidate, and returns the compiled task plus a signed token binding
-user, workspace, compiled-task hash, normalized build spec, distribution,
-`linux/amd64`, and expiry. Policy may shape the build before that token is
-issued; it may not introduce or change a build afterward. V1 rejects an
+user, workspace, compiled-task hash, normalized static build declaration,
+distribution, `linux/amd64`, context-selection rules, and expiry. The static
+declaration includes the base selector, destination, setup/execution fields,
+tree/format versions, and include rules, but cannot contain the not-yet-computed
+`root_manifest_digest`, context manifest ID, bundle digest, or final spec hash.
+Local root and `base_dir` never enter it. Policy may shape this declaration
+before the token is issued; it may not introduce or change a build afterward.
+V1 rejects an
 embedded build before local scanning when any candidate is ARM64, unknown,
-missing an image, direct, incompatible, or resolves to a different build spec.
-The final submission replaces only the token-bound build with the READY
-artifact ID. The server verifies that substitution and uses the already
-policy-compiled task instead of applying a second possibly divergent mutation.
-An expired token can be refreshed only if policy produces the identical build
-contract; otherwise preflight restarts. Raw REST task submission with an
-unresolved build or without the token fails before request persistence.
+missing an image, direct, incompatible, or resolves to a different static build
+declaration.
+
+After scanning, `POST /images/builds/resolve` verifies that token, resolves the
+catalog base, computes the final spec hash from the static declaration plus base
+digest/platform and logical root digest, and durably stores the static-policy
+hash, compiled-task hash, root digest, and final spec hash on the build. A cache
+hit must match all four fields. The final submission supplies that build ID and
+replaces only its build declaration with the exact READY output artifact ID.
+The server verifies the substitution against the durable content binding and
+the same signed compiled task instead of applying a second possibly divergent
+mutation. An expired token can be refreshed only when policy produces the
+identical compiled task and static declaration hash; the durable build binding
+then remains valid. Otherwise preflight and resolve restart. Raw REST task
+submission with an unresolved build, missing static token, or mismatched durable
+content binding fails before request persistence.
 
 The SDK/CLI preflight owns that sequencing: after policy preflight it resolves
 the catalog base, performs cache resolution, uploads only on a miss, submits the build,
@@ -437,8 +452,8 @@ user-provided access key. The API issues a workspace- and upload-scoped
 capability with short expiry and presigned object URLs. Upload bytes travel
 directly between client and object store. The API and request database never
 proxy or retain them. Build Jobs receive short-lived read URLs for exactly one
-committed manifest and bundle. A bounded logging agent receives a finite set of
-create-only segment capabilities described below.
+committed manifest and bundle. A bounded logging agent may request only the
+finite, actual-length create-only segment sequence described below.
 
 Global values bound one upload, build output, cache write, or retained object;
 workspace values separately bound pending-upload count/bytes, committed context
@@ -456,10 +471,19 @@ metadata. After the resolve miss, the API creates an upload intent containing
 only bounded manifest length, claimed SHA-256 identity digest, MD5 transport
 checksum, entry/byte counts, and logical `root_manifest_digest`. It reserves
 that length and creates one random manifest object key. It
-returns one short-lived single-PUT manifest URL whose signed headers require
+returns an initial short-lived single-PUT manifest URL whose signed headers require
 the exact content length, `If-None-Match: *`, and the strongest checksum passed
 by the store probe: SHA-256 when supported, otherwise `Content-MD5`. MD5 is
-never an identity or cache key.
+never an identity or cache key. If that response or URL is lost, the
+authenticated uploader may request a replacement capability for the same upload
+intent. The transaction verifies workspace/uploader ownership,
+`MANIFEST_CREATED`, expiry, object absence, and the immutable
+key/length/SHA-256/MD5 claims, increments a bounded issuance counter, and signs a
+new expiry. A UUID idempotency key and request hash are retained; repeating the
+same pair re-signs equivalent authority without consuming another issuance,
+while key reuse with different claims fails. It cannot change bytes, create a second key, or revive a terminal
+upload. Existing URLs may overlap only for their short remaining lifetime and
+all authorize the same create-only object.
 After upload, an isolated platform-owned context-validator Job on the dedicated
 sandbox builder pool streams the
 pinned manifest object, verifies RFC 8785 bytes, schema, path and entry limits,
@@ -766,11 +790,16 @@ One `container_image_context_uploads` row contains only:
 id, build_id, workspace, uploader_id, state,
 tree_version, root_manifest_digest, entry_count,
 manifest_claimed_digest/length, manifest_bucket/key/version NULL,
+manifest_capability_generation/issue_count/last_issued_at,
+manifest_capability_idempotency_key/request_hash NULL,
 bundle_format NULL, bundle_claimed_digest/length NULL,
 bundle_bucket/key/version NULL, multipart_upload_id NULL,
 part_size/count NULL, reserved_manifest_bytes, reserved_bundle_bytes,
 manifest_validation_owner/token/expires_at NULL,
-validator_job_name/manifest_hash/observed_uid NULL,
+validator_job_name/network_policy_name NULL,
+validator_job_manifest_hash/network_policy_hash/resource_bundle_hash NULL,
+validator_observed_job_uid/network_policy_uid NULL,
+validator_broker_capability_epoch NULL,
 commit_idempotency_key/request_hash NULL,
 commit_owner/token/expires_at NULL,
 created_at, expires_at, updated_at, error_code NULL
@@ -799,10 +828,25 @@ change the counter in the same transaction. Configuration supplies limits but
 never replaces these durable counters. A bounded repair command recomputes one
 workspace from authoritative rows and records drift.
 
+The distribution design's 14-phase **Global PostgreSQL lock order** is the sole
+lock authority for these tables; this document does not define a competing
+builder order. In particular it places builder workspace quota and UTC-day
+usage in phase 2, builds in phase 6, uploads/parts/context object custody/cache
+records in phase 7, locations in phase 8, references in phase 9, and
+attempt/output/staging/log rows in phase 10. Resolve miss, bundle commit,
+scheduler admission, retry/reactivation, cancellation/cleanup, output
+publication, and cross-origin tombstone/purge use the exact phase sequences
+listed there. IDs are discovered without locks, every acquired row is
+revalidated, and no Kubernetes, registry, broker, or object-store call occurs
+inside the transaction. PostgreSQL crossed-path tests cover all adjacent and
+full mixed sequences before migration 024 can be approved.
+
 `container_image_builds` contains:
 
 ```text
 id, workspace, spec_hash, spec_version, builder_version, platform,
+static_policy_hash, compiled_task_hash, root_manifest_digest,
+resolve_idempotency_key, resolve_request_hash,
 base_image_id, base_digest, base_location_id NULL,
 base_reference_id NULL, base_profile_revision NULL,
 base_target_fingerprint NULL, base_policy_fingerprint NULL,
@@ -815,6 +859,12 @@ cache_outcome NULL, created_by, created_at, updated_at
 UNIQUE (workspace, spec_hash)
 UNIQUE (context_upload_id) WHERE context_upload_id IS NOT NULL
 ```
+
+Embedded builds require non-null `static_policy_hash` and
+`compiled_task_hash`; direct image-build commands mark their closed origin and
+leave only `compiled_task_hash` null. Every build requires the logical root
+digest and final spec hash before cache lookup or row creation. Named checks
+enforce those origin shapes.
 
 Only `context_upload_id` is set while a build is `CONTEXT_REQUIRED`; the
 bundle commit transaction atomically replaces it with `context_manifest_id`
@@ -847,33 +897,67 @@ nor bypasses either bound.
 ```text
 build_id, retry_generation, attempt_number,
 state PROVISIONING|RUNNING|JOB_SUCCEEDED|VERIFYING|PUBLISHING|SETTLING|TERMINAL,
-job_name, desired_manifest_hash, observed_job_uid NULL,
+job_name, network_policy_name, desired_job_manifest_hash,
+desired_network_policy_hash,
+desired_resource_bundle_hash, observed_network_policy_uid NULL,
+observed_job_uid NULL,
 create_owner/token/expires_at NULL, execution_owner/token/expires_at NULL,
-cancel_requested_at NULL, staging_reference, registry_token_hash,
+cancel_requested_at NULL, staging_reference, broker_capability_epoch,
 reserved_active_execution, reserved_staging_bytes, reserved_cache_bytes,
 started_at NULL, finished_at NULL, terminal_code NULL
 
 UNIQUE (build_id, retry_generation, attempt_number)
 UNIQUE (job_name)
+UNIQUE (network_policy_name)
 ```
 
 Scheduler admission commits the attempt in PROVISIONING, all quota
-reservations, a deterministic DNS-safe Job name derived from the attempt key,
-and a hash of the complete canonical Job manifest before Kubernetes I/O. A
-creator claims a short lease, reconstructs exactly that manifest, rechecks
-cancellation, and calls Create. Success or `AlreadyExists` is followed by GET.
-The controller adopts the Job only when SkyPilot ownership labels, attempt key,
-manifest hash, and immutable spec match; it then records the observed UID under
-the same token. A foreign or mismatched same-name object is never adopted or
-deleted and closes the attempt with `JOB_NAME_COLLISION`.
+reservations, deterministic DNS-safe Job and NetworkPolicy names derived from
+the attempt key, hashes of both canonical manifests, their complete resource
+bundle hash, and capability epoch before Kubernetes I/O. Helm has already
+installed a namespace-wide default-deny policy, a broker-only egress path, and
+one builder ServiceAccount with no Kubernetes RBAC. The ServiceAccount disables
+automatic token mounting. The Job explicitly projects only a short-lived,
+automatically refreshed service-account token for audience
+`skypilot-image-builder-broker`; Kubernetes binds it to that Pod UID. No
+per-attempt Secret or ConfigMap exists, and no presigned URL or registry token is
+embedded in a reconstructible Job manifest.
 
-A crash after database commit but before Create is a normal reclaimed Create.
-A lost Create response converges through deterministic GET/UID adoption.
+A creator claims a short lease, reconstructs both manifests, rechecks
+cancellation, and creates or adopts the attempt NetworkPolicy before the Job.
+The policy selects only the unique attempt labels and permits only deployment-
+qualified broker, internal-registry, and context/log egress gateways. Success or
+`AlreadyExists` is followed by GET for each object. The controller adopts an
+object only when SkyPilot ownership labels, attempt key, resource-bundle hash,
+its individual manifest hash, and immutable spec match, and records both
+observed UIDs under the same token. A foreign or mismatched same-name object is
+never adopted or deleted and closes the attempt with
+`NETWORK_POLICY_NAME_COLLISION` or `JOB_NAME_COLLISION`.
+
+The trusted capability broker validates the projected token with TokenReview,
+the bound Pod UID, Job ownership, recorded attempt/generation, resource-bundle hash,
+active state, and capability epoch on every mint. It can then reissue short-lived
+context-read URLs, one attempt-scoped internal-registry token, bounded log
+segment PUT capabilities, and a typed result PUT capability. The broker owns no
+catalog write path and the sandbox receives no cloud-registry credential. Token
+expiry therefore does not make a queued or long-running Job unreconstructible;
+a live matching Pod refreshes through the broker, while cancellation or
+settlement increments/revokes the epoch and prevents further minting. Already
+issued capabilities retain only their short bounded lifetime and cannot make an
+output READY without the independent verifier and fenced publisher.
+
+A crash after database commit but before either Create is a normal reclaimed
+Create. A lost NetworkPolicy or Job Create response converges through
+deterministic GET/UID adoption.
 Controller takeover requires an expired create/execution lease and repeats the
 same rules. Cancellation before Create moves directly to SETTLING. Cancellation
-racing Create records CANCEL_REQUESTED, GETs the matching UID, and deletes only
-that UID with a precondition; a replacement object with the same name is never
-touched. Job deletion, eviction, deadline, or node loss is observed by UID and
+racing Create records CANCEL_REQUESTED, revokes the capability epoch, GETs the
+matching Job UID, and deletes only that UID with a precondition; a replacement
+object with the same name is never touched. After the Job is terminal or proven
+absent, cleanup deletes only the matching NetworkPolicy UID and hash. Lost
+delete responses are reconciled by GET. Foreign or replaced policies are left
+untouched and surfaced for an administrator. Job deletion, eviction, deadline,
+or node loss is observed by UID and
 becomes a bounded retry or terminal failure. A stale controller can neither
 record a new UID nor settle quotas.
 
@@ -881,10 +965,14 @@ Completion records the exact internal-registry digest before moving to
 VERIFYING. Active-execution and worst-case byte reservations are released or
 reduced exactly once only after the observed Job UID is terminal/absent and all
 staging/cache outcomes have reached a fenced retained-or-absent state. The
-attempt row is retained for audit. Context-validator Jobs use the same
-deterministic name/hash/UID protocol with fields on the upload row, but never
-reserve paid build execution. Fault tests cover every database/Create/GET/UID,
-cancellation, node-loss, and settlement crash boundary.
+attempt row is retained for audit. A sweeper reconciles every nonterminal DB
+intent plus labeled orphan, but may adopt or delete only an exact recorded
+resource bundle. Context-validator Jobs use the same default deny, projected
+identity, broker, deterministic NetworkPolicy/Job name/hash/UID protocol with
+fields on the upload row, but receive only manifest GET/result PUT and never
+reserve paid build execution. Fault tests cover every database, policy Create,
+Job Create, GET/UID, broker refresh, cancellation, node-loss, cleanup, and
+settlement crash boundary.
 
 Automatic failures use bounded exponential backoff within one generation. A
 user/admin retry keeps the same build ID and immutable spec and never creates a
@@ -913,8 +1001,8 @@ another qualifying physical READY location does not change build identity.
 
 Every BuildKit attempt pushes to a create-only internal staging reference containing
 workspace, build ID, retry generation, attempt number, and a hash of the random
-lease token. It can never share or overwrite another attempt's tag. Push
-The token given to BuildKit is scoped by the internal registry auth service to that
+lease token. It can never share or overwrite another attempt's tag. The token
+given to BuildKit is scoped by the internal registry auth service to that
 one attempt target plus its workspace/platform cache. A stale attempt has no tag
 used by a later generation and no cloud registry authority. Attempt admission
 reserves active execution, the daily attempt, configured maximum staging-output
@@ -1018,8 +1106,10 @@ container RuntimeClass, rootless UID mapping, namespace, or node label alone is
 not tenant isolation.
 
 Helm creates one dedicated builder namespace at activation; build admission
-never creates Kubernetes namespaces. Each claim creates one single-attempt
-BuildKit Job and job-scoped network policy in that namespace. The sandbox gives
+never creates Kubernetes namespaces. It also creates the permanent default-deny
+policy, no-RBAC ServiceAccount, identity/capability broker, and qualified egress
+gateways. Each claim creates one single-attempt NetworkPolicy followed by its
+BuildKit Job in that namespace under the crash protocol above. The sandbox gives
 each pod its own guest, so the daemon and setup process share no guest with
 another workspace or attempt. The Job has no host Docker socket, host path, host PID/IPC/network,
 device pass-through, service-account API token, API database route, or unrelated
@@ -1031,13 +1121,18 @@ and result endpoints.
 Only bounded ephemeral volumes for BuildKit state, scratch space, the
 materialized read-only tree handoff, and typed result output are writable. The
 setup process receives no intentionally mounted presigned URL, registry token,
-BuildKit control socket, or Kubernetes token.
+BuildKit control socket, or Kubernetes token. The explicit audience-scoped
+projected token is mounted only into the trusted capability agent. It grants no
+Kubernetes RBAC and the agent exchanges it through the broker for attempt-
+scoped capabilities; the Job manifest itself remains free of expiring secrets.
 
 Kubernetes NetworkPolicy is pod-scoped, not container-scoped. The complete
 sandbox pod is therefore one network security principal. Process isolation
 prevents ordinary setup code from reading BuildKit/session state, but the threat
-model does not claim that a compromised guest kernel cannot steal the
-attempt-scoped internal-registry token or object capabilities. Such a token can
+model does not claim that a compromised guest kernel cannot steal the projected
+broker identity, attempt-scoped internal-registry token, or object capabilities.
+The broker identity can mint only while this exact recorded Pod UID, attempt,
+state, and capability epoch remain current. Such a registry token can
 write only this attempt's untrusted staging tag and this workspace/platform
 cache within hard byte/request/expiry bounds. It cannot read another workspace,
 obtain cloud registry credentials, or make output READY without independent
@@ -1134,6 +1229,7 @@ resource:
 POST /images/builds/policy-preflights
 POST /images/builds/resolve
 GET  /images/builds/{build_id}/upload?workspace=W
+POST /images/builds/{build_id}/upload/manifest/capability
 POST /images/builds/{build_id}/upload/manifest/commit
 POST /images/builds/{build_id}/upload/bundle
 POST /images/builds/{build_id}/upload/parts
@@ -1148,10 +1244,17 @@ GET  /images/builds/{build_id}/logs?workspace=W&cursor=C&limit_bytes=32768
 
 Resolve returns `200 ContainerImageBuild` for a verified cache hit or active
 coalescing. On a miss it returns `201 ContainerImageBuild` in CONTEXT_REQUIRED,
-including its upload ID, reserved manifest length, expiry, and the one
+including its upload ID, reserved manifest length, expiry, and an initial
 short-lived manifest PUT capability.
-That bearer capability is returned only once, is never logged or persisted by
-the client library, and is not available from upload status. Manifest commit
+Resolve carries a UUID idempotency key and request hash. A lost miss response is
+recovered by repeating it: the same uploader receives the same build/upload ID
+without a second quota reservation, then calls the capability route; a different
+request under that key fails closed.
+That bearer capability is never logged or persisted by the client library and
+is not available from upload status. The uploader-only capability route accepts
+a UUID idempotency key and can reissue only the row's identical create-only
+intent under the bounded generation/count rules above; it is rate-limited and
+never reveals a capability to another uploader or after upload expiry. Manifest commit
 returns `202` with VALIDATING state; the upload projection reports VALIDATED or
 a closed failure. Only then may bundle metadata reserve bytes and the parts
 route return signed URLs for at most 100 predetermined part numbers. Bundle
@@ -1169,17 +1272,41 @@ requested terminal state already matches.
 
 Build listing uses a value-validated opaque `(created_at, id)` keyset cursor,
 defaults to 50, and caps at 200. Detail returns one typed build and no log body.
-Logs are immutable create-only segments. Each attempt receives at most 64
-256-KiB data-segment capabilities plus one FINAL marker, all exact-length
-bounded under random attempt keys and signed with `If-None-Match: *`. The
-controller HEADs only those finite keys and inserts
-`container_image_build_log_segments` rows containing attempt, sequence,
-`DATA|FINAL` kind, pinned object identity, digest, and size. A missing sequence
-cannot make a later segment visible until reconciled, and FINAL closes the
-stream. The read cursor opaquely binds build/attempt, segment sequence, pinned
+Logs are immutable create-only segments. The trusted log agent buffers at most
+256 KiB, then asks the broker for the next sequence using the actual byte length
+and SHA-256. The broker permits only sequences 0 through 63, a cumulative
+16-MiB maximum, and the current attempt/capability epoch, and signs exact
+`Content-Length`, checksum, key, and `If-None-Match: *`. Thus every full segment
+may be 256 KiB and the last data segment may be any actual length from 1 through
+256 KiB without a padded or unsigned write; an empty stream has zero data
+segments. Segment evidence is HEAD-verified
+before the next sequence becomes issuable.
+
+Normal close writes one canonical-JSON FINAL marker containing attempt key,
+contiguous segment count, total bytes, SHA-256 of the concatenated byte stream,
+`truncated`, and a closed reason `PROCESS_EXIT|BYTE_LIMIT|CANCELLED`. FINAL is a
+separate create-only key. The controller validates its counts and digest and
+inserts `container_image_build_log_segments` rows containing attempt, sequence,
+`DATA|FINAL` kind, pinned object identity, digest, size, and close metadata. A
+missing sequence makes every later segment invisible and non-issuable until it
+is reconciled.
+
+Job termination does not depend on a surviving log agent. After a bounded grace
+period, a trusted log reconciler HEADs only the 64 deterministic data keys,
+chooses the longest contiguous prefix, deletes or quarantines any later orphan,
+streams at most 16 MiB to recompute the exact digest, and conditionally creates
+FINAL with `truncated=true` and `close_reason=LOGGER_LOST`. If a normal FINAL won
+the create race, it validates and adopts that marker instead. A conflicting
+marker closes with `LOG_FINAL_MISMATCH` and never exposes noncontiguous bytes.
+The reconciler is generation/attempt fenced, so a dead or cancelled logger
+always converges to one terminal stream and a stale logger cannot reopen it.
+
+The read cursor opaquely binds build/attempt, segment sequence, pinned
 generation, and byte offset. Responses cap at 64 KiB and each attempt at 16 MiB,
-return `next_cursor` and `truncated`, and never accept a raw object key or
-offset. Active detail polls at
+return `next_cursor`, `truncated`, and terminal close reason, and never accept a
+raw object key or offset. An active stream with a missing next segment returns
+its current contiguous prefix plus `terminal=false`; a terminal stream is
+defined only by the verified FINAL row. Active detail polls at
 five seconds while visible and backs off after errors; terminal detail does not
 poll. The API never creates request rows for polling.
 
@@ -1245,7 +1372,9 @@ Delivery has a pre-product decision point:
    syntax;
 2. implement a non-public builder prototype using the pinned frontend/BuildKit,
    exact catalog base, sandbox, internal OCI registry, trusted publisher, and
-   context encoder, but no migration 024, durable API, controller, or Build UI;
+   context encoder, plus the default-deny namespace, projected pod identity,
+   refreshable capability broker, and deterministic NetworkPolicy/Job bundle,
+   but no migration 024, durable public API, product controller, or Build UI;
 3. run the prototype on representative Boltz and one non-Python workload
    against external CI, including Docker/OCI base vectors and hostile sandbox
    conformance; and
@@ -1299,7 +1428,10 @@ conditional-create overwrite rejection, URL reuse, unexpected/chunked payload
 rejection, competing multipart-ID
 rejection, manifest reservation before its capability and separate bundle
 reservation before multipart creation, distinct manifest
-and bundle idempotency-request conflicts, every manifest-validation and
+and bundle idempotency-request conflicts, lost initial manifest-capability
+response plus owner-only identical reissue, reissue-count/expiry/rate limits,
+cross-uploader denial, create-only races between overlapping same-byte URLs,
+every manifest-validation and
 `UPLOADING -> COMMITTING -> COMMITTED` crash point, Complete response loss,
 exact-version or conditional-create ETag HEAD recovery, rejected and ambiguous
 object charging, and quota
@@ -1358,14 +1490,21 @@ OUTPUT_RETIRED transition and defensive lock-order revalidation for every
 artifact and location lifecycle state.
 
 Interface and operations tests cover task client preflight, server rejection
-and policy-token binding before request persistence, policy mutation/expiry,
+and static policy-token binding before request persistence, exclusion of the
+not-yet-known root digest from preflight, durable resolve-time content binding,
+final exact build-to-artifact substitution, policy mutation/expiry and
+identical-static-contract refresh,
 mixed AMD64/ARM64/unknown/direct candidate rejection before local scan, no
 embedded workload no-wait mode, direct typed
 `image_build(wait=False)`, top-level setup preservation, service/job
 snapshotting, direct typed mutation responses, RBAC route coverage, bounded
 reads plus immutable segmented logs, dashboard prepared-context flow and every
-disabled/quota/capability state, Helm security context, deterministic Job
-Create/AlreadyExists/UID/cancellation/node-loss recovery, per-call ECR limiter
+disabled/quota/capability state, Helm security context, permanent default deny,
+no-RBAC projected broker identity, deterministic NetworkPolicy and Job
+Create/AlreadyExists/UID/cancellation/node-loss/cleanup recovery, broker token
+refresh and capability-epoch revocation, foreign ancillary-object collision,
+normal short-final log segments, byte-limit FINAL, logger-loss synthetic FINAL,
+gap/orphan handling, final-digest mismatch, per-call ECR limiter
 contention in the trusted publisher, internal OCI staging/cache token
 scope/ownership/quota/GC, and live S3 plus R2 context-store capability and drift
 tests.

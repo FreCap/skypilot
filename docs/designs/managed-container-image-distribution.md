@@ -146,7 +146,13 @@ container_image_catalog_facets
 
 The literal DDL includes every foreign key, named check, partial uniqueness
 constraint, queue/claim index, active-revision join index, and catalog-query
-index described below. It creates external-OCI-only artifact provenance and
+index described below. The catalog singleton includes the nonnegative central
+config generation, 64-hex image-config digest, and bounded last-apply
+idempotency/request hashes used by the atomic activation protocol. Realm rows
+and allocations include the generation-qualified prefix fields and physical
+prefix uniqueness described below. The preexisting central `config_yaml` table
+is updated in the same transaction but is not recreated or counted as an image
+table. Migration 023 creates external-OCI-only artifact provenance and
 SOURCE-only canonical origins. It never creates the obsolete single-counter
 `container_image_workspace_catalogs` table or artifact-level source columns.
 There is no launchability backfill, `LEGACY_REPUBLISH_REQUIRED`, epoch table,
@@ -241,25 +247,26 @@ every supplied artifact ID, source alias, and release selector is bound to that
 artifact.
 
 The same final check deterministically renders the expected managed OCI
-reference from the current target, workspace, and artifact digest. Source
+reference from the current target, realm generation, immutable shard policy,
+workspace, and artifact digest. Source
 bindings select immutable import provenance but never contribute a repository
 path. The configured immutable power-of-two shard count uses the digest's
 leading bits to select a workspace repository, while the full digest identifies
-the manifest inside that repository. There is no arbitrary global maximum: the
+the manifest inside that repository. There is no single fixed shard count: the
 realm chooses a feasible count from both repository-count and
-images-per-repository quotas, with a configured administrative ceiling.
+images-per-repository quotas, within the public v1 ceiling of 256.
 This bounds provider resources without placing all artifacts under one
 images-per-repository quota. A READY row and pull plan cannot agree on a
 different digest-matching registry reference and thereby bypass the physical
 destination fingerprint, and rotating a failed import to an equivalent mirror
 cannot rename existing canonical or regional content.
 
-Changing a manager identity, pull-auth strategy, ownership boundary, or a
-realm that is not rendered into the namespace does not create a new artifact
-or physical location. It transfers an explicit policy revision onto the same
-verified bytes while no operation owns the row. Changing the registry
-endpoint, provider account, or rendered namespace creates a new physical
-location so old and new routes can coexist during migration.
+Changing a manager identity, pull-auth strategy, or ownership boundary does not
+create a new artifact or physical location. It transfers an explicit policy
+revision onto the same verified bytes while no operation owns the row. Changing
+the registry endpoint, provider account, realm generation, shard policy, or
+rendered generation-qualified namespace creates a new physical location so old
+and new routes can coexist during migration.
 
 The following is the target module split created by this PR, not a claim about
 the branch's current file tree. The foundation currently has `state.py`,
@@ -604,21 +611,27 @@ profile, target, Kubernetes/VM binding, and workspace policy field; credential
 references are selected by name and secret values are never fetched. The editor
 shows the normalized secret-free diff/fingerprint, requires an explicit
 monotonic revision on semantic changes, validates endpoint/locality ambiguity
-and quota feasibility server-side, and applies through the existing atomic
-configuration service. It offers YAML preview/export for GitOps users. It does
+and quota feasibility server-side, and applies through the managed-image
+compare-and-swap activation transaction described below. The raw Settings
+editor invokes that same transaction whenever its diff touches an image
+section. It offers YAML preview/export for GitOps users. It does
 not run Terraform or create cloud resources from the browser; it links exact
 module/preflight commands and refreshes observed readiness. Read-only users see
 only the topology projection above.
 
 ### Dashboard API contract
 
-The unpaginated asynchronous `GET /images` and existing SDK/CLI response remain
-compatible. The dashboard adds direct, authenticated, bounded read operations:
+The asynchronous `GET /images` and existing SDK/CLI response shape remain
+compatible. Without an exact selector it has a hard 1,000-artifact response
+ceiling and fails with `IMAGE_STATUS_REQUIRES_PAGINATION` instead of returning a
+partial result; large catalogs use the direct catalog API. The dashboard adds
+direct, authenticated bounded reads and one bounded admin compare-and-swap:
 
 ```text
-GET /images/catalog?workspace=W&limit=50&cursor=C
-    [&selector=S][&state=READY][&lifecycle=ACTIVE]
-    [&distribution=P][&target=T][&canonical=true]
+GET /images/catalog?workspace=W&limit=50&cursor=C[&selector=S]
+GET /images/catalog?workspace=W&limit=50&cursor=C&lifecycle=ACTIVE
+GET /images/catalog?workspace=W&limit=50&cursor=C&distribution=P
+    [&target=T][&state=READY][&canonical=true]
 GET /images/artifacts/{artifact_id}?workspace=W
 GET /images/artifacts/{artifact_id}/locations?workspace=W&limit=50&cursor=C
     [&current_only=true]
@@ -631,33 +644,41 @@ POST /images/admin/config/apply
 
 These FastAPI routes are synchronous `def` handlers so blocking PostgreSQL
 work runs in the framework threadpool. They return typed responses directly
-and never create request rows, logs, or executor work. Mutations remain on the
-existing asynchronous request protocol. A dashboard tab therefore performs
-bounded reads, not a stream of request-table writes.
+and never create request rows, logs, or executor work. Catalog lifecycle and
+publication mutations remain on the existing asynchronous request protocol;
+admin config apply is the one direct, bounded PostgreSQL compare-and-swap. A
+dashboard tab therefore performs bounded reads, not a stream of request-table
+writes.
 
 The three `/images/admin/config` routes are admin-only typed projections over
-the existing API-server configuration transaction. GET returns only image
+the managed-image activation transaction shared with the raw configuration
+editor. GET returns only image
 distribution sections plus capability/infrastructure status. Validate accepts a
 complete proposed image subsection, normalizes it, performs parser/profile/
 quota checks, and returns a secret-free diff without mutation. Apply requires
 that diff's hash plus the current config generation, rejects a stale generation,
-and updates only those sections through the same atomic writer used by the raw
-Settings editor. It cannot read or replace secret values. These routes do not
-create a second source of configuration truth.
+and updates only those sections. It cannot read or replace secret values. These
+routes do not create a second source of configuration truth. The ordinary raw
+Settings editor detects an image-section diff, produces the same normalized
+proposal and hash, and calls the same activation helper rather than the legacy
+best-effort reload hook.
 
 `/images/catalog` returns `ContainerImageCatalogPage` with `items`, an opaque
 `next_cursor`, and `has_more`. The cursor contains a versioned, value-validated
 keyset boundary and is never a raw SQL fragment or offset. `limit` defaults to
 50 and is bounded to 200. A selector is resolved by the same ambiguity-safe
-artifact/release/source logic as operational commands. State, distribution,
-target, lifecycle, and canonical filters use the transactionally maintained
+artifact/release/source logic as operational commands. Lifecycle alone, or
+distribution with optional state, target, and canonical filters, use the
+transactionally maintained
 catalog-facet indexes described below. They never walk the artifact ordering
 index hoping to encounter a selective match and never load the whole workspace
 in memory. Each page joins its one-row summaries and batch-loads bounded aliases;
 it never materializes every location row for the page. Catalog polling refreshes only the first visible
 page every 15 seconds while the tab is visible, backs off after errors, and
 never resets the user's cursor or open dialog. Detail polling uses the direct artifact
-endpoint, and publish progress uses the direct publication endpoint.
+endpoint, and publish progress uses the direct publication endpoint. State,
+target, or canonical without distribution is rejected before database access.
+An exact selector is mutually exclusive with every list filter.
 
 `/images/profiles` returns `ContainerImageProfileSummary` for only the resolved
 workspace. It is produced from validated profile models and a dedicated
@@ -723,7 +744,7 @@ container_registries:
       realm: boltz-production
       realm_generation: 1
       repository_shards: 16
-      namespace: skypilot/{organization}/{workspace}
+      namespace: skypilot/{organization}/{workspace}/g{realm_generation}
       canonical:
         provider: aws
         account: "699..."
@@ -783,7 +804,12 @@ Defaults mean models do not repeat registry choices. A task-level
 `distribution` is an override within the workspace allowlist, not a credential
 or endpoint declaration. `realm_generation` and `repository_shards` are copied
 from the Terraform output, are identical across managed profiles sharing that
-realm generation, and are immutable after the first allocation. The general
+realm generation, and are immutable after the first allocation. A managed
+namespace must contain both `{workspace}` and `{realm_generation}`; the renderer
+appends `/shard-<fixed-width-prefix>` selected from the declared shard count.
+The rendered generation prefix, realm generation, and shard count are always
+part of destination identity even if another literal field happens to repeat.
+The general
 parser ceiling remains 128 platforms, but an administrator must deliberately
 raise the workspace bound and pass the repository-feasibility proof before a
 multi-platform fleet is admitted.
@@ -813,8 +839,9 @@ workspace limit. Quota counters are repaired from source tables by a bounded
 operator reconciliation job and never trusted to authorize a negative count.
 
 `revision` is a positive monotonic administrator-controlled generation for the
-complete profile. Any endpoint, ownership, identity, auth, namespace, or target
-edit must increment it. `container_image_profile_heads` stores the one active
+complete profile. Any endpoint, ownership, identity, auth, namespace, realm
+generation, shard count, or target edit must increment it. The complete revision
+fingerprint includes all of those fields. `container_image_profile_heads` stores the one active
 revision and fingerprint. `container_image_profile_revisions` retains every
 accepted secret-free normalized revision, and
 `container_image_target_custodies` retains each revision/target's provider,
@@ -853,9 +880,57 @@ parser or location API. The final revision compare-and-swap must affect exactly
 one row; a concurrent activation is surfaced for retry rather than silently
 reported as applied.
 
-A managed namespace must include `{workspace}`. Cross-workspace physical
-deduplication would require a global reference and eviction authority model;
-the workspace-scoped catalog deliberately refuses to pretend it has one.
+### Atomic configuration and profile activation
+
+The central PostgreSQL configuration row and image profile heads are one
+authority boundary. Migration 023 extends the singleton
+`container_image_catalog` row with `active_config_generation`,
+`active_image_config_digest`, and the last apply idempotency key/request hash.
+The database-backed API-server config writer is refactored so every whole-config
+update locks the existing `config_yaml` row and this catalog singleton first,
+compares the submitted generation, and commits through one caller-owned
+PostgreSQL session. A file- or PVC-backed API server may edit ordinary local
+configuration, but it cannot activate managed images; managed-image activation
+requires the central PostgreSQL config row.
+
+Validation and provider capability probes run before the transaction and
+produce bounded, secret-free evidence digests. The apply transaction then
+rereads and normalizes the complete proposed config, verifies its diff hash and
+evidence generations, follows the global lock phases, inserts immutable realm,
+profile-revision, and custody rows, advances every changed profile head, writes
+the complete YAML value, and increments the singleton generation/digest in one
+commit. All changed profile keys are sorted. Removing a profile first moves its
+retained custody to DRAINING and is rejected when that would orphan active
+authority. No cloud, registry, filesystem, ConfigMap, or secret-provider I/O
+occurs under the transaction.
+
+Both the typed image editor and raw Settings editor use this helper. A raw edit
+that does not change image configuration still takes the same config-row
+compare-and-swap, so it cannot overwrite a concurrent image activation. A
+repeated idempotency key with the same request hash returns the committed
+generation; reuse with different bytes fails closed. A crash before commit
+changes neither config nor heads. A crash or lost response after commit is
+recovered from the recorded generation and idempotency result, so config
+revision 2 with profile head 1, or the reverse, is not a representable state.
+
+Commit emits PostgreSQL `NOTIFY` only as a wakeup. Every API and worker replica
+also polls the singleton generation, reloads the complete DB config, validates
+its digest, and records the locally loaded generation. Managed-image request
+admission, queue claim, and final transition compare that generation under the
+phase-1 catalog lock; a stale or failed replica returns
+`IMAGE_CONFIG_RELOAD_PENDING` or skips work until it converges. Ordinary
+non-image operations remain available. The in-process reload hook and
+Kubernetes ConfigMap mirror are post-commit conveniences, never authority and
+never a way to advance a profile head. Activation remains disabled during a
+mixed-version rollout until every participating API, controller, and worker
+advertises this generation protocol.
+
+A managed namespace must include `{workspace}` and `{realm_generation}`.
+Cross-workspace physical deduplication would require a global reference and
+eviction authority model; the workspace-scoped catalog deliberately refuses to
+pretend it has one. Profile validation rejects a managed namespace that could
+render the same generation-qualified repository prefix as another realm
+generation on the same provider/account/region/registry authority.
 
 Kubernetes is explicit because a registry being close to a cluster does not
 prove that its nodes or service accounts can pull it:
@@ -1032,29 +1107,35 @@ Dashboard results may be temporarily stale under detected projection drift;
 launch, purge, quota, and worker decisions never read these tables.
 
 The catalog API accepts only these indexed filter shapes: no filter; lifecycle
-alone; current location state alone; or distribution with optional target,
-state, and canonical flag. `target` or `canonical` without `distribution` is a
-400 error. Exact artifact, release, and source selectors use their authority
-indexes. Literal migration 023 creates separate indexes for lifecycle,
-state-plus-active-revision join, and each prefix of the allowed distribution
-shape, all ending in copied artifact `(created_at DESC, id DESC)`. Filtered
-queries start in facets, join profile heads, deduplicate one bounded page of
-artifact IDs, then load artifacts and revision-independent summaries in a fixed
-number of statements. An artifact's authoritative `location_count` is locked
-on insertion and has a database check of 0 through 128; workspace policy may
-set a lower limit. That hard bound, not an unenforced configuration promise,
-caps page fan-out. Unfiltered pages use the artifact ordering index directly.
+alone; or distribution with optional target, state, and canonical flag. State,
+target, or canonical without distribution is a 400 error. Exact artifact,
+release, and source selectors use their authority indexes. Literal migration
+023 creates separate indexes for lifecycle and each prefix of the allowed
+`(workspace, distribution, active_profile_revision, target, state, canonical,
+artifact_created_at DESC, artifact_id DESC)` shape. A distribution query first
+loads its single active head, then uses that exact revision in the facet index;
+it never scans historical revisions or an unbounded set of profile heads.
+Filtered queries deduplicate one bounded page of artifact IDs, then load
+artifacts and revision-independent summaries in a fixed number of statements.
+An artifact's authoritative `location_count` is locked on insertion and has a
+database check of 0 through 128; workspace policy may set a lower limit. That
+hard bound, not an unenforced configuration promise, caps duplicate qualifying
+facets per artifact. Unfiltered pages use the artifact ordering index directly.
 
 ### `container_image_realm_generations` and `container_image_realm_allocations`
 
 One immutable realm-generation row stores the Terraform-declared workspace
-capacity, power-of-two shard count, quota/inventory snapshot digest, and
-ownership identity. One allocation row per `(realm_generation_id, workspace)`
-reserves a stable namespace slot. The first managed-profile activation locks the
-realm generation and creates the allocation before any repository intent. Both
-rows are retained while any artifact, location, publication, or audit tombstone
-uses the realm. This is capacity authority only, not cloud state; the provider
-adapter still proves repository ownership and handles quota drift.
+capacity, power-of-two shard count, generation-qualified prefix template,
+quota/inventory snapshot digest, and ownership identity. One allocation row per
+`(realm_generation_id, workspace)` reserves a stable namespace slot and its
+fully rendered generation prefix. The first managed-profile activation locks
+the realm generation and creates the allocation before any repository intent.
+A uniqueness constraint over provider, account/project, region, registry
+authority, and rendered generation prefix prevents two generations from
+claiming the same repository set. Both rows are retained while any artifact,
+location, publication, or audit tombstone uses the realm. This is capacity
+authority only, not cloud state; the provider adapter still proves repository
+ownership and handles quota drift.
 
 ### `container_image_registry_limiters` and
 `container_image_registry_permit_leases`
@@ -1063,8 +1144,9 @@ Registry rate authority is global per `(provider, account, region,
 operation_class)`, not per pod. One limiter row stores the applied quota
 snapshot, conservative token capacity/refill rate, last-refill timestamp,
 available weighted tokens, and shared penalty-until time for
-`REPOSITORY_MUTATION`, `LAYER_CHECK`, `LAYER_INITIATE`, `LAYER_PART`,
-`LAYER_COMPLETE`, `MANIFEST_PUT`, `VERIFY`, and `DELETE`. Each admitted provider
+`AUTH_TOKEN`, `METADATA_READ`, `REPOSITORY_MUTATION`, `LAYER_CHECK`,
+`LAYER_READ`, `LAYER_INITIATE`, `LAYER_PART`, `LAYER_COMPLETE`,
+`MANIFEST_READ`, `MANIFEST_PUT`, `VERIFY`, and `DELETE`. Each admitted provider
 operation creates its own permit-lease row with owner, random-token hash,
 resource ID, weight, expiry, and observed outcome. Acquisition locks the limiter,
 refills from elapsed database time, reclaims expired leases, consumes tokens,
@@ -1073,8 +1155,23 @@ token. A throttle extends the shared penalty and lowers the effective refill
 rate under bounded recovery. An aggregate counter is never used as a substitute
 for independently expirable owners.
 
-Every AWS adapter call acquires its matching permit immediately before that
-call. The v1 copy/publisher adapters traverse a bounded manifest graph and own
+Every ECR API call made by the distribution worker or trusted publisher
+acquires its matching permit immediately before that call. A closed adapter
+mapping assigns `GetAuthorizationToken` to `AUTH_TOKEN`; repository and tag
+describes to `METADATA_READ`; create/tag/policy mutation to
+`REPOSITORY_MUTATION`; `BatchCheckLayerAvailability`,
+`GetDownloadUrlForLayer`, `InitiateLayerUpload`, `UploadLayerPart`, and
+`CompleteLayerUpload` to their corresponding layer classes; `BatchGetImage` to
+`MANIFEST_READ`; `PutImage` to `MANIFEST_PUT`; `DescribeImages` and
+`ListImages` to `VERIFY`; and manifest/repository deletion to `DELETE`. Adding
+an ECR call without registering an operation class fails an adapter test and a
+runtime assertion before the SDK invocation. Authorization tokens are cached
+only until their bounded refresh margin and every mint is paced. Service
+Quotas, CloudWatch, Terraform, and the explicit operator inventory command are
+control-plane probes with their own bounded AWS SDK retry policy, not hidden
+data-plane calls covered by this invariant.
+
+The v1 copy/publisher adapters traverse a bounded manifest graph and own
 the ECR layer and manifest APIs directly, so they can pace actual calls. They do
 not hand credentialed pushes to an opaque subprocess. A local token bucket may
 reduce database chatter only by leasing a bounded, expiring token tranche that
@@ -1192,7 +1289,8 @@ One row per artifact and materialization identity:
 - distribution name and target display name;
 - lowercase 64-hex physical destination fingerprint, separate lowercase
   64-hex policy fingerprint, profile revision, target-custody ID, realm
-  generation ID, and immutable shard count;
+  generation ID, immutable shard count, and rendered generation-qualified
+  workspace prefix;
 - canonical flag, exact expected digest, and for a regional copy the exact
   canonical location ID for the same revision;
 - for a canonical location, closed `origin_kind SOURCE|BUILD` plus exactly one
@@ -1204,7 +1302,11 @@ One row per artifact and materialization identity:
   generation/attempt/token-bound `BUILD_OUTPUT` lease kind.
 
 The physical fingerprint excludes profile and target aliases as well as auth
-configuration. One physical destination cannot be canonical in one profile
+configuration, but always includes provider authority, account/project,
+endpoint, rendered generation-qualified workspace prefix, realm generation,
+and shard count. The destination reference is derived from exactly those fields,
+the digest-selected shard, and the full artifact digest. One physical
+destination cannot be canonical in one profile
 and an evictable cache in another. A uniqueness constraint also prevents two
 logical locations for one artifact from publishing the same physical manifest
 reference. Renaming a target alias in a new profile revision transfers that
@@ -1306,25 +1408,49 @@ uses the same phases, with keys sorted lexicographically inside each phase:
 
 | Phase | Rows or locks |
 | --- | --- |
-| 1 | workspace quota, realm generation/allocation, and independent registry limiter rows |
-| 2 | profile head, immutable revision, and target custody |
-| 3 | workspace/digest advisory keys |
-| 4 | artifacts |
-| 5 | producer rows, sources or builds |
-| 6 | canonical locations, then regional locations |
-| 7 | consumer references, build attempts, and build-output leases |
-| 8 | publications |
-| 9 | releases |
-| 10 | audit/outbox append rows |
+| 1 | catalog singleton/config generation and central `config_yaml` row |
+| 2 | distribution workspace quota, builder workspace quota, builder UTC-day usage, then realm generation/allocation |
+| 3 | profile head, immutable revision, and target custody |
+| 4 | workspace/digest advisory keys |
+| 5 | artifacts |
+| 6 | producer rows: sources, then builds |
+| 7 | context uploads and part evidence, context manifests/object custody, then build-cache records |
+| 8 | canonical locations, then regional locations |
+| 9 | consumer references |
+| 10 | build attempts, build-output leases, staging custody, then build-log segment metadata |
+| 11 | publications |
+| 12 | releases |
+| 13 | catalog summaries and facets |
+| 14 | audit/outbox append rows |
 
-Registry permits are acquired in their own short transaction and never while a
-catalog lock is held. No provider or object-store I/O occurs while holding the
-catalog phases. A path that does not need an earlier phase simply starts at its
-first required phase; it may never acquire an earlier phase afterward.
-Release-name recovery, tombstone, builder finalization, publication fast paths,
-and batch publication all resolve IDs first and then follow this order. Batch
-work locks all keys in one phase before moving to the next. This table is the
-authority over prose in individual lifecycle sections.
+Within a phase, table rank is the order shown and primary keys are sorted
+lexicographically; a multi-workspace operation sorts workspace before table
+rank. Object-store keys and staging references are custody fields on their phase
+7 or phase 10 owner row, never an independently locked hidden resource.
+Registry limiter and permit rows use their own short transaction, lock limiter
+then permit key, and are never held with any catalog phase. No provider,
+Kubernetes, secret-provider, filesystem, or object-store I/O occurs while
+holding these locks.
+
+A path that does not need an earlier phase simply starts at its first required
+phase; it may never acquire an earlier phase afterward. All foreign keys and
+candidate IDs are discovered without locks before the mutation begins, then
+revalidated after acquisition. Release-name recovery, tombstone, builder
+finalization, publication fast paths, and batch publication all follow this
+order. Batch work locks all keys in one phase before moving to the next. The
+shared builder contract maps its mixed paths explicitly: resolve miss uses
+1/2/5/6/7, bundle commit uses 1/2/3/5/6/7/8/9, scheduler admission uses
+1/2/6/10, and retry/reactivation uses 1/2/3/5/6/7/8/9/10. Intake cancellation
+uses 1/2/6/7; active cancellation that has output custody uses
+1/2/3/5/6/7/8/9/10/13/14. Output publication uses
+1/2/3/4/5/6/8/10/13/14, and artifact tombstone/purge walks
+1/2/5/6/7/8/9/10/11/12/13/14. Every managed-image mutation and worker claim
+takes `FOR KEY SHARE` on the phase-1 catalog singleton and verifies its locally
+loaded config generation; config apply takes `FOR UPDATE` on the singleton and
+central config row in sorted key order. A transaction may omit other
+unused phases but never reorder the ones it uses. Concurrency tests exercise every adjacent
+overlap and the full crossed mixed-path graph. This table is the authority over
+prose in both canonical designs.
 
 ## Deployment lifecycle
 
@@ -1855,11 +1981,13 @@ closed `REPOSITORY_QUOTA_EXHAUSTED` and
 quota/headroom runbook.
 
 An existing namespace never silently changes shard count. Capacity expansion
-creates a new namespace generation and profile revision, directs new writes to
-it, keeps old READY routes readable, lazily prepares content on observed use,
-and retains old durable references until they drain. Only then does ordinary
-ownership-fenced lifecycle purge the old generation. The migration has no
-all-artifact eager-copy step.
+creates a new realm generation whose mandatory `{realm_generation}` rendering
+produces a different repository prefix, plus a new profile revision. Activation
+proves the new prefix does not overlap any retained generation before it directs
+new writes there. It keeps old READY routes readable, lazily prepares content
+on observed use, and retains old durable references until they drain. Only then
+does ordinary ownership-fenced lifecycle purge the old generation. The
+migration has no all-artifact eager-copy step.
 
 Terraform outputs a secret-free profile fragment without `revision`, plus the
 complete normalized `profile_fingerprint`. The administrator supplies the
@@ -2023,6 +2151,8 @@ sky image publish --artifact-id UUID --release RELEASE \
 sky image status [ARTIFACT|RELEASE|REF]
 sky image prepare IMAGE --targets TARGET[,TARGET...] [--distribution NAME]
 sky image retry IMAGE --target TARGET
+sky image infrastructure inventory aws --account ACCOUNT --regions R[,R...] \
+    --output inventory.json                         # admin/read-only
 sky image publication release-name PUBLICATION_ID --reason CODE --yes # admin
 sky image tombstone --artifact-id UUID --reason CODE --yes       # admin
 sky image purge --artifact-id UUID [--retry] --yes               # admin
@@ -2115,10 +2245,13 @@ current-only, and historical location-detail pages for the highest-cardinality
 artifact. Each request must issue a constant number of SQL statements, avoid
 disk spill and sequential million-row scans, and complete under 200 ms p95 on
 the release benchmark host. An unfiltered page may examine at most twice its
-artifact limit. A filtered page must use an exact facet index and may examine at
-most `limit * 128` facet rows under the database-enforced per-artifact hard
-bound to deduplicate one page; an exact zero-match probe remains an index-only
-bounded lookup. Executor memory stays below 64 MiB. The fixture also injects
+artifact limit. A distribution-filtered page first resolves one profile head,
+must use the exact active-revision facet index, and may examine at most
+`limit * 128` qualifying facet rows under the database-enforced per-artifact
+hard bound to deduplicate one page. An exact zero-match probe is an index-only
+lookup over one distribution and revision. State-only queries do not exist, so
+historical facets and an unbounded number of profile heads cannot invalidate the
+claim. Executor memory stays below 64 MiB. The fixture also injects
 projection drift, proves authority paths ignore it, verifies detection, and
 exercises bounded repair. Evidence
 records PostgreSQL settings and hardware; a unit test alone is not accepted as
@@ -2178,17 +2311,26 @@ request executors and restart recovery is exercised.
 
 ### Productization in the current implementation round
 
+- [ ] Rewrite migration 023 as the frozen literal 17-table PostgreSQL schema,
+  including config-generation authority, realm-prefix uniqueness, projections,
+  limiters, constraints, and exact indexes.
+- [ ] Replace best-effort image config reload with the shared central-config and
+  profile-head compare-and-swap protocol, replica convergence, and crash tests.
 - [ ] Add READY-gated publication reservations and client-side wait semantics;
   remove launchability of pending releases.
 - [ ] Fail closed for unknown runtime architectures unless an exact runtime
   binding proves a finite platform set covered by the artifact.
 - [ ] Add cursor-paginated catalog and secret-free profile-summary APIs.
+- [ ] Add transactionally maintained summaries/facets for only the closed query
+  shapes and check in their million-row PostgreSQL plans before activation.
 - [ ] Build the complete Images dashboard, artifact detail, safe actions,
   workspace handling, responsive states, and dashboard test/build coverage.
 - [ ] Add admin-only tombstone/purge state, CLI/API, audit, retry, and AWS
   ownership fencing without a dashboard delete action.
 - [ ] Implement the complete AWS ECR capability slice and reusable AWS control
-  plane, VM-pool, image-distribution, and dedicated-account Terraform example.
+  plane, VM-pool, image-distribution, and dedicated-account Terraform example,
+  including generation-qualified shard identity and the closed per-call ECR
+  limiter map.
 - [ ] Deploy the independently scalable copy worker through Helm, with metrics,
   configurable concurrency, probes, restart recovery, and rollback runbook.
 - [ ] Implement only the managed-builder prototype and evidence gate described
@@ -2202,6 +2344,25 @@ request executors and restart recovery is exercised.
 - [ ] Freeze the exact design and implementation, then complete six fresh
   paired Codex 5.6/Fable rounds with three consecutive paired `PURSUE`
   verdicts on the unchanged patch.
+
+### Activation sequence keeps the first operational slice small
+
+The code, schema, typed API, and complete UI are reviewed and merged together,
+but every new surface defaults disabled. Deployment first applies migration 023
+with workers and managed profile creation off. The second phase enables bounded
+catalog reads and the Images UI only after schema parity and checked-in query
+plans pass. The third phase enables the typed editor only after config/head crash
+recovery and replica-generation convergence pass. The first data-plane canary is
+one managed AWS realm generation, one fixed shard plan, canonical publication,
+and one locality target. Additional regions and worker replicas may scale that
+same generation after limiter evidence. Creating a second realm generation is a
+separate canary after old-generation drain and prefix-nonoverlap tests.
+
+This staging does not omit the requested UI or large-catalog implementation
+from the release artifact. It prevents an unproven dashboard projection,
+configuration editor, million-row claim, or shard-expansion path from becoming
+production authority merely because its code was deployed. The digest-only
+external profile remains the rollback path at every phase.
 
 ### Required before a managed production profile
 
@@ -2392,7 +2553,9 @@ Unit tests must cover:
   route remaining selectable and successfully revalidated;
 - two different digests sharing one immutable shard repository while configured
   digest-prefix bits select from the immutable power-of-two set of no more than
-  256 workspace repositories, and
+  256 workspace repositories; mandatory generation-qualified rendering, physical
+  fingerprints, and uniqueness prevent two realm generations or shard policies
+  from claiming the same repository prefix; and
   copy I/O writing through a deterministic immutable tag before digest-only
   verification;
 - final cluster-commit acceptance of release and digest-equivalent source
@@ -2493,10 +2656,13 @@ Unit tests must cover:
   population rewrites, plus projection drift detection/repair and authority-path
   independence;
 - the complete batch-publication, finalizer, release-name, tombstone, and future
-  builder lock graph running as real PostgreSQL overlaps without ABBA deadlock;
+  builder 14-phase lock graph, including both quota rows, daily usage, context
+  uploads/objects/cache, attempts/output/staging/logs, running as real PostgreSQL
+  overlaps without ABBA deadlock;
 - one limiter row with multiple independent permit leases, per-lease expiry and
-  fencing, per-ECR-call pacing, shared throttle penalty, and external-account
-  traffic explicitly outside the guarantee;
+  fencing, a closed mapping for every data-plane ECR auth, metadata, repository,
+  layer, manifest, verify, and delete call, shared throttle penalty, and
+  external-account traffic explicitly outside the guarantee;
 - admin-only tombstone rejection with live references, leases, or publications;
   selector invisibility after commit; deterministic regional-before-canonical
   purge; the exact `AWAITING_EXTERNAL_PUSH|VERIFYING ->
@@ -2516,6 +2682,11 @@ Unit tests must cover:
   credential-shaped, non-string, and overlong keys;
 - database-backed server config passing the same duplicate-key, schema, and
   semantic admission boundary as file-backed config, with value-free failures;
+- raw and typed config updates racing through one generation compare-and-swap,
+  atomic config-YAML/profile-head/custody/realm commit, lost-response
+  idempotency, crashes before and after commit, NOTIFY loss, stale replica
+  fail-closed behavior, and eventual poll-based convergence without a
+  representable config/head split;
 - status selectors and workspaces validated before an SDK creates HTTP query
   parameters, so client HTTP errors cannot retain rejected values;
 - server-owned workspace, registry, database, daemon, and controller policy
@@ -2549,8 +2720,11 @@ Dashboard and catalog coverage additionally proves:
 
 - keyset pagination has no duplicates or omissions across equal timestamps and
   rejects malformed/version-mismatched cursors without reflecting input;
-- workspace, selector, state, distribution, target, and limit validation occurs
-  before request persistence, and every query remains bounded;
+- workspace, selector, lifecycle, distribution, target, state, canonical, and
+  limit validation occurs before request persistence; state, target, and
+  canonical without distribution are rejected, legacy unfiltered status fails
+  rather than truncates beyond 1,000 artifacts, and every accepted query remains
+  bounded;
 - catalog pages batch-load associations in constant query count and exercise
   indexed artifact/facet/summary plans at million-artifact scale; every
   location/lifecycle mutation updates its projection transactionally, profile
@@ -2579,8 +2753,9 @@ placement-time resource dependency. Boundary plans cover each account/region's
 applied repository and image quotas, existing repositories and manifests,
 safety headroom, worst-case multi-platform manifest units, the feasible shard
 interval at or below 256, audited inventory input, durable workspace slot,
-capacity exhaustion, namespace-generation expansion, and provider-quota drift
-error mapping. Tests also prove v1 rejects native
+capacity exhaustion, generation-qualified prefix rendering and collision
+rejection, namespace-generation expansion, and provider-quota drift error
+mapping. Tests also prove v1 rejects native
 replication configuration instead of creating untracked regional content.
 
 Concurrency tests run multiple copy-worker replicas against one account/region.
