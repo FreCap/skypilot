@@ -462,7 +462,12 @@ def get_command_runners(
     """Get a command runner for the given cluster."""
     ip_list = cluster_info.get_feasible_ips()
     port_list = cluster_info.get_ssh_ports()
+    if len(ip_list) != len(port_list):
+        raise ValueError('Cluster connection metadata has mismatched IP and '
+                         f'SSH port counts: {len(ip_list)} != '
+                         f'{len(port_list)}.')
+    node_list = [(ip, port_list[index]) for index, ip in enumerate(ip_list)]
     return command_runner.SSHCommandRunner.make_runner_list(
-        node_list=zip(ip_list, port_list),
+        node_list=node_list,
         **credentials,
     )

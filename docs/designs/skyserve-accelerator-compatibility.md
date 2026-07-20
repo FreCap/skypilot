@@ -21,7 +21,11 @@ The priority rule deliberately means that a flexible priority-50 request remains
 
 ## Baseline and scope
 
-- SkyPilot design baseline: `boltz-bio/skypilot` `origin/improvements` at `a6dd3a0def00461da5f8bb5af6f15a7f3680b329`.
+- SkyPilot merge baseline: `boltz-bio/skypilot` `origin/improvements` at `33074d9e0995028104e711119a5e4d152762a769`.
+- The aggregate one-minute PostgreSQL contract in
+  `docs/designs/serve-autoscaler-history.md` remains authoritative. This
+  design extends each aggregate sample with exact-card maps; it does not add
+  another history writer or dashboard time range.
 - boltz-platform integration baseline: `boltz-bio/my-full-stack` PR branch `feat/skyserve-request-priority-header` at `3d6df7a48d68f90cc603f585b9bb1537c8a17fa3`.
 - Existing SkyServe request priority, process-local admission queue, instance-aware least-load policy, exact `replica_info.gpu_type`, targeted resource override support, and reserved-capacity broker are extended rather than replaced.
 - Existing HA behavior remains: one active load-balancer authority owns queue/admission state; clients retry across an authority change. Queue durability across an LB failover is not introduced by this project.
@@ -408,14 +412,63 @@ SkyPilot changes:
 
 - Add tooltips explaining that demand target sizes traffic, floor is a hard serving minimum, fill is optional zero-cost extra serving capacity, and free reserved slots are physical supply not yet represented by a serving replica.
 
+Persist the same exact-card values in the existing one-minute
+`serve_autoscaler_history` row as bounded PostgreSQL JSON objects. Store:
+
+- traffic demand targets by exact accelerator;
+- ready, provisioning, and non-failed tracked capacity by exact accelerator;
+- hard floor, reserved-fill target, zero-cost ready capacity, and free
+  reserved slots by exact accelerator.
+
+Each object has at most `MAX_COMPATIBILITY_ACCELERATORS` entries. Keys must be
+non-empty exact configured identifiers and values must be nonnegative integers.
+Within a minute, the newest controller observation replaces every map together
+with the aggregate target/capacity fields. Old rows and mixed-version writers
+use empty maps, which means exact-card history unavailable, not zero capacity.
+No migration backfill invents a historical card assignment.
+
+The history UI keeps one synchronized range and presents three operational
+views:
+
+1. **Traffic and capacity.** The default aggregate view keeps the existing
+   traffic target (with hysteresis), traffic-or-reservation target, ready,
+   provisioning, and non-failed tracked capacity lines. An `Accelerators`
+   view renders small multiples for traffic target, ready, provisioning, and
+   non-failed tracked capacity by exact card. It must never stack overlapping
+   target concepts. Reserved fill remains its own line in the reserved view,
+   rather than inventing an exact-card version of the aggregate maximum.
+2. **Reserved capacity.** Aggregate and exact-card views show reserved-fill
+   target, zero-cost ready capacity, and free reserved slots. These are
+   separate from traffic demand so an already-provisioned reserved cluster is
+   visible as supply rather than unexplained demand.
+3. **Demand pressure.** Keep request arrivals, peak in-flight, peak queued,
+   and rejections aggregate. Flexible compatibility sets cannot be truthfully
+   labeled as queue depth "on A100" before the allocator chooses a target.
+   The exact-card traffic-target history is the allocation result and is the
+   card-specific scaling graph.
+
+The aggregate/card switch changes only presentation. Aggregate values remain
+stored directly as the backward-compatible control-plane contract. Per-card
+demand reconciles to the autoscaler's traffic target before generic
+`num_overprovision`; the aggregate history keeps the final target after that
+overlay. The UI labels those values separately instead of implying their sums
+must always match. `A100` and `A100-80GB` are always separate series and legend
+entries. Physical-machine lifecycle history remains a separate chart from
+logical serving slots; neither is relabeled as the other.
+
 Tests:
 
-- Add status/API schema tests and dashboard connector/component tests for missing additive fields, totals, fill overlays, and separate A100 rows.
-- Assert that the displayed global demand target equals the per-card demand-target sum, while actual/fill capacity may be larger.
+- Add status/API schema tests and dashboard connector/component tests for missing additive fields, totals, fill overlays, exact-card history, aggregate/card switching, and separate A100 rows.
+- Assert when `num_overprovision` is absent that the displayed global demand
+  target equals the per-card demand-target sum. With overprovisioning, show the
+  aggregate overlay separately rather than assigning it to an invented card.
+- Add PostgreSQL migration/upsert/serialization tests proving last-observation
+  map semantics, empty-map mixed-version compatibility, incarnation fencing,
+  retention, and exact `A100` versus `A100-80GB` keys.
 
 Acceptance gate:
 
-- An operator can explain every replica above the demand target as either a hard floor, provisioning lag, or reserved fill; A100 variants are never visually combined.
+- An operator can explain every replica above the demand target as either a hard floor, provisioning lag, or reserved fill, both now and across the retained history; A100 variants are never visually combined.
 
 ### Milestone 6 - Rollout and production validation
 

@@ -136,6 +136,12 @@ def test_yaml_round_trip_preserves_demand_and_wave_policy():
         max_scale_up_rate_percentage=20,
         scale_up_rate_min_replicas=10,
         scale_up_rate_period_seconds=60,
+        adaptive_scale_up={
+            'max_scale_up_rate_percentage': 100,
+            'scale_up_rate_min_replicas': 50,
+            'pressure_observations': 2,
+            'hold_seconds': 120,
+        },
         max_scale_down_rate_percentage=50,
     )
 
@@ -147,6 +153,12 @@ def test_yaml_round_trip_preserves_demand_and_wave_policy():
     assert restored.max_scale_up_rate_percentage == 20
     assert restored.scale_up_rate_min_replicas == 10
     assert restored.scale_up_rate_period_seconds == 60
+    assert restored.adaptive_scale_up == {
+        'max_scale_up_rate_percentage': 100,
+        'scale_up_rate_min_replicas': 50,
+        'pressure_observations': 2,
+        'hold_seconds': 120,
+    }
     assert restored.max_scale_down_rate_percentage == 50
     assert restored.copy().to_yaml_config() == config
 
@@ -198,6 +210,51 @@ def test_partial_scale_up_wave_policy_rejected():
             spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
             graceful_drain_async_occupancy=True,
             max_scale_up_rate_percentage=20,
+        )
+
+
+def test_adaptive_scale_up_requires_normal_wave_policy():
+    with pytest.raises(ValueError, match='requires max_scale_up_rate'):
+        _make_spec(
+            min_replicas=1,
+            max_replicas=5,
+            target_concurrency_per_replica=1,
+            spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+            graceful_drain_async_occupancy=True,
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            },
+        )
+
+
+@pytest.mark.parametrize('field,bad_value', [
+    ('max_scale_up_rate_percentage', 0),
+    ('scale_up_rate_min_replicas', 0),
+    ('pressure_observations', 0),
+    ('hold_seconds', float('inf')),
+])
+def test_invalid_adaptive_scale_up_rejected(field, bad_value):
+    adaptive = {
+        'max_scale_up_rate_percentage': 100,
+        'scale_up_rate_min_replicas': 50,
+        'pressure_observations': 2,
+        'hold_seconds': 120,
+    }
+    adaptive[field] = bad_value
+    with pytest.raises(ValueError):
+        _make_spec(
+            min_replicas=1,
+            max_replicas=5,
+            target_concurrency_per_replica=1,
+            spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+            graceful_drain_async_occupancy=True,
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=10,
+            scale_up_rate_period_seconds=60,
+            adaptive_scale_up=adaptive,
         )
 
 

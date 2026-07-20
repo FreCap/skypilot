@@ -967,13 +967,18 @@ def ha_recovery_for_consolidation_mode(pool: bool,
         # external LBs, so the service-mode snapshot is also the complete set
         # of live LB owners used by reconciliation below.
         service_names = serve_state.get_glob_service_names(None, pool=pool)
+        # One slim query for the whole sweep instead of a per-service joined
+        # read (which deserializes the latest spec N times). The snapshot
+        # carries every field this loop consumes, including the latest
+        # version's raw yaml for placeholder detection.
+        liveness_snapshots = {
+            record['name']: record
+            for record in serve_state.get_service_liveness_snapshots(pool=pool)
+        }
         for service_name in service_names:
-            svc = _get_service_status(service_name,
-                                      pool=pool,
-                                      with_replica_info=False,
-                                      with_yaml=False)
+            svc = liveness_snapshots.get(service_name)
             # A row with no version_specs row is invisible to the joined
-            # status query.  A row whose latest version is a NULL-yaml
+            # snapshot query.  A row whose latest version is a NULL-yaml
             # placeholder is visible, but is equally unbootable when it has
             # no earlier committed version.  Retire both shapes atomically;
             # mark_unrecoverable_service_for_cleanup rechecks the absence of

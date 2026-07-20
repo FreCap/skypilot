@@ -95,6 +95,10 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # bounds only rate-limit provider calls while an outage persists.
 _FAILED_CLEANUP_RETRY_BASE_SECONDS = 60
 _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
+# A service can queue an arbitrarily large durable teardown wave. Keep the
+# queued intent, but bound live worker threads so one controller process cannot
+# exhaust its memory or refresh-loop CPU while the global budget is spacious.
+_MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
 # An autoscaler tick can place a full wave before any sky.launch result benches
 # an unavailable location. Without a bound, a zero-cost-first placer can pin
 # hundreds of replicas to one full Kubernetes pool. Demand placement consumes
@@ -1645,7 +1649,13 @@ class ReplicaInfo:
             if response.status_code == 200:
                 logger.debug(f'{replica_identity.capitalize()} is ready.')
                 return self, True, probe_time
-        except requests.exceptions.RequestException as e:
+        except Exception as e:  # pylint: disable=broad-except
+            # Catch all errors, not just RequestException: probe inputs
+            # (readiness path/headers/post data) come from user YAML and can
+            # make the HTTP stack raise e.g. UnicodeEncodeError or ValueError.
+            # An escaping exception aborts the whole probe round when the
+            # prober drains futures, stalling status updates for every
+            # replica on each tick.
             logger.error(
                 f'{colorama.Fore.YELLOW}Error when probing {replica_identity}:'
                 f' {common_utils.format_exception(e)}.'
@@ -5744,6 +5754,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_infos = serve_state.get_replica_infos_from_ids(
             self._service_name,
             [replica_id for replica_id, _ in finished_launches])
+        # A completed local worker can outlive its durable replica row. This
+        # happens when another reconciliation path removes the row before the
+        # worker result is observed. Treat durable absence as terminal local
+        # cleanup, not as a controller-wide assertion failure: the latter
+        # aborts this refresh before unrelated teardown workers are handled.
+        # Partition stale workers before spot-placement evidence is collected,
+        # since that pass also dereferences every finished launch row.
+        stale_finished_launches = [
+            replica_id for replica_id, _ in finished_launches
+            if replica_id not in launch_infos
+        ]
+        for replica_id in stale_finished_launches:
+            logger.warning(
+                f'Discarding completed launch worker for replica '
+                f'{replica_id}: its durable replica row no longer exists.')
+            self._launch_thread_pool.pop(replica_id)
+            self._replica_to_request_id.pop(replica_id)
+            self._replica_to_launch_cancelled.pop(replica_id)
+        if stale_finished_launches:
+            stale_replica_ids = set(stale_finished_launches)
+            finished_launches = [(replica_id, t)
+                                 for replica_id, t in finished_launches
+                                 if replica_id not in stale_replica_ids]
         finished_spot_locations: dict[int, spot_placer.Location] = {}
         if self._spot_placer is not None:
             for replica_id, t in finished_launches:
@@ -5897,6 +5930,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
         # (via _terminate_replica for failed launches) are admitted this tick.
         down_thread_pool_snapshot = list(self._down_thread_pool.items())
+        concurrent_downs = sum(
+            1 for _, t in down_thread_pool_snapshot if t.is_alive())
         down_to_admit: list[tuple[int, thread_utils.SafeThread,
                                   ReplicaInfo]] = []
         finished_downs = [(replica_id, t)
@@ -5946,6 +5981,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         common_utils.ProcessStatus.RUNNING)
                     self._persist_replica(replica_id, info)
                 for replica_id, t, info in down_to_admit:
+                    if concurrent_downs >= _MAX_CONCURRENT_DOWNS_PER_SERVICE:
+                        break
                     logical_retirement = getattr(info.status_property,
                                                  'logical_retirement_version',
                                                  None) is not None
@@ -6062,6 +6099,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._schedule_failed_cleanup_retry(replica_id)
                             continue
                         self._wait_for_idle_trackers.pop(replica_id, None)
+                        concurrent_downs += 1
                         # This replica is now terminating; reflect it locally
                         # (weighted like in_flight_launch_count) instead of
                         # re-scanning the DB on the next replica.

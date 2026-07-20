@@ -401,6 +401,17 @@ class DemandSnapshot:
     # catalog that admitted them.  None represents legacy/unfenced snapshots
     # and is deliberately not compatible with any handoff report.
     routing_version: int | None = None
+    queue_depth_by_priority: dict[str,
+                                  int] = dataclasses.field(default_factory=dict)
+    rejected_in_window_by_priority: dict[str, int] = dataclasses.field(
+        default_factory=dict)
+    rejected_in_recent_window_by_priority: dict[str, int] = dataclasses.field(
+        default_factory=dict)
+    unique_job_arrivals_60s: int = 0
+    unique_job_arrivals_300s: int = 0
+    headerless_arrivals_60s: int = 0
+    headerless_arrivals_300s: int = 0
+    offered_arrival_tracking_saturated: bool = False
 
     @classmethod
     def from_request(cls, request_data: dict[str, Any]) -> DemandSnapshot:
@@ -414,6 +425,22 @@ class DemandSnapshot:
         def _nonnegative(value: Any) -> int:
             return (value if isinstance(value, int) and
                     not isinstance(value, bool) and value >= 0 else 0)
+
+        def _priority_map(value: Any) -> dict[str, int]:
+            if not isinstance(value, dict):
+                return {}
+            result = {}
+            for priority, count in value.items():
+                try:
+                    normalized_priority = int(priority)
+                except (TypeError, ValueError):
+                    continue
+                if (not 0 <= normalized_priority <= 100 or
+                        not isinstance(count, int) or isinstance(count, bool) or
+                        count < 0):
+                    continue
+                result[str(normalized_priority)] = count
+            return result
 
         raw_in_flight = request_data.get('in_flight')
         in_flight = ({
@@ -468,6 +495,22 @@ class DemandSnapshot:
             rejected_in_recent_window=_nonnegative(
                 request_data.get('rejected_in_recent_window')),
             routing_version=routing_version,
+            queue_depth_by_priority=_priority_map(
+                request_data.get('queue_depth_by_priority')),
+            rejected_in_window_by_priority=_priority_map(
+                request_data.get('rejected_in_window_by_priority')),
+            rejected_in_recent_window_by_priority=_priority_map(
+                request_data.get('rejected_in_recent_window_by_priority')),
+            unique_job_arrivals_60s=_nonnegative(
+                request_data.get('unique_job_arrivals_60s')),
+            unique_job_arrivals_300s=_nonnegative(
+                request_data.get('unique_job_arrivals_300s')),
+            headerless_arrivals_60s=_nonnegative(
+                request_data.get('headerless_arrivals_60s')),
+            headerless_arrivals_300s=_nonnegative(
+                request_data.get('headerless_arrivals_300s')),
+            offered_arrival_tracking_saturated=request_data.get(
+                'offered_arrival_tracking_saturated') is True,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -490,6 +533,17 @@ class DemandSnapshot:
                 for profile in self.rejected_compatibility_profiles
             ],
             'routing_version': self.routing_version,
+            'queue_depth_by_priority': self.queue_depth_by_priority,
+            'rejected_in_window_by_priority':
+                self.rejected_in_window_by_priority,
+            'rejected_in_recent_window_by_priority':
+                self.rejected_in_recent_window_by_priority,
+            'unique_job_arrivals_60s': self.unique_job_arrivals_60s,
+            'unique_job_arrivals_300s': self.unique_job_arrivals_300s,
+            'headerless_arrivals_60s': self.headerless_arrivals_60s,
+            'headerless_arrivals_300s': self.headerless_arrivals_300s,
+            'offered_arrival_tracking_saturated':
+                self.offered_arrival_tracking_saturated,
         }
 
     @classmethod
@@ -512,6 +566,17 @@ class DemandSnapshot:
             'rejected_requests_by_compatibility':
                 value.get('rejected_requests_by_compatibility'),
             'routing_version': value.get('routing_version'),
+            'queue_depth_by_priority': value.get('queue_depth_by_priority'),
+            'rejected_in_window_by_priority':
+                value.get('rejected_in_window_by_priority'),
+            'rejected_in_recent_window_by_priority':
+                value.get('rejected_in_recent_window_by_priority'),
+            'unique_job_arrivals_60s': value.get('unique_job_arrivals_60s'),
+            'unique_job_arrivals_300s': value.get('unique_job_arrivals_300s'),
+            'headerless_arrivals_60s': value.get('headerless_arrivals_60s'),
+            'headerless_arrivals_300s': value.get('headerless_arrivals_300s'),
+            'offered_arrival_tracking_saturated':
+                value.get('offered_arrival_tracking_saturated'),
         })
         return snapshot
 
@@ -579,6 +644,28 @@ class DemandSnapshot:
                                            current.rejected_in_window)
         merged['rejected_in_recent_window'] = max(
             self.rejected_in_recent_window, current.rejected_in_recent_window)
+
+        def _merge_map(old: dict[str, int], new: dict[str,
+                                                      int]) -> dict[str, int]:
+            keys = set(old) | set(new)
+            return {key: max(old.get(key, 0), new.get(key, 0)) for key in keys}
+
+        merged['queue_depth_by_priority'] = _merge_map(
+            self.queue_depth_by_priority, current.queue_depth_by_priority)
+        merged['rejected_in_window_by_priority'] = _merge_map(
+            self.rejected_in_window_by_priority,
+            current.rejected_in_window_by_priority)
+        merged['rejected_in_recent_window_by_priority'] = _merge_map(
+            self.rejected_in_recent_window_by_priority,
+            current.rejected_in_recent_window_by_priority)
+        for field in ('unique_job_arrivals_60s', 'unique_job_arrivals_300s',
+                      'headerless_arrivals_60s', 'headerless_arrivals_300s'):
+            merged[field] = max(getattr(self, field), getattr(current, field))
+        merged['offered_arrival_tracking_saturated'] = (
+            self.offered_arrival_tracking_saturated or
+            current.offered_arrival_tracking_saturated)
+        # Controller-internal marker. This never crosses the LB wire.
+        merged['pressure_report_is_floored'] = True
         merged['in_flight'] = {
             url: max(count, current.in_flight.get(url, 0))
             for url, count in self.in_flight.items()

@@ -195,7 +195,19 @@ def test_session_ledger_requires_applied_drain_role_and_generation():
 def test_demand_handoff_holds_then_expires_previous_active_floor():
     handoff = lb_ha.DemandHandoff(5)
     handoff.begin(
-        8, lb_ha.DemandSnapshot((10, 20), 7, 3, rejected_in_recent_window=2))
+        8,
+        lb_ha.DemandSnapshot((10, 20),
+                             7,
+                             3,
+                             rejected_in_recent_window=2,
+                             queue_depth_by_priority={
+                                 '0': 5,
+                                 '50': 2,
+                             },
+                             rejected_in_window_by_priority={'50': 3},
+                             unique_job_arrivals_60s=9,
+                             unique_job_arrivals_300s=20,
+                             offered_arrival_tracking_saturated=True))
     cold = {
         'request_aggregator': {
             'timestamps': [20, 30],
@@ -203,12 +215,31 @@ def test_demand_handoff_holds_then_expires_previous_active_floor():
         'queue_depth': 1,
         'rejected_in_window': 0,
         'rejected_in_recent_window': 0,
+        'queue_depth_by_priority': {
+            '0': 3,
+            '80': 4,
+        },
+        'rejected_in_window_by_priority': {
+            '50': 1
+        },
+        'unique_job_arrivals_60s': 10,
+        'unique_job_arrivals_300s': 12,
     }
     floored = handoff.apply(8, cold, complete_authoritative_report=True, now=1)
     assert floored['request_aggregator']['timestamps'] == [10, 20, 30]
     assert floored['queue_depth'] == 7
     assert floored['rejected_in_window'] == 3
     assert floored['rejected_in_recent_window'] == 2
+    assert floored['queue_depth_by_priority'] == {
+        '0': 5,
+        '50': 2,
+        '80': 4,
+    }
+    assert floored['rejected_in_window_by_priority'] == {'50': 3}
+    assert floored['unique_job_arrivals_60s'] == 10
+    assert floored['unique_job_arrivals_300s'] == 20
+    assert floored['offered_arrival_tracking_saturated'] is True
+    assert floored['pressure_report_is_floored'] is True
     assert handoff.apply(8, cold, True, now=5.9)['queue_depth'] == 7
     assert handoff.apply(8, cold, True, now=6) == cold
 

@@ -970,10 +970,31 @@ class SkyServeController:
                             drain_authoritative or ha_enabled) else ()),
                     'reconcile_generation': reconcile_generation,
                     'queue_depth': effective_request_data.get('queue_depth'),
+                    'queue_depth_by_priority':
+                        effective_request_data.get('queue_depth_by_priority'),
                     'rejected_in_window':
                         effective_request_data.get('rejected_in_window'),
                     'rejected_in_recent_window':
                         effective_request_data.get('rejected_in_recent_window'),
+                    'rejected_in_window_by_priority':
+                        effective_request_data.get(
+                            'rejected_in_window_by_priority'),
+                    'rejected_in_recent_window_by_priority':
+                        effective_request_data.get(
+                            'rejected_in_recent_window_by_priority'),
+                    'unique_job_arrivals_60s':
+                        effective_request_data.get('unique_job_arrivals_60s'),
+                    'unique_job_arrivals_300s':
+                        effective_request_data.get('unique_job_arrivals_300s'),
+                    'headerless_arrivals_60s':
+                        effective_request_data.get('headerless_arrivals_60s'),
+                    'headerless_arrivals_300s':
+                        effective_request_data.get('headerless_arrivals_300s'),
+                    'offered_arrival_tracking_saturated':
+                        effective_request_data.get(
+                            'offered_arrival_tracking_saturated'),
+                    'pressure_report_is_floored': effective_request_data.get(
+                        'pressure_report_is_floored'),
                 })
                 if (translated_in_flight is not None and getattr(
                         self._autoscaler, 'replica_unit', None) == 'logical'):
@@ -1778,7 +1799,7 @@ class SkyServeController:
 
     def _record_autoscaler_history(
         self,
-        replica_counts: dict[str, int | str],
+        replica_counts: dict[str, Any],
         capacity_hint: dict[str, Any],
         timestamp: float | None = None,
     ) -> int:
@@ -1811,6 +1832,8 @@ class SkyServeController:
         if not isinstance(peak_queue_depth, int) or isinstance(
                 peak_queue_depth, bool):
             peak_queue_depth = None
+        accelerator_breakdown = self._get_accelerator_history_breakdown(
+            replica_counts)
         return serve_history.record_autoscaler_snapshot(
             self._service_name,
             service_hash,
@@ -1824,8 +1847,46 @@ class SkyServeController:
             total_capacity=total_capacity,
             peak_in_flight=peak_in_flight,
             peak_queue_depth=peak_queue_depth,
+            accelerator_breakdown=accelerator_breakdown,
             timestamp=timestamp,
         )
+
+    def _get_accelerator_history_breakdown(
+            self, replica_counts: dict[str, Any]) -> dict[str, Any] | None:
+        """Build one complete exact-card observation, or mark unavailable."""
+        shapes = getattr(self._autoscaler, 'configured_accelerator_shapes', {})
+        if not isinstance(shapes, dict) or not shapes:
+            return None
+        if not self._autoscaler.has_recomputed_with_fresh_data():
+            return None
+        configured = list(shapes)
+        demand_target = getattr(self._autoscaler,
+                                'target_num_replicas_by_accelerator', {})
+        if (not isinstance(demand_target, dict) or sum(demand_target.values())
+                != self._autoscaler.target_num_replicas):
+            # An aggregate fallback or mixed-version report cannot be
+            # reconstructed as exact-card zeroes.
+            return None
+
+        def mapping(field: str) -> dict[str, int]:
+            raw = replica_counts.get(field, {})
+            return raw if isinstance(raw, dict) else {}
+
+        return {
+            'configured_accelerators': configured,
+            'min_replicas': dict(
+                getattr(self._autoscaler, 'min_replicas_by_accelerator', {})),
+            'demand_target': dict(demand_target),
+            'ready_capacity': mapping('ready_replicas_by_accelerator'),
+            'provisioning_capacity':
+                mapping('provisioning_replicas_by_accelerator'),
+            'total_capacity': mapping('total_replicas_by_accelerator'),
+            'zero_cost_ready_capacity':
+                mapping('zero_cost_ready_replicas_by_accelerator'),
+            'fill_target': mapping('fill_target_by_accelerator'),
+            'free_reserved_slots':
+                mapping('free_reserved_slots_by_accelerator'),
+        }
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""

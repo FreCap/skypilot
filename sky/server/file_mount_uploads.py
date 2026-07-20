@@ -264,10 +264,6 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
         chunk_index: The chunk index, starting from 0.
         total_chunks: The total number of chunks.
     """
-    # Add the upload id to the cleanup list.
-    upload_ids_to_cleanup[(upload_id,
-                           user_hash)] = (datetime.datetime.now() +
-                                          _DEFAULT_UPLOAD_EXPIRATION_TIME)
     # Check upload_id to be a valid SkyPilot run_timestamp appended with 8 hex
     # characters, e.g. 'sky-2025-01-17-09-10-13-933602-35d31c22'.
     if not re.match(
@@ -275,6 +271,12 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
             r'[0-9]{2}-[0-9]{6}-[0-9a-f]{8}$', upload_id):
         raise ValueError(
             f'Invalid upload_id: {upload_id}. Please use a valid uuid.')
+
+    # Add only validated upload ids to the cleanup list. The cleanup daemon
+    # uses this value as a path component when removing expired uploads.
+    upload_ids_to_cleanup[(upload_id,
+                           user_hash)] = (datetime.datetime.now() +
+                                          _DEFAULT_UPLOAD_EXPIRATION_TIME)
 
     base_dir = await _prepare_client_mount_dir(user_hash, request)
     missing_chunks = await _receive_and_assemble_chunks(

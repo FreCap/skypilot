@@ -112,6 +112,13 @@ serve_autoscaler_history_table = sqlalchemy.Table(
     sqlalchemy.Column('total_capacity', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('peak_in_flight', sqlalchemy.Integer, nullable=True),
     sqlalchemy.Column('peak_queue_depth', sqlalchemy.Integer, nullable=True),
+    sqlalchemy.Column('accelerator_breakdown',
+                      postgresql.JSONB,
+                      nullable=False,
+                      server_default=sqlalchemy.text("'{}'::jsonb")),
+    sqlalchemy.Column('accelerator_breakdown_observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=True),
     sqlalchemy.CheckConstraint(
         'version >= 1 AND demand_target >= 0 AND capacity_target >= 0 AND '
         'ready_capacity >= 0 AND provisioning_capacity >= 0 AND '
@@ -418,6 +425,53 @@ def _nonnegative_int(value: Any,
     return value
 
 
+_ACCELERATOR_BREAKDOWN_MAP_FIELDS = (
+    'min_replicas',
+    'demand_target',
+    'ready_capacity',
+    'provisioning_capacity',
+    'total_capacity',
+    'zero_cost_ready_capacity',
+    'fill_target',
+    'free_reserved_slots',
+)
+
+
+def _normalize_accelerator_breakdown(
+        value: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate one bounded, exact-card history payload."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('accelerator_breakdown must be an object or null.')
+    configured = value.get('configured_accelerators')
+    if (not isinstance(configured, list) or not configured or
+            len(configured) > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or
+            not all(isinstance(card, str) and card for card in configured) or
+            len({card.casefold() for card in configured}) != len(configured)):
+        raise ValueError('configured_accelerators must be distinct non-empty '
+                         'exact card identifiers within the supported bound.')
+    configured_set = set(configured)
+    result: dict[str, Any] = {
+        'version': constants.LB_REQUEST_ACCELERATORS_VERSION,
+        'configured_accelerators': configured,
+    }
+    for field in _ACCELERATOR_BREAKDOWN_MAP_FIELDS:
+        raw_mapping = value.get(field, {})
+        if not isinstance(raw_mapping, dict):
+            raise ValueError(f'{field} must be an exact-card count object.')
+        if not set(raw_mapping).issubset(configured_set):
+            raise ValueError(f'{field} contains an unconfigured accelerator.')
+        normalized = {}
+        for card in configured:
+            raw_count = raw_mapping.get(card, 0)
+            count = _nonnegative_int(raw_count, f'{field}[{card}]')
+            assert count is not None
+            normalized[card] = count
+        result[field] = normalized
+    return result
+
+
 def record_autoscaler_snapshot(
     service_name: str,
     service_hash: str,
@@ -432,6 +486,7 @@ def record_autoscaler_snapshot(
     total_capacity: int,
     peak_in_flight: int | None = None,
     peak_queue_depth: int | None = None,
+    accelerator_breakdown: dict[str, Any] | None = None,
     timestamp: float | None = None,
 ) -> int:
     """Persist one controller-authored autoscaler observation.
@@ -465,6 +520,8 @@ def record_autoscaler_snapshot(
     peak_queue_depth = _nonnegative_int(peak_queue_depth,
                                         'peak_queue_depth',
                                         nullable=True)
+    accelerator_breakdown = _normalize_accelerator_breakdown(
+        accelerator_breakdown)
     assert demand_target is not None
     assert capacity_target is not None
     assert ready_capacity is not None
@@ -493,6 +550,8 @@ def record_autoscaler_snapshot(
         'total_capacity': total_capacity,
         'peak_in_flight': peak_in_flight,
         'peak_queue_depth': peak_queue_depth,
+        'accelerator_breakdown': accelerator_breakdown,
+        'accelerator_breakdown_observed_at': observed_at,
     }
     table = serve_autoscaler_history_table
     with engine.begin() as connection:
@@ -531,6 +590,9 @@ def record_autoscaler_snapshot(
                     'total_capacity': latest('total_capacity'),
                     'peak_in_flight': peak('peak_in_flight'),
                     'peak_queue_depth': peak('peak_queue_depth'),
+                    'accelerator_breakdown': latest('accelerator_breakdown'),
+                    'accelerator_breakdown_observed_at':
+                        latest('accelerator_breakdown_observed_at'),
                 }))
     return 1
 
@@ -671,6 +733,10 @@ def get_status_history(
         'total_capacity': row['total_capacity'],
         'peak_in_flight': row['peak_in_flight'],
         'peak_queue_depth': row['peak_queue_depth'],
+        'accelerator_breakdown':
+            (row['accelerator_breakdown'] if
+             row['accelerator_breakdown_observed_at'] == row['observed_at'] and
+             row['accelerator_breakdown'] else None),
     } for row in autoscaler_rows]
     current_bucket = observed_at.replace(second=0, microsecond=0)
     request_window_start = current_bucket - datetime.timedelta(

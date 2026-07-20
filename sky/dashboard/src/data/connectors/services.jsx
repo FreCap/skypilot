@@ -60,6 +60,18 @@ const FAILED_REPLICA_STATUSES = new Set([
   'UNKNOWN',
 ]);
 
+// Rows in these states are durable intent or completed lifecycle history, not
+// current provider billability. Keep every other status conservative: stopping,
+// cleanup-failed, unknown, and future statuses may still have live resources.
+const NON_BILLABLE_COST_STATUSES = new Set([
+  'PENDING',
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+  'PREEMPTED',
+]);
+
 const HISTORY_COUNT_FIELDS = [
   ['ready_count', 'readyCount'],
   ['provisioning_count', 'provisioningCount'],
@@ -69,6 +81,44 @@ const HISTORY_COUNT_FIELDS = [
   ['stopping_count', 'stoppingCount'],
   ['total_count', 'totalCount'],
 ];
+
+const ACCELERATOR_HISTORY_FIELDS = [
+  ['min_replicas', 'minReplicas'],
+  ['demand_target', 'demandTarget'],
+  ['ready_capacity', 'readyCapacity'],
+  ['provisioning_capacity', 'provisioningCapacity'],
+  ['total_capacity', 'totalCapacity'],
+  ['zero_cost_ready_capacity', 'zeroCostReadyCapacity'],
+  ['fill_target', 'fillTarget'],
+  ['free_reserved_slots', 'freeReservedSlots'],
+];
+
+export function normalizeAcceleratorBreakdown(value) {
+  if (!value || typeof value !== 'object' || value.version !== 1) return null;
+  const cards = value.configured_accelerators;
+  if (
+    !Array.isArray(cards) ||
+    cards.length === 0 ||
+    cards.length > 8 ||
+    cards.some((card) => typeof card !== 'string' || !card) ||
+    new Set(cards.map((card) => card.toLowerCase())).size !== cards.length
+  ) {
+    return null;
+  }
+  const normalized = { configuredAccelerators: [...cards] };
+  for (const [source, target] of ACCELERATOR_HISTORY_FIELDS) {
+    const raw = value[source];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const counts = {};
+    for (const card of cards) {
+      const count = Number(raw[card]);
+      if (!Number.isInteger(count) || count < 0) return null;
+      counts[card] = count;
+    }
+    normalized[target] = counts;
+  }
+  return normalized;
+}
 
 export function normalizeReplicaHistory(history) {
   if (!history || typeof history !== 'object') return null;
@@ -179,6 +229,9 @@ export function normalizeReplicaHistory(history) {
             totalCapacity,
             peakInFlight: optionalCount(sample.peak_in_flight),
             peakQueueDepth: optionalCount(sample.peak_queue_depth),
+            acceleratorBreakdown: normalizeAcceleratorBreakdown(
+              sample.accelerator_breakdown
+            ),
           };
         })
         .filter(Boolean)
@@ -297,10 +350,13 @@ export function normalizeService(record) {
     (value) => Number.isInteger(value) && value >= 0
   );
 
-  const pricedReplicas = replicas.filter(
+  const costTrackedReplicas = replicas.filter(
+    (replica) => !NON_BILLABLE_COST_STATUSES.has(replica.status)
+  );
+  const pricedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCost !== null
   );
-  const excludedReplicas = replicas.filter(
+  const excludedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCostExclusionReason
   );
   const hourlyCostExclusionReasons = {};
@@ -421,6 +477,7 @@ export function normalizeService(record) {
     estimatedHourlyCost,
     spotHourlyCost,
     onDemandHourlyCost,
+    costTrackedReplicaCount: costTrackedReplicas.length,
     pricedReplicaCount: pricedReplicas.length,
     hourlyCostExcludedReplicaCount,
     hourlyCostExclusionReasons,

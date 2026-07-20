@@ -316,6 +316,14 @@ class TestMigrationChainPG:
                     'serve_autoscaler_history',
                     'serve_placement_events',
                 }.issubset(tables), tables
+                autoscaler_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'serve_autoscaler_history')
+                }
+                assert {
+                    'accelerator_breakdown',
+                    'accelerator_breakdown_observed_at',
+                }.issubset(autoscaler_columns)
                 service_columns = {
                     column['name']
                     for column in inspector.get_columns('services')
@@ -781,6 +789,38 @@ class TestServeStatusHistoryPG:
             'total_capacity': 12,
             'peak_in_flight': 2,
             'peak_queue_depth': 1,
+            'accelerator_breakdown': {
+                'configured_accelerators': ['A100', 'A100-80GB'],
+                'min_replicas': {
+                    'A100-80GB': 1
+                },
+                'demand_target': {
+                    'A100': 2,
+                    'A100-80GB': 3
+                },
+                'ready_capacity': {
+                    'A100': 2,
+                    'A100-80GB': 2
+                },
+                'provisioning_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 2
+                },
+                'total_capacity': {
+                    'A100': 4,
+                    'A100-80GB': 8
+                },
+                'zero_cost_ready_capacity': {
+                    'A100': 1
+                },
+                'fill_target': {
+                    'A100': 5,
+                    'A100-80GB': 5
+                },
+                'free_reserved_slots': {
+                    'A100': 2
+                },
+            },
         }
         assert serve_history.record_autoscaler_snapshot('svc',
                                                         'hash-a',
@@ -789,35 +829,45 @@ class TestServeStatusHistoryPG:
                                                         **base) == 1
         # An older observation cannot replace state, but its peaks remain
         # meaningful for the minute.
-        serve_history.record_autoscaler_snapshot('svc',
-                                                 'hash-a',
-                                                 'a' * 32,
-                                                 timestamp=timestamp - 1,
-                                                 **{
-                                                     **base,
-                                                     'demand_target': 2,
-                                                     'capacity_target': 2,
-                                                     'ready_capacity': 2,
-                                                     'provisioning_capacity': 0,
-                                                     'total_capacity': 2,
-                                                     'peak_in_flight': 5,
-                                                     'peak_queue_depth': 4,
-                                                 })
-        serve_history.record_autoscaler_snapshot('svc',
-                                                 'hash-a',
-                                                 'b' * 32,
-                                                 timestamp=timestamp + 20,
-                                                 **{
-                                                     **base,
-                                                     'version': 2,
-                                                     'demand_target': 6,
-                                                     'capacity_target': 12,
-                                                     'ready_capacity': 8,
-                                                     'provisioning_capacity': 2,
-                                                     'total_capacity': 14,
-                                                     'peak_in_flight': 3,
-                                                     'peak_queue_depth': 7,
-                                                 })
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'a' * 32,
+            timestamp=timestamp - 1,
+            **{
+                **base,
+                'demand_target': 2,
+                'capacity_target': 2,
+                'ready_capacity': 2,
+                'provisioning_capacity': 0,
+                'total_capacity': 2,
+                'peak_in_flight': 5,
+                'peak_queue_depth': 4,
+                'accelerator_breakdown': None,
+            })
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'b' * 32,
+            timestamp=timestamp + 20,
+            **{
+                **base,
+                'version': 2,
+                'demand_target': 6,
+                'capacity_target': 12,
+                'ready_capacity': 8,
+                'provisioning_capacity': 2,
+                'total_capacity': 14,
+                'peak_in_flight': 3,
+                'peak_queue_depth': 7,
+                'accelerator_breakdown': {
+                    **base['accelerator_breakdown'],
+                    'demand_target': {
+                        'A100': 3,
+                        'A100-80GB': 3,
+                    },
+                },
+            })
 
         history = serve_history.get_status_history('svc',
                                                    timestamp=timestamp + 21)
@@ -834,7 +884,59 @@ class TestServeStatusHistoryPG:
             'total_capacity': 14,
             'peak_in_flight': 5,
             'peak_queue_depth': 7,
+            'accelerator_breakdown': {
+                'version': 1,
+                'configured_accelerators': ['A100', 'A100-80GB'],
+                'min_replicas': {
+                    'A100': 0,
+                    'A100-80GB': 1
+                },
+                'demand_target': {
+                    'A100': 3,
+                    'A100-80GB': 3
+                },
+                'ready_capacity': {
+                    'A100': 2,
+                    'A100-80GB': 2
+                },
+                'provisioning_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 2
+                },
+                'total_capacity': {
+                    'A100': 4,
+                    'A100-80GB': 8
+                },
+                'zero_cost_ready_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 0
+                },
+                'fill_target': {
+                    'A100': 5,
+                    'A100-80GB': 5
+                },
+                'free_reserved_slots': {
+                    'A100': 2,
+                    'A100-80GB': 0
+                },
+            },
         }]
+
+        # A rolling-upgrade writer that knows only aggregate columns may
+        # advance observed_at without touching the new JSONB column. The
+        # timestamp fence must hide that stale card assignment.
+        table = serve_history.serve_autoscaler_history_table
+        newer_observed_at = datetime.datetime.fromtimestamp(
+            timestamp + 21, datetime.timezone.utc)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).values(
+                    observed_at=newer_observed_at).where(
+                        table.c.service_name == 'svc',
+                        table.c.service_hash == 'hash-a'))
+        mixed = serve_history.get_status_history('svc',
+                                                 timestamp=timestamp + 22)
+        assert mixed['autoscaler_samples'][0]['accelerator_breakdown'] is None
 
     def test_mixed_reporter_rejection_history_is_not_false_zero(
             self, history_engine):

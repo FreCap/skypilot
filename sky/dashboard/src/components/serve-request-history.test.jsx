@@ -1,4 +1,23 @@
-import { buildRequestHistoryView } from './serve-request-history';
+jest.mock('@/components/serve-history-range', () => {
+  const React = require('react');
+  return {
+    SelectableHistoryLine: ({ data }) =>
+      React.createElement(
+        'div',
+        { 'data-testid': 'history-series' },
+        data.datasets.map((dataset) => dataset.label).join('|')
+      ),
+    historyLinearScale: () => ({}),
+  };
+});
+
+import React from 'react';
+import { render, screen } from '@testing-library/react';
+
+import {
+  buildRequestHistoryView,
+  RequestHistoryCard,
+} from './serve-request-history';
 
 describe('buildRequestHistoryView', () => {
   it('fills missing minute buckets and derives selected-range statistics', () => {
@@ -122,5 +141,42 @@ describe('buildRequestHistoryView', () => {
       stats: null,
       capacityStats: null,
     });
+  });
+});
+
+describe('RequestHistoryCard semantics', () => {
+  it('distinguishes traffic, reservation, and non-failed capacity', () => {
+    render(
+      <RequestHistoryCard
+        history={{
+          available: true,
+          bucketSeconds: 60,
+          requestSamples: [{ timestamp: 120, requestCount: 3 }],
+          autoscalerSamples: [
+            {
+              timestamp: 120,
+              demandTarget: 2,
+              capacityTarget: 4,
+              readyCapacity: 1,
+              provisioningCapacity: 2,
+              totalCapacity: 5,
+            },
+          ],
+        }}
+        range={{ start: 120, end: 120 }}
+        onRangeSelect={() => {}}
+      />
+    );
+
+    expect(
+      screen.getByText(/Traffic target includes autoscaler hysteresis/)
+    ).toBeTruthy();
+    expect(screen.getByTestId('history-series').textContent).toContain(
+      'Traffic target (with hysteresis)|Traffic or reservation target|Ready capacity|Provisioning capacity|Non-failed tracked capacity'
+    );
+    expect(
+      screen.getByText('Peak traffic target (with hysteresis)')
+    ).toBeTruthy();
+    expect(screen.getByText('Peak traffic or reservation target')).toBeTruthy();
   });
 });

@@ -51,6 +51,7 @@ class SkyServiceSpec:
         max_scale_up_rate_percentage: int | None = None,
         scale_up_rate_min_replicas: int | None = None,
         scale_up_rate_period_seconds: int | None = None,
+        adaptive_scale_up: dict[str, Any] | None = None,
         max_scale_down_rate_percentage: int | None = None,
         reserved_capacity_fill: bool | dict[str, Any] | None = None,
         cost_rebalance: dict[str, Any] | None = None,
@@ -83,6 +84,7 @@ class SkyServiceSpec:
                 'max_scale_up_rate_percentage',
                 'scale_up_rate_min_replicas',
                 'scale_up_rate_period_seconds',
+                'adaptive_scale_up',
                 'max_scale_down_rate_percentage',
                 'base_ondemand_fallback_replicas',
                 'dynamic_ondemand_fallback',
@@ -343,6 +345,45 @@ class SkyServiceSpec:
                     'max_scale_up_rate_percentage, '
                     'scale_up_rate_min_replicas, and '
                     'scale_up_rate_period_seconds must be set together.')
+        if adaptive_scale_up is not None:
+            if not isinstance(adaptive_scale_up, dict):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError('adaptive_scale_up must be an object. '
+                                     f'Got: {adaptive_scale_up!r}')
+            if not all(value is not None for value in scale_up_rate_fields):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'adaptive_scale_up requires max_scale_up_rate_'
+                        'percentage, scale_up_rate_min_replicas, and '
+                        'scale_up_rate_period_seconds.')
+            adaptive_defaults = {
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            }
+            adaptive_defaults.update(adaptive_scale_up)
+            _validate_percentage(
+                'adaptive_scale_up.max_scale_up_rate_percentage',
+                adaptive_defaults['max_scale_up_rate_percentage'])
+            for field in ('scale_up_rate_min_replicas',
+                          'pressure_observations'):
+                value = adaptive_defaults[field]
+                if (not isinstance(value, int) or isinstance(value, bool) or
+                        value <= 0):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            f'adaptive_scale_up.{field} must be a positive '
+                            f'integer. Got: {value!r}')
+            hold_seconds = adaptive_defaults['hold_seconds']
+            if (not isinstance(hold_seconds, (int, float)) or
+                    isinstance(hold_seconds, bool) or hold_seconds <= 0 or
+                    not math.isfinite(hold_seconds)):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'adaptive_scale_up.hold_seconds must be a finite '
+                        f'number > 0. Got: {hold_seconds!r}')
+            adaptive_scale_up = adaptive_defaults
 
         logical_scaling_fields = {
             'target_utilization_percentage': target_utilization_percentage,
@@ -350,6 +391,7 @@ class SkyServiceSpec:
             'max_scale_up_rate_percentage': max_scale_up_rate_percentage,
             'scale_up_rate_min_replicas': scale_up_rate_min_replicas,
             'scale_up_rate_period_seconds': scale_up_rate_period_seconds,
+            'adaptive_scale_up': adaptive_scale_up,
             'max_scale_down_rate_percentage': max_scale_down_rate_percentage,
         }
         explicitly_set_logical_fields = [
@@ -450,7 +492,7 @@ class SkyServiceSpec:
                     f'{constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS}. '
                     f'Got: {graceful_drain_seconds!r}')
         if lb_request_queue is not None:
-            queue_defaults = {
+            queue_defaults: dict[str, Any] = {
                 'min_size': constants.LB_REQUEST_QUEUE_MIN_SIZE,
                 'size_per_replica': constants.LB_REQUEST_QUEUE_SIZE_PER_REPLICA,
                 'max_size': constants.LB_REQUEST_QUEUE_MAX_SIZE,
@@ -508,6 +550,49 @@ class SkyServiceSpec:
                     raise ValueError(
                         'load_balancer.request_queue.timeout_seconds must be '
                         f'a finite number > 0. Got: {timeout_seconds!r}')
+            thresholds: Any = queue_defaults.get('timeout_seconds_by_priority',
+                                                 [])
+            if not isinstance(thresholds, list):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.request_queue.timeout_seconds_by_'
+                        f'priority must be a list. Got: {thresholds!r}')
+            normalized_thresholds: list[dict[str, int | float]] = []
+            previous_priority = -1
+            for threshold in thresholds:
+                if not isinstance(threshold, dict):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            'load_balancer.request_queue.timeout_seconds_by_'
+                            'priority entries must be objects.')
+                min_priority = threshold.get('min_priority')
+                threshold_timeout = threshold.get('timeout_seconds')
+                if (not isinstance(min_priority, int) or
+                        isinstance(min_priority, bool) or
+                        not 0 <= min_priority <= 100 or
+                        min_priority <= previous_priority):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            'load_balancer.request_queue.timeout_seconds_by_'
+                            'priority min_priority values must be unique, '
+                            'strictly increasing integers from 0 to 100. '
+                            f'Got: {min_priority!r}')
+                if (not isinstance(threshold_timeout, (int, float)) or
+                        isinstance(threshold_timeout, bool) or
+                        threshold_timeout <= 0 or
+                        not math.isfinite(threshold_timeout)):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            'load_balancer.request_queue.timeout_seconds_by_'
+                            'priority timeout_seconds must be a finite '
+                            f'number > 0. Got: {threshold_timeout!r}')
+                normalized_thresholds.append({
+                    'min_priority': min_priority,
+                    'timeout_seconds': threshold_timeout,
+                })
+                previous_priority = min_priority
+            queue_defaults['timeout_seconds_by_priority'] = (
+                normalized_thresholds)
             use_async_occupancy = queue_defaults['use_async_occupancy']
             if not isinstance(use_async_occupancy, bool):
                 with ux_utils.print_exception_no_traceback():
@@ -577,6 +662,7 @@ class SkyServiceSpec:
             scale_up_rate_min_replicas)
         self._scale_up_rate_period_seconds: int | None = (
             scale_up_rate_period_seconds)
+        self._adaptive_scale_up: dict[str, Any] | None = adaptive_scale_up
         self._max_scale_down_rate_percentage: int | None = (
             max_scale_down_rate_percentage)
         # Internal compatibility marker. dynamic_fallback_per_gpu predates
@@ -634,6 +720,7 @@ class SkyServiceSpec:
         state.setdefault('_max_scale_up_rate_percentage', None)
         state.setdefault('_scale_up_rate_min_replicas', None)
         state.setdefault('_scale_up_rate_period_seconds', None)
+        state.setdefault('_adaptive_scale_up', None)
         # Old persisted specs predate bounded downscale and preserve the
         # previous unlimited target adoption rather than silently changing on
         # an API-server restart. Newly parsed specs default to 50 via the
@@ -856,6 +943,7 @@ class SkyServiceSpec:
             service_config['max_scale_up_rate_percentage'] = None
             service_config['scale_up_rate_min_replicas'] = None
             service_config['scale_up_rate_period_seconds'] = None
+            service_config['adaptive_scale_up'] = None
             service_config['max_scale_down_rate_percentage'] = None
             service_config['reserved_capacity_fill'] = None
             service_config['cost_rebalance'] = None
@@ -875,7 +963,7 @@ class SkyServiceSpec:
                           'expected_request_duration_seconds',
                           'max_scale_up_rate_percentage',
                           'scale_up_rate_min_replicas',
-                          'scale_up_rate_period_seconds',
+                          'scale_up_rate_period_seconds', 'adaptive_scale_up',
                           'max_scale_down_rate_percentage'):
                 service_config[field] = policy_section.get(field, None)
             service_config['reserved_capacity_fill'] = policy_section.get(
@@ -1090,7 +1178,7 @@ class SkyServiceSpec:
                       'expected_request_duration_seconds',
                       'max_scale_up_rate_percentage',
                       'scale_up_rate_min_replicas',
-                      'scale_up_rate_period_seconds',
+                      'scale_up_rate_period_seconds', 'adaptive_scale_up',
                       'max_scale_down_rate_percentage'):
             add_if_not_none('replica_policy', field, getattr(self, f'_{field}'))
         # no_empty: omit both None and False so older controllers never see
@@ -1334,6 +1422,11 @@ class SkyServiceSpec:
         return getattr(self, '_scale_up_rate_period_seconds', None)
 
     @property
+    def adaptive_scale_up(self) -> dict[str, Any] | None:
+        value = getattr(self, '_adaptive_scale_up', None)
+        return dict(value) if value is not None else None
+
+    @property
     def max_scale_down_rate_percentage(self) -> int:
         value = getattr(self, '_max_scale_down_rate_percentage', None)
         return 50 if value is None else value
@@ -1484,6 +1577,8 @@ class SkyServiceSpec:
             'scale_up_rate_period_seconds': override.pop(
                 'scale_up_rate_period_seconds',
                 self._scale_up_rate_period_seconds),
+            'adaptive_scale_up': override.pop('adaptive_scale_up',
+                                              self._adaptive_scale_up),
             'max_scale_down_rate_percentage': override.pop(
                 'max_scale_down_rate_percentage',
                 self._max_scale_down_rate_percentage),
@@ -1542,6 +1637,8 @@ class SkyServiceSpec:
             scale_up_rate_period_seconds=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['scale_up_rate_period_seconds']),
+            adaptive_scale_up=(None if preserve_legacy_semantics else
+                               logical_scaling_values['adaptive_scale_up']),
             max_scale_down_rate_percentage=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['max_scale_down_rate_percentage']),

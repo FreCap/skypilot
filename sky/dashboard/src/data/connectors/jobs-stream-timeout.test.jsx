@@ -23,7 +23,14 @@ jest.mock('@/data/connectors/toast', () => ({
 import { TextDecoder as NodeTextDecoder } from 'util';
 
 import { apiClient } from '@/data/connectors/client';
-import { streamManagedJobLogs } from '@/data/connectors/jobs';
+import {
+  downloadManagedJobLogs,
+  streamManagedJobLogs,
+} from '@/data/connectors/jobs';
+import {
+  downloadManagedJobLogs as downloadManagedJobLogsImplementation,
+  streamManagedJobLogs as streamManagedJobLogsImplementation,
+} from '@/data/connectors/managed-job-logs';
 import { showToast } from '@/data/connectors/toast';
 
 function abortError() {
@@ -82,6 +89,11 @@ beforeEach(() => {
 
 afterEach(() => {
   jest.useRealTimers();
+});
+
+it('preserves direct log gateway identities through the jobs facade', () => {
+  expect(streamManagedJobLogs).toBe(streamManagedJobLogsImplementation);
+  expect(downloadManagedJobLogs).toBe(downloadManagedJobLogsImplementation);
 });
 
 it('aborts the owned request when log inactivity times out', async () => {

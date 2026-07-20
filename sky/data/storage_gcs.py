@@ -39,6 +39,12 @@ _BUCKET_EXTERNALLY_DELETED_DEBUG_MESSAGE: str = (
 _STORAGE_LOG_FILE_NAME: str = storage_lib.GCS_STORAGE_LOG_FILE_NAME
 
 
+def _validate_condition(condition: bool, message: object) -> None:
+    """Raise the same error as an assertion without optimization elision."""
+    if not condition:
+        raise AssertionError(message)
+
+
 class GcsStore(AbstractStore):
     """GcsStore inherits from Storage Object and represents the backend
     for GCS buckets.
@@ -61,49 +67,59 @@ class GcsStore(AbstractStore):
     def _validate(self):
         if self.source is not None and isinstance(self.source, str):
             if self.source.startswith('s3://'):
-                assert self.name == data_utils.split_s3_path(self.source)[0], (
+                _validate_condition(
+                    self.name == data_utils.split_s3_path(self.source)[0],
                     'S3 Bucket is specified as path, the name should be the'
                     ' same as S3 bucket.')
-                assert data_utils.verify_s3_bucket(self.name), (
-                    f'Source specified as {self.source}, an S3 bucket. ',
-                    'S3 Bucket should exist.')
+                _validate_condition(
+                    data_utils.verify_s3_bucket(self.name),
+                    (f'Source specified as {self.source}, an S3 bucket. ',
+                     'S3 Bucket should exist.'))
             elif self.source.startswith('gs://'):
-                assert self.name == data_utils.split_gcs_path(self.source)[0], (
+                _validate_condition(
+                    self.name == data_utils.split_gcs_path(self.source)[0],
                     'GCS Bucket is specified as path, the name should be '
                     'the same as GCS bucket.')
             elif data_utils.is_az_container_endpoint(self.source):
                 storage_account_name, container_name, _ = (
                     data_utils.split_az_path(self.source))
-                assert self.name == container_name, (
+                _validate_condition(
+                    self.name == container_name,
                     'Azure bucket is specified as path, the name should be '
                     'the same as Azure bucket.')
-                assert data_utils.verify_az_bucket(
-                    storage_account_name, self.name), (
-                        f'Source specified as {self.source}, an Azure bucket. '
-                        'Azure bucket should exist.')
+                _validate_condition(
+                    data_utils.verify_az_bucket(storage_account_name,
+                                                self.name),
+                    f'Source specified as {self.source}, an Azure bucket. '
+                    'Azure bucket should exist.')
             elif self.source.startswith('r2://'):
-                assert self.name == data_utils.split_r2_path(self.source)[0], (
+                _validate_condition(
+                    self.name == data_utils.split_r2_path(self.source)[0],
                     'R2 Bucket is specified as path, the name should be '
                     'the same as R2 bucket.')
-                assert data_utils.verify_r2_bucket(self.name), (
-                    f'Source specified as {self.source}, a R2 bucket. ',
-                    'R2 Bucket should exist.')
+                _validate_condition(
+                    data_utils.verify_r2_bucket(self.name),
+                    (f'Source specified as {self.source}, a R2 bucket. ',
+                     'R2 Bucket should exist.'))
             elif self.source.startswith('nebius://'):
-                assert self.name == data_utils.split_nebius_path(
-                    self.source)[0], (
-                        'Nebius Object Storage is specified as path, the name '
-                        'should be the same as R2 bucket.')
-                assert data_utils.verify_nebius_bucket(self.name), (
+                _validate_condition(
+                    self.name == data_utils.split_nebius_path(self.source)[0],
+                    'Nebius Object Storage is specified as path, the name '
+                    'should be the same as R2 bucket.')
+                _validate_condition(
+                    data_utils.verify_nebius_bucket(self.name),
                     f'Source specified as {self.source}, a Nebius Object '
                     f'Storage bucket. Nebius Object Storage Bucket should '
                     f'exist.')
             elif self.source.startswith('cos://'):
-                assert self.name == data_utils.split_cos_path(self.source)[0], (
+                _validate_condition(
+                    self.name == data_utils.split_cos_path(self.source)[0],
                     'COS Bucket is specified as path, the name should be '
                     'the same as COS bucket.')
-                assert data_utils.verify_ibm_cos_bucket(self.name), (
-                    f'Source specified as {self.source}, a COS bucket. ',
-                    'COS Bucket should exist.')
+                _validate_condition(
+                    data_utils.verify_ibm_cos_bucket(self.name),
+                    (f'Source specified as {self.source}, a COS bucket. ',
+                     'COS Bucket should exist.'))
             elif self.source.startswith('oci://'):
                 raise NotImplementedError(
                     'Moving data from OCI to GCS is currently not supported.')
@@ -245,7 +261,8 @@ class GcsStore(AbstractStore):
                     f'{colorama.Style.RESET_ALL}')
 
     def _delete_sub_path(self) -> None:
-        assert self._bucket_sub_path is not None, 'bucket_sub_path is not set'
+        _validate_condition(self._bucket_sub_path is not None,
+                            'bucket_sub_path is not set')
         deleted_by_skypilot = self._delete_gcs_bucket(self.name,
                                                       self._bucket_sub_path)
         if deleted_by_skypilot:

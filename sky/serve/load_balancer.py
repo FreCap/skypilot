@@ -1,8 +1,10 @@
 """LoadBalancer: Distribute any incoming request to all ready replicas."""
 import argparse
 import asyncio
+import collections
 import contextlib
 import dataclasses
+import hashlib
 import heapq
 import json
 import logging
@@ -161,6 +163,7 @@ class SkyServeLoadBalancer:
     # _prune_reject_window (the single funnel every read and write goes
     # through), so instances cannot leak reject state into one another.
     _queue_depth: int = 0
+    _queue_depth_by_priority: dict[int, int] | None = None
     _request_queue_config: dict[str, Any] | None = None
     _request_queue_condition: asyncio.Condition | None = None
     _active_request_count: int = 0
@@ -170,11 +173,14 @@ class SkyServeLoadBalancer:
                                            _RequestQueueWaiter]] | None = None
     _request_queue_sequence: int = 0
     _draining: bool = False
-    _reject_last_seen: dict[str, float] | None = None
+    _reject_last_seen: dict[str, tuple[float, int]] | None = None
     _reject_compatibility_by_key: dict[str, tuple[int,
                                                   tuple[str,
                                                         ...]]] | None = None
     _reject_fallback_seq: int = 0
+    _offered_arrivals_by_job: dict[str, float] | None = None
+    _headerless_offered_arrivals: collections.deque[float] | None = None
+    _offered_arrival_saturated_until: float | None = None
     _capacity_hint: dict[str, Any] | None = None
     _configured_accelerators: tuple[str, ...] | None = None
     _request_accelerator_compatibility_version: int | None = None
@@ -379,6 +385,7 @@ class SkyServeLoadBalancer:
         # single uvicorn event loop, and the +=/-= pair brackets the
         # handler without an await between a read and its write.
         self._queue_depth: int = 0
+        self._queue_depth_by_priority: dict[int, int] = {}
         # Reject window with dedup: job key -> last-seen monotonic time.
         # Keyed by the LB_JOB_ID_HEADER value so repeated attempts for one
         # logical job refresh its TTL while still counting as one unit of
@@ -391,6 +398,10 @@ class SkyServeLoadBalancer:
         # each such reject counts once (raw-count over-estimation,
         # documented -- the platform sends the header).
         self._reject_fallback_seq: int = 0
+        self._offered_arrivals_by_job: dict[str, float] = {}
+        self._headerless_offered_arrivals: collections.deque[float] = (
+            collections.deque())
+        self._offered_arrival_saturated_until: float | None = None
         # Latest capacity_hint from the controller sync response
         # (provisioning/target replica counts). None until a sync carries
         # one (old controller, or never synced); /_lb/capacity readers
@@ -860,6 +871,33 @@ class SkyServeLoadBalancer:
         queue_size = max(config['min_size'],
                          queue_capacity_units * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
+
+    @staticmethod
+    def _request_queue_timeout(config: dict[str, Any], priority: int) -> float:
+        timeout = float(config['timeout_seconds'])
+        for threshold in config.get('timeout_seconds_by_priority', ()):
+            if priority < threshold['min_priority']:
+                break
+            timeout = float(threshold['timeout_seconds'])
+        return timeout
+
+    def _change_queue_depth(self, priority: int, delta: int) -> None:
+        self._queue_depth = max(0, self._queue_depth + delta)
+        depths = self._queue_depth_by_priority
+        if depths is None:
+            depths = {}
+            self._queue_depth_by_priority = depths
+        next_count = depths.get(priority, 0) + delta
+        if next_count <= 0:
+            depths.pop(priority, None)
+        else:
+            depths[priority] = next_count
+
+    def _queue_depth_priority_snapshot(self) -> dict[str, int]:
+        return {
+            str(priority): count for priority, count in sorted((
+                self._queue_depth_by_priority or {}).items()) if count > 0
+        }
 
     def _current_dispatch_load(self) -> int:
         """Conservative live request count, including returned streams."""
@@ -1577,7 +1615,8 @@ class SkyServeLoadBalancer:
         if condition is None:
             condition = asyncio.Condition()
             self._request_queue_condition = condition
-        deadline = time.monotonic() + config['timeout_seconds']
+        deadline = time.monotonic() + self._request_queue_timeout(
+            config, priority)
         waiter: _RequestQueueWaiter | None = None
         try:
             async with condition:
@@ -1971,7 +2010,7 @@ class SkyServeLoadBalancer:
                 unknown_urls.append(url)
         return in_flight, routing_urls, unknown_urls, sampled_urls
 
-    def _prune_reject_window(self) -> dict[str, float]:
+    def _prune_reject_window(self) -> dict[str, tuple[float, int]]:
         """Drop reject entries older than the window; return the live dict.
 
         Called on every access (record + read) rather than on a timer:
@@ -1984,11 +2023,16 @@ class SkyServeLoadBalancer:
         """
         cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
         current = self._reject_last_seen
-        pruned: dict[str, float] = {}
+        pruned: dict[str, tuple[float, int]] = {}
         if current:
-            pruned = {
-                key: seen for key, seen in current.items() if seen > cutoff
-            }
+            for key, entry in current.items():
+                if isinstance(entry, tuple):
+                    seen, priority = entry
+                else:
+                    seen = entry
+                    priority = constants.LB_REQUEST_PRIORITY_MIN
+                if seen > cutoff:
+                    pruned[key] = (seen, priority)
         self._reject_last_seen = pruned
         profiles = self._reject_compatibility_by_key
         if profiles is not None:
@@ -2012,7 +2056,11 @@ class SkyServeLoadBalancer:
         if key is None:
             self._reject_fallback_seq += 1
             key = f'_headerless_{self._reject_fallback_seq}'
-        self._prune_reject_window()[key] = time.monotonic()
+        priority = getattr(request, _REQUEST_PRIORITY_ATTR,
+                           constants.LB_REQUEST_PRIORITY_MIN)
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            priority = constants.LB_REQUEST_PRIORITY_MIN
+        self._prune_reject_window()[key] = (time.monotonic(), priority)
         configured = self._configured_accelerators
         compatible = getattr(request, _REQUEST_ACCELERATORS_ATTR, None)
         if compatible is None:
@@ -2020,10 +2068,6 @@ class SkyServeLoadBalancer:
         if (not isinstance(compatible, (list, tuple)) or not compatible or
                 not all(isinstance(card, str) and card for card in compatible)):
             compatible = None
-        priority = getattr(request, _REQUEST_PRIORITY_ATTR,
-                           constants.LB_REQUEST_PRIORITY_MIN)
-        if not isinstance(priority, int) or isinstance(priority, bool):
-            priority = constants.LB_REQUEST_PRIORITY_MIN
         profiles = self._reject_compatibility_by_key
         if profiles is None:
             profiles = {}
@@ -2052,7 +2096,7 @@ class SkyServeLoadBalancer:
         cutoff = (time.monotonic() -
                   constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
         grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
-        for key, last_seen in retained.items():
+        for key, (last_seen, _) in retained.items():
             profile = profiles.get(key)
             if profile is None:
                 continue
@@ -2240,7 +2284,93 @@ class SkyServeLoadBalancer:
         retained = self._prune_reject_window()
         cutoff = (time.monotonic() -
                   constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
-        return sum(last_seen > cutoff for last_seen in retained.values())
+        return sum(last_seen > cutoff for last_seen, _ in retained.values())
+
+    def _rejected_by_priority(self, recent: bool = False) -> dict[str, int]:
+        retained = self._prune_reject_window()
+        cutoff = (time.monotonic() -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        counts: dict[int, int] = {}
+        for last_seen, priority in retained.values():
+            if recent and last_seen <= cutoff:
+                continue
+            counts[priority] = counts.get(priority, 0) + 1
+        return {
+            str(priority): count for priority, count in sorted(counts.items())
+        }
+
+    def _prune_offered_arrivals(
+        self,
+        now: float | None = None
+    ) -> tuple[dict[str, float], collections.deque[float]]:
+        current = time.monotonic() if now is None else now
+        cutoff = current - constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
+        jobs = self._offered_arrivals_by_job or {}
+        self._offered_arrivals_by_job = {
+            key: seen for key, seen in jobs.items() if seen > cutoff
+        }
+        headerless = self._headerless_offered_arrivals
+        if headerless is None:
+            headerless = collections.deque()
+            self._headerless_offered_arrivals = headerless
+        while headerless and headerless[0] <= cutoff:
+            headerless.popleft()
+        saturated_until = self._offered_arrival_saturated_until
+        if saturated_until is not None and current >= saturated_until:
+            self._offered_arrival_saturated_until = None
+        return self._offered_arrivals_by_job, headerless
+
+    def _record_offered_arrival(self, request: fastapi.Request) -> None:
+        now = time.monotonic()
+        jobs, headerless = self._prune_offered_arrivals(now)
+        if self._offered_arrival_saturated_until is not None:
+            self._offered_arrival_saturated_until = (
+                now + constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
+            return
+        job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
+        if not isinstance(job_id, str) or not job_id:
+            job_id = None
+        key: str | None = None
+        if job_id is not None:
+            key = hashlib.sha256(job_id.encode('utf-8')).hexdigest()
+            if key in jobs:
+                jobs[key] = now
+                return
+        if len(jobs) + len(headerless) >= constants.LB_OFFERED_ARRIVAL_CAP:
+            self._offered_arrival_saturated_until = (
+                now + constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
+            return
+        if job_id is None:
+            headerless.append(now)
+        else:
+            assert key is not None
+            jobs[key] = now
+
+    def _offered_arrival_counts(self) -> dict[str, int | bool]:
+        now = time.monotonic()
+        jobs, headerless = self._prune_offered_arrivals(now)
+        recent_cutoff = (now - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        saturated = self._offered_arrival_saturated_until is not None
+        if saturated:
+            # Publish the conservative combined count directly as the stable
+            # job bucket. Headerless is zero so consumers that sum the two
+            # populations observe exactly the cap rather than twice the cap.
+            return {
+                'unique_job_arrivals_60s': constants.LB_OFFERED_ARRIVAL_CAP,
+                'unique_job_arrivals_300s': constants.LB_OFFERED_ARRIVAL_CAP,
+                'headerless_arrivals_60s': 0,
+                'headerless_arrivals_300s': 0,
+                'offered_arrival_tracking_saturated': True,
+            }
+        return {
+            'unique_job_arrivals_60s': sum(
+                seen > recent_cutoff for seen in jobs.values()),
+            'unique_job_arrivals_300s': len(jobs),
+            'headerless_arrivals_60s': sum(
+                seen > recent_cutoff for seen in headerless),
+            'headerless_arrivals_300s': len(headerless),
+            'offered_arrival_tracking_saturated': saturated,
+        }
 
     async def _capacity(
             self, request: fastapi.Request) -> fastapi.responses.JSONResponse:
@@ -2492,6 +2622,7 @@ class SkyServeLoadBalancer:
             'occupancy_oldest_usable_sample_age_seconds': oldest_usable_sample_age,
             'last_sync_age_seconds': last_sync_age,
             'queue_depth': self._queue_depth,
+            'queue_depth_by_priority': self._queue_depth_priority_snapshot(),
             # Process-local admission counters are required to prove that a
             # legacy LB has no body-bearing work before selector migration.
             # They remain behind the data-plane bearer like this entire
@@ -2508,6 +2639,10 @@ class SkyServeLoadBalancer:
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
             'rejected_in_window': self._rejected_in_window(),
             'rejected_in_recent_window': self._rejected_in_recent_window(),
+            'rejected_in_window_by_priority': self._rejected_by_priority(),
+            'rejected_in_recent_window_by_priority':
+                self._rejected_by_priority(recent=True),
+            **self._offered_arrival_counts(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
             'min_replicas_by_accelerator': hint.get(
@@ -3047,8 +3182,14 @@ class SkyServeLoadBalancer:
                     self._request_queue_profiles(),
                 'rejected_requests_by_compatibility':
                     self._rejected_compatibility_profiles(),
+                'queue_depth_by_priority':
+                    self._queue_depth_priority_snapshot(),
                 'rejected_in_window': self._rejected_in_window(),
                 'rejected_in_recent_window': self._rejected_in_recent_window(),
+                'rejected_in_window_by_priority': self._rejected_by_priority(),
+                'rejected_in_recent_window_by_priority':
+                    self._rejected_by_priority(recent=True),
+                **self._offered_arrival_counts(),
             }
             try:
                 # Send request information. Drain the aggregator once for the
@@ -3846,6 +3987,7 @@ class SkyServeLoadBalancer:
         setattr(request, _REQUEST_PRIORITY_ATTR, priority)
         compatible_accelerators = self._parse_request_accelerators(request)
         setattr(request, _REQUEST_ACCELERATORS_ATTR, compatible_accelerators)
+        self._record_offered_arrival(request)
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
         # The dispatched phase is deliberately excluded: the dispatch
@@ -3863,7 +4005,7 @@ class SkyServeLoadBalancer:
         # streams: that phase is accounted by the policy's load_map, not
         # here. Plain int is safe: single uvicorn event loop, no await
         # between each read and its paired write.
-        self._queue_depth += 1
+        self._change_queue_depth(priority, 1)
         acquired_slot = False
         had_admission_slot = False
         body_cleanup_transferred = False
@@ -3945,11 +4087,13 @@ class SkyServeLoadBalancer:
                 finally:
                     # Admission notification is itself cancellable. The demand
                     # gauge must still balance on every exit.
-                    self._queue_depth -= 1
+                    self._change_queue_depth(priority, -1)
 
     async def _proxy_with_retries_inner(
             self, request: fastapi.Request) -> fastapi.responses.Response:
         """Retry loop body, bracketed by the queue-depth gauge above."""
+        priority = getattr(request, _REQUEST_PRIORITY_ATTR,
+                           constants.LB_REQUEST_PRIORITY_MIN)
         # TODO(tian): Finetune backoff parameters.
         backoff = common_utils.Backoff(
             initial_backoff=self._retry_initial_backoff_seconds)
@@ -4076,7 +4220,7 @@ class SkyServeLoadBalancer:
             # so a failed attempt is queued again while it backs off.
             response_or_exception = None
             attempt_error: BaseException | None = None
-            self._queue_depth -= 1
+            self._change_queue_depth(priority, -1)
             try:
                 response_or_exception = await self._proxy_request_to(
                     ready_replica_url, request)
@@ -4084,7 +4228,7 @@ class SkyServeLoadBalancer:
                 attempt_error = error
                 raise
             finally:
-                self._queue_depth += 1
+                self._change_queue_depth(priority, 1)
                 if track_async_attempt:
                     capacity_released = self._finish_async_occupancy_attempt(
                         ready_replica_url, response_or_exception

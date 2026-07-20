@@ -349,6 +349,18 @@ describe('getServices', () => {
             total_capacity: 9,
             peak_in_flight: 5,
             peak_queue_depth: 3,
+            accelerator_breakdown: {
+              version: 1,
+              configured_accelerators: ['A100', 'A100-80GB'],
+              min_replicas: { A100: 1, 'A100-80GB': 0 },
+              demand_target: { A100: 3, 'A100-80GB': 1 },
+              ready_capacity: { A100: 4, 'A100-80GB': 2 },
+              provisioning_capacity: { A100: 1, 'A100-80GB': 1 },
+              total_capacity: { A100: 6, 'A100-80GB': 3 },
+              zero_cost_ready_capacity: { A100: 2, 'A100-80GB': 1 },
+              fill_target: { A100: 5, 'A100-80GB': 0 },
+              free_reserved_slots: { A100: 1, 'A100-80GB': 0 },
+            },
           },
         ],
         samples: [
@@ -414,6 +426,17 @@ describe('getServices', () => {
           totalCapacity: 9,
           peakInFlight: 5,
           peakQueueDepth: 3,
+          acceleratorBreakdown: {
+            configuredAccelerators: ['A100', 'A100-80GB'],
+            minReplicas: { A100: 1, 'A100-80GB': 0 },
+            demandTarget: { A100: 3, 'A100-80GB': 1 },
+            readyCapacity: { A100: 4, 'A100-80GB': 2 },
+            provisioningCapacity: { A100: 1, 'A100-80GB': 1 },
+            totalCapacity: { A100: 6, 'A100-80GB': 3 },
+            zeroCostReadyCapacity: { A100: 2, 'A100-80GB': 1 },
+            fillTarget: { A100: 5, 'A100-80GB': 0 },
+            freeReservedSlots: { A100: 1, 'A100-80GB': 0 },
+          },
         },
       ],
     });
@@ -553,6 +576,18 @@ describe('normalizeReplicaHistory', () => {
           total_capacity: 4,
           peak_in_flight: 7,
           peak_queue_depth: null,
+          accelerator_breakdown: {
+            version: 1,
+            configured_accelerators: ['A100', 'A100-80GB'],
+            min_replicas: { A100: 1, 'A100-80GB': 0 },
+            demand_target: { A100: 3, 'A100-80GB': 1 },
+            ready_capacity: { A100: 2, 'A100-80GB': 0 },
+            provisioning_capacity: { A100: 1, 'A100-80GB': 0 },
+            total_capacity: { A100: 3, 'A100-80GB': 1 },
+            zero_cost_ready_capacity: { A100: 1, 'A100-80GB': 0 },
+            fill_target: { A100: 4, 'A100-80GB': 0 },
+            free_reserved_slots: { A100: 1, 'A100-80GB': 0 },
+          },
         },
         {
           timestamp: 'bad',
@@ -591,6 +626,17 @@ describe('normalizeReplicaHistory', () => {
         totalCapacity: 4,
         peakInFlight: 7,
         peakQueueDepth: null,
+        acceleratorBreakdown: {
+          configuredAccelerators: ['A100', 'A100-80GB'],
+          minReplicas: { A100: 1, 'A100-80GB': 0 },
+          demandTarget: { A100: 3, 'A100-80GB': 1 },
+          readyCapacity: { A100: 2, 'A100-80GB': 0 },
+          provisioningCapacity: { A100: 1, 'A100-80GB': 0 },
+          totalCapacity: { A100: 3, 'A100-80GB': 1 },
+          zeroCostReadyCapacity: { A100: 1, 'A100-80GB': 0 },
+          fillTarget: { A100: 4, 'A100-80GB': 0 },
+          freeReservedSlots: { A100: 1, 'A100-80GB': 0 },
+        },
       },
     ]);
     expect(history.requestWindowSeconds).toBe(3600);
@@ -707,6 +753,60 @@ describe('normalizeService / normalizeReplica', () => {
 
     expect(service.estimatedHourlyCost).toBeNull();
     expect(service.costPerThousandRequests).toBeNull();
+    expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
+  });
+
+  it('prices current billability risk without charging historical rows', () => {
+    const statuses = [
+      ['READY', 1],
+      ['SHUTTING_DOWN', 2],
+      ['FAILED_CLEANUP', 3],
+      ['UNKNOWN', 4],
+      ['PENDING', 5],
+      ['FAILED', 6],
+      ['FAILED_INITIAL_DELAY', 7],
+      ['FAILED_PROBING', 8],
+      ['FAILED_PROVISION', 9],
+      ['PREEMPTED', 10],
+    ];
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_info: statuses.map(([status, replicaId]) => ({
+          replica_id: replicaId,
+          status,
+          hourly_cost: replicaId,
+        })),
+      })
+    );
+
+    expect(service.estimatedHourlyCost).toBe(10);
+    expect(service.costTrackedReplicaCount).toBe(4);
+    expect(service.pricedReplicaCount).toBe(4);
+    expect(service.hourlyCostExcludedReplicaCount).toBe(0);
+  });
+
+  it('does not report unpriced historical rows as current exclusions', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_info: [
+          {
+            replica_id: 1,
+            status: 'FAILED',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+          {
+            replica_id: 2,
+            status: 'SHUTTING_DOWN',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+        ],
+      })
+    );
+
+    expect(service.costTrackedReplicaCount).toBe(1);
+    expect(service.hourlyCostExcludedReplicaCount).toBe(1);
     expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
   });
 

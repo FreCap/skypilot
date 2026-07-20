@@ -2180,8 +2180,71 @@ class TestAuthoritativeLbReportIngestion:
             total_capacity=14,
             peak_in_flight=5,
             peak_queue_depth=4,
+            accelerator_breakdown=None,
             timestamp=None,
         )
+
+    def test_autoscaler_history_keeps_exact_card_capacity_distinct(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.configured_accelerator_shapes = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.has_recomputed_with_fresh_data.return_value = True
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 1,
+            'A100-80GB': 2,
+        }
+        autoscaler.min_replicas_by_accelerator = {'A100-80GB': 1}
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        breakdown = ctrl._get_accelerator_history_breakdown({  # pylint: disable=protected-access
+            'ready_replicas_by_accelerator': {
+                'A100': 1,
+                'A100-80GB': 1,
+            },
+            'provisioning_replicas_by_accelerator': {'A100-80GB': 1},
+            'total_replicas_by_accelerator': {
+                'A100': 1,
+                'A100-80GB': 2,
+            },
+            'zero_cost_ready_replicas_by_accelerator': {'A100': 1},
+            'fill_target_by_accelerator': {'A100': 1},
+            'free_reserved_slots_by_accelerator': {'A100': 2},
+        })
+
+        assert breakdown == {
+            'configured_accelerators': ['A100', 'A100-80GB'],
+            'min_replicas': {
+                'A100-80GB': 1
+            },
+            'demand_target': {
+                'A100': 1,
+                'A100-80GB': 2
+            },
+            'ready_capacity': {
+                'A100': 1,
+                'A100-80GB': 1
+            },
+            'provisioning_capacity': {
+                'A100-80GB': 1
+            },
+            'total_capacity': {
+                'A100': 1,
+                'A100-80GB': 2
+            },
+            'zero_cost_ready_capacity': {
+                'A100': 1
+            },
+            'fill_target': {
+                'A100': 1
+            },
+            'free_reserved_slots': {
+                'A100': 2
+            },
+        }
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])
     def test_request_history_rejects_invalid_process_session(self, session_id):

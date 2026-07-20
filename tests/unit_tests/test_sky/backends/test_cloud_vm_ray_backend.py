@@ -2,6 +2,8 @@
 
 import multiprocessing
 import socket
+import subprocess
+import sys
 import time
 from unittest.mock import call
 from unittest.mock import MagicMock
@@ -18,6 +20,71 @@ from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
 from sky.schemas.generated import jobsv1_pb2
 from sky.utils import status_lib
+
+
+class TestCloudVmRayResourceHandleCardinality:
+
+    @staticmethod
+    def _make_handle(*,
+                     stable_internal_external_ips=None,
+                     stable_ssh_ports=None):
+        launched_resources = MagicMock(spec=resources.Resources)
+        launched_resources.assert_launchable.return_value = launched_resources
+        launched_resources.cloud.PROVISIONER_VERSION = (
+            cloud_vm_ray_backend.clouds.ProvisionerVersion.RAY_AUTOSCALER)
+        return CloudVmRayResourceHandle(
+            cluster_name='test-cluster',
+            cluster_name_on_cloud='test-cluster-on-cloud',
+            cluster_yaml='/tmp/test-cluster.yaml',
+            launched_nodes=2,
+            launched_resources=launched_resources,
+            stable_internal_external_ips=stable_internal_external_ips,
+            stable_ssh_ports=stable_ssh_ports)
+
+    def test_update_cluster_ips_rejects_mismatched_lists(self):
+        handle = self._make_handle()
+        cluster_info = MagicMock()
+        cluster_info.get_feasible_ips.side_effect = [[
+            '203.0.113.1', '203.0.113.2'
+        ], ['10.0.0.1']]
+
+        with pytest.raises(AssertionError,
+                           match='Expected same number of internal IPs'):
+            handle.update_cluster_ips(cluster_info=cluster_info)
+
+        assert handle.stable_internal_external_ips is None
+
+    def test_update_cluster_ips_rejects_mismatched_lists_under_optimization(
+            self):
+        if sys.flags.optimize == 0:
+            node_id = (f'{__file__}::TestCloudVmRayResourceHandleCardinality::'
+                       'test_update_cluster_ips_rejects_mismatched_lists_'
+                       'under_optimization')
+            result = subprocess.run([
+                sys.executable, '-O', '-m', 'pytest', '-n', '0', '--dist', 'no',
+                '-q', node_id
+            ],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30)
+            assert result.returncode == 0, result.stdout + result.stderr
+            return
+
+        self.test_update_cluster_ips_rejects_mismatched_lists()
+
+    def test_get_command_runners_rejects_mismatched_ports(self):
+        handle = self._make_handle(stable_internal_external_ips=[
+            ('10.0.0.1', '203.0.113.1'), ('10.0.0.2', '203.0.113.2')
+        ],
+                                   stable_ssh_ports=[22])
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                'ssh_credential_from_yaml',
+                return_value={}), pytest.raises(
+                    ValueError, match='same number of SSH ports'):
+            handle.get_command_runners()
 
 
 def test_set_job_info_encodes_nullable_job_group_roles():
