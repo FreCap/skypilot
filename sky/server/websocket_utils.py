@@ -117,25 +117,33 @@ async def run_websocket_proxy(
         await close_backend()
 
     async def backend_to_websocket():
-        try:
-            while True:
+        nonlocal ssh_failed
+        while True:
+            try:
                 data = await read_from_backend()
-                if not data:
-                    if not websocket_closed:
-                        logger.warning(
-                            'SSH connection to backend is disconnected '
-                            'before websocket connection is closed')
-                        nonlocal ssh_failed
-                        ssh_failed = True
-                    break
-                if timestamps_supported:
-                    # Prepend message type byte (0 = regular data)
-                    message_type_bytes = struct.pack(
-                        '!B', SSHMessageType.REGULAR_DATA.value)
-                    data = message_type_bytes + data
+            except Exception as e:  # pylint: disable=broad-except
+                if not websocket_closed:
+                    logger.error('Failed to read from SSH backend: %s', e)
+                    ssh_failed = True
+                break
+            if not data:
+                if not websocket_closed:
+                    logger.warning('SSH connection to backend is disconnected '
+                                   'before websocket connection is closed')
+                    ssh_failed = True
+                break
+            if timestamps_supported:
+                # Prepend message type byte (0 = regular data)
+                message_type_bytes = struct.pack(
+                    '!B', SSHMessageType.REGULAR_DATA.value)
+                data = message_type_bytes + data
+            try:
                 await websocket.send_bytes(data)
-        except Exception:  # pylint: disable=broad-except
-            pass
+            except Exception as e:  # pylint: disable=broad-except
+                # A send failure is on the client-facing side of the proxy;
+                # it must not be classified as an SSH backend failure.
+                logger.debug('Stopped sending SSH data to websocket: %s', e)
+                break
         try:
             await websocket.close()
         except Exception:  # pylint: disable=broad-except
