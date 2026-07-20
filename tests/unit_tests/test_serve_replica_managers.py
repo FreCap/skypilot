@@ -14,6 +14,7 @@ Covers:
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import dataclasses
+import logging
 import threading
 import types
 from unittest import mock
@@ -1060,6 +1061,82 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
         assert persisted == [(1, 2)]
         assert info.version == 2
+
+    def test_reuses_replica_when_only_git_commit_changes(self, caplog):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+
+        def _yaml(git_commit):
+            return ('resources: {}\n'
+                    'file_mounts: {}\n'
+                    'secrets: {TOKEN: stable-secret}\n'
+                    'service: {readiness_probe: /}\n'
+                    f'_metadata: {{git_commit: {git_commit}}}\n')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=_yaml('new-commit')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={1: _yaml('old-commit')}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             caplog.at_level(logging.INFO):
+            mgr.update_version(2,
+                               mock.Mock(spot_placer=None),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert persisted == [(1, 2)]
+        assert info.version == 2
+        assert 'stable-secret' not in caplog.text
+
+    def test_secret_change_forces_replacement_without_logging_values(
+            self, caplog):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+
+        def _yaml(secret):
+            return ('resources: {}\n'
+                    'file_mounts: {}\n'
+                    f'secrets: {{TOKEN: {secret}}}\n'
+                    'service: {readiness_probe: /}\n')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=_yaml('new-secret')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={1: _yaml('old-secret')}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             caplog.at_level(logging.INFO):
+            mgr.update_version(2,
+                               mock.Mock(spot_placer=None),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert not persisted
+        assert info.version == 1
+        assert 'runtime config changed' in caplog.text
+        assert 'old-secret' not in caplog.text
+        assert 'new-secret' not in caplog.text
 
     def test_storage_scope_with_owned_mount_still_forces_replacement(self):
         mgr = _make_manager()

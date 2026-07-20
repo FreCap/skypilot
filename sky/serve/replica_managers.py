@@ -150,24 +150,25 @@ class LogicalReconcileSnapshot:
     received_at: float
 
 
-def _remove_nonmaterial_empty_storage_scope_metadata(
-        config: dict[str, Any]) -> None:
-    """Ignore generated storage identity when it owns no storage mounts.
+def _remove_nonmaterial_replica_config_metadata(config: dict[str, Any]) -> None:
+    """Ignore generated metadata that cannot affect a running replica.
 
-    Every service update gets a fresh ephemeral-storage generation, even when
-    the task has no Sky-managed storage.  Treating that generated identity as
-    a replica config change turns a service-policy-only update into a full
-    rolling replacement.  An empty owned-mount list makes the identity
-    operationally irrelevant; the actual file mounts and volumes remain in
-    the config comparison and still prevent unsafe replica reuse.
+    Source provenance changes whenever a task is submitted from another Git
+    commit, but it does not alter the running process. Every service update
+    also gets a fresh ephemeral-storage generation, even when the task has no
+    Sky-managed storage. Treating either generated identity as a replica
+    config change turns a service-policy-only update into a full rolling
+    replacement. An empty owned-mount list makes the storage identity
+    operationally irrelevant; the actual secrets, file mounts, and volumes
+    remain in the config comparison and still prevent unsafe replica reuse.
     """
     metadata = config.get('_metadata')
     if not isinstance(metadata, dict):
         return
+    metadata.pop('git_commit', None)
     scope = metadata.get(serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
-    if not isinstance(scope, dict) or scope.get('storage_mounts') != []:
-        return
-    metadata.pop(serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+    if isinstance(scope, dict) and scope.get('storage_mounts') == []:
+        metadata.pop(serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
     if not metadata:
         config.pop('_metadata')
 
@@ -5887,7 +5888,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
         for key in ['service', 'pool', '_user_specified_yaml']:
             new_config.pop(key, None)
-        _remove_nonmaterial_empty_storage_scope_metadata(new_config)
+        _remove_nonmaterial_replica_config_metadata(new_config)
         new_config_any_of = (resources_utils.normalize_any_of_resources_config(
             new_config.get('resources', {}).pop('any_of', [])))
 
@@ -5914,7 +5915,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             old_config = yaml_utils.safe_load(yaml_content)
             for key in ['service', 'pool', '_user_specified_yaml']:
                 old_config.pop(key, None)
-            _remove_nonmaterial_empty_storage_scope_metadata(old_config)
+            _remove_nonmaterial_replica_config_metadata(old_config)
             prior_configs[prior_version] = old_config
             prior_any_of[prior_version] = (
                 resources_utils.normalize_any_of_resources_config(
@@ -5941,25 +5942,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                 old_config_any_of = prior_any_of[info.version]
 
                 if old_config_any_of != new_config_any_of:
-                    logger.info('Replica config changed (any_of), skipping. '
-                                f'old: {old_config_any_of}, '
-                                f'new: {new_config_any_of}')
+                    logger.info(
+                        'Replica %s config changed (any_of) from version %s '
+                        'to %s; launching replacement capacity.',
+                        info.replica_id, info.version, version)
                     continue
                 # File mounts should both be empty, as update always
                 # create new buckets if they are not empty.
                 if (old_config == new_config and
                         old_config.get('file_mounts', None) == {}):
                     logger.info(
-                        f'Updating replica {info.replica_id} to version '
-                        f'{version}. Replica {info.replica_id}\'s config '
-                        f'{old_config} is the same as '
-                        f'latest version\'s {new_config}.')
+                        'Updating replica %s from version %s to version %s '
+                        'because its runtime config is unchanged.',
+                        info.replica_id, info.version, version)
                     info.version = version
                     self._persist_replica(info.replica_id, info)
                 else:
-                    logger.info('Replica config changed (rest), skipping. '
-                                f'old: {old_config}, '
-                                f'new: {new_config}')
+                    logger.info(
+                        'Replica %s runtime config changed from version %s '
+                        'to %s; launching replacement capacity.',
+                        info.replica_id, info.version, version)
 
     def _get_version_spec(self, version: int) -> 'service_spec.SkyServiceSpec':
         cached = self._tick_version_spec_cache.get(version)
