@@ -1942,7 +1942,7 @@ def ssh_credentials_from_handles(
     cluster_yaml_dicts_to_index = {
         cluster_yaml_path: cluster_yaml_dict
         for cluster_yaml_path, cluster_yaml_dict in zip(
-            non_empty_cluster_yaml_paths, cluster_yaml_dicts)
+            non_empty_cluster_yaml_paths, cluster_yaml_dicts, strict=True)
     }
 
     credentials_to_return: list[dict[str, Any]] = []
