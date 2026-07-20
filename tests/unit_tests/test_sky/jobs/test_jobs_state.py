@@ -9,6 +9,7 @@ from unittest import mock
 import filelock
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
@@ -1380,3 +1381,32 @@ class TestGetJobsStatusCheckInfo:
         job_ids = list(_seed_test_jobs.values())
         info = state.get_jobs_status_check_info(job_ids)
         assert set(info) == set(job_ids)
+
+    def test_issues_exactly_one_select_per_chunk(self,
+                                                 _mock_managed_jobs_db_conn,
+                                                 _seed_test_jobs, monkeypatch):
+        # The batched helper must stay one slim SELECT per id chunk: no
+        # per-job queries and no hidden extra round trips.
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+        job_ids = list(_seed_test_jobs.values())
+        assert len(job_ids) > 2
+        expected_chunks = -(-len(job_ids) // 2)
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_status_check_info(job_ids)
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert set(info) == set(job_ids)
+        assert select_count == expected_chunks

@@ -836,7 +836,7 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
     for row in rows:
         job_dict = _get_jobs_dict(row._mapping)  # pylint: disable=protected-access
         # WARNING: Keep this decode (enum conversion + job_name fallback) in
-        # sync with get_jobs_status_check_info.
+        # sync with _merge_jobs_status_check_rows.
         job_dict['status'] = ManagedJobStatus(job_dict['status'])
         job_dict['schedule_state'] = ManagedJobScheduleState(
             job_dict['schedule_state'])
@@ -895,6 +895,42 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     return where_condition
 
 
+def _status_check_select(from_clause) -> 'sqlalchemy.Select':
+    """The slim 9-column projection shared by the status-check snapshots."""
+    return sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.task_name,
+        job_info_table.c.name.label('job_info_name'),
+        job_info_table.c.schedule_state,
+        job_info_table.c.controller_pid,
+        job_info_table.c.controller_pid_started_at,
+        job_info_table.c.pool,
+    ).select_from(from_clause)
+
+
+def _spot_job_info_outerjoin():
+    return spot_table.outerjoin(
+        job_info_table,
+        spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
+
+
+def _collect_status_check_snapshot(
+    job_ids: list[int] | None, fetch_chunk: Callable[[list[int] | None],
+                                                     list[Any]]
+) -> dict[int, dict[str, Any]]:
+    """Chunk ``job_ids`` and merge the fetched rows into one snapshot."""
+    result: dict[int, dict[str, Any]] = {}
+    if job_ids is None:
+        _merge_jobs_status_check_rows(result, fetch_chunk(None))
+        return result
+    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+        _merge_jobs_status_check_rows(result, fetch_chunk(chunk))
+    return result
+
+
 def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
                                   rows: list[Any]) -> None:
     """Decode slim status-check rows into the per-job refresh snapshot."""
@@ -947,40 +983,17 @@ def get_jobs_to_check_status_info(
     def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
         jobs_to_check = sqlalchemy.select(
             spot_table.c.spot_job_id.label('spot_job_id')).select_from(
-                spot_table.outerjoin(
-                    job_info_table, spot_table.c.spot_job_id ==
-                    job_info_table.c.spot_job_id)).where(
-                        _get_jobs_to_check_status_condition(
-                            chunk)).distinct().subquery()
-        query = sqlalchemy.select(
-            spot_table.c.spot_job_id,
-            spot_table.c.task_id,
-            spot_table.c.status,
-            spot_table.c.task_name,
-            job_info_table.c.name.label('job_info_name'),
-            job_info_table.c.schedule_state,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
-            job_info_table.c.pool,
-        ).select_from(
-            spot_table.outerjoin(
-                job_info_table,
-                spot_table.c.spot_job_id == job_info_table.c.spot_job_id).join(
-                    jobs_to_check, spot_table.c.spot_job_id ==
-                    jobs_to_check.c.spot_job_id)).order_by(
-                        spot_table.c.spot_job_id.desc(),
-                        spot_table.c.task_id.asc())
+                _spot_job_info_outerjoin()).where(
+                    _get_jobs_to_check_status_condition(
+                        chunk)).distinct().subquery()
+        query = _status_check_select(_spot_job_info_outerjoin().join(
+            jobs_to_check,
+            spot_table.c.spot_job_id == jobs_to_check.c.spot_job_id)).order_by(
+                spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
             return session.execute(query).fetchall()
 
-    result: dict[int, dict[str, Any]] = {}
-    if job_ids is None:
-        _merge_jobs_status_check_rows(result, _fetch_chunk(None))
-    else:
-        for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-            chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-            _merge_jobs_status_check_rows(result, _fetch_chunk(chunk))
-    return result
+    return _collect_status_check_snapshot(job_ids, _fetch_chunk)
 
 
 def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -1009,30 +1022,16 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not job_ids:
         return {}
     engine = _db_manager.get_engine()
-    result: dict[int, dict[str, Any]] = {}
-    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-        query = sqlalchemy.select(
-            spot_table.c.spot_job_id,
-            spot_table.c.task_id,
-            spot_table.c.status,
-            spot_table.c.task_name,
-            job_info_table.c.name.label('job_info_name'),
-            job_info_table.c.schedule_state,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
-            job_info_table.c.pool,
-        ).select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    spot_table.c.spot_job_id.in_(chunk)).order_by(
-                        spot_table.c.spot_job_id.asc(),
-                        spot_table.c.task_id.asc())
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        assert chunk is not None
+        query = _status_check_select(_spot_job_info_outerjoin()).where(
+            spot_table.c.spot_job_id.in_(chunk)).order_by(
+                spot_table.c.spot_job_id.asc(), spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
-            rows = session.execute(query).fetchall()
-        _merge_jobs_status_check_rows(result, rows)
-    return result
+            return session.execute(query).fetchall()
+
+    return _collect_status_check_snapshot(job_ids, _fetch_chunk)
 
 
 def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
