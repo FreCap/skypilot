@@ -60,6 +60,8 @@ jobs:
           ruff check sky/provision/aws/instance_requests.py --select PLW2901
           # API payload validation must survive `python -O`.
           ruff check sky/server/requests/payloads.py --select S101
+          # Stream response identity checks must survive `python -O`.
+          ruff check sky/client/sdk.py --select S101
           # Parallel cluster metadata must not silently truncate nodes.
           ruff check sky/backends/cloud_vm_ray_backend.py --select B905
           # Batch worker validation errors must reach the coordinator result.
