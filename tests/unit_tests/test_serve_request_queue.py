@@ -102,6 +102,13 @@ def test_per_accelerator_floor_round_trip_and_validation():
     }
     assert spec.copy().min_replicas_by_accelerator == (
         spec.min_replicas_by_accelerator)
+    concurrency_spec = _make_spec(
+        min_replicas=0,
+        max_replicas=4,
+        min_replicas_by_accelerator={'A100': 2},
+        target_concurrency_per_replica=1,
+        load_balancing_policy='instance_aware_least_load')
+    assert concurrency_spec.min_replicas_by_accelerator == {'A100': 2}
     with pytest.raises(ValueError, match='must not exceed max_replicas'):
         _make_spec(min_replicas=0,
                    max_replicas=1,
@@ -109,7 +116,7 @@ def test_per_accelerator_floor_round_trip_and_validation():
                        'A100': 1,
                        'A100-80GB': 1,
                    })
-    with pytest.raises(ValueError, match='requires dict type'):
+    with pytest.raises(ValueError, match='requires either dict type'):
         _make_spec(min_replicas=0,
                    max_replicas=2,
                    min_replicas_by_accelerator={'A100': 1},

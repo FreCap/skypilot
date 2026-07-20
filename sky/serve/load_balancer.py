@@ -171,6 +171,9 @@ class SkyServeLoadBalancer:
     _request_queue_sequence: int = 0
     _draining: bool = False
     _reject_last_seen: dict[str, float] | None = None
+    _reject_compatibility_by_key: dict[str, tuple[int,
+                                                  tuple[str,
+                                                        ...]]] | None = None
     _reject_fallback_seq: int = 0
     _capacity_hint: dict[str, Any] | None = None
     _configured_accelerators: tuple[str, ...] | None = None
@@ -324,6 +327,9 @@ class SkyServeLoadBalancer:
         self._waiting_request_body_bytes = 0
         self._request_queue_waiters = {}
         self._request_queue_sequence = 0
+        self._reject_last_seen = {}
+        self._reject_compatibility_by_key = {}
+        self._reject_fallback_seq = 0
         self._configured_accelerators = None
         self._request_accelerator_compatibility_version = None
         self._queued_compatibility_demand_supported = False
@@ -1984,6 +1990,13 @@ class SkyServeLoadBalancer:
                 key: seen for key, seen in current.items() if seen > cutoff
             }
         self._reject_last_seen = pruned
+        profiles = self._reject_compatibility_by_key
+        if profiles is not None:
+            self._reject_compatibility_by_key = {
+                key: profile
+                for key, profile in profiles.items()
+                if key in pruned
+            }
         return pruned
 
     def _record_rejection(self, request: fastapi.Request) -> None:
@@ -2000,6 +2013,25 @@ class SkyServeLoadBalancer:
             self._reject_fallback_seq += 1
             key = f'_headerless_{self._reject_fallback_seq}'
         self._prune_reject_window()[key] = time.monotonic()
+        configured = self._configured_accelerators
+        compatible = getattr(request, _REQUEST_ACCELERATORS_ATTR, None)
+        if compatible is None:
+            compatible = configured
+        if (not isinstance(compatible, (list, tuple)) or not compatible or
+                not all(isinstance(card, str) and card for card in compatible)):
+            compatible = None
+        priority = getattr(request, _REQUEST_PRIORITY_ATTR,
+                           constants.LB_REQUEST_PRIORITY_MIN)
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            priority = constants.LB_REQUEST_PRIORITY_MIN
+        profiles = self._reject_compatibility_by_key
+        if profiles is None:
+            profiles = {}
+            self._reject_compatibility_by_key = profiles
+        if compatible:
+            profiles[key] = (priority, tuple(compatible))
+        else:
+            profiles.pop(key, None)
         request_aggregator = getattr(self, '_request_aggregator', None)
         if request_aggregator is not None:
             request_aggregator.add_rejection()
@@ -2009,6 +2041,31 @@ class SkyServeLoadBalancer:
         key = request.headers.get(constants.LB_JOB_ID_HEADER)
         if key is not None:
             self._prune_reject_window().pop(key, None)
+            profiles = self._reject_compatibility_by_key
+            if profiles is not None:
+                profiles.pop(key, None)
+
+    def _rejected_compatibility_profiles(self) -> list[dict[str, Any]]:
+        """Return the replaceable recent-rejection gauge by exact profile."""
+        retained = self._prune_reject_window()
+        profiles = self._reject_compatibility_by_key or {}
+        cutoff = (time.monotonic() -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
+        for key, last_seen in retained.items():
+            profile = profiles.get(key)
+            if profile is None:
+                continue
+            count, recent_count = grouped.get(profile, (0, 0))
+            grouped[profile] = (count + 1,
+                                recent_count + int(last_seen > cutoff))
+        return [{
+            'priority': priority,
+            'compatible_accelerators': list(compatible),
+            'count': count,
+            'recent_count': recent_count,
+        } for (priority, compatible), (count, recent_count) in sorted(
+            grouped.items(), key=lambda item: (-item[0][0], item[0][1]))]
 
     async def _request_uses_async_occupancy(self,
                                             request: fastapi.Request) -> bool:
@@ -2442,6 +2499,8 @@ class SkyServeLoadBalancer:
             'local_in_flight': self._active_request_count,
             'request_queue_depth': self._waiting_request_count,
             'queued_requests_by_compatibility': self._request_queue_profiles(),
+            'rejected_requests_by_compatibility':
+                self._rejected_compatibility_profiles(),
             'in_flight_by_accelerator': self._in_flight_by_accelerator_locked(),
             'waiting_request_body_bytes': self._waiting_request_body_bytes,
             'request_queue_capacity': request_queue_capacity,
@@ -2964,6 +3023,10 @@ class SkyServeLoadBalancer:
                 self._request_aggregator.request_history_snapshot())
             request_batch_accepted = False
             sync_payload = {
+                # Catalog/version fence for compatibility gauges. This is the
+                # version of the routing spec already applied by this LB, not
+                # the version the controller may return from this request.
+                'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
                 'request_history_session_id': self._request_history_session_id,
@@ -2982,6 +3045,8 @@ class SkyServeLoadBalancer:
                 'queue_depth': self._queue_depth,
                 'queued_requests_by_compatibility':
                     self._request_queue_profiles(),
+                'rejected_requests_by_compatibility':
+                    self._rejected_compatibility_profiles(),
                 'rejected_in_window': self._rejected_in_window(),
                 'rejected_in_recent_window': self._rejected_in_recent_window(),
             }
@@ -3070,7 +3135,6 @@ class SkyServeLoadBalancer:
                         'Controller sync omitted the routing spec; retaining '
                         'the last applied routes and readiness state.')
                     return
-                self._routing_version = service_version
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):
                     # Spurious empty sync: the controller still has READY
@@ -3211,6 +3275,11 @@ class SkyServeLoadBalancer:
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
+                # Echo a version only after applying that same response's
+                # routing spec and route/catalog snapshot.  In particular, a
+                # spurious-empty response retains the previous coherent state
+                # and must not advance this fence.
+                self._routing_version = service_version
                 # Cache the controller's capacity hint for /_lb/capacity.
                 # Absence (older controller) resets to None rather than
                 # keeping a stale previous value: readers must see

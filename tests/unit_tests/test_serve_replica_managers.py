@@ -2530,6 +2530,65 @@ class TestLogicalCapacityPlanning:
                                              mgr._logical_reconcile_snapshot,
                                              ())
 
+    def test_logical_scale_up_honors_each_exact_card_target(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 7, 9)
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        overrides = []
+
+        def _append_shape(resources_override, _used_ids, existing, _budget,
+                          logical_reconcile_fence):
+            del logical_reconcile_fence
+            overrides.append(resources_override)
+            _, width = next(iter(resources_override['accelerators'].items()))
+            info = mock.Mock(replica_id=len(existing) + 1,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=width,
+                             resources_override=resources_override)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = None
+            existing.append(info)
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_append_shape):
+            mgr.scale_up_to_logical_capacity(target_capacity=9,
+                                             version=1,
+                                             reconcile_generation=7,
+                                             target_capacity_by_accelerator={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             },
+                                             accelerator_shapes={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             })
+
+        assert overrides == [{
+            'accelerators': {
+                'L4': 1
+            }
+        }, {
+            'accelerators': {
+                'A100': 8
+            }
+        }]
+
     def test_unknown_capacity_replacement_launch_is_durably_attributed(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True

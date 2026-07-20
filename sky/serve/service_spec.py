@@ -154,12 +154,14 @@ class SkyServiceSpec:
                     f'max_replicas ({effective_max}). Got: '
                     f'{sum(accelerator_floors.values())}.')
         if (accelerator_floors and
-                not isinstance(target_qps_per_replica, dict)):
+                not isinstance(target_qps_per_replica, dict) and
+                target_concurrency_per_replica is None):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'min_replicas_by_accelerator requires dict type '
-                    'target_qps_per_replica so SkyServe can size and launch '
-                    'each exact accelerator independently.')
+                    'min_replicas_by_accelerator requires either dict type '
+                    'target_qps_per_replica or '
+                    'target_concurrency_per_replica so SkyServe can size and '
+                    'launch each exact accelerator independently.')
         if (accelerator_floors and
                 load_balancing_policy != 'instance_aware_least_load'):
             with ux_utils.print_exception_no_traceback():

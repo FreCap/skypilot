@@ -7,6 +7,7 @@ logical targets divide demand by the per-GPU saturation knob and publish GPU
 slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
+import threading
 # pylint: disable=protected-access
 import time
 import types
@@ -34,15 +35,18 @@ def _spec(knob=1.0,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
           scale_up_rate_period_seconds=None,
-          max_scale_down_rate_percentage=100):
+          max_scale_down_rate_percentage=100,
+          min_replicas_by_accelerator=None,
+          num_overprovision=None):
     # Default delays resolve to one decision interval -> hysteresis
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
     interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
     return types.SimpleNamespace(
         min_replicas=min_replicas,
+        min_replicas_by_accelerator=(min_replicas_by_accelerator or {}),
         max_replicas=max_replicas,
-        num_overprovision=None,
+        num_overprovision=num_overprovision,
         target_concurrency_per_replica=knob,
         replica_unit=replica_unit,
         target_utilization_percentage=target_utilization_percentage,
@@ -66,6 +70,7 @@ def _make_autoscaler(**spec_kwargs):
 
 def _replica(replica_id,
              gpu_count=1,
+             card='L4',
              status=serve_state.ReplicaStatus.READY,
              version=1,
              planned_capacity=None):
@@ -83,7 +88,8 @@ def _replica(replica_id,
         common_utils.ProcessStatus.SUCCEEDED)
     info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
-    info.handle.return_value.launched_resources.accelerators = {'L4': gpu_count}
+    info.resources_override = {'accelerators': {card: gpu_count}}
+    info.handle.return_value.launched_resources.accelerators = {card: gpu_count}
     return info
 
 
@@ -96,7 +102,11 @@ def _report(autoscaler,
             unknown=(),
             unknown_capacity=None,
             observed_slots=None,
-            generation=1):
+            generation=1,
+            compatibility_profiles=None,
+            queued_profiles=None,
+            rejected_profiles=None,
+            compatibility_complete=False):
     report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
@@ -107,6 +117,10 @@ def _report(autoscaler,
         'unknown_capacity_replica_ids':
             list(unknown if unknown_capacity is None else unknown_capacity),
         'reconcile_generation': generation,
+        'compatibility_profiles': list(compatibility_profiles or []),
+        'queued_requests_by_compatibility': list(queued_profiles or []),
+        'rejected_requests_by_compatibility': list(rejected_profiles or []),
+        'compatibility_demand_complete': compatibility_complete,
     }
     if recent_rejected is not None:
         report['rejected_in_recent_window'] = recent_rejected
@@ -354,6 +368,498 @@ class TestTargetMath(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas, 3)
         self.assertEqual(autoscaler.downscale_counter, 1)
         self._recompute(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+
+
+class TestExactAcceleratorCompatibility(unittest.TestCase):
+    """Concurrency demand keeps exact-card scheduling and accounting."""
+
+    @staticmethod
+    def _profile(priority, cards, count, recent_count=None):
+        profile = {
+            'priority': priority,
+            'compatible_accelerators': cards,
+            'count': count,
+        }
+        if recent_count is not None:
+            profile['recent_count'] = recent_count
+        return profile
+
+    def test_physical_scale_from_zero_uses_exact_override(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual([decision.target for decision in decisions], [{
+            'accelerators': {
+                'A100': 1
+            }
+        }])
+
+    def test_physical_zero_demand_retires_last_exact_card(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        l4 = _replica(1, card='L4')
+        _report(autoscaler,
+                in_flight={1: 0},
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        decisions = _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+        self.assertEqual(_scale_downs(decisions), [1])
+
+    def test_logical_zero_demand_retires_last_exact_card(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        decisions = _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+        downs = [
+            decision.target
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        ]
+        self.assertEqual(len(downs), 1)
+        self.assertIsInstance(downs[0], autoscalers.LogicalScaleDownTarget)
+        self.assertEqual(downs[0].replica_id, 1)
+
+    def test_physical_card_migration_drains_zero_target_card_when_ready(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        l4 = _replica(1, card='L4')
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        scale_up = _decisions(autoscaler, [l4])
+        self.assertEqual([decision.target for decision in scale_up], [{
+            'accelerators': {
+                'A100': 1
+            }
+        }])
+
+        a100 = _replica(2, card='A100')
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=3)
+        scale_down = _decisions(autoscaler, [l4, a100])
+        self.assertEqual(_scale_downs(scale_down), [1])
+
+    def test_num_overprovision_keeps_exact_card_scale_up_shaped(self):
+        autoscaler = _make_autoscaler(max_replicas=2, num_overprovision=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 1})
+        self.assertEqual([decision.target for decision in decisions], [{
+            'accelerators': {
+                'L4': 1
+            }
+        }, {
+            'accelerators': {
+                'L4': 1
+            }
+        }])
+
+    def test_disabling_exact_card_catalog_clears_compatibility_state(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        shaped = _decisions(autoscaler, [])
+        self.assertEqual(shaped[0].target, {'accelerators': {'A100': 1}})
+
+        autoscaler.set_configured_accelerator_shapes({})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        aggregate = _decisions(autoscaler, [])
+
+        self.assertFalse(autoscaler._compatibility_demand_complete)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+        self.assertEqual([decision.target for decision in aggregate], [None])
+
+    def test_logical_same_total_card_migration_obeys_wave_limit(self):
+        autoscaler = _make_autoscaler(max_replicas=10, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = [_replica(i, card='L4') for i in range(1, 11)]
+        occupancy = {info.replica_id: 0 for info in replicas}
+        slots = {info.replica_id: 1 for info in replicas}
+        _report(autoscaler,
+                in_flight=occupancy,
+                observed_slots=slots,
+                queue_depth=10,
+                queued_profiles=[self._profile(20, ['L4'], 10)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, replicas)
+        autoscaler.max_scale_up_rate_percentage = 50
+        autoscaler.scale_up_rate_min_replicas = 1
+        autoscaler.scale_up_rate_period_seconds = 60
+
+        _report(autoscaler,
+                in_flight=occupancy,
+                observed_slots=slots,
+                queue_depth=10,
+                queued_profiles=[self._profile(20, ['A100'], 10)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 5,
+            'A100': 5,
+        })
+        self.assertEqual(len(decisions), 1)
+        target = decisions[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator), {
+            'L4': 5,
+            'A100': 5,
+        })
+
+        a100_replicas = [_replica(i, card='A100') for i in range(11, 16)]
+        transition_replicas = replicas + a100_replicas
+        transition_occupancy = {
+            info.replica_id: 0 for info in transition_replicas
+        }
+        transition_slots = {info.replica_id: 1 for info in transition_replicas}
+        autoscaler._last_scale_up_wave_at = 100.0
+        with mock.patch.object(autoscalers.time, 'time', return_value=120.0):
+            _report(autoscaler,
+                    in_flight=transition_occupancy,
+                    observed_slots=transition_slots,
+                    queue_depth=10,
+                    queued_profiles=[self._profile(20, ['A100'], 10)],
+                    rejected_profiles=[],
+                    compatibility_complete=True,
+                    generation=3)
+            cooldown = _decisions(autoscaler, transition_replicas)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 5,
+            'A100': 5,
+        })
+        self.assertEqual(cooldown, [])
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=161.0):
+            _report(autoscaler,
+                    in_flight=transition_occupancy,
+                    observed_slots=transition_slots,
+                    queue_depth=10,
+                    queued_profiles=[self._profile(20, ['A100'], 10)],
+                    rejected_profiles=[],
+                    compatibility_complete=True,
+                    generation=4)
+            second_wave = _decisions(autoscaler, transition_replicas)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 10})
+        self.assertEqual(len(second_wave), 1)
+        self.assertEqual(
+            dict(second_wave[0].target.target_capacity_by_accelerator),
+            {'A100': 10})
+
+    def test_logical_floor_card_migration_obeys_wave_limit(self):
+        autoscaler = _make_autoscaler(min_replicas=10,
+                                      max_replicas=10,
+                                      min_replicas_by_accelerator={'A100': 10},
+                                      replica_unit='logical',
+                                      max_scale_up_rate_percentage=50,
+                                      scale_up_rate_min_replicas=1,
+                                      scale_up_rate_period_seconds=60)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        # Model a recovered pre-floor target. The first fresh reconciliation
+        # must migrate it in waves, not request the full new floor at once.
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
+        replicas = [_replica(i, card='L4') for i in range(1, 11)]
+        occupancy = {info.replica_id: 0 for info in replicas}
+        slots = {info.replica_id: 1 for info in replicas}
+        _report(autoscaler,
+                in_flight=occupancy,
+                observed_slots=slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 5,
+            'A100': 5,
+        })
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {
+                'L4': 5,
+                'A100': 5,
+            })
+
+    def test_logical_cold_floor_advances_only_after_each_wave_commits(self):
+        autoscaler = _make_autoscaler(min_replicas=10,
+                                      max_replicas=10,
+                                      min_replicas_by_accelerator={'A100': 10},
+                                      replica_unit='logical',
+                                      max_scale_up_rate_percentage=10,
+                                      scale_up_rate_min_replicas=1,
+                                      scale_up_rate_period_seconds=60)
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            _report(autoscaler,
+                    in_flight={},
+                    queued_profiles=[],
+                    rejected_profiles=[],
+                    compatibility_complete=True)
+            first_wave = _decisions(autoscaler, [])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(
+            dict(first_wave[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
+
+        a100 = _replica(1, card='A100', planned_capacity=1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=120.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    observed_slots={1: 1},
+                    queued_profiles=[],
+                    rejected_profiles=[],
+                    compatibility_complete=True,
+                    generation=2)
+            cooldown = _decisions(autoscaler, [a100])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(cooldown, [])
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=161.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    observed_slots={1: 1},
+                    queued_profiles=[],
+                    rejected_profiles=[],
+                    compatibility_complete=True,
+                    generation=3)
+            second_wave = _decisions(autoscaler, [a100])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 2})
+        self.assertEqual(
+            dict(second_wave[0].target.target_capacity_by_accelerator),
+            {'A100': 2})
+
+    def test_physical_exact_card_stale_report_never_scales_down(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+        autoscaler._report_received_at = (
+            time.time() - autoscaler._staleness_threshold_seconds() - 1)
+        replicas = [_replica(1, card='L4'), _replica(2, card='L4')]
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(decisions, [])
+
+    def test_running_work_is_not_preempted_by_high_priority_backlog(self):
+        autoscaler = _make_autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        running_l4 = _replica(1, card='L4')
+        _report(autoscaler,
+                in_flight={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [running_l4])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 1})
+        self.assertEqual(decisions, [])
+
+    def test_flexible_backlog_reuses_spare_capacity_on_running_card(self):
+        autoscaler = _make_autoscaler(knob=2, max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 4})
+        running_a100 = _replica(1, gpu_count=4, card='A100')
+        _report(autoscaler,
+                in_flight={1: 4},
+                queue_depth=4,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 4)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [running_a100])
+
+        # One A100 backend has capacity 2 * 4 = 8 and already carries four
+        # requests, so the four queued requests need no cold L4 launch.
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(decisions, [])
+
+    def test_ready_reserved_card_wins_for_flexible_backlog(self):
+        autoscaler = _make_autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        paid_l4 = _replica(1, card='L4')
+        paid_l4.is_zero_cost = False
+        reserved_a100 = _replica(2, card='A100')
+        reserved_a100.is_zero_cost = True
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [paid_l4, reserved_a100])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
+    def test_rejection_profiles_preserve_aggregate_duration_math(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=100,
+                                      replica_unit='logical',
+                                      expected_request_duration_seconds=30)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                rejected=120,
+                recent_rejected=60,
+                rejected_profiles=[
+                    self._profile(20, ['L4'], 60, 0),
+                    self._profile(50, ['A100'], 60, 60),
+                ],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [])
+
+        # Aggregate rejection work remains max(120*30/360, 60*30/60)=30.
+        self.assertEqual(autoscaler._rejected_concurrency, 30)
+        # Independent exact-card rounding may add one slot while preserving
+        # the aggregate rejection-work signal itself.
+        self.assertEqual(
+            sum(autoscaler.target_num_replicas_by_accelerator.values()), 31)
+        self.assertGreater(
+            autoscaler.target_num_replicas_by_accelerator.get('A100', 0),
+            autoscaler.target_num_replicas_by_accelerator.get('L4', 0))
+
+    def test_logical_target_carries_card_slots_and_physical_shapes(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=9,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 8})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=9,
+                queued_profiles=[
+                    self._profile(50, ['A100'], 8),
+                    self._profile(20, ['L4'], 1),
+                ],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=7)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(len(decisions), 1)
+        target = decisions[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator), {
+            'L4': 1,
+            'A100': 8,
+        })
+        self.assertEqual(dict(target.accelerator_shapes), {
+            'L4': 1,
+            'A100': 8,
+        })
+
+    def test_incomplete_mixed_version_report_holds_restart_fence(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = [_replica(1, card='L4'), _replica(2, card='A100')]
+        _report(autoscaler, in_flight={1: 0, 2: 0})
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(decisions, [])
+        self.assertTrue(autoscaler._snap_target_on_next_recompute)
         self.assertEqual(autoscaler.target_num_replicas, 1)
 
 
@@ -1481,7 +1987,7 @@ class TestUpdateVersion(unittest.TestCase):
                   scale_up_rate_period_seconds=60),
             serve_utils.DEFAULT_UPDATE_MODE)
 
-        self.assertEqual(autoscaler.target_num_replicas, 1)
+        self.assertEqual(autoscaler.target_num_replicas, 0)
         _report(autoscaler, in_flight={}, queue_depth=1000)
         autoscaler._last_scale_up_wave_at = None
         with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
@@ -1532,6 +2038,301 @@ class TestUpdateVersion(unittest.TestCase):
             if autoscaler.target_num_replicas == 1000:
                 break
         self.assertEqual(autoscaler.target_num_replicas, 1000)
+
+    def test_version_and_policy_downgrade_clear_catalog_atomically(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        downgraded = _spec(knob=1.0)
+        downgraded.load_balancing_policy = 'least_load'
+
+        autoscaler.update_version_and_accelerator_shapes(
+            2, downgraded, serve_utils.DEFAULT_UPDATE_MODE, {})
+
+        self.assertEqual(autoscaler.latest_version, 2)
+        self.assertEqual(autoscaler.configured_accelerator_shapes, {})
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+        self.assertFalse(autoscaler._compatibility_demand_complete)
+        self.assertEqual(autoscaler.queued_compatibility_profiles, [])
+
+    def test_catalog_change_waits_for_new_compatibility_report(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        initial = _decisions(autoscaler, [])
+        self.assertEqual(initial[0].target, {'accelerators': {'A100': 1}})
+        updated = _spec(knob=1.0)
+        updated.load_balancing_policy = 'instance_aware_least_load'
+
+        autoscaler.update_version_and_accelerator_shapes(
+            2, updated, serve_utils.DEFAULT_UPDATE_MODE, {'H100': 1})
+        decisions = _decisions(autoscaler, [], active_versions=(2,))
+
+        self.assertEqual(decisions, [])
+        self.assertEqual(autoscaler.configured_accelerator_shapes, {'H100': 1})
+        self.assertEqual(autoscaler.queued_compatibility_profiles, [])
+        self.assertFalse(autoscaler._compatibility_demand_complete)
+
+    def test_concurrency_to_qps_catalog_change_drops_old_card_gauge(self):
+        old = _make_autoscaler(knob=1.0)
+        old.set_configured_accelerator_shapes({'A100': 1})
+        now = time.time()
+        _report(old,
+                in_flight={},
+                queue_depth=1,
+                timestamps=[now] * 60,
+                queued_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 60,
+                }],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        qps_spec = types.SimpleNamespace(min_replicas=0,
+                                         min_replicas_by_accelerator={},
+                                         max_replicas=4,
+                                         num_overprovision=None,
+                                         target_qps_per_replica={'H100': 1.0},
+                                         upscale_delay_seconds=0,
+                                         downscale_delay_seconds=0)
+        replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                     qps_spec,
+                                                                     version=2)
+
+        replacement.load_dynamic_states(old.dump_dynamic_states())
+        self.assertEqual(replacement.configured_accelerator_shapes, {'A100': 1})
+        replacement.set_configured_accelerator_shapes({'H100': 1})
+
+        # The aggregate arrival history survives and still scales the service,
+        # but the A100-only queue gauge cannot be interpreted under H100.
+        self.assertEqual(replacement.queued_compatibility_profiles, [])
+        self.assertFalse(replacement._compatibility_demand_complete)
+        replacement._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(replacement.target_num_replicas, 1)
+        self.assertEqual(replacement.target_num_replicas_by_accelerator,
+                         {'H100': 1})
+
+        # A delayed report from the old routing version remains aggregate-only
+        # and cannot re-arm the cleared exact-card profile.
+        replacement.collect_request_information({
+            'timestamps': [now],
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 60,
+            }],
+            'compatibility_demand_complete': False,
+        })
+        self.assertEqual(replacement.queued_compatibility_profiles, [])
+
+    def test_concurrency_to_qps_same_catalog_keeps_arrival_constraints(self):
+        old = _make_autoscaler(knob=1.0)
+        catalog = {'A100': 1, 'H100': 1}
+        old.set_configured_accelerator_shapes(catalog)
+        now = time.time()
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 60,
+                compatibility_profiles=[{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 60,
+                }],
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        qps_spec = types.SimpleNamespace(min_replicas=0,
+                                         min_replicas_by_accelerator={},
+                                         max_replicas=4,
+                                         num_overprovision=None,
+                                         target_qps_per_replica={
+                                             'A100': 1.0,
+                                             'H100': 1.0,
+                                         },
+                                         upscale_delay_seconds=0,
+                                         downscale_delay_seconds=0)
+        replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                     qps_spec,
+                                                                     version=2)
+        snapshot = old.dump_dynamic_states()
+
+        replacement.load_dynamic_states(dict(snapshot))
+        replacement.set_configured_accelerator_shapes(catalog)
+        replacement._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(replacement.target_num_replicas, 1)
+        self.assertEqual(replacement.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        decisions = replacement._generate_scaling_decisions([])
+        self.assertEqual(decisions[0].target, {'accelerators': {'A100': 1}})
+
+        legacy_snapshot = dict(snapshot)
+        legacy_snapshot.pop('compatibility_profiles')
+        legacy = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                qps_spec,
+                                                                version=2)
+        legacy.load_dynamic_states(legacy_snapshot)
+        legacy.set_configured_accelerator_shapes(catalog)
+        legacy._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertFalse(legacy._compatibility_demand_complete)
+        self.assertEqual(legacy.target_num_replicas, 1)
+        self.assertEqual(
+            sum(legacy.target_num_replicas_by_accelerator.values()), 1)
+
+    def test_concurrency_to_qps_incomplete_state_uses_all_aggregate_arrivals(
+            self):
+        old = _make_autoscaler(knob=1.0, max_replicas=20)
+        catalog = {'A100': 1, 'H100': 1}
+        old.set_configured_accelerator_shapes(catalog)
+        now = time.time()
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 60,
+                compatibility_profiles=[{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 60,
+                }],
+                compatibility_complete=True)
+        # An old/mixed-version report adds aggregate arrivals but cannot prove
+        # their exact constraints. The handoff must not size from only the
+        # earlier A100 profile and silently discard these 600 arrivals.
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 600,
+                compatibility_complete=False)
+        qps_spec = types.SimpleNamespace(min_replicas=0,
+                                         min_replicas_by_accelerator={},
+                                         max_replicas=20,
+                                         num_overprovision=None,
+                                         target_qps_per_replica={
+                                             'A100': 1.0,
+                                             'H100': 1.0,
+                                         },
+                                         upscale_delay_seconds=0,
+                                         downscale_delay_seconds=0)
+        replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                     qps_spec,
+                                                                     version=2)
+
+        replacement.load_dynamic_states(old.dump_dynamic_states())
+        replacement.set_configured_accelerator_shapes(catalog)
+        replacement._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertFalse(replacement._compatibility_demand_complete)
+        self.assertEqual(replacement.target_num_replicas, 11)
+        self.assertEqual(
+            sum(replacement.target_num_replicas_by_accelerator.values()), 11)
+
+    def test_concurrency_to_qps_complete_handoff_keeps_unmatched_arrivals(self):
+        old = _make_autoscaler(knob=1.0, max_replicas=20)
+        catalog = {'A100': 1, 'H100': 1}
+        old.set_configured_accelerator_shapes(catalog)
+        now = time.time()
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 60,
+                compatibility_profiles=[{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 60,
+                }],
+                compatibility_complete=True)
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 600,
+                compatibility_complete=False)
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 60,
+                compatibility_profiles=[{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 60,
+                }],
+                compatibility_complete=True)
+        qps_spec = types.SimpleNamespace(min_replicas=0,
+                                         min_replicas_by_accelerator={},
+                                         max_replicas=20,
+                                         num_overprovision=None,
+                                         target_qps_per_replica={
+                                             'A100': 1.0,
+                                             'H100': 1.0,
+                                         },
+                                         upscale_delay_seconds=0,
+                                         downscale_delay_seconds=0)
+        replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                     qps_spec,
+                                                                     version=2)
+
+        replacement.load_dynamic_states(old.dump_dynamic_states())
+        replacement.set_configured_accelerator_shapes(catalog)
+        replacement._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertTrue(replacement._compatibility_demand_complete)
+        self.assertEqual(replacement.target_num_replicas, 12)
+        self.assertEqual(
+            sum(replacement.target_num_replicas_by_accelerator.values()), 12)
+        self.assertGreaterEqual(
+            replacement.target_num_replicas_by_accelerator['A100'], 2)
+
+    def test_qps_aggregate_fallback_composes_with_per_card_floor(self):
+        old = _make_autoscaler(knob=1.0)
+        old.set_configured_accelerator_shapes({'A100': 1})
+        now = time.time()
+        _report(old,
+                in_flight={},
+                timestamps=[now] * 120,
+                compatibility_profiles=[{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 120,
+                }],
+                compatibility_complete=True)
+        qps_spec = types.SimpleNamespace(
+            min_replicas=0,
+            min_replicas_by_accelerator={'H100': 1},
+            max_replicas=4,
+            num_overprovision=None,
+            target_qps_per_replica={'H100': 1.0},
+            upscale_delay_seconds=0,
+            downscale_delay_seconds=0)
+        replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
+                                                                     qps_spec,
+                                                                     version=2)
+
+        replacement.load_dynamic_states(old.dump_dynamic_states())
+        replacement.set_configured_accelerator_shapes({'H100': 1})
+        replacement._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertFalse(replacement._compatibility_demand_complete)
+        self.assertEqual(replacement.target_num_replicas, 2)
+        self.assertEqual(replacement.target_num_replicas_by_accelerator,
+                         {'H100': 2})
 
     def test_old_version_replicas_keep_their_launch_knob(self):
         # A knob-raising update must not inflate old replicas' capacity:
@@ -1591,6 +2392,81 @@ class TestDynamicStates(unittest.TestCase):
         self.assertEqual(loaded._outstanding_work(), 4)
         self.assertEqual(loaded._rejected_in_recent_window, 1)
         self.assertEqual(len(loaded.request_timestamps), 1)
+
+    def test_dump_is_atomic_with_authoritative_demand_ingestion(self):
+        source = _make_autoscaler(knob=1.0)
+        source.set_configured_accelerator_shapes({'A100': 1, 'H100': 1})
+        _report(source,
+                in_flight={},
+                queued_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        dump_entered = threading.Event()
+        resume_dump = threading.Event()
+        report_started = threading.Event()
+        dumped = []
+        errors = []
+        original_dump = source._dump_dynamic_states_locked
+
+        def _blocking_dump():
+            dump_entered.set()
+            assert resume_dump.wait(timeout=5)
+            return original_dump()
+
+        def _dump():
+            try:
+                dumped.append(source.dump_dynamic_states())
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        def _replace_report():
+            report_started.set()
+            try:
+                _report(source,
+                        in_flight={},
+                        queued_profiles=[{
+                            'priority': 50,
+                            'compatible_accelerators': ['H100'],
+                            'count': 1,
+                        }],
+                        rejected_profiles=[],
+                        compatibility_complete=True)
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        with mock.patch.object(source,
+                               '_dump_dynamic_states_locked',
+                               side_effect=_blocking_dump):
+            dump_thread = threading.Thread(target=_dump)
+            dump_thread.start()
+            self.assertTrue(dump_entered.wait(timeout=5))
+            report_thread = threading.Thread(target=_replace_report)
+            report_thread.start()
+            self.assertTrue(report_started.wait(timeout=5))
+            report_thread.join(timeout=0.05)
+            self.assertTrue(report_thread.is_alive())
+            resume_dump.set()
+            dump_thread.join(timeout=5)
+            report_thread.join(timeout=5)
+
+        self.assertFalse(dump_thread.is_alive())
+        self.assertFalse(report_thread.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(
+            dumped[0]['queued_compatibility_profiles'][0]
+            ['compatible_accelerators'], ['A100'])
+        self.assertTrue(dumped[0]['compatibility_demand_complete'])
+        self.assertEqual(dumped[0]['configured_accelerator_shapes'], {
+            'A100': 1,
+            'H100': 1,
+        })
+        self.assertEqual(
+            source.queued_compatibility_profiles[0]['compatible_accelerators'],
+            ('H100',))
 
     def test_old_report_reads_as_stale_after_load(self):
         source = _make_autoscaler(knob=1.0)

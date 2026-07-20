@@ -189,6 +189,8 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._routing_spec = None  # pylint: disable=protected-access
+    ctrl._applied_version = 1  # pylint: disable=protected-access
+    ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
 
@@ -222,7 +224,8 @@ class _FakeSpec:
                  lb_stream_timeout_seconds,
                  lb_retriable_status_codes=None,
                  lb_max_retries=None,
-                 lb_retry_initial_backoff_seconds=None) -> None:
+                 lb_retry_initial_backoff_seconds=None,
+                 target_concurrency_per_replica=None) -> None:
         self.load_balancing_policy = load_balancing_policy
         self.target_qps_per_replica = target_qps_per_replica
         self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
@@ -230,6 +233,7 @@ class _FakeSpec:
         self.lb_max_retries = lb_max_retries
         self.lb_retry_initial_backoff_seconds = (
             lb_retry_initial_backoff_seconds)
+        self.target_concurrency_per_replica = (target_concurrency_per_replica)
 
 
 class TestGetRoutingSpec:
@@ -274,6 +278,67 @@ class TestGetRoutingSpec:
         get_service.assert_not_called()
         get_spec.assert_not_called()
 
+    def test_concurrency_autoscaler_advertises_exact_card_capability(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.ConcurrencyAutoscaler)
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica=None,
+                         target_concurrency_per_replica=1,
+                         lb_stream_timeout_seconds=120)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['L4', 'A100']):
+            routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_concurrency_per_replica'] == 1
+        assert routing_spec['request_accelerator_compatibility_version'] == 1
+        assert routing_spec['configured_accelerators'] == ['L4', 'A100']
+
+    def test_concurrency_least_load_withholds_exact_card_capability(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.ConcurrencyAutoscaler)
+        spec = _FakeSpec(load_balancing_policy='least_load',
+                         target_qps_per_replica=None,
+                         target_concurrency_per_replica=1,
+                         lb_stream_timeout_seconds=120)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['L4', 'A100'
+                                            ]) as configured_accelerators:
+            routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_concurrency_per_replica'] == 1
+        assert 'request_accelerator_compatibility_version' not in routing_spec
+        assert 'configured_accelerators' not in routing_spec
+        configured_accelerators.assert_not_called()
+        ctrl._configure_instance_aware_accelerators(spec)  # pylint: disable=protected-access
+        ctrl._autoscaler.set_configured_accelerator_shapes.assert_called_once_with(  # pylint: disable=line-too-long
+            {})
+
+    def test_compatibility_report_requires_applied_routing_version(self):
+        ctrl = _make_controller()
+        report = {
+            'routing_version': ctrl._applied_version,  # pylint: disable=protected-access
+            'in_flight': {},
+            'queue_depth': 0,
+            'rejected_in_window': 0,
+            'rejected_in_recent_window': 0,
+            'unknown_in_flight_urls': [],
+            'queued_requests_by_compatibility': [],
+            'rejected_requests_by_compatibility': [],
+        }
+
+        assert ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+        report['routing_version'] -= 1
+        assert not ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+        del report['routing_version']
+        assert not ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+
     def test_only_instance_aware_autoscaler_advertises_exact_card_capability(
             self):
         ctrl = _make_controller()
@@ -304,7 +369,9 @@ class TestGetRoutingSpec:
             types.SimpleNamespace(accelerators={'A100': 8}),
             types.SimpleNamespace(accelerators={'A100-80GB': 1}),
         ])
-        spec = types.SimpleNamespace(min_replicas_by_accelerator={})
+        spec = types.SimpleNamespace(
+            min_replicas_by_accelerator={},
+            load_balancing_policy='instance_aware_least_load')
         with mock.patch.object(controller.replica_managers,
                                'load_task_with_service_spec',
                                return_value=task):
@@ -413,6 +480,7 @@ class TestGetRoutingSpec:
             # The DB already points at the new version, but the controller has
             # not finished applying it locally yet. Syncs must keep serving the
             # old routing spec until the runtime transition completes.
+            assert ctrl._applied_version == 1  # pylint: disable=protected-access
             assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
                 'load_balancing_policy_name': 'round_robin',
                 'target_qps_per_replica': None,
@@ -429,6 +497,7 @@ class TestGetRoutingSpec:
         assert not updater.is_alive()
         ctrl._replica_manager.clear_pending_version.assert_called_once_with(  # pylint: disable=line-too-long
             2)
+        assert ctrl._applied_version == 2  # pylint: disable=protected-access
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
             'target_qps_per_replica': {
@@ -2145,6 +2214,40 @@ class TestAuthoritativeLbReportIngestion:
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
 
+    def test_sync_with_mid_snapshot_update_withholds_mixed_routing_epoch(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._routing_spec = {'catalog': ['A100']}  # pylint: disable=protected-access
+
+        def _finish_replica_snapshot(*_args, **_kwargs):
+            with ctrl._routing_state_lock:  # pylint: disable=protected-access
+                ctrl._routing_spec = {'catalog': ['H100']}  # pylint: disable=protected-access
+                ctrl._applied_version = 2  # pylint: disable=protected-access
+            return {}, 1
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 ctrl, '_lb_report_authority', return_value=(True, True, True)), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_lb_replica_info',
+                 side_effect=_finish_replica_snapshot), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        body = json.loads(response.body)
+        assert body['service_version'] == 2
+        assert body['routing_spec'] is None
+
     def test_live_max_surge_reporter_persists_request_history(self):
         ctrl, info, report = self._controller_and_report()
         ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
@@ -2195,6 +2298,44 @@ class TestAuthoritativeLbReportIngestion:
             ({
                 self._URL: 2
             }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
+
+    def test_old_report_cannot_cross_catalog_publication_epoch(self):
+        ctrl, info, report = self._controller_and_report()
+        report.update({
+            'routing_version': 1,
+            'rejected_requests_by_compatibility': [],
+        })
+        reached_epoch_fence = threading.Event()
+        errors = []
+
+        def _unknown_ids(*_args, **_kwargs):
+            reached_epoch_fence.set()
+            return {1}
+
+        def _ingest():
+            try:
+                ctrl._apply_load_balancer_report(  # pylint: disable=protected-access
+                    report, [info], {1: True}, (True, True, True), {})
+            except BaseException as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        # Hold the same publication lock used by _apply_service_update. The
+        # old report reaches the fence under version 1, but cannot validate or
+        # collect until the version-2 catalog epoch is visible.
+        with mock.patch.object(ctrl,
+                               '_unknown_async_replica_ids',
+                               side_effect=_unknown_ids):
+            with ctrl._routing_state_lock:  # pylint: disable=protected-access
+                reporter = threading.Thread(target=_ingest)
+                reporter.start()
+                assert reached_epoch_fence.wait(timeout=5)
+                ctrl._applied_version = 2  # pylint: disable=protected-access
+            reporter.join(timeout=5)
+
+        assert not reporter.is_alive()
+        assert not errors
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'compatibility_demand_complete'] is False
 
     def test_logical_report_publishes_capacity_and_demand_as_one_generation(
             self):
@@ -2413,6 +2554,10 @@ class TestAuthoritativeLbReportIngestion:
                 'compatible_accelerators': ['A100'],
                 'count': 3,
             }]
+        # An old LB omitting the new rejection-profile gauge must not unlock
+        # card-specific target changes during a mixed-version rollout.
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'compatibility_demand_complete'] is False
         # The reporter's clean-looking drain fields are not copied. A blocking
         # view also invalidates any still-fresh proof from before the rollout.
         assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
@@ -2962,9 +3107,10 @@ class TestLbSyncBlockingReadsOffLoop:
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint', 'request_history_accepted',
-            'queued_compatibility_demand_supported'
+            'queued_compatibility_demand_supported', 'service_version'
         }
         assert body['queued_compatibility_demand_supported'] is True
+        assert body['service_version'] == 1
 
 
 class TestLbSyncOwnershipFences:

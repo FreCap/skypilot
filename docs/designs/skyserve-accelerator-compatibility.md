@@ -157,7 +157,51 @@ service:
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
 - For this first version, require one GPU-count shape per exact accelerator ID in a multi-card service. Reject ambiguous configurations such as both `A100:1` and `A100:8` under one `A100` floor until the public identity is extended to an exact card-plus-count shape.
-- For this first version, exact-card compatibility and per-card floors require dict `target_qps_per_replica` plus `instance_aware_least_load`. Other autoscalers retain their legacy aggregate behavior and do not advertise the compatibility capability, preventing constrained demand from triggering generic scale-ups onto the wrong card.
+- Exact-card compatibility and per-card floors support either dict
+  `target_qps_per_replica` or `target_concurrency_per_replica`, and require
+  `instance_aware_least_load`. Other autoscalers retain their legacy aggregate
+  behavior and do not advertise the compatibility capability, preventing
+  constrained demand from triggering generic scale-ups onto the wrong card.
+  An in-place policy downgrade to `least_load` withdraws the capability and
+  clears the autoscaler's prior exact-card catalog, targets, gauges, and
+  reserved-card supply atomically with the autoscaler version transition,
+  before aggregate scaling resumes or the new replica-manager fence can accept
+  a decision.
+  A nonempty card or GPU-count catalog change also invalidates replaceable
+  compatibility gauges and holds exact-card scaling until a complete LB report
+  arrives under the new routing version. Old A100 demand is never reinterpreted
+  as H100 demand merely because the task catalog changed.
+- Per-card values use the service's public replica unit. Physical-backend
+  services count machines. Logical services count GPU slots, matching the
+  existing concurrency target, min, max, and capacity fields. A logical
+  `A100:8` backend therefore contributes eight A100 units to ready, target,
+  and floor accounting, while it remains one physical machine in the
+  separately reported physical counts.
+- Concurrency sizing preserves the existing aggregate outstanding-work
+  contract and its utilization, rejection-duration, hysteresis, wave-limit,
+  and stale-report rules. Running and unknown work is pinned to the exact card
+  of the backend already carrying it, so a priority change never preempts or
+  relabels active work. Queued and recently rejected work remains flexible
+  within its declared compatibility set and is allocated priority-first using
+  the same ready-reserved, ready, provisioning, free-reserved, then cold-paid
+  ordering as request admission.
+- Exact-card rounding happens independently. If fractional duration-normalized
+  work spans several disjoint compatibility profiles, the compatibility-safe
+  target may be slightly larger than `ceil(total_work / per_slot_capacity)`;
+  the published global target remains exactly the sum of the per-card targets.
+- An empty per-card map is a valid complete target when aggregate demand and
+  floors are zero. It gracefully retires idle paid replicas on every card and
+  never falls back to the incomplete-target fence.
+- `num_overprovision` remains separate from the published demand target. At
+  actuation time, extend the complete per-card demand map to the final target
+  with the same ready, reserved, provisioning, then cold ordering, so every
+  overprovisioned launch still carries an exact card override.
+- A logical same-total card migration is a scale-up event even though its
+  aggregate demand target is unchanged. Limit positive per-card deltas by the
+  configured slot wave, retain the corresponding old-card target during the
+  transition, and retire idle old-card capacity only after the authorized
+  replacement target is ready. Apply a hard floor larger than one wave over
+  successive waves without weakening the eventual floor.
 
 The control loop exposes three related but different values:
 
@@ -259,10 +303,25 @@ Acceptance gate:
 
 SkyPilot changes:
 
-- Extend LB-to-controller request history with the bounded `(numeric priority, compatibility bitmap)` histogram and exact-card in-flight counts. Keep the payload sparse and make the active authority the sole reporter.
-- In `sky/serve/autoscalers.py`, add a deterministic, sticky priority-first supply-aware allocator that converts demand profiles into `demand_target_by_accelerator` using each exact card's request-rate target and the same marginal fallback ranking as admission.
+- Extend LB-to-controller demand reports with the bounded `(numeric priority,
+  compatibility bitmap)` arrival, queued, and recent-rejection histograms.
+  Attribute the authoritative per-URL in-flight gauge to exact cards in the
+  controller from the same replica catalog used for routing. Queue, rejection,
+  and in-flight values are replaceable gauges. Keep the payload sparse and
+  make the active authority the sole reporter.
+- In `sky/serve/autoscalers.py`, add a deterministic, sticky priority-first
+  supply-aware allocator shared by request-rate and concurrency autoscalers.
+  Request-rate mode converts profile counts with each exact card's QPS target.
+  Concurrency mode uses the existing per-GPU concurrency knob, pins running
+  and unknown work to its actual exact card, and allocates queued/rejected
+  work with the same marginal fallback ranking as admission.
 - Update autoscaler decisions to carry exact accelerator resource overrides on ordinary demand scale-up, not only reserved-fill scale-up.
 - Make scale-down exact-card-aware and enforce both aggregate and per-card hard floors under the existing graceful delays.
+- Carry the per-card logical target through `LogicalScaleTarget` and the
+  replica-manager reconciliation fence. Logical placement may pack several
+  slots into one compatible physical backend, but it must not satisfy one
+  card's shortfall with another card. Logical retirement must prove both the
+  aggregate target and every exact-card target remain covered.
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
 - Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
@@ -274,6 +333,12 @@ Tests:
 - Preserve and expand the existing A100/A100-80GB reserved-pool separation tests.
 - Test that demand and fill replicas on reserved infrastructure both advertise zero-cost provenance to the LB, while a paid replica and a replica with unknown/stale provenance do not receive reserved-first preference.
 - Add controller/LB synchronization tests for service-version changes and stale reserved observations.
+- Add concurrency tests for physical and logical replica units, exact-card
+  in-flight attribution, queued and rejected compatibility gauges, stale
+  mixed-version reports, HA handoff, controller restart, bounded scale-up
+  waves, same-total card migration, floors larger than one wave, demand-to-zero
+  retirement, `num_overprovision`, multi-GPU logical packing, and card-safe
+  non-preemptive retirement.
 
 Acceptance gate:
 
@@ -349,17 +414,79 @@ additive queue gauge. Services without an advertised exact-card catalog always
 retain legacy aggregate arrival scaling because they cannot publish bounded
 card profiles.
 
+Every new LB demand sync echoes the service version of the routing spec it has
+already applied. The controller returns its applied service version in every
+sync response and accepts compatibility gauges as complete only when those
+versions match. A first-sync, old-LB, or delayed old-catalog report may still
+refresh aggregate demand, but it cannot re-arm exact-card scaling after a
+catalog update. The LB advances its echoed version only after it atomically
+applies the response's routing spec, exact-card catalog, and route set. A
+spurious empty endpoint response retains both the prior snapshot and its prior
+version. Within the controller, autoscaler catalog/version publication,
+routing-spec publication, the applied-version fence, compatibility validation,
+and compatibility-gauge ingestion share one routing-state lock. A report can
+therefore be interpreted wholly before an update (and then cleared by it) or
+wholly after it (and rejected if stale), never across the transition.
+If the applied version changes while a controller sync is resolving its
+replica snapshot, the response intentionally withholds the routing spec; the LB
+acknowledges the demand batch but retains its last coherent routing epoch until
+the next complete sync.
+
 HA cutover snapshots carry both accepted compatibility arrivals and the live
-compatibility-queue gauge. Arrival events transfer to the promoted controller
-state exactly once; the queue and in-flight gauges remain conservative floors
-for the bounded handoff interval. Repeated active heartbeats must not replay the
-same arrival batch, while old snapshot JSON that lacks these additive fields
-continues to deserialize as empty compatibility demand.
+compatibility queue, recent-rejection, and exact-card in-flight gauges. Arrival
+events transfer to the promoted controller state exactly once; replaceable
+gauges remain conservative per-profile or per-card maxima for the bounded
+handoff interval. Repeated active heartbeats must not replay the same arrival
+batch, while old snapshot JSON that lacks these additive fields continues to
+deserialize as empty compatibility demand. A report is complete for
+compatibility-aware concurrency only when all aggregate and compatibility
+gauges are present and valid; a mixed-version report therefore keeps the prior
+handoff floor and cannot authorize a card-specific downscale. Each durable HA
+demand snapshot also records its routing version. Aggregate timestamps,
+queueing, rejection, and in-flight safety floors may cross a version boundary,
+but exact-card arrivals and queue/rejection profiles are merged only when the
+snapshot and promoted LB report have the same non-legacy routing version.
 
 An in-process autoscaler replacement during `sky serve update` transfers the
-windowed compatibility arrivals and current queue gauge together with aggregate
-timestamps. The replacement must never retain total demand while forgetting its
-exact-card constraints.
+windowed compatibility arrivals and current queue/rejection gauges together
+with aggregate timestamps and in-flight state. The replacement must never
+retain total demand while forgetting its exact-card constraints. Dynamic state
+also carries the source exact-card catalog and compatibility-completeness bit.
+When a concurrency/QPS mode switch changes that catalog, the replacement drops
+the old exact-card profiles but keeps aggregate demand. Until a version-matched
+LB report establishes the new card constraints, it represents that aggregate
+demand as one flexible profile over every newly configured exact card, combines
+it with hard per-card floors, and allocates it with the normal supply-aware
+ordering. This preserves legacy scaling without reinterpreting an old A100-only
+profile as H100-only demand. The same aggregate fallback replaces, rather than
+supplements, any stale exact profiles after an incomplete report, so all
+aggregate arrivals are counted exactly once. An incomplete delayed report
+cannot re-arm the cleared profiles.
+Because completeness describes only the current report and its replaceable
+gauges, a later complete report does not retroactively attribute older
+aggregate-only arrivals still inside the QPS window. The allocator subtracts
+only windowed exact arrival counts from aggregate arrivals and adds the
+non-negative remainder as one all-configured-card profile. It never subtracts
+the queued compatibility gauge, which is additive outstanding demand rather
+than a duplicate arrival feed.
+Both retained concurrency and instance-aware QPS autoscalers serialize version,
+performance-profile, exact-card catalog, demand ingestion, reserved-supply
+updates, dynamic-state snapshots, and scaling decisions under their own state
+locks. The controller uses each autoscaler's atomic
+`update_version_and_accelerator_shapes` transition, so the decision thread can
+never launch from a new version using the previous version's card catalog.
+For an autoscaler type replacement, the controller also holds the routing-state
+lock from the old autoscaler's locked dynamic-state dump through restore,
+version/catalog initialization, and publication of the replacement. This both
+prevents torn dumps and prevents an authoritative LB report from landing on the
+old object after the snapshot and being lost during the swap.
+Concurrency retains the windowed exact-card arrival profiles solely for this
+handoff, while continuing to size outstanding work from live gauges and using
+only aggregate arrivals as its stale-signal floor. The profile key is emitted
+even when empty, so a QPS replacement can distinguish a complete new-format
+snapshot from an older dump that could retain aggregate arrivals while losing
+their card constraints. The latter uses the same all-configured-card aggregate
+fallback until a fresh, version-matched LB report.
 
 1. Land and deploy SkyPilot schema/status changes with behavior disabled by absence of the new header/map.
 2. Land compatibility queue and per-card autoscaling behind a service flag; deploy to a test multi-card fleet.
@@ -404,7 +531,9 @@ Production checks:
 
 ## Manual test plan
 
-Use a test SkyServe service configured with exact L4, A100, A100-80GB, and H100 resources and distinct per-card QPS targets.
+Use test SkyServe services configured with exact L4, A100, A100-80GB, and H100
+resources, one with distinct per-card QPS targets and one with
+`target_concurrency_per_replica` in logical GPU-slot mode.
 
 1. Start with zero serving replicas and no free reserved capacity. Submit a default/missing-field request and confirm the cheapest compatible paid card is targeted.
 2. Expose a free reserved A100 slot (and no ready replica), submit the same request, and confirm the exact A100 resource override is selected before paid L4.

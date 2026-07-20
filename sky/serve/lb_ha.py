@@ -336,6 +336,7 @@ class CompatibilityDemand:
     compatible_accelerators: tuple[str, ...]
     count: int
     timestamp: float | None = None
+    recent_count: int | None = None
 
     @classmethod
     def from_dict(cls, value: Any, *,
@@ -345,6 +346,7 @@ class CompatibilityDemand:
         priority = value.get('priority')
         accelerators = value.get('compatible_accelerators')
         count = value.get('count', 1)
+        recent_count = value.get('recent_count')
         timestamp = value.get('timestamp')
         if (not isinstance(priority, int) or isinstance(priority, bool) or
                 not isinstance(accelerators, list) or not accelerators or
@@ -352,6 +354,11 @@ class CompatibilityDemand:
                     isinstance(card, str) and card for card in accelerators) or
                 not isinstance(count, int) or isinstance(count, bool) or
                 count < 1):
+            return None
+        if (recent_count is not None and
+            (not isinstance(recent_count, int) or
+             isinstance(recent_count, bool) or recent_count < 0 or
+             recent_count > count)):
             return None
         if require_timestamp:
             if (not isinstance(timestamp,
@@ -361,7 +368,8 @@ class CompatibilityDemand:
             normalized_timestamp: float | None = float(timestamp)
         else:
             normalized_timestamp = None
-        return cls(priority, tuple(accelerators), count, normalized_timestamp)
+        return cls(priority, tuple(accelerators), count, normalized_timestamp,
+                   recent_count)
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -371,6 +379,8 @@ class CompatibilityDemand:
         }
         if self.timestamp is not None:
             value['timestamp'] = self.timestamp
+        if self.recent_count is not None:
+            value['recent_count'] = self.recent_count
         return value
 
 
@@ -385,7 +395,12 @@ class DemandSnapshot:
     unknown_in_flight_urls: tuple[str, ...] = ()
     compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
     queued_compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
+    rejected_compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
     rejected_in_recent_window: int = 0
+    # Compatibility profiles are meaningful only under the exact routing
+    # catalog that admitted them.  None represents legacy/unfenced snapshots
+    # and is deliberately not compatible with any handoff report.
+    routing_version: int | None = None
 
     @classmethod
     def from_request(cls, request_data: dict[str, Any]) -> DemandSnapshot:
@@ -426,6 +441,19 @@ class DemandSnapshot:
             profile for value in raw_queued_profiles
             if (profile := CompatibilityDemand.from_dict(
                 value, require_timestamp=False)) is not None)
+        raw_rejected_profiles = request_data.get(
+            'rejected_requests_by_compatibility', [])
+        if not isinstance(raw_rejected_profiles, list):
+            raw_rejected_profiles = []
+        rejected_compatibility_profiles = tuple(
+            profile for value in raw_rejected_profiles
+            if (profile := CompatibilityDemand.from_dict(
+                value, require_timestamp=False)) is not None)
+        raw_routing_version = request_data.get('routing_version')
+        routing_version = (raw_routing_version
+                           if isinstance(raw_routing_version, int) and
+                           not isinstance(raw_routing_version, bool) and
+                           raw_routing_version >= 0 else None)
         return cls(
             timestamps=valid_timestamps,
             queue_depth=_nonnegative(request_data.get('queue_depth')),
@@ -436,8 +464,10 @@ class DemandSnapshot:
                 sorted(value for value in unknown if isinstance(value, str))),
             compatibility_profiles=compatibility_profiles,
             queued_compatibility_profiles=queued_compatibility_profiles,
+            rejected_compatibility_profiles=rejected_compatibility_profiles,
             rejected_in_recent_window=_nonnegative(
                 request_data.get('rejected_in_recent_window')),
+            routing_version=routing_version,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -455,6 +485,11 @@ class DemandSnapshot:
                 profile.to_dict()
                 for profile in self.queued_compatibility_profiles
             ],
+            'rejected_requests_by_compatibility': [
+                profile.to_dict()
+                for profile in self.rejected_compatibility_profiles
+            ],
+            'routing_version': self.routing_version,
         }
 
     @classmethod
@@ -474,6 +509,9 @@ class DemandSnapshot:
             'unknown_in_flight_urls': value.get('unknown_in_flight_urls'),
             'queued_requests_by_compatibility':
                 value.get('queued_requests_by_compatibility'),
+            'rejected_requests_by_compatibility':
+                value.get('rejected_requests_by_compatibility'),
+            'routing_version': value.get('routing_version'),
         })
         return snapshot
 
@@ -484,11 +522,15 @@ class DemandSnapshot:
         """Return a copy with scale-up-safe demand floors applied."""
         merged = dict(request_data)
         current = DemandSnapshot.from_request(request_data)
+        same_compatibility_epoch = (self.routing_version is not None and
+                                    self.routing_version
+                                    == current.routing_version)
         if include_arrivals:
             # Arrival samples are events, not gauges. Transfer the old-active
             # batch exactly once; DemandHandoff keeps the remaining gauges
             # floored without replaying these events on every heartbeat.
-            compatibility_profiles = list(self.compatibility_profiles)
+            compatibility_profiles = (list(self.compatibility_profiles)
+                                      if same_compatibility_epoch else [])
             known_profiles = set(compatibility_profiles)
             for profile in current.compatibility_profiles:
                 if profile not in known_profiles:
@@ -501,10 +543,10 @@ class DemandSnapshot:
                     profile.to_dict() for profile in compatibility_profiles
                 ],
             }
-        queued_profiles = {
+        queued_profiles = ({
             (profile.priority, profile.compatible_accelerators): profile
             for profile in self.queued_compatibility_profiles
-        }
+        } if same_compatibility_epoch else {})
         for profile in current.queued_compatibility_profiles:
             key = (profile.priority, profile.compatible_accelerators)
             previous = queued_profiles.get(key)
@@ -512,6 +554,25 @@ class DemandSnapshot:
                 queued_profiles[key] = profile
         merged['queued_requests_by_compatibility'] = [
             profile.to_dict() for profile in queued_profiles.values()
+        ]
+        rejected_profiles = ({
+            (profile.priority, profile.compatible_accelerators): profile
+            for profile in self.rejected_compatibility_profiles
+        } if same_compatibility_epoch else {})
+        for profile in current.rejected_compatibility_profiles:
+            key = (profile.priority, profile.compatible_accelerators)
+            previous = rejected_profiles.get(key)
+            if previous is None:
+                rejected_profiles[key] = profile
+            else:
+                rejected_profiles[key] = CompatibilityDemand(
+                    priority=profile.priority,
+                    compatible_accelerators=profile.compatible_accelerators,
+                    count=max(previous.count, profile.count),
+                    recent_count=max(previous.recent_count or 0,
+                                     profile.recent_count or 0))
+        merged['rejected_requests_by_compatibility'] = [
+            profile.to_dict() for profile in rejected_profiles.values()
         ]
         merged['queue_depth'] = max(self.queue_depth, current.queue_depth)
         merged['rejected_in_window'] = max(self.rejected_in_window,

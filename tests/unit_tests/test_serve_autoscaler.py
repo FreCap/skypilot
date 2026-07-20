@@ -1,5 +1,6 @@
 """Unit tests for sky.serve.autoscalers."""
 # pylint: disable=protected-access
+import threading
 import time
 import types
 import unittest
@@ -848,6 +849,72 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_version_and_catalog_change_are_atomic_for_decisions(self):
+        autoscaler = self._make_autoscaler({'A100': 1.0})
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        now = time.time()
+        autoscaler.collect_request_information({
+            'timestamps': [now] * 60,
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 60,
+            }],
+            'compatibility_demand_complete': True,
+        })
+        new_spec = self._spec({'H100': 1.0}, min_replicas=0)
+        entered_catalog_transition = threading.Event()
+        resume_catalog_transition = threading.Event()
+        decision_started = threading.Event()
+        decisions = []
+        errors = []
+        original_setter = (autoscaler._set_configured_accelerator_shapes_locked)
+
+        def _blocking_setter(shapes):
+            entered_catalog_transition.set()
+            assert resume_catalog_transition.wait(timeout=5)
+            original_setter(shapes)
+
+        def _update():
+            try:
+                autoscaler.update_version_and_accelerator_shapes(
+                    2, new_spec, serve_utils.DEFAULT_UPDATE_MODE, {'H100': 1})
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        def _decide():
+            decision_started.set()
+            try:
+                decisions.extend(autoscaler.generate_scaling_decisions([], [2]))
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        with mock.patch.object(autoscaler,
+                               '_set_configured_accelerator_shapes_locked',
+                               side_effect=_blocking_setter):
+            updater = threading.Thread(target=_update)
+            updater.start()
+            self.assertTrue(entered_catalog_transition.wait(timeout=5))
+            decision_thread = threading.Thread(target=_decide)
+            decision_thread.start()
+            self.assertTrue(decision_started.wait(timeout=5))
+            decision_thread.join(timeout=0.05)
+            self.assertTrue(decision_thread.is_alive())
+            resume_catalog_transition.set()
+            updater.join(timeout=5)
+            decision_thread.join(timeout=5)
+
+        self.assertFalse(updater.is_alive())
+        self.assertFalse(decision_thread.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(autoscaler.latest_version, 2)
+        self.assertEqual(autoscaler.configured_accelerator_shapes, {'H100': 1})
+        self.assertFalse(
+            any(decision.target == {'accelerators': {
+                'A100': 1
+            }} for decision in decisions))
+
 
 class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
     """After an update, the drain must never act on a stale target.
@@ -1210,8 +1277,45 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
 
+    def test_complete_report_keeps_prior_unattributed_arrivals(self):
+        autoscaler = self._autoscaler(max_replicas=20)
+        autoscaler.set_configured_accelerator_shapes({
+            'A100': 1,
+            'H100': 1,
+        })
+        now = time.time()
+
+        def collect(count, *, complete):
+            autoscaler.collect_request_information({
+                'timestamps': [now] * count,
+                'compatibility_profiles': ([{
+                    'timestamp': now,
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': count,
+                }] if complete else []),
+                'queued_requests_by_compatibility': [],
+                'compatibility_demand_complete': complete,
+            })
+
+        collect(60, complete=True)
+        collect(600, complete=False)
+        collect(60, complete=True)
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertTrue(autoscaler._compatibility_demand_complete)
+        self.assertEqual(autoscaler.target_num_replicas, 12)
+        self.assertEqual(
+            sum(autoscaler.target_num_replicas_by_accelerator.values()), 12)
+        self.assertGreaterEqual(
+            autoscaler.target_num_replicas_by_accelerator['A100'], 2)
+
     def test_compatibility_demand_survives_dynamic_state_handoff(self):
         autoscaler = self._autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+        })
         now = time.time()
         autoscaler.collect_request_information({
             'timestamps': [now],
@@ -1226,6 +1330,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
                 'compatible_accelerators': ['L4', 'A100'],
                 'count': 3,
             }],
+            'compatibility_demand_complete': True,
         })
 
         restored = self._autoscaler(max_replicas=2)
@@ -1236,6 +1341,8 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
                          autoscaler.compatibility_profiles)
         self.assertEqual(restored.queued_compatibility_profiles,
                          autoscaler.queued_compatibility_profiles)
+        self.assertEqual(restored.configured_accelerator_shapes,
+                         autoscaler.configured_accelerator_shapes)
 
     def test_task_shape_controls_capacity_and_exact_scale_up_override(self):
         autoscaler = self._autoscaler(max_replicas=4)
@@ -1246,6 +1353,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         })
         autoscaler.compatibility_profiles = self._profiles(50, ['A100'],
                                                            count=480)
+        autoscaler._compatibility_demand_complete = True
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
@@ -1304,6 +1412,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         placer.cost_per_hour.return_value = 2.0
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
+        autoscaler._compatibility_demand_complete = True
 
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
 
@@ -1314,6 +1423,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1})
         autoscaler.compatibility_profiles = self._profiles(50, ['A100'])
+        autoscaler._compatibility_demand_complete = True
 
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
 
