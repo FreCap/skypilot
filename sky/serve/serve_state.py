@@ -2437,10 +2437,14 @@ def get_orphaned_service_child_names(
         child_names.c.service_name).where(~sqlalchemy.exists().where(
             services_table.c.name == child_names.c.service_name))
     if service_names is not None:
-        patterns = [name.replace('*', '%') for name in service_names]
+        patterns = [
+            db_utils.glob_to_like_pattern(name) for name in service_names
+        ]
         query = query.where(
             sqlalchemy.or_(*[
-                child_names.c.service_name.like(pattern) for pattern in patterns
+                child_names.c.service_name.like(
+                    pattern, escape=db_utils.LIKE_ESCAPE_CHAR)
+                for pattern in patterns
             ]))
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2555,9 +2559,10 @@ def get_glob_service_names(service_names: list[str] | None = None,
         if not service_names:
             return []
         query = query.where(
-            sqlalchemy.or_(
-                *(services_table.c.name.like(service_name.replace('*', '%'))
-                  for service_name in service_names)))
+            sqlalchemy.or_(*(services_table.c.name.like(
+                db_utils.glob_to_like_pattern(service_name),
+                escape=db_utils.LIKE_ESCAPE_CHAR)
+                             for service_name in service_names)))
     with orm.Session(engine) as session:
         rows = session.execute(_with_pool_filter(query)).fetchall()
     return list({row[0] for row in rows})
