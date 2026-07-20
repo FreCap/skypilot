@@ -27,16 +27,28 @@ turning an unproven convenience into a permanent compatibility and security
 obligation.
 
 The prototype has one deliberate seam into the shipped distribution product.
-After its independent verifier accepts an immutable staging digest, its harness
-uses the existing external exact-digest adoption flow through a dedicated
-`ownership: external` output profile, pushes that digest to the returned
-canonical destination with prototype-scoped credentials, and waits for ordinary
-destination verification. The resulting catalog artifact is `external_oci`.
+It runs only in the reserved admin-only `image-builder-prototype` workspace;
+the harness rejects every other workspace and product builder admission can
+never be enabled there. After its independent verifier accepts an immutable
+staging digest, its harness uses the existing external exact-digest adoption
+flow through a dedicated `ownership: external` output profile, pushes that
+digest to the returned canonical destination with prototype-scoped credentials,
+and waits for ordinary destination verification. The resulting catalog artifact
+is `external_oci`.
 The prototype does not write `managed_build`, BUILD origin, `BUILD_RESERVED`,
 build-output leases, or any central builder row. Its restart/fault evidence
 lives in an isolated prototype journal or test harness that is disposable with
 the prototype, not in migration 023. Migration 024 is the only path that later
 introduces native durable build provenance and publication authority.
+Prototype artifacts therefore cannot preoccupy a user workspace's unique digest
+before native builder convergence. They may be launched for benchmarks inside
+the reserved workspace, then externally purged/acknowledged or retained under
+its bounded quotas. Reusing a successful digest elsewhere is an ordinary
+cross-workspace exact-digest adoption, not an in-place producer promotion.
+Prototype bootstrap claims the reserved workspace only when it is absent or
+empty and already admin-only; a preexisting artifact, release, location, or
+consumer is a hard collision rather than something the harness adopts or
+deletes.
 
 The useful Modal-like property is that construction is declared and cached
 independently from replica startup. Placement never runs a Docker build or
@@ -416,6 +428,10 @@ origin. A crash before the push leaves only prototype staging/journal state. A
 crash after push is recovered by idempotently inspecting the destination and
 retrying the same external-adoption request. This proves the data plane without
 smuggling migration-024 semantics into migration 023.
+The prototype ServiceAccount is authorized only for the reserved workspace and
+its external output profile. API-63 activation preflight rejects any workspace
+policy that tries to combine the reserved prototype marker with product builder
+admission.
 
 ## Context custody and object storage
 
@@ -833,6 +849,20 @@ must match metadata exactly. Old migrations never import live metadata. The
 builder PR deliberately couples API-63 code and migration 024; activation of
 the controller, executor, internal registry, and UI remains separately gated.
 
+Migration is not activation. While builder admission is disabled, 024 adds only
+nullable columns/tables and broader checks; it writes no BUILD producer, state,
+or lease value, so API-62 distribution replicas remain schema-compatible. The
+API-63 activation transaction locks the catalog singleton, verifies migration
+024 and healthy API/controller/publisher/purge capability evidence, then raises
+the migration-023 `minimum_image_writer_api_version` fence from 62 to 63 before
+any builder intent is admitted. Every API-62 image read/mutation/claim/finalizer
+already checks that fence and fails managed-image work closed; an in-flight
+API-62 lease expires for API-63 recovery. Before any 024-owned row or value
+exists, disabling the unused builder may lower the fence to 62. After the first
+builder row or BUILD value commits, rollback is only to a 024-aware API-63
+binary with builder admission disabled. Schema downgrade or API-62 image-plane
+rollback is forbidden, while unrelated SkyPilot operations remain available.
+
 One `container_image_context_uploads` row contains only:
 
 ```text
@@ -1249,11 +1279,16 @@ its recorded exact canonical location is READY under current policy. A normal
 BUILD-origin output additionally requires that origin to point to this READY
 build; a `CONTENT_CONVERGED` output instead requires the unchanged recorded
 source or other-build origin and exact digest. The cache lookup first reads
-candidate IDs without trusting them, then in one transaction locks artifact,
-build, canonical location, and output record in the shared order and revalidates
-every condition. Tombstone, PURGING, PURGED, missing canonical content, or
-origin mismatch changes the row to `OUTPUT_RETIRED` in that transaction; it is
-never returned or rebuilt automatically.
+candidate IDs without trusting them. Its transaction then follows phases
+1/3/5/6/8/10: catalog singleton and loaded config/API-version fence; exact
+profile head, revision, and custody; artifact; build; canonical location; and
+output record. It locks each in the shared order and revalidates the active head,
+policy fingerprint, lifecycle, origin, output, and exact READY route before
+returning the hit. Profile activation takes the conflicting phase-1/3 locks, so
+it cannot race this validation or force a later lock-order inversion. Tombstone,
+PURGING, PURGED, missing canonical content, or origin mismatch changes the row
+to `OUTPUT_RETIRED` in that transaction; it is never returned or rebuilt
+automatically.
 
 Catalog tombstone does not duplicate builder SQL or import the builder module.
 API-63 builder startup registers a `CatalogLifecycleExtension` whose
@@ -1445,8 +1480,8 @@ Delivery has a pre-product decision point:
    refreshable capability broker, and deterministic NetworkPolicy/Job bundle,
    but no migration 024, durable public API, product controller, or Build UI;
    publish verified output only through external exact-digest adoption as an
-   `external_oci` artifact, with restart evidence in a disposable isolated
-   harness journal;
+   `external_oci` artifact in the reserved `image-builder-prototype` workspace,
+   with restart evidence in a disposable isolated harness journal;
 3. run the prototype on representative Boltz and one non-Python workload
    against external CI, including Docker/OCI base vectors and hostile sandbox
    conformance; and
@@ -1555,8 +1590,11 @@ and same-row retry changes counters exactly once. Repair tests detect and fix a
 single-workspace drift without scanning or locking unrelated workspaces.
 
 Catalog integration tests cover fresh literal 022-to-023-to-024 migration,
-metadata parity, disabled-builder rollback, activation fencing, the named
-constraint replacement, pre-I/O artifact/location/byte reservation,
+metadata parity, applied-but-disabled API-62 compatibility, atomic minimum
+writer-version activation before any BUILD value, API-62 fail-closed behavior,
+expired old-lease recovery, safe pre-state fence reversal, post-state API-62
+rollback rejection, disabled-builder API-63 rollback, activation fencing, the
+named constraint replacement, pre-I/O artifact/location/byte reservation,
 generation/attempt/token-scoped output and staging records, crashes and stale
 attempts before and after canonical push, immutable-tag recovery, cancellation
 races, no rowless canonical content, ordinary abandoned-output tombstone/purge,
@@ -1566,7 +1604,8 @@ digest/platform mismatch, SOURCE-versus-BUILD runtime validation, content
 convergence without provenance rewriting, and ordinary artifact-ID
 READY-fast-path publication. Cache tests exercise the shared session-taking
 OUTPUT_RETIRED transition and defensive lock-order revalidation for every
-artifact and location lifecycle state.
+artifact and location lifecycle state, including profile activation racing the
+exact phase-1/3/5/6/8/10 cache-hit transaction.
 
 Interface and operations tests cover task client preflight, server rejection
 and static policy-token binding before request persistence, exclusion of the
@@ -1590,7 +1629,10 @@ conditional-create race with normal FINAL, late-segment cleanup, response-enum
 parity, gap/orphan handling, final-digest mismatch, per-call ECR limiter
 contention in the trusted publisher, internal OCI staging/cache token
 scope/ownership/quota/GC, and live S3 plus R2 context-store capability and drift
-tests.
+tests. Prototype tests prove the harness and ServiceAccount reject every
+non-reserved workspace, product admission rejects the reserved workspace, its
+outputs remain `external_oci`, and the same digest can be adopted independently
+in a product workspace without producer promotion or collision.
 
 Release evidence includes real PostgreSQL migration/concurrency tests, MinIO or
 S3-compatible integration, the hostile sandbox conformance matrix plus a real
@@ -1598,6 +1640,7 @@ BuildKit build and cache hit, one ECR publication, dashboard production
 build/manual pass, Terraform validation, and a security review of the executor,
 Job manifest, and credential scopes. The activation runbook proves the
 dedicated tainted builder pool, sandbox RuntimeClass, fixed builder namespace,
+reserved prototype-workspace exclusion, minimum-writer-version transition,
 admission policy, writable-volume allowlist, network policy, node-loss cleanup,
 and disabled-builder behavior before and after Helm rollback. The builder
 joins the distribution design's final six paired Codex/Fable exact-head rounds
