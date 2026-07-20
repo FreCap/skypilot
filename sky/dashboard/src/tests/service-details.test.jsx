@@ -257,6 +257,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
           estimatedHourlyCost: 5.5,
           spotHourlyCost: 1.5,
           onDemandHourlyCost: 4,
+          costTrackedReplicaCount: 2,
           hourlyCostExcludedReplicaCount: 0,
           requestRate: 0.5,
           recentRequestCount: 30,
@@ -271,9 +272,10 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(screen.getByText('$5.50/hr')).toBeTruthy();
+    expect(screen.getByText('Estimated tracked compute cost')).toBeTruthy();
     expect(
       screen.getByText(
-        'Spot $1.50/hr · On-demand $4.00/hr · Current catalog, compute only'
+        'Spot $1.50/hr · On-demand $4.00/hr · 2 active, stopping, or cleanup-uncertain replicas · Current catalog, compute only, not a provider bill'
       )
     ).toBeTruthy();
     expect(screen.getByText('0.50 req/s')).toBeTruthy();
@@ -305,6 +307,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
           estimatedHourlyCost: null,
           spotHourlyCost: 0,
           onDemandHourlyCost: 0,
+          costTrackedReplicaCount: 120,
           pricedReplicaCount: 0,
           hourlyCostExcludedReplicaCount: 120,
           hourlyCostExclusionReasons: { kubernetes: 120 },
@@ -338,6 +341,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
           estimatedHourlyCost: 1,
           spotHourlyCost: 1,
           onDemandHourlyCost: 0,
+          costTrackedReplicaCount: 2,
           pricedReplicaCount: 1,
           hourlyCostExcludedReplicaCount: 1,
           hourlyCostExclusionReasons: { kubernetes: 1 },
@@ -390,9 +394,15 @@ describe('ServiceDetailCard cost and request estimates', () => {
       />
     );
 
-    expect(screen.getByText('Logical replicas (ready/total)')).toBeTruthy();
-    expect(screen.getByText(/1\/2 physical backends ready/)).toBeTruthy();
-    expect(screen.queryByText('Replicas (ready/total)')).toBeNull();
+    expect(
+      screen.getByText('Logical capacity (ready/non-failed)')
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/1\/2 physical backends \(ready\/non-failed\)/)
+    ).toBeTruthy();
+    expect(screen.getByText(/4 failed slots in history/)).toBeTruthy();
+    expect(screen.getByText(/1 failed backends in history/)).toBeTruthy();
+    expect(screen.queryByText('Replicas (ready/non-failed)')).toBeNull();
   });
 
   it('does not show a request total when durable history is unavailable', () => {

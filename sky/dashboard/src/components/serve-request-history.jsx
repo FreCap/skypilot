@@ -216,7 +216,7 @@ export function RequestHistoryCard({
       ...(hasCapacity
         ? [
             capacityLine(
-              'Demand target',
+              'Traffic target (with hysteresis)',
               view.demandTargets,
               'rgb(234, 88, 12)',
               [7, 4]
@@ -224,7 +224,7 @@ export function RequestHistoryCard({
             ...(hasDistinctCapacityTarget
               ? [
                   capacityLine(
-                    'Effective capacity target',
+                    'Traffic or reservation target',
                     view.capacityTargets,
                     'rgb(147, 51, 234)',
                     [3, 3]
@@ -243,7 +243,7 @@ export function RequestHistoryCard({
               [2, 3]
             ),
             capacityLine(
-              'Total capacity',
+              'Non-failed capacity (incl. stopping)',
               view.totalCapacities,
               'rgb(100, 116, 139)',
               [1, 3]
@@ -319,7 +319,10 @@ export function RequestHistoryCard({
             Request and capacity history
           </h3>
           <div className="text-sm text-gray-500">
-            Recorded requests, autoscaler targets, and available capacity
+            Traffic target includes autoscaler hysteresis. Traffic or
+            reservation target is the larger of traffic and reserved-capacity
+            fill. Non-failed capacity includes stopping rows until cleanup
+            finishes
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
@@ -356,13 +359,17 @@ export function RequestHistoryCard({
             {view.capacityStats && (
               <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 text-sm">
                 <div>
-                  <div className="text-gray-500">Peak demand target</div>
+                  <div className="text-gray-500">
+                    Peak traffic target (with hysteresis)
+                  </div>
                   <div className="font-semibold">
                     {view.capacityStats.peakDemandTarget}
                   </div>
                 </div>
                 <div>
-                  <div className="text-gray-500">Peak capacity target</div>
+                  <div className="text-gray-500">
+                    Peak traffic or reservation target
+                  </div>
                   <div className="font-semibold">
                     {view.capacityStats.peakCapacityTarget}
                   </div>
