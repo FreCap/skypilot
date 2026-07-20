@@ -1177,7 +1177,8 @@ provider layer deduplication. Failure to reserve it ends the attempt before
 canonical paid I/O. No source row or release is created.
 
 Only the current RESERVED output lease can obtain short-lived authority for its
-exact digest-sharded canonical repository and immutable tag. The trusted publisher
+exact stored-assigned-shard canonical repository and immutable tag. The trusted
+publisher
 sets the output and location to COPYING, copies the exact staging digest, then
 sets VERIFYING and independently verifies the destination. A reclaimed lease
 always inspects the immutable destination before copying, so a crash after push
@@ -1675,9 +1676,9 @@ Job manifest, and credential scopes. The activation runbook proves the
 dedicated tainted builder pool, sandbox RuntimeClass, fixed builder namespace,
 reserved prototype-workspace exclusion, minimum-writer-version transition,
 admission policy, writable-volume allowlist, network policy, node-loss cleanup,
-and disabled-builder behavior before and after Helm rollback. The builder
-joins the distribution design's final six paired Codex/Fable exact-head rounds
-only after all of those surfaces are frozen.
+and disabled-builder behavior before and after Helm rollback. The builder joins
+the distribution design's exhaustive paired exact-head implementation gate only
+after all of those surfaces are frozen.
 
 ## Explicit non-goals
 

@@ -167,11 +167,47 @@ lost-response recovery. Realm rows
 and allocations include the generation-qualified prefix fields and physical
 prefix uniqueness described below. The preexisting central `config_yaml` table
 is updated in the same transaction but is not recreated or counted as an image
-table. Migration 023 creates external-OCI-only artifact provenance and
+table. Migration 023 nevertheless owns one compatibility guard on that table.
+The migration Job first upgrades the separate config history through revision
+001, sets its version declaration, and takes `ACCESS EXCLUSIVE` on
+`config_yaml`; an old write either commits before this lock or begins after the
+guard exists, never across it. Before enabling the guard it inserts the
+mandatory `api_server_config` row with an empty mapping only when the row is
+absent. It then installs a named
+`trg_config_yaml_image_writer_fence` `BEFORE INSERT OR UPDATE OR DELETE`
+trigger, the `pol_config_yaml_image_reader_fence` forced-RLS policy, and the
+schema-qualified `container_image_require_api_62()` and
+`container_image_guard_config_write()` functions with pinned search paths. The
+trigger rejects every
+writer whose session API version is below the catalog's
+`minimum_image_writer_api_version`, and it rejects deletion of the mandatory
+row. The RLS predicate raises, rather than filtering the row, when the session
+API version is absent, malformed, or below 62. `ENABLE ROW LEVEL SECURITY` plus
+`FORCE ROW LEVEL SECURITY` makes the predicate apply to the table owner too.
+Migration activation fails unless the effective application role is neither a
+superuser nor `BYPASSRLS`, the policy is forced, and the mandatory row is
+visible through a version-62 session.
+
+API 62 sets the transaction-independent custom PostgreSQL setting
+`skypilot.api_version=62` on every synchronous and asynchronous connection
+before its first application statement, including fresh connections after pool
+recycle. Alembic's separately constructed migration connection sets the same
+value at the start of 023 before it enables the guard. The setting is a
+compatibility declaration, not an authorization
+credential. API 61 and older binaries do not set it, so their mandatory
+startup/config-reload query raises at the database boundary and they cannot
+fall back to file configuration. The write trigger additionally fences an
+already-running old writer that was waiting on the config row. Future APIs may
+read ordinary configuration at version 62 after builder activation, but the
+write trigger follows `minimum_image_writer_api_version`, so an API-62 process
+cannot overwrite API-63 image configuration. Managed-image operations retain
+their narrower catalog fence. New migration code also rejects a database
+revision newer than its compiled target instead of treating it as current.
+
+Migration 023 creates external-OCI-only artifact provenance and
 SOURCE-only canonical origins. It never creates the obsolete single-counter
 `container_image_workspace_catalogs` table or artifact-level source columns.
-There is no launchability backfill, `LEGACY_REPUBLISH_REQUIRED`, epoch table,
-forced-RLS compatibility fence, or zero-session maintenance ceremony.
+There is no launchability backfill, `LEGACY_REPUBLISH_REQUIRED`, or epoch table.
 
 Migration 024 is not part of the distribution release. It is designed and
 tested only after the builder prototype passes its pre-product worth and
@@ -206,24 +242,59 @@ train. Those code/schema pieces do not pretend to be independently mergeable.
 Their
 data-plane activation and provider support claims remain independent:
 
-1. deploy API-version-62 code with distribution workers disabled; normal
-   startup Alembic applies literal 023 through the existing application database
-   URI;
-2. verify exact schema, constraints, queue plans, API/UI behavior, and external
+1. for an existing deployment, roll out API-version-62 code with the central
+   state schema explicitly capped at 022 and all image surfaces disabled; every
+   new process already declares version 62 on its database connections;
+2. after every API replica reports version 62, run the dedicated migration Job
+   through the existing application database URI to apply literal 023, then
+   remove the temporary schema ceiling; a clean install may apply 023 before
+   its first API process starts;
+3. verify exact schema, compatibility guard, constraints, queue plans, API/UI
+   behavior, and external
    exact-digest adoption;
-3. deploy the independently scalable AWS copy and opt-in purge workers with
+4. deploy the independently scalable AWS copy and opt-in purge workers with
    their separate identities; and
-4. activate each managed realm only after its registry, identity, capacity, and
+5. activate each managed realm only after its registry, identity, capacity, and
    fault-injection gates pass.
 
-Rollback below API 62 is allowed only while
-`distribution_state_ever_created = FALSE`; it disables the unused distribution
-surface before any profile, artifact, publication, location, or consumer state
-exists. After that monotonic flag becomes TRUE, rollback is only to another
-migration-023-aware API-62 binary. Future image migrations use ordinary expand,
-dual-read/write where needed, backfill, and contract phases. They do not inherit
-a standing right to revoke the shared application database role or stop
-unrelated clusters, requests, jobs, and Serve state.
+The schema ceiling is a deployment-only compatibility control, not a general
+user setting, accepted revision, or second schema authority. It only caps the
+highest revision that API startup may apply automatically. API 62 accepts its
+compiled revision 023 normally and temporarily tolerates revision 022 only
+while image surfaces are disabled, reporting `IMAGE_SCHEMA_PENDING` for those
+routes. It rejects any revision above its compiled target. The migration Job
+verifies the live replica-version set and refuses to apply 023 while a below-62
+API pod remains. Every version-62 config write and the migration Job take the
+same fixed PostgreSQL advisory transaction lock and re-read the state revision
+before choosing the 022 compatibility writer or 023 atomic writer, so no write
+can straddle that change. Leaving the auto-upgrade ceiling in place after the
+database reaches 023 is harmless but visible; Helm removes it in the same
+release operation. This two-step existing-install rollout avoids applying the
+forced-RLS guard while an older serving pod is still expected to accept
+traffic.
+
+Rollback below API 62 is a guarded schema rollback, not a binary-only rollback.
+It is allowed only while `distribution_state_ever_created = FALSE`,
+`builder_state_ever_created = FALSE`, the image configuration is absent, the
+apply ledger is empty, and every migration-023-owned child table is empty. The
+PostgreSQL downgrade takes one fixed advisory transaction lock, then takes
+`ACCESS EXCLUSIVE` on `config_yaml` and locks the mandatory config row, catalog
+singleton, and all image tables in global order.
+It rechecks those conditions inside that transaction before dropping the
+config trigger/RLS policy/functions and the 17 tables and stamping revision
+022. Any witness or owned row raises from the database and leaves both schema
+and guard intact. The supported Helm/manual rollback first disables image
+admission, stops API and image-worker database sessions for this short
+maintenance window, runs that guarded downgrade, and only then starts a
+below-62 binary. This prevents a version-62 writer from recreating state across
+the downgrade boundary. After either monotonic flag becomes TRUE, rollback is
+only to a migration-aware binary at or above its minimum writer fence.
+
+Future image migrations use ordinary expand, dual-read/write where needed,
+backfill, and contract phases. They do not inherit a standing right to revoke
+the shared application database role or stop unrelated clusters, requests,
+jobs, and Serve state outside an explicitly requested pre-activation schema
+downgrade.
 
 ## The reshape
 
@@ -285,16 +356,19 @@ every supplied artifact ID, source alias, and release selector is bound to that
 artifact.
 
 The same final check deterministically renders the expected managed OCI
-reference from the current target, realm generation, immutable shard policy,
-workspace, and artifact digest. Source
-bindings select immutable import provenance but never contribute a repository
-path. The configured immutable power-of-two shard count uses the digest's
-leading bits to select a workspace repository, while the full digest identifies
-the manifest inside that repository. There is no single fixed shard count: the
-realm chooses a feasible count from both repository-count and
-images-per-repository quotas, within the public v1 ceiling of 256.
+reference from the current target, realm generation, stored shard allocation,
+workspace, and artifact digest. Source bindings select immutable import
+provenance but never contribute a repository path. Before creating the first
+location for one `(realm_generation, workspace, artifact)`, SkyPilot locks that
+workspace's realm allocation, chooses the least-filled shard with hard reserved
+capacity, stores its two-hex index on the location, and increments the shard
+reservation in the same transaction. The full digest identifies the manifest
+inside that repository but never chooses the shard. There is no single fixed
+shard count: the realm chooses any feasible count from 1 through the public v1
+ceiling of 256 using both repository-count and images-per-repository quotas.
 This bounds provider resources without placing all artifacts under one
-images-per-repository quota. A READY row and pull plan cannot agree on a
+images-per-repository quota or assuming adversarial digests are uniformly
+distributed. A READY row and pull plan cannot agree on a
 different digest-matching registry reference and thereby bypass the physical
 destination fingerprint, and rotating a failed import to an equivalent mirror
 cannot rename existing canonical or regional content.
@@ -302,8 +376,9 @@ cannot rename existing canonical or regional content.
 Changing a manager identity, pull-auth strategy, or ownership boundary does not
 create a new artifact or physical location. It transfers an explicit policy
 revision onto the same verified bytes while no operation owns the row. Changing
-the registry endpoint, provider account, realm generation, shard policy, or
-rendered generation-qualified namespace creates a new physical location so old
+the canonical registry authority, complete repository-generation prefix, realm
+generation, shard policy, or rendered workspace namespace creates a new
+physical location so old
 and new routes can coexist during migration.
 
 The following is the target module split created by this PR, not a claim about
@@ -462,10 +537,11 @@ Compatibility is explicit: clients below 62 cannot serialize
 `resources.container_image` or call image SDK methods; a 62 client down-converts
 only legacy `image_id: docker:...` when talking to an older server; servers at
 62 keep legacy response fields decodable by old clients; and rolling the server
-back below 62 is permitted only before the catalog's monotonic distribution-state
-witness becomes TRUE. After any managed-image state has existed, the oldest
-rollback target is a migration-023-aware API-62 binary. A new client receives a
-version error before
+back below 62 requires the locked 023-to-022 downgrade before the catalog's
+monotonic distribution-state witness becomes TRUE. A below-62 binary cannot
+start against revision 023 because PostgreSQL rejects its mandatory config
+read. After any managed-image state has existed, the oldest rollback target is
+a migration-023-aware API-62 binary. A new client receives a version error before
 request persistence, not an unknown-field failure from an old server.
 
 `Resources.container_image` is keyword-only and appended after every existing
@@ -650,9 +726,10 @@ The page also shows the workspace's effective image policy and a secret-free
 registry topology: profile name and revision, managed/external ownership,
 literal namespace root, canonical target, regional targets, provider, region,
 registry prefix when known, locality declarations, and runtime pull strategy
-name. Quota cards distinguish lifetime distinct-digest usage from releasable
-materialized-byte, publication-record, and location-record usage, and warn that
-purge does not restore a v0 artifact slot. It excludes manager identities,
+name. Quota cards distinguish lifetime distinct-digest and publication-generation
+usage from releasable materialized-byte, publication-record, and location-record
+usage, and warn that purge or history compaction restores neither lifetime slot.
+It excludes manager identities,
 credential references, tokens, raw
 configuration, and every unrelated SkyPilot setting. Administrators also
 receive a complete **Settings > Image distribution** panel, not a raw-YAML-only
@@ -871,8 +948,9 @@ workspaces:
       max_platforms_per_artifact: 1   # Boltz L4 fleet is linux/amd64 only
       max_sources_per_artifact: 128
       max_releases_per_artifact: 128
-      max_publication_generations_per_artifact: 256
+      max_lifetime_publication_generations_per_artifact: 256
       max_release_reservations: 2000000
+      max_lifetime_publication_generations: 4000000
       max_publication_records: 2000000
       max_location_records: 5000000
       max_locations_per_artifact: 128
@@ -880,12 +958,14 @@ workspaces:
       max_user_retry_generations_per_location: 3
 ```
 
-Validation requires `max_publication_generations_per_artifact` to be at least
-`max_releases_per_artifact` and `max_publication_records` to be at least
-`max_release_reservations`, so successful immutable names cannot consume an
-impossible record budget. The per-artifact publication setting is capped at 256
-by the parser and database check. Lower operational limits use the release
-quotas, not an internally contradictory history ceiling.
+Validation requires `max_lifetime_publication_generations_per_artifact` to be at
+least `max_releases_per_artifact`, `max_publication_records` to be at least
+`max_release_reservations`, and the workspace lifetime-generation limit to be at
+least both retained publication records and release reservations. Successful
+immutable names cannot consume an impossible record budget. The per-artifact
+lifetime setting is capped at 256 by the parser and database check. Lower
+operational limits use release/retained-record quotas, not an internally
+contradictory lifetime ceiling.
 
 Defaults mean models do not repeat registry choices. A task-level
 `distribution` is an override within the workspace allowlist, not a credential
@@ -898,32 +978,42 @@ separator, or repeated separator. Every segment and the complete value use a
 bounded portable grammar validated before activation. A workspace is likewise
 one bounded OCI-safe segment and never contains a separator.
 
+At activation, one provider-neutral canonicalizer parses either an explicit or
+provider-derived registry reference into a normalized `host[:port]` authority
+and optional repository base path. It validates provider/account/region/project
+metadata against that result but never includes those adapter labels in
+physical uniqueness. It joins the base path, literal `namespace_root`, and
+`g<realm_generation>` into one complete canonical repository-generation prefix.
+Thus spelling `registry.example/a` plus root `b`, or
+`registry.example` plus root `a/b`, yields the same reserved physical prefix.
+
 SkyPilot, not administrator string interpolation, appends one universal
 injective layout for managed and external profiles:
-`<namespace_root>/<workspace>/g<realm_generation>/shard-<fixed-width-prefix>`.
+`<repository-generation-prefix>/<workspace>/shard-<two-hex-index>`.
 An external owner may choose one shard but does not get a shorter renderer.
-Generation is an unsigned decimal rendered with the literal `g` prefix, and
-shard width is fixed by the immutable realm shard count. Because every profile
+Generation is an unsigned decimal rendered with the literal `g` prefix before
+the workspace, and every shard index is exactly two lowercase hex digits from
+`00` through `ff`, bounded by the immutable shard count. Because every profile
 uses the same suffix segment count, equality of rendered repository paths
-requires equal root depth and segments followed by equal workspace, generation,
-and shard. Changing one tuple member therefore cannot render the same path, and
-a longer external root cannot absorb a managed workspace/generation suffix.
+requires equal canonical authority and generation prefix followed by equal
+workspace and stored shard index. Changing one tuple member cannot render the
+same path, and a longer configured root cannot absorb the fixed suffix.
 
 More than one profile may reference the same capacity realm only when every
-provider/account/region/registry/rendered-repository destination is disjoint.
+canonical `(registry authority, repository-generation prefix)` is disjoint.
 Activation rejects overlap with every active profile and every retained
-ACTIVE, DRAINING, or RETIRED target custody/realm generation, even when the
-profiles name the same realm generation, because historical purge authority
-must not race newly assigned bytes. For each of the bounded submitted targets,
-the activation transaction performs one exact indexed reservation lookup/insert
-under the sorted realm locks. The database unique key makes concurrent
-activations converge or conflict without scanning historical custody or using a
-stale preflight. It never enumerates workspaces because the universal suffix is
-injective. A RETIRED root becomes reusable only after no location,
-DELETE_UNKNOWN outcome, manifest audit record, or purge lease remains and its
-root reservation has been explicitly compacted. The namespace root, rendered
-generation prefix, realm generation, and shard count are always part of
-destination identity even if another literal field happens to repeat.
+ACTIVE, DRAINING, or RETIRED target custody/realm generation, even when provider
+adapters, endpoint/base-path splits, or account metadata differ, because
+historical purge authority must not race newly assigned bytes. For each bounded
+submitted target, the activation transaction performs one exact indexed
+reservation lookup/insert under sorted realm locks. The database unique key
+makes concurrent activations converge or conflict without scanning historical
+custody or using a stale preflight. It never enumerates workspaces because the
+universal suffix is injective. A RETIRED prefix becomes reusable only after no
+location, DELETE_UNKNOWN outcome, manifest audit record, or purge lease remains
+and its reservation has been explicitly compacted. The canonical authority,
+complete repository-generation prefix, and immutable shard policy are always
+part of destination identity even if adapter metadata happens to repeat.
 The general parser ceiling remains 128 platforms for external profiles, whose
 owner controls deletion dependencies. A v0 managed profile admits exactly one
 platform and one OCI/Docker schema-2 image manifest as the artifact root. It
@@ -945,15 +1035,17 @@ distribution. Validation rejects a larger proposal before the apply transaction.
 Consequently replacing the whole image section advances at most 256 global head
 rows, independent of the number of workspaces or artifacts.
 
-The workspace quota row tracks artifact, permanent release-reservation,
-retained publication-record, and location-record counts plus READY materialized
-bytes. Artifact, publication, and location-intent creation reserve count quota
-in their transaction. One publication consumes both one workspace reservation
-and one per-artifact
-release slot plus one retained publication-record slot before copy work begins.
-At most 256 retained publication generations may refer to one artifact. A
-RELEASED generation restores only the permanent name reservation; its retained
-record remains charged until terminal-history compaction. Finalizing its release
+The workspace quota row tracks artifact, active release-name-reservation,
+lifetime publication-generation, retained publication-record, and
+location-record counts plus READY materialized bytes. Artifact, publication,
+and location-intent creation reserve count quota in their transaction. One
+publication consumes one workspace and one per-artifact lifetime-generation
+slot, both non-releasable, plus the active digest-bound name reservations and one retained
+publication-record slot before copy work begins. At most 256 lifetime
+publication generations may ever refer to one artifact. A RELEASED generation
+restores only the active name reservation; its lifetime slots remain charged
+forever and its retained record remains charged until terminal-history
+compaction. Finalizing its release
 does not consume a second slot, and FAILED or CANCELLED state does not free
 either permanently digest-bound reservation. Before registry I/O, the worker inspects exact
 manifest size and atomically reserves byte quota when configured; a race that
@@ -962,7 +1054,7 @@ purge releases READY byte quota, while location-record quota is released only
 when an orphaned
 historical row or terminal publication is compacted under its audit retention
 policy. Compaction first writes the bounded immutable outcome to the audit sink,
-then removes the query row and releases only publication-record or
+then removes the query row and releases only retained publication-record or
 location-record quota. User retries
 increment a per-location generation counter and require an admin after the
 workspace limit. Quota counters are repaired from source tables by a bounded
@@ -979,7 +1071,8 @@ realm allocation remain separate rows and are checked at admission.
 `container_image_profile_revisions` retains every
 accepted secret-free normalized revision, and
 `container_image_target_custodies` retains each revision/target's provider,
-account/project, endpoint, physical repository-root fingerprint, ownership
+account/project, endpoint policy metadata, provider-neutral canonical registry
+authority/repository-generation prefix, physical root fingerprint, ownership
 kind/tags, versioned manager-credential reference/principal fingerprint,
 distinct nullable versioned purge-credential reference/principal fingerprint,
 and `ACTIVE|DRAINING|RETIRED` custody state.
@@ -1045,8 +1138,11 @@ The transaction removes only expired oldest entries; if 256 unexpired entries
 remain it returns `IMAGE_CONFIG_APPLY_LEDGER_FULL` before changing any row.
 The database-backed API-server config writer is refactored so every whole-config
 update locks the existing `config_yaml` row and this catalog singleton first,
-compares the submitted generation, and commits through one caller-owned
-PostgreSQL session. A file- or PVC-backed API server may edit ordinary local
+compares both the submitted generation and prior complete-config digest, and
+commits through one caller-owned PostgreSQL session. The migration-023 trigger
+rejects the legacy one-statement writer before it can enter this lock protocol,
+including when that statement began waiting before a distribution activation
+committed. A file- or PVC-backed API server may edit ordinary local
 configuration, but it cannot activate managed images; managed-image activation
 requires the central PostgreSQL config row.
 
@@ -1086,14 +1182,15 @@ mixed-version rollout until every participating API, controller, and worker
 advertises this generation protocol.
 
 All profiles accept only the literal `namespace_root` and the fixed
-workspace/generation/shard renderer above. Arbitrary templates and the shorter
+generation/workspace/assigned-shard renderer above. Arbitrary templates and the shorter
 legacy external layout are rejected.
 Cross-workspace physical deduplication would require a global reference and
 eviction authority model; the workspace-scoped catalog deliberately refuses to
 pretend it has one. Profile validation rejects a namespace root whose fixed
-rendered repository set overlaps another retained realm generation on the same
-provider/account/region/registry authority. The activation transaction's unique
-root reservation rejects concurrent or historical overlap even when no profile
+canonical repository-generation prefix overlaps another retained realm
+generation on the same normalized registry authority. The activation
+transaction's provider-neutral unique prefix reservation rejects concurrent or
+historical overlap even when no profile
 head currently points at the retained custody.
 
 Kubernetes is explicit because a registry being close to a cluster does not
@@ -1239,8 +1336,9 @@ moves the handle and reference to the current revision.
 ### `container_image_workspace_quotas`
 
 One row per workspace stores `artifact_count`, `release_reservation_count`,
-`publication_record_count`, `location_record_count`, and `materialized_bytes` as
-nonnegative counters plus update time. PostgreSQL
+non-releasable `publication_generation_count`, retained
+`publication_record_count`, `location_record_count`, and `materialized_bytes`
+as nonnegative counters plus update time. PostgreSQL
 check constraints reject negative or signed-64-bit-overflow values. All quota
 authorizations lock this row before the artifact/location they may create, so
 concurrent users cannot oversubscribe a limit. Policy limits remain validated
@@ -1250,7 +1348,10 @@ creating the first `(workspace, digest)` increments it exactly once, and
 tombstone, purge, audit compaction, or release removal never decrements it. A
 workspace that exhausts this v0 safety bound must receive an explicit quota
 increase or use a new workspace. Materialized-byte and compactable child-record
-counters are released under their narrower proved-absence rules.
+counters are released under their narrower proved-absence rules. Every newly
+inserted publication row increments `publication_generation_count` exactly
+once, and no release, retry, purge, audit compaction, or row deletion decrements
+it. That lifetime counter is the finite bound on the immutable audit history.
 
 ### `container_image_catalog_summaries` and `container_image_catalog_facets`
 
@@ -1332,26 +1433,46 @@ facets per artifact. Unfiltered pages use the artifact ordering index directly.
 
 ### `container_image_realm_generations` and `container_image_realm_allocations`
 
-One immutable realm-generation target row stores a physical registry authority,
-owning distribution, Terraform-declared or externally attested workspace
-capacity, power-of-two shard count, literal namespace root plus fixed
-generation-qualified layout contract, quota/inventory snapshot digest, and
-ownership identity. Canonical and regional
+One immutable realm-generation target row stores the provider-neutral canonical
+registry `host[:port]`, complete repository-generation prefix, owning
+distribution, provider-policy metadata, Terraform-declared or externally
+attested workspace capacity, shard count from 1 through 256, fixed two-hex
+renderer, quota/inventory snapshot digest, and ownership identity. Canonical and regional
 targets receive separate rows, while policy-only profile revisions reuse the
 same row. This existing table is the physical-root reservation, not an
 additional eighteenth table.
 
-A uniqueness constraint over provider, account/project, region, registry
-authority, literal namespace root, and realm generation admits exactly one
-owning distribution and one immutable shard count until the row is compacted.
-It deliberately excludes shard count from the unique key, so two configurations
-cannot overlap on `shard-0` by claiming different shard counts. One allocation
-row per `(realm_generation_id, workspace)` reserves a stable namespace slot and
-its fully rendered generation prefix. Profile activation locks and validates
-the immutable realm generation but creates no workspace rows. First use in a
-workspace locks the realm and creates its allocation before any repository or
-location intent, so profile activation never fans out over configured or
-historical workspaces.
+A uniqueness constraint over `(canonical_registry_authority,
+canonical_repository_generation_prefix)` admits exactly one owning distribution
+and one immutable shard policy until the row is compacted. It deliberately
+excludes provider, account/project, region, configured endpoint/root split, and
+shard count, so alternate adapter descriptions or different shard counts cannot
+reserve the same `shard-00` repository twice.
+
+One allocation row per `(realm_generation_id, workspace)` reserves a stable
+workspace namespace slot. It stores immutable shard count, the fully rendered
+workspace prefix, hard per-shard manifest capacities, and current
+reserved-manifest counts as bounded arrays of exactly that shard count. Every
+element is a nonnegative BIGINT and each reservation is checked against its
+matching hard capacity. V0 managed generation prefixes begin empty, so there is
+no imported baseline-manifest vector to reconcile. Profile activation locks and
+validates the immutable realm generation but creates no workspace rows. First
+use locks the realm and creates the allocation before any repository or
+location intent, so activation never fans out over configured or historical
+workspaces.
+
+First location creation for one artifact locks that allocation in phase 2,
+reuses any existing `(realm_generation_id, workspace, image_id)` location
+mapping, or chooses the shard with the lowest
+`reserved_manifest_count` and then lowest index among those below capacity. It
+increments that shard reservation and creates the
+location with `assigned_shard_index` in the same transaction. A uniqueness
+constraint on that triple makes concurrent identical creation converge. The
+allocation row serializes only this short first-location transaction; provider
+I/O and launch do not hold it. Reservation is released only when exact manifest
+absence is proved and the terminal location is compacted. EVICTED locations
+that may rematerialize retain both mapping and reservation. Adversarial digest
+prefixes therefore cannot bias placement or exceed a repository's hard count.
 
 The bounded activation transaction locks realm reservations and global heads in
 their shared order, preventing two distributions from authorizing the same
@@ -1426,8 +1547,9 @@ One row per `(workspace, digest)`:
   rewriting this initial provenance;
 - lifecycle state (`ACTIVE`, `TOMBSTONED`, `PURGING`, or `PURGED`), tombstone
   actor/reason/time, and purge completion time;
-- nonnegative `publication_record_count` capped at 256 and `location_count`
-  capped at 128, maintained under the artifact lock for bounded child records;
+- nonnegative lifetime `publication_generation_count` capped at 256, retained
+  `publication_record_count` capped at 256, and `location_count` capped at 128,
+  maintained under the artifact lock for bounded child records;
 - timestamps and creator hash;
 - no profile, endpoint, runtime auth, or credential data.
 
@@ -1435,7 +1557,8 @@ The row and digest uniqueness survive PURGED forever. This is both the
 nonresurrection witness and the hard bound on historical artifact cardinality;
 no compactor replaces it with an uncounted tombstone table or frees its lifetime
 artifact slot. Catalog plans and quotas therefore include every retained
-lifecycle state, not only ACTIVE content.
+lifecycle state, not only ACTIVE content. Its publication-generation counter is
+likewise monotonic and remains after publication query rows are compacted.
 
 Literal migration 023 creates no artifact-level `source_ref` or
 `resolved_source_ref` columns. Immutable aliases live only in
@@ -1507,28 +1630,34 @@ the publication ID without locking, then locks quota, profile, artifact,
 canonical location if present, publication, and active-name release key in the
 global order; it requires
 FAILED or CANCELLED, no durable consumer, no live lease, and no release row;
-records actor, reason, time, and terminal `RELEASED`; restores the workspace and
-per-artifact reservation counters; and removes only that generation from the
-partial unique active-name index. A later publication may reuse the text with a
-new `reservation_generation`. Every worker and finalizer is fenced by
+records actor, reason, time, and terminal `RELEASED`; restores only the workspace
+and per-artifact active name-reservation counters, never either lifetime
+generation counter; and removes only that generation from the partial unique
+active-name index. A later publication may reuse the text with a new
+`reservation_generation` only while both lifetime limits permit it. Every worker and finalizer is fenced by
 publication ID and generation, so a late callback for the released reservation
-cannot bind the reused name. Audit history is never deleted. Publication status
+cannot bind the reused name. Audit history is never deleted and remains finite
+under the non-releasable workspace and per-artifact generation bounds. Publication status
 is directly readable by ID and workspace with no asynchronous request row.
 
 Creating the reservation locks its workspace quota row and artifact, checks
 `max_release_reservations`, `max_releases_per_artifact`,
-`max_publication_records`, and
-`max_publication_generations_per_artifact`. It consumes the two permanent
-release-reservation slots plus one retained publication-record slot before any
-copy is queued. The release slots remain charged through FAILED and CANCELLED
-and are restored only by the never-READY RELEASED transaction above. The
-publication-record slot remains charged through RELEASED until the terminal row
-passes retention, its closed outcome is durably compacted to audit, and that row
-is deleted. A workspace or artifact at the retained-record limit fails before
-copy work rather than accumulating unbounded typo/reuse history.
+`max_lifetime_publication_generations`,
+`max_lifetime_publication_generations_per_artifact`, and
+`max_publication_records`. It consumes the two non-releasable lifetime
+generation slots, the two active name-reservation slots, and one retained
+publication-record slot before any copy is queued. The active name slots remain
+charged through FAILED and CANCELLED and are restored only by the never-READY
+RELEASED transaction above. The lifetime slots are never restored. Only a
+never-READY RELEASED query row is eligible for publication compaction; its
+record slot remains charged until retention passes, the closed outcome is
+durably written to audit, and the row is deleted. READY rows remain while their
+immutable release points at them. A workspace or artifact at either lifetime or
+retained-record limit fails before copy work rather than accumulating unbounded
+typo/reuse history.
 Reactivation increments
 `retry_generation` on the same row and consumes retry-attempt budget, but never
-consumes another release slot. Consequently the READY finalizer cannot finish a
+consumes another generation, name, or record slot. Consequently the READY finalizer cannot finish a
 paid transfer and then fail because another caller exhausted release quota.
 
 Reservation creation invokes that same finalization transaction immediately
@@ -1544,8 +1673,8 @@ One row per artifact and materialization identity:
 - distribution name and target display name;
 - lowercase 64-hex physical destination fingerprint, separate lowercase
   64-hex policy fingerprint, profile revision, target-custody ID, realm
-  generation ID, immutable shard count, and rendered generation-qualified
-  workspace prefix;
+  generation ID, immutable shard count, stored `assigned_shard_index`, and
+  rendered canonical repository path;
 - closed `ownership_kind MANAGED|EXTERNAL`, protected by a composite foreign
   key `(target_custody_id, ownership_kind)` to the immutable custody snapshot;
 - canonical flag, exact expected digest, and for a regional copy the exact
@@ -1568,12 +1697,14 @@ One row per artifact and materialization identity:
   `BUILD_RESERVED` plus the generation/attempt/token-bound `BUILD_OUTPUT` lease
   kind.
 
-The physical fingerprint excludes profile and target aliases as well as auth
-configuration, but always includes provider authority, account/project,
-endpoint, literal namespace root, rendered generation-qualified workspace
-prefix, realm generation, and shard count. The destination reference is derived
-from exactly those fields, the digest-selected shard, and the full artifact
-digest. One physical
+The physical fingerprint excludes profile and target aliases, provider adapter
+labels, account/project/region metadata, and auth configuration. It includes
+only the provider-neutral canonical registry authority, complete
+repository-generation prefix, workspace, immutable shard policy, stored
+assigned shard index, and full rendered repository. The destination reference
+is derived from exactly those physical fields and the full artifact digest;
+neither digest bits nor an adapter-specific endpoint decomposition can alter the
+stored shard. One physical
 destination cannot be canonical in one profile
 and an evictable cache in another. A uniqueness constraint also prevents two
 logical locations for one artifact from publishing the same physical manifest
@@ -1617,8 +1748,9 @@ regional rows carry no origin field. Additive migration 024 adds the nullable
 constraint, and installs the complete check: a canonical is either SOURCE with
 only `source_id` or BUILD with only `build_id`, while a regional row has
 `origin_kind`, `source_id`, and `build_id` all NULL. Managed destination
-rendering accepts only workspace, target, and artifact digest, never a source
-reference, so both origins produce the same immutable shard identity. Runtime
+rendering accepts only the canonical target, workspace, stored shard allocation,
+and artifact digest, never a source reference, so both origins produce the same
+immutable physical identity. Runtime
 validation, regional
 copy, and purge lock the canonical origin and prove either an immutable source
 record resolving to the artifact digest or a READY build whose output artifact
@@ -1642,9 +1774,9 @@ A READY canonical location keeps the provenance that produced its verified
 destination. Workers, runtime route validation, and the final atomic cluster
 commit validate that origin binding against the artifact digest rather than
 the artifact's historical first-source fields. Managed
-destination repositories are independently selected by workspace and the
-realm-generation's immutable power-of-two digest-prefix shard count, and
-manifests remain content-addressed by the full digest.
+destination repositories are independently selected by the realm allocation's
+stored balanced shard index, and manifests remain content-addressed by the full
+digest.
 Rotating a failed canonical import between digest-equivalent source
 repositories therefore preserves every canonical and regional destination
 reference.
@@ -1705,7 +1837,8 @@ uses the same phases, with keys sorted lexicographically inside each phase:
 
 | Phase | Rows or locks |
 | --- | --- |
-| 1 | catalog singleton/config generation and central `config_yaml` row |
+| 0 | fixed compatibility advisory transaction lock, only for whole-config writes and schema migration |
+| 1 | central `config_yaml` row when needed, then catalog singleton/config generation |
 | 2 | distribution workspace quota, builder workspace quota, builder UTC-day usage, then realm generation/allocation |
 | 3 | profile head, immutable revision, and target custody |
 | 4 | workspace/digest advisory keys |
@@ -1748,10 +1881,11 @@ loaded config generation plus `minimum_image_writer_api_version`; bounded reads
 check the same version before decoding polymorphic state. A first-state writer
 takes `FOR UPDATE` instead, monotonically sets the appropriate distribution or
 builder witness before later phases, and cannot clear it. Config apply takes
-`FOR UPDATE` on the singleton and
-central config row in sorted key order, then updates at most the bounded number
-of distribution heads present in the submitted image section, never one row per
-workspace. A transaction may omit other
+the phase-0 advisory lock, then `FOR UPDATE` on the config row and singleton in
+that exact order, and updates at most the bounded number of distribution heads
+present in the submitted image section, never one row per workspace. No path
+that already holds the catalog singleton may acquire the config row. A
+transaction may omit other
 unused phases but never reorder the ones it uses. Concurrency tests exercise every adjacent
 overlap and the full crossed mixed-path graph. This table is the authority over
 prose in both canonical designs.
@@ -2256,8 +2390,9 @@ SkyPilot never labels this state legal byte erasure unless a provider-specific
 extension supplies an auditable blob-GC guarantee or artifact-scoped encryption
 destruction. Successful release rows remain as nonresolving tombstones so a
 name that was ever launchable can never be reused. RELEASED never-launchable
-publication generations remain in audit history but do not block the explicit
-new reservation generation. Raw source
+publication generations remain in bounded audit history and no longer hold the
+active name reservation; an explicit new generation is allowed only while both
+lifetime counters have headroom. Raw source
 references and operational details are cleared under retention policy, leaving
 only nonreversible hashes when audit policy requires provenance. The retained
 PURGED artifact row remains the canonical digest tombstone and keeps its
@@ -2275,11 +2410,14 @@ publication, source alias, durable reference, or READY build. It records
 `BUILD_OUTPUT_ABANDONED` and then invokes the same artifact-scoped purge engine,
 ownership checks, DELETE_UNKNOWN recovery, and audit path as an administrator.
 
-Default retention is explicit: terminal publication query rows are retained for
-30 days under the hard workspace/per-artifact record quotas, copy and purge
-attempt diagnostics for 90 days, and compact audit records for the platform
-audit policy. Publication compaction is keyset-bounded and releases exactly one
-record slot only after the audit write commits. The catalog exposes aggregate
+Default retention is explicit: never-READY RELEASED publication query rows are
+retained for 30 days under the hard workspace/per-artifact record quotas; READY
+rows remain referenced by their immutable releases, and FAILED/CANCELLED rows
+remain while their active name reservation exists. Copy and purge attempt
+diagnostics are retained for 90 days, and compact audit records follow the
+platform audit policy. Publication compaction is keyset-bounded and releases
+exactly one retained-record slot only after the audit write commits; it never
+releases a lifetime generation slot. The catalog exposes aggregate
 retained bytes and tombstoned age so administrators can act before workspace
 quotas are exhausted. No cleanup deletes a row with a live lease or durable
 reference.
@@ -2385,7 +2523,7 @@ verified.
 ### First managed provider: AWS ECR
 
 The AWS adapter implements one complete path before any other provider is
-called managed. `ensure_repository` describes the deterministic shard, creates
+called managed. `ensure_repository` describes the stored assigned shard, creates
 it only when absent with required realm/workspace/manager tags, and rejects a
 name collision whose tags, encryption, mutability, or scan policy do not match.
 Create permission is bounded by repository prefix and required request tags.
@@ -2471,56 +2609,87 @@ then verifies those ownership tags before mutation. This happens in the copy
 worker, never during placement admission. A dedicated-account example wires
 all enabled regions while preserving region-level opt-in.
 
-Shard sizing is a two-sided feasibility proof for every `(account, region)`.
-The immutable realm shard count is a power of two from 1 through the public v1
-ceiling of 256. This bounds repository fan-out and matches the two-hex-character
-digest prefix, but a realm need not allocate all 256. The module reads applied
-ECR repository and images-per-repository quotas through Service Quotas. It does
-not claim Terraform can enumerate every existing image. An accompanying
-read-only `sky image infrastructure inventory aws` preflight uses paginated ECR
-APIs to emit a timestamped, account/region-bound JSON file with existing
-repository and per-repository manifest counts. Terraform accepts that audited
-file plus explicit safety headroom, workspace capacity, and the lifetime maximum
-distinct artifacts per workspace. A stale,
-wrong-account, incomplete, or omitted inventory fails activation unless the
+Shard sizing is a two-sided feasibility proof for every physical registry
+target. The immutable realm shard count is any integer from 1 through the public
+v1 ceiling of 256. This bounds repository fan-out; fixed two-hex indices keep
+rendering stable without coupling allocation to digest bits. The module reads
+applied ECR repository and images-per-repository quotas through
+[Service Quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html);
+AWS currently marks both limits adjustable.
+An accompanying read-only `sky image infrastructure inventory aws` preflight
+uses paginated ECR APIs to emit a timestamped, account/region-bound JSON file
+with existing repository and per-repository manifest counts. Terraform accepts
+that audited file plus explicit safety headroom, workspace capacity, and the
+lifetime maximum distinct artifacts per workspace. A stale, wrong-account,
+incomplete, or omitted inventory fails activation unless the
 account is explicitly asserted empty through a separately audited bootstrap
-mode. Every managed v0 artifact consumes exactly one root image-manifest unit;
-shared layers do not reduce this conservative manifest count.
+mode. The inventory must prove a complete listing under the provider-neutral
+canonical repository-generation prefix, including every recognized existing
+workspace/shard repository. V0 activates a managed generation only when that
+complete prefix contains zero manifests. Existing compliant empty repositories
+may be retained, but an incomplete page, nonempty repository, unrecognized
+writer, or unparseable repository fails closed. Existing images elsewhere in
+the account remain valid immutable sources or external-profile content; they
+are never silently adopted into the managed generation.
 
-For candidate power-of-two shard count `S`, every runtime repository must
-satisfy:
+Managed repository policy grants manifest publication only to the copy worker
+and the later separately gated trusted builder publisher. Both reject OCI
+indexes in v0. The purge identity is delete-only and runtime identities are
+pull-only. Activation and periodic custody checks fail on any other publisher,
+so durable reservations cannot be bypassed by an out-of-band manifest. Every
+managed v0 artifact consumes exactly one root image-manifest unit; shared layers
+do not reduce this conservative manifest count. For each candidate count `S`,
+the hard additional capacity of every initially empty shard is:
 
 ```text
-ceil(max_retained_artifacts_per_workspace / S)
-  + existing_manifest_units
-  + image_headroom
-<= applied_images_per_repository_quota
+capacity[i] = applied_images_per_repository_quota
+              - image_headroom[i]
 ```
 
-The regional repository budget must simultaneously cover
-`workspace_capacity * S`, inventoried existing repositories, and repository
-headroom. Workspace `max_artifacts` is a lifetime distinct-digest bound and
-never falls after purge or compaction, so retained tombstones cannot hide
-catalog demand.
-Terraform selects or validates one feasible `S` at or below 256 and fails
-activation when the image lower bound and repository upper bound do not
-intersect. More shards relieve image density but consume repository quota;
+Every capacity must be nonnegative and
+`sum(capacity[0:S]) >= max_artifacts`. Terraform exports the exact capacity
+vector; PostgreSQL stores it on each workspace realm allocation and rejects an
+increment above the selected shard's capacity. The least-filled allocator and
+the hard per-shard check, not a statistical digest assumption, are the capacity
+proof.
+
+The regional repository budget must simultaneously prove:
+
+```text
+inventoried_total_repositories
+  + (workspace_capacity * S - compliant_empty_managed_repositories)
+  + repository_headroom
+<= applied_repository_quota
+```
+
+Every retained empty managed repository must be one of the planned rendered
+names, so the subtraction is nonnegative and cannot hide unrelated resources.
+Workspace `max_artifacts` is a lifetime distinct-digest bound and never falls
+after purge or compaction, so retained tombstones cannot hide catalog demand.
+Terraform selects or validates the smallest feasible `S` at or below 256 and
+fails activation when the total hard manifest capacity and repository budget do
+not intersect. More shards relieve image density but consume repository quota;
 separate realms or approved quota increases are the escape hatch.
 
 For the documented Boltz AMD64 example, one million retained single-manifest
 artifacts and an applied 100,000-images-per-repository quota require at least 10
-repositories, so the next power of two is 16 before headroom. This is an example
-calculation, not an assumed account quota. The module always uses the live
-applied values and refuses an infeasible plan.
+repositories before headroom; the smallest exact feasible count may be larger
+after the per-shard headroom vector is applied. This is an example calculation,
+not an assumed account quota. The module always uses live applied values and
+refuses an infeasible plan.
 
 The secret-free Terraform output records the exact applied quota snapshot,
-inventory digest/time, sizing inputs, selected shard count,
-`workspace_capacity`, and realm generation.
+inventory digest/time, sizing inputs, selected shard count, exact capacity
+vector, compliant empty-repository count, `workspace_capacity`, and realm
+generation.
 PostgreSQL reserves one durable realm slot before a workspace can first use a
 managed profile; capacity exhaustion fails before repository I/O with
 `REGISTRY_WORKSPACE_CAPACITY_EXHAUSTED`. Removing a workspace does not silently
-reuse its namespace slot while retained artifacts exist. Activation and every
-just-in-time repository creation recheck stored capacity against provider drift;
+reuse its namespace slot while retained artifacts exist. A first-location
+allocation fails before location or repository I/O with
+`REGISTRY_SHARD_CAPACITY_EXHAUSTED` when no stored shard has a free reservation.
+Activation and every just-in-time repository creation recheck stored capacity
+against provider drift;
 closed `REPOSITORY_QUOTA_EXHAUSTED` and
 `IMAGES_PER_REPOSITORY_QUOTA_EXHAUSTED` outcomes are retryable and point to the
 quota/headroom runbook.
@@ -2683,9 +2852,8 @@ provider-neutral.
   for DNS case, trailing DNS dots, IPv4/IPv6 spelling, and the default HTTPS
 port before identity comparison and reference rendering. Configured and
 rendered repository paths use the OCI lowercase component grammar; managed
-  artifact paths use the realm generation's quota-proved fixed
-  power-of-two shard count, and invalid paths are rejected rather than
-  rewritten.
+  artifact paths use the realm generation's quota-proved stored balanced shard
+  index, and invalid paths are rejected rather than rewritten.
 
 ## Operational surfaces
 
@@ -2863,8 +3031,11 @@ request executors and restart recovery is exercised.
 ### Productization in the current implementation round
 
 - [ ] Rewrite migration 023 as the frozen literal 17-table PostgreSQL schema,
-  including config-generation authority, realm-prefix uniqueness, projections,
-  limiters, constraints, and exact indexes.
+  including config-generation authority, the forced config compatibility guard,
+  guarded downgrade, realm-prefix uniqueness, projections, limiters,
+  constraints, and exact indexes.
+- [ ] Add the Helm/manual 022-ceiling compatibility rollout and dedicated 023
+  migration Job, with exact live-version preflight and clean-install behavior.
 - [ ] Replace best-effort image config reload with the shared central-config and
   profile-head compare-and-swap protocol, replica convergence, and crash tests.
 - [ ] Add READY-gated publication reservations and client-side wait semantics;
@@ -2881,8 +3052,8 @@ request executors and restart recovery is exercised.
   delete action.
 - [ ] Implement the complete AWS ECR capability slice and reusable AWS control
   plane, VM-pool, image-distribution, and dedicated-account Terraform example,
-  including generation-qualified shard identity and the closed per-call ECR
-  limiter map.
+  including generation-qualified balanced shard allocation and the closed
+  per-call ECR limiter map.
 - [ ] Deploy independently scalable copy and purge workers through Helm, with
   separate identities, metrics, configurable concurrency, probes, restart
   recovery, and rollback runbooks.
@@ -2894,22 +3065,24 @@ request executors and restart recovery is exercised.
 - [ ] Capture the independent million-artifact catalog plans and the AWS
   integration/negative-IAM evidence. Treat large-fleet timing as an activation
   gate when real fleet capacity is available.
-- [ ] Freeze the exact design and implementation, then complete six fresh
-  paired Codex 5.6/Fable rounds with three consecutive paired `PURSUE`
-  verdicts on the unchanged patch.
+- [ ] Pass the exhaustive paired design gate before implementation, then freeze
+  the verified implementation and pass the exhaustive paired exact-head
+  acceptance gate described below.
 
 ### Activation sequence keeps the first operational slice small
 
 The code, schema, typed API, and complete UI are reviewed and merged together,
-but every new surface defaults disabled. Deployment first applies migration 023
-with workers and managed profile creation off. The second phase enables bounded
-catalog reads and the Images UI only after schema parity and checked-in query
-plans pass. The third phase enables the typed editor only after config/head crash
-recovery and replica-generation convergence pass. The first data-plane canary is
-one managed AWS realm generation, one fixed shard plan, canonical publication,
-and one locality target. Additional regions and worker replicas may scale that
-same generation after limiter evidence. Creating a second realm generation is a
-separate canary after old-generation drain and prefix-nonoverlap tests.
+but every new surface defaults disabled. An existing deployment first rolls all
+API replicas to version 62 against the temporary 022 schema ceiling, then the
+dedicated Job applies migration 023 with workers and managed profile creation
+off. The next phase enables bounded catalog reads and the Images UI only after
+schema/guard parity and checked-in query plans pass. The following phase enables
+the typed editor only after config/head crash recovery and replica-generation
+convergence pass. The first data-plane canary is one managed AWS realm
+generation, one fixed shard plan, canonical publication, and one locality
+target. Additional regions and worker replicas may scale that same generation
+after limiter evidence. Creating a second realm generation is a separate canary
+after old-generation drain and prefix-nonoverlap tests.
 
 This staging does not omit the requested UI or large-catalog implementation
 from the release artifact. It prevents an unproven dashboard projection,
@@ -2957,9 +3130,10 @@ Unit tests must cover:
   invariants; a never-READY name can be released only under every stated
   precondition, restores quota once, and rejects stale finalizers, while a name
   that was ever READY remains immutable; workspace and per-artifact publication
-  record caps cannot be bypassed by repeated RELEASED generations, and
+  lifetime-generation caps cannot be bypassed or released by repeated RELEASED
+  generations, retained-record caps remain independent, and
   keyset-bounded post-retention compaction writes audit before releasing exactly
-  one record slot;
+  one retained-record slot and zero lifetime slots;
   publishing another release for an already READY canonical route finalizes
   immediately through the same locked validator;
   artifact-ID publication creates no source row, requires one authorized ACTIVE
@@ -2971,8 +3145,15 @@ Unit tests must cover:
   listed above with every named check/index/foreign key, absence of obsolete
   legacy tables/columns, the API-62 minimum-writer fence, both monotonic
   state-ever-created witnesses and TRUE-to-FALSE trigger, atomic first
-  distribution-state marking, pre-state-only below-62 rollback, and no
-  live-metadata imports. The separately gated builder
+  distribution-state marking, and no live-metadata imports. A version-61-style
+  connection without the custom setting cannot read or write the mandatory
+  config row and its server bootstrap fails; sync/async version-62 connections
+  survive pool recycle; a superuser or `BYPASSRLS` application role is rejected;
+  the staged 022 rollout keeps image routes closed; and the dedicated Job
+  refuses migration while a below-62 live replica remains. A locked clean
+  downgrade restores 022, while either witness, any owned row, image config,
+  or an old/new writer race makes downgrade fail in PostgreSQL with the RLS
+  guard and revision intact. The separately gated builder
   release owns its later 022-to-023-to-024 parity and pre-024 compatibility
   probe;
 - the named 023 external-OCI-only producer and SOURCE-only origin constraints.
@@ -3117,14 +3298,19 @@ Unit tests must cover:
 - canonical and regional READY references surviving an A-to-B canonical source
   rotation across different source repositories, with the existing regional
   route remaining selectable and successfully revalidated;
-- two different digests sharing one immutable shard repository while configured
-  digest-prefix bits select from the immutable power-of-two set of no more than
-  256 workspace repositories; literal namespace-root parsing and the universal
-  managed/external `<root>/<workspace>/g<generation>/shard-<prefix>` segment
-  layout are injective for adversarial root-depth/workspace combinations and
-  reject arbitrary or shorter external templates; a root/generation reservation
-  prevents different shard counts from overlapping on shard zero; activation
-  rejects overlap with active heads and retained ACTIVE/DRAINING/RETIRED custody,
+- two different digests sharing one immutable shard repository while a locked
+  allocation chooses and stores the least-filled capacity-eligible two-hex shard
+  index independent of digest bits; concurrent first-location creation reserves
+  exactly once, adversarial same-prefix digests remain balanced, a full shard is
+  skipped, and aggregate exhaustion fails before location or repository I/O;
+  literal namespace-root parsing and the universal managed/external
+  `<root>/g<generation>/<workspace>/shard-<index>` layout are injective for
+  adversarial root-depth/workspace combinations and reject arbitrary or shorter
+  external templates; a provider-neutral `(registry host:port, complete
+  repository-generation prefix)` reservation makes explicit/derived registries,
+  provider aliases, and endpoint/root decompositions collide physically;
+  different shard counts cannot overlap on shard zero; activation rejects
+  overlap with active heads and retained ACTIVE/DRAINING/RETIRED custody,
   including through one shared capacity realm, concurrent reservation inserts,
   and historical purger authority; and
   copy I/O writing through a deterministic immutable tag before digest-only
@@ -3344,7 +3530,8 @@ Dashboard and catalog coverage additionally proves:
 - catalog pages return bounded location/publication aggregates while current and
   historical detail locations plus retained publication history use their exact
   indexes and duplicate-free keyset pagination; detail never embeds unbounded
-  publication generations, and record-limit/compaction states render explicitly;
+  publication generations, lifetime versus retained-record limits render
+  separately, and compaction visibly restores only the retained-record count;
 - profile summaries omit manager identities, credential references, and raw
   configuration while preserving useful topology;
 - stale workspace responses cannot overwrite a newer selection;
@@ -3358,16 +3545,19 @@ Dashboard and catalog coverage additionally proves:
 
 Terraform validation additionally runs `terraform fmt -check`, `terraform
 validate`, static least-privilege assertions, and plans for single-region,
-multi-region, and existing-ECR configurations. Plans must prove no image-content
-fan-out, no account-wide administrative grants, no repository deletion
+multi-region, and existing-ECR-account configurations with an empty dedicated
+managed prefix. Plans must prove no image-content fan-out, no account-wide
+administrative grants, no repository deletion
 permission, no API/copy-worker canonical delete permission, a separately
 assumable opt-in purge role with only the closed inspection and
 `BatchDeleteImage` surface, and no placement-time resource dependency. Boundary
 plans cover each account/region's
 applied repository and image quotas, existing repositories and manifests,
 safety headroom, the lifetime single-manifest artifact bound, the feasible shard
-interval at or below 256, audited inventory input, durable workspace slot,
-capacity exhaustion, generation-qualified prefix rendering and collision
+interval at or below 256, exact capacity vectors, audited complete inventory,
+managed-prefix nonemptiness rejection, durable workspace slot, balanced
+transactional shard reservations under adversarial digests, capacity
+exhaustion, provider-neutral canonical prefix rendering and collision
 rejection, realm-generation prefix expansion, and provider-quota drift error
 mapping. Tests also prove v1 rejects native
 replication configuration instead of creating untracked regional content.
@@ -3411,31 +3601,26 @@ the managed profile remains disabled and no performance claim is made.
 This design and implementation are being challenged independently by Codex
 5.6 and Claude Fable. A review round is valid only when the reviewer inspects
 the current plan, code, diff, and tests and returns one of `PURSUE`, `RESHAPE`,
-or `DROP` with evidence. Material implementation or architecture changes reset
-both consecutive-PURSUE streaks. Completion requires at least six paired
-rounds and three consecutive PURSUE verdicts from each reviewer against the
-same materially unchanged patch.
+or `DROP` with evidence. Repeating an unchanged review to accumulate a streak is
+not evidence.
 
-Before those acceptance rounds, one discovery sweep audits the whole patch by
-invariant rather than stopping at the first blocker. Every discovery reviewer
-must enumerate all reproducible findings across its assigned matrix, including
-nearby instances of the same defect class. The combined findings are
-deduplicated and fixed as one batch, with table-driven or cross-boundary tests
-where an invariant is shared. Only after that batch passes the complete focused
-suite is the implementation hash frozen and the six paired acceptance rounds
-started. A rejected acceptance snapshot is handled the same way: all active
-reviews are allowed to finish their exhaustive inventories, their findings are
-batched, and a new frozen snapshot starts a fresh six-pair gate. A first finding
-is never used as a reason to stop inspecting the rest of the rejected snapshot.
+There are exactly two gates. Before productization code begins, both reviewers
+challenge the same exact design commit and linked builder design for product
+worth, Modal comparison, component boundaries, API compatibility,
+million-artifact behavior, multi-cloud portability, security, operability, and
+rollout. After implementation and the complete focused suite, both reviewers
+inspect the same frozen implementation head, including the plan, full diff,
+tests, dashboard build, Terraform evidence, and remaining operational gates.
+Each gate passes only when both independent reviewers return `PURSUE` on that
+exact snapshot. An unavailable reviewer is reported as an external blocker and
+is not silently replaced by another model.
 
-Before productization code begins, both reviewers also challenge this exact
-canonical design and the linked builder design for product worth, Modal
-comparison, component boundaries,
-API compatibility, million-artifact behavior, multi-cloud portability,
-security, operability, and rollout. Those design rounds are discovery rounds
-and do not count toward the six fresh exact-head acceptance pairs. Any accepted
-design correction is made here before implementation. The final acceptance
-brief includes the exact Git tree hash, canonical design path, complete diff,
-test evidence, dashboard build evidence, and remaining explicitly operational
-gates; reviewers may not assume unimplemented infrastructure is production
-ready.
+Every reviewer must audit the whole snapshot by invariant, enumerate all
+reproducible findings and nearby instances of each defect class, and continue
+after finding the first blocker. A `RESHAPE` or `DROP` lets all active reviews
+finish; findings are deduplicated, resolved as one coherent batch, and covered
+by table-driven or cross-boundary tests where an invariant is shared. A
+materially changed snapshot receives one new paired review. Pure evidence or
+comment updates do not manufacture another round. The final acceptance brief
+records the exact Git tree hash and may not treat unimplemented infrastructure
+as production ready.
