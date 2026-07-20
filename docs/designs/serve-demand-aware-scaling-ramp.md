@@ -168,8 +168,9 @@ An HA load-balancer promotion temporarily preserves the previous active slot's
 demand gauges so a cold promoted process cannot prove idle capacity and trigger
 an early drain. The 60-second handoff countdown starts after the promoted,
 authoritative slot reports the complete demand-gauge contract: in-flight work,
-queue depth, retained and recent rejections, and explicit unknown-occupancy
-URLs. It does not wait for every backend occupancy probe to succeed.
+aggregate queue depth, the compatibility-aware queue profile list, retained and
+recent rejections, and explicit unknown-occupancy URLs. It does not wait for
+every backend occupancy probe to succeed.
 
 Backends missing a fresh occupancy sample remain represented in the current
 report's unknown set and stay individually protected from retirement. Coupling
