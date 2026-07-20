@@ -5343,9 +5343,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         parallel_args = [
             [runner, *item]
             # Both lists are derived from the same `dirs` list.
-            for item in zip(
-                local_log_dirs,  # noqa: B905
-                remote_log_dirs)
+            for item in zip(local_log_dirs, remote_log_dirs)  # noqa: B905
             for runner in runners
         ]
         subprocess_utils.run_in_parallel(_rsync_down, parallel_args)
