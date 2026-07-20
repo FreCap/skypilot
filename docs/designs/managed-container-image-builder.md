@@ -2,6 +2,8 @@
 
 _Created: 2026-07-19_
 
+_Cross-system contract correction: 2026-07-20_
+
 _Status: target design reshaped; non-public prototype and worth gate precede
 durable product implementation_
 
@@ -313,18 +315,28 @@ missing an image, direct, incompatible, or resolves to a different static build
 declaration.
 
 After scanning, `POST /images/builds/resolve` verifies that token, resolves the
-catalog base, computes the final spec hash from the static declaration plus base
-digest/platform and logical root digest, and durably stores the static-policy
-hash, compiled-task hash, root digest, and final spec hash on the build. A cache
-hit must match all four fields. The final submission supplies that build ID and
-replaces only its build declaration with the exact READY output artifact ID.
-The server verifies the substitution against the durable content binding and
-the same signed compiled task instead of applying a second possibly divergent
-mutation. An expired token can be refreshed only when policy produces the
-identical compiled task and static declaration hash; the durable build binding
-then remains valid. Otherwise preflight and resolve restart. Raw REST task
-submission with an unresolved build, missing static token, or mismatched durable
-content binding fails before request persistence.
+catalog base, and computes the final spec hash from the static declaration plus
+base digest/platform and logical root digest. The build row remains purely
+content-addressed by workspace and spec hash; it never stores a compiled-task or
+static-policy identity. Resolve instead returns a signed, per-submission
+`build_binding` receipt containing user, workspace, compiled-task hash,
+static-policy hash, build ID, spec hash, root digest, and expiry. Two different
+tasks or a direct command can therefore share one build without competing for
+its unique row.
+
+The final submission supplies the compiled task and receipt and replaces only
+its build declaration with the exact READY output artifact ID. The server
+verifies the receipt, recompiles the value-only task under current policy, and
+requires the same compiled-task/static-policy hashes plus the receipt's durable
+build/spec/root binding and that build's current READY output instead of
+applying a second divergent mutation.
+Resolve is naturally response-loss safe: repeating the same authorized content
+lookup returns the same build and a fresh equivalent receipt without mutating
+the build row. An expired receipt can be refreshed only when policy reproduces
+the identical compiled task and static declaration and the content-addressed
+build binding is unchanged. Otherwise preflight and resolve restart. Raw REST
+task submission with an unresolved build, missing receipt, or mismatched content
+binding fails before request persistence.
 
 The SDK/CLI preflight owns that sequencing: after policy preflight it resolves
 the catalog base, performs cache resolution, uploads only on a miss, submits the build,
@@ -476,14 +488,18 @@ the exact content length, `If-None-Match: *`, and the strongest checksum passed
 by the store probe: SHA-256 when supported, otherwise `Content-MD5`. MD5 is
 never an identity or cache key. If that response or URL is lost, the
 authenticated uploader may request a replacement capability for the same upload
-intent. The transaction verifies workspace/uploader ownership,
-`MANIFEST_CREATED`, expiry, object absence, and the immutable
-key/length/SHA-256/MD5 claims, increments a bounded issuance counter, and signs a
-new expiry. A UUID idempotency key and request hash are retained; repeating the
-same pair re-signs equivalent authority without consuming another issuance,
-while key reuse with different claims fails. It cannot change bytes, create a second key, or revive a terminal
-upload. Existing URLs may overlap only for their short remaining lifetime and
-all authorize the same create-only object.
+intent. A short transaction verifies workspace/uploader ownership,
+`MANIFEST_CREATED`, expiry, the immutable key/length/SHA-256/MD5 claims, and a
+UUID idempotency key/request hash, then claims a fenced capability generation
+and persists its deterministic issued-at/expiry before committing. The broker
+HEADs the exact key outside PostgreSQL. A matching existing object advances to
+ordinary validation recovery; absence allows it to reproduce the claimed
+generation's create-only URL. A final token-matching transaction records the
+observation without performing object-store I/O. Repeating the same key re-signs
+equivalent authority without consuming another issuance, while key reuse with
+different claims fails. It cannot change bytes, create a second key, or revive
+a terminal upload. Existing URLs may overlap only for their persisted short
+remaining lifetime and all authorize the same create-only object.
 After upload, an isolated platform-owned context-validator Job on the dedicated
 sandbox builder pool streams the
 pinned manifest object, verifies RFC 8785 bytes, schema, path and entry limits,
@@ -598,24 +614,30 @@ conditional-create ETag identity, so response loss cannot authorize different
 bytes.
 
 The bundle commit transaction accepts a separate bounded UUID idempotency key
-and typed completed-part ETags/checksums, lists the persisted upload's parts, proves their
-aggregate size equals the already reserved authorized length, stores a hash of
-the complete commit request, changes `UPLOADING` to `COMMITTING`, and acquires a
-fenced commit owner, random token, and expiry. Repeating the same key and
-request is idempotent; reusing the key or session with different bytes or parts
-is rejected. A direct API call returns the durable resource and never holds a
+and typed completed-part ETags/checksums, stores a hash of the complete commit
+request, closes further part-capability issuance, persists the maximum expiry of
+every outstanding part capability, changes `UPLOADING` to `COMMITTING`, and
+acquires a fenced commit owner, random token, and expiry. It performs no
+ListParts, HEAD, or Complete call. Repeating the same key and request is
+idempotent; reusing the key or session with different bytes or parts is
+rejected. A direct API call returns the durable resource and never holds a
 request worker across object-store completion.
 
-The commit reconciler first HEADs the unique random bundle key. If the completed
-object is absent, it invokes `CompleteMultipartUpload` using only the persisted
-part set. It then HEADs the exact key, captures the stable provider
+After every persisted part-capability expiry plus bounded clock-skew grace has
+passed, the commit reconciler lists parts outside PostgreSQL under its fenced
+lease, proves the observed set and aggregate size equal the persisted commit
+request, and first HEADs the unique random bundle key. If the completed object
+is absent, it invokes `CompleteMultipartUpload` using only that proved part set.
+It then HEADs the exact key, captures the stable provider
 version/generation returned for that object, and validates length and any
 provider-supplied checksum before a matching-token transaction records bucket,
 key, version/generation, size, and claimed digests as `COMMITTED`. On a crash or
 lost provider response, a reclaimed lease repeats HEAD before Complete. The
 unique random key, post-completion overwrite denial, and stable
 version/generation make an exact
-already-completed object the idempotent success result. A missing upload plus
+already-completed object the idempotent success result. Completing the upload
+invalidates its upload ID, and the expiry fence prevents an authorized late part
+from racing the final ListParts snapshot. A missing upload plus
 absent object, wrong length, wrong provider checksum, or conflicting version
 becomes `REJECTED`; an inconclusive provider result remains `COMMITTING` for
 fenced retry.
@@ -790,15 +812,18 @@ One `container_image_context_uploads` row contains only:
 id, build_id, workspace, uploader_id, state,
 tree_version, root_manifest_digest, entry_count,
 manifest_claimed_digest/length, manifest_bucket/key/version NULL,
-manifest_capability_generation/issue_count/last_issued_at,
+manifest_capability_generation/issue_count/last_issued_at/expires_at,
 manifest_capability_idempotency_key/request_hash NULL,
+manifest_capability_claim_owner/token/expires_at NULL,
+manifest_absence_observed_at NULL,
 bundle_format NULL, bundle_claimed_digest/length NULL,
 bundle_bucket/key/version NULL, multipart_upload_id NULL,
 part_size/count NULL, reserved_manifest_bytes, reserved_bundle_bytes,
+part_capability_generation, part_issuance_closed_at/max_expires_at NULL,
 manifest_validation_owner/token/expires_at NULL,
 validator_job_name/network_policy_name NULL,
 validator_job_manifest_hash/network_policy_hash/resource_bundle_hash NULL,
-validator_observed_job_uid/network_policy_uid NULL,
+validator_observed_job_uid/network_policy_uid/pod_name/pod_uid NULL,
 validator_broker_capability_epoch NULL,
 commit_idempotency_key/request_hash NULL,
 commit_owner/token/expires_at NULL,
@@ -845,8 +870,7 @@ full mixed sequences before migration 024 can be approved.
 
 ```text
 id, workspace, spec_hash, spec_version, builder_version, platform,
-static_policy_hash, compiled_task_hash, root_manifest_digest,
-resolve_idempotency_key, resolve_request_hash,
+root_manifest_digest,
 base_image_id, base_digest, base_location_id NULL,
 base_reference_id NULL, base_profile_revision NULL,
 base_target_fingerprint NULL, base_policy_fingerprint NULL,
@@ -860,11 +884,10 @@ UNIQUE (workspace, spec_hash)
 UNIQUE (context_upload_id) WHERE context_upload_id IS NOT NULL
 ```
 
-Embedded builds require non-null `static_policy_hash` and
-`compiled_task_hash`; direct image-build commands mark their closed origin and
-leave only `compiled_task_hash` null. Every build requires the logical root
-digest and final spec hash before cache lookup or row creation. Named checks
-enforce those origin shapes.
+Every build requires the logical root digest and final spec hash before cache
+lookup or row creation. Submission-specific policy and compiled-task identity
+exist only in signed `build_binding` receipts, so neither embedded nor direct
+use changes content identity or the unique build row.
 
 Only `context_upload_id` is set while a build is `CONTEXT_REQUIRED`; the
 bundle commit transaction atomically replaces it with `context_manifest_id`
@@ -900,7 +923,7 @@ state PROVISIONING|RUNNING|JOB_SUCCEEDED|VERIFYING|PUBLISHING|SETTLING|TERMINAL,
 job_name, network_policy_name, desired_job_manifest_hash,
 desired_network_policy_hash,
 desired_resource_bundle_hash, observed_network_policy_uid NULL,
-observed_job_uid NULL,
+observed_job_uid NULL, observed_pod_name NULL, observed_pod_uid NULL,
 create_owner/token/expires_at NULL, execution_owner/token/expires_at NULL,
 cancel_requested_at NULL, staging_reference, broker_capability_epoch,
 reserved_active_execution, reserved_staging_bytes, reserved_cache_bytes,
@@ -923,11 +946,22 @@ automatically refreshed service-account token for audience
 per-attempt Secret or ConfigMap exists, and no presigned URL or registry token is
 embedded in a reconstructible Job manifest.
 
+The qualified Job is single-Pod and non-replacing: `parallelism: 1`,
+`completions: 1`, `restartPolicy: Never`, `backoffLimit: 0`, and
+`podReplacementPolicy: Failed` are mandatory capability-probe results. After
+adopting the Job UID, the controller lists only Pods owned by that exact UID and
+atomically records one Pod name/UID under the execution lease before the broker
+can mint anything. Zero Pods remains PROVISIONING. More than one Pod, a changed
+Pod UID, or an implementation that can replace the Pod closes and settles the
+attempt; node loss creates a new attempt identity rather than another Pod for
+the old attempt.
+
 A creator claims a short lease, reconstructs both manifests, rechecks
 cancellation, and creates or adopts the attempt NetworkPolicy before the Job.
 The policy selects only the unique attempt labels and permits only deployment-
 qualified broker, internal-registry, and context/log egress gateways. Success or
-`AlreadyExists` is followed by GET for each object. The controller adopts an
+`AlreadyExists` is followed by GET for each object and then the single-Pod
+adoption above. The controller adopts an
 object only when SkyPilot ownership labels, attempt key, resource-bundle hash,
 its individual manifest hash, and immutable spec match, and records both
 observed UIDs under the same token. A foreign or mismatched same-name object is
@@ -935,7 +969,8 @@ never adopted or deleted and closes the attempt with
 `NETWORK_POLICY_NAME_COLLISION` or `JOB_NAME_COLLISION`.
 
 The trusted capability broker validates the projected token with TokenReview,
-the bound Pod UID, Job ownership, recorded attempt/generation, resource-bundle hash,
+requires its bound Pod UID to equal the durably recorded Pod UID, rechecks exact
+Job ownership, recorded attempt/generation, resource-bundle hash,
 active state, and capability epoch on every mint. It can then reissue short-lived
 context-read URLs, one attempt-scoped internal-registry token, bounded log
 segment PUT capabilities, and a typed result PUT capability. The broker owns no
@@ -957,9 +992,9 @@ object with the same name is never touched. After the Job is terminal or proven
 absent, cleanup deletes only the matching NetworkPolicy UID and hash. Lost
 delete responses are reconciled by GET. Foreign or replaced policies are left
 untouched and surfaced for an administrator. Job deletion, eviction, deadline,
-or node loss is observed by UID and
-becomes a bounded retry or terminal failure. A stale controller can neither
-record a new UID nor settle quotas.
+node loss, or any replacement-Pod observation is fenced by the recorded Job and
+Pod UIDs and becomes a bounded retry or terminal failure. A stale controller
+can neither record a new UID nor settle quotas.
 
 Completion records the exact internal-registry digest before moving to
 VERIFYING. Active-execution and worst-case byte reservations are released or
@@ -968,8 +1003,9 @@ staging/cache outcomes have reached a fenced retained-or-absent state. The
 attempt row is retained for audit. A sweeper reconciles every nonterminal DB
 intent plus labeled orphan, but may adopt or delete only an exact recorded
 resource bundle. Context-validator Jobs use the same default deny, projected
-identity, broker, deterministic NetworkPolicy/Job name/hash/UID protocol with
-fields on the upload row, but receive only manifest GET/result PUT and never
+identity, broker, deterministic NetworkPolicy/Job name/hash/UID and single-Pod
+adoption protocol with fields on the upload row, but receive only manifest
+GET/result PUT and never
 reserve paid build execution. Fault tests cover every database, policy Create,
 Job Create, GET/UID, broker refresh, cancellation, node-loss, cleanup, and
 settlement crash boundary.
@@ -1284,7 +1320,10 @@ before the next sequence becomes issuable.
 
 Normal close writes one canonical-JSON FINAL marker containing attempt key,
 contiguous segment count, total bytes, SHA-256 of the concatenated byte stream,
-`truncated`, and a closed reason `PROCESS_EXIT|BYTE_LIMIT|CANCELLED`. FINAL is a
+`truncated`, and a closed reason
+`PROCESS_EXIT|BYTE_LIMIT|CANCELLED|LOGGER_LOST`. `LOGGER_LOST` is accepted only
+from the fenced trusted reconciler after the grace period; the ordinary agent
+cannot request it. FINAL is a
 separate create-only key. The controller validates its counts and digest and
 inserts `container_image_build_log_segments` rows containing attempt, sequence,
 `DATA|FINAL` kind, pinned object identity, digest, size, and close metadata. A
@@ -1298,8 +1337,11 @@ streams at most 16 MiB to recompute the exact digest, and conditionally creates
 FINAL with `truncated=true` and `close_reason=LOGGER_LOST`. If a normal FINAL won
 the create race, it validates and adopts that marker instead. A conflicting
 marker closes with `LOG_FINAL_MISMATCH` and never exposes noncontiguous bytes.
-The reconciler is generation/attempt fenced, so a dead or cancelled logger
-always converges to one terminal stream and a stale logger cannot reopen it.
+The reconciler is generation/attempt fenced, removes or quarantines late
+segments before finalization, and races normal FINAL through conditional create,
+so a dead or cancelled logger always converges to one terminal stream and a
+stale logger cannot reopen it. The persisted and response enums contain the same
+four close reasons.
 
 The read cursor opaquely binds build/attempt, segment sequence, pinned
 generation, and byte offset. Responses cap at 64 KiB and each attempt at 16 MiB,
@@ -1430,9 +1472,13 @@ rejection, manifest reservation before its capability and separate bundle
 reservation before multipart creation, distinct manifest
 and bundle idempotency-request conflicts, lost initial manifest-capability
 response plus owner-only identical reissue, reissue-count/expiry/rate limits,
-cross-uploader denial, create-only races between overlapping same-byte URLs,
+cross-uploader denial, fenced database claim followed by out-of-transaction HEAD,
+create-only races between overlapping same-byte URLs,
 every manifest-validation and
 `UPLOADING -> COMMITTING -> COMMITTED` crash point, Complete response loss,
+commit-time closure of part issuance, persisted maximum capability expiry,
+late-part attempts around the ListParts/Complete fence, and proof that no
+object-store operation runs while PostgreSQL locks are held,
 exact-version or conditional-create ETag HEAD recovery, rejected and ambiguous
 object charging, and quota
 release only after confirmed deletion. They also cover cross-workspace and
@@ -1445,6 +1491,9 @@ Context-identity tests prove two resolve calls with transport-independent
 logical trees produce the same spec hash and cache hit, while any path, type,
 mode, content, symlink, or tree-version change does not. On a miss, v1 accepts
 only the byte-exact strict-USTAR format and rejects a noncanonical bundle.
+Different embedded compiled tasks and direct commands with the same normalized
+build spec converge on that one build row and receive independent signed
+submission bindings; one caller's policy identity never becomes build identity.
 Cache-hit tests run before upload creation and prove no manifest URL, validator,
 byte reservation, multipart ID, bundle construction, paid attempt, or Job
 exists. Cache-miss tests prove the unique `CONTEXT_REQUIRED` binding, separate
@@ -1491,9 +1540,10 @@ artifact and location lifecycle state.
 
 Interface and operations tests cover task client preflight, server rejection
 and static policy-token binding before request persistence, exclusion of the
-not-yet-known root digest from preflight, durable resolve-time content binding,
-final exact build-to-artifact substitution, policy mutation/expiry and
-identical-static-contract refresh,
+not-yet-known root digest from preflight, content-addressed resolve plus
+per-submission `build_binding` receipts, lost resolve response, receipt refresh,
+cross-task/direct same-spec sharing, final exact build-to-artifact substitution,
+and policy mutation/expiry with identical-static-contract refresh,
 mixed AMD64/ARM64/unknown/direct candidate rejection before local scan, no
 embedded workload no-wait mode, direct typed
 `image_build(wait=False)`, top-level setup preservation, service/job
@@ -1501,10 +1551,13 @@ snapshotting, direct typed mutation responses, RBAC route coverage, bounded
 reads plus immutable segmented logs, dashboard prepared-context flow and every
 disabled/quota/capability state, Helm security context, permanent default deny,
 no-RBAC projected broker identity, deterministic NetworkPolicy and Job
-Create/AlreadyExists/UID/cancellation/node-loss/cleanup recovery, broker token
-refresh and capability-epoch revocation, foreign ancillary-object collision,
-normal short-final log segments, byte-limit FINAL, logger-loss synthetic FINAL,
-gap/orphan handling, final-digest mismatch, per-call ECR limiter
+Create/AlreadyExists/UID/cancellation/node-loss/cleanup recovery, mandatory
+single-Pod Job settings, durable Pod UID adoption, zero/multiple/replacement-Pod
+handling, broker rejection before adoption and after node loss, token refresh
+and capability-epoch revocation, foreign ancillary-object collision, normal
+short-final log segments, byte-limit FINAL, reconciler-only `LOGGER_LOST`, its
+conditional-create race with normal FINAL, late-segment cleanup, response-enum
+parity, gap/orphan handling, final-digest mismatch, per-call ECR limiter
 contention in the trusted publisher, internal OCI staging/cache token
 scope/ownership/quota/GC, and live S3 plus R2 context-store capability and drift
 tests.
