@@ -199,8 +199,9 @@ handoff floor, preserving mixed-version safety.
 
 ### Scale-down wave
 
-After raw demand remains lower for `downscale_delay_seconds`, ordinary
-demand-driven logical downscale may reduce the adopted target by at most:
+After raw demand remains lower for `downscale_delay_seconds` of elapsed wall
+clock time, ordinary demand-driven logical downscale may reduce the adopted
+target by at most:
 
 ```text
 allowance = max(
@@ -212,12 +213,23 @@ next_target = max(raw_target,
                   current_committed_capacity - allowance)
 ```
 
-After adopting this lower target, the downscale counter resets. Another lower
-wave requires a new complete delay window. Busy-replica and stale-signal safety
-continue to clip actual victims. Controller reconstruction may restore the
-committed fleet as the target baseline only for the first fresh recompute. An
-adopted lower target must not rebound to committed capacity on later ticks while
-asynchronous retirement is still catching up.
+The elapsed window starts when a fresh recompute first observes raw demand
+below the adopted target. For compatibility with the established one-tick
+default, that first observation receives at most one nominal decision interval
+of evidence; all remaining progress uses monotonic elapsed time. A demand
+rebound to or above the adopted target, a stale demand report, a version
+update, or an accepted lower wave resets the window. Controller reconstruction
+also starts with no prior timer evidence. Another lower wave requires a new
+complete elapsed window.
+
+Decision-loop counts are diagnostic only. They cannot implement this delay:
+large-fleet probing can make a nominal 20-second decision tick take much
+longer, which turned a configured 300-second delay into roughly 9.5 minutes in
+production. Busy-replica and stale-signal safety continue to clip actual
+victims. Controller reconstruction may restore the committed fleet as the
+target baseline only for the first fresh recompute. An adopted lower target
+must not rebound to committed capacity on later ticks while asynchronous
+retirement is still catching up.
 
 Failed/stopping cleanup, explicit shutdown, cost rebalance, and old-version
 retirement remain exempt. These are lifecycle actions rather than ordinary
@@ -276,11 +288,13 @@ occupancy as fail-closed active work.
 Apply the scale-up wave to fresh and stale target increases. Persist its
 timestamp through in-process service updates. Reset a newly committed
 version's adopted target to its minimum so an inherited old-version target
-cannot bypass the first wave. Apply the 50 percent downscale wave after
-hysteresis and reset the counter after each permitted reduction. During a
-logical rolling update, preserve coverage using observed latest-version
-logical capacity plus a conservative one-slot floor per READY old backend, and
-retire eligible old physical backends in batches of at most 20 per tick.
+cannot bypass the first wave. Gate the 50 percent downscale wave on elapsed
+wall-clock hysteresis and reset its timer after each permitted reduction,
+without changing legacy count-based hysteresis for other autoscaler modes.
+During a logical rolling update, preserve coverage using observed
+latest-version logical capacity plus a conservative one-slot floor per READY
+old backend, and retire eligible old physical backends in batches of at most 20
+per tick.
 Start the HA demand-handoff expiry from the first complete authoritative demand
 gauge report even when some backend occupancy samples remain unknown.
 
@@ -336,6 +350,14 @@ minutes between old-version batches would prolong duplicate fleets. The
 per-tick 20-backend batch is an actuation bound, while busy-backend and fresh
 demand coverage checks provide the safety gate.
 
+### Keep using nominal decision-loop counts for downscale
+
+Rejected. The controller's decision interval is a scheduling target, not a
+duration guarantee. Fleet probing and reconciliation can stretch a tick, so a
+15-tick threshold does not reliably represent 300 seconds. Changing only the
+logical concurrency downscale gate avoids broad hysteresis changes for legacy
+request-rate and physical-backend policies.
+
 ## Rollout and rollback
 
 The user approved direct production deployment without a test-fleet gate.
@@ -373,9 +395,10 @@ rate to 100, then restore the previous control-plane image if required.
   jumps directly to the raw target.
 - Verify a demand rebound does not cause scale-down and stale reports cannot
   shrink capacity.
-- Verify 50 percent downscale requires a fresh complete five-minute window per
-  wave, does not rebound while retirement lags, and works for mixed 1, 4, and
-  8-slot backends.
+- Verify 50 percent downscale requires 300 elapsed seconds per wave even when
+  decision ticks are irregular or slow, resets on a demand rebound or stale
+  report, does not rebound while retirement lags, and works for mixed 1, 4,
+  and 8-slot backends.
 - Verify logical rolling retirement starts before latest capacity reaches the
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old
