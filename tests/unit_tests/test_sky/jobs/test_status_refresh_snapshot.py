@@ -31,7 +31,7 @@ class TestGetJobsToCheckStatusInfo:
                     schedule_state=state.ManagedJobScheduleState.DONE.value))
             session.commit()
 
-        info = state.get_jobs_to_check_status_info(pipeline_id)
+        info = state.get_jobs_to_check_status_info([pipeline_id])
 
         assert list(info) == [pipeline_id]
         tasks = info[pipeline_id]['tasks']
@@ -40,6 +40,32 @@ class TestGetJobsToCheckStatusInfo:
             state.ManagedJobStatus.SUCCEEDED,
             state.ManagedJobStatus.RUNNING,
         ]
+
+    def test_batched_job_ids_filter_matches_full_snapshot(
+            self, _seed_test_jobs):
+        full = state.get_jobs_to_check_status_info()
+        job_ids = list(full)
+        assert len(job_ids) >= 2
+
+        batched = state.get_jobs_to_check_status_info(job_ids)
+        assert batched == full
+
+        subset = state.get_jobs_to_check_status_info(job_ids[:1])
+        assert list(subset) == job_ids[:1]
+
+        assert not state.get_jobs_to_check_status_info([])
+
+    def test_batched_job_ids_chunking_merges_all_chunks(self, _seed_test_jobs,
+                                                        monkeypatch):
+        full = state.get_jobs_to_check_status_info()
+        job_ids = list(full)
+        assert len(job_ids) >= 2
+
+        # Force multiple IN (...) chunks and verify the merged result is
+        # identical to the single-query snapshot.
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        batched = state.get_jobs_to_check_status_info(job_ids)
+        assert batched == full
 
     def test_refresh_snapshot_issues_single_select(self,
                                                    _mock_managed_jobs_db_conn,

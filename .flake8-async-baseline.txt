@@ -12,8 +12,8 @@ sky/jobs/controller.py:1759:13: ASYNC120 checkpoint inside except on line 1757 w
 sky/jobs/controller.py:1760:13: ASYNC120 checkpoint inside except on line 1757 will discard the active exception if cancelled.
 sky/jobs/controller.py:1819:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/jobs/scheduler.py:441:9: ASYNC120 checkpoint inside except on line 440 will discard the active exception if cancelled.
-sky/jobs/state.py:4318:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/state.py:4320:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
+sky/jobs/state.py:4330:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/state.py:4332:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/server/metrics.py:164:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/metrics.py:166:13: ASYNC104 Cancelled (and therefore BaseException) must be re-raised.
 sky/server/requests/executor.py:1051:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.

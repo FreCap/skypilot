@@ -848,18 +848,18 @@ def get_nonterminal_job_ids_by_name(name: str | None,
         return job_ids
 
 
-def get_jobs_to_check_status(job_id: int | None = None) -> list[int]:
+def get_jobs_to_check_status(job_ids: list[int] | None = None) -> list[int]:
     """Get jobs that need controller process checking.
 
     Args:
-        job_id: Optional job ID to check. If None, checks all jobs.
+        job_ids: Optional job IDs to check. If None, checks all jobs.
 
     Returns a list of job_ids, including the following:
     - Jobs that have a schedule_state that is not DONE
     - Jobs have schedule_state DONE but are in a non-terminal status
     - Legacy jobs (that is, no schedule state) that are in non-terminal status
     """
-    where_condition = _get_jobs_to_check_status_condition(job_id)
+    where_condition = _get_jobs_to_check_status_condition(job_ids)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = sqlalchemy.select(
@@ -1091,7 +1091,7 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
 _STATUS_CHECK_JOB_ID_CHUNK = 500
 
 
-def _get_jobs_to_check_status_condition(job_id: int | None = None):
+def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     """Build the filter for jobs that need controller-process checking."""
     terminal_status_values = [
         status.value for status in ManagedJobStatus.terminal_statuses()
@@ -1113,9 +1113,9 @@ def _get_jobs_to_check_status_condition(job_id: int | None = None):
         ~spot_table.c.status.in_(terminal_status_values),
     )
     where_condition = sqlalchemy.or_(condition1, condition2)
-    if job_id is not None:
+    if job_ids is not None:
         where_condition = sqlalchemy.and_(where_condition,
-                                          spot_table.c.spot_job_id == job_id)
+                                          spot_table.c.spot_job_id.in_(job_ids))
     return where_condition
 
 
@@ -1151,7 +1151,7 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
 
 
 def get_jobs_to_check_status_info(
-        job_id: int | None = None) -> dict[int, dict[str, Any]]:
+        job_ids: list[int] | None = None) -> dict[int, dict[str, Any]]:
     """One-query slim snapshot for jobs needing controller-process checking.
 
     The status-refresh sweep needs two things from the same tables:
@@ -1162,36 +1162,48 @@ def get_jobs_to_check_status_info(
     per-job/per-task shape as ``get_jobs_status_check_info`` but does the
     "which jobs?" filter in a subquery and returns the full slim snapshot in
     one SQL statement.
+
+    When ``job_ids`` is given, the filter is chunked so a large batch (e.g.
+    ``sky jobs cancel --all``) never overflows the DB bind-parameter limit.
     """
     engine = _db_manager.get_engine()
-    jobs_to_check = sqlalchemy.select(
-        spot_table.c.spot_job_id.label('spot_job_id')).select_from(
+
+    def _fetch_chunk(chunk: list[int] | None) -> list[Any]:
+        jobs_to_check = sqlalchemy.select(
+            spot_table.c.spot_job_id.label('spot_job_id')).select_from(
+                spot_table.outerjoin(
+                    job_info_table, spot_table.c.spot_job_id ==
+                    job_info_table.c.spot_job_id)).where(
+                        _get_jobs_to_check_status_condition(
+                            chunk)).distinct().subquery()
+        query = sqlalchemy.select(
+            spot_table.c.spot_job_id,
+            spot_table.c.task_id,
+            spot_table.c.status,
+            spot_table.c.task_name,
+            job_info_table.c.name.label('job_info_name'),
+            job_info_table.c.schedule_state,
+            job_info_table.c.controller_pid,
+            job_info_table.c.controller_pid_started_at,
+            job_info_table.c.pool,
+        ).select_from(
             spot_table.outerjoin(
                 job_info_table,
-                spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
-        ).where(
-            _get_jobs_to_check_status_condition(job_id)).distinct().subquery()
-    query = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-        spot_table.c.task_name,
-        job_info_table.c.name.label('job_info_name'),
-        job_info_table.c.schedule_state,
-        job_info_table.c.controller_pid,
-        job_info_table.c.controller_pid_started_at,
-        job_info_table.c.pool,
-    ).select_from(
-        spot_table.outerjoin(
-            job_info_table,
-            spot_table.c.spot_job_id == job_info_table.c.spot_job_id).join(
-                jobs_to_check, spot_table.c.spot_job_id ==
-                jobs_to_check.c.spot_job_id)).order_by(
-                    spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
-    with orm.Session(engine) as session:
-        rows = session.execute(query).fetchall()
+                spot_table.c.spot_job_id == job_info_table.c.spot_job_id).join(
+                    jobs_to_check, spot_table.c.spot_job_id ==
+                    jobs_to_check.c.spot_job_id)).order_by(
+                        spot_table.c.spot_job_id.desc(),
+                        spot_table.c.task_id.asc())
+        with orm.Session(engine) as session:
+            return session.execute(query).fetchall()
+
     result: dict[int, dict[str, Any]] = {}
-    _merge_jobs_status_check_rows(result, rows)
+    if job_ids is None:
+        _merge_jobs_status_check_rows(result, _fetch_chunk(None))
+    else:
+        for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+            chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+            _merge_jobs_status_check_rows(result, _fetch_chunk(chunk))
     return result
 
 

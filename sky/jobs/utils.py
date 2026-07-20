@@ -561,7 +561,7 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
-def update_managed_jobs_statuses(job_id: int | None = None):
+def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     """Update managed job status if the controller process failed abnormally.
 
     Check the status of the controller process. If it is not running, it must
@@ -570,8 +570,8 @@ def update_managed_jobs_statuses(job_id: int | None = None):
     when above happens, which could be not accurate based on the frequency this
     function is called.
 
-    Note: we expect that job_id, if provided, refers to a nonterminal job or a
-    job that has not completed its cleanup (schedule state not DONE).
+    Note: we expect that job_ids, if provided, refer to nonterminal jobs or
+    jobs that have not completed their cleanup (schedule state not DONE).
     """
     # The signal file suggests that the controller is recovering from a
     # failure. See sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -630,10 +630,10 @@ def update_managed_jobs_statuses(job_id: int | None = None):
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
-    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_id)
+    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
     if not jobs_info:
-        # job_id is already terminal, or if job_id is None, there are no jobs
-        # that need to be checked.
+        # The given jobs are already terminal, or if job_ids is None, there
+        # are no jobs that need to be checked.
         return
 
     for job_id, info in jobs_info.items():
@@ -1049,9 +1049,13 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
                 cancelled_job_ids.append(job_id)
                 continue
 
-        update_managed_jobs_statuses(job_id)
         jobs_to_refresh.append(job_id)
 
+    if jobs_to_refresh:
+        # One batched refresh sweep for every job that needs it, instead of a
+        # sweep per job: all jobs are judged against a single status snapshot,
+        # and a cancel of N live jobs issues one refresh query instead of N.
+        update_managed_jobs_statuses(jobs_to_refresh)
     fresh_states = managed_job_state.get_job_cancellation_states(
         jobs_to_refresh)
     for job_id in jobs_to_refresh:
