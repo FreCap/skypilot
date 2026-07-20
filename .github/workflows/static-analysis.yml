@@ -45,6 +45,8 @@ jobs:
           ruff check sky/resources.py --select B011
           # Backend construction and dispatch guards must survive `python -O`.
           ruff check sky/backends/backend_utils.py --select B011
+          # GCP fallback and deprecated-path guards must survive `python -O`.
+          ruff check sky/clouds/gcp.py --select B011
           # EFA setup has a nested network-card loop inside the subnet retry
           # loop. Shadowing its attempt index can silently skip failover.
           ruff check sky/provision/aws/instance_requests.py --select PLW2901

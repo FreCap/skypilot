@@ -67,6 +67,7 @@ jobs:
           src/lib/request-activity.test.js \
           src/lib/request-activity.persistence.test.js \
           src/hooks/useTour.test.jsx \
+          src/plugins/PluginProvider.test.jsx \
           src/utils/grafana.test.js
         npm --prefix sky/dashboard run lint
         npm --prefix sky/dashboard run format:check
