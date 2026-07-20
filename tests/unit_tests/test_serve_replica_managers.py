@@ -3721,6 +3721,7 @@ class TestLogicalCapacityPlanning:
         mgr._uses_logical_replicas = True
         mgr._is_pool = False
         mgr._register_wait_for_idle = mock.Mock()
+        recovered_url = 'http://old-backend'
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -3731,12 +3732,43 @@ class TestLogicalCapacityPlanning:
              mock.patch.object(
                  replica_managers.global_user_state,
                  'get_cluster_status_fields',
-                 return_value={}):
+                 return_value={}), \
+             mock.patch.object(mgr,
+                               '_resolve_probe_urls',
+                               return_value={1: recovered_url}) as resolve_urls:
             mgr._recover_replica_operations()
 
-        mgr._register_wait_for_idle.assert_called_once_with(retiring)
+        resolve_urls.assert_called_once_with([retiring])
+        mgr._register_wait_for_idle.assert_called_once_with(
+            retiring, replica_url=recovered_url)
         assert mgr._recovering_logical_retirement_ids == {1}
         assert mgr._logical_retirement_recovery_deadline is not None
+
+    def test_recovery_drain_url_batch_failure_falls_back_per_replica(self):
+        retiring = self._recoverable_logical_retirement(1)
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._is_pool = False
+        mgr._register_wait_for_idle = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_contents',
+                               return_value={}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={}), \
+             mock.patch.object(mgr,
+                               '_resolve_probe_urls',
+                               side_effect=RuntimeError('snapshot failed')):
+            mgr._recover_replica_operations()
+
+        kwargs = mgr._register_wait_for_idle.call_args.kwargs
+        assert (kwargs['replica_url']
+                is replica_managers._REPLICA_URL_NOT_PROVIDED)
 
     @pytest.mark.parametrize('confirmed_generation', [None, 4])
     def test_recovery_adopts_old_epoch_retirement_and_preserves_deadline(
