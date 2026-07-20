@@ -1833,7 +1833,7 @@ class SkyServeController:
                 peak_queue_depth, bool):
             peak_queue_depth = None
         accelerator_breakdown = self._get_accelerator_history_breakdown(
-            replica_counts)
+            replica_counts, fill_target)
         return serve_history.record_autoscaler_snapshot(
             self._service_name,
             service_hash,
@@ -1852,7 +1852,8 @@ class SkyServeController:
         )
 
     def _get_accelerator_history_breakdown(
-            self, replica_counts: dict[str, Any]) -> dict[str, Any] | None:
+            self, replica_counts: dict[str, Any],
+            aggregate_fill_target: int) -> dict[str, Any] | None:
         """Build one complete exact-card observation, or mark unavailable."""
         shapes = getattr(self._autoscaler, 'configured_accelerator_shapes', {})
         if not isinstance(shapes, dict) or not shapes:
@@ -1872,6 +1873,13 @@ class SkyServeController:
             raw = replica_counts.get(field, {})
             return raw if isinstance(raw, dict) else {}
 
+        fill_target = mapping('fill_target_by_accelerator')
+        if sum(fill_target.values()) != aggregate_fill_target:
+            # A broker grant can briefly outlive the exact physical supply
+            # observation that attributed it. Preserve the aggregate target,
+            # but do not publish an invented exact-card history overlay.
+            return None
+
         return {
             'configured_accelerators': configured,
             'min_replicas': dict(
@@ -1883,7 +1891,7 @@ class SkyServeController:
             'total_capacity': mapping('total_replicas_by_accelerator'),
             'zero_cost_ready_capacity':
                 mapping('zero_cost_ready_replicas_by_accelerator'),
-            'fill_target': mapping('fill_target_by_accelerator'),
+            'fill_target': fill_target,
             'free_reserved_slots':
                 mapping('free_reserved_slots_by_accelerator'),
         }
@@ -2155,7 +2163,7 @@ class SkyServeController:
         zero_cost_total: dict[str, int],
         free_reserved: dict[str, int],
     ) -> dict[str, int]:
-        """Project the aggregate fill overlay onto exact observed cards."""
+        """Return a fully attributable aggregate fill overlay by exact card."""
         if getattr(self._autoscaler, 'reserved_capacity_fill',
                    False) is not True:
             return {}
@@ -2188,12 +2196,11 @@ class SkyServeController:
                     continue
                 result[card] = result.get(card, 0) + allocated
                 remaining -= allocated
-        if remaining > 0 and card_order:
+        if remaining > 0:
             # A broker grant may remain visible for one poll after the exact
-            # free observation becomes stale. Preserve aggregate reconciliation
-            # without inventing a family match by assigning only to the first
-            # exact configured card.
-            result[card_order[0]] = result.get(card_order[0], 0) + remaining
+            # free observation becomes stale. The aggregate remains valid, but
+            # its exact card is unavailable and must not be guessed.
+            return {}
         return result
 
     def _configured_accelerators(self, service_spec: Any) -> list[str]:

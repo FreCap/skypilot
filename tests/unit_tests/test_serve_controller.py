@@ -2200,20 +2200,21 @@ class TestAuthoritativeLbReportIngestion:
         autoscaler.min_replicas_by_accelerator = {'A100-80GB': 1}
         ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
 
-        breakdown = ctrl._get_accelerator_history_breakdown({  # pylint: disable=protected-access
-            'ready_replicas_by_accelerator': {
-                'A100': 1,
-                'A100-80GB': 1,
-            },
-            'provisioning_replicas_by_accelerator': {'A100-80GB': 1},
-            'total_replicas_by_accelerator': {
-                'A100': 1,
-                'A100-80GB': 2,
-            },
-            'zero_cost_ready_replicas_by_accelerator': {'A100': 1},
-            'fill_target_by_accelerator': {'A100': 1},
-            'free_reserved_slots_by_accelerator': {'A100': 2},
-        })
+        breakdown = ctrl._get_accelerator_history_breakdown(  # pylint: disable=protected-access
+            {
+                'ready_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+                'provisioning_replicas_by_accelerator': {'A100-80GB': 1},
+                'total_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 2,
+                },
+                'zero_cost_ready_replicas_by_accelerator': {'A100': 1},
+                'fill_target_by_accelerator': {'A100': 1},
+                'free_reserved_slots_by_accelerator': {'A100': 2},
+            }, 1)
 
         assert breakdown == {
             'configured_accelerators': ['A100', 'A100-80GB'],
@@ -2245,6 +2246,52 @@ class TestAuthoritativeLbReportIngestion:
                 'A100': 2
             },
         }
+
+    def test_exact_fill_overlay_withholds_unattributed_stale_grant(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.reserved_capacity_fill = True
+        autoscaler._fill_target = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 0,
+            'A100-80GB': 0,
+        }
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        fill = ctrl._get_fill_target_by_accelerator(  # pylint: disable=protected-access
+            {'A100-80GB': 1}, {'A100-80GB': 1})
+
+        assert not fill
+
+    def test_history_withholds_exact_cards_for_unattributed_fill(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.configured_accelerator_shapes = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.has_recomputed_with_fresh_data.return_value = True
+        autoscaler.target_num_replicas = 2
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.min_replicas_by_accelerator = {}
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        breakdown = ctrl._get_accelerator_history_breakdown(  # pylint: disable=protected-access
+            {
+                'ready_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+                'total_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+            }, 1)
+
+        assert breakdown is None
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])
     def test_request_history_rejects_invalid_process_session(self, session_id):
