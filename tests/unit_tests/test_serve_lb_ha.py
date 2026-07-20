@@ -250,6 +250,52 @@ def test_complete_demand_report_does_not_require_all_occupancy_samples():
     assert controller.SkyServeController._lb_demand_report_is_complete(report)
 
 
+def test_empty_complete_report_starts_window_but_preserves_floor():
+    # A freshly promoted active LB may send a well-formed but empty report
+    # (no in-flight, nothing sampled yet). It counts as complete and starts
+    # the expiry window, but the handoff demand floor must survive until the
+    # window elapses instead of being dropped immediately.
+    empty_report = {
+        'in_flight': {},
+        'queue_depth': 0,
+        'rejected_in_window': 0,
+        'rejected_in_recent_window': 0,
+        'unknown_in_flight_urls': [],
+        'occupancy_sampled_urls': [],
+    }
+    assert controller.SkyServeController._lb_demand_report_is_complete(
+        empty_report)
+
+    handoff = lb_ha.DemandHandoff(60)
+    handoff.begin(
+        3,
+        lb_ha.DemandSnapshot((100,),
+                             4,
+                             2,
+                             rejected_in_recent_window=1,
+                             in_flight={'http://replica': 5},
+                             unknown_in_flight_urls=('http://unprobed',)))
+
+    floored = handoff.apply(3,
+                            dict(empty_report),
+                            complete_authoritative_report=True,
+                            now=1000)
+    # Floor preserved within the window: old demand evidence still visible.
+    assert floored['in_flight'] == {'http://replica': 5}
+    assert floored['unknown_in_flight_urls'] == ['http://unprobed']
+    assert floored['queue_depth'] == 4
+    assert floored['rejected_in_window'] == 2
+    assert floored['rejected_in_recent_window'] == 1
+
+    # Still floored just before expiry.
+    late = handoff.apply(3, dict(empty_report), True, now=1059.9)
+    assert late['in_flight'] == {'http://replica': 5}
+
+    # Only after the full window does the empty report take effect.
+    expired = handoff.apply(3, dict(empty_report), True, now=1060)
+    assert expired == empty_report
+
+
 def test_incomplete_demand_report_preserves_handoff_floor():
     complete = {
         'in_flight': {},
