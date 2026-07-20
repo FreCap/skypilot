@@ -167,6 +167,12 @@ uncertainty into a fleet-wide reactivation feedback loop. If no newer evidence
 arrives, the recovery deadline remains diagnostic and the victim stays
 off-route; timeout alone is never route-admission authority.
 
+Recovery adoption and final teardown use the same logical actuation fence as
+ordinary retirement: the fresh capacity snapshot may be newer than the current
+published target generation, but never older. The post-adoption barrier remains
+separate and still requires a snapshot strictly newer than the generation that
+re-fenced the victim.
+
 The recovery gate also owns every queued shutdown-admission row while that
 replica remains indexed for recovery. The admission pass must check membership
 under the same logical-state lock before evaluating the persisted controller
@@ -239,11 +245,12 @@ the bounded precommit marker through the one-generation recovery barrier so an
 equivalent-version relabel cannot bypass the newer-evidence requirement.
 
 The recovery deadline is diagnostic, not independent route-admission
-authority. If no fresh matching target and capacity snapshot exists when it
-expires, recovery keeps every uncommitted victim off route and renews the
-deadline. Re-advertising capacity cannot repair availability while the load
-balancer cannot synchronize, and doing so blindly can resurrect the complete
-old fleet during a large controller rebuild. Once fresh evidence arrives,
+authority. If no fresh authoritative target and capacity snapshot at least as
+new as that target exists when it expires, recovery keeps every uncommitted
+victim off route and renews the deadline. Re-advertising capacity cannot repair
+availability while the load balancer cannot synchronize, and doing so blindly
+can resurrect the complete old fleet during a large controller rebuild. Once
+fresh evidence arrives,
 ready or never-ready provisioning capacity already committed to the elected
 version may cover the target and allow recovery to re-fence the drains without
 reactivation. Only a measured remaining shortfall permits the bounded fallback
@@ -526,9 +533,9 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify final manager admission and teardown fences count one slot per ready
   old backend, but never count a backend that is already off route.
 - Verify an adopted recovery retirement remains off route for its adoption
-  generation, is released only after a strictly newer matching target and
-  snapshot, and remains off route when the diagnostic recovery deadline expires
-  without newer evidence.
+  generation, is released when capacity advances while the current published
+  target remains authoritative, and remains off route when the diagnostic
+  recovery deadline expires without newer evidence.
 - Verify queued shutdown admission cannot abort or advertise a recovered
   retirement before the recovery pass adopts and releases it.
 - Verify in-process updates preserve the rate timestamp and a rebuild never

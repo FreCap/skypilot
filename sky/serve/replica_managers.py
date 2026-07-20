@@ -1692,9 +1692,10 @@ class ReplicaManager:
         # marker and this recovered index survive controller restarts; the
         # thread-pool refresher clears both after authoritative recovery.
         self._unknown_capacity_replacement_ids: set[int] = set()
-        # Published by the autoscaler tick after it consumes a report. A newer
-        # LB generation without a matching target publication blocks logical
-        # retirement until the next tick, which is the safe direction.
+        # Published by the autoscaler tick after it consumes a report. The
+        # target remains authoritative while newer LB capacity reports arrive;
+        # only a capacity report older than the target publication blocks
+        # logical actuation.
         self._logical_target: tuple[int, int, int] | None = None
         header_keys = None
         if spec.readiness_headers is not None:
@@ -4140,7 +4141,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         target_version, target_generation, current_target = target_state
         if target_version != version:
             return 'abort'
-        if target_generation != snapshot.generation:
+        if snapshot.generation < target_generation:
             return 'wait'
         if (require_victim_idle and
                 not self._logical_retirement_victim_is_idle(info, snapshot)):
@@ -4425,7 +4426,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 target_version, target_generation, current_target = target_state
                 if (target_version != self.latest_version or
-                        target_generation != snapshot.generation):
+                        snapshot.generation < target_generation):
                     continue
                 pending_version = getattr(self, '_pending_version', None)
                 if (pending_version is not None and
@@ -4560,7 +4561,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return
             target_version, target_generation, current_target = target_state
             if (target_version != self.latest_version or
-                    target_generation != snapshot.generation):
+                    snapshot.generation < target_generation):
                 if self._logical_retirement_recovery_timed_out():
                     logger.warning(
                         'Logical retirement recovery target and capacity '
@@ -4593,7 +4594,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # Adoption changes durable shutdown authority. Do not admit
                 # that shutdown from the same LB generation whose pre-adoption
                 # view authorized the re-fence. A strictly newer matching
-                # snapshot/target releases it to the normal admission path.
+                # capacity snapshot releases it to the normal admission path
+                # while the separately published target remains authoritative.
                 selection_generation = (status.logical_retirement_generation)
                 assert type(selection_generation) is int
                 if snapshot.generation > selection_generation:
