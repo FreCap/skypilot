@@ -172,6 +172,23 @@ one-slot floor guarantees the remaining old backend count plus observed latest
 logical capacity is never below the larger of raw demand and the adopted
 target.
 
+An in-process service update is also a retirement-authority transition. A
+newer pending version freezes already selected victims instead of returning
+them to routing. Irreversibly committed teardowns continue through the shared
+termination pool. Uncommitted, off-route victims retain their original drain
+deadlines and are handed to the same bounded recovery path used after a
+controller restart; they may be re-fenced only after the new version publishes
+a fresh target and capacity snapshot. If that snapshot proves a current-version
+capacity shortfall, recovery may reactivate only the capacity needed to cover
+the shortfall. Runtime-equivalent uncommitted victims are relabelled to the new
+version while remaining off route, so they can satisfy such a shortfall without
+a replacement launch; irreversibly committed victims keep their original
+version and finish teardown. The existing bounded recovery timeout remains the
+availability fallback if an update cannot publish that evidence at all. During
+a successful policy-only or runtime-equivalent update, asynchronously draining
+backends must therefore stay off route instead of the whole old fleet becoming
+READY again.
+
 The 20-backend cap bounds each transition without tying rollout progress to a
 wall-clock rate limit. If five new logical slots become ready, up to five
 additional READY old backends become excess. If the old fleet was already far
@@ -403,6 +420,10 @@ rate to 100, then restore the previous control-plane image if required.
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old
   backends, and emits no more than 20 victims per tick.
+- Verify a newer pending version freezes old-version retirement admission,
+  committed teardowns remain irreversible, and an applied in-process update
+  re-fences uncommitted victims from fresh new-version evidence without
+  advertising the whole draining fleet again.
 - Verify an authoritative HA demand report starts the handoff expiry when all
   demand gauges are present, while incomplete or legacy reports retain the
   previous floor. Missing occupancy samples must still protect those replicas
