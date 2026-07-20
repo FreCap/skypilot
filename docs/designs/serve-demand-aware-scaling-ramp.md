@@ -219,6 +219,18 @@ version while remaining off route, so they can satisfy such a shortfall without
 a replacement launch; irreversibly committed victims keep their original
 version and finish teardown.
 
+Uncommitted victims include both strict idle-wait rows and outdated rows whose
+idle deadline expired, whose replacement-capacity proof was confirmed, and
+whose teardown is still queued behind the shared termination budget. The
+latter bounded precommit rows are already off route but have not crossed the
+irreversible `RUNNING` admission boundary. A controller restart or version
+update must index them into recovery before rebuilding a teardown worker. Fresh
+evidence may then adopt them under the new controller epoch, or reactivate only
+the measured shortfall under the same 20-backend cap. Merely changing the
+controller epoch must not return the queued fleet to routing. Adoption retains
+the bounded precommit marker through the one-generation recovery barrier so an
+equivalent-version relabel cannot bypass the newer-evidence requirement.
+
 The recovery deadline is diagnostic, not independent route-admission
 authority. If no fresh matching target and capacity snapshot exists when it
 expires, recovery keeps every uncommitted victim off route and renews the
@@ -492,8 +504,10 @@ rate to 100, then restore the previous control-plane image if required.
   backends, and emits no more than 20 victims per tick.
 - Verify a newer pending version freezes old-version retirement admission,
   committed teardowns remain irreversible, and an applied in-process update
-  re-fences uncommitted victims from fresh new-version evidence without
-  advertising the whole draining fleet again.
+  re-fences both strict idle-wait and bounded precommit victims from fresh
+  new-version evidence without advertising the whole draining fleet again.
+  Repeat the same assertion for controller recovery, including bounded victims
+  whose drain deadlines expired while teardown admission was budget-delayed.
 - Verify an authoritative HA demand report starts the handoff expiry when all
   demand gauges are present, while incomplete or legacy reports retain the
   previous floor. Missing occupancy samples must still protect those replicas

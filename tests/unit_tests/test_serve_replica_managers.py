@@ -1343,6 +1343,107 @@ class TestUpdateVersionBatchesPriorVersionYamls:
             mgr._reconcile_recovering_logical_retirements()
         assert not mgr._recovering_logical_retirement_ids
 
+    def test_logical_update_hands_off_bounded_precommit_retirement(self):
+        """A budget-delayed bounded drain stays off route across an update."""
+        mgr = _make_manager()
+        mgr.latest_version = 2
+        mgr._uses_logical_replicas = True
+        mgr._is_pool = False
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        old_epoch = mgr._logical_controller_epoch
+
+        retiring = replica_managers.ReplicaInfo(replica_id=1,
+                                                cluster_name='svc-1',
+                                                replica_port='8080',
+                                                is_spot=True,
+                                                location=None,
+                                                version=1,
+                                                resources_override=None,
+                                                planned_capacity=1)
+        status = retiring.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+        status.service_ready_now = True
+        status.is_scale_down = True
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.drain_cap_seconds = 3900
+        status.drain_started_at = replica_managers.time.time() - 100
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_version = 2
+        status.logical_retirement_controller_epoch = old_epoch
+        status.logical_retirement_generation = 4
+        status.logical_retirement_target_capacity = 1
+        status.logical_retirement_confirmed_generation = 4
+        status.logical_retirement_bounded_deadline = True
+        status.logical_retirement_committed = False
+        tracker_deadline = replica_managers.time.monotonic() - 1
+        mgr._wait_for_idle_trackers = {
+            1: (mock.Mock(return_value=False), tracker_deadline)
+        }
+
+        handed_off = mgr._handoff_logical_retirements_for_version_update(
+            [retiring])
+
+        assert handed_off == {1}
+        assert mgr._logical_controller_epoch != old_epoch
+        assert mgr._recovering_logical_retirement_ids == {1}
+        assert retiring.status_property.is_scale_down
+        assert retiring.status_property.logical_retirement_version == 2
+
+        survivor = replica_managers.ReplicaInfo(replica_id=2,
+                                                cluster_name='svc-2',
+                                                replica_port='8080',
+                                                is_spot=True,
+                                                location=None,
+                                                version=3,
+                                                resources_override=None,
+                                                planned_capacity=1)
+        survivor.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        survivor.status_property.service_ready_now = True
+        mgr.latest_version = 3
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=3,
+                generation=5,
+                observed_slots_by_replica_id={2: 1},
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (3, 5, 1)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        status = retiring.status_property
+        assert mgr._recovering_logical_retirement_ids == {1}
+        assert status.is_scale_down
+        assert status.logical_retirement_version == 3
+        assert status.logical_retirement_controller_epoch == (
+            mgr._logical_controller_epoch)
+        assert status.logical_retirement_generation == 5
+        assert status.logical_retirement_confirmed_generation == 5
+        assert status.logical_retirement_bounded_deadline
+        assert mgr._wait_for_idle_trackers[1][1] == tracker_deadline
+        mgr._terminate_replica.assert_not_called()
+
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, generation=6)
+        mgr._logical_target = (3, 6, 1)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert not mgr._recovering_logical_retirement_ids
+        assert status.is_scale_down
+        assert status.logical_retirement_bounded_deadline
+        mgr._terminate_replica.assert_not_called()
+
     def test_logical_update_aborts_budget_queued_uncommitted_victim(self):
         """Pin abort+reselect for a budget-queued (post-idle-proof) victim.
 
@@ -3350,20 +3451,22 @@ class TestLogicalCapacityPlanning:
     def _recoverable_logical_retirement(self,
                                         replica_id,
                                         width=1,
-                                        confirmed_generation=None):
+                                        confirmed_generation=None,
+                                        bounded_precommit=False):
         info = self._ready_backend(replica_id, width)
         status = info.status_property
         status.is_scale_down = True
         status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
         status.drain_cap_seconds = 3900
         status.drain_started_at = replica_managers.time.time() - 100
-        status.wait_for_idle_before_termination = True
-        status.logical_retirement_version = 1
+        status.wait_for_idle_before_termination = not bounded_precommit
+        status.logical_retirement_version = 2 if bounded_precommit else 1
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
         status.logical_retirement_generation = 4
         status.logical_retirement_target_capacity = 1
-        status.logical_retirement_confirmed_generation = confirmed_generation
-        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_confirmed_generation = (
+            4 if bounded_precommit else confirmed_generation)
+        status.logical_retirement_bounded_deadline = bounded_precommit
         status.logical_retirement_committed = False
         return info
 
@@ -3408,6 +3511,8 @@ class TestLogicalCapacityPlanning:
         mgr = self._logical_recovery_manager([retiring], survivor)
         mgr._logical_reconcile_snapshot = None
         mgr._logical_target = None
+        mgr._logical_retirement_recovery_deadline = (
+            replica_managers.time.monotonic() - 1)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
@@ -3607,8 +3712,11 @@ class TestLogicalCapacityPlanning:
         assert mgr._recovering_logical_retirement_ids == {1, 3}
         mgr._terminate_replica.assert_not_called()
 
-    def test_recovery_pass_indexes_valid_uncommitted_retirement(self):
-        retiring = self._recoverable_logical_retirement(1)
+    @pytest.mark.parametrize('bounded_precommit', [False, True])
+    def test_recovery_pass_indexes_valid_uncommitted_retirement(
+            self, bounded_precommit):
+        retiring = self._recoverable_logical_retirement(
+            1, bounded_precommit=bounded_precommit)
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._is_pool = False
