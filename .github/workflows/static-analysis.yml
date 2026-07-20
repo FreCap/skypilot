@@ -52,6 +52,8 @@ jobs:
           # EFA setup has a nested network-card loop inside the subnet retry
           # loop. Shadowing its attempt index can silently skip failover.
           ruff check sky/provision/aws/instance_requests.py --select PLW2901
+          # API payload validation must survive `python -O`.
+          ruff check sky/server/requests/payloads.py --select S101
           # A mutable class default bypasses threading.local's per-thread
           # attribute storage and is shared by every thread. RUF012 is noisy
           # for intentional class constants, so scope it to local subclasses.
