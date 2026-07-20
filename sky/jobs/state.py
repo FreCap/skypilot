@@ -1476,16 +1476,25 @@ def set_api_access_token_ids(job_ids: list[int], token_id: str) -> None:
 
 
 @db_retries.retry
-def get_api_access_token_id(job_id: int) -> str | None:
-    """Get the API access token ID for a managed job."""
+def get_releasable_api_access_token_id(job_id: int) -> str | None:
+    """Return this job's token only when every associated job is terminal."""
     engine = _db_manager.get_engine()
+    owner = api_access_token_table.alias('token_owner')
+    sibling = api_access_token_table.alias('token_sibling')
+    sibling_tasks = sibling.outerjoin(
+        spot_table, sibling.c.job_id == spot_table.c.spot_job_id)
+    terminal_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    unreleasable_sibling = sqlalchemy.exists(
+        sqlalchemy.select(1).select_from(sibling_tasks).where(
+            sibling.c.token_id == owner.c.token_id,
+            sqlalchemy.or_(spot_table.c.status.is_(None),
+                           spot_table.c.status.not_in(terminal_values))))
+    query = sqlalchemy.select(owner.c.token_id).where(owner.c.job_id == job_id,
+                                                      ~unreleasable_sibling)
     with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.select(api_access_token_table.c.token_id).where(
-                api_access_token_table.c.job_id == job_id)).fetchone()
-        if result is None:
-            return None
-        return result[0]
+        return session.execute(query).scalar_one_or_none()
 
 
 @db_retries.retry_async

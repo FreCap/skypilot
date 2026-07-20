@@ -156,6 +156,8 @@ api_access_token_table = sqlalchemy.Table(
     sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('token_id', sqlalchemy.Text, nullable=False),
 )
+sqlalchemy.Index('ix_api_access_tokens_token_id',
+                 api_access_token_table.c.token_id)
 
 # TODO(cooperc): drop the table in a migration
 ha_recovery_script_table = sqlalchemy.Table(
