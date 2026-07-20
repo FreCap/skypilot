@@ -216,6 +216,27 @@ demand reports continue to prohibit all rolling retirement. A pending logical
 scale-up wave does not block the bridge because the raw-demand side of the
 coverage target already protects work that the adopted target has not reached.
 
+### Launch completion and teardown progress
+
+The replica-manager refresher holds the manager lock while reconciling launch
+and teardown workers. A large launch wave may finish many workers in one
+refresh. Persisting each completed launch in a separate transaction makes the
+lock-held pass grow with the wave size and can delay admission of already
+selected teardown workers behind repeated PostgreSQL round trips. The rolling
+bridge is then visibly bounded but provider cleanup does not keep pace.
+
+The refresher reads all completed-launch replica rows in its existing batch,
+applies their launch and placement outcomes in memory, and persists those
+completed-launch transitions with one existing multi-row upsert. It removes
+the completed workers from local tracking and schedules failed-launch cleanup
+only after that batch commit succeeds. If the batch write fails, the workers
+remain tracked and the next refresh retries the same durable transition.
+
+This changes only persistence cardinality and retry atomicity for completed
+launches. Pending-launch authorization, placement benching, launch and
+termination admission order, shared resource limits, demand sizing, retirement
+selection, and provider cleanup behavior remain unchanged.
+
 ### Load-balancer demand handoff
 
 An HA load-balancer promotion temporarily preserves the previous active slot's

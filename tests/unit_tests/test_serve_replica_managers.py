@@ -1742,6 +1742,70 @@ class TestLaunchOwnershipFence:
         assert len(mgr._replica_to_launch_cancelled) == 0
         persist.assert_not_called()
 
+    def test_completed_launch_wave_uses_one_batch_before_cleanup(self):
+        mgr, infos = self._queued_manager([1, 2])
+        for info in infos.values():
+            info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        mgr._launch_thread_pool[1].format_exc = None
+        mgr._launch_thread_pool[2].format_exc = 'no capacity'
+        events = []
+
+        def _persist(updates):
+            events.append(
+                ('persist', [replica_id for replica_id, _ in updates]))
+
+        def _terminate(replica_id, **_kwargs):
+            events.append(('terminate', replica_id))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=list(infos.values())), \
+             mock.patch.object(mgr,
+                               '_persist_replicas',
+                               side_effect=_persist) as persist, \
+             mock.patch.object(mgr,
+                               '_terminate_replica',
+                               side_effect=_terminate), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        persist.assert_called_once_with([(1, infos[1]), (2, infos[2])])
+        assert events == [('persist', [1, 2]), ('terminate', 2)]
+        assert len(mgr._launch_thread_pool) == 0
+        assert len(mgr._replica_to_request_id) == 0
+
+    def test_completed_launch_batch_failure_keeps_workers_for_retry(self):
+        mgr, infos = self._queued_manager([1, 2])
+        for info in infos.values():
+            info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        mgr._launch_thread_pool[1].format_exc = None
+        mgr._launch_thread_pool[2].format_exc = 'no capacity'
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(mgr,
+                               '_persist_replicas',
+                               side_effect=RuntimeError(
+                                   'database unavailable')), \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             pytest.raises(RuntimeError, match='database unavailable'):
+            mgr._refresh_thread_pool()
+
+        assert {
+            replica_id for replica_id, _ in mgr._launch_thread_pool.items()
+        } == {1, 2}
+        assert {
+            replica_id for replica_id, _ in mgr._replica_to_request_id.items()
+        } == {1, 2}
+        terminate.assert_not_called()
+
     def test_unfenced_external_lb_failure_stops_replica_churn(self):
         mgr, infos = self._queued_manager([1])
         info = infos[1]
@@ -1759,7 +1823,7 @@ class TestLaunchOwnershipFence:
                  replica_managers.serve_state,
                  'get_replica_infos',
                  return_value=[info]), \
-             mock.patch.object(mgr, '_persist_replica') as persist, \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
              mock.patch.object(mgr, '_terminate_replica') as terminate, \
              mock.patch.object(mgr, '_reconcile_failed_cleanup'):
             mgr._refresh_thread_pool()
@@ -1767,7 +1831,7 @@ class TestLaunchOwnershipFence:
         assert info.status_property.user_app_failed is True
         assert (info.status_property.sky_launch_status ==
                 common_utils.ProcessStatus.FAILED)
-        persist.assert_called_once_with(1, info)
+        persist.assert_called_once_with([(1, info)])
         terminate.assert_called_once_with(1,
                                           sync_down_logs=True,
                                           replica_drain_delay_seconds=0)
@@ -1803,7 +1867,7 @@ class TestLaunchOwnershipFence:
                  replica_managers.serve_state,
                  'get_replica_infos',
                  return_value=[info]), \
-             mock.patch.object(mgr, '_persist_replica'), \
+             mock.patch.object(mgr, '_persist_replicas'), \
              mock.patch.object(mgr, '_terminate_replica'), \
              mock.patch.object(mgr, '_reconcile_failed_cleanup'):
             mgr._refresh_thread_pool()
@@ -1941,7 +2005,7 @@ class TestLaunchOwnershipFence:
                                'get_replica_infos',
                                return_value=[]), \
              mock.patch.object(mgr, '_remove_replica') as remove, \
-             mock.patch.object(mgr, '_persist_replica'), \
+             mock.patch.object(mgr, '_persist_replicas'), \
              mock.patch.object(mgr, '_terminate_replica'):
             mgr._refresh_thread_pool()
 
@@ -1970,7 +2034,7 @@ class TestLaunchOwnershipFence:
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
-             mock.patch.object(mgr, '_persist_replica'), \
+             mock.patch.object(mgr, '_persist_replicas'), \
              mock.patch.object(mgr, '_terminate_replica'):
             mgr._refresh_thread_pool()
 
@@ -2014,7 +2078,7 @@ class TestLaunchOwnershipFence:
                     for rid in ids
                 }), \
              mock.patch.object(mgr,
-                               '_persist_replica',
+                               '_persist_replicas',
                                side_effect=_persist), \
              mock.patch.object(mgr,
                                '_terminate_replica',
@@ -6430,6 +6494,10 @@ class TestRefreshThreadPoolUnfencedLaunch:
 
         persisted = []
         terminated = []
+
+        def _persist(updates):
+            persisted.extend(updates)
+
         with mock.patch.object(
                 manager, '_reconcile_legacy_uncertain_logical_retirements'), \
              mock.patch.object(
@@ -6438,8 +6506,8 @@ class TestRefreshThreadPoolUnfencedLaunch:
              mock.patch.object(
                  manager, '_clear_known_unknown_capacity_replacements'), \
              mock.patch.object(
-                 manager, '_persist_replica',
-                 side_effect=lambda rid, i: persisted.append((rid, i))), \
+                 manager, '_persist_replicas',
+                 side_effect=_persist), \
              mock.patch.object(
                  manager, '_terminate_replica',
                  side_effect=lambda rid, **_k: terminated.append(rid)), \

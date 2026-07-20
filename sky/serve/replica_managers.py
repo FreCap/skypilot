@@ -1954,7 +1954,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if persisted is False:
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
-                'persisting replica probe results.')
+                'persisting a replica batch.')
 
     @with_lock
     def confirm_logical_bridge_capacities(
@@ -5208,6 +5208,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             for location in failed_spot_locations:
                 self._spot_placer.set_preemptive(location)
 
+        completed_launches: list[tuple[int, ReplicaInfo, bool]] = []
         for replica_id, t in finished_launches:
             info = launch_infos.get(replica_id)
             assert info is not None, replica_id
@@ -5221,8 +5222,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             # retry_until_up flag is set to True, but it will be helpful
             # when we enable user choose whether to retry or not.
             logger.info(f'Launch thread for replica {replica_id} finished.')
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
             error_in_sky_launch = False
             if t.format_exc is not None:
                 logger.warning(f'Launch thread for replica {replica_id} '
@@ -5254,7 +5253,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (t.format_exc is not None and
                         replica_id not in unfenced_launch_failures):
                     info.status_property.failed_spot_availability = True
-            self._persist_replica(replica_id, info)
+            completed_launches.append((replica_id, info, error_in_sky_launch))
+
+        # Persist one completed launch wave in one transaction while holding
+        # the manager lock. A per-replica transaction here delays admission of
+        # already-selected teardown workers behind O(wave size) PostgreSQL
+        # round trips. Keep local worker tracking intact until the batch commit
+        # succeeds so a transient write failure is retried on the next tick.
+        self._persist_replicas([
+            (replica_id, info) for replica_id, info, _ in completed_launches
+        ])
+        for replica_id, info, error_in_sky_launch in completed_launches:
+            self._launch_thread_pool.pop(replica_id)
+            self._replica_to_request_id.pop(replica_id)
             if error_in_sky_launch:
                 # Teardown after update replica info since
                 # _terminate_replica will update the replica info too.
