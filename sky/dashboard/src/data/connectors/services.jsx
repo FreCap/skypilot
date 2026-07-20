@@ -60,6 +60,18 @@ const FAILED_REPLICA_STATUSES = new Set([
   'UNKNOWN',
 ]);
 
+// Rows in these states are durable intent or completed lifecycle history, not
+// current provider billability. Keep every other status conservative: stopping,
+// cleanup-failed, unknown, and future statuses may still have live resources.
+const NON_BILLABLE_COST_STATUSES = new Set([
+  'PENDING',
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+  'PREEMPTED',
+]);
+
 const HISTORY_COUNT_FIELDS = [
   ['ready_count', 'readyCount'],
   ['provisioning_count', 'provisioningCount'],
@@ -285,10 +297,13 @@ export function normalizeService(record) {
     (value) => Number.isInteger(value) && value >= 0
   );
 
-  const pricedReplicas = replicas.filter(
+  const costTrackedReplicas = replicas.filter(
+    (replica) => !NON_BILLABLE_COST_STATUSES.has(replica.status)
+  );
+  const pricedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCost !== null
   );
-  const excludedReplicas = replicas.filter(
+  const excludedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCostExclusionReason
   );
   const hourlyCostExclusionReasons = {};
@@ -362,6 +377,7 @@ export function normalizeService(record) {
     estimatedHourlyCost,
     spotHourlyCost,
     onDemandHourlyCost,
+    costTrackedReplicaCount: costTrackedReplicas.length,
     pricedReplicaCount: pricedReplicas.length,
     hourlyCostExcludedReplicaCount,
     hourlyCostExclusionReasons,
