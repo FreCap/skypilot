@@ -8,6 +8,7 @@ import contextlib
 import functools
 import hmac
 import logging
+import math
 import os
 import threading
 import time
@@ -1997,6 +1998,64 @@ class SkyServeController:
                 'SkyServe exact-card compatibility requires one positive GPU '
                 'count shape per accelerator; found ambiguous shapes '
                 f'{ambiguous}.')
+        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
+                         None)
+        if len(configured) > 1 and not isinstance(task.resources,
+                                                  list) and placer is None:
+            if floors:
+                raise ValueError(
+                    'SkyServe per-card floors without a placement policy '
+                    'require an ordered accelerator resource list so cold '
+                    'scale-up is deterministic.')
+            # A resources.any_of set has no user-defined order. Withhold the
+            # request capability instead of turning hash iteration into a
+            # cold-card policy. Existing aggregate any_of behavior remains.
+            return []
+
+        # First establish a deterministic service fallback. Ordered/list
+        # resources retain their user order; unordered any_of resources use
+        # the instance-aware QPS key order and then exact lexical order.
+        if not isinstance(task.resources, list):
+            qps_order: dict[str, int] = {}
+            target_qps = getattr(service_spec, 'target_qps_per_replica', {})
+            if isinstance(target_qps, dict):
+                for key in target_qps:
+                    card = key.partition(':')[0].casefold()
+                    qps_order.setdefault(card, len(qps_order))
+            configured.sort(key=lambda card: (qps_order.get(
+                card.casefold(), len(qps_order)), card.casefold()))
+
+        # A dynamic placer provides the actual cached per-machine price of
+        # each active paid shape. Publish that order to the LB, while the
+        # autoscaler recomputes from the live placer again on every tick.
+        if placer is not None:
+            configured_by_name = {card.casefold(): card for card in configured}
+            paid_costs: dict[str, float] = {}
+            try:
+                active_locations = placer.active_locations()
+            except Exception:  # pylint: disable=broad-except
+                active_locations = []
+            for location in active_locations:
+                accelerators = location.accelerators or {}
+                if len(accelerators) != 1:
+                    continue
+                raw_card = next(iter(accelerators))
+                card = configured_by_name.get(str(raw_card).casefold())
+                if card is None:
+                    continue
+                try:
+                    hourly_cost = float(placer.cost_per_hour(location))
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                if not math.isfinite(hourly_cost) or hourly_cost <= 0:
+                    continue
+                paid_costs[card] = min(hourly_cost,
+                                       paid_costs.get(card, float('inf')))
+            fallback_order = {
+                card: index for index, card in enumerate(configured)
+            }
+            configured.sort(key=lambda card: (paid_costs.get(
+                card, float('inf')), fallback_order[card]))
         return configured
 
     def _configured_accelerator_shapes(self,
@@ -2012,14 +2071,14 @@ class SkyServeController:
         task = replica_managers.load_task_with_service_spec(
             yaml_content, service_spec)
         configured_by_name = {card.casefold(): card for card in configured}
-        shapes: dict[str, int] = {}
+        counts_by_name: dict[str, int] = {}
         for resources in task.resources:
             for accelerator, raw_count in (resources.accelerators or
                                            {}).items():
                 card = configured_by_name.get(accelerator.casefold())
                 if card is not None:
-                    shapes[card] = int(raw_count)
-        return shapes
+                    counts_by_name[card.casefold()] = int(raw_count)
+        return {card: counts_by_name[card.casefold()] for card in configured}
 
     def _configure_instance_aware_accelerators(self, service_spec: Any) -> None:
         """Feed task-authoritative exact shapes to the compatible autoscaler."""

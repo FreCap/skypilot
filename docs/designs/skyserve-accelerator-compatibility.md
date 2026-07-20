@@ -110,6 +110,13 @@ The autoscaler allocates aggregate demand by numeric priority descending using t
 3. for residual scale-out, claim a free exact-card slot on reserved/zero-cost infrastructure;
 4. for any remaining scale-out, choose the cheapest cold paid compatible resource, using request/service order only as a deterministic equal-cost tie-break.
 
+For placer-backed services, cheapest means the lowest current cached hourly
+cost among active paid locations; a temporarily unavailable card sorts behind
+active paid alternatives. Without a placement policy, a multi-card service
+must use an ordered accelerator resource list before advertising compatibility.
+An unordered `resources.any_of` service keeps legacy aggregate behavior rather
+than turning hash iteration into a cold-card policy.
+
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 
 This is why an already-ready reserved A100 may serve flexible L4/A100/H100 work, while an empty fleet normally cold-starts the cheaper L4. When an A100-only request later arrives, no running flexible request is interrupted. At equal priority it owns the next A100 admission opportunity, and its demand increases the A100 target if capacity is otherwise occupied.

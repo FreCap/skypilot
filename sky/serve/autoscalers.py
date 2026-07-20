@@ -2010,11 +2010,14 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         return scaling_decisions
 
     def _configured_cards_from_profiles(self) -> list[str]:
+        # A controller-provided task catalog is authoritative. In particular,
+        # recent arrivals from the previous service version must not revive a
+        # card that the active version removed. Direct/unit-test construction
+        # has no task catalog and retains the additive fallbacks below.
+        if self.configured_accelerator_shapes:
+            return list(self.configured_accelerator_shapes)
         cards: list[str] = []
         seen: set[str] = set()
-        for card in self.configured_accelerator_shapes:
-            cards.append(card)
-            seen.add(card.casefold())
         if isinstance(self.target_qps_per_replica, dict):
             for key in self.target_qps_per_replica:
                 card = key.partition(':')[0]
@@ -2032,6 +2035,39 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 cards.append(card)
                 seen.add(card.casefold())
         return cards
+
+    def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
+        """Order cold cards by live paid placement cost when available."""
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return list(configured_cards)
+        canonical_by_name = {card.casefold(): card for card in configured_cards}
+        paid_costs: dict[str, float] = {}
+        try:
+            active_locations = placer.active_locations()
+        except Exception:  # pylint: disable=broad-except
+            return list(configured_cards)
+        for location in active_locations:
+            raw_card, gpu_count = self._location_gpu_shape(location)
+            card = canonical_by_name.get(raw_card.casefold())
+            if (card is None or gpu_count != self._configured_gpu_count(card)):
+                continue
+            try:
+                hourly_cost = float(placer.cost_per_hour(location))
+            except Exception:  # pylint: disable=broad-except
+                continue
+            # Zero-cost supply has its own fresh-capacity tier. It must not
+            # make a saturated reserved-only card look like a cold option.
+            if not math.isfinite(hourly_cost) or hourly_cost <= 0:
+                continue
+            paid_costs[card] = min(hourly_cost,
+                                   paid_costs.get(card, float('inf')))
+        service_order = {
+            card: index for index, card in enumerate(configured_cards)
+        }
+        return sorted(configured_cards,
+                      key=lambda card:
+                      (paid_costs.get(card, float('inf')), service_order[card]))
 
     def _configured_gpu_count(self, card: str) -> int:
         """Return the service's unique configured GPU count for a card."""
@@ -2099,21 +2135,26 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 # path below does not let it authorize scale-down.
                 provisioning[card] += 1
 
+        cold_order = self._cold_paid_card_order(configured_cards)
+        cold_rank = {card: index for index, card in enumerate(cold_order)}
+        canonical_by_name = {card.casefold(): card for card in configured_cards}
         grouped: dict[tuple[int, tuple[str, ...]], int] = {}
         for profile in (self.compatibility_profiles +
                         self.queued_compatibility_profiles):
-            requested = set(profile['compatible_accelerators'])
+            requested = {
+                canonical_by_name[card.casefold()]
+                for card in profile['compatible_accelerators']
+                if card.casefold() in canonical_by_name
+            }
             # Compatibility is a set. Canonicalize by service cost order so
             # [L4, A100] and [A100, L4] share one bounded demand profile and
             # caller order cannot force the cold paid-card choice.
-            cards = tuple(card for card in configured_cards
+            cards = tuple(card for card in cold_order
                           if card in requested and card in capacities)
             if not cards:
                 continue
             key = (profile['priority'], cards)
             grouped[key] = grouped.get(key, 0) + int(profile.get('count', 1))
-        groups = sorted(grouped.items(),
-                        key=lambda item: (-item[0][0], len(item[0][1])))
 
         # Cumulative marginal-supply tiers. Comparing each cumulative count to
         # the target already assigned to the card consumes each unit exactly
@@ -2129,37 +2170,84 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                    self.free_reserved_slots_by_accelerator.get(card, 0)
                   ) for card in configured_cards
         })
-        for (priority, compatible), request_count in groups:
-            del priority  # ordering above is the priority contract
-            remaining_qps = request_count / self.qps_window_size
+
+        def fallback_after_next_assignment(
+                compatible: tuple[str, ...]) -> tuple[int, int]:
+            """Return the second-best marginal supply tier for one profile."""
+            options: list[tuple[int, int]] = []
             for card in compatible:
-                consumed = min(remaining_qps, unused_capacity.get(card, 0.0))
-                remaining_qps -= consumed
-                unused_capacity[card] = max(
-                    0.0,
-                    unused_capacity.get(card, 0.0) - consumed)
-                if remaining_qps <= 0:
-                    break
-            while (remaining_qps > 0 and
-                   sum(target.values()) < self.max_replicas):
-                selected: str | None = None
-                for tier in planned_by_tier:
-                    selected = next(
-                        (card for card in compatible
-                         if tier.get(card, 0) > target.get(card, 0)), None)
-                    if selected is not None:
+                if unused_capacity.get(card, 0.0) > 0:
+                    options.append((0, cold_rank[card]))
+                previous_count = target.get(card, 0)
+                for tier_index, tier in enumerate(planned_by_tier, start=1):
+                    tier_count = max(previous_count, tier.get(card, 0))
+                    # Two copies are sufficient: only the best option is
+                    # consumed before comparing the fallback.
+                    options.extend([(tier_index, cold_rank[card])] *
+                                   min(2, max(0, tier_count - previous_count)))
+                    previous_count = tier_count
+                # Another paid replica remains the final fallback after all
+                # already-materialized or reserved marginal supply is used.
+                options.append((len(planned_by_tier) + 1, cold_rank[card]))
+            options.sort()
+            if len(options) > 1:
+                return options[1]
+            if options:
+                return options[0]
+            return len(planned_by_tier) + 2, len(cold_order)
+
+        groups_by_priority: dict[int, list[tuple[tuple[str, ...], int]]] = {}
+        for (priority, compatible), request_count in grouped.items():
+            groups_by_priority.setdefault(priority, []).append(
+                (compatible, request_count))
+        for priority in sorted(groups_by_priority, reverse=True):
+            pending = groups_by_priority[priority]
+            while pending:
+                # Protect the profile whose best non-selected fallback is
+                # worse. The list is stable, so FIFO/report order breaks a
+                # true fallback tie without relying on raw set cardinality.
+                fallback_keys = [
+                    tuple(
+                        -value
+                        for value in fallback_after_next_assignment(compatible))
+                    for compatible, _ in pending
+                ]
+                selected_index = min(range(len(pending)),
+                                     key=fallback_keys.__getitem__)
+                compatible, request_count = pending.pop(selected_index)
+                if sum(target.values()) >= self.max_replicas:
+                    continue
+                remaining_qps = request_count / self.qps_window_size
+                for card in compatible:
+                    consumed = min(remaining_qps,
+                                   unused_capacity.get(card, 0.0))
+                    remaining_qps -= consumed
+                    unused_capacity[card] = max(
+                        0.0,
+                        unused_capacity.get(card, 0.0) - consumed)
+                    if remaining_qps <= 0:
                         break
-                if selected is None:
-                    # Compatibility order is not a hardware preference. The
-                    # service's instance-aware key order is its deterministic
-                    # cold paid-card order (normally cheapest first).
-                    selected = next(
-                        card for card in configured_cards if card in compatible)
-                capacity = capacities.get(selected, 0.0)
-                if capacity <= 0:
-                    break
-                target[selected] = target.get(selected, 0) + 1
-                remaining_qps -= capacity
+                while (remaining_qps > 0 and
+                       sum(target.values()) < self.max_replicas):
+                    selected: str | None = None
+                    for tier in planned_by_tier:
+                        selected = next(
+                            (card for card in compatible
+                             if tier.get(card, 0) > target.get(card, 0)), None)
+                        if selected is not None:
+                            break
+                    if selected is None:
+                        # Compatibility order is not a hardware preference.
+                        # Use live paid placement cost/availability when
+                        # available, with service order only as the
+                        # deterministic fallback.
+                        selected = next(
+                            card for card in cold_order if card in compatible)
+                    capacity = capacities.get(selected, 0.0)
+                    if capacity <= 0:
+                        break
+                    target[selected] = target.get(selected, 0) + 1
+                    remaining_qps -= capacity
 
         # Aggregate min_replicas remains independent from per-card floors.
         # Materialize any residual aggregate floor on already-ready reserved,
@@ -2173,7 +2261,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 if selected is not None:
                     break
             if selected is None:
-                selected = configured_cards[0]
+                selected = cold_order[0]
             target[selected] = target.get(selected, 0) + 1
         return {card: count for card, count in target.items() if count > 0}
 

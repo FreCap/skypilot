@@ -315,6 +315,55 @@ class TestGetRoutingSpec:
                 'A100-80GB': 1,
             })
 
+    def test_unordered_any_of_without_placer_withholds_compatibility(self):
+        ctrl = _make_controller()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=None)
+        l4 = mock.Mock(accelerators={'L4': 1})
+        a100 = mock.Mock(accelerators={'A100': 1})
+        task = types.SimpleNamespace(resources={l4, a100})
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'L4': 1.0,
+                                         'A100': 1.0,
+                                     })
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert not configured
+
+    def test_configured_catalog_uses_active_paid_cost_order(self):
+        ctrl = _make_controller()
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.active_locations.return_value = [l4_location, a100_location]
+        placer.cost_per_hour.side_effect = (lambda location: 4.0
+                                            if location is l4_location else 2.0)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=placer)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'A100': 1}),
+        ])
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'L4': 1.0,
+                                         'A100': 1.0,
+                                     })
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert configured == ['A100', 'L4']
+
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
         assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access

@@ -1267,6 +1267,58 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
             'A100': 1,
         })
 
+    def test_crossed_sets_use_both_ready_cards_before_cold_start(self):
+        autoscaler = self._autoscaler(max_replicas=2)
+        # Put the more-flexible ready assignment first to prove report order
+        # cannot consume A100 and force an unnecessary cold L4 launch.
+        autoscaler.compatibility_profiles = (
+            self._profiles(50, ['A100', 'H100']) +
+            self._profiles(50, ['L4', 'A100']))
+        replicas = [self._replica(1, 'A100'), self._replica(2, 'H100')]
+
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'A100': 1,
+            'H100': 1,
+        })
+
+    def test_crossed_sets_protect_worse_cold_fallback_at_capacity(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        autoscaler.compatibility_profiles = (
+            self._profiles(50, ['L4', 'A100']) +
+            self._profiles(50, ['A100', 'H100']))
+
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
+    def test_live_paid_cost_and_availability_choose_cold_card(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        # L4 is currently unavailable; A100 is the only active paid fallback.
+        placer.active_locations.return_value = [a100_location]
+        placer.cost_per_hour.return_value = 2.0
+        autoscaler.set_spot_placer(placer)
+        autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
+
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
+    def test_active_task_catalog_drops_removed_card_demand(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        autoscaler.compatibility_profiles = self._profiles(50, ['A100'])
+
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+
     def test_provisioning_counts_for_launch_but_not_for_graceful_retirement(
             self):
         autoscaler = self._autoscaler(max_replicas=2)
