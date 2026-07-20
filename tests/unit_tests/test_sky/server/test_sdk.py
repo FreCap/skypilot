@@ -18,6 +18,7 @@ from sky.client import sdk as client_sdk
 from sky.server import common as server_common
 from sky.server import rest as server_rest
 from sky.server.constants import API_COOKIE_FILE_ENV_VAR
+from sky.server.constants import STREAM_REQUEST_HEADER
 from sky.utils import common as common_utils
 
 
@@ -645,6 +646,24 @@ def test_stream_and_get_non_200_uses_safe_fallback(request_id):
     else:
         assert result == 'result'
         mock_get.assert_called_once_with(request_id)
+
+
+def test_stream_and_get_rejects_mismatched_request_id():
+    """A mismatched stream response must not enter the stream decoder."""
+    response = requests.Response()
+    response.status_code = 200
+    response.url = 'http://api.example/api/stream'
+    response.headers[STREAM_REQUEST_HEADER] = 'wrong-request-id'
+
+    with mock.patch(
+            'sky.server.common.make_authenticated_request',
+            return_value=response), mock.patch(
+                'sky.server.common.check_server_healthy_or_start_fn'), \
+            mock.patch('sky.client.sdk.stream_response') as mock_stream:
+        with pytest.raises(RuntimeError, match='Stream request ID mismatch'):
+            client_sdk.stream_and_get('expected-request-id')
+
+    mock_stream.assert_not_called()
 
 
 def test_stream_response_non_resumable():
