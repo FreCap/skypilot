@@ -198,14 +198,26 @@ deadlines and are handed to the same bounded recovery path used after a
 controller restart; they may be re-fenced only after the new version publishes
 a fresh target and capacity snapshot. If that snapshot proves a current-version
 capacity shortfall, recovery may reactivate only the capacity needed to cover
-the shortfall. Runtime-equivalent uncommitted victims are relabelled to the new
+the shortfall, with at most 20 physical victims reactivated per fresh
+generation. Active old-version victims are eligible for this bounded fallback
+and contribute the same conservative one-slot coverage floor used by the
+rolling bridge. Runtime-equivalent uncommitted victims are relabelled to the new
 version while remaining off route, so they can satisfy such a shortfall without
 a replacement launch; irreversibly committed victims keep their original
-version and finish teardown. The existing bounded recovery timeout remains the
-availability fallback if an update cannot publish that evidence at all. During
-a successful policy-only or runtime-equivalent update, asynchronously draining
-backends must therefore stay off route instead of the whole old fleet becoming
-READY again.
+version and finish teardown.
+
+The recovery deadline is diagnostic, not independent route-admission
+authority. If no fresh matching target and capacity snapshot exists when it
+expires, recovery keeps every uncommitted victim off route and renews the
+deadline. Re-advertising capacity cannot repair availability while the load
+balancer cannot synchronize, and doing so blindly can resurrect the complete
+old fleet during a large controller rebuild. Once fresh evidence arrives,
+ready or never-ready provisioning capacity already committed to the elected
+version may cover the target and allow recovery to re-fence the drains without
+reactivation. Only a measured remaining shortfall permits the bounded fallback
+above. During a successful policy-only or runtime-equivalent update,
+asynchronously draining backends must therefore stay off route instead of the
+whole old fleet becoming READY again.
 
 The 20-backend cap bounds each transition without tying rollout progress to a
 wall-clock rate limit. If five new logical slots become ready, up to five

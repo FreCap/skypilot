@@ -76,11 +76,15 @@ _DRAIN_WALL_CLOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _IN_FLIGHT_REPORT_STALENESS_SECONDS = (
     3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 # A controller and its external LB commonly roll together. Give the new pair
-# multiple sync opportunities to publish one matching target/capacity proof,
-# but bound how long capacity selected by the old controller can stay
-# conservatively off-route when the surviving fleet is insufficient.
+# multiple sync opportunities to publish one matching target/capacity proof
+# before emitting a diagnostic and renewing the wait. The deadline never grants
+# route-admission authority without that fresh proof.
 _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS = (
     6 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+# A recovered controller may need several generations to prove and repair a
+# real capacity shortfall.  Bound each reactivation wave like the logical
+# rolling-update bridge instead of returning the complete old fleet to routing.
+_LOGICAL_RETIREMENT_RECOVERY_MAX_REACTIVATIONS_PER_GENERATION = 20
 _SERVICE_OWNER_WATCH_INTERVAL_SECONDS = 1
 _LAUNCH_OWNER_WATCH_INTERVAL_SECONDS = 0.5
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
@@ -4455,29 +4459,37 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._clear_logical_retirement_recovery_if_done()
             return
 
-        if self._logical_retirement_recovery_timed_out():
-            logger.warning(
-                f'Logical retirement recovery timed out after '
-                f'{_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS}s; '
-                f'reactivating {len(candidates)} uncommitted replicas for '
-                'availability.')
-            for info in candidates:
-                self._abort_logical_retirement(
-                    info, 'controller recovery evidence timed out')
-                recovering_ids.discard(info.replica_id)
-            self._clear_logical_retirement_recovery_if_done()
-            return
-
         with self._logical_state_lock:
             snapshot = self._logical_reconcile_snapshot
             target_state = self._logical_target
             if (snapshot is None or target_state is None or
                     not self._logical_snapshot_is_fresh(snapshot) or
                     snapshot.version != self.latest_version):
+                if self._logical_retirement_recovery_timed_out():
+                    logger.warning(
+                        'Logical retirement recovery evidence remained '
+                        f'unavailable after '
+                        f'{_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS}s; '
+                        f'keeping {len(candidates)} uncommitted replicas '
+                        'off-route until a fresh target and capacity snapshot '
+                        'arrives.')
+                    self._logical_retirement_recovery_deadline = (
+                        time.monotonic() +
+                        _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS)
                 return
             target_version, target_generation, current_target = target_state
             if (target_version != self.latest_version or
                     target_generation != snapshot.generation):
+                if self._logical_retirement_recovery_timed_out():
+                    logger.warning(
+                        'Logical retirement recovery target and capacity '
+                        'generations remained incoherent after '
+                        f'{_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS}s; '
+                        f'keeping {len(candidates)} uncommitted replicas '
+                        'off-route until coherent evidence arrives.')
+                    self._logical_retirement_recovery_deadline = (
+                        time.monotonic() +
+                        _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS)
                 return
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -4490,32 +4502,42 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return
             self._logical_retirement_reactivation_generation = None
 
-            ready_capacity = self._logical_ready_capacity(
+            committed_capacity = self._logical_committed_capacity(
                 replica_infos, snapshot, self.latest_version,
                 frozenset(recovering_ids))
-            if ready_capacity < current_target:
-                shortfall = current_target - ready_capacity
+            if committed_capacity < current_target:
+                shortfall = current_target - committed_capacity
                 reactivated_capacity = 0
                 reactivated_count = 0
-                for info in candidates:
-                    # Only a current-version backend can satisfy this logical
-                    # target. Outdated candidates remain safely off-route and
-                    # are reconsidered after current capacity is restored.
-                    if info.version != self.latest_version:
-                        continue
+                # Prefer current-version victims because their immutable
+                # logical width is authoritative.  Old-version victims remain
+                # a valid availability bridge, but count as one conservative
+                # slot each, matching _logical_committed_capacity.
+                ordered_candidates = sorted(
+                    candidates,
+                    key=lambda candidate:
+                    (candidate.version != self.latest_version, candidate.
+                     replica_id))
+                for info in ordered_candidates:
                     self._abort_logical_retirement(
                         info, 'current capacity is below the recovered target')
                     recovering_ids.discard(info.replica_id)
-                    reactivated_capacity += self._logical_planned_capacity(info)
+                    reactivated_capacity += (
+                        self._logical_planned_capacity(info)
+                        if info.version == self.latest_version else 1)
                     reactivated_count += 1
-                    if reactivated_capacity >= shortfall:
+                    if (reactivated_capacity >= shortfall or
+                            reactivated_count >=
+                            _LOGICAL_RETIREMENT_RECOVERY_MAX_REACTIVATIONS_PER_GENERATION
+                       ):
                         break
                 if reactivated_count:
                     self._logical_retirement_reactivation_generation = (
                         snapshot.generation)
                     logger.info(
                         f'Reactivated {reactivated_count} recovered logical '
-                        f'retirements ({reactivated_capacity} planned slots) '
+                        f'retirements ({reactivated_capacity} conservative '
+                        'slots) '
                         f'to cover a {shortfall}-slot target shortfall; '
                         'waiting for a newer observed-capacity generation.')
                 self._clear_logical_retirement_recovery_if_done()

@@ -3703,7 +3703,7 @@ class TestLogicalCapacityPlanning:
         assert candidates[1].is_ready
         assert not mgr._recovering_logical_retirement_ids
 
-    def test_recovery_timeout_reactivates_uncommitted_retirement(self):
+    def test_recovery_timeout_with_fresh_coverage_adopts_retirement(self):
         retiring = self._recoverable_logical_retirement(1)
         survivor = self._ready_backend(2, 1)
         mgr = self._logical_recovery_manager([retiring], survivor)
@@ -3715,10 +3715,95 @@ class TestLogicalCapacityPlanning:
                                return_value=[retiring, survivor]):
             mgr._reconcile_recovering_logical_retirements()
 
-        assert retiring.is_ready
-        assert retiring.status_property.drain_started_at is None
+        assert (retiring.status ==
+                replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+        assert retiring.status_property.logical_retirement_controller_epoch == (
+            'test-controller-epoch')
         assert not mgr._recovering_logical_retirement_ids
         mgr._persist_replica.assert_called_once_with(1, retiring)
+
+    def test_recovery_timeout_without_fresh_evidence_stays_off_route(self):
+        retiring = self._recoverable_logical_retirement(1)
+        survivor = self._ready_backend(2, 1)
+        mgr = self._logical_recovery_manager([retiring], survivor)
+        mgr._logical_reconcile_snapshot = None
+        mgr._logical_target = None
+        expired_deadline = replica_managers.time.monotonic() - 1
+        mgr._logical_retirement_recovery_deadline = expired_deadline
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert (retiring.status ==
+                replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+        assert retiring.status_property.logical_retirement_controller_epoch == (
+            'old-controller-epoch')
+        assert mgr._recovering_logical_retirement_ids == {1}
+        assert mgr._logical_retirement_recovery_deadline > expired_deadline
+        mgr._persist_replica.assert_not_called()
+
+    def test_recovery_provisioning_coverage_preserves_old_version_drain(self):
+        retiring = self._recoverable_logical_retirement(1)
+        provisioning = self._ready_backend(2, 4)
+        provisioning.version = 2
+        provisioning.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        provisioning.status_property.service_ready_now = False
+        provisioning.status_property.first_ready_time = None
+        mgr = self._logical_recovery_manager([retiring], provisioning, target=4)
+        mgr.latest_version = 2
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            version=2,
+            observed_slots_by_replica_id={},
+            in_flight_by_replica_id={
+                1: 0,
+                2: 0
+            })
+        mgr._logical_target = (2, 5, 4)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, provisioning]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert (retiring.status ==
+                replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+        assert retiring.status_property.logical_retirement_version == 2
+        assert not mgr._recovering_logical_retirement_ids
+        mgr._persist_replica.assert_called_once_with(1, retiring)
+
+    def test_recovery_shortfall_reactivation_is_bounded_per_generation(self):
+        candidates = [
+            self._recoverable_logical_retirement(replica_id)
+            for replica_id in range(1, 26)
+        ]
+        survivor = self._ready_backend(100, 1)
+        survivor.version = 2
+        mgr = self._logical_recovery_manager(candidates, survivor, target=25)
+        mgr.latest_version = 2
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            version=2,
+            observed_slots_by_replica_id={100: 1},
+            in_flight_by_replica_id={
+                **{
+                    info.replica_id: 0 for info in candidates
+                },
+                100: 0,
+            })
+        mgr._logical_target = (2, 5, 25)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=candidates + [survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert sum(info.is_ready for info in candidates) == 20
+        assert mgr._recovering_logical_retirement_ids == set(range(21, 26))
+        assert mgr._logical_retirement_reactivation_generation == 5
 
     def test_recovery_adoption_persist_failure_stays_off_route_for_retry(self):
         retiring = self._recoverable_logical_retirement(1)
