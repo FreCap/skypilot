@@ -1080,6 +1080,7 @@ def test_empty_fleet_records_compatibility_demand_before_admission():
 
     async def _run():
         lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._queued_compatibility_demand_supported = True
         lb._apply_routing_spec({
             'request_queue': _queue_config(max_concurrency=1,
                                            timeout_seconds=5),
@@ -1094,13 +1095,16 @@ def test_empty_fleet_records_compatibility_demand_before_admission():
         proxy = asyncio.create_task(lb._proxy_with_retries(request))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)
-        profiles = list(lb._request_aggregator.compatibility_profiles)
-        assert len(profiles) == 1
-        assert profiles[0]['priority'] == 50
-        assert profiles[0]['compatible_accelerators'] == ['A100']
+        assert lb._request_aggregator.request_history_snapshot() is None
+        assert lb._request_queue_profiles() == [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }]
         proxy.cancel()
         with pytest.raises(asyncio.CancelledError):
             await proxy
+        assert lb._request_queue_profiles() == []
 
     asyncio.run(_run())
 
@@ -1384,6 +1388,41 @@ def test_waiter_wakes_when_dispatch_slot_released():
     asyncio.run(_run())
 
 
+def test_controller_capability_rollback_backfills_waiting_demand_once():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._queued_compatibility_demand_supported = True
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4', 'A100'],
+        })
+        request = _request_with_headers([
+            (b'x-skyserve-compatible-accelerators', b'A100'),
+            (b'x-skyserve-priority', b'50'),
+        ])
+        request.body = mock.AsyncMock(return_value=b'')
+        proxy = asyncio.create_task(lb._proxy_with_retries(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        assert lb._request_aggregator.request_history_snapshot() is None
+
+        lb._set_queued_compatibility_demand_support(False)
+        first = lb._request_aggregator.request_history_snapshot()
+        assert first is not None
+        assert first['buckets'][0]['request_count'] == 1
+        lb._set_queued_compatibility_demand_support(False)
+        assert lb._request_aggregator.request_history_snapshot() == first
+
+        proxy.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy
+
+    asyncio.run(_run())
+
+
 def test_occupancy_probe_wakes_waiter():
 
     async def _run():
@@ -1425,6 +1464,9 @@ def test_timeout_and_cancellation_remove_waiters():
             await lb._acquire_request_slot(request)
         assert exc.value.status_code == 503
         assert lb._waiting_request_count == 0
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
 
         lb._request_queue_config = {
             **(lb._request_queue_config or {}),
@@ -1437,6 +1479,7 @@ def test_timeout_and_cancellation_remove_waiters():
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert lb._waiting_request_count == 0
+        assert lb._request_aggregator.request_history_snapshot() == history
 
     asyncio.run(_run())
 

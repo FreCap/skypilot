@@ -1111,6 +1111,56 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 1})
 
+    def test_queued_compatibility_demand_is_a_replaceable_gauge(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        autoscaler.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 60,
+            }],
+        })
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
+        autoscaler.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [],
+        })
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+
+    def test_compatibility_demand_survives_dynamic_state_handoff(self):
+        autoscaler = self._autoscaler(max_replicas=2)
+        now = time.time()
+        autoscaler.collect_request_information({
+            'timestamps': [now],
+            'compatibility_profiles': [{
+                'timestamp': now,
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 2,
+            }],
+            'queued_requests_by_compatibility': [{
+                'priority': 20,
+                'compatible_accelerators': ['L4', 'A100'],
+                'count': 3,
+            }],
+        })
+
+        restored = self._autoscaler(max_replicas=2)
+        restored.load_dynamic_states(autoscaler.dump_dynamic_states())
+
+        self.assertEqual(restored.request_timestamps, [now])
+        self.assertEqual(restored.compatibility_profiles,
+                         autoscaler.compatibility_profiles)
+        self.assertEqual(restored.queued_compatibility_profiles,
+                         autoscaler.queued_compatibility_profiles)
+
     def test_task_shape_controls_capacity_and_exact_scale_up_override(self):
         autoscaler = self._autoscaler(max_replicas=4)
         autoscaler.set_configured_accelerator_shapes({

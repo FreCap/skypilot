@@ -329,6 +329,52 @@ class LbSessionLedger:
 
 
 @dataclasses.dataclass(frozen=True)
+class CompatibilityDemand:
+    """One validated, JSON-safe accelerator compatibility demand profile."""
+
+    priority: int
+    compatible_accelerators: tuple[str, ...]
+    count: int
+    timestamp: float | None = None
+
+    @classmethod
+    def from_dict(cls, value: Any, *,
+                  require_timestamp: bool) -> CompatibilityDemand | None:
+        if not isinstance(value, dict):
+            return None
+        priority = value.get('priority')
+        accelerators = value.get('compatible_accelerators')
+        count = value.get('count', 1)
+        timestamp = value.get('timestamp')
+        if (not isinstance(priority, int) or isinstance(priority, bool) or
+                not isinstance(accelerators, list) or not accelerators or
+                not all(
+                    isinstance(card, str) and card for card in accelerators) or
+                not isinstance(count, int) or isinstance(count, bool) or
+                count < 1):
+            return None
+        if require_timestamp:
+            if (not isinstance(timestamp,
+                               (int, float)) or isinstance(timestamp, bool) or
+                    not math.isfinite(timestamp)):
+                return None
+            normalized_timestamp: float | None = float(timestamp)
+        else:
+            normalized_timestamp = None
+        return cls(priority, tuple(accelerators), count, normalized_timestamp)
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            'priority': self.priority,
+            'compatible_accelerators': list(self.compatible_accelerators),
+            'count': self.count,
+        }
+        if self.timestamp is not None:
+            value['timestamp'] = self.timestamp
+        return value
+
+
+@dataclasses.dataclass(frozen=True)
 class DemandSnapshot:
     """Durable scale-down-safe evidence retained across one promotion."""
 
@@ -337,6 +383,8 @@ class DemandSnapshot:
     rejected_in_window: int
     in_flight: dict[str, int] = dataclasses.field(default_factory=dict)
     unknown_in_flight_urls: tuple[str, ...] = ()
+    compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
+    queued_compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
 
     @classmethod
     def from_request(cls, request_data: dict[str, Any]) -> DemandSnapshot:
@@ -361,10 +409,27 @@ class DemandSnapshot:
         unknown = request_data.get('unknown_in_flight_urls', [])
         if not isinstance(unknown, list):
             unknown = []
+        raw_profiles = (aggregator.get('compatibility_profiles', [])
+                        if isinstance(aggregator, dict) else [])
+        if not isinstance(raw_profiles, list):
+            raw_profiles = []
+        compatibility_profiles = tuple(
+            profile for value in raw_profiles
+            if (profile := CompatibilityDemand.from_dict(
+                value, require_timestamp=True)) is not None)
+        raw_queued_profiles = request_data.get(
+            'queued_requests_by_compatibility', [])
+        if not isinstance(raw_queued_profiles, list):
+            raw_queued_profiles = []
+        queued_compatibility_profiles = tuple(
+            profile for value in raw_queued_profiles
+            if (profile := CompatibilityDemand.from_dict(
+                value, require_timestamp=False)) is not None)
         return cls(
             valid_timestamps, _nonnegative(request_data.get('queue_depth')),
             _nonnegative(request_data.get('rejected_in_window')), in_flight,
-            tuple(sorted(value for value in unknown if isinstance(value, str))))
+            tuple(sorted(value for value in unknown if isinstance(value, str))),
+            compatibility_profiles, queued_compatibility_profiles)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -373,6 +438,13 @@ class DemandSnapshot:
             'rejected_in_window': self.rejected_in_window,
             'in_flight': self.in_flight,
             'unknown_in_flight_urls': list(self.unknown_in_flight_urls),
+            'compatibility_profiles': [
+                profile.to_dict() for profile in self.compatibility_profiles
+            ],
+            'queued_requests_by_compatibility': [
+                profile.to_dict()
+                for profile in self.queued_compatibility_profiles
+            ],
         }
 
     @classmethod
@@ -382,24 +454,54 @@ class DemandSnapshot:
         snapshot = cls.from_request({
             'request_aggregator': {
                 'timestamps': value.get('timestamps', []),
+                'compatibility_profiles': value.get('compatibility_profiles',
+                                                    []),
             },
             'queue_depth': value.get('queue_depth'),
             'rejected_in_window': value.get('rejected_in_window'),
             'in_flight': value.get('in_flight'),
             'unknown_in_flight_urls': value.get('unknown_in_flight_urls'),
+            'queued_requests_by_compatibility':
+                value.get('queued_requests_by_compatibility'),
         })
         return snapshot
 
-    def floor(self, request_data: dict[str, Any]) -> dict[str, Any]:
+    def floor(self,
+              request_data: dict[str, Any],
+              *,
+              include_arrivals: bool = True) -> dict[str, Any]:
         """Return a copy with scale-up-safe demand floors applied."""
         merged = dict(request_data)
         current = DemandSnapshot.from_request(request_data)
-        # Timestamp samples are events, so use a set union rather than replaying
-        # the old list on every new-active heartbeat.
-        merged['request_aggregator'] = {
-            'timestamps':
-                sorted(set(self.timestamps) | set(current.timestamps))
+        if include_arrivals:
+            # Arrival samples are events, not gauges. Transfer the old-active
+            # batch exactly once; DemandHandoff keeps the remaining gauges
+            # floored without replaying these events on every heartbeat.
+            compatibility_profiles = list(self.compatibility_profiles)
+            known_profiles = set(compatibility_profiles)
+            for profile in current.compatibility_profiles:
+                if profile not in known_profiles:
+                    compatibility_profiles.append(profile)
+                    known_profiles.add(profile)
+            merged['request_aggregator'] = {
+                'timestamps':
+                    sorted(set(self.timestamps) | set(current.timestamps)),
+                'compatibility_profiles': [
+                    profile.to_dict() for profile in compatibility_profiles
+                ],
+            }
+        queued_profiles = {
+            (profile.priority, profile.compatible_accelerators): profile
+            for profile in self.queued_compatibility_profiles
         }
+        for profile in current.queued_compatibility_profiles:
+            key = (profile.priority, profile.compatible_accelerators)
+            previous = queued_profiles.get(key)
+            if previous is None or profile.count > previous.count:
+                queued_profiles[key] = profile
+        merged['queued_requests_by_compatibility'] = [
+            profile.to_dict() for profile in queued_profiles.values()
+        ]
         merged['queue_depth'] = max(self.queue_depth, current.queue_depth)
         merged['rejected_in_window'] = max(self.rejected_in_window,
                                            current.rejected_in_window)
@@ -425,14 +527,18 @@ class DemandHandoff:
         self._generation: int | None = None
         self._snapshot: DemandSnapshot | None = None
         self._complete_report_at: float | None = None
+        self._arrivals_applied = False
 
     def begin(self, generation: int, snapshot: DemandSnapshot | None) -> None:
         self._generation = generation
         self._snapshot = snapshot
         self._complete_report_at = None
+        self._arrivals_applied = False
 
     def restore(self, generation: int | None, snapshot: DemandSnapshot | None,
                 complete_report_at: float | None) -> None:
+        if generation != self._generation or snapshot != self._snapshot:
+            self._arrivals_applied = False
         self._generation = generation
         self._snapshot = snapshot
         self._complete_report_at = complete_report_at
@@ -465,5 +571,9 @@ class DemandHandoff:
             self._generation = None
             self._snapshot = None
             self._complete_report_at = None
+            self._arrivals_applied = False
             return request_data
-        return self._snapshot.floor(request_data)
+        floored = self._snapshot.floor(
+            request_data, include_arrivals=not self._arrivals_applied)
+        self._arrivals_applied = True
+        return floored

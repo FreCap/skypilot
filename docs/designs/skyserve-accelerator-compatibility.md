@@ -315,6 +315,29 @@ Acceptance gate:
 
 ### Milestone 6 - Rollout and production validation
 
+The controller/LB demand protocol is explicitly mixed-version safe. A new
+controller advertises support for the replaceable compatibility-queue gauge in
+each successful sync response. A new LB continues publishing the legacy
+pre-admission arrival event until that acknowledgement is observed, and treats
+a later missing acknowledgement as a controller rollback. On rollback it
+backfills every already-waiting request into the legacy event feed exactly once.
+An old LB ignores the additive response field; an old controller ignores the
+additive queue gauge. Services without an advertised exact-card catalog always
+retain legacy aggregate arrival scaling because they cannot publish bounded
+card profiles.
+
+HA cutover snapshots carry both accepted compatibility arrivals and the live
+compatibility-queue gauge. Arrival events transfer to the promoted controller
+state exactly once; the queue and in-flight gauges remain conservative floors
+for the bounded handoff interval. Repeated active heartbeats must not replay the
+same arrival batch, while old snapshot JSON that lacks these additive fields
+continues to deserialize as empty compatibility demand.
+
+An in-process autoscaler replacement during `sky serve update` transfers the
+windowed compatibility arrivals and current queue gauge together with aggregate
+timestamps. The replacement must never retain total demand while forgetting its
+exact-card constraints.
+
 1. Land and deploy SkyPilot schema/status changes with behavior disabled by absence of the new header/map.
 2. Land compatibility queue and per-card autoscaling behind a service flag; deploy to a test multi-card fleet.
 3. Verify the capacity endpoint advertises compatibility version 1 and distinct configured cards.

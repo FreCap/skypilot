@@ -339,6 +339,31 @@ def test_large_ready_set_is_not_emitted_to_info_logs():
     info.assert_not_called()
 
 
+def test_queue_demand_capability_negotiates_and_downgrades():
+    lb = _make_lb()
+    routing_spec = {
+        'load_balancing_policy_name': 'least_load',
+        'stream_timeout_seconds': 90,
+    }
+    _run_one_sync(
+        lb, {
+            'replica_info': {},
+            'num_ready_replicas': 0,
+            'routing_spec': routing_spec,
+            'queued_compatibility_demand_supported': True,
+        })
+    assert lb._queued_compatibility_demand_supported is True
+
+    # Missing means an older controller, including a rollback after a new
+    # controller had already enabled the gauge-only path.
+    _run_one_sync(lb, {
+        'replica_info': {},
+        'num_ready_replicas': 0,
+        'routing_spec': routing_spec,
+    })
+    assert lb._queued_compatibility_demand_supported is False
+
+
 def test_request_routing_does_not_emit_per_attempt_logs():
     policy = lb_policies.RoundRobinPolicy()
     policy.set_ready_replicas(['http://replica:8080'])

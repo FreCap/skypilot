@@ -1814,6 +1814,11 @@ class TestAuthoritativeLbReportIngestion:
             'request_aggregator': {
                 'timestamps': [201, 202]
             },
+            'queued_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 3,
+            }],
             'in_flight': {
                 self._URL: 2
             },
@@ -2239,6 +2244,12 @@ class TestAuthoritativeLbReportIngestion:
             }, {1}, 11, 13, 1)
         assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
             'unknown_capacity_replica_ids'] == []
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'queued_requests_by_compatibility'] == [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 3,
+            }]
         # The reporter's clean-looking drain fields are not copied. A blocking
         # view also invalidates any still-fresh proof from before the rollout.
         assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
@@ -2787,8 +2798,10 @@ class TestLbSyncBlockingReadsOffLoop:
         body = json.loads(response.body)
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
-            'capacity_hint', 'request_history_accepted'
+            'capacity_hint', 'request_history_accepted',
+            'queued_compatibility_demand_supported'
         }
+        assert body['queued_compatibility_demand_supported'] is True
 
 
 class TestLbSyncOwnershipFences:

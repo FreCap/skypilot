@@ -395,7 +395,11 @@ class TestLbCutoverAuthorityPG:
             4,
             2,
             in_flight={'http://replica': 1},
-            unknown_in_flight_urls=('http://unknown',))
+            unknown_in_flight_urls=('http://unknown',),
+            compatibility_profiles=(lb_ha.CompatibilityDemand(
+                50, ('A100',), 2, 10.0),),
+            queued_compatibility_profiles=(lb_ha.CompatibilityDemand(
+                50, ('A100',), 3),))
         assert serve_state.record_lb_active_demand_snapshot(
             'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.A, 1,
             demand_snapshot)

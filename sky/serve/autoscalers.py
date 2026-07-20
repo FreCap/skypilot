@@ -1707,6 +1707,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             version: spec.target_qps_per_replica
         }
         self.compatibility_profiles: list[dict[str, Any]] = []
+        # Outstanding queue demand is a last-writer-wins gauge. Unlike arrival
+        # profiles, it must be replaced on every authoritative LB report rather
+        # than accumulated across the QPS window.
+        self.queued_compatibility_profiles: list[dict[str, Any]] = []
         # Controller-owned exact task shapes. target_qps_per_replica keys are
         # performance profiles, not an authoritative resource shape: a bare
         # A100 profile can still describe an A100:8 task resource.
@@ -1778,11 +1782,59 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 'compatible_accelerators': tuple(accelerators),
                 'count': count,
             })
+        queued_profiles: list[dict[str, Any]] = []
+        for profile in request_aggregator_info.get(
+                'queued_requests_by_compatibility', []):
+            if not isinstance(profile, dict):
+                continue
+            priority = profile.get('priority')
+            accelerators = profile.get('compatible_accelerators')
+            count = profile.get('count', 1)
+            if (not isinstance(priority, int) or isinstance(priority, bool) or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1 or not all(
+                        isinstance(item, str) and item
+                        for item in accelerators)):
+                continue
+            queued_profiles.append({
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'count': count,
+            })
+        self.queued_compatibility_profiles = queued_profiles
         cutoff = time.time() - self.qps_window_size
         self.compatibility_profiles = [
             profile for profile in self.compatibility_profiles
             if profile['timestamp'] >= cutoff
         ]
+
+    def _dump_dynamic_states(self) -> dict[str, Any]:
+        """Preserve exact-card demand across an autoscaler replacement."""
+        states = super()._dump_dynamic_states()
+        states['compatibility_profiles'] = [{
+            **profile,
+            'compatible_accelerators': list(profile['compatible_accelerators']),
+        } for profile in self.compatibility_profiles]
+        states['queued_compatibility_profiles'] = [{
+            **profile,
+            'compatible_accelerators': list(profile['compatible_accelerators']),
+        } for profile in self.queued_compatibility_profiles]
+        return states
+
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
+        """Restore exact-card arrivals and the replaceable queue gauge."""
+        profiles = dynamic_states.pop('compatibility_profiles', [])
+        queued_profiles = dynamic_states.pop('queued_compatibility_profiles',
+                                             [])
+        super()._load_dynamic_states(dynamic_states)
+        self.compatibility_profiles = []
+        self.queued_compatibility_profiles = []
+        self.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': profiles,
+            'queued_requests_by_compatibility': queued_profiles,
+        })
 
     def generate_scaling_decisions(
         self,
@@ -1927,7 +1979,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 if card.casefold() not in seen:
                     cards.append(card)
                     seen.add(card.casefold())
-        for profile in self.compatibility_profiles:
+        for profile in (self.compatibility_profiles +
+                        self.queued_compatibility_profiles):
             for card in profile['compatible_accelerators']:
                 if card.casefold() not in seen:
                     cards.append(card)
@@ -2005,7 +2058,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 provisioning[card] += 1
 
         grouped: dict[tuple[int, tuple[str, ...]], int] = {}
-        for profile in self.compatibility_profiles:
+        for profile in (self.compatibility_profiles +
+                        self.queued_compatibility_profiles):
             requested = set(profile['compatible_accelerators'])
             # Compatibility is a set. Canonicalize by service cost order so
             # [L4, A100] and [A100, L4] share one bounded demand profile and
@@ -2091,6 +2145,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         candidate_target_by_accelerator: dict[str, int] | None = None
         latest_capacities: list[float] = []
         if (getattr(self, 'compatibility_profiles', []) or
+                getattr(self, 'queued_compatibility_profiles', []) or
                 getattr(self, 'min_replicas_by_accelerator', {})):
             candidate_target_by_accelerator = (
                 self._calculate_target_by_accelerator(replica_infos))
@@ -2177,9 +2232,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self.upscale_counter = self.downscale_counter = 0
         if apply_target:
             self.target_num_replicas = target_num_replicas
-            if candidate_target_by_accelerator is not None:
-                self.target_num_replicas_by_accelerator = dict(
-                    candidate_target_by_accelerator)
+            # Aggregate fallback deliberately has no exact-card assignment.
+            # Clear an older compatibility map so status and the decision path
+            # cannot reuse a stale shape target after the gauge becomes empty
+            # or an old LB stops publishing compatibility telemetry.
+            self.target_num_replicas_by_accelerator = dict(
+                candidate_target_by_accelerator or {})
 
         logger.info(
             f'Instance-aware: Old target number of replicas: '

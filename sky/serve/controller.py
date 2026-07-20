@@ -881,6 +881,8 @@ class SkyServeController:
             timestamps: list[int] = request_aggregator.get('timestamps', [])
             compatibility_profiles = request_aggregator.get(
                 'compatibility_profiles', [])
+            queued_compatibility_profiles = effective_request_data.get(
+                'queued_requests_by_compatibility', [])
             logger.info(f'Received {len(timestamps)} inflight requests.')
             translated_in_flight = self._translate_in_flight(
                 effective_request_data.get('in_flight'))
@@ -897,6 +899,7 @@ class SkyServeController:
             self._autoscaler.collect_request_information({
                 'timestamps': timestamps,
                 'compatibility_profiles': compatibility_profiles,
+                'queued_requests_by_compatibility': queued_compatibility_profiles,
                 'in_flight_by_replica_id': translated_in_flight,
                 'unknown_in_flight_replica_ids': list(unknown_replica_ids),
                 'observed_slots_by_replica_id': observed_slots,
@@ -1018,6 +1021,10 @@ class SkyServeController:
                     logical_versions,
                     replica_counts=replica_counts),
                 'request_history_accepted': request_history_accepted,
+                # Additive protocol negotiation for mixed-version rollouts.
+                # A new LB only relies exclusively on the replaceable queue
+                # gauge after a controller positively advertises support.
+                'queued_compatibility_demand_supported': True,
             }
             if getattr(self, '_lb_ha_enabled', False):
                 response_content['service_version'] = self._applied_version

@@ -57,6 +57,7 @@ _WAITING_REQUEST_BODY_BYTES_ATTR = '_skyserve_waiting_body_bytes'
 _REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
 _REQUEST_ACCELERATORS_ATTR = '_skyserve_compatible_accelerators'
 _REQUEST_GRANTED_ACCELERATOR_ATTR = '_skyserve_granted_accelerator'
+_REQUEST_DEMAND_RECORDED_ATTR = '_skyserve_request_demand_recorded'
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
 # transport failure cannot create a second logical operation. POST/PATCH are
@@ -173,6 +174,11 @@ class SkyServeLoadBalancer:
     _capacity_hint: dict[str, Any] | None = None
     _configured_accelerators: tuple[str, ...] | None = None
     _request_accelerator_compatibility_version: int | None = None
+    # Fail open for mixed-version availability: until a controller explicitly
+    # acknowledges the replaceable queue gauge, publish the legacy arrival
+    # event before admission so an old controller can cold-start an empty
+    # fleet. A successful old-controller response also downgrades this flag.
+    _queued_compatibility_demand_supported: bool = False
     _replica_info_by_url: dict[str, dict[str, Any]] | None = None
     _draining_clients: dict[str, list[httpx.AsyncClient]] | None = None
     _occupancy_capable: set[str] | None = None
@@ -319,6 +325,7 @@ class SkyServeLoadBalancer:
         self._request_queue_sequence = 0
         self._configured_accelerators = None
         self._request_accelerator_compatibility_version = None
+        self._queued_compatibility_demand_supported = False
         self._replica_info_by_url = {}
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
@@ -1328,6 +1335,29 @@ class SkyServeLoadBalancer:
              tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
                ]
 
+    def _record_request_demand_once(self, request: fastapi.Request) -> None:
+        """Commit one legacy/accepted demand event for this LB request."""
+        if vars(request).get(_REQUEST_DEMAND_RECORDED_ATTR, False):
+            return
+        self._request_aggregator.add(request)
+        setattr(request, _REQUEST_DEMAND_RECORDED_ATTR, True)
+
+    def _set_queued_compatibility_demand_support(self, supported: bool) -> None:
+        """Apply controller queue-gauge capability and rollback fallback."""
+        previous = getattr(self, '_queued_compatibility_demand_supported',
+                           False)
+        self._queued_compatibility_demand_supported = supported
+        if not previous or supported:
+            return
+        # A controller rollback can happen while requests are already waiting.
+        # Backfill each waiter once into the legacy arrival feed so the old
+        # controller can still cold-start compatible capacity. Request-local
+        # idempotence prevents a later admission/timeout from counting twice.
+        for bucket in self._request_queue_waiters_for_instance().values():
+            for waiter in bucket.values():
+                if not waiter.abandoned:
+                    self._record_request_demand_once(waiter.request)
+
     def _in_flight_by_accelerator_locked(self) -> dict[str, int]:
         """Attribute work to exact cards while holding client-pool lock."""
         if self._queue_uses_async_occupancy():
@@ -1521,6 +1551,11 @@ class SkyServeLoadBalancer:
                         self._record_unassigned_occupancy_admission(request)
                     return True
                 if self._waiting_request_count >= queue_size:
+                    # Capacity rejections are real demand even though they
+                    # never enter the queue. Unlike HA drain/inactive
+                    # rejections, recording them helps the controller grow the
+                    # exact compatible fleet instead of hiding overload.
+                    self._record_request_demand_once(request)
                     self._record_rejection(request)
                     raise fastapi.HTTPException(
                         status_code=503,
@@ -1579,6 +1614,7 @@ class SkyServeLoadBalancer:
                     if time.monotonic() >= deadline:
                         self._remove_request_queue_waiter_locked(waiter)
                         self._resolve_request_queue_waiter_locked(waiter)
+                        self._record_request_demand_once(request)
                         self._record_rejection(request)
                         self._dispatch_request_queue_locked()
                         raise self._queue_timeout_error()
@@ -2891,6 +2927,8 @@ class SkyServeLoadBalancer:
                 'draining_urls': list(self._draining_clients or {}),
                 'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,
+                'queued_requests_by_compatibility':
+                    self._request_queue_profiles(),
                 'rejected_in_window': self._rejected_in_window(),
             }
             try:
@@ -2929,6 +2967,10 @@ class SkyServeLoadBalancer:
                         # conservatively over-counting.
                         request_batch_accepted = True
                         response_json = await response.json()
+                        self._set_queued_compatibility_demand_support(
+                            response_json.get(
+                                'queued_compatibility_demand_supported') is
+                            True)
                         if response_json.get(
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
@@ -3708,10 +3750,17 @@ class SkyServeLoadBalancer:
             # work without occupying a queue slot.
             if self._request_queue_config is not None:
                 await self._request_body(request)
-            # Record demand before admission. In particular, a request waiting
-            # on an empty exact-card fleet must reach the controller so it can
-            # cause the first compatible replica to launch.
-            self._request_aggregator.add(request)
+            legacy_demand = (not getattr(
+                self, '_queued_compatibility_demand_supported', False) or
+                             self._configured_accelerators is None)
+            if legacy_demand:
+                # Until capability negotiation succeeds, retain the old
+                # pre-admission signal. This is required for a new LB rolled
+                # out before (or rolled back onto) an old controller: the old
+                # controller ignores the replaceable queue gauge. Services
+                # without an exact-card catalog also retain aggregate arrival
+                # scaling because their queue cannot publish card profiles.
+                self._record_request_demand_once(request)
             acquired_slot = await self._acquire_request_slot(request)
             had_admission_slot = acquired_slot
             if acquired_slot:
@@ -3725,6 +3774,11 @@ class SkyServeLoadBalancer:
                 raise self._draining_request_error()
             if not self._accepts_new_requests():
                 raise self._inactive_role_request_error()
+            # Commit arrival/history only after admission and its final role
+            # fence. Waiting work is reported separately as a live queue gauge,
+            # so an empty compatible fleet can still launch without leaving a
+            # phantom arrival behind when this LB drains during admission.
+            self._record_request_demand_once(request)
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):

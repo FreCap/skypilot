@@ -232,6 +232,78 @@ def test_demand_handoff_unions_old_and_new_in_flight_evidence():
     assert floored['unknown_in_flight_urls'] == ['unknown-new', 'unknown-old']
 
 
+def test_demand_handoff_preserves_compatibility_arrivals_and_queue_floors():
+    old_request = {
+        'request_aggregator': {
+            'timestamps': [10],
+            'compatibility_profiles': [{
+                'timestamp': 10,
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 2,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 3,
+        }],
+    }
+    current_request = {
+        'request_aggregator': {
+            'timestamps': [20],
+            'compatibility_profiles': [{
+                'timestamp': 20,
+                'priority': 20,
+                'compatible_accelerators': ['L4', 'A100'],
+                'count': 1,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }, {
+            'priority': 20,
+            'compatible_accelerators': ['L4', 'A100'],
+            'count': 4,
+        }],
+    }
+    snapshot = lb_ha.DemandSnapshot.from_request(old_request)
+    assert lb_ha.DemandSnapshot.from_dict(snapshot.to_dict()) == snapshot
+
+    handoff = lb_ha.DemandHandoff(60)
+    handoff.begin(8, snapshot)
+    floored = handoff.apply(8, current_request, True, now=1)
+
+    assert floored['request_aggregator']['timestamps'] == [10, 20]
+    assert floored['request_aggregator']['compatibility_profiles'] == [
+        old_request['request_aggregator']['compatibility_profiles'][0],
+        current_request['request_aggregator']['compatibility_profiles'][0],
+    ]
+    assert floored['queued_requests_by_compatibility'] == [{
+        'priority': 50,
+        'compatible_accelerators': ['A100'],
+        'count': 3,
+    }, {
+        'priority': 20,
+        'compatible_accelerators': ['L4', 'A100'],
+        'count': 4,
+    }]
+
+    next_request = {
+        **current_request,
+        'request_aggregator': {
+            'timestamps': [],
+            'compatibility_profiles': [],
+        },
+    }
+    repeated = handoff.apply(8, next_request, True, now=21)
+    assert repeated['request_aggregator'] == next_request['request_aggregator']
+    assert repeated['queued_requests_by_compatibility'] == floored[
+        'queued_requests_by_compatibility']
+
+
 def test_ha_kubernetes_contract_has_single_slot_selector_and_disruption_guard():
     service = lb_k8s._build_service_dict('service',
                                          'service-lb',
