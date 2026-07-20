@@ -183,11 +183,15 @@ Cancellation is allowed before trusted publication starts. Once publication
 starts, cancellation stops waiting but does not guess whether the registry
 write occurred. Recovery verifies staging and canonical digests.
 
-The requested release is reserved internally but is not returned by public
-release lookup until the distribution service commits it READY. A failed build
-or publication leaves the prior release or service version untouched. V0
-releases remain immutable, so publishing a replacement uses a new release name.
-A later mutable channel must snapshot one generation across every service,
+The requested release is advisory prototype metadata, not a distribution
+reservation. A digest does not exist yet, so temporary build state cannot
+serialize against normal v0 publication. At handoff, the trusted publisher
+submits the ordinary digest-backed publication transaction and may receive
+`RELEASE_CONFLICT` if another caller won the name. A failed build or publication
+leaves the prior release or service version untouched. True pre-build
+reservation requires reviewed durable post-gate schema and expiry semantics.
+V0 releases remain immutable, so publishing a replacement uses a new release
+name. A later mutable channel must snapshot one generation across every service,
 cluster, and job consumer before it can safely replace a name.
 
 ## Isolation and supply-chain boundary
@@ -217,7 +221,9 @@ than migration 024. It must demonstrate:
 4. R2 or S3 context upload without routing bytes through the API server;
 5. crash recovery before and after BuildKit output publication;
 6. trusted promotion into the existing distribution publication contract; and
-7. zero secret values in image history, logs, database rows, or attestations.
+7. deterministic handling when the advisory release name loses a publication
+   race; and
+8. zero secret values in image history, logs, database rows, or attestations.
 
 The prototype may live behind an internal command or test harness. It cannot be
 enabled in the Dashboard or normal client configuration.
