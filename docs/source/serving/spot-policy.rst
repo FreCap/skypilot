@@ -90,6 +90,12 @@ instance-shape lists. Configured cloud and region constraints still apply.
         min_replicas: 1
         max_replicas: 100
         target_concurrency_per_replica: 1
+        target_utilization_percentage: 90
+        expected_request_duration_seconds: 30
+        max_scale_up_rate_percentage: 20
+        scale_up_rate_min_replicas: 10
+        scale_up_rate_period_seconds: 60
+        max_scale_down_rate_percentage: 50
         spot_placer: dynamic_fallback_per_gpu
 
     resources:
@@ -106,11 +112,14 @@ per-GPU policy only when each configured GPU contributes one equivalent serving
 slot. The policy automatically makes ``min_replicas``, ``max_replicas``, and
 the autoscaler target count logical GPU slots, while the selected physical
 backend shape stays internal to SkyServe. A positive integer
-``target_concurrency_per_replica`` controls how many outstanding requests
-(including queued and recently rejected work) map to each slot; it does not
-change the occupancy-gated execution concurrency. Multiple accelerator models
-can be supplied as separate ``any_of`` entries; supported widths are discovered
-independently for each model.
+``target_concurrency_per_replica`` controls how many simultaneous requests map
+to each slot; it does not change the occupancy-gated execution concurrency.
+``target_utilization_percentage`` reserves request-slot headroom. When
+``expected_request_duration_seconds`` is set, recently rejected requests are
+converted from the load balancer's retained population into concurrent work.
+The scale-rate fields bound target changes to timed waves. Multiple accelerator
+models can be supplied as separate ``any_of`` entries; supported widths are
+discovered independently for each model.
 Non-spot entries and cluster-backed clouds such as Kubernetes remain at their
 explicitly configured count. SkyPilot does not inspect those live cluster APIs
 to discover additional shapes.

@@ -255,6 +255,33 @@ def get_service_schema():
                         'type': 'number',
                         'exclusiveMinimum': 0,
                     },
+                    'target_utilization_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
+                    },
+                    'expected_request_duration_seconds': {
+                        'type': 'number',
+                        'exclusiveMinimum': 0,
+                    },
+                    'max_scale_up_rate_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
+                    },
+                    'scale_up_rate_min_replicas': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'scale_up_rate_period_seconds': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'max_scale_down_rate_percentage': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 100,
+                    },
                     # Opt-in: allow the autoscaler to scale up onto free
                     # reserved (zero-cost) capacity. Absent/False means no
                     # behavior change; orthogonal to the demand knobs, so no

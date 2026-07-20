@@ -2172,6 +2172,13 @@ class SkyServeLoadBalancer:
         """Unique jobs terminally 503'd within the reject window (gauge)."""
         return len(self._prune_reject_window())
 
+    def _rejected_in_recent_window(self) -> int:
+        """Unique rejected jobs refreshed in the autoscaler rate window."""
+        retained = self._prune_reject_window()
+        cutoff = (time.monotonic() -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        return sum(last_seen > cutoff for last_seen in retained.values())
+
     async def _capacity(
             self, request: fastapi.Request) -> fastapi.responses.JSONResponse:
         """Data-plane capacity read: the volatile half of admission sizing.
@@ -2435,6 +2442,7 @@ class SkyServeLoadBalancer:
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
             'rejected_in_window': self._rejected_in_window(),
+            'rejected_in_recent_window': self._rejected_in_recent_window(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
             'min_replicas_by_accelerator': hint.get(
@@ -2969,6 +2977,7 @@ class SkyServeLoadBalancer:
                 'queued_requests_by_compatibility':
                     self._request_queue_profiles(),
                 'rejected_in_window': self._rejected_in_window(),
+                'rejected_in_recent_window': self._rejected_in_recent_window(),
             }
             try:
                 # Send request information. Drain the aggregator once for the

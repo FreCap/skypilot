@@ -193,18 +193,21 @@ def test_session_ledger_requires_applied_drain_role_and_generation():
 
 def test_demand_handoff_holds_then_expires_previous_active_floor():
     handoff = lb_ha.DemandHandoff(5)
-    handoff.begin(8, lb_ha.DemandSnapshot((10, 20), 7, 3))
+    handoff.begin(
+        8, lb_ha.DemandSnapshot((10, 20), 7, 3, rejected_in_recent_window=2))
     cold = {
         'request_aggregator': {
             'timestamps': [20, 30],
         },
         'queue_depth': 1,
         'rejected_in_window': 0,
+        'rejected_in_recent_window': 0,
     }
     floored = handoff.apply(8, cold, complete_authoritative_report=True, now=1)
     assert floored['request_aggregator']['timestamps'] == [10, 20, 30]
     assert floored['queue_depth'] == 7
     assert floored['rejected_in_window'] == 3
+    assert floored['rejected_in_recent_window'] == 2
     assert handoff.apply(8, cold, True, now=5.9)['queue_depth'] == 7
     assert handoff.apply(8, cold, True, now=6) == cold
 

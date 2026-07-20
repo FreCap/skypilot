@@ -1875,6 +1875,7 @@ class TestAuthoritativeLbReportIngestion:
             'unknown_in_flight_urls': [self._URL],
             'queue_depth': 11,
             'rejected_in_window': 13,
+            'rejected_in_recent_window': 8,
             'routing_urls': [self._URL],
             'draining_urls': [self._URL],
         }
