@@ -43,9 +43,12 @@ const readiness = {
       target: 'aws-us-west-2',
       region: 'us-west-2',
       queue_depth: 501,
+      queue_depth_at_least: false,
       failed_count: 3,
+      failed_count_at_least: false,
       oldest_queued_at: 9_900,
       quota_bound_eta_seconds: 51,
+      quota_bound_eta_at_least: false,
       quota_rate_per_second: 10,
       quota_blocked_until: null,
       max_manifests: 100_000,
@@ -140,5 +143,78 @@ describe('Image readiness', () => {
 
     expect(screen.queryByText('do-not-render')).toBeNull();
     expect(screen.getByText('secret_access_key: READY')).toBeVisible();
+  });
+
+  it('keeps cached data visible but disables mutations after refresh failure', () => {
+    render(
+      <ImageReadiness
+        readiness={readiness}
+        capabilities={capabilities}
+        loading={false}
+        error="READINESS_UNAVAILABLE"
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      /cached snapshot is read-only/
+    );
+    expect(
+      screen.getByRole('button', { name: 'Ingest handoff' })
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Run canary' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+  });
+
+  it('renders bounded queue counts and ETAs as lower bounds', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          queues: [
+            {
+              ...readiness.queues[0],
+              queue_depth: 10_000,
+              queue_depth_at_least: true,
+              failed_count: 10_000,
+              failed_count_at_least: true,
+              quota_bound_eta_seconds: 1000,
+              quota_bound_eta_at_least: true,
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getAllByText('10,000+')).toHaveLength(2);
+    expect(screen.getByText('10,000+ terminal failures')).toBeVisible();
+    expect(screen.getByText('10,000+ failed')).toBeVisible();
+    expect(screen.getByText('≥17m')).toBeVisible();
+  });
+
+  it('ages worker heartbeats from a live client clock', () => {
+    const dateNow = jest.spyOn(Date, 'now').mockReturnValue(10_031_000);
+    try {
+      render(
+        <ImageReadiness
+          readiness={readiness}
+          capabilities={capabilities}
+          loading={false}
+          error={null}
+          onRefresh={jest.fn()}
+        />
+      );
+      expect(
+        screen
+          .getAllByText('36s ago')
+          .find((element) => element.classList.contains('text-amber-700'))
+      ).toBeDefined();
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 });

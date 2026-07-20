@@ -24,6 +24,10 @@ resource "terraform_data" "validate_contract" {
       )
       error_message = "Configure both ami_arns and subnet_arns for EC2 canaries, or at least one eks_cluster_arn for an EKS-only target."
     }
+    precondition {
+      condition     = !local.ec2_canary_enabled || length(var.canary_instance_types) > 0
+      error_message = "EC2 canaries require at least one exact canary_instance_type."
+    }
   }
 }
 
@@ -61,6 +65,12 @@ data "aws_iam_policy_document" "permissions" {
         tolist(var.subnet_arns),
         tolist(var.security_group_arns),
       ))
+
+      condition {
+        test     = "StringEquals"
+        variable = "ec2:InstanceType"
+        values   = sort(tolist(var.canary_instance_types))
+      }
     }
   }
 
@@ -71,6 +81,12 @@ data "aws_iam_policy_document" "permissions" {
       effect    = "Allow"
       actions   = ["ec2:RunInstances", "ec2:CreateTags"]
       resources = local.instance_resource_arns
+
+      condition {
+        test     = "StringEquals"
+        variable = "ec2:InstanceType"
+        values   = sort(tolist(var.canary_instance_types))
+      }
 
       condition {
         test     = "StringEquals"
@@ -116,6 +132,12 @@ data "aws_iam_policy_document" "permissions" {
       effect    = "Allow"
       actions   = ["iam:PassRole"]
       resources = sort(tolist(var.runtime_role_arns))
+
+      condition {
+        test     = "StringEquals"
+        variable = "iam:PassedToService"
+        values   = ["ec2.amazonaws.com"]
+      }
     }
   }
 

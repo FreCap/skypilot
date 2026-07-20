@@ -52,6 +52,10 @@ _AWS_REGISTRY_REGION_PATTERN = re.compile(
     r'^[a-z]{2}(?:-[a-z0-9]+){1,3}-[0-9]+$')
 _GCP_STYLE_REGISTRY_REGION_PATTERN = re.compile(
     r'^(?:us|europe|asia|[a-z][a-z0-9]*(?:-[a-z0-9]+)*[0-9])$')
+_KUBERNETES_LABEL_NAME_PATTERN = re.compile(
+    r'^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$')
+_KUBERNETES_LABEL_PREFIX_PATTERN = re.compile(
+    r'^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$')
 
 
 def validate_workspace_name(value: Any, subject: str) -> str:
@@ -290,6 +294,48 @@ class RegistryAccessBindingKind(enum.Enum):
     KUBERNETES_DOCKERCONFIG_SECRET = 'kubernetes_dockerconfig_secret'
 
 
+@dataclasses.dataclass(frozen=True)
+class QualifiedKubernetesCluster:
+    """One immutable EKS cluster and node-pool qualification boundary."""
+
+    context: str
+    cluster_arn: str
+    node_role: str
+    namespace: str
+    node_selector: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        validate_control_plane_identifier(self.context,
+                                          'Qualified Kubernetes context')
+        if (not self.cluster_arn.startswith('arn:') or
+                not self.node_role.startswith('arn:') or
+                not isinstance(self.namespace, str) or not self.namespace or
+                len(self.namespace) > 253 or
+                any(character.isspace() for character in self.namespace)):
+            raise ValueError('Qualified EKS cluster identity is invalid.')
+        selector = tuple(self.node_selector)
+        if (not selector or len(selector) > 16 or
+                len({key for key, _ in selector}) != len(selector)):
+            raise ValueError('Qualified EKS node selector must contain 1 to '
+                             '16 unique labels.')
+        normalized: list[tuple[str, str]] = []
+        for key, value in selector:
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError('Qualified EKS node selector is invalid.')
+            prefix, separator, name = key.rpartition('/')
+            if not separator:
+                name = key
+                prefix = ''
+            if (not _KUBERNETES_LABEL_NAME_PATTERN.fullmatch(name) or
+                (prefix and
+                 (len(prefix) > 253 or
+                  not _KUBERNETES_LABEL_PREFIX_PATTERN.fullmatch(prefix))) or
+                    not _KUBERNETES_LABEL_NAME_PATTERN.fullmatch(value)):
+                raise ValueError('Qualified EKS node selector is invalid.')
+            normalized.append((key, value))
+        object.__setattr__(self, 'node_selector', tuple(sorted(normalized)))
+
+
 _ACCESS_PURPOSES = frozenset({
     'source_read',
     'destination_write',
@@ -318,7 +364,7 @@ class RegistryAccessBinding:
     canary_instance_type: str | None = None
     canary_subnets: tuple[tuple[str, tuple[str, ...]], ...] = ()
     canary_security_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    qualified_clusters: tuple[tuple[str, str, str, str], ...] = ()
+    qualified_clusters: tuple[QualifiedKubernetesCluster, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -403,17 +449,12 @@ class RegistryAccessBinding:
             validate_control_plane_identifier(self.canary_authority,
                                               'EKS canary authority')
             contexts: set[str] = set()
-            for context, cluster_arn, node_role, namespace in self.qualified_clusters:
-                validate_control_plane_identifier(
-                    context, 'Qualified Kubernetes context')
-                if (context in contexts or not cluster_arn.startswith('arn:') or
-                        not node_role.startswith('arn:') or
-                        not isinstance(namespace, str) or not namespace or
-                        len(namespace) > 253 or
-                        any(character.isspace() for character in namespace)):
+            for cluster in self.qualified_clusters:
+                if (not isinstance(cluster, QualifiedKubernetesCluster) or
+                        cluster.context in contexts):
                     raise ValueError(
                         'Qualified EKS cluster tuples are invalid.')
-                contexts.add(context)
+                contexts.add(cluster.context)
 
     @property
     def fingerprint(self) -> str:
@@ -643,10 +684,9 @@ class ManagedRegistryProfile:
                         runtime.qualified_node_images)):
                     raise ValueError('Registry EC2 runtime binding has no '
                                      'qualified tuple for the target region.')
-                if (backend == 'aws_eks' and not any(
-                        f':{target.region}:' in cluster_arn
-                        for _, cluster_arn, _, _ in runtime.qualified_clusters)
-                   ):
+                if (backend == 'aws_eks' and
+                        not any(f':{target.region}:' in cluster.cluster_arn
+                                for cluster in runtime.qualified_clusters)):
                     raise ValueError('Registry EKS runtime binding has no '
                                      'qualified cluster in the target region.')
                 canary = (bindings.get(runtime.canary_authority)
@@ -715,7 +755,15 @@ class ManagedRegistryProfile:
                 payload[field] = tuple(
                     (item[0], tuple(item[1])) for item in payload[field])
             payload['qualified_clusters'] = tuple(
-                tuple(item) for item in payload['qualified_clusters'])
+                QualifiedKubernetesCluster(context=item['context'],
+                                           cluster_arn=item['cluster_arn'],
+                                           node_role=item['node_role'],
+                                           namespace=item['namespace'],
+                                           node_selector=tuple(
+                                               tuple(pair)
+                                               for pair in
+                                               item['node_selector']))
+                for item in payload['qualified_clusters'])
             return RegistryAccessBinding(**payload)
 
         return cls(
@@ -802,6 +850,7 @@ class ImageLocationErrorCode(enum.Enum):
     EVICTION_COMPLETION_FENCE_CHANGED = ('eviction_completion_fence_changed')
     PROVIDER_THROTTLED = 'provider_throttled'
     PROVIDER_OUTCOME_AMBIGUOUS = 'provider_outcome_ambiguous'
+    REGISTRY_CAPACITY_EXHAUSTED = 'registry_capacity_exhausted'
     SOURCE_CONTENT_UNSUPPORTED = 'source_content_unsupported'
     SOURCE_PLATFORM_AMBIGUOUS = 'source_platform_ambiguous'
     SOURCE_PLATFORM_MISSING = 'source_platform_missing'
@@ -838,6 +887,7 @@ class ImageProfileState(enum.Enum):
 class ImageShardState(enum.Enum):
     """Admission state of a pre-provisioned physical repository shard."""
 
+    PENDING = 'PENDING'
     READY = 'READY'
     FULL = 'FULL'
     DRIFTED = 'DRIFTED'
@@ -1380,6 +1430,7 @@ class ResolvedContainerImage:
     credential_helper: str | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
+    kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
     status: str = 'READY'
     fallback_reason: str | None = None
 
@@ -1485,6 +1536,18 @@ class ResolvedContainerImage:
         if ((self.instance_profile is not None) != (self.runtime_principal
                                                     is not None)):
             raise ValueError('Resolved EC2 runtime identity fields are atomic.')
+        if self.kubernetes_node_selector:
+            if self.location_id is None or self.instance_profile is not None:
+                raise ValueError('Resolved Kubernetes node selector is valid '
+                                 'only for a managed Kubernetes pull plan.')
+            qualified = QualifiedKubernetesCluster(
+                context='validation',
+                cluster_arn='arn:validation',
+                node_role='arn:validation',
+                namespace='validation',
+                node_selector=self.kubernetes_node_selector)
+            object.__setattr__(self, 'kubernetes_node_selector',
+                               qualified.node_selector)
         if self.status not in {'READY', 'WARMING'}:
             raise ValueError('Resolved container image status must be READY '
                              'or WARMING.')
@@ -1497,7 +1560,7 @@ class ResolvedContainerImage:
                              'requires a fallback reason, and READY status '
                              'must not include one.')
 
-    def to_dict(self) -> dict[str, str | int | None]:
+    def to_dict(self) -> dict[str, Any]:
         """Returns a secret-free API/serialization representation."""
         return dataclasses.asdict(type(self).from_dict(self))
 
@@ -1521,7 +1584,8 @@ class ResolvedContainerImage:
             'location_id', 'distribution', 'profile_revision',
             'policy_fingerprint', 'profile_revision_id', 'target_fingerprint',
             'demand_id', 'demand_generation', 'credential_helper',
-            'runtime_principal', 'instance_profile', 'status', 'fallback_reason'
+            'runtime_principal', 'instance_profile', 'kubernetes_node_selector',
+            'status', 'fallback_reason'
         }
         unknown = set(value) - required - optional
         missing = required - set(value)
@@ -1556,4 +1620,14 @@ class ResolvedContainerImage:
              isinstance(demand_generation, bool))):
             raise ValueError('_resolved_container_image.demand_generation '
                              'must be an integer or null.')
+        node_selector = value.get('kubernetes_node_selector', ())
+        if (not isinstance(node_selector, (list, tuple)) or
+                any(not isinstance(item, (list, tuple)) or len(item) != 2
+                    for item in node_selector)):
+            raise ValueError('_resolved_container_image.'
+                             'kubernetes_node_selector must be a label-pair '
+                             'list.')
+        value = dict(value)
+        value['kubernetes_node_selector'] = tuple(
+            (str(item[0]), str(item[1])) for item in node_selector)
         return cls(**value)

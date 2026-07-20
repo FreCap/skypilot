@@ -6,9 +6,12 @@ groups, runtime roles, and instance profiles, and limits EKS identity checks to
 explicit cluster ARNs. Temporary instances must carry the exact SkyPilot
 catalog tag, and only matching tagged instances can be read or terminated.
 
-Configure both `ami_arns` and `subnet_arns` for EC2 qualification. An EKS-only
-deployment may leave both empty and provide `eks_cluster_arns`; it still lists
-the node roles and instance profiles that can be inspected.
+Configure `ami_arns`, `subnet_arns`, and at least one exact
+`canary_instance_type` for EC2 qualification. The launch policy constrains all
+three, requires catalog and operation tags, and permits `iam:PassRole` only to
+EC2. An EKS-only deployment may leave the EC2 inputs empty and provide
+`eks_cluster_arns`; it still lists the node roles and instance profiles that can
+be inspected.
 
 Use one module instance per compute account and region. Add its `role_arn` to
 `aws-image-worker-identity.canary_target_role_arns`, and use `binding` as the

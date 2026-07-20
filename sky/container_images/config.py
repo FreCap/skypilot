@@ -113,17 +113,27 @@ def _binding_from_config(name: str,
         clusters = value.get('qualified_clusters', ())
         if not isinstance(clusters, list):
             raise ValueError('qualified_clusters must be a list.')
-        qualified_clusters: list[tuple[str, str, str, str]] = []
+        qualified_clusters: list[models.QualifiedKubernetesCluster] = []
         for cluster in clusters:
             if not isinstance(cluster, dict) or set(cluster) != {
-                    'context', 'cluster_arn', 'node_role', 'namespace'
+                    'context', 'cluster_arn', 'node_role', 'namespace',
+                    'node_selector'
             }:
                 raise ValueError(
                     'Each qualified EKS cluster requires only '
-                    'context, cluster_arn, node_role, and namespace.')
+                    'context, cluster_arn, node_role, namespace, and '
+                    'node_selector.')
+            selector = cluster['node_selector']
+            if not isinstance(selector, dict):
+                raise ValueError('Qualified EKS node_selector must be a map.')
             qualified_clusters.append(
-                (str(cluster['context']), str(cluster['cluster_arn']),
-                 str(cluster['node_role']), str(cluster['namespace'])))
+                models.QualifiedKubernetesCluster(
+                    context=str(cluster['context']),
+                    cluster_arn=str(cluster['cluster_arn']),
+                    node_role=str(cluster['node_role']),
+                    namespace=str(cluster['namespace']),
+                    node_selector=tuple((str(key), str(item))
+                                        for key, item in selector.items())))
         kwargs['qualified_clusters'] = tuple(qualified_clusters)
         kwargs['canary_authority'] = value.get('canary_authority')
     else:

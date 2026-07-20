@@ -172,6 +172,11 @@ variable "applied_images_per_repository_quota" {
   type        = number
   default     = null
   nullable    = true
+
+  validation {
+    condition     = var.applied_images_per_repository_quota == null || var.applied_images_per_repository_quota >= 1
+    error_message = "applied_images_per_repository_quota must be null or positive."
+  }
 }
 
 variable "applied_ecr_api_rate_per_second" {

@@ -38,14 +38,16 @@ def runtime_ids(target: models.ManagedRegistryTarget, backend: str,
         return ((target.region,)
                 if target.region in dict(binding.qualified_node_images) else ())
     if backend == 'aws_eks':
-        return tuple(cluster[0]
+        return tuple(cluster.context
                      for cluster in binding.qualified_clusters
-                     if f':{target.region}:' in cluster[1])
+                     if f':{target.region}:' in cluster.cluster_arn)
     return ()
 
 
 def _attestation_requirements(
-        profile: models.ManagedRegistryProfile) -> dict[str, int | None]:
+    profile: models.ManagedRegistryProfile,
+    attestations: dict[str, Any] | None = None,
+) -> dict[str, int | None]:
     required: dict[str, int | None] = {'terraform': None}
     for target in (profile.canonical,) + profile.targets:
         required[models.profile_attestation_key('terraform_target',
@@ -62,6 +64,14 @@ def _attestation_requirements(
                 required[_runtime_attestation_key(
                     target, backend, binding, runtime_id
                 )] = (profile.qualification.runtime_attestation_max_age_seconds)
+    for key, evidence in (attestations or {}).items():
+        if not key.startswith('terraform_shard:'):
+            continue
+        live_key = (evidence.get('live_attestation_key') if isinstance(
+            evidence, dict) else None)
+        if not isinstance(live_key, str) or not live_key:
+            raise ValueError('Terraform shard attestation is invalid.')
+        required[live_key] = _AUTOMATIC_WINDOW_SECONDS
     return required
 
 
@@ -519,7 +529,10 @@ def maybe_activate_profile(
         return None
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
-    requirements = _attestation_requirements(profile)
+    try:
+        requirements = _attestation_requirements(profile, revision.attestations)
+    except ValueError:
+        return None
     for key, max_age in requirements.items():
         evidence = revision.attestations.get(key)
         if max_age is None:

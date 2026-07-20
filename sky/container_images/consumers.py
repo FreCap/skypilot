@@ -1,0 +1,122 @@
+"""Restart-stable managed-image consumer identity and optimizer context."""
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import dataclasses
+import re
+from typing import Any, Iterator
+
+from sky import task as task_lib
+from sky.serve import constants as serve_constants
+from sky.skylet import constants
+from sky.utils import common_utils
+
+
+@dataclasses.dataclass(frozen=True)
+class ImageConsumerContext:
+    """One logical deployment owner shared by optimization and provisioning."""
+
+    consumer_kind: str
+    consumer_owner: str
+    owner_epoch_token: str
+    metadata: dict[str, Any]
+
+
+_CURRENT: contextvars.ContextVar[ImageConsumerContext |
+                                 None] = (contextvars.ContextVar(
+                                     'managed_image_consumer', default=None))
+
+
+def _workload_attribution(
+        task: task_lib.Task, cluster_name: str, workload_type: str,
+        launch_context: dict[str, Any] | None) -> tuple[str, int | None]:
+    workload_id = cluster_name
+    workload_task_id = None
+    task_envs = task.envs or {}
+    if workload_type in ('service', 'pool'):
+        service_name = (launch_context or {}).get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if isinstance(service_name, str) and service_name:
+            service_version = (launch_context or {}).get(
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+            if type(service_version) is int and service_version > 0:
+                workload_task_id = service_version
+            return service_name, workload_task_id
+        replica_id = task_envs.get(serve_constants.REPLICA_ID_ENV_VAR)
+        replica_suffix = f'-{replica_id}' if replica_id is not None else None
+        if replica_suffix and cluster_name.endswith(replica_suffix):
+            workload_id = cluster_name[:-len(replica_suffix)]
+        return workload_id, workload_task_id
+    if workload_type != 'managed_job':
+        return workload_id, workload_task_id
+    managed_job_id = task_envs.get(constants.MANAGED_JOB_ID_ENV_VAR)
+    if managed_job_id:
+        workload_id = str(managed_job_id)
+    global_task_id = task_envs.get(constants.TASK_ID_ENV_VAR, '')
+    task_id_match = re.search(r'-(\d+)$', global_task_id)
+    if task_id_match is not None:
+        workload_task_id = int(task_id_match.group(1))
+    return workload_id, workload_task_id
+
+
+def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
+           launch_context: dict[str, Any] | None) -> ImageConsumerContext:
+    """Derives an identity that survives request and controller restarts."""
+    request_id = common_utils.get_current_request_id()
+    stable_cluster_name = cluster_name or f'unnamed:{request_id}'
+    workload_id, workload_task_id = _workload_attribution(
+        task, stable_cluster_name, workload_type, launch_context)
+    if workload_type in ('service', 'pool'):
+        service_hash = (launch_context or {}).get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if (isinstance(service_hash, str) and service_hash and
+                workload_task_id is not None):
+            return ImageConsumerContext(
+                consumer_kind='service_version',
+                consumer_owner=f'{workload_id}:v{workload_task_id}',
+                owner_epoch_token=(
+                    f'service:{service_hash}:v{workload_task_id}'),
+                metadata={
+                    'workload_type': workload_type,
+                    'workload_id': workload_id,
+                    'workload_task_id': workload_task_id,
+                    'service_hash': service_hash,
+                })
+    elif workload_type == 'managed_job' and workload_task_id is not None:
+        managed_job_id = (task.envs or {}).get(constants.MANAGED_JOB_ID_ENV_VAR)
+        if managed_job_id is not None:
+            owner = f'{managed_job_id}:task:{workload_task_id}'
+            return ImageConsumerContext(
+                consumer_kind='managed_job_task',
+                consumer_owner=owner,
+                owner_epoch_token=f'managed-job:{owner}',
+                metadata={
+                    'workload_type': workload_type,
+                    'workload_id': str(managed_job_id),
+                    'workload_task_id': workload_task_id,
+                    'request_id': request_id,
+                })
+    return ImageConsumerContext(
+        consumer_kind='cluster',
+        consumer_owner=stable_cluster_name,
+        owner_epoch_token=f'cluster:{stable_cluster_name}',
+        metadata={
+            'workload_type': 'cluster',
+            'workload_id': stable_cluster_name,
+            'request_id': request_id,
+        })
+
+
+def current() -> ImageConsumerContext | None:
+    return _CURRENT.get()
+
+
+@contextlib.contextmanager
+def use(context: ImageConsumerContext) -> Iterator[None]:
+    token = _CURRENT.set(context)
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)

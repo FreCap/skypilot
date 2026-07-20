@@ -544,6 +544,15 @@
                         "null"
                     ]
                 },
+                "healthPort": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
+                },
                 "maxInFlight": {
                     "type": "integer",
                     "minimum": 1
@@ -613,6 +622,15 @@
                         "null"
                     ]
                 },
+                "healthPort": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
+                },
                 "maxInFlight": {
                     "type": "integer",
                     "minimum": 1
@@ -632,6 +650,27 @@
                 },
                 "resources": {
                     "type": "object"
+                },
+                "sourceCredentialSecrets": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "required": ["namespace", "name"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "namespace": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 253
+                            },
+                            "name": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 253
+                            }
+                        }
+                    }
                 },
                 "serviceAccount": {
                     "type": "object",
@@ -687,6 +726,15 @@
                         "string",
                         "null"
                     ]
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
                 },
                 "maxInFlight": {
                     "type": "integer",

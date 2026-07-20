@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import json
+import socket
 from types import SimpleNamespace
 from unittest import mock
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -17,6 +22,7 @@ from sky.container_images import demand_state
 from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
 from sky.container_images import topology_state
+from sky.container_images import worker_health
 
 _DIGEST = 'sha256:' + 'a' * 64
 _CONFIG_DIGEST = 'sha256:' + 'b' * 64
@@ -36,6 +42,7 @@ def _cluster_demand(
         workspace='research',
         consumer_kind='cluster',
         consumer_owner='orphan-cluster',
+        request_id='request-id',
         consumer_generation=0,
         target_key='artifact:target',
         owner_epoch=1,
@@ -133,6 +140,98 @@ def test_canary_persists_only_closed_error_codes(
 
     assert not canary_worker_service.run_canary(operation)
     failed.assert_called_once_with(operation, expected)
+
+
+def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
+    return SimpleNamespace(metadata=SimpleNamespace(
+        uid=uid, labels={'skypilot.co/image-pull-role': selector_value}),
+                           spec=SimpleNamespace(
+                               provider_id=f'aws:///us-west-2a/{instance_id}',
+                               unschedulable=False))
+
+
+def test_eks_qualification_proves_every_selected_node_role(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    core = mock.Mock()
+    core.list_node.return_value = SimpleNamespace(
+        items=[_eks_node('node-a', 'i-a'),
+               _eks_node('node-b', 'i-b')],
+        metadata=SimpleNamespace(_continue=None))
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-a',
+                'IamInstanceProfile': {
+                    'Arn': 'arn:aws:iam::123:instance-profile/profile-a'
+                },
+            }, {
+                'InstanceId': 'i-b',
+                'IamInstanceProfile': {
+                    'Arn': 'arn:aws:iam::123:instance-profile/profile-b'
+                },
+            }]
+        }]
+    }
+    iam = mock.Mock()
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region: ec2 if service == 'ec2' else iam)
+    monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
+                        lambda _iam, _name: qualified.node_role)
+
+    count, node_set_hash = canary_worker_service._qualified_eks_nodes(
+        core, mock.sentinel.role, target, qualified)
+
+    assert count == 2
+    assert len(node_set_hash) == 64
+    core.list_node.assert_called_once_with(
+        label_selector='skypilot.co/image-pull-role=eks-node',
+        limit=canary_worker_service._MAX_QUALIFIED_EKS_NODES + 1,
+        _request_timeout=canary_worker_service.kubernetes.API_TIMEOUT)
+
+
+def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    core = mock.Mock()
+    core.list_node.return_value = SimpleNamespace(
+        items=[_eks_node('node-a', 'i-a'),
+               _eks_node('node-b', 'i-b')],
+        metadata=SimpleNamespace(_continue=None))
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': instance_id,
+                'IamInstanceProfile': {
+                    'Arn': f'arn:aws:iam::123:instance-profile/{profile_name}'
+                },
+            } for instance_id, profile_name in [('i-a',
+                                                 'qualified'), ('i-b', 'other')]
+                         ]
+        }]
+    }
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region: ec2
+        if service == 'ec2' else mock.Mock())
+    monkeypatch.setattr(
+        canary_worker_service, '_instance_profile_role',
+        lambda _iam, name: qualified.node_role
+        if name == 'qualified' else 'arn:aws:iam::123:role/OtherNodeRole')
+
+    with pytest.raises(ValueError,
+                       match='QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED'):
+        canary_worker_service._qualified_eks_nodes(core, mock.sentinel.role,
+                                                   target, qualified)
 
 
 def _artifact() -> catalog_state.ArtifactRecord:
@@ -354,3 +453,106 @@ def test_lost_copy_lease_cannot_mark_location_ready(
     destination.verify_graph.assert_not_called()
     assert all(
         call.kwargs.get('ready') is False for call in converge.call_args_list)
+
+
+def _dockerconfig_binding() -> models.RegistryAccessBinding:
+    return models.RegistryAccessBinding(
+        id='source-secret',
+        kind=(models.RegistryAccessBindingKind.KUBERNETES_DOCKERCONFIG_SECRET),
+        purposes=('source_read',),
+        reference={
+            'namespace': 'image-sources',
+            'name': 'ghcr',
+            'key': '.dockerconfigjson',
+        })
+
+
+def test_source_secret_allowlist_blocks_ambient_rbac(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST', '[]')
+    core_api = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.kubernetes, 'core_api',
+                        lambda: core_api)
+
+    with pytest.raises(ValueError, match='AUTH_BINDING_UNAVAILABLE'):
+        copy_worker_service._docker_config_credentials(_dockerconfig_binding(),
+                                                       'ghcr.io')
+    core_api.read_namespaced_secret.assert_not_called()
+
+
+def test_source_secret_allowlist_reads_only_the_exact_secret(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        'SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST',
+        json.dumps([{
+            'namespace': 'image-sources',
+            'name': 'ghcr'
+        }]))
+    payload = base64.b64encode(
+        json.dumps({
+            'auths': {
+                'https://ghcr.io': {
+                    'username': 'robot',
+                    'password': 'token',
+                }
+            }
+        }).encode()).decode()
+    core_api = mock.Mock()
+    core_api.read_namespaced_secret.return_value = SimpleNamespace(
+        data={'.dockerconfigjson': payload})
+    monkeypatch.setattr(copy_worker_service.kubernetes, 'core_api',
+                        lambda: core_api)
+
+    credentials = copy_worker_service._docker_config_credentials(
+        _dockerconfig_binding(), 'ghcr.io')
+
+    assert credentials.username == 'robot'
+    assert credentials.password == 'token'
+    core_api.read_namespaced_secret.assert_called_once_with(
+        'ghcr',
+        'image-sources',
+        _request_timeout=copy_worker_service.kubernetes.API_TIMEOUT)
+
+
+def test_worker_health_requires_heartbeat_and_detects_stalled_loop(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = {'value': 100.0}
+    monkeypatch.setattr(worker_health.time, 'monotonic',
+                        lambda: current['value'])
+    health = worker_health.WorkerHealth('copy', liveness_deadline_seconds=30)
+    assert health.snapshot().live
+    assert not health.snapshot().ready
+    health.registered()
+    health.heartbeat(True)
+    assert health.snapshot().ready
+    current['value'] = 131.0
+    assert not health.snapshot().live
+    assert not health.snapshot().ready
+
+
+def test_worker_health_http_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = {'value': 100.0}
+    monkeypatch.setattr(worker_health.time, 'monotonic',
+                        lambda: current['value'])
+    health = worker_health.WorkerHealth('copy', liveness_deadline_seconds=30)
+    health.registered()
+    health.heartbeat(True)
+    with socket.socket() as candidate:
+        candidate.bind(('127.0.0.1', 0))
+        port = candidate.getsockname()[1]
+    health_server = worker_health.HealthServer(health, port)
+    health_server.start()
+    try:
+        with urllib.request.urlopen(  # nosec B310
+                f'http://127.0.0.1:{port}/ready', timeout=2) as response:
+            assert response.status == 200
+        metrics = urllib.request.urlopen(  # nosec B310
+            f'http://127.0.0.1:{port}/metrics', timeout=2).read().decode()
+        assert 'skypilot_image_worker_ready{kind="copy"} 1' in metrics
+        current['value'] = 131.0
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(  # nosec B310
+                f'http://127.0.0.1:{port}/live', timeout=2)
+        assert error.value.code == 503
+    finally:
+        health_server.stop()

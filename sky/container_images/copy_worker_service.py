@@ -30,6 +30,7 @@ from sky.container_images import providers
 from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import transactions
+from sky.container_images import worker_health
 
 _ECR_AUTHORITY = re.compile(
     r'^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.'
@@ -123,6 +124,25 @@ class _LeaseHeartbeat:
 def _docker_config_credentials(binding: models.RegistryAccessBinding,
                                authority: str) -> providers.SourceCredentials:
     assert binding.reference is not None
+    try:
+        configured_allowlist = json.loads(
+            os.environ.get('SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST', '[]'))
+    except ValueError:
+        raise ValueError('AUTH_BINDING_UNAVAILABLE') from None
+    if (not isinstance(configured_allowlist, list) or
+            len(configured_allowlist) > 64 or
+            any(not isinstance(item, dict) or set(item) !=
+                {'namespace', 'name'} or not isinstance(item['namespace'], str)
+                or not isinstance(item['name'], str)
+                for item in configured_allowlist)):
+        raise ValueError('AUTH_BINDING_UNAVAILABLE')
+    allowed = {
+        (item['namespace'], item['name']) for item in configured_allowlist
+    }
+    secret_identity = (binding.reference['namespace'],
+                       binding.reference['name'])
+    if secret_identity not in allowed:
+        raise ValueError('AUTH_BINDING_UNAVAILABLE')
     secret = kubernetes.core_api().read_namespaced_secret(
         binding.reference['name'],
         binding.reference['namespace'],
@@ -272,6 +292,14 @@ def inspect_publication(publication: catalog_state.PublicationRecord,
                 max_releases_per_artifact=(
                     profile.limits.max_releases_per_artifact))
         return True
+    except topology_state.RegistryCapacityExhaustedError:
+        catalog_state.fail_publication_inspection(
+            publication.id,
+            token,
+            models.ImageLocationErrorCode.REGISTRY_CAPACITY_EXHAUSTED.value,
+            retry_at=None,
+            terminal=True)
+        return False
     except (ValueError, TypeError):
         catalog_state.fail_publication_inspection(
             publication.id,
@@ -454,7 +482,8 @@ def copy_location(location: topology_state.LocationRecord,
 
 
 def _profile_for_shard(
-        shard: topology_state.ShardRecord) -> models.ManagedRegistryProfile:
+    shard: topology_state.ShardRecord,
+) -> tuple[topology_state.ProfileRevisionRecord, models.ManagedRegistryProfile]:
     revisions = topology_state.list_profile_revisions(shard.workspace)
     revision = next((item for item in revisions
                      if item.profile == shard.profile and item.state in (
@@ -464,7 +493,22 @@ def _profile_for_shard(
                      )), None)
     if revision is None:
         raise ValueError('Registry shard has no usable profile revision.')
-    return models.ManagedRegistryProfile.from_snapshot(revision.config_snapshot)
+    return revision, models.ManagedRegistryProfile.from_snapshot(
+        revision.config_snapshot)
+
+
+def _expected_shard_attestation(
+    revision: topology_state.ProfileRevisionRecord,
+    shard: topology_state.ShardRecord,
+) -> tuple[str, dict[str, Any]]:
+    key = models.profile_attestation_key('terraform_shard',
+                                         shard.physical_fingerprint)
+    expected = revision.attestations.get(key)
+    if (not isinstance(expected, dict) or expected.get('status') != 'READY' or
+            expected.get('physical_fingerprint') != shard.physical_fingerprint
+            or not isinstance(expected.get('live_attestation_key'), str)):
+        raise LookupError('Terraform shard attestation is not committed yet.')
+    return str(expected['live_attestation_key']), expected
 
 
 def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
@@ -486,9 +530,9 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
         if backend == 'aws_vm':
             runtime_ids = (target.region,)
         else:
-            runtime_ids = tuple(cluster[0]
+            runtime_ids = tuple(cluster.context
                                 for cluster in binding.qualified_clusters
-                                if f':{target.region}:' in cluster[1])
+                                if f':{target.region}:' in cluster.cluster_arn)
         for runtime_id in runtime_ids:
             runtime_key = models.profile_attestation_key(
                 'runtime', target.name, backend, binding.fingerprint,
@@ -619,14 +663,39 @@ def reconcile_inventory(
     if token is None:
         return False
     try:
-        profile = _profile_for_shard(shard)
+        revision, profile = _profile_for_shard(shard)
         target = profile.target(shard.target_id)
         binding = profile.bindings[target.write_authority]
-        repository = aws.EcrRepository.from_role(
-            _aws_role(binding, profile, 'verify'),
-            shard.region,
-            shard.repository_name,
-            hooks=_ecr_hooks(limiter, shard))
+        role = _aws_role(binding, profile, 'verify')
+        repository = aws.EcrRepository.from_role(role,
+                                                 shard.region,
+                                                 shard.repository_name,
+                                                 hooks=_ecr_hooks(
+                                                     limiter, shard))
+        live_key, expected = _expected_shard_attestation(revision, shard)
+        metadata = repository.repository_metadata()
+        applied_quota = aws.applied_ecr_images_per_repository_quota(
+            role, shard.region)
+        expected_values = {
+            'repository_arn': expected.get('repository_arn'),
+            'repository_uri': expected.get('repository_uri'),
+            'tag_mutability': expected.get('tag_mutability'),
+            'encryption_type': expected.get('encryption_type'),
+            'kms_key': expected.get('kms_key'),
+            'scanning_mode': expected.get('scanning_mode'),
+            'policy_hash': expected.get('policy_hash'),
+            'ownership_tags_hash': expected.get('ownership_tags_hash'),
+        }
+        headroom = expected.get('reserved_headroom')
+        terraform_quota = expected.get('terraform_applied_quota')
+        max_manifests = expected.get('max_manifests')
+        if (metadata != expected_values or type(headroom) is not int or
+                type(terraform_quota) is not int or
+                type(max_manifests) is not int or
+                applied_quota < terraform_quota or
+                max_manifests + headroom > applied_quota):
+            topology_state.mark_shard_drifted(shard.id, token)
+            return False
         digests, cursor = repository.inventory_page(
             next_token=shard.inventory_cursor)
         completed = topology_state.record_inventory_page(
@@ -634,6 +703,9 @@ def reconcile_inventory(
         if completed is None:
             return False
         if cursor is not None:
+            return True
+        if completed.state not in (models.ImageShardState.READY,
+                                   models.ImageShardState.FULL):
             return True
         candidates = topology_state.list_inventory_missing_candidates(
             shard.id,
@@ -646,9 +718,27 @@ def reconcile_inventory(
                 shard.id,
                 completed.inventory_epoch,
                 present=present)
+        topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=live_key,
+            evidence={
+                'status': 'READY',
+                'observed_at': int(time.time()),
+                'physical_fingerprint': shard.physical_fingerprint,
+                **metadata,
+                'applied_images_per_repository_quota': applied_quota,
+                'reserved_headroom': headroom,
+                'inventory_epoch': completed.inventory_epoch,
+                'inventory_completed_at': completed.inventory_completed_at,
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash)
         return True
     except (aws.ProviderThrottledError, aws.AmbiguousProviderOutcomeError,
             budgets.ProviderBudgetUnavailableError):
+        topology_state.abandon_inventory_claim(shard.id, token)
+        return False
+    except LookupError:
         topology_state.abandon_inventory_claim(shard.id, token)
         return False
     except Exception as error:  # pylint: disable=broad-except
@@ -668,7 +758,8 @@ class CopyWorkerService:
                  worker_id: str,
                  version: str,
                  max_in_flight: int,
-                 lease_seconds: int = _DEFAULT_LEASE_SECONDS) -> None:
+                 lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+                 health: worker_health.WorkerHealth | None = None) -> None:
         self.worker_id = worker_id
         self.version = version
         self.max_in_flight = max_in_flight
@@ -677,6 +768,7 @@ class CopyWorkerService:
         self._claim_inspection_next = True
         self._claims_since_inventory = 16
         self._budget_limiter = budgets.ProviderBudgetLimiter(worker_id)
+        self._health = health
 
     def stop(self) -> None:
         self._stop.set()
@@ -714,6 +806,8 @@ class CopyWorkerService:
         topology_state.register_worker(self.worker_id,
                                        models.ImageWorkerKind.COPY,
                                        self.version, self.max_in_flight)
+        if self._health is not None:
+            self._health.registered()
         last_config_refresh = 0
         last_qualification_refresh = 0
         manifest_directory = os.environ.get(
@@ -724,6 +818,8 @@ class CopyWorkerService:
             futures: set[concurrent.futures.Future[bool]] = set()
             qualification_future: concurrent.futures.Future[bool] | None = None
             while not self._stop.is_set():
+                if self._health is not None:
+                    self._health.tick(len(futures))
                 done = {future for future in futures if future.done()}
                 for future in done:
                     with contextlib.suppress(Exception):
@@ -750,9 +846,10 @@ class CopyWorkerService:
                         _qualification_maintenance, self._budget_limiter)
                     futures.add(qualification_future)
                     last_qualification_refresh = current
-                topology_state.heartbeat_worker(self.worker_id,
-                                                in_flight=len(futures),
-                                                success=bool(done))
+                heartbeat_ok = topology_state.heartbeat_worker(
+                    self.worker_id, in_flight=len(futures), success=bool(done))
+                if self._health is not None:
+                    self._health.heartbeat(heartbeat_ok)
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = self._claim()
@@ -782,16 +879,27 @@ def main() -> None:
     max_in_flight = int(os.environ.get('SKYPILOT_IMAGE_MAX_IN_FLIGHT', '4'))
     if max_in_flight <= 0:
         raise ValueError('SKYPILOT_IMAGE_MAX_IN_FLIGHT must be positive.')
+    health = worker_health.WorkerHealth(
+        'copy',
+        liveness_deadline_seconds=int(
+            os.environ.get('SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS', '30')))
+    health_server = worker_health.HealthServer(
+        health, int(os.environ.get('SKYPILOT_IMAGE_HEALTH_PORT', '8081')))
     service = CopyWorkerService(
         worker_id=os.environ.get('SKYPILOT_IMAGE_WORKER_ID', str(uuid.uuid4())),
         version=os.environ.get('SKYPILOT_IMAGE_WORKER_VERSION', 'dev'),
         max_in_flight=max_in_flight,
         lease_seconds=int(
             os.environ.get('SKYPILOT_IMAGE_LEASE_SECONDS',
-                           str(_DEFAULT_LEASE_SECONDS))))
+                           str(_DEFAULT_LEASE_SECONDS))),
+        health=health)
     signal.signal(signal.SIGTERM, lambda *_: service.stop())
     signal.signal(signal.SIGINT, lambda *_: service.stop())
-    service.run_forever()
+    health_server.start()
+    try:
+        service.run_forever()
+    finally:
+        health_server.stop()
 
 
 if __name__ == '__main__':

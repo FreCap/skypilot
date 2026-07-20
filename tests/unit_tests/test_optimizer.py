@@ -256,6 +256,33 @@ def test_fill_in_launchable_resources_preserves_candidate_metadata():
     assert hints[requested] == ['capacity hint']
 
 
+def test_managed_image_locality_wins_across_resource_alternatives():
+    """A READY image globally beats cheaper direct or warming alternatives."""
+    image = mock.sentinel.container_image
+    ready_request = mock.Mock(container_image=image)
+    direct_request = mock.Mock(container_image=image)
+    warming_request = mock.Mock(container_image=image)
+    ready = mock.Mock()
+    direct = mock.Mock()
+    warming = mock.Mock()
+    launchable = {
+        ready_request: [ready],
+        direct_request: [direct],
+        warming_request: [warming],
+    }
+
+    optimizer_candidate_generation._filter_managed_image_locality(  # pylint: disable=protected-access
+        launchable, {
+            ready: 0,
+            direct: 1,
+            warming: 2,
+        })
+
+    assert launchable[ready_request] == [ready]
+    assert launchable[direct_request] == []
+    assert launchable[warming_request] == []
+
+
 def _optimize_ordered_task_with_mock_launchable(dag, launchable_call_indexes):
     fill_calls = []
 

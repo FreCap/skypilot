@@ -566,8 +566,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
             max_manifests=max_manifests,
             max_declared_bytes=max_declared_bytes,
             max_in_flight=max_in_flight,
-            state=models.ImageShardState.READY.value,
-            qualified_at=now,
+            state=models.ImageShardState.PENDING.value,
             created_at=now,
             updated_at=now).returning(table)).mappings().one()
         return _shard(row)
@@ -589,14 +588,20 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
             max_declared_bytes < int(row['reserved_declared_bytes'])):
         raise ValueError(
             'Registry shard ceilings cannot fall below reservations.')
+    values: dict[str, Any] = {
+        'max_manifests': max_manifests,
+        'max_declared_bytes': max_declared_bytes,
+        'max_in_flight': max_in_flight,
+        'updated_at': now,
+    }
+    if row['inventory_lease_token'] is None:
+        values.update(inventory_cursor=None,
+                      inventory_started_at=None,
+                      inventory_completed_at=None,
+                      observed_manifests=0)
     updated = session.execute(
         table.update().where(table.c.id == row['id']).values(
-            max_manifests=max_manifests,
-            max_declared_bytes=max_declared_bytes,
-            max_in_flight=max_in_flight,
-            state=models.ImageShardState.READY.value,
-            qualified_at=now,
-            updated_at=now).returning(table)).mappings().one()
+            **values).returning(table)).mappings().one()
     return _shard(updated)
 
 
@@ -655,6 +660,7 @@ def claim_inventory_shard(*,
         row = session.execute(
             sqlalchemy.select(table).where(
                 table.c.state.in_([
+                    models.ImageShardState.PENDING.value,
                     models.ImageShardState.READY.value,
                     models.ImageShardState.FULL.value,
                     models.ImageShardState.DRIFTED.value,
@@ -760,7 +766,12 @@ def record_inventory_page(shard_id: str,
                 state = models.ImageShardState.FULL.value
             else:
                 state = models.ImageShardState.READY.value
-            values.update(inventory_completed_at=current, state=state)
+            values.update(inventory_completed_at=current,
+                          state=state,
+                          qualified_at=(current if state
+                                        in (models.ImageShardState.READY.value,
+                                            models.ImageShardState.FULL.value)
+                                        else shard['qualified_at']))
         updated = session.execute(
             shards.update().where(shards.c.id == shard_id).values(
                 **values).returning(shards)).mappings().one()
@@ -789,6 +800,27 @@ def abandon_inventory_claim(shard_id: str,
             schema.registry_shards.c.id == shard_id,
             schema.registry_shards.c.inventory_lease_token ==
             lease_token).values(**values)).rowcount
+    return changed == 1
+
+
+def mark_shard_drifted(shard_id: str,
+                       lease_token: str,
+                       *,
+                       now: int | None = None) -> bool:
+    """Fails closed on live infrastructure mismatch while releasing its lease."""
+    current = int(time.time()) if now is None else now
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard_id,
+            schema.registry_shards.c.inventory_lease_token ==
+            lease_token).values(state=models.ImageShardState.DRIFTED.value,
+                                inventory_lease_token=None,
+                                inventory_lease_expires_at=None,
+                                inventory_cursor=None,
+                                inventory_started_at=None,
+                                inventory_completed_at=None,
+                                observed_manifests=0,
+                                updated_at=current)).rowcount
     return changed == 1
 
 
@@ -863,10 +895,20 @@ def complete_inventory_confirmation(
         return _location(updated)
 
 
+def _bounded_location_count(session: orm.Session, shard_ids: list[str],
+                            states: tuple[str, ...], result_cap: int) -> int:
+    bounded = sqlalchemy.select(schema.locations.c.id).where(
+        schema.locations.c.shard_id.in_(shard_ids),
+        schema.locations.c.state.in_(states)).limit(result_cap + 1).subquery()
+    statement = sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                 ).select_from(bounded)
+    return int(session.execute(statement).scalar_one())
+
+
 def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
     """Returns bounded queue and capacity aggregates without provider I/O."""
+    result_cap = 10_000
     shards = schema.registry_shards
-    locations = schema.locations
     pending_states = (
         models.ImageLocationState.PENDING.value,
         models.ImageLocationState.COPYING.value,
@@ -874,7 +916,6 @@ def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
         models.ImageLocationState.MISSING.value,
         models.ImageLocationState.EVICTED.value,
     )
-    pending = locations.c.state.in_(pending_states)
     capacity_statement = sqlalchemy.select(
         shards.c.profile,
         shards.c.target_id,
@@ -889,51 +930,62 @@ def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
             shards.c.max_declared_bytes).label('max_declared_bytes'),
         sqlalchemy.func.sum(shards.c.in_flight).label('in_flight'),
         sqlalchemy.func.sum(shards.c.max_in_flight).label('max_in_flight'),
+        sqlalchemy.func.array_agg(shards.c.id).label('shard_ids'),
     ).where(shards.c.workspace == workspace).group_by(
         shards.c.profile, shards.c.target_id, shards.c.account,
         shards.c.region).order_by(shards.c.profile, shards.c.target_id)
-    queue_statement = sqlalchemy.select(
-        shards.c.profile,
-        shards.c.target_id,
-        sqlalchemy.func.count(  # pylint: disable=not-callable
-            locations.c.id).filter(pending).label('queue_depth'),
-        sqlalchemy.func.count(  # pylint: disable=not-callable
-            locations.c.id).filter(
-                locations.c.state ==
-                models.ImageLocationState.FAILED.value).label('failed_count'),
-        sqlalchemy.func.min(
-            locations.c.updated_at).filter(pending).label('oldest_queued_at'),
-    ).select_from(shards.join(locations,
-                              locations.c.shard_id == shards.c.id)).where(
-                                  shards.c.workspace == workspace).group_by(
-                                      shards.c.profile, shards.c.target_id)
     with orm.Session(catalog_state.engine()) as session:
         rows = session.execute(capacity_statement).mappings().all()
-        queue_rows = session.execute(queue_statement).mappings().all()
-    queues = {
-        (str(row['profile']), str(row['target_id'])): row for row in queue_rows
-    }
-    return [{
-        'profile': str(row['profile']),
-        'target': str(row['target_id']),
-        'account': str(row['account']),
-        'region': str(row['region']),
-        'reserved_manifests': int(row['reserved_manifests'] or 0),
-        'max_manifests': int(row['max_manifests'] or 0),
-        'reserved_declared_bytes': int(row['reserved_declared_bytes'] or 0),
-        'max_declared_bytes': int(row['max_declared_bytes'] or 0),
-        'in_flight': int(row['in_flight'] or 0),
-        'max_in_flight': int(row['max_in_flight'] or 0),
-        'queue_depth': int(
-            queues.get((str(row['profile']), str(row['target_id'])),
-                       {}).get('queue_depth') or 0),
-        'failed_count': int(
-            queues.get((str(row['profile']), str(row['target_id'])),
-                       {}).get('failed_count') or 0),
-        'oldest_queued_at': queues.get(
-            (str(row['profile']), str(row['target_id'])),
-            {}).get('oldest_queued_at'),
-    } for row in rows]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            shard_ids = [str(item) for item in row['shard_ids']]
+            queued_count = _bounded_location_count(session, shard_ids,
+                                                   pending_states, result_cap)
+            failed_count = _bounded_location_count(
+                session, shard_ids, (models.ImageLocationState.FAILED.value,),
+                result_cap)
+            # The minimum of each shard/state index head is the exact global
+            # oldest row, without scanning or sorting the complete queue.
+            oldest_statement = sqlalchemy.text("""
+                SELECT MIN(candidate.updated_at)
+                FROM unnest(CAST(:shard_ids AS text[])) AS shard(id)
+                CROSS JOIN unnest(CAST(:states AS text[])) AS selected(state)
+                CROSS JOIN LATERAL (
+                    SELECT location.updated_at
+                    FROM container_image_locations AS location
+                    WHERE location.shard_id = shard.id
+                      AND location.state = selected.state
+                    ORDER BY location.updated_at, location.id
+                    LIMIT 1
+                ) AS candidate
+            """).bindparams(
+                sqlalchemy.bindparam('shard_ids',
+                                     type_=postgresql.ARRAY(sqlalchemy.Text())),
+                sqlalchemy.bindparam('states',
+                                     type_=postgresql.ARRAY(sqlalchemy.Text())))
+            oldest_queued_at = session.execute(oldest_statement, {
+                'shard_ids': shard_ids,
+                'states': list(pending_states),
+            }).scalar_one()
+            results.append({
+                'profile': str(row['profile']),
+                'target': str(row['target_id']),
+                'account': str(row['account']),
+                'region': str(row['region']),
+                'reserved_manifests': int(row['reserved_manifests'] or 0),
+                'max_manifests': int(row['max_manifests'] or 0),
+                'reserved_declared_bytes': int(row['reserved_declared_bytes'] or
+                                               0),
+                'max_declared_bytes': int(row['max_declared_bytes'] or 0),
+                'in_flight': int(row['in_flight'] or 0),
+                'max_in_flight': int(row['max_in_flight'] or 0),
+                'queue_depth': min(queued_count, result_cap),
+                'queue_depth_at_least': queued_count > result_cap,
+                'failed_count': min(failed_count, result_cap),
+                'failed_count_at_least': failed_count > result_cap,
+                'oldest_queued_at': oldest_queued_at,
+            })
+    return results
 
 
 def get_shard(shard_id: str) -> ShardRecord | None:
@@ -1200,19 +1252,55 @@ def retry_location(location_id: str,
                    now: int | None = None) -> LocationRecord | None:
     current = int(time.time()) if now is None else now
     locations = schema.locations
+    shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        row = session.execute(locations.update().where(
-            locations.c.id == location_id, locations.c.workspace == workspace,
-            locations.c.state.in_([
-                models.ImageLocationState.FAILED.value,
-                models.ImageLocationState.MISSING.value,
-                models.ImageLocationState.EVICTED.value,
-            ])).values(
-                state=models.ImageLocationState.PENDING.value,
-                next_retry_at=None,
-                error_code=None,
-                updated_at=current).returning(locations)).mappings().first()
-        return _location(row) if row is not None else None
+        optimistic = session.execute(
+            sqlalchemy.select(locations.c.shard_id).where(
+                locations.c.id == location_id,
+                locations.c.workspace == workspace)).first()
+        if optimistic is None:
+            return None
+        shard = session.execute(
+            sqlalchemy.select(shards).where(shards.c.id == optimistic[0]).
+            with_for_update()).mappings().one()
+        row = session.execute(
+            sqlalchemy.select(locations).where(
+                locations.c.id == location_id, locations.c.workspace ==
+                workspace).with_for_update()).mappings().one()
+        if str(row['state']) not in (models.ImageLocationState.FAILED.value,
+                                     models.ImageLocationState.MISSING.value,
+                                     models.ImageLocationState.EVICTED.value):
+            return None
+        values: dict[str, Any] = {
+            'state': models.ImageLocationState.PENDING.value,
+            'next_retry_at': None,
+            'error_code': None,
+            'updated_at': current,
+        }
+        if str(row['state']) == models.ImageLocationState.EVICTED.value:
+            if int(row['reserved_declared_bytes']) != 0:
+                raise RuntimeError(
+                    'Evicted location retained a capacity charge.')
+            charge = session.execute(
+                sqlalchemy.select(schema.images.c.declared_size_bytes).where(
+                    schema.images.c.id == row['image_id'])).scalar_one()
+            changed = session.execute(shards.update().where(
+                shards.c.id == shard['id'], shards.c.reserved_manifests
+                < shards.c.max_manifests,
+                shards.c.reserved_declared_bytes + charge
+                <= shards.c.max_declared_bytes).values(
+                    reserved_manifests=shards.c.reserved_manifests + 1,
+                    reserved_declared_bytes=(shards.c.reserved_declared_bytes +
+                                             charge),
+                    updated_at=current)).rowcount
+            if changed != 1:
+                raise RegistryCapacityExhaustedError(
+                    'REGISTRY_CAPACITY_EXHAUSTED')
+            values['reserved_declared_bytes'] = charge
+        updated = session.execute(
+            locations.update().where(locations.c.id == location_id).values(
+                **values).returning(locations)).mappings().one()
+        return _location(updated)
 
 
 def register_worker(worker_id: str,
@@ -1357,10 +1445,12 @@ def claim_next_eviction(*,
 def complete_eviction(location_id: str,
                       lease_token: str,
                       *,
-                      absent: bool,
-                      terminal_denial: bool = False,
+                      present: bool | None,
+                      provider_not_called: bool = False,
                       now: int | None = None) -> LocationRecord | None:
-    """Commits EVICTED only after exact absence, or restores READY on denial."""
+    """Commits only exact presence/absence or a proven no-I/O denial."""
+    if provider_not_called and present is not None:
+        raise ValueError('No-I/O eviction completion cannot assert presence.')
     current = int(time.time()) if now is None else now
     locations = schema.locations
     shards = schema.registry_shards
@@ -1389,16 +1479,7 @@ def complete_eviction(location_id: str,
                     models.ImageDemandState.WARMING.value,
                     models.ImageDemandState.READY.value,
                 ])).limit(1)).first()
-        if live_demand is not None:
-            terminal_denial = True
-            absent = False
-        if absent:
-            new_state = models.ImageLocationState.EVICTED
-            error_code = None
-        elif terminal_denial:
-            new_state = models.ImageLocationState.READY
-            error_code = models.ImageLocationErrorCode.EVICTION_FAILED.value
-        else:
+        if present is None and not provider_not_called:
             # Keep the ambiguous EVICTING state. Clearing the expired lease is
             # forbidden by the schema, so extend it for the next exact read.
             updated = session.execute(
@@ -1408,33 +1489,55 @@ def complete_eviction(location_id: str,
                                 PROVIDER_OUTCOME_AMBIGUOUS.value),
                     updated_at=current).returning(locations)).mappings().one()
             return _location(updated)
+        release_reservation = False
+        if provider_not_called:
+            new_state = models.ImageLocationState.READY
+            error_code = models.ImageLocationErrorCode.EVICTION_FAILED.value
+        elif present:
+            new_state = models.ImageLocationState.READY
+            error_code = None
+        elif live_demand is not None:
+            new_state = models.ImageLocationState.PENDING
+            error_code = None
+        else:
+            new_state = models.ImageLocationState.EVICTED
+            error_code = None
+            release_reservation = True
+        location_values: dict[str, Any] = {
+            'state': new_state.value,
+            'lease_kind': None,
+            'lease_token': None,
+            'lease_expires_at': None,
+            'next_retry_at': None,
+            'error_code': error_code,
+            'updated_at': current,
+        }
+        if release_reservation:
+            location_values['reserved_declared_bytes'] = 0
         updated = session.execute(
             locations.update().where(locations.c.id == location_id).values(
-                state=new_state.value,
-                lease_kind=None,
-                lease_token=None,
-                lease_expires_at=None,
-                next_retry_at=None,
-                error_code=error_code,
-                updated_at=current).returning(locations)).mappings().one()
+                **location_values).returning(locations)).mappings().one()
         shard_values: dict[str, Any] = {
             'in_flight': sqlalchemy.case(
                 (shards.c.in_flight > 0, shards.c.in_flight - 1), else_=0),
             'updated_at': current,
         }
-        if absent:
-            shard_values.update(reserved_manifests=sqlalchemy.case(
-                (shards.c.reserved_manifests
-                 > 0, shards.c.reserved_manifests - 1),
-                else_=0),
-                                reserved_declared_bytes=sqlalchemy.case(
-                                    (shards.c.reserved_declared_bytes
-                                     >= row['reserved_declared_bytes'],
-                                     shards.c.reserved_declared_bytes -
-                                     row['reserved_declared_bytes']),
-                                    else_=0))
-        session.execute(shards.update().where(
-            shards.c.id == row['shard_id']).values(**shard_values))
+        if release_reservation:
+            shard_values.update(
+                reserved_manifests=shards.c.reserved_manifests - 1,
+                reserved_declared_bytes=(shards.c.reserved_declared_bytes -
+                                         row['reserved_declared_bytes']))
+        shard_predicates = [shards.c.id == row['shard_id']]
+        if release_reservation:
+            shard_predicates.extend((
+                shards.c.reserved_manifests > 0,
+                shards.c.reserved_declared_bytes
+                >= row['reserved_declared_bytes'],
+            ))
+        changed = session.execute(shards.update().where(
+            *shard_predicates).values(**shard_values)).rowcount
+        if changed != 1:
+            raise RuntimeError('Eviction reservation accounting drifted.')
         return _location(updated)
 
 

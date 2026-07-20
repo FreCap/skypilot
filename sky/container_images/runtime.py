@@ -10,6 +10,7 @@ import typing
 
 from sky.container_images import catalog_state
 from sky.container_images import config
+from sky.container_images import consumers
 from sky.container_images import demand_state
 from sky.container_images import models
 from sky.container_images import topology_state
@@ -34,6 +35,10 @@ class ContainerImageWarmingError(ValueError):
 class ContainerImagePreparationFailedError(ValueError):
     """The selected target reached a closed terminal preparation failure."""
 
+    def __init__(self, demand_id: str) -> None:
+        self.demand_id = demand_id
+        super().__init__('IMAGE_PREPARATION_FAILED')
+
 
 @dataclasses.dataclass(frozen=True)
 class _MetadataResolution:
@@ -45,10 +50,14 @@ class _MetadataResolution:
     active: topology_state.ProfileRevisionRecord | None = None
     artifact: catalog_state.ArtifactRecord | None = None
     publication: catalog_state.PublicationRecord | None = None
+    location: topology_state.LocationRecord | None = None
     target: models.ManagedRegistryTarget | None = None
     binding: models.RegistryAccessBinding | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
+    kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
+    locality_rank: int = 0
+    current_demand: demand_state.DemandRecord | None = None
 
 
 def _policy_fingerprint(active: topology_state.ProfileRevisionRecord,
@@ -122,7 +131,7 @@ def _target_for_placement(
             if binding_id is None:
                 continue
             binding = profile.bindings[binding_id]
-            if any(cluster[0] == placement.region
+            if any(cluster.context == placement.region
                    for cluster in binding.qualified_clusters):
                 matching_targets.append(candidate)
         if len(matching_targets) != 1:
@@ -146,7 +155,8 @@ def _target_for_placement(
 def _runtime_binding(
     profile: models.ManagedRegistryProfile,
     target: models.ManagedRegistryTarget, placement: models.Placement
-) -> tuple[models.RegistryAccessBinding, str | None, str | None, str | None]:
+) -> tuple[models.RegistryAccessBinding, str | None, str | None, str | None,
+           tuple[tuple[str, str], ...]]:
     binding_id = target.runtime_binding(placement.backend)
     if binding_id is None:
         raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
@@ -154,6 +164,7 @@ def _runtime_binding(
     expected_host_image: str | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
+    kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
     if placement.backend == 'aws_vm':
         if (binding.kind
                 != models.RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY):
@@ -175,15 +186,18 @@ def _runtime_binding(
                 != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY):
             raise ValueError('QUALIFICATION_FAILED')
         qualified = next((item for item in binding.qualified_clusters
-                          if item[0] == placement.region), None)
+                          if item.context == placement.region), None)
         if qualified is None:
             raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
-        _, expected_cluster_arn, expected_node_role, _ = qualified
+        expected_cluster_arn = qualified.cluster_arn
+        expected_node_role = qualified.node_role
+        kubernetes_node_selector = qualified.node_selector
         if (placement.kubernetes_cluster_arn not in (None, expected_cluster_arn)
                 or placement.kubernetes_node_role
                 not in (None, expected_node_role)):
             raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
-    return binding, expected_host_image, runtime_principal, instance_profile
+    return (binding, expected_host_image, runtime_principal, instance_profile,
+            kubernetes_node_selector)
 
 
 def _pin_host_image(resources: 'resources_lib.Resources',
@@ -206,6 +220,50 @@ def _direct_fallback_allowed(policy: models.WorkspaceImagePolicy,
             policy.locality == models.Locality.PREFER and image.ref is not None)
 
 
+def _current_consumer_demand(
+    workspace: str,
+    cache: dict[tuple[typing.Any, ...], typing.Any],
+) -> demand_state.DemandRecord | None:
+    consumer = consumers.current()
+    if consumer is None:
+        return None
+    owner_epoch = demand_state.owner_epoch_from_token(
+        consumer.owner_epoch_token)
+    key = ('consumer_demand', workspace, consumer.consumer_kind,
+           consumer.consumer_owner, owner_epoch)
+    if key not in cache:
+        cache[key] = demand_state.get_current_demand_for_owner_epoch(
+            workspace=workspace,
+            consumer_kind=consumer.consumer_kind,
+            consumer_owner=consumer.consumer_owner,
+            owner_epoch=owner_epoch)
+    return cache[key]
+
+
+def _matches_current_demand(
+        demand: demand_state.DemandRecord, *, placement: models.Placement,
+        active: topology_state.ProfileRevisionRecord,
+        artifact: catalog_state.ArtifactRecord,
+        target: models.ManagedRegistryTarget,
+        location: topology_state.LocationRecord | None) -> bool:
+    if location is None:
+        return False
+    expected_placement = {
+        'provider': placement.provider,
+        'region': placement.region,
+        'backend': placement.backend,
+        'platform': placement.platform or 'linux/amd64',
+    }
+    return (demand.image_id == artifact.id and
+            demand.runtime_digest == artifact.runtime_digest and
+            demand.profile_revision_id == active.id and
+            demand.target_fingerprint == target.target_fingerprint and
+            demand.location_id == location.id and demand.target_key
+            == f'{artifact.id}:{target.target_fingerprint}' and all(
+                demand.placement.get(key) == value
+                for key, value in expected_placement.items()))
+
+
 def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
                            profile: models.ManagedRegistryProfile,
                            target: models.ManagedRegistryTarget,
@@ -219,12 +277,27 @@ def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
                                          runtime_id)
     evidence = active.attestations.get(key)
     current = int(time.time()) if now is None else now
+    eks_identity_matches = True
+    if placement.backend == 'aws_eks':
+        qualified = next((item for item in binding.qualified_clusters
+                          if item.context == runtime_id), None)
+        eks_identity_matches = (
+            qualified is not None and isinstance(evidence, dict) and
+            evidence.get('cluster_arn') == qualified.cluster_arn and
+            evidence.get('node_role') == qualified.node_role and
+            evidence.get('node_selector') == dict(qualified.node_selector) and
+            isinstance(evidence.get('qualified_node_count'), int) and
+            evidence['qualified_node_count'] > 0 and
+            isinstance(evidence.get('qualified_node_set_hash'), str))
     return (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
             evidence.get('target_fingerprint') == target.target_fingerprint and
             evidence.get('binding_fingerprint') == binding.fingerprint and
             evidence.get('backend') == placement.backend and
             evidence.get('runtime_id') == runtime_id and
-            isinstance(evidence.get('observed_at'), int) and
+            eks_identity_matches and
+            (placement.kubernetes_cluster_arn is None or
+             evidence.get('cluster_arn') == placement.kubernetes_cluster_arn)
+            and isinstance(evidence.get('observed_at'), int) and
             0 <= current - evidence['observed_at'] <=
             profile.qualification.runtime_attestation_max_age_seconds)
 
@@ -241,23 +314,45 @@ def _resolve_metadata(
     if (image is None or resources.container_image_from_legacy_image_id or
             resources.resolved_container_image is not None):
         return _MetadataResolution(resources=resources, direct=True)
-    profile_key = ('profile', workspace, image.distribution)
-    if profile_key not in cache:
-        cache[profile_key] = config.resolve_profile(image.distribution,
-                                                    workspace)
-    profile, policy = cache[profile_key]
-    if profile is None:
-        return _MetadataResolution(resources=resources,
-                                   direct=True,
-                                   policy=policy)
-    active_key = ('active', workspace, profile.name)
-    if active_key not in cache:
-        cache[active_key] = topology_state.get_active_profile(
-            workspace, profile.name)
-    active = cache[active_key]
-    if (active is None or active.revision != profile.revision or
-            active.config_hash != profile.config_hash):
-        raise ValueError('PROFILE_NOT_ACTIVE')
+    current_demand = _current_consumer_demand(workspace, cache)
+    if current_demand is not None:
+        policy_key = ('workspace_policy', workspace)
+        if policy_key not in cache:
+            cache[policy_key] = config.get_workspace_policy(workspace)
+        policy = cache[policy_key]
+        revision_key = ('revision', current_demand.profile_revision_id)
+        if revision_key not in cache:
+            cache[revision_key] = topology_state.get_profile_revision(
+                current_demand.profile_revision_id)
+        active = cache[revision_key]
+        if (active is None or active.workspace != workspace or
+                active.state not in (models.ImageProfileState.ACTIVE,
+                                     models.ImageProfileState.RETIRED)):
+            raise ValueError('PROFILE_NOT_ACTIVE')
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            active.config_snapshot)
+        if (profile.name != active.profile or
+            (image.distribution is not None and
+             image.distribution != profile.name)):
+            raise ValueError('IMAGE_DEMAND_TARGET_MISMATCH')
+    else:
+        profile_key = ('profile', workspace, image.distribution)
+        if profile_key not in cache:
+            cache[profile_key] = config.resolve_profile(image.distribution,
+                                                        workspace)
+        profile, policy = cache[profile_key]
+        if profile is None:
+            return _MetadataResolution(resources=resources,
+                                       direct=True,
+                                       policy=policy)
+        active_key = ('active', workspace, profile.name)
+        if active_key not in cache:
+            cache[active_key] = topology_state.get_active_profile(
+                workspace, profile.name)
+        active = cache[active_key]
+        if (active is None or active.revision != profile.revision or
+                active.config_hash != profile.config_hash):
+            raise ValueError('PROFILE_NOT_ACTIVE')
     platform = placement.platform or 'linux/amd64'
     identity_key = ('identity', workspace, image.ref, image.release,
                     image.artifact_id, platform)
@@ -265,12 +360,13 @@ def _resolve_metadata(
         cache[identity_key] = _published_identity(image, workspace, platform)
     identity = cache[identity_key]
     if identity is None:
-        if _direct_fallback_allowed(policy, image):
+        if (_direct_fallback_allowed(policy, image) and current_demand is None):
             return _MetadataResolution(resources=resources,
                                        direct=True,
                                        profile=profile,
                                        policy=policy,
-                                       active=active)
+                                       active=active,
+                                       locality_rank=1)
         raise ValueError('IMAGE_NOT_PUBLISHED: run sky image publish first.')
     artifact, publication = identity
     publication_key = ('revision', publication.profile_revision_id)
@@ -282,34 +378,81 @@ def _resolve_metadata(
             publication_revision.profile != profile.name):
         raise ValueError('ARTIFACT_NOT_READY')
     try:
-        target = _target_for_placement(profile, policy, placement)
-        (binding, expected_host_image, runtime_principal,
-         instance_profile) = _runtime_binding(profile, target, placement)
+        if current_demand is None:
+            target = _target_for_placement(profile, policy, placement)
+        else:
+            matching_targets = [
+                item for item in (profile.canonical,) + profile.targets
+                if item.target_fingerprint == current_demand.target_fingerprint
+            ]
+            if len(matching_targets) != 1:
+                raise ValueError('IMAGE_DEMAND_TARGET_MISMATCH')
+            target = matching_targets[0]
+        (binding, expected_host_image, runtime_principal, instance_profile,
+         kubernetes_node_selector) = _runtime_binding(profile, target,
+                                                      placement)
         prepared = _pin_host_image(resources, placement, expected_host_image)
-        if not _runtime_binding_fresh(active, profile, target, placement,
-                                      binding):
+        qualification_time = (current_demand.created_at
+                              if current_demand is not None else None)
+        if not _runtime_binding_fresh(
+                active, profile, target, placement, binding,
+                now=qualification_time):
             raise ValueError('QUALIFICATION_STALE')
     except ValueError:
-        if _direct_fallback_allowed(policy, image):
+        if (_direct_fallback_allowed(policy, image) and current_demand is None):
             return _MetadataResolution(resources=resources,
                                        direct=True,
                                        profile=profile,
                                        policy=policy,
                                        active=active,
                                        artifact=artifact,
-                                       publication=publication)
+                                       publication=publication,
+                                       locality_rank=1)
         raise
-    return _MetadataResolution(resources=prepared,
-                               direct=False,
-                               profile=profile,
-                               policy=policy,
-                               active=active,
-                               artifact=artifact,
-                               publication=publication,
-                               target=target,
-                               binding=binding,
-                               runtime_principal=runtime_principal,
-                               instance_profile=instance_profile)
+    location_key = (('location_id', current_demand.location_id)
+                    if current_demand is not None else
+                    ('location', workspace, artifact.id,
+                     target.target_fingerprint, artifact.runtime_digest))
+    if location_key not in cache:
+        if current_demand is not None:
+            cache[location_key] = topology_state.get_location(
+                current_demand.location_id)
+        else:
+            cache[location_key] = topology_state.get_location_for_target(
+                image_id=artifact.id,
+                workspace=workspace,
+                target_fingerprint=target.target_fingerprint,
+                runtime_digest=artifact.runtime_digest)
+    location = cache[location_key]
+    if (current_demand is not None and
+            not _matches_current_demand(current_demand,
+                                        placement=placement,
+                                        active=active,
+                                        artifact=artifact,
+                                        target=target,
+                                        location=location)):
+        raise ValueError('IMAGE_DEMAND_TARGET_MISMATCH')
+    locality_rank = 0
+    if (policy.locality == models.Locality.PREFER and current_demand is None and
+        (location is None or
+         location.state != models.ImageLocationState.READY)):
+        locality_rank = 2
+    return _MetadataResolution(
+        resources=prepared,
+        direct=False,
+        profile=profile,
+        policy=policy,
+        active=active,
+        artifact=artifact,
+        publication=publication,
+        location=location,
+        target=target,
+        binding=binding,
+        runtime_principal=runtime_principal,
+        instance_profile=instance_profile,
+        kubernetes_node_selector=(kubernetes_node_selector),
+        locality_rank=locality_rank,
+        current_demand=current_demand)
 
 
 def prepare_metadata_only(
@@ -322,6 +465,20 @@ def prepare_metadata_only(
     try:
         return _resolve_metadata(resources, placement, workspace,
                                  cache).resources
+    except ValueError:
+        return None
+
+
+def prepare_metadata_only_with_rank(
+    resources: 'resources_lib.Resources',
+    placement: models.Placement,
+    workspace: str,
+    cache: dict[tuple[typing.Any, ...], typing.Any] | None = None,
+) -> tuple['resources_lib.Resources', int] | None:
+    """Returns one eligible candidate and its locality preference class."""
+    try:
+        resolution = _resolve_metadata(resources, placement, workspace, cache)
+        return resolution.resources, resolution.locality_rank
     except ValueError:
         return None
 
@@ -349,7 +506,13 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
                           ensure: bool = True) -> 'resources_lib.Resources':
     """Pins one qualified AWS target or preserves the exact direct path."""
     image = resources.container_image
-    metadata = _resolve_metadata(resources, placement, workspace)
+    consumer = consumers.ImageConsumerContext(
+        consumer_kind=consumer_kind,
+        consumer_owner=consumer_owner,
+        owner_epoch_token=owner_epoch_token,
+        metadata=consumer_metadata or {})
+    with consumers.use(consumer):
+        metadata = _resolve_metadata(resources, placement, workspace)
     resources = metadata.resources
     if metadata.direct:
         return resources
@@ -370,12 +533,9 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
     binding = metadata.binding
     runtime_principal = metadata.runtime_principal
     instance_profile = metadata.instance_profile
+    kubernetes_node_selector = metadata.kubernetes_node_selector
     platform = placement.platform or 'linux/amd64'
-    location = topology_state.get_location_for_target(
-        image_id=artifact.id,
-        workspace=workspace,
-        target_fingerprint=target.target_fingerprint,
-        runtime_digest=artifact.runtime_digest)
+    location = metadata.location
     if location is None:
         if not ensure:
             return resources
@@ -395,7 +555,7 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
         return resources
     if (policy.mode == models.WorkspaceImageMode.MANAGED_PREFERRED and
             policy.locality == models.Locality.PREFER and
-            image.ref is not None and
+            image.ref is not None and metadata.current_demand is None and
             location.state != models.ImageLocationState.READY):
         return resources
     authority_id = catalog_state.get_catalog_authority_id(create=False)
@@ -424,9 +584,9 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
         location_id=location.id,
         placement=placement_payload)
     if location.state == models.ImageLocationState.FAILED:
-        demand_state.mark_demand_failed(
+        demand_state.fail_and_supersede_demand(
             demand.id, location.error_code or 'IMAGE_PREPARATION_FAILED')
-        raise ContainerImagePreparationFailedError('IMAGE_PREPARATION_FAILED')
+        raise ContainerImagePreparationFailedError(demand.id)
     if location.state != models.ImageLocationState.READY:
         raise ContainerImageWarmingError(demand)
     policy_fingerprint = _policy_fingerprint(active, target, binding,
@@ -445,6 +605,7 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
             ('ecr-login' if placement.backend == 'aws_vm' else None),
         'runtime_principal': runtime_principal,
         'instance_profile': instance_profile,
+        'kubernetes_node_selector': list(kubernetes_node_selector),
     }
     demand = transactions.commit_ready_demand(
         demand_id=demand.id,
@@ -467,7 +628,8 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
         credential_helper=('ecr-login'
                            if placement.backend == 'aws_vm' else None),
         runtime_principal=runtime_principal,
-        instance_profile=instance_profile)
+        instance_profile=instance_profile,
+        kubernetes_node_selector=kubernetes_node_selector)
     return resources.copy(_resolved_container_image=resolved,
                           _docker_login_config=_managed_login(
                               target, placement))

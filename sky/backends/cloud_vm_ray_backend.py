@@ -48,6 +48,7 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
+from sky.container_images import consumers as container_image_consumers
 from sky.container_images import models as container_image_models
 from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
@@ -207,7 +208,7 @@ def _resolve_container_image_for_placement(
                                                    no_failover=True) from e
     except container_image_runtime.ContainerImagePreparationFailedError as e:
         raise exceptions.ResourcesUnavailableError(str(e),
-                                                   no_failover=True) from e
+                                                   no_failover=False) from e
     except ValueError as e:
         # Catalog, profile, and policy errors are not capacity failures. A
         # different placement cannot repair them, so fail without cycling the
@@ -1115,60 +1116,13 @@ def _get_workload_attribution(
     return workload_id, workload_task_id
 
 
-@dataclasses.dataclass(frozen=True)
-class _ImageDemandAttribution:
-    consumer_kind: str
-    consumer_owner: str
-    owner_epoch_token: str
-    metadata: dict[str, Any]
-
-
 def _get_image_demand_attribution(
-        task: task_lib.Task, cluster_name: str, workload_type: str,
-        launch_context: dict[str, Any] | None) -> _ImageDemandAttribution:
+    task: task_lib.Task, cluster_name: str, workload_type: str,
+    launch_context: dict[str, Any] | None
+) -> container_image_consumers.ImageConsumerContext:
     """Collapses physical launches onto one logical image target owner."""
-    request_id = common_utils.get_current_request_id()
-    workload_id, workload_task_id = _get_workload_attribution(
-        task, cluster_name, workload_type, launch_context)
-    if workload_type in ('service', 'pool'):
-        service_hash = (launch_context or {}).get(
-            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
-        if (isinstance(service_hash, str) and service_hash and
-                workload_task_id is not None):
-            return _ImageDemandAttribution(
-                consumer_kind='service_version',
-                consumer_owner=f'{workload_id}:v{workload_task_id}',
-                owner_epoch_token=f'{service_hash}:v{workload_task_id}',
-                metadata={
-                    'workload_type': workload_type,
-                    'workload_id': workload_id,
-                    'workload_task_id': workload_task_id,
-                    'service_hash': service_hash,
-                })
-    elif workload_type == 'managed_job' and workload_task_id is not None:
-        managed_job_id = (task.envs or {}).get(constants.MANAGED_JOB_ID_ENV_VAR)
-        if managed_job_id is not None:
-            return _ImageDemandAttribution(
-                consumer_kind='managed_job_task',
-                consumer_owner=f'{managed_job_id}:task:{workload_task_id}',
-                owner_epoch_token=request_id,
-                metadata={
-                    'workload_type': workload_type,
-                    'workload_id': str(managed_job_id),
-                    'workload_task_id': workload_task_id,
-                    'request_id': request_id,
-                })
-    # Older Serve controllers do not carry an immutable version in their
-    # launch fence. Keep those and ordinary clusters isolated by physical
-    # cluster generation rather than aggregating against a guessed owner.
-    return _ImageDemandAttribution(consumer_kind='cluster',
-                                   consumer_owner=cluster_name,
-                                   owner_epoch_token=request_id,
-                                   metadata={
-                                       'workload_type': 'cluster',
-                                       'workload_id': cluster_name,
-                                       'request_id': request_id,
-                                   })
+    return container_image_consumers.derive(task, cluster_name, workload_type,
+                                            launch_context)
 
 
 def _placement_error_code(error: BaseException) -> str | None:

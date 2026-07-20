@@ -72,8 +72,8 @@ def _select_and_lock_shard(
             table.c.reserved_manifests < table.c.max_manifests,
             table.c.reserved_declared_bytes + declared_size_bytes
             <= table.c.max_declared_bytes).order_by(
-                score, table.c.id).limit(1).with_for_update(
-                    skip_locked=True)).mappings().first()
+                score,
+                table.c.id).limit(1).with_for_update()).mappings().first()
     if row is None:
         raise topology_state.RegistryCapacityExhaustedError(
             'REGISTRY_CAPACITY_EXHAUSTED')
@@ -394,12 +394,35 @@ def reserve_regional_location(
             if str(winner['state']) in (
                     models.ImageLocationState.MISSING.value,
                     models.ImageLocationState.EVICTED.value):
-                winner = session.execute(locations.update(
-                ).where(locations.c.id == winner['id']).values(
-                    state=models.ImageLocationState.PENDING.value,
-                    next_retry_at=None,
-                    error_code=None,
-                    updated_at=current).returning(locations)).mappings().one()
+                location_values: dict[str, Any] = {
+                    'state': models.ImageLocationState.PENDING.value,
+                    'next_retry_at': None,
+                    'error_code': None,
+                    'updated_at': current,
+                }
+                if (str(winner['state']) ==
+                        models.ImageLocationState.EVICTED.value):
+                    charge = int(artifact['declared_size_bytes'])
+                    if int(winner['reserved_declared_bytes']) != 0:
+                        raise RuntimeError(
+                            'Evicted location retained a capacity charge.')
+                    changed = session.execute(shards.update().where(
+                        shards.c.id == shard['id'], shards.c.reserved_manifests
+                        < shards.c.max_manifests,
+                        shards.c.reserved_declared_bytes + charge
+                        <= shards.c.max_declared_bytes).values(
+                            reserved_manifests=(shards.c.reserved_manifests +
+                                                1),
+                            reserved_declared_bytes=(
+                                shards.c.reserved_declared_bytes + charge),
+                            updated_at=current)).rowcount
+                    if changed != 1:
+                        raise topology_state.RegistryCapacityExhaustedError(
+                            'REGISTRY_CAPACITY_EXHAUSTED')
+                    location_values['reserved_declared_bytes'] = charge
+                winner = session.execute(locations.update().where(
+                    locations.c.id == winner['id']).values(**location_values).
+                                         returning(locations)).mappings().one()
             return topology_state._location(  # pylint: disable=protected-access
                 winner)
         regional_count = session.execute(
@@ -801,9 +824,10 @@ def create_warming_demand_for_owner_epoch(
     """Allocates one monotonic generation and converges request replay."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        _lock_profile(session,
-                      profile_revision_id,
-                      states=(models.ImageProfileState.ACTIVE,))
+        profile_row = _lock_profile(session,
+                                    profile_revision_id,
+                                    states=(models.ImageProfileState.ACTIVE,
+                                            models.ImageProfileState.RETIRED))
         location = session.execute(
             sqlalchemy.select(schema.locations).where(
                 schema.locations.c.id == location_id,
@@ -828,7 +852,10 @@ def create_warming_demand_for_owner_epoch(
             target_fingerprint=target_fingerprint,
             location_id=location_id,
             placement=placement,
-            now=current)
+            now=current,
+            require_existing=(str(
+                profile_row['state']) == models.ImageProfileState.RETIRED.value
+                             ))
 
 
 def commit_ready_demand(*,
@@ -857,6 +884,18 @@ def commit_ready_demand(*,
                     optimistic['target_fingerprint'])):
             raise ValueError(
                 'Location is not a lease-free READY demand target.')
+        watermark = session.execute(
+            sqlalchemy.select(schema.consumer_watermarks).where(
+                schema.consumer_watermarks.c.workspace ==
+                optimistic['workspace'],
+                schema.consumer_watermarks.c.consumer_kind ==
+                optimistic['consumer_kind'],
+                schema.consumer_watermarks.c.consumer_owner == optimistic[
+                    'consumer_owner']).with_for_update()).mappings().one()
+        if (int(watermark['max_seen_generation']) != consumer_generation or int(
+                watermark['max_terminal_generation']) >= consumer_generation):
+            raise demand_state.StaleConsumerGenerationError(
+                'Demand is no longer the current consumer generation.')
         demand = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.id ==

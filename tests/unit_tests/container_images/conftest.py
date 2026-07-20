@@ -77,6 +77,9 @@ def registry_config() -> dict[str, Any]:
                     'node_role':
                         (f'arn:aws:iam::{COMPUTE_ACCOUNT}:role/EksNodeRole'),
                     'namespace': 'skypilot-image-canaries',
+                    'node_selector': {
+                        'skypilot.co/image-pull-role': 'eks-node',
+                    },
                 }],
             },
         },

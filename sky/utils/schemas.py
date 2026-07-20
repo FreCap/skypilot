@@ -1914,7 +1914,8 @@ def get_config_schema():
                     'items': {
                         'type': 'object',
                         'required': [
-                            'context', 'cluster_arn', 'node_role', 'namespace'
+                            'context', 'cluster_arn', 'node_role', 'namespace',
+                            'node_selector'
                         ],
                         'additionalProperties': False,
                         'properties': {
@@ -1937,6 +1938,21 @@ def get_config_schema():
                                 'type': 'string',
                                 'minLength': 1,
                                 'maxLength': 253,
+                            },
+                            'node_selector': {
+                                'type': 'object',
+                                'minProperties': 1,
+                                'maxProperties': 16,
+                                'propertyNames': {
+                                    'type': 'string',
+                                    'minLength': 1,
+                                    'maxLength': 317,
+                                },
+                                'additionalProperties': {
+                                    'type': 'string',
+                                    'minLength': 1,
+                                    'maxLength': 63,
+                                },
                             },
                         },
                     },

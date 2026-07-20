@@ -200,6 +200,7 @@ def _demand(
         workspace='research',
         consumer_kind='service_version',
         consumer_owner='boltz:v7',
+        request_id=None,
         consumer_generation=1,
         target_key=f'{_ARTIFACT_ID}:{target.target_fingerprint}',
         owner_epoch=10,
@@ -236,6 +237,9 @@ def _wire_metadata(monkeypatch: pytest.MonkeyPatch,
         (_artifact(), _publication()))
     monkeypatch.setattr(runtime.topology_state, 'get_profile_revision',
                         lambda revision_id: active)
+    monkeypatch.setattr(runtime.demand_state,
+                        'get_current_demand_for_owner_epoch',
+                        lambda **kwargs: None)
 
 
 def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
@@ -344,6 +348,75 @@ def test_managed_preferred_stale_route_preserves_direct_digest_path(
     assert result.resolved_container_image is None
 
 
+def test_live_demand_replays_its_retired_immutable_profile_snapshot(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    revision = dataclasses.replace(_active_revision(profile, observed_at=9),
+                                   state=models.ImageProfileState.RETIRED)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile='new-profile',
+        allowed_profiles=('new-profile',),
+        locality=models.Locality.PREFER)
+    location = _location(profile, models.ImageLocationState.READY)
+    pinned = dataclasses.replace(_demand(profile),
+                                 placement={
+                                     'provider': 'aws',
+                                     'region': 'us-west-2',
+                                     'backend': 'aws_vm',
+                                     'platform': 'linux/amd64',
+                                 },
+                                 created_at=10)
+    monkeypatch.setattr(
+        runtime.config, 'resolve_profile',
+        mock.Mock(side_effect=AssertionError('current profile was consulted')))
+    monkeypatch.setattr(runtime.config, 'get_workspace_policy',
+                        lambda workspace: policy)
+    monkeypatch.setattr(runtime.demand_state,
+                        'get_current_demand_for_owner_epoch',
+                        lambda **kwargs: pinned)
+    monkeypatch.setattr(runtime.topology_state, 'get_profile_revision',
+                        lambda revision_id: revision)
+    monkeypatch.setattr(
+        runtime, '_published_identity', lambda image, workspace, platform:
+        (_artifact(), _publication()))
+    monkeypatch.setattr(runtime.topology_state, 'get_location',
+                        lambda location_id: location)
+    monkeypatch.setattr(
+        runtime.topology_state, 'get_location_for_target',
+        mock.Mock(side_effect=AssertionError('pinned location was not used')))
+    monkeypatch.setattr(runtime.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: _AUTHORITY_ID)
+    create = mock.Mock(return_value=pinned)
+    monkeypatch.setattr(runtime.transactions,
+                        'create_warming_demand_for_owner_epoch', create)
+    monkeypatch.setattr(
+        runtime.transactions, 'commit_ready_demand', lambda **kwargs:
+        dataclasses.replace(pinned,
+                            state=models.ImageDemandState.READY,
+                            pull_plan=kwargs['pull_plan']))
+    monkeypatch.setattr(runtime.time, 'time', lambda: 100_000)
+
+    resources = _FakeResources(
+        models.ContainerImage(release='boltz-l4', distribution=profile.name))
+    resolved = runtime.resolve_for_placement(
+        resources,
+        models.Placement(provider='aws',
+                         region='us-west-2',
+                         backend='aws_vm',
+                         platform='linux/amd64'),
+        workspace='research',
+        consumer_kind=pinned.consumer_kind,
+        consumer_owner=pinned.consumer_owner,
+        owner_epoch_token='service:stable:v7')
+
+    assert resolved.resolved_container_image is not None
+    assert resolved.resolved_container_image.profile_revision_id == revision.id
+    assert resolved.resolved_container_image.reference == location.target_ref
+    create.assert_called_once()
+
+
 def test_exact_host_image_mismatch_is_rejected_before_demand_mutation(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -388,7 +461,7 @@ def test_one_thousand_service_replicas_share_one_version_target_owner(
                     attribution.owner_epoch_token))
     assert len(owners) == 1
     assert owners == {('service_version', 'boltz-l4-fleet:v7',
-                       'service-hash:v7')}
+                       'service:service-hash:v7')}
 
 
 def test_legacy_docker_image_survives_copy_pickle_and_yaml_round_trip() -> None:

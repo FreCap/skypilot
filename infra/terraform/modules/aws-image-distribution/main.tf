@@ -2,7 +2,14 @@ data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 data "aws_region" "current" {}
 
+data "aws_servicequotas_service_quota" "ecr_images_per_repository" {
+  count        = var.applied_images_per_repository_quota == null ? 1 : 0
+  service_code = "ecr"
+  quota_code   = "L-03A36CE1"
+}
+
 locals {
+  applied_images_per_repository_quota = var.applied_images_per_repository_quota != null ? var.applied_images_per_repository_quota : data.aws_servicequotas_service_quota.ecr_images_per_repository[0].value
   workspace_hashes = {
     for workspace in var.workspaces :
     workspace => substr(sha256("v1:${var.catalog_authority}:${lower(trimspace(workspace))}"), 0, 32)
@@ -70,9 +77,9 @@ resource "terraform_data" "validation" {
       error_message = "kms_key_arn must be set only when encryption_type is KMS."
     }
     precondition {
-      condition = var.applied_images_per_repository_quota == null || alltrue([
+      condition = alltrue([
         for target in values(var.targets) :
-        target.max_manifests_per_shard + var.quota_headroom <= var.applied_images_per_repository_quota
+        target.max_manifests_per_shard + var.quota_headroom <= local.applied_images_per_repository_quota
       ])
       error_message = "A configured manifest ceiling exceeds the verified quota after headroom."
     }
@@ -142,11 +149,11 @@ resource "aws_ecr_repository" "qualification" {
   depends_on = [terraform_data.validation]
 }
 
-data "aws_iam_policy_document" "target_role_boundary" {
+data "aws_iam_policy_document" "copy_role_boundary" {
   statement {
-    sid       = "ExactManagedRepositories"
+    sid       = "CopyExactManagedRepositories"
     effect    = "Allow"
-    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchDeleteImage"]
+    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:DescribeRepositories", "ecr:GetRepositoryPolicy", "ecr:ListTagsForResource", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"]
     resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
   }
 
@@ -156,14 +163,46 @@ data "aws_iam_policy_document" "target_role_boundary" {
     actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"]
   }
+
+  statement {
+    sid       = "ReadAppliedEcrQuota"
+    effect    = "Allow"
+    actions   = ["servicequotas:GetServiceQuota", "servicequotas:GetAWSDefaultServiceQuota"]
+    resources = ["*"]
+  }
 }
 
-resource "aws_iam_policy" "target_role_boundary" {
-  count = local.create_copy_role || local.create_lifecycle_role ? 1 : 0
+data "aws_iam_policy_document" "lifecycle_role_boundary" {
+  statement {
+    sid       = "LifecycleExactManagedRepositories"
+    effect    = "Allow"
+    actions   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:BatchDeleteImage"]
+    resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
+  }
+
+  statement {
+    sid       = "LifecycleAuthorizationTokenOnly"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "copy_role_boundary" {
+  count = local.create_copy_role ? 1 : 0
 
   name        = "${var.copy_target_role_name}-boundary"
-  description = "Maximum ECR data-plane permissions for SkyPilot image target roles."
-  policy      = data.aws_iam_policy_document.target_role_boundary.json
+  description = "Maximum ECR and quota-read permissions for the SkyPilot image copy role."
+  policy      = data.aws_iam_policy_document.copy_role_boundary.json
+  tags        = local.common_tags
+}
+
+resource "aws_iam_policy" "lifecycle_role_boundary" {
+  count = local.create_lifecycle_role ? 1 : 0
+
+  name        = "${var.lifecycle_target_role_name}-boundary"
+  description = "Maximum ECR delete permissions for the SkyPilot image lifecycle role."
+  policy      = data.aws_iam_policy_document.lifecycle_role_boundary.json
   tags        = local.common_tags
 }
 
@@ -244,7 +283,7 @@ resource "aws_iam_role" "copy_target" {
 
   name                 = var.copy_target_role_name
   assume_role_policy   = data.aws_iam_policy_document.copy_trust[0].json
-  permissions_boundary = aws_iam_policy.target_role_boundary[0].arn
+  permissions_boundary = aws_iam_policy.copy_role_boundary[0].arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "copy" })
 }
@@ -254,7 +293,7 @@ resource "aws_iam_role" "lifecycle_target" {
 
   name                 = var.lifecycle_target_role_name
   assume_role_policy   = data.aws_iam_policy_document.lifecycle_trust[0].json
-  permissions_boundary = aws_iam_policy.target_role_boundary[0].arn
+  permissions_boundary = aws_iam_policy.lifecycle_role_boundary[0].arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "lifecycle" })
 }
@@ -272,7 +311,7 @@ data "aws_iam_policy_document" "copy_permissions" {
   statement {
     sid       = "CopyExactManagedContent"
     effect    = "Allow"
-    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"]
+    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:DescribeRepositories", "ecr:GetRepositoryPolicy", "ecr:ListTagsForResource", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"]
     resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
   }
 
@@ -280,6 +319,13 @@ data "aws_iam_policy_document" "copy_permissions" {
     sid       = "CopyAuthorizationToken"
     effect    = "Allow"
     actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "CopyReadAppliedEcrQuota"
+    effect    = "Allow"
+    actions   = ["servicequotas:GetServiceQuota", "servicequotas:GetAWSDefaultServiceQuota"]
     resources = ["*"]
   }
 }
@@ -444,7 +490,7 @@ locals {
       kms_key_arn         = var.encryption_type == "KMS" ? var.kms_key_arn : null
       tag_immutability    = "IMMUTABLE"
       scanning_mode       = var.scan_on_push ? "SCAN_ON_PUSH" : "MANUAL"
-      policy_hash         = sha256(data.aws_iam_policy_document.shard[key].json)
+      policy_hash         = sha256(jsonencode(jsondecode(data.aws_iam_policy_document.shard[key].json)))
       ownership_tags_hash = sha256(jsonencode(aws_ecr_repository.shard[key].tags))
       max_manifests       = shard.max_manifests
       max_declared_bytes  = shard.max_declared_bytes

@@ -530,48 +530,69 @@ beyond the one selected placement.
 Before the first optimization, a metadata-only eligibility pass maps each
 candidate placement to the active profile's declared runtime binding, locality,
 and selected artifact platform. `locality: require` removes unsupported
-candidates; `prefer` ranks a READY local route ahead of canonical or permitted
-direct fallback. This pass makes no provider call. No eligible target fails with
-`IMAGE_LOCALITY_UNSUPPORTED` before provisioning rather than warming an
-impossible placement.
+candidates. `prefer` is a lexicographic class ahead of the ordinary optimizer:
+READY managed routes rank first, an authorized direct source fallback ranks
+second, and a managed route that still needs warming ranks third. Cost, time,
+reservations, and egress preserve their existing ordering within the winning
+class. Exact indexed location reads supply this rank without provider calls. No
+eligible target fails with `IMAGE_LOCALITY_UNSUPPORTED` before provisioning
+rather than warming an impossible placement.
 
 For managed EC2, that metadata includes the exact planned host AMI and instance
 profile. Both must match the binding's qualified regional AMI and principal; a
 request with no host image is pinned to the qualified regional AMI before
 optimization, while a user-supplied host image or role outside that tuple is not
 silently trusted. EKS eligibility maps the selected SkyPilot Kubernetes context
-to one exact cluster ARN and node-role tuple, then binds the selected cluster
-and node group to that attestation. `managed_required` fails closed on a
+to one exact cluster ARN, node role, namespace, and immutable nonempty node
+selector. The canary and every managed workload pod receive that same selector.
+Qualification enumerates every schedulable node matching the selector, resolves
+each node's EC2 instance profile, and requires the declared role for the complete
+eligible set before recording READY. A selector that matches zero nodes, more
+than the bounded qualification page, or heterogeneous roles fails closed. This
+binds the selected cluster and node pool to the attestation instead of proving
+one fortuitously scheduled canary node. `managed_required` fails closed on a
 mismatch, while
 `managed_preferred` may use only its otherwise-authorized direct digest path.
 
-When a selected managed target has no READY route, resolution first persists one
-server-owned demand for the logical deployment target. Identity is:
+Before optimization, the execution path derives one restart-stable logical
+consumer identity and loads its current live demand from PostgreSQL. A live
+demand restricts the metadata pass to its stored provider, region, backend,
+profile revision, target fingerprint, digest, and platform. A request or
+controller restart therefore cannot select a second target while the first is
+warming. When a selected managed target has no READY route, resolution first
+persists one server-owned demand for that logical deployment target. Identity
+is:
 
-- cluster launch generation;
-- managed-job recovery generation plus target; or
+- stable named-cluster owner plus its monotonic relaunch generation;
+- stable managed-job ID and task ID plus its monotonic recovery generation; or
 - Serve service version plus target.
 
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
 authority, artifact/runtime digest, exact profile revision, target fingerprint,
-location, bounded placement constraint, owner epoch, and retry epoch. It contains
-no credential or raw untrusted value, and users cannot supply it in YAML.
+location, bounded placement constraint, owner epoch, retry epoch, and a bounded
+server request ID used only for unattached cluster cleanup. The request ID has a
+partial PostgreSQL index; terminal request handling never scans or parses every
+live demand. The row contains no credential or raw user-controlled registry
+value, and users cannot supply it in YAML.
 
 Only after that commit does the resolver raise the typed
-`ContainerImageWarmingError`. The same-call provisioning loop also sets
-`no_failover=True`, but the durable demand is authoritative. Before every
-new optimization, normal launch, SkyServe, and managed-job controllers reload
-it and restrict candidates to its target. An API or controller restart therefore
-cannot reoptimize into another cloud and create another warming intent. The
-dashboard and events say `IMAGE_WARMING`, not `resources unavailable`.
+`ContainerImageWarmingError`. The PostgreSQL demand and consumer watermark are
+the authoritative image-placement state. Normal launch, SkyServe, and
+managed-job recovery establish the same consumer context before both the normal
+optimizer and the under-lock planner, so either path reloads and restricts to
+the durable target. The per-controller SQLite-compatible state may retain the
+demand ID as a hint, but correctness does not depend on a second database
+commit. The dashboard and events say `IMAGE_WARMING`, not `resources
+unavailable`.
 
-If materialization fails terminally, the controller reports
-`IMAGE_PREPARATION_FAILED` for that target. It does not reinterpret that failure
-as capacity. After a READY plan, a genuine capacity failure may explicitly
-supersede the demand, increment the consumer generation, and optimize a new
-placement. This distinction preserves ordinary recovery without allowing image
-warming itself to cause failover.
+If materialization fails terminally, the controller atomically supersedes that
+demand before permitting a new candidate and reports
+`IMAGE_PREPARATION_FAILED` for the failed target. Transient warming never causes
+failover. A genuine post-READY capacity failure may use the same explicit
+supersession transaction. READY commit locks the consumer watermark and requires
+the demand to remain its current maximum generation, so a stale worker or retry
+cannot publish a pull plan after supersession.
 
 With `managed_preferred` plus `locality: prefer`, the exact request-supplied
 digest can be used immediately if its pull authentication is valid for the
@@ -588,10 +609,27 @@ controllers, so their own SQLite-compatible state stores only the demand ID and
 generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
+An owner epoch with a live demand reloads that demand's exact immutable profile
+snapshot and target even after the revision becomes RETIRED. It evaluates
+qualification freshness at the demand creation timestamp and accepts only an
+exact replay. A retired revision cannot admit a new owner or select a new target,
+so a profile rollout cannot strand an in-flight deployment or reopen old
+capacity.
 
-Eviction treats every WARMING or READY demand as the fence and locks its location
-before inspecting those states. Consumer terminal or supersede handling writes a
-tombstone and advances one stable-owner generation watermark in the same
+Eviction treats every WARMING or READY demand as the fence and locks its shard,
+location, and demand state in the canonical order. If demand appears after the
+provider deletion began and exact readback proves absence, completion changes
+the location to `PENDING`, preserves its existing capacity reservation, and lets
+the copy queue rematerialize it. It never records READY for absent bytes. If no
+demand exists, exact absence changes the location to `EVICTED`, decrements the
+reservation exactly once, and zeros the location's charged bytes. Re-admission
+or explicit retry atomically restores count and bytes before changing an
+EVICTED location to `PENDING`. A provider operation known not to have started may
+restore READY; after provider I/O, only exact presence may do so. Ambiguous
+readback remains fenced in `EVICTING` for another worker.
+
+Consumer terminal or supersede handling writes a tombstone and advances one
+stable-owner generation watermark in the same
 transaction. Demand creation locks that watermark and rejects a generation below
 maximum seen or at/below maximum terminal; a replay of the exact live
 maximum-seen generation converges the existing demand. A WARMING request demand
@@ -601,6 +639,15 @@ least 24 hours old. For clusters, jobs, and services, reconciliation requires tw
 authoritative terminal observations separated by an hour before advancing a
 missing tombstone; absence or an unreachable consumer store never releases a
 fence.
+All demand creation, supersession, failure, and authoritative terminal paths use
+the same watermark-then-demand lock order. This prevents inverse-lock deadlocks
+under concurrent controller replay and lifecycle reconciliation.
+
+For `locality: prefer`, candidate generation assigns READY managed, authenticated
+direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
+rank across every resource alternative for the task before the cost optimizer
+runs. A cheap cross-region or warming option therefore cannot defeat a READY
+regional image merely because it originated from another `any_of` resource.
 
 Terminal demand rows compact after 30 days only when the consumer credential is
 revoked or provably expired and the owner watermark prevents resurrection. A
@@ -852,6 +899,8 @@ container_registries:
           cluster_arn: arn:aws:eks:us-west-2:210987654321:cluster/boltz-gpu
           node_role: arn:aws:iam::210987654321:role/EksNodeRole
           namespace: skypilot-image-canaries
+          node_selector:
+            skypilot.co/image-pull-role: eks-node
     compute-canary:
       kind: aws_assume_role
       authority: arn:aws:iam::210987654321:role/SkyPilotImageCanary
@@ -1029,9 +1078,20 @@ Terraform reads the applied ECR images-per-repository quota, reserves explicit
 headroom, and emits `max_manifests_per_shard`. AWS documents a default adjustable
 limit of 100,000 images per repository in its
 [ECR service quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html).
+A Terraform handoff creates or updates shard rows as `PENDING`; desired Terraform
+output is never live qualification. The copy worker assumes only the regional
+copy/verify role and reads every physical shard's live ARN, URI, tag immutability,
+encryption/KMS setting, scanning setting, repository policy, ownership tags, and
+applied images-per-repository service quota. It canonicalizes the policy and
+tags and compares them to the handoff fingerprints. The first complete inventory
+must be empty. Only that live proof may promote the shard to READY and write the
+profile's per-shard attestation. Reingesting a handoff cannot turn a DRIFTED shard
+READY.
+
 A managed target first activates only when every workspace shard and the cleaned
 qualification repository are empty, fingerprints match, and hard ceilings are no
-greater than verified applied quotas minus headroom. Later revisions reconcile
+greater than verified applied quotas minus headroom. Activation requires a fresh
+live attestation for every exact physical fingerprint. Later revisions reconcile
 the already managed inventory instead of requiring it to disappear. A repository
 containing unexplained preexisting content must use external ownership instead.
 
@@ -1041,7 +1101,10 @@ physical ceiling only when a new Terraform handoff and live quota proof agree;
 configuration alone never creates capacity.
 
 On first location creation, the transaction starts from a stable digest-derived
-shard index and probes the fixed ring. It locks one physical shard row, rechecks
+shard index and probes the fixed ring. Admission uses an ordinary PostgreSQL row
+lock rather than `SKIP LOCKED`: brief contention waits and rechecks the same
+capacity predicate instead of being misreported as exhaustion. It locks one
+physical shard row, rechecks
 whether the location already exists, and reserves one slot only when
 `reserved_count < max_manifests_per_shard` and conservative declared bytes fit.
 The chosen shard is stored on the location forever. A full ring fails closed with
@@ -1194,7 +1257,7 @@ location contract, never alternative sources of truth.
 
 ## Worker services
 
-Helm exposes two disabled-by-default deployments:
+Helm exposes three disabled-by-default deployments:
 
 ```text
 imageCopyWorker.enabled
@@ -1206,15 +1269,37 @@ imageLifecycleWorker.enabled
 imageLifecycleWorker.replicaCount
 imageLifecycleWorker.maxInFlight
 imageLifecycleWorker.serviceAccount
+
+imageCanaryWorker.enabled
+imageCanaryWorker.replicaCount
+imageCanaryWorker.maxInFlight
+imageCanaryWorker.serviceAccount
 ```
 
-Each pod registers a random worker ID and periodically upserts a bounded
+Each pod uses its Kubernetes pod UID as a stable process-lifetime worker ID and
+periodically upserts a bounded
 heartbeat with kind, version, started time, last-success time, and current
 in-flight count. The UI treats a heartbeat as stale after three periods. Stale
 rows older than 24 hours are deleted by the lifecycle worker in batches of at
 most 500 every five minutes. Heartbeats contain no hostname, token, ARN, or
 credential. Worker reads are keyset-paginated, so a restart storm cannot produce
 an unbounded API response while compaction catches up.
+
+Every worker also exposes a dependency-free HTTP health and Prometheus text
+surface on a dedicated port. Liveness fails when the main claim loop has not
+ticked within its bounded deadline; readiness requires successful registration
+and a recent PostgreSQL heartbeat. Helm configures startup, readiness, and
+liveness probes against these distinct signals and annotates the metrics port.
+A deadlocked loop is therefore restarted even when the Python process still
+exists.
+
+`kubernetes_dockerconfig_secret` is fail-closed. Helm accepts an explicit bounded
+allowlist of source credential Secret namespace/name pairs, renders one
+least-privilege Role and RoleBinding per namespace for a chart-managed service
+account, and passes the same allowlist to the copy process. The process refuses a
+configured Secret outside that list even if broader ambient RBAC exists. An
+externally managed service account still supplies the allowlist and owns matching
+RBAC itself.
 
 Copy-worker concurrency is bounded by its pod setting and provider throttling.
 Adding replicas increases claim throughput safely because leases and
@@ -1337,7 +1422,11 @@ or mark itself qualified.
 Every readiness response is a projection of PostgreSQL state written by bounded
 background work. A Dashboard request never assumes a role, calls STS/KMS/ECR,
 resumes inventory, or refreshes qualification. Stale timestamps are shown as
-stale rather than synchronously repaired.
+stale rather than synchronously repaired. Queue counts are capped index-backed
+queries and oldest ages take one indexed head per physical shard before a final
+minimum; neither operation scans or sorts the full queue. The browser advances
+its own clock, keeps refresh errors visible beside cached data, and disables
+prepare, retry, and qualification mutations while the snapshot is stale.
 
 ### Mutation API
 
@@ -1587,3 +1676,17 @@ destination/ECR ambiguity transition, fences desired revisions and consumer
 generations, folds release/reference projections out of separate tables, batches
 provider tokens with fair dispatch, requires exact inventory confirmation, keeps
 AWS CLI off managed launch, and leaves Serve as the sole drain owner.
+
+Implementation review round 1 at
+`26cdfc40d3ba2160b09bdd17c98448c8269213f1` returned paired Codex `RESHAPE`
+and Fable `RESHAPE`. Both confirmed the overall split and digest-custody model,
+but found contract breaches in eviction re-admission, restart-stable demand
+ownership, READY locality ranking, worker health, and acceptance proof. Codex
+also found transient shard-lock misclassification, single-node EKS proof,
+Terraform-intent trust, unbounded readiness aggregation, missing source-Secret
+RBAC, and stale UI health. This revision incorporates the union as one
+architecture correction before implementation round 2. The correction also
+makes terminal request lookup index-bounded, applies locality ranking globally
+across task alternatives, replays retired immutable profile snapshots, splits
+copy and lifecycle IAM boundaries, discovers applied ECR quota during planning,
+and makes PostgreSQL concurrency and scale tests mandatory in CI.

@@ -75,6 +75,15 @@ class CopyOutcome(enum.Enum):
     AMBIGUOUS = 'AMBIGUOUS'
 
 
+class DeleteOutcome(enum.Enum):
+    """Exact deletion result, including proof that provider I/O never began."""
+
+    ABSENT = 'ABSENT'
+    PRESENT = 'PRESENT'
+    AMBIGUOUS = 'AMBIGUOUS'
+    NOT_STARTED = 'NOT_STARTED'
+
+
 @dataclasses.dataclass(frozen=True)
 class EcrCallHooks:
     before_call: Callable[[], None]
@@ -326,6 +335,7 @@ def ingest_terraform_qualification(
     budget_scopes = {(shard.partition, shard.account, shard.region)
                      for shard in manifest.shards}
     provider_budgets: list[tuple[str, str, str, int, int]] = []
+    regional_quotas: dict[str, tuple[int, int]] = {}
     for partition, account, region in sorted(budget_scopes):
         rate = manifest.quota_facts.get(f'{region}:ecr_api_rate_per_second')
         burst = manifest.quota_facts.get(f'{region}:ecr_api_burst')
@@ -334,9 +344,18 @@ def ingest_terraform_qualification(
             raise ValueError(
                 'Qualification manifest has no verified ECR API budget.')
         provider_budgets.append((partition, account, region, rate, burst))
+        images = manifest.quota_facts.get(f'{region}:images_per_repository')
+        headroom = manifest.quota_facts.get(f'{region}:reserved_headroom')
+        if (not isinstance(images, int) or images <= 0 or
+                not isinstance(headroom, int) or headroom < 0 or
+                headroom >= images):
+            raise ValueError(
+                'Qualification manifest has no applied repository quota.')
+        regional_quotas[region] = (images, headroom)
     for shard in manifest.shards:
         target = profile.target(shard.target)
         expected_prefix = f'{target.repository_prefix}/'
+        applied_quota, reserved_headroom = regional_quotas[shard.region]
         if (shard.workspace != manifest.workspace or
                 shard.partition != profile.partition or
                 shard.account != profile.registry_account or
@@ -346,7 +365,8 @@ def ingest_terraform_qualification(
                 not shard.repository_name.startswith(expected_prefix) or
                 shard.max_manifests > target.max_manifests_per_shard or
                 shard.max_declared_bytes > target.max_declared_bytes_per_shard
-                or shard.max_in_flight > target.max_in_flight):
+                or shard.max_in_flight > target.max_in_flight or
+                shard.max_manifests + reserved_headroom > applied_quota):
             raise ValueError('Qualification shard contradicts profile.')
     target_evidence: list[tuple[str, dict[str, Any]]] = []
     for target in (profile.canonical,) + profile.targets:
@@ -358,8 +378,8 @@ def ingest_terraform_qualification(
         }
         required_facts = {
             'copy_role_arn', 'copy_policy_hash', 'lifecycle_role_arn',
-            'lifecycle_policy_hash', 'boundary_policy_hash',
-            'qualification_repo_arn'
+            'lifecycle_policy_hash', 'copy_boundary_policy_hash',
+            'lifecycle_boundary_policy_hash', 'qualification_repo_arn'
         }
         if set(facts) != required_facts:
             raise ValueError(
@@ -396,7 +416,9 @@ def ingest_terraform_qualification(
             'copy_policy_hash': facts['copy_policy_hash'],
             'lifecycle_role_arn': facts['lifecycle_role_arn'],
             'lifecycle_policy_hash': facts['lifecycle_policy_hash'],
-            'boundary_policy_hash': facts['boundary_policy_hash'],
+            'copy_boundary_policy_hash': facts['copy_boundary_policy_hash'],
+            'lifecycle_boundary_policy_hash':
+                facts['lifecycle_boundary_policy_hash'],
         }))
     desired = topology_state.stage_profile_revision(
         workspace=manifest.workspace,
@@ -454,6 +476,35 @@ def ingest_terraform_qualification(
         expected_config_hash=profile.config_hash,
         terraform_hash=manifest.manifest_hash,
         now=current)
+    for shard in manifest.shards:
+        applied_quota, reserved_headroom = regional_quotas[shard.region]
+        live_key = models.profile_attestation_key('infrastructure_shard',
+                                                  shard.physical_fingerprint)
+        desired = topology_state.record_profile_attestation(
+            profile_revision_id=desired.id,
+            kind=models.profile_attestation_key('terraform_shard',
+                                                shard.physical_fingerprint),
+            evidence={
+                'status': 'READY',
+                'observed_at': current,
+                'physical_fingerprint': shard.physical_fingerprint,
+                'target': shard.target,
+                'repository_arn': shard.repository_arn,
+                'repository_uri': f'{shard.registry}/{shard.repository_name}',
+                'tag_mutability': shard.tag_immutability,
+                'encryption_type': shard.encryption_type,
+                'kms_key': shard.kms_key_arn,
+                'scanning_mode': shard.scanning_mode,
+                'policy_hash': shard.policy_hash,
+                'ownership_tags_hash': shard.ownership_tags_hash,
+                'max_manifests': shard.max_manifests,
+                'terraform_applied_quota': applied_quota,
+                'reserved_headroom': reserved_headroom,
+                'live_attestation_key': live_key,
+            },
+            expected_generation=desired.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=current)
     for target_name, evidence in target_evidence:
         desired = topology_state.record_profile_attestation(
             profile_revision_id=desired.id,
@@ -486,6 +537,33 @@ def _error_code(error: BaseException) -> str | None:
     return str(code) if code is not None else None
 
 
+def _canonical_json_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+
+
+def applied_ecr_images_per_repository_quota(binding: AwsRoleBinding,
+                                            region: str) -> int:
+    """Reads the customized quota, falling back to the AWS default."""
+    client = assumed_client(binding, 'service-quotas', region)
+    kwargs = {
+        'ServiceCode': 'ecr',
+        'QuotaCode': 'L-03A36CE1',
+    }
+    try:
+        response = client.get_service_quota(**kwargs)
+    except BaseException as error:  # pylint: disable=broad-except
+        if _error_code(error) != 'NoSuchResourceException':
+            raise
+        response = client.get_aws_default_service_quota(**kwargs)
+    value = (response.get('Quota') or {}).get('Value')
+    if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+            value < 1 or int(value) != value):
+        raise ValueError('ECR images-per-repository quota is invalid.')
+    return int(value)
+
+
 def _classify(error: BaseException) -> None:
     code = _error_code(error)
     if code in _THROTTLE_ERROR_CODES:
@@ -509,6 +587,7 @@ class _HookedEcrClient:
     def __init__(self, client: Any, hooks: EcrCallHooks) -> None:
         self._client = client
         self._hooks = hooks
+        self.started_calls = 0
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._client, name)
@@ -517,6 +596,7 @@ class _HookedEcrClient:
 
         def call(*args: Any, **kwargs: Any) -> Any:
             self._hooks.before_call()
+            self.started_calls += 1
             try:
                 return value(*args, **kwargs)
             except BaseException as error:  # pylint: disable=broad-except
@@ -647,7 +727,7 @@ class EcrRepository:
                 'ECR returned manifest bytes with a different digest.')
         return raw, str(media_type)
 
-    def repository_metadata(self) -> dict[str, str | None]:
+    def repository_metadata(self) -> dict[str, Any]:
         """Returns bounded live identity and immutable repository settings."""
         response = self._client.describe_repositories(
             repositoryNames=[self.repository_name])
@@ -658,12 +738,41 @@ class EcrRepository:
         if repository.get('repositoryName') != self.repository_name:
             raise ValueError('ECR qualification repository identity changed.')
         encryption = repository.get('encryptionConfiguration') or {}
+        scanning = repository.get('imageScanningConfiguration') or {}
+        repository_arn = repository.get('repositoryArn')
+        if not isinstance(repository_arn, str):
+            raise ValueError('ECR repository ARN is unavailable.')
+        policy_text = self._client.get_repository_policy(
+            repositoryName=self.repository_name).get('policyText')
+        if not isinstance(policy_text, str) or len(policy_text) > 1024 * 1024:
+            raise ValueError('ECR repository policy is unavailable.')
+        try:
+            policy = json.loads(policy_text)
+        except ValueError:
+            raise ValueError('ECR repository policy is invalid.') from None
+        tags_response = self._client.list_tags_for_resource(
+            resourceArn=repository_arn)
+        raw_tags = tags_response.get('tags', [])
+        if not isinstance(raw_tags, list) or len(raw_tags) > 256:
+            raise ValueError('ECR repository ownership tags are invalid.')
+        tags: dict[str, str] = {}
+        for item in raw_tags:
+            if (not isinstance(item, dict) or
+                    not isinstance(item.get('Key'), str) or
+                    not isinstance(item.get('Value'), str) or
+                    item['Key'] in tags):
+                raise ValueError('ECR repository ownership tags are invalid.')
+            tags[item['Key']] = item['Value']
         return {
-            'repository_arn': repository.get('repositoryArn'),
+            'repository_arn': repository_arn,
             'repository_uri': repository.get('repositoryUri'),
             'tag_mutability': repository.get('imageTagMutability'),
             'encryption_type': encryption.get('encryptionType'),
             'kms_key': encryption.get('kmsKey'),
+            'scanning_mode': ('SCAN_ON_PUSH' if scanning.get('scanOnPush')
+                              is True else 'MANUAL'),
+            'policy_hash': _canonical_json_hash(policy),
+            'ownership_tags_hash': _canonical_json_hash(tags),
         }
 
     def read_manifest(self, digest: str) -> bytes:
@@ -859,20 +968,37 @@ class EcrRepository:
                 return CopyOutcome.AMBIGUOUS
             raise AssertionError('unreachable') from error
 
-    def exact_delete(self, digest: str) -> bool:
-        """Deletes one regional digest and proves exact absence."""
+    def delete_outcome(self, digest: str) -> DeleteOutcome:
+        """Deletes one digest and reports only provider-proven outcomes."""
         digest = models.validate_sha256_digest(digest, 'ECR delete digest')
+        calls_before = getattr(self._client, 'started_calls', None)
         try:
             self._client.batch_delete_image(repositoryName=self.repository_name,
                                             imageIds=[{
                                                 'imageDigest': digest
                                             }])
-        except BaseException as error:  # pylint: disable=broad-except
-            try:
-                _classify(error)
-            except AmbiguousProviderOutcomeError:
-                pass
-        return self._batch_get_manifest(digest) is None
+        except BaseException:  # pylint: disable=broad-except
+            calls_after = getattr(self._client, 'started_calls', None)
+            if (calls_before is not None and calls_after == calls_before):
+                return DeleteOutcome.NOT_STARTED
+        try:
+            return (DeleteOutcome.ABSENT if self._batch_get_manifest(digest)
+                    is None else DeleteOutcome.PRESENT)
+        except BaseException:  # pylint: disable=broad-except
+            calls_after = getattr(self._client, 'started_calls', None)
+            if (calls_before is not None and calls_after == calls_before):
+                return DeleteOutcome.NOT_STARTED
+            return DeleteOutcome.AMBIGUOUS
+
+    def exact_delete(self, digest: str) -> bool:
+        """Deletes one regional digest and proves exact absence."""
+        outcome = self.delete_outcome(digest)
+        if outcome == DeleteOutcome.ABSENT:
+            return True
+        if outcome == DeleteOutcome.PRESENT:
+            return False
+        raise AmbiguousProviderOutcomeError(
+            'ECR deletion has no exact final presence proof.')
 
     def exact_manifest_exists(self, digest: str) -> bool:
         """Returns exact manifest presence without accepting a tag alias."""

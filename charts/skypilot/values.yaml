@@ -277,6 +277,11 @@ imageCopyWorker:
   # Maximum provider-I/O claims handled concurrently by each replica.
   # @schema type: [integer]; minimum: 1
   maxInFlight: 4
+  # Dedicated dependency-free probe and Prometheus port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null
@@ -287,6 +292,10 @@ imageCopyWorker:
   # qualification manifests. Entries are ingested asynchronously.
   # @schema type: [string, null]
   qualificationManifestConfigMapName: null
+  # Exact source dockerconfig Secrets this process may read. The chart grants
+  # resourceNames-scoped RBAC only for chart-created service accounts.
+  # @schema type: [array]; item: object; maxItems: 64
+  sourceCredentialSecrets: []
   serviceAccount:
     # Create the worker service account. Set false with name to use an existing
     # Terraform-managed account.
@@ -318,6 +327,10 @@ imageLifecycleWorker:
   replicaCount: 1
   # @schema type: [integer]; minimum: 1
   maxInFlight: 4
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null
@@ -356,6 +369,10 @@ imageCanaryWorker:
   # Maximum temporary compute canaries handled concurrently by each replica.
   # @schema type: [integer]; minimum: 1
   maxInFlight: 2
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null

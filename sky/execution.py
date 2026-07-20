@@ -24,6 +24,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
+from sky.container_images import consumers as container_image_consumers
 from sky.execution_autostop import _check_autostop_feasibility_early
 from sky.execution_autostop import (
     _compute_set_autostop_args_for_hooks_only_relaunch)
@@ -494,6 +495,17 @@ def _execute_dag(
 
     is_managed = (_is_launched_by_jobs_controller or
                   _is_launched_by_sky_serve_controller)
+    workload_type = 'cluster'
+    if _is_launched_by_jobs_controller:
+        workload_type = 'managed_job'
+    elif _is_launched_by_sky_serve_controller:
+        workload_type = ('pool' if task.service is not None and
+                         task.service.pool else 'service')
+    elif controller is not None:
+        workload_type = 'controller'
+    image_consumer = container_image_consumers.derive(task, cluster_name,
+                                                      workload_type,
+                                                      _extra_launch_context)
 
     if not cluster_exists:
         # If spot is launched on serve or jobs controller, we don't need to
@@ -524,9 +536,11 @@ def _execute_dag(
                         job_logger.info(
                             f'Choosing resources for {controller.value.name}...'
                         )
-                    dag = optimizer.Optimizer.optimize(dag,
-                                                       minimize=optimize_target,
-                                                       quiet=_quiet_optimizer)
+                    with container_image_consumers.use(image_consumer):
+                        dag = optimizer.Optimizer.optimize(
+                            dag,
+                            minimize=optimize_target,
+                            quiet=_quiet_optimizer)
                     task = dag.tasks[0]  # Keep: dag may have been deep-copied.
                     assert task.best_resources is not None, task
 
@@ -541,23 +555,15 @@ def _execute_dag(
                   backends.CloudVmRayBackend) and Stage.OPTIMIZE in stages:
 
         def _planner(_t: 'sky.Task'):
-            new_dag = optimizer.Optimizer.optimize(dag,
-                                                   minimize=optimize_target,
-                                                   quiet=_quiet_optimizer)
+            with container_image_consumers.use(image_consumer):
+                new_dag = optimizer.Optimizer.optimize(dag,
+                                                       minimize=optimize_target,
+                                                       quiet=_quiet_optimizer)
             new_task = new_dag.tasks[0]
             assert new_task.best_resources is not None, new_task
             return new_task.best_resources.assert_launchable()
 
         planner = _planner
-
-    workload_type = 'cluster'
-    if _is_launched_by_jobs_controller:
-        workload_type = 'managed_job'
-    elif _is_launched_by_sky_serve_controller:
-        workload_type = ('pool' if task.service is not None and
-                         task.service.pool else 'service')
-    elif controller is not None:
-        workload_type = 'controller'
 
     backend.register_info(
         dag=dag,

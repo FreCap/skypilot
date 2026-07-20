@@ -20,9 +20,11 @@ from sky.container_images import catalog_state
 from sky.container_images import models
 from sky.container_images import qualification
 from sky.container_images import topology_state
+from sky.container_images import worker_health
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
+_MAX_QUALIFIED_EKS_NODES = 1000
 _CANARY_ERROR_CODES = frozenset({
     'CANARY_DUPLICATE_CHILD',
     'CANARY_FAILED',
@@ -275,6 +277,67 @@ def _api_error_status(error: BaseException) -> int | None:
     return int(status) if isinstance(status, int) else None
 
 
+def _qualified_eks_nodes(
+    core: Any,
+    role: aws.AwsRoleBinding,
+    target: models.ManagedRegistryTarget,
+    qualified: models.QualifiedKubernetesCluster,
+) -> tuple[int, str]:
+    """Proves the runtime role for the complete bounded selector set."""
+    selector = ','.join(
+        f'{key}={value}' for key, value in qualified.node_selector)
+    response = core.list_node(label_selector=selector,
+                              limit=_MAX_QUALIFIED_EKS_NODES + 1,
+                              _request_timeout=kubernetes.API_TIMEOUT)
+    continuation = getattr(getattr(response, 'metadata', None), '_continue',
+                           None)
+    nodes = [
+        node for node in (getattr(response, 'items', None) or []) if getattr(
+            getattr(node, 'spec', None), 'unschedulable', False) is not True
+    ]
+    if (not nodes or len(nodes) > _MAX_QUALIFIED_EKS_NODES or continuation):
+        raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
+    provider_ids: list[str] = []
+    node_uids: list[str] = []
+    for node in nodes:
+        metadata = getattr(node, 'metadata', None)
+        spec = getattr(node, 'spec', None)
+        uid = getattr(metadata, 'uid', None)
+        provider_id = getattr(spec, 'provider_id', None)
+        labels = getattr(metadata, 'labels', None) or {}
+        if (not isinstance(uid, str) or not uid or
+                not isinstance(provider_id, str) or '/' not in provider_id or
+                any(
+                    labels.get(key) != value
+                    for key, value in qualified.node_selector)):
+            raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+        node_uids.append(uid)
+        provider_ids.append(provider_id.rsplit('/', 1)[-1])
+    if len(set(provider_ids)) != len(provider_ids):
+        raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+    ec2 = aws.assumed_client(role, 'ec2', target.region)
+    iam = aws.assumed_client(role, 'iam', target.region)
+    instances: list[dict[str, Any]] = []
+    for offset in range(0, len(provider_ids), 100):
+        result = ec2.describe_instances(InstanceIds=provider_ids[offset:offset +
+                                                                 100])
+        instances.extend(item for reservation in result.get('Reservations', [])
+                         for item in reservation.get('Instances', []))
+    if ({item.get('InstanceId') for item in instances} != set(provider_ids)):
+        raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+    roles: set[str] = set()
+    for instance in instances:
+        profile_arn = (instance.get('IamInstanceProfile') or {}).get('Arn')
+        if not isinstance(profile_arn, str) or '/' not in profile_arn:
+            raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+        roles.add(_instance_profile_role(iam, profile_arn.rsplit('/', 1)[-1]))
+    if roles != {qualified.node_role}:
+        raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
+    node_set_hash = hashlib.sha256('\n'.join(
+        sorted(node_uids)).encode()).hexdigest()
+    return len(nodes), node_set_hash
+
+
 def _run_eks_canary(operation: catalog_state.OperationRecord,
                     payload: dict[str, Any],
                     revision: topology_state.ProfileRevisionRecord,
@@ -285,13 +348,14 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
     del revision
     if binding.kind != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
         raise ValueError('QUALIFICATION_FAILED')
-    qualified = next(
-        (item for item in binding.qualified_clusters
-         if item[0] == payload['runtime_id'] and f':{target.region}:' in item[1]
-        ), None)
+    qualified = next((item for item in binding.qualified_clusters
+                      if item.context == payload['runtime_id'] and
+                      f':{target.region}:' in item.cluster_arn), None)
     if qualified is None:
         raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
-    context, cluster_arn, expected_node_role, namespace = qualified
+    context = qualified.context
+    cluster_arn = qualified.cluster_arn
+    namespace = qualified.namespace
     pod_name = f'sky-img-canary-{operation.id.replace("-", "")[:20]}'
     child_id = f'eks:{context}:{namespace}:{pod_name}'
     assert operation.lease_token is not None
@@ -314,6 +378,8 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             not isinstance(configured_endpoint, str) or
             endpoint.rstrip('/') != configured_endpoint.rstrip('/')):
         raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+    node_count, node_set_hash = _qualified_eks_nodes(core, role, target,
+                                                     qualified)
     deadline = operation.teardown_deadline or int(time.time())
     body = {
         'apiVersion': 'v1',
@@ -327,6 +393,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
         },
         'spec': {
             'restartPolicy': 'Never',
+            'nodeSelector': dict(qualified.node_selector),
             'containers': [{
                 'name': 'canary',
                 'image': reference,
@@ -391,23 +458,6 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
         if (not isinstance(node_uid, str) or not isinstance(provider_id, str) or
                 '/' not in provider_id):
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-        instance_id = provider_id.rsplit('/', 1)[-1]
-        ec2 = aws.assumed_client(role, 'ec2', target.region)
-        iam = aws.assumed_client(role, 'iam', target.region)
-        response = ec2.describe_instances(InstanceIds=[instance_id])
-        instances = [
-            item for reservation in response.get('Reservations', [])
-            for item in reservation.get('Instances', [])
-        ]
-        if len(instances) != 1:
-            raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-        profile_arn = (instances[0].get('IamInstanceProfile') or {}).get('Arn')
-        if not isinstance(profile_arn, str) or '/' not in profile_arn:
-            raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-        instance_profile = profile_arn.rsplit('/', 1)[-1]
-        actual_role = _instance_profile_role(iam, instance_profile)
-        if actual_role != expected_node_role:
-            raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
         evidence = {
             'status': 'READY',
             'observed_at': int(time.time()),
@@ -419,9 +469,11 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             'runtime_digest': digest,
             'context': context,
             'cluster_arn': cluster_arn,
+            'node_role': qualified.node_role,
+            'node_selector': dict(qualified.node_selector),
+            'qualified_node_count': node_count,
+            'qualified_node_set_hash': node_set_hash,
             'node_uid': node_uid,
-            'node_instance_id': instance_id,
-            'actual_principal': actual_role,
             'nonce_hash': hashlib.sha256(payload['nonce'].encode()).hexdigest(),
         }
     finally:
@@ -491,12 +543,14 @@ class CanaryWorkerService:
                  worker_id: str,
                  version: str,
                  max_in_flight: int,
-                 lease_seconds: int = _DEFAULT_LEASE_SECONDS) -> None:
+                 lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+                 health: worker_health.WorkerHealth | None = None) -> None:
         self.worker_id = worker_id
         self.version = version
         self.max_in_flight = max_in_flight
         self.lease_seconds = lease_seconds
         self._stop = threading.Event()
+        self._health = health
 
     def stop(self) -> None:
         self._stop.set()
@@ -505,19 +559,24 @@ class CanaryWorkerService:
         topology_state.register_worker(self.worker_id,
                                        models.ImageWorkerKind.CANARY,
                                        self.version, self.max_in_flight)
+        if self._health is not None:
+            self._health.registered()
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_in_flight,
                 thread_name_prefix='image-canary') as executor:
             futures: set[concurrent.futures.Future[bool]] = set()
             while not self._stop.is_set():
+                if self._health is not None:
+                    self._health.tick(len(futures))
                 done = {future for future in futures if future.done()}
                 for future in done:
                     with contextlib.suppress(Exception):
                         future.result()
                 futures -= done
-                topology_state.heartbeat_worker(self.worker_id,
-                                                in_flight=len(futures),
-                                                success=bool(done))
+                heartbeat_ok = topology_state.heartbeat_worker(
+                    self.worker_id, in_flight=len(futures), success=bool(done))
+                if self._health is not None:
+                    self._health.heartbeat(heartbeat_ok)
                 while len(futures) < self.max_in_flight:
                     operation = qualification.claim_canary(
                         worker_id=self.worker_id,
@@ -535,16 +594,27 @@ def main() -> None:
     max_in_flight = int(os.environ.get('SKYPILOT_IMAGE_MAX_IN_FLIGHT', '4'))
     if max_in_flight <= 0:
         raise ValueError('SKYPILOT_IMAGE_MAX_IN_FLIGHT must be positive.')
+    health = worker_health.WorkerHealth(
+        'canary',
+        liveness_deadline_seconds=int(
+            os.environ.get('SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS', '30')))
+    health_server = worker_health.HealthServer(
+        health, int(os.environ.get('SKYPILOT_IMAGE_HEALTH_PORT', '8081')))
     service = CanaryWorkerService(
         worker_id=os.environ.get('SKYPILOT_IMAGE_WORKER_ID', str(uuid.uuid4())),
         version=os.environ.get('SKYPILOT_IMAGE_WORKER_VERSION', 'dev'),
         max_in_flight=max_in_flight,
         lease_seconds=int(
             os.environ.get('SKYPILOT_IMAGE_LEASE_SECONDS',
-                           str(_DEFAULT_LEASE_SECONDS))))
+                           str(_DEFAULT_LEASE_SECONDS))),
+        health=health)
     signal.signal(signal.SIGTERM, lambda *_: service.stop())
     signal.signal(signal.SIGINT, lambda *_: service.stop())
-    service.run_forever()
+    health_server.start()
+    try:
+        service.run_forever()
+    finally:
+        health_server.stop()
 
 
 if __name__ == '__main__':

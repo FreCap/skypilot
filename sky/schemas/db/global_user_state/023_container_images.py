@@ -364,7 +364,7 @@ def _create_tables() -> None:
             'physical_fingerprint',
             name='uq_container_image_registry_physical'),
         sqlalchemy.CheckConstraint(
-            "state IN ('READY', 'FULL', 'DRIFTED', 'DISABLED')",
+            "state IN ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')",
             name='ck_container_image_registry_shard_state'),
         sqlalchemy.CheckConstraint(
             'shard_generation >= 0 AND shard_index >= 0 AND max_manifests > 0 '
@@ -471,6 +471,9 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_locations_shard_queue',
                     'container_image_locations',
                     ['shard_id', 'state', 'next_retry_at', 'updated_at', 'id'])
+    op.create_index('ix_container_image_locations_shard_readiness',
+                    'container_image_locations',
+                    ['shard_id', 'state', 'updated_at', 'id'])
     op.create_index('ix_container_image_locations_canonical',
                     'container_image_locations',
                     ['canonical_location_id', 'state', 'id'])
@@ -578,6 +581,7 @@ def _create_tables() -> None:
         sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('consumer_kind', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('consumer_owner', sqlalchemy.Text, nullable=False),
+        sqlalchemy.Column('request_id', sqlalchemy.Text),
         sqlalchemy.Column('consumer_generation',
                           sqlalchemy.BigInteger,
                           nullable=False),
@@ -649,6 +653,12 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_demands_owner_epoch',
                     'container_image_demands',
                     ['consumer_kind', 'owner_epoch', 'state'])
+    op.create_index(
+        'ix_container_image_demands_cluster_request',
+        'container_image_demands', ['request_id', 'state', 'id'],
+        postgresql_where=sqlalchemy.text(
+            "consumer_kind = 'cluster' AND consumer_attached IS false AND "
+            'request_id IS NOT NULL'))
     op.create_index('ix_container_image_demands_terminal',
                     'container_image_demands', ['state', 'expires_at', 'id'])
     op.create_index('ix_container_image_demands_reconcile',

@@ -763,6 +763,7 @@ def readiness(request: fastapi.Request,
         queue['quota_bound_eta_seconds'] = (math.ceil(
             queue['queue_depth'] /
             rate) if rate is not None and rate > 0 else None)
+        queue['quota_bound_eta_at_least'] = queue['queue_depth_at_least']
     authority_base32 = base64.b32encode(
         uuid.UUID(authority).bytes).decode().lower().rstrip('=')
     return api_models.ReadinessView(

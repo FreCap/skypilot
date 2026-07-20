@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Copy, RefreshCw, ShieldCheck } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -26,6 +26,10 @@ function duration(seconds) {
 function age(now, timestamp) {
   if (!timestamp) return 'Never';
   return `${duration(Math.max(0, now - timestamp))} ago`;
+}
+
+function bounded(value, atLeast) {
+  return `${Number(value || 0).toLocaleString()}${atLeast ? '+' : ''}`;
 }
 
 function bytes(value) {
@@ -94,7 +98,18 @@ export function ImageReadiness({
 }) {
   const [qualifyOpen, setQualifyOpen] = useState(false);
   const [canaryOpen, setCanaryOpen] = useState(false);
-  const now = readiness?.generated_at || Math.floor(Date.now() / 1000);
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const timer = setInterval(
+      () => setNow(Math.floor(Date.now() / 1000)),
+      5000
+    );
+    return () => clearInterval(timer);
+  }, []);
+  const snapshotAge = readiness?.generated_at
+    ? Math.max(0, now - readiness.generated_at)
+    : null;
+  const stale = Boolean(error) || snapshotAge === null || snapshotAge > 60;
   const healthyWorkers =
     readiness?.workers.filter((worker) => now - worker.heartbeat_at <= 30) ||
     [];
@@ -108,6 +123,16 @@ export function ImageReadiness({
   const profileNames = useMemo(
     () => [...new Set(capabilities.distributions.map((item) => item.name))],
     [capabilities]
+  );
+  const queueDepth =
+    readiness?.queues.reduce((sum, queue) => sum + queue.queue_depth, 0) || 0;
+  const queueDepthAtLeast = Boolean(
+    readiness?.queues.some((queue) => queue.queue_depth_at_least)
+  );
+  const failedCount =
+    readiness?.queues.reduce((sum, queue) => sum + queue.failed_count, 0) || 0;
+  const failedCountAtLeast = Boolean(
+    readiness?.queues.some((queue) => queue.failed_count_at_least)
   );
 
   if (loading && !readiness) {
@@ -129,6 +154,16 @@ export function ImageReadiness({
 
   return (
     <div className="space-y-6">
+      {stale && (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"
+        >
+          {error
+            ? `Latest refresh failed (${error}). The cached snapshot is read-only until refresh succeeds.`
+            : `This snapshot is ${age(now, readiness.generated_at)} old. Mutations are disabled until refresh succeeds.`}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-gray-900">
@@ -155,10 +190,21 @@ export function ImageReadiness({
             variant="outline"
             size="sm"
             onClick={() => setQualifyOpen(true)}
+            disabled={stale || loading}
+            title={
+              stale ? 'Refresh readiness before changing state' : undefined
+            }
           >
             Ingest handoff
           </Button>
-          <Button size="sm" onClick={() => setCanaryOpen(true)}>
+          <Button
+            size="sm"
+            onClick={() => setCanaryOpen(true)}
+            disabled={stale || loading}
+            title={
+              stale ? 'Refresh readiness before changing state' : undefined
+            }
+          >
             <ShieldCheck className="mr-2 h-4 w-4" />
             Run canary
           </Button>
@@ -180,12 +226,9 @@ export function ImageReadiness({
         />
         <SummaryCard
           label="Queued locations"
-          value={readiness.queues.reduce(
-            (sum, queue) => sum + queue.queue_depth,
-            0
-          )}
-          detail={`${readiness.queues.reduce((sum, queue) => sum + queue.failed_count, 0)} terminal failures`}
-          warning={readiness.queues.some((queue) => queue.failed_count > 0)}
+          value={bounded(queueDepth, queueDepthAtLeast)}
+          detail={`${bounded(failedCount, failedCountAtLeast)} terminal failures`}
+          warning={failedCount > 0}
         />
         <SummaryCard
           label="Provider backoffs"
@@ -310,10 +353,11 @@ export function ImageReadiness({
                   </div>
                 </TableCell>
                 <TableCell>
-                  {queue.queue_depth}
+                  {bounded(queue.queue_depth, queue.queue_depth_at_least)}
                   {queue.failed_count > 0 && (
                     <div className="text-xs text-red-700">
-                      {queue.failed_count} failed
+                      {bounded(queue.failed_count, queue.failed_count_at_least)}{' '}
+                      failed
                     </div>
                   )}
                 </TableCell>
@@ -321,7 +365,9 @@ export function ImageReadiness({
                 <TableCell>
                   {queue.quota_blocked_until > now
                     ? `Backoff ${duration(queue.quota_blocked_until - now)}`
-                    : duration(queue.quota_bound_eta_seconds)}
+                    : `${queue.quota_bound_eta_at_least ? '≥' : ''}${duration(
+                        queue.quota_bound_eta_seconds
+                      )}`}
                   <div className="text-xs text-gray-500">
                     {queue.quota_rate_per_second
                       ? `${queue.quota_rate_per_second}/s shared`

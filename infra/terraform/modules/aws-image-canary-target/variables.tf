@@ -63,6 +63,17 @@ variable "security_group_arns" {
   default     = []
 }
 
+variable "canary_instance_types" {
+  description = "Exact EC2 instance types allowed for image pull canaries."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(var.canary_instance_types) <= 32 && alltrue([for item in var.canary_instance_types : can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", item))])
+    error_message = "canary_instance_types must contain at most 32 valid EC2 instance type names."
+  }
+}
+
 variable "eks_cluster_arns" {
   description = "Exact EKS clusters whose identity the canary worker may verify."
   type        = set(string)

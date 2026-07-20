@@ -694,11 +694,13 @@ def _replace_yaml_dicts(
 
 
 def _restore_managed_container_image_fields(
-        new_yaml: str,
-        restored_yaml: str,
-        image_reference: str,
-        *,
-        enforce_kubernetes: bool = False) -> str:
+    new_yaml: str,
+    restored_yaml: str,
+    image_reference: str,
+    *,
+    enforce_kubernetes: bool = False,
+    kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
+) -> str:
     """Keeps a freshly resolved managed image after restart restoration.
 
     Existing-cluster compatibility restores broad ``docker`` and
@@ -743,7 +745,8 @@ def _restore_managed_container_image_fields(
 
     _overlay_images(new_config, restored_config)
     if enforce_kubernetes:
-        _enforce_managed_kubernetes_image(restored_config, image_reference)
+        _enforce_managed_kubernetes_image(restored_config, image_reference,
+                                          kubernetes_node_selector)
 
     # Login instructions may live under docker (new provisioners) or provider
     # (legacy provisioners).  Absence is meaningful: an auth rotation to
@@ -763,9 +766,11 @@ def _restore_managed_container_image_fields(
     return yaml_utils.dump_yaml_str(restored_config)
 
 
-def _enforce_managed_kubernetes_image(config: dict[str, Any],
-                                      image_reference: str) -> None:
-    """Makes the resolved image authoritative over Kubernetes pod overrides."""
+def _enforce_managed_kubernetes_image(
+    config: dict[str, Any],
+    image_reference: str,
+    node_selector: tuple[tuple[str, str], ...] = ()) -> None:
+    """Makes the qualified image and node pool authoritative for K8s pods."""
     available_node_types = config.get('available_node_types')
     if not isinstance(available_node_types, dict):
         return
@@ -788,6 +793,20 @@ def _enforce_managed_kubernetes_image(config: dict[str, Any],
                 changed += 1
         return changed
 
+    def _merge_node_selector(pod_spec: dict[str, Any]) -> None:
+        if not node_selector:
+            return
+        configured = pod_spec.setdefault('nodeSelector', {})
+        if not isinstance(configured, dict):
+            raise exceptions.InvalidCloudConfigs(
+                'Managed container images require nodeSelector to be a map.')
+        for key, value in node_selector:
+            if key in configured and configured[key] != value:
+                raise exceptions.InvalidCloudConfigs(
+                    'Managed container image qualification conflicts with '
+                    f'the configured Kubernetes node selector {key!r}.')
+            configured[key] = value
+
     for node_type_name, node_type in available_node_types.items():
         if not isinstance(node_type, dict):
             continue
@@ -796,6 +815,7 @@ def _enforce_managed_kubernetes_image(config: dict[str, Any],
             continue
         pod_spec = node_config.get('spec')
         if isinstance(pod_spec, dict):
+            _merge_node_selector(pod_spec)
             changed = _set_named_image(pod_spec.get('containers'), 'ray-node')
             if node_type_name == head_node_type:
                 active_ray_node_count += changed
@@ -807,6 +827,7 @@ def _enforce_managed_kubernetes_image(config: dict[str, Any],
                 if isinstance(template, dict):
                     template_spec = template.get('spec')
                     if isinstance(template_spec, dict):
+                        _merge_node_selector(template_spec)
                         _set_named_image(template_spec.get('initContainers'),
                                          'init-copy-home')
 
@@ -1508,7 +1529,8 @@ def write_cluster_config(
         resolved_container_image = to_provision.resolved_container_image
         if resolved_container_image is not None:
             _enforce_managed_kubernetes_image(
-                combined_yaml_obj, resolved_container_image.reference)
+                combined_yaml_obj, resolved_container_image.reference,
+                resolved_container_image.kubernetes_node_selector)
         # Write the updated YAML back to the file
         yaml_utils.dump_yaml(tmp_yaml_path, combined_yaml_obj)
 
@@ -1551,7 +1573,9 @@ def write_cluster_config(
                 new_yaml_content,
                 restored_yaml_content,
                 resolved_container_image.reference,
-                enforce_kubernetes=isinstance(cloud, clouds.Kubernetes))
+                enforce_kubernetes=isinstance(cloud, clouds.Kubernetes),
+                kubernetes_node_selector=(
+                    resolved_container_image.kubernetes_node_selector))
         with open(tmp_yaml_path, 'w', encoding='utf-8') as f:
             f.write(restored_yaml_content)
 

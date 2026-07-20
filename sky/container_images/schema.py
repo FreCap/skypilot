@@ -15,7 +15,7 @@ LOCATION_STATES = ('PENDING', 'COPYING', 'VERIFYING', 'READY', 'FAILED',
                    'MISSING', 'EVICTING', 'EVICTED')
 OPERATION_STATES = ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')
 PROFILE_STATES = ('QUALIFYING', 'ACTIVE', 'FAILED', 'SUPERSEDED', 'RETIRED')
-SHARD_STATES = ('READY', 'FULL', 'DRIFTED', 'DISABLED')
+SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
 LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'RECONCILE')
@@ -405,6 +405,8 @@ locations = sqlalchemy.Table(
                      'next_retry_at', 'lease_expires_at', 'id'),
     sqlalchemy.Index('ix_container_image_locations_shard_queue', 'shard_id',
                      'state', 'next_retry_at', 'updated_at', 'id'),
+    sqlalchemy.Index('ix_container_image_locations_shard_readiness', 'shard_id',
+                     'state', 'updated_at', 'id'),
     sqlalchemy.Index('ix_container_image_locations_canonical',
                      'canonical_location_id', 'state', 'id'),
     sqlalchemy.Index('ix_container_image_locations_artifact', 'image_id',
@@ -509,6 +511,7 @@ demands = sqlalchemy.Table(
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('consumer_kind', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('consumer_owner', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('request_id', sqlalchemy.Text),
     sqlalchemy.Column('consumer_generation',
                       sqlalchemy.BigInteger,
                       nullable=False),
@@ -572,6 +575,14 @@ demands = sqlalchemy.Table(
                      'target_key'),
     sqlalchemy.Index('ix_container_image_demands_owner_epoch', 'consumer_kind',
                      'owner_epoch', 'state'),
+    sqlalchemy.Index(
+        'ix_container_image_demands_cluster_request',
+        'request_id',
+        'state',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "consumer_kind = 'cluster' AND consumer_attached IS false AND "
+            'request_id IS NOT NULL')),
     sqlalchemy.Index('ix_container_image_demands_terminal', 'state',
                      'expires_at', 'id'),
     sqlalchemy.Index('ix_container_image_demands_reconcile',

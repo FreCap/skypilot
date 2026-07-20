@@ -29,6 +29,41 @@ metadata:
 automountServiceAccountToken: true
 ---
 {{- end }}
+{{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
+{{- range $index, $secret := .Values.imageCopyWorker.sourceCredentialSecrets }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-img-source-%d" $fullName $index | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $secret.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: [{{ $secret.name | quote }}]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-img-source-%d" $fullName $index | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $secret.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-img-source-%d" $fullName $index | trunc 63 | trimSuffix "-" }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "skypilot.imageCopyWorkerServiceAccountName" $ }}
+  namespace: {{ $.Release.Namespace }}
+---
+{{- end }}
+{{- end }}
 {{- if .Values.imageCopyWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -51,6 +86,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ $fullName }}
         app.kubernetes.io/component: image-copy-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageCopyWorker.healthPort | quote }}
     spec:
       serviceAccountName: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
@@ -83,8 +122,18 @@ spec:
           value: {{ $fullName | quote }}
         - name: SKYPILOT_IMAGE_WORKER_VERSION
           value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
           value: {{ .Values.imageCopyWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageCopyWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageCopyWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST
+          value: {{ toJson .Values.imageCopyWorker.sourceCredentialSecrets | quote }}
         {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
         - name: SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR
           value: /var/skypilot/image-qualification
@@ -106,6 +155,28 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageCopyWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
         resources:
           {{- toYaml .Values.imageCopyWorker.resources | nindent 10 }}
         volumeMounts:
@@ -179,6 +250,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ $fullName }}
         app.kubernetes.io/component: image-lifecycle-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageLifecycleWorker.healthPort | quote }}
     spec:
       serviceAccountName: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
@@ -211,8 +286,16 @@ spec:
           value: {{ $fullName | quote }}
         - name: SKYPILOT_IMAGE_WORKER_VERSION
           value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
           value: {{ .Values.imageLifecycleWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageLifecycleWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageLifecycleWorker.livenessDeadlineSeconds | quote }}
         - name: SKYPILOT_IMAGE_RETENTION_SECONDS
           value: {{ .Values.imageLifecycleWorker.retentionSeconds | quote }}
         {{- if .Values.apiService.dbConnectionSecretName }}
@@ -232,6 +315,28 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageLifecycleWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
         resources:
           {{- toYaml .Values.imageLifecycleWorker.resources | nindent 10 }}
         volumeMounts:
@@ -295,6 +400,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ $fullName }}
         app.kubernetes.io/component: image-canary-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageCanaryWorker.healthPort | quote }}
     spec:
       serviceAccountName: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
@@ -327,8 +436,16 @@ spec:
           value: {{ $fullName | quote }}
         - name: SKYPILOT_IMAGE_WORKER_VERSION
           value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
           value: {{ .Values.imageCanaryWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageCanaryWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageCanaryWorker.livenessDeadlineSeconds | quote }}
         {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
         - name: KUBECONFIG
           value: /var/skypilot/kubeconfig/config
@@ -350,6 +467,28 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageCanaryWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
         resources:
           {{- toYaml .Values.imageCanaryWorker.resources | nindent 10 }}
         volumeMounts:

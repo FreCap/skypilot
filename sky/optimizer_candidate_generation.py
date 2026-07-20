@@ -66,17 +66,43 @@ def _managed_image_placement(
 def _prepare_managed_image_candidates(
     candidates: list[resources_lib.Resources],
     cache: dict[tuple[Any, ...], Any],
+    locality_ranks: dict[resources_lib.Resources, int],
 ) -> list[resources_lib.Resources]:
     workspace = (skypilot_config.get_active_workspace() or
                  skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
     prepared = []
     for candidate in candidates:
         placement = _managed_image_placement(candidate)
-        eligible = container_image_runtime.prepare_metadata_only(
+        result = container_image_runtime.prepare_metadata_only_with_rank(
             candidate, placement, workspace, cache)
-        if eligible is not None:
+        if result is not None:
+            eligible, rank = result
             prepared.append(eligible)
+            locality_ranks[eligible] = min(rank,
+                                           locality_ranks.get(eligible, rank))
     return prepared
+
+
+def _filter_managed_image_locality(
+    launchable: dict[resources_lib.Resources, list[resources_lib.Resources]],
+    locality_ranks: dict[resources_lib.Resources, int],
+) -> None:
+    """Keeps the best image locality class across all task alternatives."""
+    managed_candidates = [
+        candidate for requested, candidates in launchable.items()
+        if requested.container_image is not None for candidate in candidates
+    ]
+    if not managed_candidates:
+        return
+    winning_rank = min(
+        locality_ranks[candidate] for candidate in managed_candidates)
+    for requested, candidates in launchable.items():
+        if requested.container_image is None:
+            continue
+        launchable[requested] = [
+            candidate for candidate in candidates
+            if locality_ranks[candidate] == winning_rank
+        ]
 
 
 def filter_out_blocked_launchable_resources(
@@ -248,6 +274,7 @@ def fill_in_launchable_resources(
     resource_hints: dict[resources_lib.Resources,
                          list[str]] = collections.defaultdict(list)
     image_metadata_cache: dict[tuple[Any, ...], Any] = {}
+    image_locality_ranks: dict[resources_lib.Resources, int] = {}
     if blocked_resources is None:
         blocked_resources = []
     for resources in task.resources:
@@ -284,7 +311,7 @@ def fill_in_launchable_resources(
                 eligible = generated
                 if resources.container_image is not None:
                     eligible = _prepare_managed_image_candidates(
-                        generated, image_metadata_cache)
+                        generated, image_metadata_cache, image_locality_ranks)
                 launchable[resources].extend(eligible)
                 # Each cloud can occur multiple times in feasible_list,
                 # for different region/zone.
@@ -298,6 +325,8 @@ def fill_in_launchable_resources(
             else:
                 all_fuzzy_candidates.update(
                     feasible_resources.fuzzy_candidate_list)
+        launchable[resources] = filter_out_blocked_launchable_resources(
+            launchable[resources], blocked_resources)
         if not launchable[resources]:
             clouds_str = str(clouds_list) if len(clouds_list) > 1 else str(
                 clouds_list[0])
@@ -343,8 +372,6 @@ def fill_in_launchable_resources(
                     logger.info(f'{colorama.Fore.LIGHTBLACK_EX}'
                                 f'{repr(cloud)}: {hint}'
                                 f'{colorama.Style.RESET_ALL}')
-
-        launchable[resources] = filter_out_blocked_launchable_resources(
-            launchable[resources], blocked_resources)
+    _filter_managed_image_locality(launchable, image_locality_ranks)
     return launchable, cloud_candidates, list(
         sorted(all_fuzzy_candidates)), resource_hints

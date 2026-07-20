@@ -1238,6 +1238,59 @@ def test_managed_kubernetes_image_requires_active_head_node_container():
         'containers'][0]['image'] == managed_ref
 
 
+def test_managed_kubernetes_image_enforces_qualified_node_selector():
+    digest = 'sha256:' + 'e' * 64
+    managed_ref = f'managed.example/skypilot/image@{digest}'
+    config = yaml_utils.read_yaml_str(
+        'available_node_types:\n'
+        '  ray_head_default:\n'
+        '    node_config:\n'
+        '      spec:\n'
+        '        nodeSelector: {existing: value}\n'
+        '        containers:\n'
+        '        - {name: ray-node, image: old:latest}\n'
+        '      deployment_spec:\n'
+        '        spec:\n'
+        '          template:\n'
+        '            spec:\n'
+        '              initContainers:\n'
+        '              - {name: init-copy-home, image: old:latest}\n')
+    selector = (('skypilot.co/image-pull-role', 'eks-node'),)
+
+    backend_utils._enforce_managed_kubernetes_image(config, managed_ref,
+                                                    selector)
+
+    node_config = config['available_node_types']['ray_head_default'][
+        'node_config']
+    assert node_config['spec']['nodeSelector'] == {
+        'existing': 'value',
+        'skypilot.co/image-pull-role': 'eks-node',
+    }
+    assert node_config['deployment_spec']['spec']['template']['spec'][
+        'nodeSelector'] == {
+            'skypilot.co/image-pull-role': 'eks-node',
+        }
+
+
+def test_managed_kubernetes_image_rejects_conflicting_qualified_selector():
+    digest = 'sha256:' + 'f' * 64
+    managed_ref = f'managed.example/skypilot/image@{digest}'
+    config = yaml_utils.read_yaml_str(
+        'available_node_types:\n'
+        '  ray_head_default:\n'
+        '    node_config:\n'
+        '      spec:\n'
+        '        nodeSelector:\n'
+        '          skypilot.co/image-pull-role: other\n'
+        '        containers:\n'
+        '        - {name: ray-node, image: old:latest}\n')
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='qualification conflicts'):
+        backend_utils._enforce_managed_kubernetes_image(
+            config, managed_ref, (('skypilot.co/image-pull-role', 'eks-node'),))
+
+
 def test_make_safe_symlink_command_default_uses_sudo():
     """By default the privileged steps are prefixed with sudo."""
     cmd = backend_utils.FileMountHelper.make_safe_symlink_command(

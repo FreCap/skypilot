@@ -34,6 +34,7 @@ class DemandRecord:
     workspace: str
     consumer_kind: str
     consumer_owner: str
+    request_id: str | None
     consumer_generation: int
     target_key: str
     owner_epoch: int
@@ -86,6 +87,7 @@ def _demand(row: sqlalchemy.engine.RowMapping) -> DemandRecord:
         workspace=str(row['workspace']),
         consumer_kind=str(row['consumer_kind']),
         consumer_owner=str(row['consumer_owner']),
+        request_id=row['request_id'],
         consumer_generation=int(row['consumer_generation']),
         target_key=str(row['target_key']),
         owner_epoch=int(row['owner_epoch']),
@@ -203,12 +205,23 @@ def create_demand_in_session(session: orm.Session, *, authority_id: str,
                                 separators=(',', ':'))
     if len(placement_json.encode()) > 8192:
         raise ValueError('Demand placement constraints exceed 8 KiB.')
+    request_id = None
+    consumer_metadata = placement.get('consumer')
+    if consumer_kind == 'cluster' and isinstance(consumer_metadata, dict):
+        candidate_request_id = consumer_metadata.get('request_id')
+        if candidate_request_id is not None:
+            if (not isinstance(candidate_request_id, str) or
+                    not candidate_request_id or
+                    len(candidate_request_id) > 1024):
+                raise ValueError('Cluster demand request ID is invalid.')
+            request_id = candidate_request_id
     row = session.execute(table.insert().values(
         id=str(uuid.uuid4()),
         authority_id=authority_id,
         workspace=workspace,
         consumer_kind=consumer_kind,
         consumer_owner=consumer_owner,
+        request_id=request_id,
         consumer_generation=consumer_generation,
         target_key=target_key,
         owner_epoch=owner_epoch,
@@ -232,17 +245,23 @@ def create_demand(**kwargs: Any) -> DemandRecord:
         return create_demand_in_session(session, now=current, **kwargs)
 
 
-def create_demand_for_owner_epoch_in_session(session: orm.Session, *,
-                                             authority_id: str, workspace: str,
-                                             consumer_kind: str,
-                                             consumer_owner: str,
-                                             target_key: str, owner_epoch: int,
-                                             image_id: str, runtime_digest: str,
-                                             profile_revision_id: str,
-                                             target_fingerprint: str,
-                                             location_id: str,
-                                             placement: dict[str, Any],
-                                             now: int) -> DemandRecord:
+def create_demand_for_owner_epoch_in_session(
+        session: orm.Session,
+        *,
+        authority_id: str,
+        workspace: str,
+        consumer_kind: str,
+        consumer_owner: str,
+        target_key: str,
+        owner_epoch: int,
+        image_id: str,
+        runtime_digest: str,
+        profile_revision_id: str,
+        target_fingerprint: str,
+        location_id: str,
+        placement: dict[str, Any],
+        now: int,
+        require_existing: bool = False) -> DemandRecord:
     """Converges request replay or allocates the next durable generation."""
     watermarks = schema.consumer_watermarks
     inserted = session.execute(
@@ -263,18 +282,25 @@ def create_demand_for_owner_epoch_in_session(session: orm.Session, *,
             watermarks.c.consumer_kind == consumer_kind,
             watermarks.c.consumer_owner ==
             consumer_owner).with_for_update()).mappings().one()
-    existing = session.execute(
+    existing_rows = session.execute(
         sqlalchemy.select(schema.demands).where(
             schema.demands.c.workspace == workspace,
             schema.demands.c.consumer_kind == consumer_kind,
             schema.demands.c.consumer_owner == consumer_owner,
             schema.demands.c.owner_epoch == owner_epoch,
-            schema.demands.c.target_key == target_key).order_by(
-                schema.demands.c.consumer_generation.desc()).limit(
-                    1).with_for_update()).mappings().first()
+            schema.demands.c.state.in_([
+                models.ImageDemandState.WARMING.value,
+                models.ImageDemandState.READY.value,
+                models.ImageDemandState.FAILED.value,
+            ])).order_by(schema.demands.c.consumer_generation.desc()).limit(
+                2).with_for_update()).mappings().all()
+    if len(existing_rows) > 1:
+        raise RuntimeError('A consumer epoch has multiple live image demands.')
+    existing = existing_rows[0] if existing_rows else None
     if existing is not None:
         immutable = {
             'authority_id': authority_id,
+            'target_key': target_key,
             'image_id': image_id,
             'runtime_digest': runtime_digest,
             'profile_revision_id': profile_revision_id,
@@ -286,6 +312,9 @@ def create_demand_for_owner_epoch_in_session(session: orm.Session, *,
                 for key, value in immutable.items()):
             raise ValueError('A demand owner epoch cannot change image target.')
         return _demand(existing)
+    if require_existing:
+        raise StaleConsumerGenerationError(
+            'A retired profile revision accepts only an exact live replay.')
     generation = (0 if inserted is not None else
                   int(watermark['max_seen_generation']) + 1)
     if generation > _MAX_POSTGRES_BIGINT:
@@ -333,6 +362,28 @@ def get_live_demand(*, workspace: str, consumer_kind: str, consumer_owner: str,
                     models.ImageDemandState.FAILED.value,
                 ]))).mappings().first()
     return _demand(row) if row is not None else None
+
+
+def get_current_demand_for_owner_epoch(*, workspace: str, consumer_kind: str,
+                                       consumer_owner: str,
+                                       owner_epoch: int) -> DemandRecord | None:
+    """Returns the sole live target fence for a restart-stable owner epoch."""
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(schema.demands).where(
+                schema.demands.c.workspace == workspace,
+                schema.demands.c.consumer_kind == consumer_kind,
+                schema.demands.c.consumer_owner == consumer_owner,
+                schema.demands.c.owner_epoch == owner_epoch,
+                schema.demands.c.state.in_([
+                    models.ImageDemandState.WARMING.value,
+                    models.ImageDemandState.READY.value,
+                    models.ImageDemandState.FAILED.value,
+                ])).order_by(schema.demands.c.consumer_generation.desc()).limit(
+                    2)).mappings().all()
+    if len(rows) > 1:
+        raise RuntimeError('A consumer epoch has multiple live image demands.')
+    return _demand(rows[0]) if rows else None
 
 
 def list_demands(image_id: str,
@@ -389,27 +440,24 @@ def mark_cluster_request_terminal(request_id: str,
                                   *,
                                   now: int | None = None) -> int:
     """Records exact terminal request proof for unattached cluster demands."""
+    if (not isinstance(request_id, str) or not request_id or
+            len(request_id) > 1024):
+        raise ValueError('Cluster demand request ID is invalid.')
     current = int(time.time()) if now is None else now
-    owner_epoch = owner_epoch_from_token(request_id)
     demands = schema.demands
-    changed = 0
     with orm.Session(catalog_state.engine()) as session, session.begin():
         rows = session.execute(
             sqlalchemy.select(demands).where(
                 demands.c.consumer_kind == 'cluster',
-                demands.c.owner_epoch == owner_epoch,
                 demands.c.consumer_attached.is_(False),
+                demands.c.request_id == request_id,
                 demands.c.state.in_([
                     models.ImageDemandState.WARMING.value,
                     models.ImageDemandState.READY.value,
                     models.ImageDemandState.FAILED.value,
                 ])).with_for_update()).mappings().all()
+        changed = 0
         for row in rows:
-            placement = json.loads(str(row['placement_json']))
-            consumer = placement.get('consumer', {})
-            if (not isinstance(consumer, dict) or
-                    consumer.get('request_id') != request_id):
-                continue
             values: dict[str, Any] = {
                 'last_terminal_observed_at': current,
                 'terminal_observation_count': max(
@@ -430,14 +478,62 @@ def supersede_demand(demand_id: str,
     """Ends a demand only after the owning controller chose real failover."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        optimistic = session.execute(
+            sqlalchemy.select(schema.demands).where(
+                schema.demands.c.id == demand_id,
+                schema.demands.c.workspace == workspace)).mappings().first()
+        if optimistic is None:
+            return False
+        _lock_watermark(session,
+                        workspace=str(optimistic['workspace']),
+                        consumer_kind=str(optimistic['consumer_kind']),
+                        consumer_owner=str(optimistic['consumer_owner']),
+                        generation=int(optimistic['consumer_generation']),
+                        now=current)
         row = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.id == demand_id, schema.demands.c.workspace ==
                 workspace).with_for_update()).mappings().first()
-        if row is None or str(
-                row['state']) in (models.ImageDemandState.SUPERSEDED.value,
-                                  models.ImageDemandState.RELEASED.value):
-            return row is not None
+        if row is None:
+            return False
+        if str(row['state']) in (models.ImageDemandState.SUPERSEDED.value,
+                                 models.ImageDemandState.RELEASED.value):
+            return True
+        _terminalize(session,
+                     row,
+                     models.ImageDemandState.SUPERSEDED,
+                     now=current)
+        return True
+
+
+def fail_and_supersede_demand(demand_id: str,
+                              error_code: str,
+                              *,
+                              now: int | None = None) -> bool:
+    """Atomically records terminal materialization failure and opens failover."""
+    current = int(time.time()) if now is None else now
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        optimistic = session.execute(
+            sqlalchemy.select(schema.demands).where(
+                schema.demands.c.id == demand_id)).mappings().first()
+        if optimistic is None:
+            return False
+        _lock_watermark(session,
+                        workspace=str(optimistic['workspace']),
+                        consumer_kind=str(optimistic['consumer_kind']),
+                        consumer_owner=str(optimistic['consumer_owner']),
+                        generation=int(optimistic['consumer_generation']),
+                        now=current)
+        row = session.execute(
+            sqlalchemy.select(schema.demands).where(
+                schema.demands.c.id ==
+                demand_id).with_for_update()).mappings().one()
+        if str(row['state']) in (models.ImageDemandState.SUPERSEDED.value,
+                                 models.ImageDemandState.RELEASED.value):
+            return True
+        session.execute(schema.demands.update().where(
+            schema.demands.c.id == demand_id).values(error_code=error_code,
+                                                     updated_at=current))
         _terminalize(session,
                      row,
                      models.ImageDemandState.SUPERSEDED,
@@ -513,6 +609,18 @@ def observe_consumer_terminal(demand_id: str,
     current = int(time.time()) if now is None else now
     demands = schema.demands
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        optimistic = session.execute(
+            sqlalchemy.select(demands).where(
+                demands.c.id == demand_id,
+                demands.c.workspace == workspace)).mappings().first()
+        if optimistic is None:
+            return False
+        _lock_watermark(session,
+                        workspace=str(optimistic['workspace']),
+                        consumer_kind=str(optimistic['consumer_kind']),
+                        consumer_owner=str(optimistic['consumer_owner']),
+                        generation=int(optimistic['consumer_generation']),
+                        now=current)
         row = session.execute(
             sqlalchemy.select(demands).where(
                 demands.c.id == demand_id, demands.c.workspace ==

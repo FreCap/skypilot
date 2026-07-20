@@ -131,6 +131,7 @@ export function ImageDetail() {
           (requestError.status === 404 || requestError.status === 426)
         ) {
           setOldServer(true);
+          setError(requestError.code || requestError.message);
         } else {
           setError(requestError.code || requestError.message);
         }
@@ -226,8 +227,18 @@ export function ImageDetail() {
   if (!detail || !capabilities) return null;
 
   const artifact = detail.artifact;
+  const stale = loading || Boolean(error) || oldServer;
   return (
     <div className="mx-auto max-w-[1500px] space-y-6">
+      {(error || oldServer) && (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"
+        >
+          Latest refresh failed ({error || 'UPGRADE'}). Cached artifact data is
+          read-only until refresh succeeds.
+        </div>
+      )}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <Link
@@ -254,7 +265,17 @@ export function ImageDetail() {
             Refresh
           </Button>
           {capabilities.publish && (
-            <Button onClick={() => setPrepareOpen(true)}>Prepare target</Button>
+            <Button
+              onClick={() => setPrepareOpen(true)}
+              disabled={stale}
+              title={
+                stale
+                  ? 'Refresh artifact data before changing state'
+                  : undefined
+              }
+            >
+              Prepare target
+            </Button>
           )}
         </div>
       </div>
@@ -431,6 +452,7 @@ export function ImageDetail() {
                           <Button
                             variant="outline"
                             size="sm"
+                            disabled={stale}
                             onClick={() =>
                               setRetry({ kind: 'location', id: location.id })
                             }
@@ -482,6 +504,7 @@ export function ImageDetail() {
                           <Button
                             variant="outline"
                             size="sm"
+                            disabled={stale}
                             onClick={() =>
                               setRetry({
                                 kind: 'publication',

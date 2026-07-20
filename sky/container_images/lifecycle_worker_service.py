@@ -23,6 +23,7 @@ from sky.container_images import qualification
 from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
+from sky.container_images import worker_health
 from sky.jobs import state as managed_job_state
 from sky.serve import serve_state
 
@@ -78,8 +79,8 @@ def evict_location(location: topology_state.LocationRecord,
     if target.delete_authority is None:
         topology_state.complete_eviction(location.id,
                                          token,
-                                         absent=False,
-                                         terminal_denial=True)
+                                         present=None,
+                                         provider_not_called=True)
         return False
     binding = profile.bindings[target.delete_authority]
     repository = aws.EcrRepository.from_role(
@@ -89,25 +90,17 @@ def evict_location(location: topology_state.LocationRecord,
         hooks=aws.EcrCallHooks(
             before_call=lambda: limiter.before_call(shard),
             on_throttle=lambda: limiter.record_throttle(shard)))
-    try:
-        absent = repository.exact_delete(location.runtime_digest)
+    outcome = repository.delete_outcome(location.runtime_digest)
+    if outcome == aws.DeleteOutcome.NOT_STARTED:
         topology_state.complete_eviction(location.id,
                                          token,
-                                         absent=absent,
-                                         terminal_denial=False)
-        return absent
-    except (aws.ProviderThrottledError, budgets.ProviderBudgetUnavailableError):
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         absent=False,
-                                         terminal_denial=False)
+                                         present=None,
+                                         provider_not_called=True)
         return False
-    except Exception:  # pylint: disable=broad-except
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         absent=False,
-                                         terminal_denial=True)
-        return False
+    present = (True if outcome == aws.DeleteOutcome.PRESENT else
+               False if outcome == aws.DeleteOutcome.ABSENT else None)
+    topology_state.complete_eviction(location.id, token, present=present)
+    return outcome == aws.DeleteOutcome.ABSENT
 
 
 def _reconcile_publication_fanout(limit: int = 100) -> int:
@@ -270,9 +263,9 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                     runtime_ids = (target.region,)
                 else:
                     runtime_ids = tuple(
-                        cluster[0]
+                        cluster.context
                         for cluster in binding.qualified_clusters
-                        if f':{target.region}:' in cluster[1])
+                        if f':{target.region}:' in cluster.cluster_arn)
                 for runtime_id in runtime_ids:
                     runtime_key = models.profile_attestation_key(
                         'runtime', target.name, backend, binding.fingerprint,
@@ -384,7 +377,8 @@ class LifecycleWorkerService:
                  version: str,
                  max_in_flight: int,
                  retention_seconds: int,
-                 lease_seconds: int = _DEFAULT_LEASE_SECONDS) -> None:
+                 lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+                 health: worker_health.WorkerHealth | None = None) -> None:
         self.worker_id = worker_id
         self.version = version
         self.max_in_flight = max_in_flight
@@ -392,6 +386,7 @@ class LifecycleWorkerService:
         self.lease_seconds = lease_seconds
         self._stop = threading.Event()
         self._budget_limiter = budgets.ProviderBudgetLimiter(worker_id)
+        self._health = health
 
     def stop(self) -> None:
         self._stop.set()
@@ -406,6 +401,8 @@ class LifecycleWorkerService:
         topology_state.register_worker(self.worker_id,
                                        models.ImageWorkerKind.LIFECYCLE,
                                        self.version, self.max_in_flight)
+        if self._health is not None:
+            self._health.registered()
         last_maintenance = 0
         last_consumer_reconciliation = 0
         last_qualification_reconciliation = 0
@@ -417,6 +414,8 @@ class LifecycleWorkerService:
             qualification_future: concurrent.futures.Future[bool] | None = None
             canonical_future: concurrent.futures.Future[bool] | None = None
             while not self._stop.is_set():
+                if self._health is not None:
+                    self._health.tick(len(futures))
                 done = {future for future in futures if future.done()}
                 for future in done:
                     with contextlib.suppress(Exception):
@@ -428,9 +427,10 @@ class LifecycleWorkerService:
                 if canonical_future is not None and canonical_future.done():
                     canonical_future = None
                 current = int(time.time())
-                topology_state.heartbeat_worker(self.worker_id,
-                                                in_flight=len(futures),
-                                                success=bool(done))
+                heartbeat_ok = topology_state.heartbeat_worker(
+                    self.worker_id, in_flight=len(futures), success=bool(done))
+                if self._health is not None:
+                    self._health.heartbeat(heartbeat_ok)
                 if current - last_maintenance >= 5 * 60:
                     self._maintenance(current)
                     last_maintenance = current
@@ -479,6 +479,12 @@ def main() -> None:
                        str(8 * 7 * 24 * 60 * 60)))
     if max_in_flight <= 0 or retention_seconds <= 0:
         raise ValueError('Image worker limits must be positive.')
+    health = worker_health.WorkerHealth(
+        'lifecycle',
+        liveness_deadline_seconds=int(
+            os.environ.get('SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS', '30')))
+    health_server = worker_health.HealthServer(
+        health, int(os.environ.get('SKYPILOT_IMAGE_HEALTH_PORT', '8081')))
     service = LifecycleWorkerService(
         worker_id=os.environ.get('SKYPILOT_IMAGE_WORKER_ID', str(uuid.uuid4())),
         version=os.environ.get('SKYPILOT_IMAGE_WORKER_VERSION', 'dev'),
@@ -486,10 +492,15 @@ def main() -> None:
         retention_seconds=retention_seconds,
         lease_seconds=int(
             os.environ.get('SKYPILOT_IMAGE_LEASE_SECONDS',
-                           str(_DEFAULT_LEASE_SECONDS))))
+                           str(_DEFAULT_LEASE_SECONDS))),
+        health=health)
     signal.signal(signal.SIGTERM, lambda *_: service.stop())
     signal.signal(signal.SIGINT, lambda *_: service.stop())
-    service.run_forever()
+    health_server.start()
+    try:
+        service.run_forever()
+    finally:
+        health_server.stop()
 
 
 if __name__ == '__main__':
