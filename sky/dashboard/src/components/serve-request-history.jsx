@@ -10,7 +10,18 @@ import {
 
 export function buildRequestHistoryView(history, range) {
   if (!history?.available || !range) {
-    return { timestamps: [], counts: [], stats: null };
+    return {
+      timestamps: [],
+      counts: [],
+      demandTargets: [],
+      capacityTargets: [],
+      readyCapacities: [],
+      provisioningCapacities: [],
+      totalCapacities: [],
+      events: [],
+      stats: null,
+      capacityStats: null,
+    };
   }
   const bucketSeconds = history.bucketSeconds || 60;
   const requestCounts = new Map(
@@ -21,6 +32,17 @@ export function buildRequestHistoryView(history, range) {
   );
   const timestamps = [];
   const counts = [];
+  const autoscalerSamples = new Map(
+    (history.autoscalerSamples || []).map((sample) => [
+      sample.timestamp,
+      sample,
+    ])
+  );
+  const demandTargets = [];
+  const capacityTargets = [];
+  const readyCapacities = [];
+  const provisioningCapacities = [];
+  const totalCapacities = [];
   for (
     let timestamp = range.start;
     timestamp <= range.end;
@@ -28,16 +50,111 @@ export function buildRequestHistoryView(history, range) {
   ) {
     timestamps.push(timestamp);
     counts.push(requestCounts.get(timestamp) || 0);
+    const sample = autoscalerSamples.get(timestamp);
+    demandTargets.push(sample?.demandTarget ?? null);
+    capacityTargets.push(sample?.capacityTarget ?? null);
+    readyCapacities.push(sample?.readyCapacity ?? null);
+    provisioningCapacities.push(sample?.provisioningCapacity ?? null);
+    totalCapacities.push(sample?.totalCapacity ?? null);
   }
   const total = counts.reduce((sum, count) => sum + count, 0);
+  const observedCapacity = timestamps
+    .map((timestamp, index) => ({
+      timestamp,
+      demandTarget: demandTargets[index],
+      capacityTarget: capacityTargets[index],
+      readyCapacity: readyCapacities[index],
+    }))
+    .filter(
+      (sample) =>
+        sample.demandTarget !== null &&
+        sample.capacityTarget !== null &&
+        sample.readyCapacity !== null
+    );
+  let longestBelowTargetBuckets = 0;
+  let currentBelowTargetBuckets = 0;
+  capacityTargets.forEach((capacityTarget, index) => {
+    const readyCapacity = readyCapacities[index];
+    if (capacityTarget === null || readyCapacity === null) {
+      currentBelowTargetBuckets = 0;
+    } else if (readyCapacity < capacityTarget) {
+      currentBelowTargetBuckets += 1;
+      longestBelowTargetBuckets = Math.max(
+        longestBelowTargetBuckets,
+        currentBelowTargetBuckets
+      );
+    } else {
+      currentBelowTargetBuckets = 0;
+    }
+  });
+  const minuteMultiplier = bucketSeconds / 60;
+  const capacityStats = observedCapacity.length
+    ? {
+        peakDemandTarget: Math.max(
+          ...observedCapacity.map((sample) => sample.demandTarget)
+        ),
+        peakCapacityTarget: Math.max(
+          ...observedCapacity.map((sample) => sample.capacityTarget)
+        ),
+        peakDeficit: Math.max(
+          ...observedCapacity.map((sample) =>
+            Math.max(0, sample.capacityTarget - sample.readyCapacity)
+          )
+        ),
+        belowTargetMinutes:
+          observedCapacity.filter(
+            (sample) => sample.readyCapacity < sample.capacityTarget
+          ).length * minuteMultiplier,
+        longestBelowTargetMinutes: longestBelowTargetBuckets * minuteMultiplier,
+      }
+    : null;
+  const orderedSamples = (history.autoscalerSamples || [])
+    .filter(
+      (sample) =>
+        sample.timestamp >= range.start && sample.timestamp <= range.end
+    )
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const events = [];
+  orderedSamples.forEach((sample, index) => {
+    if (index === 0) return;
+    const previous = orderedSamples[index - 1];
+    const y = sample.capacityTarget ?? sample.readyCapacity ?? 0;
+    if (
+      sample.controllerSessionId &&
+      previous.controllerSessionId &&
+      sample.controllerSessionId !== previous.controllerSessionId
+    ) {
+      events.push({
+        timestamp: sample.timestamp,
+        y,
+        kind: 'restart',
+        label: 'Controller restarted',
+      });
+    }
+    if (sample.version !== previous.version) {
+      events.push({
+        timestamp: sample.timestamp,
+        y,
+        kind: 'update',
+        label: `Service updated to v${sample.version}`,
+      });
+    }
+  });
   return {
     timestamps,
     counts,
+    demandTargets,
+    capacityTargets,
+    readyCapacities,
+    provisioningCapacities,
+    totalCapacities,
+    events,
     stats: {
       total,
       averagePerMinute: counts.length ? total / counts.length : 0,
       peakPerMinute: counts.length ? Math.max(...counts) : 0,
     },
+    capacityStats,
   };
 }
 
@@ -52,6 +169,33 @@ export function RequestHistoryCard({
     [history, range]
   );
   if (!history || history.available === false) return null;
+  const capacityData = (values) =>
+    view.timestamps.map((timestamp, index) => ({
+      x: timestamp,
+      y: values[index],
+    }));
+  const capacityLine = (label, values, color, borderDash = []) => ({
+    label,
+    data: capacityData(values),
+    parsing: false,
+    yAxisID: 'yCapacity',
+    borderColor: color,
+    backgroundColor: color,
+    fill: false,
+    pointRadius: 0,
+    borderWidth: 1.75,
+    borderDash,
+    stepped: 'middle',
+    spanGaps: false,
+    tension: 0,
+  });
+  const hasCapacity = view.demandTargets.some((value) => value !== null);
+  const hasDistinctCapacityTarget = view.capacityTargets.some(
+    (value, index) =>
+      value !== null &&
+      view.demandTargets[index] !== null &&
+      value !== view.demandTargets[index]
+  );
   const chartData = {
     datasets: [
       {
@@ -69,27 +213,113 @@ export function RequestHistoryCard({
         stepped: 'middle',
         tension: 0,
       },
+      ...(hasCapacity
+        ? [
+            capacityLine(
+              'Demand target',
+              view.demandTargets,
+              'rgb(234, 88, 12)',
+              [7, 4]
+            ),
+            ...(hasDistinctCapacityTarget
+              ? [
+                  capacityLine(
+                    'Effective capacity target',
+                    view.capacityTargets,
+                    'rgb(147, 51, 234)',
+                    [3, 3]
+                  ),
+                ]
+              : []),
+            capacityLine(
+              'Ready capacity',
+              view.readyCapacities,
+              'rgb(22, 163, 74)'
+            ),
+            capacityLine(
+              'Provisioning capacity',
+              view.provisioningCapacities,
+              'rgb(8, 145, 178)',
+              [2, 3]
+            ),
+            capacityLine(
+              'Total capacity',
+              view.totalCapacities,
+              'rgb(100, 116, 139)',
+              [1, 3]
+            ),
+          ]
+        : []),
+      ...['restart', 'update']
+        .filter((kind) => view.events.some((event) => event.kind === kind))
+        .map((kind) => ({
+          label: kind === 'restart' ? 'Controller restart' : 'Service update',
+          data: view.events
+            .filter((event) => event.kind === kind)
+            .map((event) => ({
+              x: event.timestamp,
+              y: event.y,
+              eventLabel: event.label,
+            })),
+          parsing: false,
+          yAxisID: 'yCapacity',
+          showLine: false,
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          pointStyle: kind === 'restart' ? 'triangle' : 'rectRot',
+          borderColor:
+            kind === 'restart' ? 'rgb(220, 38, 38)' : 'rgb(79, 70, 229)',
+          backgroundColor:
+            kind === 'restart' ? 'rgb(220, 38, 38)' : 'rgb(79, 70, 229)',
+          clip: false,
+        })),
     ],
+  };
+  const scales = historyLinearScale(range, {
+    beginAtZero: true,
+    ticks: { precision: 0 },
+    title: { display: true, text: 'Recorded requests / minute' },
+  });
+  scales.yCapacity = {
+    position: 'right',
+    beginAtZero: true,
+    ticks: { precision: 0 },
+    grid: { drawOnChartArea: false },
+    title: {
+      display: hasCapacity,
+      text:
+        history.autoscalerSamples?.find((sample) => sample.replicaUnit)
+          ?.replicaUnit === 'logical_slot'
+          ? 'Capacity slots'
+          : 'Machines',
+    },
   };
   const options = {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
-    scales: historyLinearScale(range, {
-      beginAtZero: true,
-      ticks: { precision: 0 },
-      title: { display: true, text: 'Recorded requests / minute' },
-    }),
-    plugins: { legend: { display: false } },
+    scales,
+    plugins: {
+      legend: { display: hasCapacity, position: 'bottom' },
+      tooltip: {
+        callbacks: {
+          label: (context) =>
+            context.raw?.eventLabel ||
+            `${context.dataset.label}: ${context.parsed.y}`,
+        },
+      },
+    },
   };
 
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
         <div>
-          <h3 className="text-lg font-semibold">Request history</h3>
+          <h3 className="text-lg font-semibold">
+            Request and capacity history
+          </h3>
           <div className="text-sm text-gray-500">
-            Recorded requests per minute
+            Recorded requests, autoscaler targets, and available capacity
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
@@ -123,6 +353,40 @@ export function RequestHistoryCard({
                 </div>
               </div>
             </div>
+            {view.capacityStats && (
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 text-sm">
+                <div>
+                  <div className="text-gray-500">Peak demand target</div>
+                  <div className="font-semibold">
+                    {view.capacityStats.peakDemandTarget}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Peak capacity target</div>
+                  <div className="font-semibold">
+                    {view.capacityStats.peakCapacityTarget}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Peak target deficit</div>
+                  <div className="font-semibold">
+                    {view.capacityStats.peakDeficit}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Minutes below target</div>
+                  <div className="font-semibold">
+                    {view.capacityStats.belowTargetMinutes}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Longest target gap</div>
+                  <div className="font-semibold">
+                    {view.capacityStats.longestBelowTargetMinutes} min
+                  </div>
+                </div>
+              </div>
+            )}
             <SelectableHistoryLine
               data={chartData}
               options={options}

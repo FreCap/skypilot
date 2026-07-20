@@ -327,6 +327,30 @@ describe('getServices', () => {
         retention_hours: 72,
         window_start: 1751590000,
         window_end: 1751633200,
+        rejection_history_available: true,
+        request_samples: [
+          {
+            timestamp: 1751633160,
+            request_count: 9,
+            rejected_count: 2,
+          },
+        ],
+        autoscaler_samples: [
+          {
+            timestamp: 1751633160,
+            observed_at: 1751633175,
+            controller_session_id: 'a'.repeat(32),
+            version: 2,
+            replica_unit: 'physical_backend',
+            demand_target: 4,
+            capacity_target: 8,
+            ready_capacity: 6,
+            provisioning_capacity: 2,
+            total_capacity: 9,
+            peak_in_flight: 5,
+            peak_queue_depth: 3,
+          },
+        ],
         samples: [
           {
             timestamp: 1751633160,
@@ -370,6 +394,26 @@ describe('getServices', () => {
           erroredCount: 2,
           stoppingCount: 1,
           totalCount: 7,
+        },
+      ],
+      requestSamples: [
+        { timestamp: 1751633160, requestCount: 9, rejectedCount: 2 },
+      ],
+      rejectionHistoryAvailable: true,
+      autoscalerSamples: [
+        {
+          timestamp: 1751633160,
+          observedAt: 1751633175,
+          controllerSessionId: 'a'.repeat(32),
+          version: 2,
+          replicaUnit: 'physical_backend',
+          demandTarget: 4,
+          capacityTarget: 8,
+          readyCapacity: 6,
+          provisioningCapacity: 2,
+          totalCapacity: 9,
+          peakInFlight: 5,
+          peakQueueDepth: 3,
         },
       ],
     });
@@ -492,7 +536,30 @@ describe('normalizeReplicaHistory', () => {
       ],
       request_samples: [
         { timestamp: '120', request_count: '7' },
+        { timestamp: '180', request_count: 2, rejected_count: null },
         { timestamp: 'bad', request_count: 8 },
+      ],
+      autoscaler_samples: [
+        {
+          timestamp: '120',
+          observed_at: '125',
+          controller_session_id: 'a'.repeat(32),
+          version: 2,
+          replica_unit: 'logical_slot',
+          demand_target: 3,
+          capacity_target: 4,
+          ready_capacity: 2,
+          provisioning_capacity: 1,
+          total_capacity: 4,
+          peak_in_flight: 7,
+          peak_queue_depth: null,
+        },
+        {
+          timestamp: 'bad',
+          observed_at: 125,
+          version: 2,
+          replica_unit: 'logical_slot',
+        },
       ],
       request_window_seconds: 3600,
       requests_last_hour: 7,
@@ -507,7 +574,24 @@ describe('normalizeReplicaHistory', () => {
       }),
     ]);
     expect(history.requestSamples).toEqual([
-      { timestamp: 120, requestCount: 7 },
+      { timestamp: 120, requestCount: 7, rejectedCount: null },
+      { timestamp: 180, requestCount: 2, rejectedCount: null },
+    ]);
+    expect(history.autoscalerSamples).toEqual([
+      {
+        timestamp: 120,
+        observedAt: 125,
+        controllerSessionId: 'a'.repeat(32),
+        version: 2,
+        replicaUnit: 'logical_slot',
+        demandTarget: 3,
+        capacityTarget: 4,
+        readyCapacity: 2,
+        provisioningCapacity: 1,
+        totalCapacity: 4,
+        peakInFlight: 7,
+        peakQueueDepth: null,
+      },
     ]);
     expect(history.requestWindowSeconds).toBe(3600);
     expect(history.requestsLastHour).toBe(7);

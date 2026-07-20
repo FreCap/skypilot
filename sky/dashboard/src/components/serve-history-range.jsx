@@ -38,6 +38,7 @@ export function getHistoryBounds(history) {
   const timestamps = [
     ...(history.samples || []).map((sample) => sample.timestamp),
     ...(history.requestSamples || []).map((sample) => sample.timestamp),
+    ...(history.autoscalerSamples || []).map((sample) => sample.timestamp),
   ].filter(Number.isFinite);
   const fallbackStart = timestamps.length ? Math.min(...timestamps) : null;
   const fallbackEnd = timestamps.length ? Math.max(...timestamps) : null;
@@ -149,7 +150,7 @@ export function HistoryRangeToolbar({ selection, range, onPreset }) {
   return (
     <div className="flex flex-wrap items-center justify-end gap-2 mb-3">
       <span className="text-xs text-gray-500 mr-1">
-        Drag either chart to select a shared range
+        Drag any chart to select a shared range
       </span>
       {HISTORY_PRESETS.map((preset) => {
         const active =

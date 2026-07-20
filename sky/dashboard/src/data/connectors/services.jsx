@@ -107,7 +107,79 @@ export function normalizeReplicaHistory(history) {
           ) {
             return null;
           }
-          return { timestamp, requestCount };
+          const rejectedCount = Number(sample.rejected_count);
+          return {
+            timestamp,
+            requestCount,
+            rejectedCount:
+              Object.prototype.hasOwnProperty.call(sample, 'rejected_count') &&
+              sample.rejected_count !== null &&
+              sample.rejected_count !== undefined &&
+              Number.isInteger(rejectedCount) &&
+              rejectedCount >= 0
+                ? rejectedCount
+                : null,
+          };
+        })
+        .filter(Boolean)
+    : [];
+  const autoscalerSamples = Array.isArray(history.autoscaler_samples)
+    ? history.autoscaler_samples
+        .map((sample) => {
+          const timestamp = Number(sample.timestamp);
+          const observedAt = Number(sample.observed_at);
+          const version = Number(sample.version);
+          const requiredCounts = [
+            sample.demand_target,
+            sample.capacity_target,
+            sample.ready_capacity,
+            sample.provisioning_capacity,
+            sample.total_capacity,
+          ].map(Number);
+          if (
+            !Number.isFinite(timestamp) ||
+            !Number.isFinite(observedAt) ||
+            !Number.isInteger(version) ||
+            version < 1 ||
+            !['physical_backend', 'logical_slot'].includes(
+              sample.replica_unit
+            ) ||
+            requiredCounts.some(
+              (value) => !Number.isInteger(value) || value < 0
+            )
+          ) {
+            return null;
+          }
+          const [
+            demandTarget,
+            capacityTarget,
+            readyCapacity,
+            provisioningCapacity,
+            totalCapacity,
+          ] = requiredCounts;
+          if (capacityTarget < demandTarget) return null;
+          const optionalCount = (value) => {
+            if (value === null || value === undefined) return null;
+            const count = Number(value);
+            return Number.isInteger(count) && count >= 0 ? count : null;
+          };
+          return {
+            timestamp,
+            observedAt,
+            controllerSessionId:
+              typeof sample.controller_session_id === 'string'
+                ? sample.controller_session_id
+                : null,
+            version,
+            replicaUnit: sample.replica_unit,
+            demandTarget,
+            capacityTarget,
+            readyCapacity,
+            provisioningCapacity,
+            totalCapacity,
+            peakInFlight: optionalCount(sample.peak_in_flight),
+            peakQueueDepth: optionalCount(sample.peak_queue_depth),
+          };
         })
         .filter(Boolean)
     : [];
@@ -120,6 +192,8 @@ export function normalizeReplicaHistory(history) {
     windowEnd: Number(history.window_end) || null,
     samples,
     requestSamples,
+    autoscalerSamples,
+    rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:
       Number(history.request_window_seconds) > 0
         ? Number(history.request_window_seconds)

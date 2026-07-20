@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from typing import Any, NamedTuple
+import uuid
 
 import colorama
 import fastapi
@@ -155,6 +156,7 @@ class SkyServeController:
         self._service_name = service_name
         self._resource_scope = resource_scope
         self._service_hash = service_hash
+        self._history_session_id = uuid.uuid4().hex
         self._controller_owner = ((controller_pid,
                                    controller_ip) if service_hash is not None or
                                   controller_pid is not None or
@@ -976,7 +978,10 @@ class SkyServeController:
                 self._lb_occupancy_contract_known = True
             # History is incarnation-scoped and never changes runtime state,
             # so it may finish before the final ownership fence even if this
-            # controller loses the service mid-write.
+            # controller loses the service mid-write. Autoscaler history reads
+            # the previously applied authoritative demand snapshot; the next
+            # frequent sync captures the report below without adding an await
+            # after the runtime-mutation fence.
             observed_slots: dict[int, int] = {}
             if authority[1]:
                 observed_slots = self._translate_observed_slots(
@@ -984,8 +989,14 @@ class SkyServeController:
                 if logical_versions is not None:
                     await self._confirm_logical_bridge_capacities(
                         replica_infos, logical_versions, observed_slots)
-            request_history_accepted = await self._persist_request_history(
-                request_data)
+            replica_counts = self._get_replica_counts(replica_infos)
+            history_capacity_hint = self._get_capacity_hint(
+                replica_infos, logical_versions, replica_counts=replica_counts)
+            request_history_accepted, _ = await asyncio.gather(
+                self._persist_request_history(request_data),
+                self._persist_autoscaler_history(replica_counts,
+                                                 history_capacity_hint),
+            )
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             # All awaits, including durable bridge confirmation, are above
@@ -998,16 +1009,14 @@ class SkyServeController:
                 authority,
                 observed_slots,
             )
-            replica_counts = self._get_replica_counts(replica_infos)
             self._replica_counts_snapshot = replica_counts
+            capacity_hint = self._get_capacity_hint(
+                replica_infos, logical_versions, replica_counts=replica_counts)
             response_content = {
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
-                'capacity_hint': self._get_capacity_hint(
-                    replica_infos,
-                    logical_versions,
-                    replica_counts=replica_counts),
+                'capacity_hint': capacity_hint,
                 'request_history_accepted': request_history_accepted,
             }
             if getattr(self, '_lb_ha_enabled', False):
@@ -1617,6 +1626,74 @@ class SkyServeController:
             request_history,
         )
         return True
+
+    async def _persist_autoscaler_history(
+        self,
+        replica_counts: dict[str, int | str],
+        capacity_hint: dict[str, Any],
+    ) -> None:
+        """Persist controller gauges without allowing history to fail sync."""
+        loop = asyncio.get_running_loop()
+        observed_at = time.time()
+        try:
+            await loop.run_in_executor(None, self._record_autoscaler_history,
+                                       replica_counts, capacity_hint,
+                                       observed_at)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to persist autoscaler history for '
+                           f'{self._service_name!r}: '
+                           f'{common_utils.format_exception(e)}')
+
+    def _record_autoscaler_history(
+        self,
+        replica_counts: dict[str, int | str],
+        capacity_hint: dict[str, Any],
+        timestamp: float | None = None,
+    ) -> int:
+        """Persist one minute observation from already-computed sync state."""
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            return 0
+        replica_unit = replica_counts.get('replica_unit')
+        ready_capacity = replica_counts.get('ready_replicas')
+        total_capacity = replica_counts.get('total_replicas')
+        provisioning_capacity = capacity_hint.get('provisioning_replicas')
+        if (not isinstance(replica_unit, str) or
+                replica_unit not in {'physical_backend', 'logical_slot'} or
+                not isinstance(ready_capacity, int) or
+                not isinstance(total_capacity, int) or
+                not isinstance(provisioning_capacity, int)):
+            return 0
+
+        autoscaler_info = self._autoscaler.info()
+        demand_target = self._autoscaler.get_final_target_num_replicas()
+        fill_target = autoscaler_info.get('fill_target')
+        if not isinstance(fill_target, int) or isinstance(fill_target, bool):
+            fill_target = 0
+        capacity_target = max(demand_target, fill_target)
+        peak_in_flight = autoscaler_info.get('in_flight_total')
+        peak_queue_depth = autoscaler_info.get('queue_depth')
+        if not isinstance(peak_in_flight, int) or isinstance(
+                peak_in_flight, bool):
+            peak_in_flight = None
+        if not isinstance(peak_queue_depth, int) or isinstance(
+                peak_queue_depth, bool):
+            peak_queue_depth = None
+        return serve_history.record_autoscaler_snapshot(
+            self._service_name,
+            service_hash,
+            self._history_session_id,
+            version=self._applied_version,
+            replica_unit=replica_unit,
+            demand_target=demand_target,
+            capacity_target=capacity_target,
+            ready_capacity=ready_capacity,
+            provisioning_capacity=provisioning_capacity,
+            total_capacity=total_capacity,
+            peak_in_flight=peak_in_flight,
+            peak_queue_depth=peak_queue_depth,
+            timestamp=timestamp,
+        )
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""

@@ -8,6 +8,7 @@ import {
   getEffectiveHistorySelection,
   resolveHistoryRange,
 } from '@/components/serve-history-range';
+import { DemandPressureCard } from '@/components/serve-demand-pressure';
 import { ReplicaHistoryCard } from '@/components/serve-replica-history';
 import { RequestHistoryCard } from '@/components/serve-request-history';
 
@@ -34,6 +35,14 @@ export function ServeHistorySection({ history, loading = false }) {
         onPreset={(seconds) => setSelection({ kind: 'preset', seconds })}
       />
       <RequestHistoryCard
+        history={history}
+        range={range}
+        onRangeSelect={({ start, end }) =>
+          setSelection({ kind: 'custom', start, end })
+        }
+        loading={loading}
+      />
+      <DemandPressureCard
         history={history}
         range={range}
         onRangeSelect={({ start, end }) =>

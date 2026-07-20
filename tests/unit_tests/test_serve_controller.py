@@ -1697,6 +1697,8 @@ class _StatefulDemandAutoscaler:
     def __init__(self) -> None:
         self.replica_unit = 'physical_backend'
         self.latest_version = 1
+        self.max_replicas = 100
+        self.target_num_replicas = 1
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
@@ -1704,6 +1706,19 @@ class _StatefulDemandAutoscaler:
         self.rejected_in_window = 5
         self.collect_calls = 0
         self.reports = []
+
+    def get_final_target_num_replicas(self):
+        return self.target_num_replicas
+
+    def has_recomputed_with_fresh_data(self):
+        return True
+
+    def info(self):
+        return {
+            'target_num_replicas': self.target_num_replicas,
+            'in_flight_total': sum(self.in_flight_by_replica_id.values()),
+            'queue_depth': self.queue_depth,
+        }
 
     def collect_request_information(self, report) -> None:
         self.collect_calls += 1
@@ -1872,6 +1887,49 @@ class TestAuthoritativeLbReportIngestion:
             'service-hash',
             f"lb-a:{'a' * 32}",
             report['request_history'],
+        )
+
+    def test_autoscaler_history_distinguishes_demand_and_fill_targets(self):
+        ctrl, _, _ = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._history_session_id = 'c' * 32  # pylint: disable=protected-access
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        autoscaler = mock.Mock()
+        autoscaler.get_final_target_num_replicas.return_value = 7
+        autoscaler.info.return_value = {
+            'fill_target': 12,
+            'in_flight_total': 5,
+            'queue_depth': 4,
+        }
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        replica_counts = {
+            'replica_unit': 'physical_backend',
+            'ready_replicas': 9,
+            'total_replicas': 14,
+        }
+        capacity_hint = {'provisioning_replicas': 3}
+
+        with mock.patch.object(controller.serve_history,
+                               'record_autoscaler_snapshot',
+                               return_value=1) as record_history:
+            written = ctrl._record_autoscaler_history(  # pylint: disable=protected-access
+                replica_counts, capacity_hint)
+
+        assert written == 1
+        record_history.assert_called_once_with(
+            'svc',
+            'service-hash',
+            'c' * 32,
+            version=3,
+            replica_unit='physical_backend',
+            demand_target=7,
+            capacity_target=12,
+            ready_capacity=9,
+            provisioning_capacity=3,
+            total_capacity=14,
+            peak_in_flight=5,
+            peak_queue_depth=4,
+            timestamp=None,
         )
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])

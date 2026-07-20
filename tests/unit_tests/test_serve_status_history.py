@@ -96,6 +96,8 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'retention_hours': 72,
         'samples': [],
         'request_samples': [],
+        'autoscaler_samples': [],
+        'rejection_history_available': False,
         'request_window_seconds': 3600,
         'requests_last_hour': 0,
     }
@@ -126,7 +128,22 @@ def test_request_history_rows_validate_and_normalize_recent_buckets():
         'bucket_start': observed_at.replace(second=0, microsecond=0),
         'observed_at': observed_at,
         'request_count': 7,
+        'rejected_count': 0,
+        'rejection_count_available': False,
     }]
+
+    rejection_only = serve_history._request_history_rows(
+        'svc', 'hash', 'pod:process', {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': int(observed_at.timestamp()) // 60 * 60,
+                'request_count': 0,
+                'rejected_count': 1,
+            }],
+        }, observed_at)
+    assert rejection_only[0]['request_count'] == 0
+    assert rejection_only[0]['rejected_count'] == 1
+    assert rejection_only[0]['rejection_count_available'] is True
 
 
 @pytest.mark.parametrize(
@@ -148,6 +165,14 @@ def test_request_history_rows_validate_and_normalize_recent_buckets():
             'buckets': [{
                 'bucket_start': 60,
                 'request_count': 0,
+            }],
+        },
+        {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 60,
+                'request_count': 1,
+                'rejected_count': -1,
             }],
         },
     ],

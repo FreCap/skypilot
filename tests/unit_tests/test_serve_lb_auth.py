@@ -576,6 +576,7 @@ def test_request_history_uses_cumulative_minute_counters(monkeypatch):
         'buckets': [{
             'bucket_start': 120,
             'request_count': 2,
+            'rejected_count': 0,
         }],
     }
 
@@ -585,6 +586,7 @@ def test_request_history_uses_cumulative_minute_counters(monkeypatch):
     assert agg.request_history_snapshot()['buckets'] == [{
         'bucket_start': 120,
         'request_count': 3,
+        'rejected_count': 0,
     }]
 
 
@@ -601,6 +603,49 @@ def test_request_history_ack_preserves_arrivals_during_sync(monkeypatch):
     assert agg.request_history_snapshot()['buckets'] == [{
         'bucket_start': 120,
         'request_count': 2,
+        'rejected_count': 0,
+    }]
+
+
+def test_rejection_history_is_acknowledged_independently(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    agg = serve_utils.RequestTimestamp()
+    agg.add(None)
+    first = agg.request_history_snapshot()
+    agg.mark_request_history_accepted(first)
+
+    agg.add_rejection()
+    rejected = agg.request_history_snapshot()
+    assert rejected == {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': 120,
+            'request_count': 1,
+            'rejected_count': 1,
+        }],
+    }
+
+    agg.add_rejection()
+    agg.mark_request_history_accepted(rejected)
+    assert agg.request_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 1,
+        'rejected_count': 2,
+    }]
+
+
+def test_terminal_rejection_feeds_exact_history(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    request = fastapi.Request(_scope('/predict'))
+    lb._request_aggregator.add(request)
+
+    lb._record_rejection(request)
+
+    assert lb._request_aggregator.request_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 1,
+        'rejected_count': 1,
     }]
 
 
@@ -698,6 +743,7 @@ def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
     assert lb._request_aggregator.request_history_snapshot()['buckets'] == [{
         'bucket_start': 120,
         'request_count': 2,
+        'rejected_count': 0,
     }]
 
 
@@ -722,6 +768,7 @@ def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
     assert captured['json']['request_history']['buckets'] == [{
         'bucket_start': 120,
         'request_count': 1,
+        'rejected_count': 0,
     }]
     assert (captured['timeout'].total ==
             constants.LB_DRAIN_HISTORY_FLUSH_TIMEOUT_SECONDS)
