@@ -3248,6 +3248,45 @@ class TestLogicalCapacityPlanning:
         assert not retiring.status_property.is_scale_down
         assert not retiring.status_property.wait_for_idle_before_termination
 
+    def test_target_growth_reactivates_when_latest_backend_unobservable(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        unobservable = self._ready_backend(11, 4)
+        unobservable.version = 10
+        mgr._logical_target = (10, 5, 5)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor, unobservable]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert not retiring.status_property.wait_for_idle_before_termination
+
+    def test_target_growth_reactivates_when_latest_backend_unknown(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        unknown = self._ready_backend(11, 4)
+        unknown.version = 10
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            observed_slots_by_replica_id={
+                10: 1,
+                11: 4,
+            },
+            unknown_replica_ids=frozenset({11}))
+        mgr._logical_target = (10, 5, 5)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor, unknown]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert not retiring.status_property.wait_for_idle_before_termination
+
     def test_target_growth_reactivates_only_capacity_shortfall(self):
         mgr, first_retiring, first_survivor = (
             self._pending_logical_retirement())
