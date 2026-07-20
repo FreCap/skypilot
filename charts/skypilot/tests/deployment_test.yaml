@@ -1076,6 +1076,22 @@ tests:
           content:
             name: logrotate
 
+  - it: should rotate API and Serve controller logs with the configured retention
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+      apiService.logs.retention.size: 37M
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: '/root/\.sky/api_server/server\.log[\s\S]*size 37M[\s\S]*copytruncate'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: '/root/\.sky/serve/\*/controller\.log[\s\S]*/root/\.sky/serve/\*/batch_controller\.log[\s\S]*size 37M[\s\S]*rotate 1[\s\S]*copytruncate'
+      - notMatchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: '/root/\.sky/serve/\*/replica'
+
   - it: should not include logrotate sidecar when serveServerLog is false
     set:
       apiService.serveServerLog: false
