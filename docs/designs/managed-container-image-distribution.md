@@ -10,9 +10,9 @@ Last updated: 2026-07-20
 
 SkyPilot will provide a small, portable image-distribution control plane built
 on standard OCI registries. An image is identified by an immutable digest. An
-explicit publication operation adopts that digest, prepares one canonical
-registry location asynchronously, and makes an optional human-readable release
-visible only after the canonical location is verified READY. Workload
+explicit publication operation adopts that digest under one required immutable
+release, prepares one canonical registry location asynchronously, and makes the
+release visible only after the canonical location is verified READY. Workload
 deployment consumes published identity and may request one placement-specific
 cache intent. Deployment never discovers a mutable tag, registers a source, or
 publishes a release.
@@ -62,7 +62,7 @@ V0 contains:
 - one managed AWS ECR adapter for qualified EC2 and EKS runtimes;
 - fixed, Terraform-created AWS repository shards;
 - separate API, copy-worker, lifecycle-worker, and workload identities;
-- durable deployment references and reference-aware regional eviction;
+- durable deployment demands that fence regional eviction;
 - node-scoped image resolution for multi-GPU and multi-node workloads;
 - bounded paginated APIs and a complete operational Images UI;
 - copy and lifecycle worker Helm deployments, health, metrics, and recovery;
@@ -108,8 +108,8 @@ here.
 | --- | --- | --- |
 | Artifact | Workspace-scoped immutable runtime digest and platform | catalog repository |
 | Source | Exact root reference and selected runtime manifest used to import an artifact | publication service |
-| Publication | Durable adoption attempt and optional release reservation | publication service |
-| Release | Human-readable immutable alias created only after verification | publication service |
+| Publication | Durable adoption attempt and required release reservation | publication service |
+| Release | Immutable published name projected only from a READY publication | publication service |
 | Profile | Complete registry topology and policy snapshot | server configuration |
 | Access binding | Credential-free reference to one qualified read, write, pull, or delete authority | provider adapter |
 | Qualification | Timestamped proof that one profile revision and its access bindings are usable | background worker |
@@ -117,7 +117,6 @@ here.
 | Location | One digest in one physical registry target | materialization service |
 | Demand | Durable placement pin shared by one logical deployment and target | demand transaction service |
 | Pull plan | Secret-free, placement-specific READY location snapshot | runtime resolver |
-| Reference | Durable consumer fence preventing location eviction | reference service |
 | Copy worker | Claims copy/verify work and can write manifests | materialization worker |
 | Lifecycle worker | Claims eligible regional eviction work and can delete manifests | lifecycle worker |
 
@@ -129,7 +128,7 @@ sky/container_images/
   config.py                 profile and workspace policy snapshots
   catalog_state.py          artifact, source, publication, and release aggregate
   topology_state.py         profiles, budgets, shards, locations, leases, workers
-  demand_state.py           durable demands, pull plans, references, tombstones
+  demand_state.py           durable demands, pull plans, tombstones, watermarks
   transactions.py           cross-repository PostgreSQL transitions
   publication.py            explicit publication service
   runtime.py                read-only workload resolution and warming demand
@@ -144,7 +143,7 @@ sky/container_images/
 Repository functions accept a caller-owned SQLAlchemy session and never commit
 it. `transactions.py` is the only cross-repository transaction boundary. Its
 small public surface owns publication creation/convergence, demand
-creation/READY commit, and reference-fenced eviction. It owns no tables and does
+creation/READY commit, and demand-fenced eviction. It owns no tables and does
 no provider I/O. Repositories do not call each other, which prevents the split
 from recreating a cyclic monolith. Business services never issue raw SQL.
 Provider adapters do no catalog writes. API handlers create intent or project
@@ -195,17 +194,20 @@ default.
 
 ```text
 sky image publish SOURCE@sha256:DIGEST \
-    [--source-auth BINDING] [--release NAME] \
+    [--source-auth BINDING] --release NAME \
     --distribution PROFILE [--platform linux/amd64] [--no-wait]
 sky image status [SELECTOR] [--workspace W]
-sky image prepare SELECTOR --distribution PROFILE --target TARGET... [--no-wait]
+sky image prepare SELECTOR --distribution PROFILE --target TARGET [--no-wait]
 sky image retry SELECTOR --distribution PROFILE --target TARGET [--no-wait]
 sky image profile qualify PROFILE --manifest TERRAFORM.json [--no-wait]
+sky image profile canary PROFILE --target TARGET \
+    --backend aws_vm|aws_eks [--no-wait]
 ```
 
-`publish` is the only public source-adoption operation. There is no `register`
-alias. `status` and every Dashboard catalog/readiness query are synchronous,
-paginated reads that create no generic request row.
+`publish` is the only public source-adoption operation and requires one release.
+There is no `register` alias or release-less permanent artifact path. `status`
+and every Dashboard catalog/readiness query are synchronous, paginated reads that
+create no generic request row.
 
 `--source-auth` names an allowed credential resolver binding, never a secret.
 The publication persists only its binding ID and qualification fingerprint. A
@@ -216,17 +218,24 @@ names without reading or returning their values.
 Terraform handoff. Helm deployments normally mount that handoff from a ConfigMap
 for automatic background ingestion; the command supports non-Kubernetes control
 planes. Neither path runs Terraform or waits for provider qualification inline.
+`profile canary` is an administrator-only asynchronous proof using the actual
+declared EC2 instance-profile or EKS node-role pull path. It is the only public
+operation allowed to resolve a desired but not-yet-active revision, and only for
+the fixed qualification artifact and one-time nonce.
 
-`prepare` accepts only a READY artifact whose canonical location is verified. It
-validates every selected target before creating any regional intent. A pending
-publication fails with `ARTIFACT_NOT_READY` and a status remediation; callers do
-not orchestrate a hidden two-call canonical protocol.
+`prepare` accepts only a READY artifact whose canonical location is verified and
+one qualified target. It validates that target before creating a regional intent.
+A pending publication fails with `ARTIFACT_NOT_READY` and a status remediation;
+callers do not orchestrate a hidden two-call canonical protocol. V0 has no
+standard-user bulk fan-out; normal deployment may prepare only its selected
+placement, and administrators repeat the single-target operation explicitly.
 
 ### Mutation contract
 
-`publish`, `prepare`, `retry`, and `profile qualify` require a client-generated
-idempotency key in the SDK or `Idempotency-Key` header. The CLI and Dashboard
-generate a random key once per submitted form and reuse it after lost responses.
+`publish`, `prepare`, `retry`, `profile qualify`, and `profile canary` require a
+client-generated idempotency key in the SDK or `Idempotency-Key` header. The CLI
+and Dashboard generate a random key once per submitted form and reuse it after
+lost responses.
 One bounded image-operation row is unique by catalog authority, workspace or
 administrator scope, actor hash, mutation kind, and key. It stores the request
 hash and only a typed, secret-free result projection. Same key and body returns
@@ -236,10 +245,11 @@ Each mutation has one versioned typed result:
 
 | Mutation | Stable result |
 | --- | --- |
-| Publish | operation, publication, optional artifact/release, state |
-| Prepare | operation, artifact, ordered target/location states |
+| Publish | operation, publication, requested release, optional inspected artifact, READY-only published release, state |
+| Prepare | operation, artifact, target/location state |
 | Retry | operation, retried publication or location, state |
 | Profile qualify | operation, profile/desired revision, manifest hash, state |
+| Profile canary | operation, profile/desired revision, target/backend, attestation state |
 
 `--no-wait` returns the same result in its current nonterminal state. The default
 wait polls by operation ID and returns the terminal form. A cancellation before
@@ -252,8 +262,9 @@ Terminal errors are code-valued and value-free: `IMAGE_NOT_PUBLISHED`,
 `ARTIFACT_NOT_READY`, `PROFILE_NOT_ACTIVE`, `PLATFORM_UNSUPPORTED`,
 `IMAGE_LOCALITY_UNSUPPORTED`,
 `RELEASE_CONFLICT`, `IDEMPOTENCY_KEY_REUSED`, `AUTH_BINDING_UNAVAILABLE`,
-`REGISTRY_CAPACITY_EXHAUSTED`, `IMAGE_PREPARATION_FAILED`,
-`QUALIFICATION_FAILED`, and `PERMISSION_DENIED`. `IMAGE_WARMING` and provider
+`REGISTRY_CAPACITY_EXHAUSTED`, `IMAGE_LIMIT_EXCEEDED`, `TARGET_READ_ONLY`,
+`IMAGE_PREPARATION_FAILED`, `QUALIFICATION_FAILED`, `CANARY_FAILED`, and
+`PERMISSION_DENIED`. `IMAGE_WARMING` and provider
 throttling are nonterminal states with bounded retry/ETA metadata. CLI and UI map
 each code to one copyable remediation without reflecting provider or secret
 values.
@@ -274,7 +285,7 @@ unavailable to it. Launch response shapes do not change for clients that did not
 opt into the feature.
 
 Server request validation rejects client-supplied pull plans, resolved runtime
-digests, demand IDs, references, qualification records, and any field prefixed as
+digests, demand IDs, demand fences, qualification records, and any field prefixed as
 server-owned. It applies to REST bodies, serialized YAML, every resource
 alternative, and persisted request revalidation. Request-scoped config overrides
 cannot define or replace `container_registries`, access bindings, or workspace
@@ -322,11 +333,11 @@ Publication is independent of workload deployment. Managed v0 accepts either a
 single image manifest or one selected child of an OCI index. `--platform`
 defaults to `linux/amd64`; additional platforms are explicit, never speculative.
 
-1. Validate a digest-pinned source root, requested platform, optional release,
+1. Validate a digest-pinned source root, requested platform, required release,
    workspace, source access binding, and complete active profile. The request
    hash includes every field and exact profile revision.
 2. In one transaction, create a durable PENDING publication and reserve its
-   optional release. The canonical location remains null until source inspection;
+   release. The canonical location remains null until source inspection;
    deployment still cannot observe a release.
 3. A copy worker claims the publication with a random fenced inspection lease,
    moves it to INSPECTING, authenticates only to the source, and builds
@@ -335,11 +346,13 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    runnable child. In one transaction, the worker rechecks the inspection token,
    persists the immutable source-root digest, selected child/runtime digest, and
    platform, converges the artifact/source, reserves one shard, creates or reuses
-   its canonical intent, clears the inspection lease, and returns the bound
+   its canonical intent, enforces the artifact's release ceiling while holding
+   the artifact lock, clears the inspection lease, and returns the bound
    publication to PENDING.
 4. The worker separately acquires destination authority, copies only the selected
-   manifest and referenced layers, then verifies the destination child digest and
-   platform. It never uploads the source index in v0.
+   exact raw manifest and referenced distributable layers, then verifies the
+   destination child digest, config digest, and platform. It never uploads the
+   source index in v0.
 5. `transactions.converge_canonical()` locks the location, records READY or
    terminal FAILED, then locks dependent PENDING publications in ascending ID
    batches. Each publication becomes READY and gains its immutable release, or
@@ -368,7 +381,6 @@ Publication collision behavior is complete and server-enforced:
 | Same release reservation, source root, platform, and profile revision | Return the reserving publication, even with a different idempotency key |
 | Same release with another source root, platform, or profile revision | Reject with `RELEASE_CONFLICT`; use `prepare` for another distribution |
 | Different releases selecting the same runtime digest and profile revision | Create distinct publications sharing one canonical location |
-| No release and a new idempotency key | Create one retention-bounded publication sharing any existing canonical location |
 
 Keys are 16 through 128 bytes. Terminal operation rows are retained for 30 days,
 which exceeds the seven-day replay guarantee, then compacted in batches of 500.
@@ -376,14 +388,108 @@ Release-backed successful publications are retained catalog facts. An active
 failed release reservation expires after 30 days without retry; its
 `reservation_active` flag is cleared, so a name that was never publicly visible
 can be requested again. The failed publication remains visible for 90 days and
-is then compacted. Terminal release-less publications are retained for 30 days,
-which exceeds the seven-day idempotency replay guarantee. The lifecycle worker
-processes at most 500 expirations or deletions per sweep. There is no separate
-unbounded publication-attempt table.
+is then compacted. The lifecycle worker processes at most 500 expirations or
+deletions per sweep. There is no release-less publication or separate unbounded
+publication-attempt table.
+
+A READY canonical artifact is permanent in v0, so custody is bounded before
+source inspection can reserve it. The active profile sets a maximum artifact
+size, maximum releases per artifact, maximum regional locations per artifact,
+and conservative declared-byte ceiling per physical shard. Descriptor sizes are
+charged without assuming cross-artifact layer deduplication. The existing shard
+manifest ceiling bounds artifact count. A concurrent reservation locks the chosen
+shard and fails with `REGISTRY_CAPACITY_EXHAUSTED` before destination authority
+when either count or declared bytes would exceed its limit. Publication requires
+the explicit `images:publish` capability; ordinary workload permission cannot
+fill canonical custody.
 
 Mutable tags are rejected in v0. Documentation must not promise tag resolution.
 A later isolated resolver may accept a credential reference, resolve a tag to a
 digest, discard the credential, and submit the same publication transaction.
+
+## Durable transition and ECR ambiguity contract
+
+The asynchronous state machines are closed. Publication moves from unbound
+PENDING to INSPECTING, back to bound PENDING, then to READY or FAILED. An
+explicit retained FAILED retry returns it to PENDING. Operation moves from
+PENDING to RUNNING, then SUCCEEDED or FAILED. Cancellation before the intent
+transaction deletes PENDING; after commit it only detaches.
+
+Location transitions are:
+
+| From | To | Guard |
+| --- | --- | --- |
+| PENDING | COPYING | Fenced worker claim |
+| COPYING | VERIFYING | `PutImage` returned or its outcome is ambiguous |
+| COPYING | PENDING | Retryable pre-manifest failure with backoff |
+| COPYING | FAILED | Closed permanent error |
+| VERIFYING | READY | Exact destination content verifies |
+| VERIFYING | PENDING | Exact manifest is absent or read is retryable |
+| VERIFYING | FAILED | Exact mismatch or closed permanent error |
+| READY | MISSING | Completed inventory plus exact digest absence |
+| READY | EVICTING | Regional, past retention, and no live demand |
+| FAILED, MISSING, EVICTED | PENDING | Explicit retry or new authorized demand |
+| EVICTING | EVICTED | Exact digest absence after delete |
+| EVICTING | READY | Exact digest remains after terminal delete denial |
+| EVICTING | EVICTING | Ambiguous/retryable delete; reclaim after lease expiry |
+
+Only INSPECTING publications carry an inspection token and expiry. Only
+COPYING, VERIFYING, or EVICTING locations carry a random location token, expiry,
+and matching lease kind. PENDING, READY, FAILED, MISSING, and EVICTED carry no
+lease. Canonical locations never enter EVICTING or EVICTED. Every retry records a
+bounded attempt count, code, and `next_retry_at`; throttles, timeouts, and unknown
+provider outcomes are retryable, never guessed terminal failures.
+
+A PROFILE_CANARY operation is the only operation row that also acts as its work
+queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
+and teardown deadline. The canary resource is tagged with operation/profile/
+generation, may exercise only one target/backend, and always auto-terminates.
+After a crash, the next claimant reads the child launch and qualification
+repository before retrying or teardown; it never launches a second live canary
+for the same operation. Other operation kinds project their publication,
+location, or profile work and carry no provider lease.
+
+Canary intent creation locks the desired profile row and reserves its conservative
+worst-case cost in a UTC daily window before committing the operation. Concurrent
+automatic or manual canaries cannot exceed the configured hard cap; increasing
+the cap requires a new profile revision.
+
+An ECR destination claim executes this fenced algorithm:
+
+1. Claim one PENDING or expired COPYING/VERIFYING location with `FOR UPDATE SKIP
+   LOCKED`, a new token, and COPYING state. An expired claim first follows the same
+   destination inspection path as a fresh claim; it never resumes from process
+   memory.
+2. Re-read the selected source by digest and preserve its exact raw manifest
+   bytes. Fetch and hash the config blob, prove its OS/architecture matches the
+   requested platform, and validate every descriptor digest and declared size.
+   Reject
+   foreign or nondistributable media types, external layer URLs, excessive
+   manifest/config size, excessive layer count, or the artifact byte limit before
+   acquiring destination authority.
+3. Call destination `BatchGetImage` for the exact child digest. If the returned
+   raw bytes, media type, config, platform, and referenced layers verify, skip all
+   writes and converge through VERIFYING to READY.
+4. Use `BatchCheckLayerAvailability` and transfer only missing blobs. Each source
+   download is streamed through a digest verifier. After an ambiguous ECR upload
+   initiation, part, or completion, check exact layer availability; if absent,
+   start a new upload. Abandoned ECR upload IDs are not catalog identity.
+5. Submit the unchanged selected manifest bytes with untagged `PutImage`. A
+   success or already-exists response moves the fenced row to VERIFYING. A timeout
+   or disconnect also moves it to VERIFYING with an ambiguous-outcome code.
+6. VERIFYING performs exact `BatchGetImage` plus config and layer checks. Exact
+   presence commits READY. Confirmed absence returns to PENDING with backoff.
+   Digest/media/config mismatch is terminal and never overwrites the destination.
+7. SQL completion locks the location and validates the token and database clock.
+   A worker that lost its lease cannot complete state even if its same-digest ECR
+   call finished. The next claimant's exact reads make that harmless write
+   converge. Canonical READY then fans out dependent publications in bounded
+   batches without repeating provider I/O.
+
+Inventory is advisory. A completed list epoch may nominate a READY location as
+absent, but only an exact digest read under a reconciliation lease can move it to
+MISSING or mark a managed shard drifted. This rule also applies after an invalid
+or expired provider cursor.
 
 ## Deployment and warming contract
 
@@ -399,6 +505,11 @@ publications, and releases.
   selected placement in one resolution attempt.
 - Provider calls and OCI transfers occur only in workers.
 
+The location-intent transaction locks the selected physical shard, then the
+artifact, enforces its regional-location ceiling, reserves count and conservative
+declared bytes once, and inserts or converges the location. An implicit workload
+request cannot fan out beyond the one selected placement.
+
 Before the first optimization, a metadata-only eligibility pass maps each
 candidate placement to the active profile's declared runtime binding, locality,
 and selected artifact platform. `locality: require` removes unsupported
@@ -406,6 +517,15 @@ candidates; `prefer` ranks a READY local route ahead of canonical or permitted
 direct fallback. This pass makes no provider call. No eligible target fails with
 `IMAGE_LOCALITY_UNSUPPORTED` before provisioning rather than warming an
 impossible placement.
+
+For managed EC2, that metadata includes the exact planned host AMI and instance
+profile. Both must match the binding's qualified regional AMI and principal; a
+request with no host image is pinned to the qualified regional AMI before
+optimization, while a user-supplied host image or role outside that tuple is not
+silently trusted. EKS
+eligibility similarly binds the selected cluster ARN and node group to an
+attested node role. `managed_required` fails closed on a mismatch, while
+`managed_preferred` may use only its otherwise-authorized direct digest path.
 
 When a selected managed target has no READY route, resolution first persists one
 server-owned demand for the logical deployment target. Identity is:
@@ -442,7 +562,7 @@ source fallback.
 
 The runtime commits a secret-free pull plan only after a READY route is selected.
 `transactions.commit_ready_demand()` locks the location, then the demand,
-inserts or converges its single logical reference, and stores the plan in one
+marks the demand itself as the durable eviction fence, and stores the plan in one
 PostgreSQL transaction. It rechecks profile revision, target fingerprint, digest,
 platform, auth strategy, lease-free READY state, and consumer epoch. Central
 demand state is the durable source for normal launch, Serve, and managed-job
@@ -451,23 +571,35 @@ generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
 
-Eviction treats a live WARMING demand as a fence before a reference exists.
-Reference acquisition and eviction both lock the same location row. Consumer
-terminal or supersede handling writes a central tombstone and releases demand
-and reference together. A WARMING request demand may expire only when its request
-is terminal, no durable consumer attached, and it is at least 24 hours old. For
-clusters, jobs, and services, reconciliation requires two authoritative terminal
-consumer observations separated by an hour before writing a missing tombstone;
-absence or an unreachable consumer store never releases a fence. Such rows are
-shown as orphan candidates for administrator review rather than deleted by age.
+Eviction treats every WARMING or READY demand as the fence and locks its location
+before inspecting those states. Consumer terminal or supersede handling writes a
+tombstone and advances one stable-owner generation watermark in the same
+transaction. Demand creation locks that watermark and rejects a generation below
+maximum seen or at/below maximum terminal; a replay of the exact live
+maximum-seen generation converges the existing demand. A WARMING request demand
+may expire
+only when its request is terminal, no durable consumer attached, and it is at
+least 24 hours old. For clusters, jobs, and services, reconciliation requires two
+authoritative terminal observations separated by an hour before advancing a
+missing tombstone; absence or an unreachable consumer store never releases a
+fence.
 
-SkyServe keeps the prior healthy version routed and its demands referenced until
-the new version has a READY registry plan, at least one replica reports node pull
-completion, and that replica passes health checks. Registry READY, node pull
-complete, and replica healthy are three distinct states and timestamps. Only
-then may traffic shift and the old version drain. Spot or capacity failover after
-READY creates a new version-target demand and tombstones the superseded one only
-after the replacement is healthy.
+Terminal demand rows compact after 30 days only when the consumer credential is
+revoked or provably expired and the owner watermark prevents resurrection. A
+watermark compacts only after authoritative owner deletion plus the maximum
+controller-credential and request-replay lifetime. If either proof is unavailable,
+the watermark and newest tombstone remain as bounded orphan candidates for
+administrator review. This retains at most one high-watermark row per stable
+consumer owner rather than every historical generation.
+
+The image plane gates only whether a new SkyServe replica is eligible to become
+READY. Registry READY, node pull complete, and replica healthy remain three
+distinct states and timestamps. SkyServe's existing capacity-aware rolling
+update remains the sole owner of routing, coverage, rollback, and old-version
+drain. The old version's demand stays live until Serve declares that version
+terminal after its own drain. Spot or capacity failover after READY creates a new
+version-target demand; image code never initiates a traffic shift or replica
+retirement.
 
 ## Multi-node, multi-GPU, and architecture behavior
 
@@ -487,7 +619,7 @@ platform, and selected child digest; `container_images` is keyed by runtime chil
 digest and platform. Pull plans use only the child digest. Placement fails closed
 when the runtime architecture does not match. V0 defaults publication to AMD64
 and never builds or selects ARM64 speculatively. Full index replication remains
-post-v0 because parent and every child then need capacity, reference, and deletion
+post-v0 because parent and every child then need capacity, demand, and deletion
 ownership.
 
 ## PostgreSQL data model
@@ -505,12 +637,11 @@ container_image_operations
 container_images
 container_image_sources
 container_image_publications
-container_image_releases
 container_image_provider_budgets
 container_image_registry_shards
 container_image_locations
 container_image_demands
-container_image_references
+container_image_consumer_watermarks
 container_image_workers
 ```
 
@@ -518,8 +649,9 @@ The catalog singleton contains only a stable authority UUID and creation time.
 There is no forced RLS policy, API-version GUC, runtime-wide advisory lock,
 global configuration apply ledger, realm generation, dynamic repository
 creation, catalog projection, or facet table in v0. A physical shard row is the
-small admission primitive required to prove that a fixed repository cannot be
-overfilled; it is not a workspace billing or product quota.
+small admission primitive required to enforce the profile's permanent artifact
+count and conservative declared-byte ceilings. It is a custody limit, not a
+billing ledger, and does not require a separate workspace-quota table.
 
 Important constraints include:
 
@@ -528,34 +660,40 @@ Important constraints include:
   immutable source-root and selected-child digests;
 - unique operation `(authority, scope, actor_hash, kind, idempotency_key)` plus a
   bounded request hash, `PENDING|RUNNING|SUCCEEDED|FAILED` state, result
-  projection, and 30-day terminal expiry;
-- unique non-null `(workspace, requested_release)` while
+  projection, and 30-day terminal expiry, with a lease/child/teardown tuple only
+  for RUNNING PROFILE_CANARY;
+- unique `(workspace, requested_release)` while
   `reservation_active`, retained forever for READY publications and expiring
   after 30 days for unretried FAILED publications;
 - publication state in `PENDING|INSPECTING|READY|FAILED`, with an inspection
   lease token and expiry only in INSPECTING, one canonical location, and the
   collision behavior above; canonical location is null only before source
   inspection and becomes immutable when bound;
-- every release row points to the READY publication and artifact that created
-  it, and no release row exists before that transaction;
+- release lookup is an indexed projection of READY publications and returns no
+  reservation or failed row;
 - one provider budget row per provider, partition, account, region, and API
   family, with an applied rate, token state, and persisted throttle backoff;
-- profile revision state in `QUALIFYING|ACTIVE|FAILED|RETIRED`, with at most one
-  active revision per profile selection scope and a bounded desired-config and
-  qualification hash;
+- profile revision state in
+  `QUALIFYING|ACTIVE|FAILED|SUPERSEDED|RETIRED`, a monotonically increasing
+  desired generation, partial unique desired and active revisions per profile
+  selection scope, and bounded config, Terraform, and capability-attestation
+  hashes plus a daily canary-cost reservation window;
 - one row per physical repository shard with immutable fingerprint, hard
-  manifest ceiling, reserved count, observed count, qualification timestamp,
+  manifest and declared-byte ceilings, reserved/observed counters,
+  qualification timestamp, fair-dispatch timestamp and in-flight ceiling,
   reconciliation epoch/cursor, and `READY|FULL|DRIFTED|DISABLED` admission state;
-- unique physical location identity for artifact/profile/target/fingerprint;
+- unique physical location identity for artifact, physical shard/fingerprint,
+  and runtime digest, independent of profile revision;
 - canonical versus regional location relationship checks;
-- closed location state and lease combinations;
+- the exact location transitions and lease combinations above;
 - an inventory epoch marker on each manifest-present location;
 - one server-owned demand per cluster generation, job recovery target, or Serve
   version target, with immutable owner identity/generation, target, terminal
   observation/tombstone fields, and
   `WARMING|READY|FAILED|SUPERSEDED|RELEASED` state plus a bounded secret-free plan;
-- one durable reference per demand; and
-- worker kind in `COPY|LIFECYCLE` with bounded heartbeat metadata.
+- one maximum seen/terminal generation watermark per stable consumer owner; and
+- worker kind in `COPY|LIFECYCLE` with bounded heartbeat metadata and bounded
+  provider-token grants.
 
 All queue discovery is bounded and indexed by state, retry time, inspection or
 location lease expiry, and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O
@@ -564,26 +702,32 @@ lease token after acquiring the row lock and reading the current clock.
 
 Every command that locks more than one image row uses this order:
 
-1. profile revision and physical shard rows, ordered by ID;
+1. profile revision, provider budget, physical shard, and worker rows, ordered by
+   class and ID;
 2. artifact and source rows, ordered by ID;
 3. canonical location before regional location, then location ID;
-4. publication, release, and operation rows, ordered by ID;
-5. demand and reference rows, ordered by ID; and
+4. publication and operation rows, ordered by ID;
+5. consumer watermark and demand rows, ordered by ID; and
 6. a central durable consumer row, when normal cluster state participates.
 
 Initial insert races rely on unique constraints and restart the transaction.
 No repository function acquires an earlier class after a later one. Canonical
 completion and publication retry both lock location before publication.
-Reference acquisition and lifecycle eviction both lock location before checking
-demands or references. This is the executable ownership contract for the
-component split.
+Inspection completion reads its publication optimistically, locks profile/shard,
+artifact/source, and location rows first, then locks and rechecks the publication
+token; an invalid token rolls the entire transaction back. Demand READY commit
+and lifecycle eviction both lock location before checking demands. This is the
+executable ownership contract for the component split.
 
 Migration 023 is run under a PostgreSQL migration-scoped advisory lock, not a
-runtime control-plane lock. The downgrade itself can inspect only database
-state, so it drops the tables only when every image table is empty. Draining all
-023 processes is a separately verified operator precondition. Normal rollback
-never downgrades. Because the feature has not shipped, there is no compatibility
-reason to preserve the earlier branch-only schema.
+runtime control-plane lock. The downgrade itself can inspect only database state.
+It requires every operational image table to be empty and the catalog table to
+contain exactly the expected singleton authority row, then drops the singleton
+with the schema. Draining all 023 processes, removing profile configuration,
+revoking controller/canary credentials, and running the bounded teardown command
+that empties operational rows are separately verified operator preconditions.
+Normal rollback never downgrades. Because the feature has not shipped, there is
+no compatibility reason to preserve the earlier branch-only schema.
 
 ## Registry profiles
 
@@ -597,7 +741,7 @@ from a pull plan. Every source or target resolves the following fixed roles:
 - `destination_write`: authority to inspect and write one declared target;
 - `runtime_pull`: backend-specific strategy used by the actual container-runtime
   principal;
-- `lifecycle_delete`: optional authority for reference-safe deletion; and
+- `lifecycle_delete`: optional authority for demand-safe deletion; and
 - `localities`: finite provider/backend/region bindings the target truly serves.
 
 An access binding has an immutable ID, provider kind, nonsecret authority or
@@ -666,11 +810,16 @@ container_registries:
       purposes: [runtime_pull]
       principals:
         - arn:aws:iam::210987654321:role/SkyPilotNodeRole
+      credential_helper: amazon-ecr-credential-helper
+      qualified_node_images:
+        us-east-1: ami-0123456789abcdef0
+        us-west-2: ami-0fedcba9876543210
     aws-eks-pullers:
       kind: aws_eks_kubelet_identity
       purposes: [runtime_pull]
-      principals:
-        - arn:aws:iam::210987654321:role/EksNodeRole
+      qualified_clusters:
+        - cluster_arn: arn:aws:eks:us-west-2:210987654321:cluster/boltz-gpu
+          node_role: arn:aws:iam::210987654321:role/EksNodeRole
   profiles:
     gpu-production:
       revision: 1
@@ -679,17 +828,26 @@ container_registries:
       partition: aws
       registry_account: "123456789012"
       realm: skypilot-production
+      limits:
+        max_artifact_bytes: 107374182400
+        max_releases_per_artifact: 32
+        max_regional_locations_per_artifact: 16
+      qualification:
+        runtime_attestation_max_age_seconds: 86400
+        automatic_canaries: true
+        max_daily_canary_cost_usd: 5
       canonical:
         region: us-east-1
         registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
         repository_prefix: skypilot-images
         shard_count: 16
         max_manifests_per_shard: 90000
+        max_declared_bytes_per_shard: 10995116277760
+        max_in_flight: 16
         write_authority: registry-copy
         delete_authority: disabled
         runtime_pull:
           aws_vm: aws-vm-pullers
-          aws_eks: aws-eks-pullers
       targets:
         - name: us-west-2
           region: us-west-2
@@ -697,6 +855,8 @@ container_registries:
           repository_prefix: skypilot-images
           shard_count: 16
           max_manifests_per_shard: 90000
+          max_declared_bytes_per_shard: 10995116277760
+          max_in_flight: 16
           write_authority: registry-copy
           delete_authority: registry-lifecycle
           runtime_pull:
@@ -704,23 +864,69 @@ container_registries:
             aws_eks: aws-eks-pullers
 ```
 
-Semantic changes require a higher explicit revision. Existing durable pull
-plans remain valid while their exact target and auth contract remains usable.
-Config reload stages a desired profile revision as `QUALIFYING`; it never makes
-provider calls or blocks deployment. The copy worker validates the secret-free
-Terraform handoff, assumes each access binding, probes settings and capabilities,
-and persists a qualification hash and timestamp. One transaction promotes the
-revision to `ACTIVE` only when every target is fresh and matches the desired
-config. The previous active revision remains selectable until then. New
-placement uses only the active revision; existing plans retain their exact old
-revision until references drain.
+Semantic changes require a higher explicit revision. Existing durable pull plans
+remain valid while their exact target and auth contract remains usable. In one
+transaction, config reload locks the current desired and active rows, increments
+the desired generation, marks an older unfinished desired revision SUPERSEDED,
+and stages the new revision as QUALIFYING. It never makes provider calls or
+blocks deployment.
 
-Qualification refreshes every ten minutes. After one hour without a successful
-refresh, new publication and materialization stop for that target while existing
-verified pull plans remain usable. This is a scoped profile state machine in
-`container_image_profile_revisions`, not a second global configuration ledger.
-Config validation still rejects ambiguous locality, duplicate targets,
-cross-partition managed profiles, or incompatible access bindings before staging.
+Qualification is a bounded aggregation of revision-scoped, secret-free
+attestations, not one powerful worker assuming every identity:
+
+- the Terraform handoff attests desired repository, policy, quota, KMS, and role
+  fingerprints but cannot by itself claim runtime readiness;
+- a copy worker uses only the copy role to probe destination read/write and copy
+  the fixed canary artifact;
+- a lifecycle worker uses only the lifecycle role to delete and exactly verify a
+  regional canary with no demand;
+- an EC2 canary pulls through the declared instance-profile and exact regional
+  host AMI whose ECR helper was present before workload start; and
+- an EKS canary pulls through the declared kubelet node role.
+
+Every declared EC2 region/AMI/role tuple and EKS cluster/role tuple needs its own
+attestation; success for one tuple never qualifies another. Target qualification
+orders canary copy, actual runtime pulls, then lifecycle deletion and exact
+absence, so activation never races cleanup.
+
+Each service writes a bounded attestation through its authenticated internal
+endpoint. A canary result includes a single-use nonce and actual-principal
+evidence, never credentials: the canonicalized EC2 STS role ARN, or the EKS node
+UID/node-group role paired with successful kubelet pull and pod start. Copy
+workers may coordinate aggregation but cannot assume or simulate lifecycle or
+runtime roles. `transactions.activate_profile()` locks the
+current desired row and promotes it only after rechecking desired generation,
+config and Terraform hashes, target fingerprints, and fresh required
+attestations. A late older qualifier becomes SUPERSEDED and cannot activate. The
+previous active revision remains selectable until the new one commits ACTIVE;
+existing plans retain their exact old revision until their demands drain.
+
+Profile revision is routing and authority metadata, not physical image identity.
+If a new active revision names the same qualified physical shard fingerprint, it
+reuses the existing READY location after rechecking its new runtime binding. A
+v0 revision that would change a canonical physical fingerprint after any release
+exists fails validation. A later repository-generation feature must first define
+copy-then-cutover custody and superseded-canonical deletion. This prevents
+policy-only revisions from reserving or copying the same ECR manifest twice while
+each pull plan still pins the exact authority revision it used.
+
+Infrastructure and copy attestations refresh every ten minutes. A live runtime
+pull refreshes its binding attestation. An actual-principal canary is required at
+activation, after an AMI/helper, cluster/node role, repository-policy, or binding
+fingerprint change, and before the configured maximum age. The background
+scheduler creates the same idempotent PROFILE_CANARY operation ahead of expiry
+when automatic canaries are enabled; its daily cost cap is hard, and exhaustion
+makes the binding stale rather than spending more. Copy staleness stops new
+publication and materialization for that target. Runtime staleness stops new
+placement on that binding. Lifecycle staleness stops deletion only. Existing
+verified pull plans remain usable. This is one scoped state machine in
+`container_image_profile_revisions`, not a second configuration ledger. Config
+validation still rejects ambiguous locality, duplicate targets, cross-partition
+managed profiles, unbounded policies, or incompatible bindings before staging.
+
+A workload never runs a qualification canary inline. A stale binding is removed
+by the metadata eligibility pass; background or explicit admin canaries restore
+it without extending an already-started deployment request.
 
 ## AWS managed slice
 
@@ -733,13 +939,23 @@ declared workspace, region, and shard index, the name is deterministic:
 <prefix>/r<authority-base32>/w<workspace-hash>/g00/s<two-hex-index>
 ```
 
+It also creates one fixed, non-catalog qualification repository per region. That
+repository uses the same encryption and rendered access-policy template but is
+outside workspace capacity. Copy, actual-runtime-pull, and lifecycle canaries use
+only bounded untagged digests there, and the lifecycle attestation verifies their
+removal. A qualification digest is never returned in a workload pull plan.
+
 `authority-base32` encodes the 128-bit catalog authority. `workspace-hash` is a
 128-bit, versioned hash of authority plus normalized workspace name. Terraform
 and the API reject any collision across the declared workspace set and validate
 the final ECR name and length. `g00` is the fixed v0 repository generation. This
 prevents two SkyPilot control planes sharing an account from colliding and avoids
-placing workspace display names in registry paths. A later shard expansion uses
-a new explicit generation and profile revision; it never changes old paths.
+placing workspace display names in registry paths. A post-v0 shard expansion uses
+a new explicit generation, profile revision, and reviewed custody migration; it
+never changes old paths in place.
+Adding a workspace likewise requires Terraform to create its fixed repositories
+and a new qualified profile revision before that workspace can opt in. Until then
+its direct OCI behavior is unchanged.
 
 A shard's physical identity includes AWS partition, account, region, registry
 authority, repository ARN and name, catalog authority/realm, workspace encoding
@@ -753,33 +969,40 @@ Terraform reads the applied ECR images-per-repository quota, reserves explicit
 headroom, and emits `max_manifests_per_shard`. AWS documents a default adjustable
 limit of 100,000 images per repository in its
 [ECR service quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html).
-A managed target activates
-only when every Terraform-owned repository is empty, its fingerprint matches,
-and its hard ceiling is no greater than the verified applied quota minus
-headroom. A repository containing preexisting content must use external
-ownership instead.
+A managed target first activates only when every workspace shard and the cleaned
+qualification repository are empty, fingerprints match, and hard ceilings are no
+greater than verified applied quotas minus headroom. Later revisions reconcile
+the already managed inventory instead of requiring it to disappear. A repository
+containing unexplained preexisting content must use external ownership instead.
+
+After first activation, a revision may not lower manifest, declared-byte,
+release, or regional-location ceilings below current reservations. It may raise a
+physical ceiling only when a new Terraform handoff and live quota proof agree;
+configuration alone never creates capacity.
 
 On first location creation, the transaction starts from a stable digest-derived
 shard index and probes the fixed ring. It locks one physical shard row, rechecks
 whether the location already exists, and reserves one slot only when
-`reserved_count < max_manifests_per_shard`. The chosen shard is stored on the
-location forever. A full ring fails closed with `REGISTRY_CAPACITY_EXHAUSTED`;
-it does not try an undeclared repository. Reserved count is decremented only
-after exact provider inspection proves that no manifest exists and no retained
-publication or demand can recreate it.
+`reserved_count < max_manifests_per_shard` and conservative declared bytes fit.
+The chosen shard is stored on the location forever. A full ring fails closed with
+`REGISTRY_CAPACITY_EXHAUSTED`; it does not try an undeclared repository. A READY
+canonical reservation is permanent in v0. Failed reservations decrement count
+and bytes only after exact provider inspection proves that no manifest exists and
+no retained publication or demand can recreate it.
 
 Each shard stores a durable inventory epoch, provider cursor, started time, and
 last-completed time. One reconciliation claim reads at most ten provider pages
 or runs for ten seconds, then commits its cursor. An invalid or expired provider
 cursor restarts the epoch safely. Observed managed digests update the matching
-location's epoch marker. Only a completed epoch may diagnose a missing manifest.
+location's epoch marker. Only a completed epoch may nominate a missing manifest
+for the exact confirmation required by the transition contract.
 An in-flight or not-yet-written location consumes a reservation but is not
 expected in inventory. An unexplained manifest, observed count above reserved
 count, or manifest-present location absent from a complete epoch marks the shard
 `DRIFTED` and stops new admission without breaking existing pulls.
 
 Failed canonical reservations are reaped only after every dependent publication
-reservation has expired, no demand or reference remains, no lease is live,
+reservation has expired, no demand remains, no lease is live,
 and exact inspection proves the digest absent. The same transaction deletes the
 empty location and decrements the shard count. V0 never deletes a READY canonical
 manifest. An ambiguous write that left content therefore keeps its honest
@@ -812,17 +1035,32 @@ The module creates or accepts these non-interchangeable identities:
   only for fixed destination repositories, with no deletion or administration;
 - lifecycle worker base: may assume only the exact lifecycle role;
 - lifecycle role: describe all fixed managed repositories and
-  `BatchDeleteImage` only for eligible regional repositories, with no push or
-  repository deletion; and
+  `BatchDeleteImage` only for qualification repositories and eligible regional
+  workspace repositories, never canonical workspace repositories, with no push
+  or repository deletion; and
 - runtime pull principals: the actual EC2 instance-profile role, EKS kubelet
-  node role, Fargate execution role, or declared kubelet credential provider,
-  with token plus repository-scoped pull only.
+  node role, with token plus repository-scoped pull only.
 
 A pod service account is not treated as the EKS image-pull principal. V0 supports
-the EKS node role, Fargate execution role, or an explicitly installed kubelet ECR
-credential provider. Generic `imagePullSecret` and non-cloud Docker helper
-bindings remain post-v0. Credentials refresh at pull time and are never
-serialized into a pull plan.
+only the EKS node role for Kubernetes. Fargate, custom kubelet credential
+providers, generic `imagePullSecret`, and non-cloud Docker helper bindings remain
+post-v0. Credentials refresh at pull time and are never serialized into a pull
+plan.
+
+Each v0 qualified EKS cluster declares one node role shared by every node on
+which SkyPilot may schedule these pods. Qualification fails for a heterogeneous
+eligible node-role set rather than proving one node and trusting the others.
+Multiple clusters are listed independently; a later node-pool binding may add
+selector-to-role cardinality without changing the pull-plan contract.
+
+A managed EC2 target is eligible only when its qualified node image already
+contains the Amazon ECR credential helper, or an equivalent reviewed native
+helper, before workload deployment. The pull plan configures the endpoint and
+digest; the helper uses the instance profile and refreshes tokens. Managed launch
+never downloads AWS CLI, runs per-deployment `docker login`, or persists an ECR
+bearer token. EKS uses the kubelet's native ECR path. Legacy direct `image_id`
+keeps its existing behavior and is not evidence that a managed runtime binding
+is qualified.
 
 Target-role trust names only the worker base principals and constrains session
 duration, external ID, and catalog/profile session tags. Cross-account repository
@@ -831,6 +1069,14 @@ permissions boundaries, so accidentally broad identity policy on those roles
 cannot escape the fixed repository set. SkyPilot cannot constrain a dedicated
 account administrator; that administrative trust is explicit and all mutations
 are drift-checked and CloudTrail-audited.
+
+The module renders every repository policy before apply, caps explicit pull
+principals, and fails when the provider policy-byte limit would be exceeded. A
+single organization-and-principal-tag statement may replace an ARN list only
+when the operator explicitly supplies the organization ID and the dedicated
+compute accounts enforce that immutable role tag. Qualification compares the
+exact rendered and live policy hashes; it never truncates principals or broadens
+to account root silently.
 
 Repository creation/deletion, repository policies, IAM, KMS, and account
 administration stay with Terraform. ECR registry V2 replication-policy management
@@ -848,24 +1094,29 @@ infra/terraform/examples/aws-dedicated-skypilot-account
 ```
 
 The distribution module accepts partition, dedicated registry account ID,
-regional provider aliases, catalog authority/realm, declared workspaces, prefix,
-fixed shard count/generation, encryption/scanning settings, quota headroom,
-exact compute pull-principal ARNs, and optional existing worker role ARNs. It
+regional registry and compute-account provider aliases, catalog authority/realm,
+declared workspaces, prefix,
+fixed shard count/generation, manifest and declared-byte ceilings,
+encryption/scanning settings, quota headroom, exact compute pull-principal ARNs,
+qualified EC2 AMI IDs/helper fingerprint, optional organization/tag policy
+conditions, and optional existing worker role ARNs. It
 reads applied repository and images-per-repository quotas when permitted;
 otherwise it requires explicit validated inputs and leaves readiness false.
 
 Its secret-free qualification manifest contains desired config hash, timestamp,
 workspace encoding version, repository fingerprints and ceilings, role and
 permissions-boundary ARNs, repository-policy hashes, applied quotas, KMS/grant
-facts, and Terraform ownership tags. The background worker compares this handoff
-with live provider state before activation. Terraform output alone never claims
-live readiness.
+facts, rendered policy byte sizes, EC2 AMI/helper facts, and Terraform ownership
+tags. Background
+attesters compare this handoff with live provider state and actual-principal
+canaries before activation. Terraform output alone never claims live readiness.
 
 Import/adoption accepts only empty repositories with exact immutable settings
 and ownership tags. Nonempty adoption remains external. Repositories use
 `force_delete = false` and explicit destroy protection. Terraform destroy fails
 while content exists; profile retirement additionally requires the Dashboard to
-show zero demands, references, and pull plans. Policies and access bindings
+show zero live demands and pull plans and zero locations requiring old-only
+authority. Policies and access bindings
 for an old revision remain configured until that revision drains. The example
 composes PostgreSQL/API infrastructure already owned by the platform and does not
 duplicate database state.
@@ -876,7 +1127,7 @@ ECR replication is push-triggered, preserves repository names, does not backfill
 preexisting images, and is capped at 25 unique destinations. Pull-through cache
 has a bounded upstream set and makes the workload's first pull perform the fill.
 Neither gives SkyPilot per-digest JIT placement, READY-before-deploy, adoption of
-arbitrary existing digests, durable copy recovery, or reference-aware regional
+arbitrary existing digests, durable copy recovery, or demand-aware regional
 deletion. V0 therefore uses portable workers and does not configure either AWS
 feature. They remain possible future optimizations behind the same verified
 location contract, never alternative sources of truth.
@@ -907,12 +1158,22 @@ an unbounded API response while compaction catches up.
 
 Copy-worker concurrency is bounded by its pod setting and provider throttling.
 Adding replicas increases claim throughput safely because leases and
-`SKIP LOCKED` prevent duplicate authority. Before each provider API family, a
-worker acquires from the PostgreSQL account-region token bucket. Applied quota,
-refill rate, and burst are qualification inputs; provider throttles persist one
-shared exponential `blocked_until`, so scaling pods cannot multiply past the
-account limit. ECR's default `PutImage` rate is only 10 per second, and the UI
-reports a quota-bound ETA rather than implying worker replicas can exceed it.
+`SKIP LOCKED` prevent duplicate authority. A grant transaction locks one
+PostgreSQL account-region-API budget row and the worker row, deducts at most one
+second or 64 calls of capacity, and records an expiring grant. The worker spends
+that batch locally, so layer APIs do not update one hot row per call; a crash only
+loses a bounded grant until refill. Applied quota, refill rate, and burst are
+qualification inputs. A provider throttle writes one shared exponential
+`blocked_until`, so scaling pods cannot multiply past the account limit. ECR's
+default `PutImage` rate is only 10 per second, and the UI reports a quota-bound ETA
+rather than implying worker replicas can exceed it.
+
+Location dispatch is two-level and no-starvation: select an eligible physical
+shard by oldest `last_dispatch_at` under its target in-flight ceiling, then claim
+its oldest eligible location. Source-inspection claims rotate by
+profile/workspace. If another target has eligible work, one target cannot consume
+every consecutive claim. Lease reconciliation repairs in-flight counters after a
+worker expires.
 
 Worker budgets do not pretend to control calls made by remote container
 runtimes. Node pulls use per-node credential reuse plus bounded exponential
@@ -920,10 +1181,11 @@ backoff and jitter against qualified pull quotas. A thousand service replicas ma
 still cause many node layer downloads; registry locality avoids cross-region
 transfer but does not claim that an OCI registry prewarms each node cache.
 
-The copy worker also owns bounded background profile qualification and shard
-inventory claims. It validates `OciContentGraph` before destination I/O and uses
-separate source-read and destination-write sessions. Lifecycle workers claim only
-reference-free, noncanonical, managed locations past retention, plus provably
+The copy worker owns only its copy attestation, bounded aggregation of independent
+attestations, and shard inventory claims. It validates `OciContentGraph` before
+destination I/O and uses separate source-read and destination-write sessions.
+Lifecycle workers own their lifecycle attestation and claim only demand-free,
+noncanonical, managed locations past retention, plus provably
 empty failed canonical reservations for counter reclamation. They inspect the
 exact digest after ambiguous deletion and never delete a repository or a READY
 canonical manifest.
@@ -939,13 +1201,14 @@ Readiness tabs. It does not add a registry editor or Terraform surface.
 
 ### Images catalog and detail
 
-Authorization maps to three explicit capabilities:
+Authorization maps to four explicit capabilities:
 
 | Capability | Existing authorization | Actions |
 | --- | --- | --- |
 | `images:read` | user may view the workspace | Catalog, detail, bounded operation status |
-| `images:write` | user may launch/manage resources in the workspace | Publish, Prepare, Retry within that workspace |
-| `images:admin` | server administrator | Qualification ingestion/status, all-workspace readiness and remediation |
+| `images:use` | user may launch/manage resources in the workspace | Resolve a published image and implicitly prepare only the selected placement |
+| `images:publish` | explicit workspace owner/operator grant | Publish, single-target Prepare, and Retry within that workspace |
+| `images:admin` | server administrator | Qualification ingestion/canaries, all-workspace readiness and remediation |
 
 Every lookup checks workspace access before selector resolution. Binding names
 appear only when the caller can use them; credential values never do.
@@ -956,7 +1219,7 @@ Authorized users can:
 - page artifacts with digest, releases, platforms, size, and updated time;
 - filter by release, digest, distribution, target, and location state;
 - open artifact detail with sources, release reservations, locations, errors,
-  references, and publication history;
+  demands, and publication history;
 - start Publish, Prepare, Retry publication, and Retry location actions when
   authorized;
 - follow asynchronous request progress without duplicate submission; and
@@ -975,8 +1238,10 @@ an action.
 
 Status labels never conflate layers:
 
-- registry `PENDING|INSPECTING|READY|FAILED` and a queue/quota-based preparation
-  ETA;
+- publication `PENDING|INSPECTING|READY|FAILED`;
+- registry location
+  `PENDING|COPYING|VERIFYING|READY|FAILED|MISSING|EVICTING|EVICTED` and a
+  queue/quota-based preparation ETA;
 - deployment node pull `UNKNOWN|IN_PROGRESS|COMPLETE|FAILED`; and
 - SkyServe replica health, linked from Serve rather than synthesized by Images.
 
@@ -991,8 +1256,9 @@ motion.
 Administrators get an operational Settings panel showing:
 
 - active secret-free profile revisions and workspace defaults/allowlists;
-- desired versus active revisions, qualification hash/age, repository and role
-  readiness, reconciliation progress, quota backoff, and drift;
+- desired generation versus active revision, per-capability attestation hash/age,
+  repository and role readiness, reconciliation progress, count/declared-byte
+  headroom, quota backoff, and drift;
 - copy and lifecycle worker healthy/stale counts;
 - queue depth and oldest pending/retry age by profile/target; and
 - capability failures that prevent managed-profile activation.
@@ -1002,15 +1268,33 @@ configuration and Terraform through normal GitOps, then use the panel to verify
 convergence. This removes a second configuration transaction system without
 making the feature raw-YAML-only operationally.
 
-The only infrastructure-adjacent UI mutation is the same bounded, secret-free
-qualification-manifest upload as `sky image profile qualify`. It stages a hash
-for background verification; it cannot edit a profile, run Terraform, assume a
-role, or mark itself qualified.
+The infrastructure-adjacent UI mutations are the bounded, secret-free
+qualification-manifest upload and the asynchronous one-target EC2/EKS canary,
+with explicit cost/target confirmation. They stage evidence for background
+verification; the browser cannot edit a profile, run Terraform, assume a role,
+or mark itself qualified.
 
 Every readiness response is a projection of PostgreSQL state written by bounded
 background work. A Dashboard request never assumes a role, calls STS/KMS/ECR,
 resumes inventory, or refreshes qualification. Stale timestamps are shown as
 stale rather than synchronously repaired.
+
+### Mutation API
+
+```text
+POST /images/publications
+POST /images/artifacts/{id}/prepare
+POST /images/publications/{id}/retry
+POST /images/locations/{id}/retry
+POST /images/profiles/{name}/qualification
+POST /images/profiles/{name}/canaries
+```
+
+Each accepts `Idempotency-Key`, returns its versioned mutation result directly,
+and authorizes workspace/profile scope before looking up the named object. It
+returns the promptly committed current state; the CLI/SDK default waiter polls
+the read API. It never wraps the result in SkyPilot's generic request-row
+response. Detaching leaves the same operation ID available through the read API.
 
 ### Direct read API
 
@@ -1021,7 +1305,7 @@ GET /images/artifacts/{id}/releases?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/sources?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/publications?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/locations?workspace=W&limit=50&cursor=C
-GET /images/artifacts/{id}/references?workspace=W&limit=50&cursor=C
+GET /images/artifacts/{id}/demands?workspace=W&limit=50&cursor=C
 GET /images/operations/{id}?workspace=W
 GET /images/profiles?workspace=W
 GET /images/workers?workspace=W&limit=50&cursor=C
@@ -1047,7 +1331,7 @@ No dashboard read creates a generic request row.
 - API, copy base/target, lifecycle base/target, and runtime-pull identities are
   non-interchangeable.
 - Managed deletion is allowed only for noncanonical regional content with no
-  live durable reference.
+  live WARMING or READY demand.
 - External profiles never grant SkyPilot deletion authority.
 - OCI indexes and manifest lists may select one exact platform child; nested
   indexes, ambiguous matches, unselected children, and artifact manifests never
@@ -1069,11 +1353,11 @@ No dashboard read creates a generic request row.
 4. Apply Terraform in one dedicated registry account, import its qualification
    manifest, and stage the desired profile revision without activating it.
 5. Deploy one copy worker and one lifecycle worker with separate identities.
-6. Let background qualification prove repository inventory, settings, quota,
-   KMS, access bindings, runtime pull principals, and fingerprints, then
-   atomically activate one profile for one test workspace.
+6. Let each worker attest only its own capability, run actual-principal EC2 and
+   EKS canaries, and atomically activate the desired generation only after all
+   repository, quota, KMS, policy, runtime, and fingerprint evidence is fresh.
 7. Verify publish, warming, pull, API/controller restart, retry, capacity
-   admission, drift fail-closed behavior, and reference-fenced eviction.
+   admission, drift fail-closed behavior, and demand-fenced eviction.
 8. Convert the Boltz L4 test fleet and compare direct cross-region pulls,
    operator-prewarmed images, and managed JIT locations.
 9. Enable production only if the operations or performance gate passes.
@@ -1095,6 +1379,8 @@ drained and every image table is empty; it is never part of Helm rollback.
 - A server default never opts a workspace into managed behavior; direct and
   managed selector combinations follow the explicit activation matrix.
 - A release lookup returns nothing until its canonical location is READY.
+- Every publication has a release, requires `images:publish`, and reserves
+  bounded permanent canonical count and declared bytes before destination I/O.
 - A failed publication leaves every prior release and deployment launchable.
 - One placement attempt creates at most one location intent and warming never
   causes cloud or region failover.
@@ -1103,18 +1389,20 @@ drained and every image table is empty; it is never part of Helm rollback.
 - Copy crashes before and after manifest publication converge to one verified
   digest.
 - At 1,000 replicas and eight GPUs per node, copy cardinality equals requested
-  physical targets and demand/reference cardinality equals service-version
-  targets, not replicas, nodes, or GPUs.
-- A Serve update keeps the prior healthy version routed until the replacement has
-  registry READY, node pull complete, and a healthy replica.
-- Regional eviction cannot pass a concurrent reference acquisition, warming
-  demand, or canonical-location fence.
+  physical targets and demand cardinality equals service-version targets, not
+  replicas, nodes, or GPUs.
+- Image readiness only gates new Serve replica eligibility; Serve's existing
+  capacity-aware controller exclusively owns traffic, rollback, and drain.
+- Regional eviction cannot pass a concurrent WARMING or READY demand or a
+  canonical-location fence.
 - Every physical shard refuses admission at its hard ceiling, and provider drift
   stops new writes before the database can claim additional capacity.
 - No API, placement, or Dashboard read performs registry, STS, KMS, or Terraform
   I/O.
 - V0 resolves an index to one declared platform child before destination
   authority, and never uploads the parent or an unselected child.
+- Managed EC2 pulls use a prequalified native helper and never install AWS CLI or
+  run per-deployment `docker login` on the image hot path.
 - Every mutation is idempotent, typed, and detachable without abandoning durable
   or ambiguous provider work; every read bypasses generic request rows.
 
@@ -1129,27 +1417,41 @@ drained and every image table is empty; it is never part of Helm rollback.
 - scalar/object parsing, every selector combination, explicit opt-in/defaults,
   allowlists, direct restrictions, and byte-for-byte legacy `image_id` tests;
 - AWS integration plus negative IAM tests;
-- EC2 instance and EKS kubelet/Fargate runtime pull-auth refresh tests, plus
+- EC2 instance and EKS kubelet runtime pull-auth refresh tests, preinstalled
+  helper/AMI enforcement, homogeneous EKS-node-role validation, multi-cluster
+  attestation, no managed-path CLI install/login, plus
   unchanged direct OCI behavior on other runtimes;
 - `terraform fmt -check`, `terraform validate`, and plans for one and multiple
   regions with fixed shards;
-- worker kill/restart tests around every provider-I/O boundary;
+- worker kill/restart and ambiguous-outcome tests around source reads, layer
+  availability/download/upload/complete, `PutImage`, exact verification, SQL
+  completion, publication fan-out, eviction, and attestation activation;
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
+- canary nonce/principal proof, child-launch crash deduplication, forced teardown,
+  automatic refresh, concurrent daily-cost reservation, and stale-binding tests;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
-- source/destination account separation, permissions-boundary, repository-policy,
-  KMS grant, protected destroy, empty import, and old-revision drain tests;
-- one-million-row resumable inventory, durable cursor, API token-bucket,
-  throttling, and empty failed-reservation reclamation tests;
+- source/destination/compute account separation, cross-identity attestation,
+  negative STS trust, permissions-boundary, repository-policy size/principal,
+  KMS grant, protected destroy, empty import, desired-generation fencing, and
+  old-revision drain tests;
+- policy-only profile revision location reuse and physical-layout-change
+  rejection after first release;
+- one-million-row resumable inventory, exact missing confirmation, durable cursor,
+  batched token grants, hot/cold target no-starvation, throttling, count/byte
+  ceilings, and empty failed-reservation reclamation tests;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
-  version-target, controller loss, supersede, and unreachable consumer stores;
+  version-target, controller loss, supersede, generation watermark, credential
+  expiry/revocation, compaction, and unreachable consumer stores;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
-  nested index, and artifact reject-before-write tests;
+  nested index, artifact, nondistributable/foreign layer, external URL, config
+  platform, raw-byte digest, and size-bound reject-before-write tests;
 - Jest interaction, pagination, permission, responsive, and stale-state tests;
 - Dashboard capability matrix, action validation/idempotency, stale poll and
   navigation suppression, detach semantics, old-server deep links, keyboard,
-  screen-reader, reduced-motion, ETA-layer, and secret-absence tests;
+  screen-reader, reduced-motion, separate publication/location states,
+  attestation/canary flow, ETA-layer, and secret-absence tests;
 - a production Next.js build;
 - repository formatting and focused backend tests; and
 - 100, 500, and 1,000-replica timing evidence before a speed claim.
@@ -1207,3 +1509,12 @@ selects one platform child from ordinary indexes, specifies the operational UI,
 uses explicit builder step inputs, adds bounded replayable operation state and
 fenced source inspection, and collapses persistence into three aggregates plus
 the transaction coordinator.
+
+Round 5 at `a3884f19dc6c8c67aea314d7563b4162794f631c` returned Codex `RESHAPE`.
+Fable again reported no usage credits, so the round is not paired. This revision
+replaces cross-identity qualification with capability-specific attestations,
+requires release-backed and quota-bounded permanent custody, defines every
+destination/ECR ambiguity transition, fences desired revisions and consumer
+generations, folds release/reference projections out of separate tables, batches
+provider tokens with fair dispatch, requires exact inventory confirmation, keeps
+AWS CLI off managed launch, and leaves Serve as the sole drain owner.

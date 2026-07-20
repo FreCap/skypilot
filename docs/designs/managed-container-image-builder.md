@@ -103,7 +103,7 @@ pulled once per node and may serve all visible GPUs.
 
 Multi-platform publication is post-prototype. Before enabling it, distribution
 must represent an OCI index and each child manifest as owned content so
-verification, reference tracking, and deletion cannot orphan a child.
+verification, demand fencing, and deletion cannot orphan a child.
 
 ## Components
 
@@ -218,8 +218,9 @@ cluster, and job consumer before it can safely replace a name.
 
 ## Prototype
 
-The prototype is invoked only by maintainers and uses temporary state rather
-than migration 024. It must demonstrate:
+The prototype is invoked only by maintainers and uses an isolated disposable
+PostgreSQL schema rather than migration 024. Its state survives coordinator and
+worker crashes but is never read by a production API binary. It must demonstrate:
 
 1. one explicit AMD64 setup-layer build;
 2. a second identical build with a material cache hit;
