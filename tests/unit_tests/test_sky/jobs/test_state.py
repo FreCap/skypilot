@@ -888,3 +888,71 @@ def test_get_pending_jobs_count_by_pool_uses_single_aggregate_query(
         assert state.get_pending_jobs_count_by_pool('pool-a') == 1
 
     assert counts['n'] == 1, counts
+
+
+def test_get_task_logs_to_clean_excludes_failed_tasks(
+        _mock_managed_jobs_db_conn):
+    """Excluded (job, task) pairs must not occupy batch slots."""
+    now = time.time()
+    engine = state._db_manager.get_engine()
+    job_id = state.set_job_info_without_job_id(
+        name='job-exclude',
+        workspace='ws',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    for task_id in range(3):
+        _insert_task(
+            engine,
+            job_id,
+            task_id,
+            status=ManagedJobStatus.SUCCEEDED,
+            end_at=now - 200,
+            local_log_file=f'/tmp/t{task_id}.log',
+            logs_cleaned_at=None,
+        )
+    state.scheduler_set_done(job_id)
+
+    res = state.get_task_logs_to_clean(60,
+                                       batch_size=2,
+                                       exclude_tasks={(job_id, 0), (job_id, 1)})
+    assert [(r['job_id'], r['task_id']) for r in res] == [(job_id, 2)]
+
+    # Empty/None exclusion keeps the original behavior.
+    assert len(state.get_task_logs_to_clean(60, batch_size=10)) == 3
+    assert len(
+        state.get_task_logs_to_clean(60, batch_size=10,
+                                     exclude_tasks=set())) == 3
+
+
+def test_get_controller_logs_to_clean_excludes_failed_jobs(
+        _mock_managed_jobs_db_conn):
+    """Excluded job ids must not occupy batch slots."""
+    now = time.time()
+    engine = state._db_manager.get_engine()
+    job_ids = []
+    for idx in range(3):
+        job_id = _insert_job_info(engine, controller_logs_cleaned_at=None)
+        _insert_task(
+            engine,
+            job_id,
+            0,
+            status=ManagedJobStatus.SUCCEEDED,
+            end_at=now - 200,
+            local_log_file=f'/tmp/c{idx}.log',
+            logs_cleaned_at=None,
+        )
+        state.scheduler_set_done(job_id)
+        job_ids.append(job_id)
+
+    res = state.get_controller_logs_to_clean(
+        60, batch_size=2, exclude_job_ids={job_ids[0], job_ids[1]})
+    assert [r['job_id'] for r in res] == [job_ids[2]]
+
+    assert len(state.get_controller_logs_to_clean(60, batch_size=10)) == 3
+    assert len(
+        state.get_controller_logs_to_clean(60,
+                                           batch_size=10,
+                                           exclude_job_ids=set())) == 3

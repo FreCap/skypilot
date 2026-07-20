@@ -4,6 +4,7 @@
 import collections
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Collection
 import json
 import time
 from typing import Any, Optional
@@ -2578,17 +2579,39 @@ def get_all_job_ids_by_name(name: str | None) -> list[int]:
         return job_ids
 
 
-def get_task_logs_to_clean(retention_seconds: int,
-                           batch_size: int) -> list[dict[str, Any]]:
+def get_task_logs_to_clean(
+    retention_seconds: int,
+    batch_size: int,
+    exclude_tasks: Collection[tuple[int, int]] | None = None
+) -> list[dict[str, Any]]:
     """Get the logs of job tasks to clean.
 
     The logs of a task will only cleaned when:
     - the job schedule state is DONE
     - AND the end time of the task is older than the retention period
+
+    Tasks in `exclude_tasks` ((job_id, task_id) pairs) are skipped so a
+    caller can page past rows whose cleanup already failed in this pass.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         now = time.time()
+        conditions = [
+            job_info_table.c.schedule_state.is_(
+                ManagedJobScheduleState.DONE.value),
+            spot_table.c.end_at.isnot(None),
+            spot_table.c.end_at < (now - retention_seconds),
+            spot_table.c.logs_cleaned_at.is_(None),
+            # The local log file is set AFTER the task is finished,
+            # add this condition to ensure the entire log file has
+            # been written.
+            spot_table.c.local_log_file.isnot(None),
+        ]
+        if exclude_tasks:
+            conditions.append(
+                sqlalchemy.tuple_(spot_table.c.spot_job_id,
+                                  spot_table.c.task_id).notin_(
+                                      list(exclude_tasks)))
         result = session.execute(
             sqlalchemy.select(
                 spot_table.c.spot_job_id,
@@ -2598,19 +2621,7 @@ def get_task_logs_to_clean(retention_seconds: int,
                 spot_table.join(
                     job_info_table,
                     spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
-                )).
-            where(
-                sqlalchemy.and_(
-                    job_info_table.c.schedule_state.is_(
-                        ManagedJobScheduleState.DONE.value),
-                    spot_table.c.end_at.isnot(None),
-                    spot_table.c.end_at < (now - retention_seconds),
-                    spot_table.c.logs_cleaned_at.is_(None),
-                    # The local log file is set AFTER the task is finished,
-                    # add this condition to ensure the entire log file has
-                    # been written.
-                    spot_table.c.local_log_file.isnot(None),
-                )).limit(batch_size))
+                )).where(sqlalchemy.and_(*conditions)).limit(batch_size))
         rows = result.fetchall()
         return [{
             'job_id': row[0],
@@ -2619,36 +2630,43 @@ def get_task_logs_to_clean(retention_seconds: int,
         } for row in rows]
 
 
-def get_controller_logs_to_clean(retention_seconds: int,
-                                 batch_size: int) -> list[dict[str, Any]]:
+def get_controller_logs_to_clean(
+        retention_seconds: int,
+        batch_size: int,
+        exclude_job_ids: Collection[int] | None = None) -> list[dict[str, Any]]:
     """Get the controller logs to clean.
 
     The controller logs will only cleaned when:
     - the job schedule state is DONE
     - AND the end time of the latest task is older than the retention period
+
+    Jobs in `exclude_job_ids` are skipped so a caller can page past rows
+    whose cleanup already failed in this pass.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         now = time.time()
+        conditions = [
+            job_info_table.c.schedule_state.is_(
+                ManagedJobScheduleState.DONE.value),
+            spot_table.c.local_log_file.isnot(None),
+            job_info_table.c.controller_logs_cleaned_at.is_(None),
+        ]
+        if exclude_job_ids:
+            conditions.append(
+                job_info_table.c.spot_job_id.notin_(list(exclude_job_ids)))
         result = session.execute(
             sqlalchemy.select(job_info_table.c.spot_job_id,).select_from(
                 job_info_table.join(
                     spot_table,
                     job_info_table.c.spot_job_id == spot_table.c.spot_job_id,
-                )).where(
-                    sqlalchemy.and_(
-                        job_info_table.c.schedule_state.is_(
-                            ManagedJobScheduleState.DONE.value),
-                        spot_table.c.local_log_file.isnot(None),
-                        job_info_table.c.controller_logs_cleaned_at.is_(None),
-                    )).group_by(
-                        job_info_table.c.spot_job_id,
-                        job_info_table.c.current_cluster_name,
-                    ).having(
-                        sqlalchemy.func.max(
-                            spot_table.c.end_at).isnot(None),).having(
-                                sqlalchemy.func.max(spot_table.c.end_at) < (
-                                    now - retention_seconds)).limit(batch_size))
+                )).where(sqlalchemy.and_(*conditions)).group_by(
+                    job_info_table.c.spot_job_id,
+                    job_info_table.c.current_cluster_name,
+                ).having(sqlalchemy.func.max(
+                    spot_table.c.end_at).isnot(None),).having(
+                        sqlalchemy.func.max(spot_table.c.end_at) < (
+                            now - retention_seconds)).limit(batch_size))
         rows = result.fetchall()
         return [{'job_id': row[0]} for row in rows]
 
