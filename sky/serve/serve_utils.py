@@ -3186,7 +3186,13 @@ def wait_service_registration(
         # has no setup process.
         if not is_consolidation_mode(pool):
             job_status = job_lib.get_status(job_id)
-            if job_status is None or job_status < job_lib.JobStatus.RUNNING:
+            if job_status is not None and job_status.is_terminal():
+                with ux_utils.print_exception_no_traceback():
+                    raise RuntimeError(
+                        f'The controller job for the {noun} {service_name!r} '
+                        f'reached terminal status {job_status.value} before '
+                        'registration completed.')
+            if job_status != job_lib.JobStatus.RUNNING:
                 # Wait for the controller process to finish setting up. It
                 # can be slow if a lot cloud dependencies are being installed.
                 if time.monotonic() > deadline:
