@@ -202,7 +202,11 @@ read ordinary configuration at version 62 after builder activation, but the
 write trigger follows `minimum_image_writer_api_version`, so an API-62 process
 cannot overwrite API-63 image configuration. Managed-image operations retain
 their narrower catalog fence. New migration code also rejects a database
-revision newer than its compiled target instead of treating it as current.
+revision newer than its compiled target instead of treating it as current. API
+startup performs that check for every central Alembic history before readiness,
+not only on the first lazy table access; the sole lower-revision exception is an
+explicit deployment schema ceiling with its corresponding feature routes
+closed.
 
 Migration 023 creates external-OCI-only artifact provenance and
 SOURCE-only canonical origins. It never creates the obsolete single-counter
@@ -216,24 +220,46 @@ the builder design. Applying an unused migration or exposing disabled build UI
 is not treated as harmless because both create permanent compatibility and
 support obligations.
 
-Migration 024 is additive while the builder is disabled. It does not write a
-BUILD producer, state, or lease value during migration. API-63 builder
-activation atomically advances `minimum_image_writer_api_version` to 63 before
-the first builder row or BUILD value can commit. The first transaction that
-creates any migration-024 row or BUILD-owned value also sets
-`builder_state_ever_created` TRUE under that same phase-1 lock before acquiring
-later-phase rows. Migration 024 installs named BEFORE triggers on every builder
-table and every BUILD-bearing column that reject the value unless the flag is
-already TRUE; the monotonic migration-023 trigger makes the historical witness
-irreversible. Any lingering or rolled-back
-API-62 component then fails only managed-image operations at the phase-1 fence;
-it cannot misdecode or overwrite the new state, and its expired work is
-recoverable by API-63 components. The fence may return to 62 only while
-`builder_state_ever_created` remains FALSE and a locked absence check finds no
-migration-024 row or BUILD-owned value. Once builder state exists,
-rollback is to a migration-024-aware API-63 binary with builder admission
-disabled; an API-62 image-plane rollback is forbidden. Unrelated SkyPilot
-operations remain available under either fence.
+Migration 024 is additive while the builder is disabled, but API 62 is not
+declared compatible with revision 024. An existing deployment first rolls every
+API, controller, copy-worker, and purge-worker image-plane process to API 63
+against a temporary revision-023 auto-migration ceiling. API 63 reports builder
+routes `IMAGE_SCHEMA_PENDING` but continues revision-023 distribution work
+through a frozen 023 common-column projection that never selects or writes a
+024-added column or enum. Distribution queries name their columns explicitly;
+they do not use a superset ORM `SELECT *` or live reflection.
+After the live-version and database-session preflight proves no API-62
+image-plane process remains, a dedicated Job takes the compatibility advisory
+lock and applies 024. It writes no BUILD producer, state, or lease value. The
+ceiling is then removed and every API-63 process verifies exact revision 024.
+The same image is rolled once more so every process starts with the 024
+projection before builder activation. During that short restart overlap,
+revision-023 projection processes remain valid against the additive 024 schema
+and still cannot emit BUILD state.
+
+API-63 builder activation atomically advances
+`minimum_image_writer_api_version` to 63 before the first builder row or BUILD
+value can commit. The first transaction that creates any migration-024 row or
+BUILD-owned value also sets `builder_state_ever_created` TRUE under that same
+phase-1 lock before acquiring later-phase rows. Migration 024 installs named
+BEFORE triggers on every builder table and every BUILD-bearing column that
+reject the value unless the flag is already TRUE; the monotonic migration-023
+trigger makes the historical witness irreversible.
+
+A pre-witness return to API 62 is likewise a schema rollback, never a fence-only
+change. With builder admission disabled, the supported rollback stops API-63
+and builder/image-worker database sessions for a short maintenance window. The
+024 downgrade takes the compatibility advisory lock and all affected tables in
+global order, requires `builder_state_ever_created = FALSE`, and proves the
+absence of every 024 row and BUILD-owned value. Only then does one transaction
+restore `minimum_image_writer_api_version = 62`, remove the 024 schema changes,
+and stamp revision 023 before API 62 starts. Any witness or owned value raises
+in PostgreSQL and preserves revision 024 plus the writer fence. Once builder
+state exists, rollback is only to a migration-024-aware API-63 binary with
+builder admission disabled; API-62 image-plane and schema rollback are
+permanently forbidden. Unrelated operations remain available during an API-63
+binary rollback, outside the explicitly requested pre-witness schema-downgrade
+window.
 
 The current pull request deliberately couples the API-62 distribution code,
 literal migration 023, task YAML syntax for immutable image selection, AWS
@@ -1073,7 +1099,8 @@ accepted secret-free normalized revision, and
 `container_image_target_custodies` retains each revision/target's provider,
 account/project, endpoint policy metadata, provider-neutral canonical registry
 authority/repository-generation prefix, physical root fingerprint, ownership
-kind/tags, versioned manager-credential reference/principal fingerprint,
+kind/tags, immutable registry-guard generation and normalized contract digest,
+versioned manager-credential reference/principal fingerprint,
 distinct nullable versioned purge-credential reference/principal fingerprint,
 and `ACTIVE|DRAINING|RETIRED` custody state.
 Its `(id, ownership_kind)` pair is unique for the location composite foreign
@@ -1090,13 +1117,19 @@ the expected caller principal before provider I/O. Neither substitutes current
 profile credentials.
 
 An older API or worker replica cannot roll the policy back, and two different
-configurations cannot claim the same revision. Advancing a revision waits until
-the profile has no active availability lease. The active-lease check uses one
-partial profile-prefixed `LIMIT 1` probe for COPY, EXTERNAL_VERIFY, ordinary
-EVICT, and READY VERIFY lease kinds. Historical PURGE_DELETE/PURGE_INSPECT
-leases deliberately use retained custody and do not require an active head.
-Migration 024 replaces that predicate to include active BUILD_OUTPUT leases;
-profile activation cannot strand a builder publication mid-copy.
+configurations cannot claim the same revision. Advancing a revision never waits
+inside its transaction. After taking its earlier config/catalog and profile
+locks, activation uses one partial profile-prefixed `LIMIT 1` probe for live
+COPY, EXTERNAL_VERIFY, ordinary EVICT, and READY VERIFY leases. A hit aborts the
+whole config apply immediately with closed `IMAGE_PROFILE_BUSY`; the caller
+retries with bounded jitter after the owning worker commits or the lease
+expires. Because every new claim needs the already-held catalog/profile fence,
+no lease can appear between the locked probe and head update. Historical
+PURGE_DELETE/PURGE_INSPECT leases deliberately use retained custody and do not
+require an active head. Migration 024 replaces the predicate to include live
+BUILD_OUTPUT leases, so profile activation cannot strand a builder publication
+mid-copy. There is no persistent draining state or in-transaction polling in
+v0.
 Keeping those kinds separate lets PostgreSQL use its state-specific partial
 indexes instead of scanning an OR-shaped profile predicate. Activation inserts
 the immutable revision/custody snapshot and changes only the head authority row.
@@ -2257,8 +2290,10 @@ single claim cannot retain the generation lock across an unbounded race set.
 Claiming never groups or sorts the full eligible location queue. Reconcilers
 take compatible `FOR KEY SHARE` locks on
 one generation, so hundreds of workers can claim different rows in the same
-dominant profile while profile activation still waits for those short claim
-transactions. A worker that finds a generation under activation or exhausts
+dominant profile. Activation may wait only for one already-running short claim
+transaction to release its row lock; after obtaining the lock it fails fast on
+any committed live lease instead of waiting for lease completion. A worker that
+finds a generation under activation or exhausts
 its rows continues through the remainder of its bounded page; the next call
 starts after that page, so later profiles remain reachable without making one
 operation proportional to catalog cardinality. Eviction uses the same
@@ -2527,13 +2562,52 @@ called managed. `ensure_repository` describes the stored assigned shard, creates
 it only when absent with required realm/workspace/manager tags, and rejects a
 name collision whose tags, encryption, mutability, or scan policy do not match.
 Create permission is bounded by repository prefix and required request tags.
-The adapter never changes a colliding repository into compliance. The managed
-repository policy grants manifest writes only to the distribution copy role and
-the later qualified trusted-builder publisher, both of which reject indexes;
-the purge role can delete but not write, and runtime roles are pull-only.
-Activation and periodic custody verification fail closed on policy drift or an
-unrecognized writer principal, so the single-manifest dependency claim never
-silently assumes an externally writable repository.
+The adapter never changes a colliding repository into compliance.
+
+A repository-policy allowlist alone is insufficient in a same-account ECR
+registry because an identity policy may independently allow writes. Managed AWS
+mode therefore requires ECR
+[registry-policy scope V2](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry-permissions.html)
+and an account/region registry policy that is enforced on all ECR requests.
+Before any managed-prefix
+repository exists, Terraform installs explicit `Deny` statements with
+`Principal: "*"` and `ArnNotEquals` conditions on `aws:PrincipalArn`:
+
+- manifest/layer mutation under the exact managed repository prefix is denied
+  except to the current distribution copy role and one fixed reserved trusted
+  builder-publisher principal;
+- `BatchDeleteImage` is denied except to the distinct purge role;
+- repository policy/tag/mutability/scanning configuration changes under that
+  prefix are denied except to the Terraform control role;
+- lifecycle-policy creation and repository deletion under that prefix are
+  denied to every principal; and
+- `PutRegistryPolicy`, `DeleteRegistryPolicy`, and changing
+  `REGISTRY_POLICY_SCOPE` are denied except to the Terraform control role; the
+  `PutAccountSetting` statement is narrowed by
+  `ecr:AccountSetting = REGISTRY_POLICY_SCOPE` and does not freeze unrelated
+  account settings.
+
+The write action set includes `InitiateLayerUpload`, `UploadLayerPart`,
+`CompleteLayerUpload`, `PutImage`, `ReplicateImage`, and
+`BatchImportUpstreamImage`, so native replication and pull-through import cannot
+create untracked content. The copy role is excluded from delete, the purge role
+is excluded from write, runtime roles are pull-only, and the control role has no
+image mutation or repository-delete grant. The policy uses AWS's recommended
+[`ArnNotEquals` form](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notprincipal.html)
+rather than `NotPrincipal`. Explicit deny overrides any
+same-account identity allow.
+
+The future publisher ARN may be a fixed deny exception at bootstrap, but that
+exception is not an `Allow`: no role trust or identity permission is created by
+the distribution release. Builder qualification later activates the separately
+managed principal without rewriting the guard contract around existing bytes.
+
+Activation verifies V2 scope, the exact normalized registry-policy digest,
+negative authorization probes, empty-prefix inventory, and repository custody;
+every copy/purge mutation and periodic custody check revalidates the stored
+policy generation/digest before provider I/O. Any drift freezes the managed
+realm. Thus the single-manifest capacity and deletion claims never assume an
+externally writable repository.
 
 For writes, the worker assumes a short-lived copy role with an artifact-target
 session name and repository-scoped session policy, then obtains the normal ECR
@@ -2596,11 +2670,27 @@ infra/terraform/examples/aws-dedicated-account
 identities plus policy attachment points; it never lets the API or copy worker
 assume the purge role. `aws-vm-pool` creates workload identities and ECR pull
 permissions without assuming one GPU per VM. `aws-image-distribution` creates
-the managed realm, KMS/log/metric policy when requested, least-privilege copy
-and purge policies, ownership tags, and the exact role/config outputs consumed
-by the two Helm Deployments. The separately gated builder design owns any later
-`aws-image-builder` module. PostgreSQL remains the work queue, so the
-distribution module does not create a second SQS or dead-letter source of truth.
+the managed realm, one account/region guard prefix, V2 registry policy,
+KMS/log/metric policy when requested, least-privilege copy and purge policies,
+ownership tags, and the exact role/config outputs consumed by the two Helm
+Deployments. Every managed repository-generation prefix must be beneath that
+guard prefix, so one bounded policy statement set protects all realm
+generations instead of growing per artifact or workspace. The separately gated
+builder design owns any later `aws-image-builder` module. PostgreSQL remains the
+work queue, so the distribution module does not create a second SQS or
+dead-letter source of truth.
+
+The recommended dedicated-account mode makes this module the sole Terraform
+owner of the complete registry policy in each enabled region. An existing
+account remains supported only when its registry policy is imported into the
+same Terraform state, any unrelated statements are supplied as bounded typed
+inputs, and every other policy writer is retired before activation. The
+module's explicit denies cannot be weakened by those additional allow
+statements, and its self-protection statement prevents later mutation by any
+principal except the control role. If policy ownership cannot be consolidated,
+that account is external-profile-only; SkyPilot does not claim managed custody
+from periodic observation. Existing source repositories outside the guard
+prefix remain unaffected and usable.
 
 The modules create no per-image resources and copy no content. The AWS adapter
 creates a deterministic ECR shard repository just in time under the
@@ -2632,14 +2722,15 @@ writer, or unparseable repository fails closed. Existing images elsewhere in
 the account remain valid immutable sources or external-profile content; they
 are never silently adopted into the managed generation.
 
-Managed repository policy grants manifest publication only to the copy worker
-and the later separately gated trusted builder publisher. Both reject OCI
-indexes in v0. The purge identity is delete-only and runtime identities are
-pull-only. Activation and periodic custody checks fail on any other publisher,
-so durable reservations cannot be bypassed by an out-of-band manifest. Every
-managed v0 artifact consumes exactly one root image-manifest unit; shared layers
-do not reduce this conservative manifest count. For each candidate count `S`,
-the hard additional capacity of every initially empty shard is:
+The V2 registry explicit-deny boundary admits manifest publication only from
+the copy worker and, after a later policy generation, the separately gated
+trusted builder publisher. Both reject OCI indexes in v0. The purge identity is
+delete-only and runtime identities are pull-only. Activation and periodic
+custody checks freeze on any boundary drift, so an identity-policy allow cannot
+bypass durable reservations with an out-of-band manifest. Every managed v0
+artifact consumes exactly one root image-manifest unit; shared layers do not
+reduce this conservative manifest count. For each candidate count `S`, the hard
+additional capacity of every initially empty shard is:
 
 ```text
 capacity[i] = applied_images_per_repository_quota
@@ -2754,7 +2845,8 @@ copy-worker concurrency.
 
 The provider adapter is a capability boundary. Each provider advertises
 namespace provisioning, short-lived copy authentication, pull authentication,
-verification, native replication, ownership proof, and deletion support. A
+verification, native replication, an enforceable exclusive mutation boundary,
+ownership proof, and deletion support. A
 profile cannot enable an operation the adapter does not prove. The AWS ECR
 adapter is the first managed implementation: repository creation, short-lived
 writer authentication, exact digest verification, runtime pull identity,
@@ -2762,7 +2854,8 @@ ownership proof, and manifest deletion all have integration and negative-IAM
 tests. GCP, Nebius, and generic OCI begin as `ownership: external`; their
 operators provision namespaces and credentials, and SkyPilot may copy only
 through an explicitly implemented capability. Core catalog, resolver, and
-worker state contain no Nebius-specific branch.
+worker state contain no Nebius-specific branch. No provider becomes managed
+from an allowlist that same-account or same-project identities can bypass.
 
 Cloudflare is experimental until an official OCI registry product exposes
 documented repository ownership, scoped credentials, pull compatibility, and
@@ -3324,7 +3417,10 @@ Unit tests must cover:
 - canonical endpoint normalization and complete provider-policy identity;
 - monotonic profile generations, stale-replica rollback rejection, and
   active-lease revision fencing, including real PostgreSQL activation/claim
-  interleavings;
+  interleavings in which a committed live lease returns `IMAGE_PROFILE_BUSY`
+  without polling under config/catalog/head locks, the worker finalizes after
+  that rollback, and a bounded-jitter retry succeeds; an exactly expired lease
+  cannot block activation or let its stale finalizer commit;
 - expired COPYING and EVICTING settlement after canonical loss, followed by
   successful profile repair in real PostgreSQL;
 - exact-expiry READY verification fencing and malformed future COPY lease
@@ -3473,12 +3569,15 @@ Unit tests must cover:
   head-update count across one and one million workspaces, stale replica
   fail-closed behavior, and eventual poll-based convergence without a
   representable config/head split;
-- migration 024 applied-but-disabled compatibility; atomic writer-fence 62-to-63
-  activation before the first BUILD value; API-62 read/mutation/claim/finalizer
-  refusal and expired-lease recovery; safe pre-state fence reversal; atomic
-  first-state setting of the irreversible builder witness; rejection of 024 or
-  BUILD writes while it is FALSE and of TRUE-to-FALSE updates; and permanent
-  API-62 image-plane rollback rejection after any 024-owned state;
+- staged API-63-at-023 builder rollout, migration-Job rejection while any API-62
+  process/session remains, exact 023 common-column SQL projection across the
+  additive migration, revision-024 restart/verification, and API-62 startup
+  rejection against 024; atomic writer-fence 62-to-63 activation before the
+  first BUILD value; expired old-lease recovery; atomic first-state setting of
+  the irreversible builder witness; rejection of 024 or BUILD writes while it
+  is FALSE and of TRUE-to-FALSE updates; guarded pre-witness 024-to-023
+  downgrade plus fence restoration; and permanent API-62 image-plane/schema
+  rollback rejection after any 024-owned state;
 - status selectors and workspaces validated before an SDK creates HTTP query
   parameters, so client HTTP errors cannot retain rejected values;
 - server-owned workspace, registry, database, daemon, and controller policy
@@ -3550,8 +3649,10 @@ managed prefix. Plans must prove no image-content fan-out, no account-wide
 administrative grants, no repository deletion
 permission, no API/copy-worker canonical delete permission, a separately
 assumable opt-in purge role with only the closed inspection and
-`BatchDeleteImage` surface, and no placement-time resource dependency. Boundary
-plans cover each account/region's
+`BatchDeleteImage` surface, V2 registry-policy scope, one guarded policy owner,
+the exact write/delete/custody/self-protection deny matrix under the common
+managed prefix, the 10,240-byte policy ceiling, and no placement-time resource
+dependency. Boundary plans cover each account/region's
 applied repository and image quotas, existing repositories and manifests,
 safety headroom, the lifetime single-manifest artifact bound, the feasible shard
 interval at or below 256, exact capacity vectors, audited complete inventory,
@@ -3559,7 +3660,13 @@ managed-prefix nonemptiness rejection, durable workspace slot, balanced
 transactional shard reservations under adversarial digests, capacity
 exhaustion, provider-neutral canonical prefix rendering and collision
 rejection, realm-generation prefix expansion, and provider-quota drift error
-mapping. Tests also prove v1 rejects native
+mapping. Negative tests assume a same-account probe role with an otherwise
+broad ECR identity allow and prove the registry explicit deny still rejects
+layer upload, `PutImage`, replication/import, `BatchDeleteImage`, custody
+mutation, registry-policy replacement/deletion, and V2-scope downgrade under
+the guard prefix. Positive tests prove only copy publication and purge deletion,
+while source repositories outside the prefix remain usable. Policy drift freezes
+the realm before another mutation. Tests also prove v1 rejects native
 replication configuration instead of creating untracked regional content.
 
 Concurrency tests run multiple copy-worker and purge-worker replicas against one

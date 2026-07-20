@@ -856,27 +856,44 @@ must match metadata exactly. Old migrations never import live metadata. The
 builder PR deliberately couples API-63 code and migration 024; activation of
 the controller, executor, internal registry, and UI remains separately gated.
 
-Migration is not activation. While builder admission is disabled, 024 adds only
-nullable columns/tables and broader checks; it writes no BUILD producer, state,
-or lease value, so API-62 distribution replicas remain schema-compatible. The
-API-63 activation transaction locks the catalog singleton, verifies migration
-024 and healthy API/controller/publisher/purge capability evidence, then raises
-the migration-023 `minimum_image_writer_api_version` fence from 62 to 63 before
-any builder intent is admitted. Every API-62 image read/mutation/claim/finalizer
-already checks that fence and fails managed-image work closed; an in-flight
-API-62 lease expires for API-63 recovery. The first transaction that will create
-any 024-owned row or BUILD value sets the migration-023 catalog singleton's
-`builder_state_ever_created` flag TRUE while holding the phase-1 lock, before it
-acquires any later-phase row. Migration 024 adds named BEFORE triggers on every
-builder table and BUILD-bearing distribution column that reject a write unless
-that flag is already TRUE. Migration 023's named monotonic trigger forbids
-TRUE-to-FALSE, so cleanup cannot erase the witness. Disabling an unused builder
-may lower the
-fence to 62 only when the flag remains FALSE and a locked absence check finds no
-024-owned row or value. Once the flag is TRUE, rollback is only to a 024-aware
-API-63 binary with builder admission disabled. Schema downgrade or API-62
-image-plane rollback is forbidden, while unrelated SkyPilot operations remain
-available.
+Migration is not activation, and API 62 never runs against revision 024. API 63
+first rolls out with builder admission disabled and the automatic state-schema
+ceiling held at 023. It continues distribution work but returns
+`IMAGE_SCHEMA_PENDING` for builder routes. Its distribution code uses a frozen
+explicit 023 common-column projection and cannot select or write 024-only
+columns/enums; a superset ORM `SELECT *` is forbidden. Only after every API,
+controller, copy-worker, and purge-worker image-plane process reports API 63 and
+no API-62 database session remains does a dedicated Job take the shared
+compatibility advisory lock and apply 024. While admission is disabled, 024
+adds only nullable
+columns/tables and broader checks; it writes no BUILD producer, state, or lease
+value. API-63 processes then verify exact revision 024 before the ceiling is
+removed, and the same image rolls once more so every process starts on the 024
+projection. A still-restarting 023-projection process remains valid against the
+additive schema and cannot emit BUILD state.
+
+The API-63 activation transaction locks the catalog singleton, verifies
+migration 024 and healthy API/controller/publisher/purge capability evidence,
+then raises the migration-023 `minimum_image_writer_api_version` fence from 62
+to 63 before any builder intent is admitted. The first transaction that will
+create any 024-owned row or BUILD value sets the migration-023 catalog
+singleton's `builder_state_ever_created` flag TRUE while holding the phase-1
+lock, before it acquires any later-phase row. Migration 024 adds named BEFORE
+triggers on every builder table and BUILD-bearing distribution column that
+reject a write unless that flag is already TRUE. Migration 023's named monotonic
+trigger forbids TRUE-to-FALSE, so cleanup cannot erase the witness.
+
+Returning to API 62 before the witness is a guarded 024-to-023 schema downgrade,
+not a fence-only update. With builder admission disabled and API-63 plus
+builder/image-worker database sessions stopped, the downgrade takes the shared
+compatibility advisory lock and affected tables in global order, proves the
+witness false and every 024 row/BUILD value absent, then atomically restores the
+writer fence to 62, removes 024-owned schema, and stamps 023. API 62 starts only
+after that commit. Any witness or owned value makes PostgreSQL reject the whole
+downgrade and retain revision 024/fence 63. Once the flag is TRUE, rollback is
+only to a 024-aware API-63 binary with builder admission disabled. API-62
+image-plane/schema rollback is permanently forbidden, while unrelated
+operations remain available during an API-63 binary rollback.
 
 One `container_image_context_uploads` row contains only:
 
@@ -1618,12 +1635,18 @@ and same-row retry changes counters exactly once. Repair tests detect and fix a
 single-workspace drift without scanning or locking unrelated workspaces.
 
 Catalog integration tests cover fresh literal 022-to-023-to-024 migration,
-metadata parity, applied-but-disabled API-62 compatibility, atomic minimum
-writer-version activation before any BUILD value, API-62 fail-closed behavior,
-expired old-lease recovery, safe pre-state fence reversal, transactional first
-state setting of the irreversible builder witness, direct-write rejection while
-that witness is FALSE, TRUE-to-FALSE rejection, post-state API-62 rollback
-rejection, disabled-builder API-63 rollback, activation fencing, the
+metadata parity, API-63-at-023 schema-ceiling compatibility with builder routes
+closed, SQL capture proving every distribution query/write uses only the 023
+projection before migration and remains valid after additive 024, migration-Job
+refusal while any API-62 process/session remains, exact revision-024 restart,
+and API-62 startup rejection against 024. They prove
+atomic minimum-writer activation before any BUILD value, expired old-lease
+recovery, transactional first-state setting of the irreversible builder witness,
+direct-write rejection while that witness is FALSE, and TRUE-to-FALSE
+rejection. A pre-witness locked 024-to-023 downgrade restores the fence to 62
+only after exact absence; every witness/row/value and old/new writer race keeps
+revision 024 and fence 63. Tests also cover post-state API-62 rollback rejection,
+disabled-builder API-63 rollback, activation fencing, the
 named constraint replacement, pre-I/O artifact/location/byte reservation,
 generation/attempt/token-scoped output and staging records, crashes and stale
 attempts before and after canonical push, immutable-tag recovery, cancellation
