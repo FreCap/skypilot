@@ -1855,10 +1855,13 @@ class TestHaRecoverySkipsWhenStartInFlight:
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['pool-a']), \
              mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={'controller_pid': 1234,
-                               'controller_ip': '10.4.0.1',
-                               'status': 'READY'}), \
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[{'name': 'pool-a',
+                                'controller_pid': 1234,
+                                'controller_ip': '10.4.0.1',
+                                'status': 'READY',
+                                'yaml_content': 'yaml: v1'}]), \
              mock.patch(
                  'sky.serve.serve_utils._controller_process_alive',
                  return_value=False), \
@@ -1891,14 +1894,17 @@ class TestHaRecoverySkipsWhenStartInFlight:
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['svc']), \
              mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[{
+                     'name': 'svc',
                      'hash': 'incarnation-b',
                      'resource_scope': 'incarnation-b',
                      'controller_pid': 1234,
                      'controller_ip': '10.4.0.1',
                      'status': 'READY',
-                 }), \
+                     'yaml_content': 'yaml: v1',
+                 }]), \
              mock.patch(
                  'sky.serve.serve_utils._controller_process_alive',
                  return_value=False), \
@@ -1923,6 +1929,60 @@ class TestHaRecoverySkipsWhenStartInFlight:
             'dummy script', require_outputs=True)
 
 
+class TestHaRecoveryUsesSingleLivenessSnapshot:
+    """The sweep must issue ONE slim snapshot query for the whole iteration
+    instead of a per-service joined read (`_get_service_status` →
+    `get_service_from_name`), which re-joins version_specs and deserializes
+    the latest spec once per service every ~20s daemon tick."""
+
+    def test_no_per_service_joined_reads(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('POD_IP', '10.4.0.1')
+        names = [f'svc-{i}' for i in range(5)]
+        records = [{
+            'name': name,
+            'controller_pid': None,
+            'controller_ip': '10.4.0.1',
+            'status': 'READY',
+            'hash': f'{name}-hash',
+            'resource_scope': f'{name}-hash',
+            'yaml_content': 'yaml: v1',
+        } for name in names]
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_glob_service_names',
+                return_value=names), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=records) as snapshot, \
+             mock.patch(
+                 'sky.serve.serve_utils._get_service_status') as joined, \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_service_from_name'
+                 ) as from_name, \
+             mock.patch(
+                 'sky.serve.serve_utils.'
+                 '_snapshot_in_flight_start_service_incarnations',
+                 return_value=set()), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_ha_recovery_script',
+                 return_value='dummy script'), \
+             mock.patch(
+                 'sky.serve.serve_utils.command_runner.'
+                 'LocalProcessCommandRunner') as runner_cls, \
+             mock.patch(
+                 'sky.serve.serve_utils.skylet_constants.'
+                 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                 str(tmp_path / 'recovery_log_{}.log')):
+            runner_cls.return_value.run.return_value = (0, '', '')
+            serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+        # One snapshot for N services; the joined per-service read never runs.
+        snapshot.assert_called_once_with(pool=True)
+        joined.assert_not_called()
+        from_name.assert_not_called()
+        assert runner_cls.return_value.run.call_count == len(names)
+
+
 class TestHaRecoveryRetiresUnbootableRows:
 
     def test_missing_committed_version_is_marked_for_purge(
@@ -1931,8 +1991,10 @@ class TestHaRecoveryRetiresUnbootableRows:
         with mock.patch(
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['svc']), \
-             mock.patch('sky.serve.serve_utils._get_service_status',
-                        return_value=None), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[]), \
              mock.patch(
                  'sky.serve.serve_utils.serve_state.'
                  'get_latest_committed_version',
@@ -1966,9 +2028,9 @@ def test_ha_recovery_retires_raw_row_with_no_committed_version(tmp_path):
     with mock.patch.object(serve_state,
                            'get_glob_service_names',
                            return_value=['svc']), \
-         mock.patch.object(serve_utils,
-                           '_get_service_status',
-                           return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[]), \
          mock.patch.object(serve_state,
                            'get_latest_committed_version',
                            return_value=None), \
@@ -2000,6 +2062,7 @@ def test_ha_recovery_retires_raw_row_with_no_committed_version(tmp_path):
 def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
     """A NULL-yaml version row is visible to the join but cannot boot."""
     placeholder = {
+        'name': 'svc',
         'yaml_content': None,
         'controller_pid': None,
         'controller_ip': None,
@@ -2009,8 +2072,9 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
     }
     with mock.patch.object(serve_state,
                            'get_glob_service_names', return_value=['svc']), \
-         mock.patch.object(serve_utils,
-                           '_get_service_status', return_value=placeholder), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[placeholder]), \
          mock.patch.object(serve_state,
                            'get_latest_committed_version', return_value=None), \
          mock.patch.object(serve_state,
@@ -2057,10 +2121,13 @@ class TestHaRecoveryDefensiveOnAliveCheckException:
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['svc']), \
              mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={'controller_pid': 1234,
-                               'controller_ip': '10.4.0.1',
-                               'status': 'READY'}), \
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[{'name': 'svc',
+                                'controller_pid': 1234,
+                                'controller_ip': '10.4.0.1',
+                                'status': 'READY',
+                                'yaml_content': 'yaml: v1'}]), \
              mock.patch(
                  'sky.serve.serve_utils._controller_process_alive',
                  side_effect=psutil.AccessDenied(1234)) as mock_alive, \
@@ -3013,10 +3080,14 @@ class TestHaRecoveryFencesOnLeadershipLoss:
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['svc-a', 'svc-b']), \
              mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={'controller_pid': 1234,
-                               'controller_ip': '10.4.0.1',
-                               'status': 'READY'}), \
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[{'name': name,
+                                'controller_pid': 1234,
+                                'controller_ip': '10.4.0.1',
+                                'status': 'READY',
+                                'yaml_content': 'yaml: v1'}
+                               for name in ('svc-a', 'svc-b')]), \
              mock.patch(
                  'sky.serve.serve_utils._controller_process_alive',
                  return_value=False), \
@@ -3088,10 +3159,13 @@ class TestHaRecoveryRecreatesServiceDir:
                 'sky.serve.serve_utils.serve_state.get_glob_service_names',
                 return_value=['svc']), \
              mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={'controller_pid': 1234,
-                               'controller_ip': '10.4.0.1',
-                               'status': 'READY'}), \
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_service_liveness_snapshots',
+                 return_value=[{'name': 'svc',
+                                'controller_pid': 1234,
+                                'controller_ip': '10.4.0.1',
+                                'status': 'READY',
+                                'yaml_content': 'yaml: v1'}]), \
              mock.patch(
                  'sky.serve.serve_utils._controller_process_alive',
                  return_value=False), \
