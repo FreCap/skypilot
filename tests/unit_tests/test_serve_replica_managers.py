@@ -3817,6 +3817,53 @@ class TestLogicalCapacityPlanning:
         assert not retiring.is_ready
         mgr._terminate_replica.assert_not_called()
 
+    def test_recovery_gate_blocks_queued_shutdown_admission(self, tmp_path):
+        retiring = self._recoverable_logical_retirement(1)
+        survivor = self._ready_backend(2, 1)
+        mgr = self._logical_recovery_manager([retiring], survivor)
+        mgr._resource_scope = None
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = None
+        mgr._down_thread_pool[1] = down_thread
+
+        with mock.patch.object(mgr, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 mgr, '_reconcile_recovering_logical_retirements'), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _service, ids:
+                               ({1: retiring} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True) as can_terminate:
+            mgr._refresh_thread_pool()
+
+        can_terminate.assert_not_called()
+        down_thread.start.assert_not_called()
+        assert mgr._recovering_logical_retirement_ids == {1}
+        assert not retiring.is_ready
+        assert (retiring.status_property.sky_down_status ==
+                common_utils.ProcessStatus.SCHEDULED)
+        assert (retiring.status_property.logical_retirement_controller_epoch ==
+                'old-controller-epoch')
+        mgr._persist_replica.assert_not_called()
+
     def test_adopted_recovery_timeout_stays_off_route_without_newer_generation(
             self):
         retiring = self._recoverable_logical_retirement(1)

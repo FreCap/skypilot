@@ -5434,9 +5434,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         common_utils.ProcessStatus.RUNNING)
                     self._persist_replica(replica_id, info)
                 for replica_id, t, info in down_to_admit:
-                    if not controller_utils.can_terminate(self._is_pool,
-                                                          in_flight=in_flight):
-                        continue
                     logical_retirement = getattr(info.status_property,
                                                  'logical_retirement_version',
                                                  None) is not None
@@ -5444,6 +5441,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                            if logical_retirement else
                                            contextlib.nullcontext())
                     with logical_state_guard:
+                        if logical_retirement:
+                            recovering_ids: set[int] = getattr(
+                                self, '_recovering_logical_retirement_ids',
+                                set())
+                            if replica_id in recovering_ids:
+                                # Recovery owns this durable SCHEDULED row.
+                                # Evaluating its pre-restart fence here would
+                                # abort and advertise the victim before the
+                                # recovery pass can adopt it from fresh
+                                # capacity evidence.
+                                continue
+                        if not controller_utils.can_terminate(
+                                self._is_pool, in_flight=in_flight):
+                            continue
                         if logical_retirement:
                             status = info.status_property
                             retirement_version = getattr(
