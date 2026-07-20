@@ -65,6 +65,18 @@ async function flushFetches(rounds = 4) {
   }
 }
 
+function StatefulServicesTable({ refreshDataRef }) {
+  const [loading, setLoading] = React.useState(false);
+  return (
+    <ServicesTable
+      refreshInterval={30000}
+      loading={loading}
+      setLoading={setLoading}
+      refreshDataRef={refreshDataRef}
+    />
+  );
+}
+
 describe('Services fetch wiring', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -107,18 +119,38 @@ describe('Services fetch wiring', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps the latest interval request in control when an older success finishes', async () => {
-    const oldRequest = deferred();
-    const currentRequest = deferred();
-    dashboardCache.get
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(currentRequest.promise);
+  it('coalesces interval ticks while the current request is pending', async () => {
+    const pendingRequest = deferred();
+    dashboardCache.get.mockReturnValue(pendingRequest.promise);
 
     render(<Services />);
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      jest.advanceTimersByTime(30000);
+      jest.advanceTimersByTime(90000);
+    });
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingRequest.resolve(SERVICES_RESPONSE);
+      await pendingRequest.promise;
+    });
+  });
+
+  it('lets a manual refresh supersede an older request', async () => {
+    const oldRequest = deferred();
+    const currentRequest = deferred();
+    const refreshDataRef = { current: null };
+    dashboardCache.get
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(currentRequest.promise);
+
+    render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      refreshDataRef.current();
     });
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
@@ -140,17 +172,18 @@ describe('Services fetch wiring', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('does not let an older failure erase a newer interval result', async () => {
+  it('does not let an older failure erase a newer manual refresh', async () => {
     const oldRequest = deferred();
     const currentRequest = deferred();
+    const refreshDataRef = { current: null };
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
     dashboardCache.get
       .mockReturnValueOnce(oldRequest.promise)
       .mockReturnValueOnce(currentRequest.promise);
 
-    render(<Services />);
+    render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
     await act(async () => {
-      jest.advanceTimersByTime(30000);
+      refreshDataRef.current();
       currentRequest.resolve(responseFor('current-service'));
       await currentRequest.promise;
     });
