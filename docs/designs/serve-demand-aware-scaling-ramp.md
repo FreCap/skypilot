@@ -123,29 +123,22 @@ bounded by its existing incident controls.
 
 ### Logical actuation generation fence
 
-Logical actuation must not require the live capacity snapshot generation to
-remain bit-for-bit equal to the demand generation that produced the target. On
-large fleets, a probe round or placement-lock wait can outlive the load
-balancer sync interval, so overwriting the only decision snapshot can discard
-every scale-up and rolling-drain batch forever.
-
-While the exact published `(version, decision_generation, target)` remains
-current, scale-up may use any fresh capacity snapshot from the same version
-whose generation is at least the decision generation. A newer published target
-or version still supersedes the intent, and the fence is checked again before
-each replica row is persisted. Unknown-capacity replacement is authorized only
-from the exact decision generation; a newer snapshot may narrow or cancel that
-replacement set, but cannot authorize a new overlap from stale evidence.
-
-Rolling drain is stricter: atomically retain the exact fresh capacity and
-occupancy snapshot paired with the published target. A later LB sync may update
-the live snapshot without erasing that selection proof while the autoscaler
-waits for the manager lock. The initial batch admission uses the retained exact
-snapshot and the same one-slot floor for each ready old backend, then each
-off-route victim is rechecked against current target, capacity, and occupancy
-evidence before teardown. Backends already off route never count toward that
-coverage. Publishing a newer target or letting the retained snapshot go stale
-invalidates the batch.
+Logical actuation must not require the capacity snapshot generation to remain
+bit-for-bit equal to the demand generation that produced the target. On large
+fleets, a probe round or manager-lock wait can outlive the load balancer sync
+interval, so an exact-generation fence can discard every scale-up or retirement
+batch forever. While the exact published
+`(version, decision_generation, target)` remains current, actuation may use any
+fresh capacity snapshot from the same version whose generation is at least the
+decision generation. A newer published target or version still supersedes the
+intent. Scale-up rechecks the fence and newest committed capacity before each
+replica row is persisted. Scale-down recomputes coverage and verifies each
+selected victim is still known idle in the newest snapshot before marking it
+off-route. Scale-down counts one conservative slot per ready old-version
+backend, but backends already off route never count toward coverage.
+Unknown-capacity replacement stays tied to the exact decision generation; a
+newer snapshot may narrow or cancel the set but cannot authorize new overlap
+from stale evidence.
 
 ### Rolling replacement bridge
 
@@ -221,7 +214,10 @@ next_target = max(raw_target,
 
 After adopting this lower target, the downscale counter resets. Another lower
 wave requires a new complete delay window. Busy-replica and stale-signal safety
-continue to clip actual victims.
+continue to clip actual victims. Controller reconstruction may restore the
+committed fleet as the target baseline only for the first fresh recompute. An
+adopted lower target must not rebound to committed capacity on later ticks while
+asynchronous retirement is still catching up.
 
 Failed/stopping cleanup, explicit shutdown, cost rebalance, and old-version
 retirement remain exempt. These are lifecycle actions rather than ordinary
@@ -366,13 +362,11 @@ rate to 100, then restore the previous control-plane image if required.
   larger of 10 or 20 percent based on committed logical capacity.
 - Verify provisioning capacity is committed and prevents duplicate waves.
 - Verify continuously advancing load-balancer snapshots cannot starve a
-  still-current logical scale-up target, while a newer target or version still
-  fences it before persistence.
-- Verify a recovered backend is removed from an unknown-capacity replacement
-  set before a scale-up based on newer evidence.
-- Verify a newer load-balancer sync cannot erase the exact fresh rolling-drain
-  decision snapshot while it waits for the manager lock, and that a newer
-  published target still invalidates the old drain batch.
+  still-current logical scale-up or retirement target, while a newer target or
+  version still fences it before persistence. Retirement must recompute
+  coverage and idle evidence from the newest snapshot.
+- Verify a backend that recovered between the decision snapshot and actuation
+  is removed from the unknown-capacity replacement set.
 - Verify final manager admission and teardown fences count one slot per ready
   old backend, but never count a backend that is already off route.
 - Verify in-process updates preserve the rate timestamp and a rebuild never
@@ -380,7 +374,8 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify a demand rebound does not cause scale-down and stale reports cannot
   shrink capacity.
 - Verify 50 percent downscale requires a fresh complete five-minute window per
-  wave and works for mixed 1, 4, and 8-slot backends.
+  wave, does not rebound while retirement lags, and works for mixed 1, 4, and
+  8-slot backends.
 - Verify logical rolling retirement starts before latest capacity reaches the
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old

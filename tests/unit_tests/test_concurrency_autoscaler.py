@@ -612,6 +612,29 @@ class TestLogicalScalingWaves(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
         self.assertEqual(autoscaler.target_num_replicas, 50)
 
+    def test_downscale_target_does_not_rebound_while_retirement_lags(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=2 * interval,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 100)
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
+        # Actuation is asynchronous, so committed capacity can still report
+        # the pre-wave fleet on the next tick. That must not undo the adopted
+        # target while the retirement batch catches up.
+        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
     def test_arrival_floor_never_lowers_target(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
         autoscaler.target_num_replicas = 7

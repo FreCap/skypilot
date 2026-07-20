@@ -332,7 +332,7 @@ class LbSessionLedger:
 class DemandSnapshot:
     """Durable scale-down-safe evidence retained across one promotion."""
 
-    timestamps: tuple[int, ...]
+    timestamps: tuple[float, ...]
     queue_depth: int
     rejected_in_window: int
     in_flight: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -345,8 +345,8 @@ class DemandSnapshot:
         timestamps = aggregator.get('timestamps', []) if isinstance(
             aggregator, dict) else []
         valid_timestamps = tuple(
-            value for value in timestamps
-            if isinstance(value, int) and not isinstance(value, bool))
+            value for value in timestamps if isinstance(value, (int, float)) and
+            not isinstance(value, bool) and math.isfinite(value) and value >= 0)
 
         def _nonnegative(value: Any) -> int:
             return (value if isinstance(value, int) and

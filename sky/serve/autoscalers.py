@@ -2847,13 +2847,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         target_num_replicas = self._clip_target_num_replicas(raw_target_num)
         self._raw_target_num_replicas = target_num_replicas
-        if self.replica_unit == 'logical':
+        if (self.replica_unit == 'logical' and
+                self._snap_target_on_next_recompute):
             # The adopted target is controller-local and rebuilds at
             # min_replicas, while the latest-version fleet may already be much
             # larger. Re-establish that committed fleet as the actuation
-            # baseline before applying hysteresis and the downscale limit.
+            # baseline once, before applying hysteresis and the downscale limit.
             # Otherwise the first fresh report after a restart can publish a
-            # tiny target and retire the whole live fleet in one tick.
+            # tiny target and retire the whole live fleet in one tick. Do not
+            # repeat this after the one-shot snap: an adopted downscale target
+            # must remain below committed capacity while retirement catches up.
             committed = self._latest_committed_logical_capacity(replica_infos)
             self.target_num_replicas = max(
                 self.target_num_replicas,
