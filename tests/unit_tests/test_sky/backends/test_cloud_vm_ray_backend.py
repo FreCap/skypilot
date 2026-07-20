@@ -2,6 +2,8 @@
 
 import multiprocessing
 import socket
+import subprocess
+import sys
 import time
 from unittest.mock import call
 from unittest.mock import MagicMock
@@ -51,6 +53,25 @@ class TestCloudVmRayResourceHandleCardinality:
             handle.update_cluster_ips(cluster_info=cluster_info)
 
         assert handle.stable_internal_external_ips is None
+
+    def test_update_cluster_ips_rejects_mismatched_lists_under_optimization(
+            self):
+        if sys.flags.optimize == 0:
+            node_id = (f'{__file__}::TestCloudVmRayResourceHandleCardinality::'
+                       'test_update_cluster_ips_rejects_mismatched_lists_'
+                       'under_optimization')
+            result = subprocess.run([
+                sys.executable, '-O', '-m', 'pytest', '-n', '0', '--dist', 'no',
+                '-q', node_id
+            ],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30)
+            assert result.returncode == 0, result.stdout + result.stderr
+            return
+
+        self.test_update_cluster_ips_rejects_mismatched_lists()
 
     def test_get_command_runners_rejects_mismatched_ports(self):
         handle = self._make_handle(stable_internal_external_ips=[
