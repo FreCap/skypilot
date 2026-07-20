@@ -44,11 +44,16 @@ Prototype artifacts therefore cannot preoccupy a user workspace's unique digest
 before native builder convergence. They may be launched for benchmarks inside
 the reserved workspace, then externally purged/acknowledged or retained under
 its bounded quotas. Reusing a successful digest elsewhere is an ordinary
-cross-workspace exact-digest adoption, not an in-place producer promotion.
-Prototype bootstrap claims the reserved workspace only when it is absent or
-empty and already admin-only; a preexisting artifact, release, location, or
-consumer is a hard collision rather than something the harness adopts or
-deletes.
+cross-workspace exact-digest adoption, not an in-place producer promotion. If a
+later native build independently produces that digest in the product workspace,
+its finalizer may add a new BUILD-origin canonical location under the requested
+managed profile while preserving the artifact's initial `external_oci`
+provenance. Prototype adoption therefore cannot reserve the only future
+producer route.
+Prototype bootstrap either creates the absent reserved workspace as admin-only,
+or accepts an existing one only when it is already admin-only and empty. A
+preexisting artifact, release, location, or consumer is a hard collision rather
+than something the harness adopts or deletes.
 
 The useful Modal-like property is that construction is declared and cached
 independently from replica startup. Placement never runs a Docker build or
@@ -842,7 +847,9 @@ It also adds `build_id` to canonical locations and replaces every affected
 named 023 contract in one transaction: artifact producer one-of; canonical
 origin one-of; location-state check with `BUILD_RESERVED`; lease-kind/state
 check with `BUILD_OUTPUT`; facet state check; builder claim/expiry/output partial
-indexes; and producer-aware lifecycle/purge predicates. SQLAlchemy enums,
+indexes; the profile-activation active-lease predicate extended with
+BUILD_OUTPUT; ordinary COPY repair indexes that explicitly exclude it; and
+producer-aware lifecycle/purge predicates. SQLAlchemy enums,
 response validation, repair routines, and schema-parity fixtures change in the
 same builder merge train. A fresh database runs literal 022 to 023 to 024 and
 must match metadata exactly. Old migrations never import live metadata. The
@@ -857,11 +864,19 @@ API-63 activation transaction locks the catalog singleton, verifies migration
 the migration-023 `minimum_image_writer_api_version` fence from 62 to 63 before
 any builder intent is admitted. Every API-62 image read/mutation/claim/finalizer
 already checks that fence and fails managed-image work closed; an in-flight
-API-62 lease expires for API-63 recovery. Before any 024-owned row or value
-exists, disabling the unused builder may lower the fence to 62. After the first
-builder row or BUILD value commits, rollback is only to a 024-aware API-63
-binary with builder admission disabled. Schema downgrade or API-62 image-plane
-rollback is forbidden, while unrelated SkyPilot operations remain available.
+API-62 lease expires for API-63 recovery. The first transaction that will create
+any 024-owned row or BUILD value sets the migration-023 catalog singleton's
+`builder_state_ever_created` flag TRUE while holding the phase-1 lock, before it
+acquires any later-phase row. Migration 024 adds named BEFORE triggers on every
+builder table and BUILD-bearing distribution column that reject a write unless
+that flag is already TRUE. Migration 023's named monotonic trigger forbids
+TRUE-to-FALSE, so cleanup cannot erase the witness. Disabling an unused builder
+may lower the
+fence to 62 only when the flag remains FALSE and a locked absence check finds no
+024-owned row or value. Once the flag is TRUE, rollback is only to a 024-aware
+API-63 binary with builder admission disabled. Schema downgrade or API-62
+image-plane rollback is forbidden, while unrelated SkyPilot operations remain
+available.
 
 One `container_image_context_uploads` row contains only:
 
@@ -1141,11 +1156,21 @@ canonical location, attempt/output. It then:
 4. for an ACTIVE artifact with an exact READY canonical route under the
    requested profile, records a content-convergence candidate without changing
    its original producer or SOURCE/BUILD origin; or
-5. rejects an ACTIVE artifact owned by another unresolved origin with closed
+5. for an ACTIVE same-digest artifact with no canonical location under the
+   requested managed profile, preserves its initial producer and every existing
+   location, requires its stored platform/size evidence to match the independent
+   staging verifier, reserves only the new location and exact materialized-byte
+   quota, creates a BUILD-origin canonical location for this build in
+   `BUILD_RESERVED`, and inserts the RESERVED output lease; or
+6. rejects an ACTIVE artifact whose requested profile already has a non-READY
+   canonical location owned by another source or build with closed
    `OUTPUT_DIGEST_REGISTERED_UNREADY`, leaving staging available for bounded
    retry and performing no canonical I/O.
 
-Artifact and location counters are not double charged on the convergence path.
+Artifact count is never charged for an existing digest. The READY convergence
+path charges neither location nor bytes again; the new-profile BUILD route
+charges exactly one location and its materialized bytes because it creates new
+physical custody.
 `reserved_bytes` is the verified manifest's logical compressed size, the same
 counter definition used by distribution quota, rather than an estimate of
 provider layer deduplication. Failure to reserve it ends the attempt before
@@ -1163,9 +1188,11 @@ origin binding, then atomically marks location, output, and build READY and
 stores `output_image_id` and `canonical_location_id`. A convergence candidate
 first reacquires and revalidates the existing READY location, then commits the
 build with `cache_outcome=CONTENT_CONVERGED`; it does not claim that the
-canonical location was produced by this build. Regional copies and runtime
-validation follow the recorded exact canonical origin. Release publication is
-a separate post-READY artifact publication.
+canonical location was produced by this build. A new-profile same-digest route
+instead follows the normal fenced publisher path and records this build as that
+location's BUILD origin without rewriting the artifact's initial producer.
+Regional copies and runtime validation follow the recorded exact canonical
+origin. Release publication is a separate post-READY artifact publication.
 
 A stale publisher may finish staging inspection or even canonical I/O after losing its
 token, but it cannot adopt the result. The provisional artifact, location,
@@ -1592,14 +1619,19 @@ single-workspace drift without scanning or locking unrelated workspaces.
 Catalog integration tests cover fresh literal 022-to-023-to-024 migration,
 metadata parity, applied-but-disabled API-62 compatibility, atomic minimum
 writer-version activation before any BUILD value, API-62 fail-closed behavior,
-expired old-lease recovery, safe pre-state fence reversal, post-state API-62
-rollback rejection, disabled-builder API-63 rollback, activation fencing, the
+expired old-lease recovery, safe pre-state fence reversal, transactional first
+state setting of the irreversible builder witness, direct-write rejection while
+that witness is FALSE, TRUE-to-FALSE rejection, post-state API-62 rollback
+rejection, disabled-builder API-63 rollback, activation fencing, the
 named constraint replacement, pre-I/O artifact/location/byte reservation,
 generation/attempt/token-scoped output and staging records, crashes and stale
 attempts before and after canonical push, immutable-tag recovery, cancellation
 races, no rowless canonical content, ordinary abandoned-output tombstone/purge,
-DELETE_UNKNOWN charging, concurrent identical build convergence, collision
-with SOURCE, other-BUILD, unready, tombstoned, and purged digests, output
+DELETE_UNKNOWN charging, concurrent identical build convergence, READY
+same-digest convergence, creation of a new BUILD-origin managed canonical route
+for an ACTIVE external-only same digest without rewriting initial provenance,
+collision with SOURCE or other-BUILD non-READY routes, tombstoned and purged
+digests, output
 digest/platform mismatch, SOURCE-versus-BUILD runtime validation, content
 convergence without provenance rewriting, and ordinary artifact-ID
 READY-fast-path publication. Cache tests exercise the shared session-taking
@@ -1632,7 +1664,8 @@ scope/ownership/quota/GC, and live S3 plus R2 context-store capability and drift
 tests. Prototype tests prove the harness and ServiceAccount reject every
 non-reserved workspace, product admission rejects the reserved workspace, its
 outputs remain `external_oci`, and the same digest can be adopted independently
-in a product workspace without producer promotion or collision.
+in a product workspace, then gain an independently built managed-profile route
+without producer promotion or collision.
 
 Release evidence includes real PostgreSQL migration/concurrency tests, MinIO or
 S3-compatible integration, the hostile sandbox conformance matrix plus a real
