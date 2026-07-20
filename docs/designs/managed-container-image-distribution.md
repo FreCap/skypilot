@@ -107,6 +107,8 @@ here.
 | Publication | Durable adoption attempt and optional release reservation | publication service |
 | Release | Human-readable immutable alias created only after verification | publication service |
 | Profile | Complete registry topology and policy snapshot | server configuration |
+| Access binding | Credential-free reference to one qualified read, write, pull, or delete authority | provider adapter |
+| Qualification | Timestamped proof that one profile revision and its access bindings are usable | background worker |
 | Registry shard | One preprovisioned physical repository and its hard admission budget | shard repository |
 | Location | One digest in one physical registry target | materialization service |
 | Dependency | Durable placement pin while a logical workload waits for one location | runtime transaction service |
@@ -122,14 +124,15 @@ sky/container_images/
   models.py                 value objects and validators
   config.py                 profile and workspace policy snapshots
   catalog_state.py          artifact, source, publication, release persistence
-  shard_state.py            physical repository admission and drift persistence
+  shard_state.py            repository admission, qualification, and drift persistence
+  provider_budget_state.py  account-region API budgets and throttle backoff
   materialization_state.py  location, lease, verification, and retry persistence
   dependency_state.py       durable warming pins and READY pull plans
   reference_state.py        durable consumer references and eviction eligibility
-  transactions.py           the two cross-repository PostgreSQL transitions
+  transactions.py           cross-repository PostgreSQL transitions
   publication.py            explicit publication service
   runtime.py                read-only workload resolution and warming dependency
-  providers.py              portable adapter contracts
+  providers.py              portable access, content-graph, and adapter contracts
   aws.py                    qualified ECR adapter
   copy_worker_service.py    independently deployed copy loop
   lifecycle_worker_service.py independently deployed deletion loop
@@ -187,10 +190,12 @@ default.
 
 ```text
 sky image publish SOURCE@sha256:DIGEST \
-    --release NAME --distribution PROFILE [--no-wait]
+    [--source-auth BINDING] [--release NAME] \
+    --distribution PROFILE [--no-wait]
 sky image status [SELECTOR] [--workspace W]
 sky image prepare SELECTOR --distribution PROFILE --target TARGET... [--no-wait]
 sky image retry SELECTOR --distribution PROFILE --target TARGET [--no-wait]
+sky image profile qualify PROFILE --manifest TERRAFORM.json [--no-wait]
 ```
 
 `publish` is the only public source-adoption operation. There is no `register`
@@ -198,6 +203,16 @@ alias. With `--no-wait`, it returns the asynchronous request and publication
 identifier immediately. Without it, the client waits for canonical verification
 and returns the artifact ID, publication ID, and optional public release. Request
 retry uses an idempotency key; `--release` is optional.
+
+`--source-auth` names an allowed credential resolver binding, never a secret.
+The publication persists only its binding ID and qualification fingerprint. A
+public source omits the option. The Dashboard offers the same authorized binding
+names without reading or returning their values.
+
+`profile qualify` is an administrator-only, bounded upload of the secret-free
+Terraform handoff. Helm deployments normally mount that handoff from a ConfigMap
+for automatic background ingestion; the command supports non-Kubernetes control
+planes. Neither path runs Terraform or waits for provider qualification inline.
 
 `prepare` creates only the explicitly selected target intent. If the target
 depends on a canonical location that is not READY, it returns the canonical
@@ -371,6 +386,7 @@ container_images
 container_image_sources
 container_image_publications
 container_image_releases
+container_image_provider_budgets
 container_image_registry_shards
 container_image_locations
 container_image_dependencies
@@ -397,12 +413,18 @@ Important constraints include:
   the collision behavior above;
 - every release row points to the READY publication and artifact that created
   it, and no release row exists before that transaction;
+- one provider budget row per provider, partition, account, region, and API
+  family, with an applied rate, token state, and persisted throttle backoff;
+- profile revision state in `QUALIFYING|ACTIVE|FAILED|RETIRED`, with at most one
+  active revision per profile selection scope and a bounded desired-config and
+  qualification hash;
 - one row per physical repository shard with immutable fingerprint, hard
-  manifest ceiling, reserved count, observed count, and
-  `READY|FULL|DRIFTED|DISABLED` admission state;
+  manifest ceiling, reserved count, observed count, qualification timestamp,
+  reconciliation epoch/cursor, and `READY|FULL|DRIFTED|DISABLED` admission state;
 - unique physical location identity for artifact/profile/target/fingerprint;
 - canonical versus regional dependency checks;
 - closed location state and lease combinations;
+- an inventory epoch marker on each manifest-present location;
 - one server-owned dependency per consumer generation and placement slot, with
   `WARMING|READY|FAILED|RELEASED` state and a bounded secret-free plan;
 - unique durable consumer reference; and
@@ -438,48 +460,124 @@ reason to preserve the earlier branch-only schema.
 
 ## Registry profiles
 
-A profile is a complete immutable revision:
+### Provider-neutral access contract
+
+A provider adapter consumes credential-free bindings rather than provider fields
+from a pull plan. Every source or target resolves the following fixed roles:
+
+- `source_read`: optional authority used only to inspect and copy the published
+  source digest;
+- `destination_write`: authority to inspect and write one declared target;
+- `runtime_pull`: backend-specific strategy used by the actual container-runtime
+  principal;
+- `lifecycle_delete`: optional authority for reference-safe deletion; and
+- `localities`: finite provider/backend/region bindings the target truly serves.
+
+An access binding has an immutable ID, provider kind, nonsecret authority or
+secret-resolver reference, allowed purposes, and qualification fingerprint.
+Adapters mint short-lived credentials inside the relevant worker or runtime.
+Secret values never enter a profile, pull plan, database row, command argument,
+or API response. A binding qualified for source read cannot be reused for write
+or delete.
+
+Before any destination write, the adapter returns an `OciContentGraph` containing
+the root digest, media type, child descriptors, runnable platforms, and manifest
+unit count. V0 accepts exactly one runnable image manifest and zero children. It
+rejects an OCI index, Docker manifest list, or artifact manifest before upload.
+The graph type is retained so a later reviewed index feature can account for
+parent and child manifests without replacing the provider interface.
+
+External targets have one of two modes:
+
+- `write_through`: SkyPilot may inspect and materialize through qualified
+  destination-write authority, but never provisions or deletes infrastructure;
+- `read_only`: SkyPilot may verify an already present digest and route pulls, but
+  `prepare` fails with `TARGET_READ_ONLY` instead of pretending JIT copy works.
+
+Private external OCI therefore requires explicit write and runtime-pull bindings.
+Generic OCI compatibility is not enough. Qualification records digest-preserving
+manifest read/write, accepted media types, credential refresh, throttling,
+declared locality, and optional deletion. GAR, Nebius, generic Kubernetes, and
+non-cloud Docker remain external until their adapters pass that contract. A
+generic endpoint is never declared local merely because it is reachable.
+
+### Profile syntax and activation
+
+A profile is a complete immutable revision. The managed AWS example uses one
+dedicated registry account in one AWS partition, with many target regions:
 
 ```yaml
 container_registries:
   default_profile: gpu-production
+  access_bindings:
+    registry-copy:
+      kind: aws_assume_role
+      authority: arn:aws:iam::123456789012:role/SkyPilotImageCopy
+      purposes: [source_read, destination_write, verify]
+    registry-lifecycle:
+      kind: aws_assume_role
+      authority: arn:aws:iam::123456789012:role/SkyPilotImageLifecycle
+      purposes: [verify, lifecycle_delete]
+    aws-vm-pullers:
+      kind: aws_ec2_instance_identity
+      purposes: [runtime_pull]
+      principals:
+        - arn:aws:iam::210987654321:role/SkyPilotNodeRole
+    aws-eks-pullers:
+      kind: aws_eks_kubelet_identity
+      purposes: [runtime_pull]
+      principals:
+        - arn:aws:iam::210987654321:role/EksNodeRole
   profiles:
     gpu-production:
       revision: 1
       ownership: managed
       provider: aws
+      partition: aws
+      registry_account: "123456789012"
+      realm: skypilot-production
       canonical:
-        account: "123456789012"
         region: us-east-1
         registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
         repository_prefix: skypilot-images
         shard_count: 16
         max_manifests_per_shard: 90000
-        pull_auth: ecr_runtime_identity
+        write_authority: registry-copy
+        delete_authority: disabled
+        runtime_pull:
+          aws_vm: aws-vm-pullers
+          aws_eks: aws-eks-pullers
       targets:
         - name: us-west-2
-          account: "123456789012"
           region: us-west-2
           registry: 123456789012.dkr.ecr.us-west-2.amazonaws.com
           repository_prefix: skypilot-images
           shard_count: 16
           max_manifests_per_shard: 90000
-          pull_auth: ecr_runtime_identity
+          write_authority: registry-copy
+          delete_authority: registry-lifecycle
+          runtime_pull:
+            aws_vm: aws-vm-pullers
+            aws_eks: aws-eks-pullers
 ```
-
-Externally provisioned profiles use `ownership: external`, an OCI registry
-provider binding, and no deletion authority. Kubernetes contexts explicitly map
-to one registry target and pull-auth strategy. VM targets declare the provider
-and region localities they satisfy. A generic endpoint is never declared local
-merely because it is reachable.
 
 Semantic changes require a higher explicit revision. Existing durable pull
 plans remain valid while their exact target and auth contract remains usable.
-New placement uses only the active revision. Config validation checks every
-profile atomically before activation and rejects ambiguous locality, duplicate
-targets, or incompatible authentication. V0 uses the existing server config
-reload path and feature-gated rolling deployment. It does not create a second
-global configuration transaction protocol.
+Config reload stages a desired profile revision as `QUALIFYING`; it never makes
+provider calls or blocks deployment. The copy worker validates the secret-free
+Terraform handoff, assumes each access binding, probes settings and capabilities,
+and persists a qualification hash and timestamp. One transaction promotes the
+revision to `ACTIVE` only when every target is fresh and matches the desired
+config. The previous active revision remains selectable until then. New
+placement uses only the active revision; existing plans retain their exact old
+revision until references drain.
+
+Qualification refreshes every ten minutes. After one hour without a successful
+refresh, new publication and materialization stop for that target while existing
+verified pull plans remain usable. This is a scoped profile state machine in
+`container_image_profile_revisions`, not a second global configuration ledger.
+Config validation still rejects ambiguous locality, duplicate targets,
+cross-partition managed profiles, or incompatible access bindings before staging.
 
 ## AWS managed slice
 
@@ -489,8 +587,23 @@ Terraform creates every v0 repository before profile activation. For each
 declared workspace, region, and shard index, the name is deterministic:
 
 ```text
-<prefix>/<workspace>/s<two-hex-index>
+<prefix>/r<authority-base32>/w<workspace-hash>/g00/s<two-hex-index>
 ```
+
+`authority-base32` encodes the 128-bit catalog authority. `workspace-hash` is a
+128-bit, versioned hash of authority plus normalized workspace name. Terraform
+and the API reject any collision across the declared workspace set and validate
+the final ECR name and length. `g00` is the fixed v0 repository generation. This
+prevents two SkyPilot control planes sharing an account from colliding and avoids
+placing workspace display names in registry paths. A later shard expansion uses
+a new explicit generation and profile revision; it never changes old paths.
+
+A shard's physical identity includes AWS partition, account, region, registry
+authority, repository ARN and name, catalog authority/realm, workspace encoding
+version, generation/index, encryption type and KMS key ARN, tag immutability,
+scanning mode, and Terraform ownership tags. Endpoint plus namespace alone is
+not a sufficient fingerprint. Setting drift marks the shard `DRIFTED`; it does
+not silently create a second physical identity.
 
 `shard_count` is immutable for a physical target and must be between 1 and 256.
 Terraform reads the applied ECR images-per-repository quota, reserves explicit
@@ -512,39 +625,75 @@ it does not try an undeclared repository. Reserved count is decremented only
 after exact provider inspection proves that no manifest exists and no retained
 publication or dependency can recreate it.
 
-The lifecycle worker periodically compares paginated ECR inventory with state.
+Each shard stores a durable inventory epoch, provider cursor, started time, and
+last-completed time. One reconciliation claim reads at most ten provider pages
+or runs for ten seconds, then commits its cursor. An invalid or expired provider
+cursor restarts the epoch safely. Observed managed digests update the matching
+location's epoch marker. Only a completed epoch may diagnose a missing manifest.
 An in-flight or not-yet-written location consumes a reservation but is not
-expected in inventory. An unexplained manifest, an observed count above reserved
-count, or a missing manifest for a location recorded as present marks the shard
-`DRIFTED` and stops new admission without breaking existing pulls. This makes
-capacity a transactionally enforced boundary, rather than a probabilistic
-hashing claim. At a 90,000 ceiling, twelve shards admit at least one million
-manifests; the example uses sixteen for headroom. Expanding the fixed layout
-requires Terraform plus a new profile revision. V0 never creates a repository
-during placement or copy.
+expected in inventory. An unexplained manifest, observed count above reserved
+count, or manifest-present location absent from a complete epoch marks the shard
+`DRIFTED` and stops new admission without breaking existing pulls.
+
+Failed canonical reservations are reaped only after every dependent publication
+reservation has expired, no dependency or reference remains, no lease is live,
+and exact inspection proves the digest absent. The same transaction deletes the
+empty location and decrements the shard count. V0 never deletes a READY canonical
+manifest. An ambiguous write that left content therefore keeps its honest
+capacity reservation until an operator resolves it.
+
+This makes capacity a transactionally enforced boundary rather than a
+probabilistic claim. At a 90,000 ceiling, twelve shards admit at least one million
+manifests; the example uses sixteen for headroom. A complete million-manifest
+scan is resumable and off the API path. Expanding the fixed layout requires
+Terraform plus a new profile revision. V0 never creates a repository during
+placement or copy.
 
 No Terraform action copies image content. Canonical and regional manifests are
 created only from durable intents.
 
 ### IAM boundary
 
-The module creates or accepts four distinct roles:
+V0 managed custody uses exactly one dedicated registry account per profile and
+any number of regions in the same AWS partition. Source registries and compute
+accounts may differ. Multiple destination registry accounts require separate
+external profiles until a later managed topology is reviewed.
 
-- API role: metadata reads and intent writes in PostgreSQL, no ECR writes;
-- copy-worker role: ECR read, layer upload, and `PutImage` in the fixed prefix,
-  no manifest deletion or repository administration;
-- lifecycle-worker role: describe and `BatchDeleteImage` for eligible regional
-  cache manifests, no push or repository deletion; and
-- workload role: token and pull operations only.
+The module creates or accepts these non-interchangeable identities:
 
-Repository creation/deletion, registry-policy mutation, IAM, KMS, and account
-administration stay with Terraform. The module may manage an ECR registry V2
-policy only when it is the declared sole owner. Otherwise the profile is
-external and SkyPilot makes no managed-custody claim.
+- API: PostgreSQL metadata and intent only, with no ECR, Service Quotas, KMS, or
+  data-role `sts:AssumeRole` permission;
+- copy worker base: may assume only the exact registry copy role;
+- registry copy role: `GetAuthorizationToken` on the required wildcard resource,
+  source/repository reads, metadata qualification, layer upload, and `PutImage`
+  only for fixed destination repositories, with no deletion or administration;
+- lifecycle worker base: may assume only the exact lifecycle role;
+- lifecycle role: describe all fixed managed repositories and
+  `BatchDeleteImage` only for eligible regional repositories, with no push or
+  repository deletion; and
+- runtime pull principals: the actual EC2 instance-profile role, EKS kubelet
+  node role, Fargate execution role, or declared kubelet credential provider,
+  with token plus repository-scoped pull only.
 
-Negative tests grant a probe principal broad identity permissions and prove the
-resource boundary still rejects writes outside the copy role, deletes outside
-the lifecycle role, and every repository deletion path.
+A pod service account is not treated as the EKS image-pull principal. Generic
+Kubernetes uses a qualified kubelet credential provider or a named
+`imagePullSecret` resolver; non-cloud Docker uses a qualified credential helper.
+Credentials refresh at pull time and are never serialized into a pull plan.
+
+Target-role trust names only the worker base principals and constrains session
+duration, external ID, and catalog/profile session tags. Cross-account repository
+policies grant exact copy or pull principals. Target roles have Terraform-managed
+permissions boundaries, so accidentally broad identity policy on those roles
+cannot escape the fixed repository set. SkyPilot cannot constrain a dedicated
+account administrator; that administrative trust is explicit and all mutations
+are drift-checked and CloudTrail-audited.
+
+Repository creation/deletion, repository policies, IAM, KMS, and account
+administration stay with Terraform. ECR registry V2 replication-policy management
+is not part of v0. With customer-managed encryption, keys are regional and ECR
+owns the required grants; workers receive no direct KMS data permission. The
+default module path uses standard ECR encryption, while optional CMKs add key and
+grant-quota qualification.
 
 ### Terraform deliverables
 
@@ -554,15 +703,39 @@ infra/terraform/modules/aws-image-worker-identity
 infra/terraform/examples/aws-dedicated-skypilot-account
 ```
 
-The distribution module accepts account ID, regions, workspaces, prefix, fixed
-shard count, encryption/scanning settings, quota headroom, and optional existing
-role ARNs. It reads applied repository and images-per-repository quotas when
-permitted; otherwise it requires explicit validated quota inputs and makes the
-readiness check fail until they are supplied. It outputs secret-free profile
-YAML, immutable repository fingerprints and ceilings, repository ARNs, role
-ARNs, and readiness checks. The example composes PostgreSQL/API infrastructure
-already owned by the platform with these modules. It does not duplicate database
-state.
+The distribution module accepts partition, dedicated registry account ID,
+regional provider aliases, catalog authority/realm, declared workspaces, prefix,
+fixed shard count/generation, encryption/scanning settings, quota headroom,
+exact compute pull-principal ARNs, and optional existing worker role ARNs. It
+reads applied repository and images-per-repository quotas when permitted;
+otherwise it requires explicit validated inputs and leaves readiness false.
+
+Its secret-free qualification manifest contains desired config hash, timestamp,
+workspace encoding version, repository fingerprints and ceilings, role and
+permissions-boundary ARNs, repository-policy hashes, applied quotas, KMS/grant
+facts, and Terraform ownership tags. The background worker compares this handoff
+with live provider state before activation. Terraform output alone never claims
+live readiness.
+
+Import/adoption accepts only empty repositories with exact immutable settings
+and ownership tags. Nonempty adoption remains external. Repositories use
+`force_delete = false` and explicit destroy protection. Terraform destroy fails
+while content exists; profile retirement additionally requires the Dashboard to
+show zero dependencies, references, and pull plans. Policies and access bindings
+for an old revision remain configured until that revision drains. The example
+composes PostgreSQL/API infrastructure already owned by the platform and does not
+duplicate database state.
+
+### Why workers, not ECR replication or pull-through cache
+
+ECR replication is push-triggered, preserves repository names, does not backfill
+preexisting images, and is capped at 25 unique destinations. Pull-through cache
+has a bounded upstream set and makes the workload's first pull perform the fill.
+Neither gives SkyPilot per-digest JIT placement, READY-before-deploy, adoption of
+arbitrary existing digests, durable copy recovery, or reference-aware regional
+deletion. V0 therefore uses portable workers and does not configure either AWS
+feature. They remain possible future optimizations behind the same verified
+location contract, never alternative sources of truth.
 
 ## Worker services
 
@@ -590,9 +763,26 @@ an unbounded API response while compaction catches up.
 
 Copy-worker concurrency is bounded by its pod setting and provider throttling.
 Adding replicas increases claim throughput safely because leases and
-`SKIP LOCKED` prevent duplicate authority. Lifecycle workers claim only
-reference-free, noncanonical, managed locations past retention. They inspect
-the exact digest after ambiguous deletion and never delete a repository.
+`SKIP LOCKED` prevent duplicate authority. Before each provider API family, a
+worker acquires from the PostgreSQL account-region token bucket. Applied quota,
+refill rate, and burst are qualification inputs; provider throttles persist one
+shared exponential `blocked_until`, so scaling pods cannot multiply past the
+account limit. ECR's default `PutImage` rate is only 10 per second, and the UI
+reports a quota-bound ETA rather than implying worker replicas can exceed it.
+
+Worker budgets do not pretend to control calls made by remote container
+runtimes. Node pulls use per-node credential reuse plus bounded exponential
+backoff and jitter against qualified pull quotas. A thousand service replicas may
+still cause many node layer downloads; registry locality avoids cross-region
+transfer but does not claim that an OCI registry prewarms each node cache.
+
+The copy worker also owns bounded background profile qualification and shard
+inventory claims. It validates `OciContentGraph` before destination I/O and uses
+separate source-read and destination-write sessions. Lifecycle workers claim only
+reference-free, noncanonical, managed locations past retention, plus provably
+empty failed canonical reservations for counter reclamation. They inspect the
+exact digest after ambiguous deletion and never delete a repository or a READY
+canonical manifest.
 
 Shutdown stops new claims, cancels work that has not started provider I/O, and
 lets leases expire after ambiguous I/O. Restart recovery verifies actual
@@ -625,7 +815,8 @@ bounded, code-valued errors and copyable remediation commands.
 Administrators get a read-only Settings panel showing:
 
 - active secret-free profile revisions and workspace defaults/allowlists;
-- Terraform-produced repository and role readiness;
+- desired versus active revisions, qualification hash/age, repository and role
+  readiness, reconciliation progress, quota backoff, and drift;
 - copy and lifecycle worker healthy/stale counts;
 - queue depth and oldest pending/retry age by profile/target; and
 - capability failures that prevent managed-profile activation.
@@ -634,6 +825,11 @@ V0 deliberately has no browser profile editor. Operators change versioned
 configuration and Terraform through normal GitOps, then use the panel to verify
 convergence. This removes a second configuration transaction system without
 making the feature raw-YAML-only operationally.
+
+Every readiness response is a projection of PostgreSQL state written by bounded
+background work. A Dashboard request never assumes a role, calls STS/KMS/ECR,
+resumes inventory, or refreshes qualification. Stale timestamps are shown as
+stale rather than synchronously repaired.
 
 ### Direct read API
 
@@ -663,13 +859,16 @@ No dashboard read creates a generic request row.
 - Runtime references are digest-pinned.
 - Credential values never enter YAML, PostgreSQL, request rows, logs, command
   arguments, API responses, or dashboard state.
-- Source authentication is a named secret reference resolved only inside the
-  isolated worker. V0 supports only source paths with a qualified implementation.
+- Source authentication is a named access-binding reference resolved only inside
+  the isolated worker. V0 supports only source paths with a qualified resolver.
 - Provider errors are mapped to bounded codes before persistence.
-- API, copy, lifecycle, and workload identities are non-interchangeable.
+- API, copy base/target, lifecycle base/target, and runtime-pull identities are
+  non-interchangeable.
 - Managed deletion is allowed only for noncanonical regional content with no
   live durable reference.
 - External profiles never grant SkyPilot deletion authority.
+- OCI indexes, manifest lists, and artifact manifests fail before destination
+  writes in v0.
 - Workspace authorization is checked before selector lookup to avoid existence
   disclosure.
 
@@ -684,10 +883,12 @@ No dashboard read creates a generic request row.
 3. While old 022 API replicas still serve traffic, confirm they ignore the
    additive 023 tables. Roll every API replica to the new binary, then prove no
    old pod remains before feature activation.
-4. Apply Terraform in a dedicated AWS account or an isolated fixed prefix and
-   pass repository inventory, quota, fingerprint, and IAM readiness checks.
+4. Apply Terraform in one dedicated registry account, import its qualification
+   manifest, and stage the desired profile revision without activating it.
 5. Deploy one copy worker and one lifecycle worker with separate identities.
-6. Activate one profile for one test workspace and publish one digest.
+6. Let background qualification prove repository inventory, settings, quota,
+   KMS, access bindings, runtime pull principals, and fingerprints, then
+   atomically activate one profile for one test workspace.
 7. Verify publish, warming, pull, API/controller restart, retry, capacity
    admission, drift fail-closed behavior, and reference-fenced eviction.
 8. Convert the Boltz L4 test fleet and compare direct cross-region pulls,
@@ -721,6 +922,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   dependency fence.
 - Every physical shard refuses admission at its hard ceiling, and provider drift
   stops new writes before the database can claim additional capacity.
+- No API, placement, or Dashboard read performs registry, STS, KMS, or Terraform
+  I/O.
+- V0 rejects a manifest index before reserving any destination write authority
+  or uploading any child manifest.
 
 ### Required verification
 
@@ -729,11 +934,19 @@ drained and every image table is empty; it is never part of Helm rollback.
   migration-lock, and mixed-022/023 feature-disabled tests;
 - old-server/new-client and new-server/old-client feature-gate tests;
 - AWS integration plus negative IAM tests;
+- EC2 instance, EKS kubelet/Fargate, generic Kubernetes, and non-cloud runtime
+  pull-auth refresh tests;
 - `terraform fmt -check`, `terraform validate`, and plans for one and multiple
   regions with fixed shards;
 - worker kill/restart tests around every provider-I/O boundary;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
+- source/destination account separation, permissions-boundary, repository-policy,
+  KMS grant, protected destroy, empty import, and old-revision drain tests;
+- one-million-row resumable inventory, durable cursor, API token-bucket,
+  throttling, and empty failed-reservation reclamation tests;
+- single-manifest preflight and reject-before-write tests for OCI indexes,
+  manifest lists, and artifact manifests;
 - Jest interaction, pagination, permission, responsive, and stale-state tests;
 - a production Next.js build;
 - repository formatting and focused backend tests; and
@@ -769,3 +982,11 @@ adds the exact cross-repository transaction owner and lock order, complete
 publication convergence matrix, durable warming dependencies, singleton
 migration rollout, hard physical-shard admission, bounded worker and publication
 retention, and the builder handoff correction required by that review.
+
+Round 3 at `bebb29dbbff51783def0dc578cb50181448263b1` returned Codex `RESHAPE`.
+Fable again reported no usage credits, so the round is not paired. This revision
+adds the provider-neutral access and content-graph contracts, selects one
+dedicated-account AWS topology, binds pulls to the actual EC2 or kubelet
+principal, removes registry V2 policy management, defines exact repository
+identity and durable rate-limited reconciliation, rejects indexes before writes,
+and makes Terraform/background qualification a nonblocking durable handoff.
