@@ -154,6 +154,19 @@ current target continues to block or abort retirement as appropriate. This
 prevents one scale-up decision from both launching replacement capacity and
 reactivating a large old fleet while preserving the ready-capacity fence before
 destructive cleanup.
+
+A recovered uncommitted retirement must not proceed to shutdown admission in
+the same load-balancer generation that re-fenced it under the new controller
+epoch. Re-fencing changes durable authority, while the snapshot that authorized
+the write predates that new state. The manager keeps each adopted victim in the
+recovery gate, and off route, until a strictly newer fresh snapshot and matching
+published target arrive. It then releases the victim to the ordinary current
+target, coverage, and idle revalidation path. This one-generation barrier also
+prevents a controller or load-balancer handoff from turning transient occupancy
+uncertainty into a fleet-wide reactivation feedback loop. If no newer evidence
+arrives, the recovery deadline remains diagnostic and the victim stays
+off-route; timeout alone is never route-admission authority.
+
 Unknown-capacity replacement stays tied to the exact decision generation; a
 newer snapshot may narrow or cancel the set but cannot authorize new overlap
 from stale evidence.
@@ -461,6 +474,10 @@ rate to 100, then restore the previous control-plane image if required.
   is removed from the unknown-capacity replacement set.
 - Verify final manager admission and teardown fences count one slot per ready
   old backend, but never count a backend that is already off route.
+- Verify an adopted recovery retirement remains off route for its adoption
+  generation, is released only after a strictly newer matching target and
+  snapshot, and remains off route when the diagnostic recovery deadline expires
+  without newer evidence.
 - Verify in-process updates preserve the rate timestamp and a rebuild never
   jumps directly to the raw target.
 - Verify a demand rebound does not cause scale-down and stale reports cannot
