@@ -104,8 +104,8 @@ here.
 | --- | --- | --- |
 | Artifact | Workspace-scoped immutable OCI digest | catalog repository |
 | Source | Exact digest-pinned OCI reference used to import an artifact | publication service |
-| Publication | Requested adoption and optional release reservation | publication service |
-| Release | Human-readable immutable alias visible only after verification | publication service |
+| Publication | Durable adoption attempt and optional release reservation | publication service |
+| Release | Human-readable immutable alias created only after verification | publication service |
 | Profile | Complete registry topology and policy snapshot | server configuration |
 | Location | One digest in one physical registry target | materialization service |
 | Pull plan | Secret-free, placement-specific READY location snapshot | runtime resolver |
@@ -217,16 +217,17 @@ Publication is independent of workload deployment.
 
 1. Validate a digest-pinned source, release, workspace, and complete active
    profile before persistence.
-2. In one transaction, converge the artifact and source, reserve the release as
-   PENDING, and create or reuse one canonical location intent.
+2. In one transaction, converge the artifact and source, create a durable
+   PENDING publication, reserve its optional release name through a unique
+   publication constraint, and create or reuse one canonical location intent.
 3. A copy worker claims the canonical location with a random fenced lease,
    obtains short-lived credentials, copies the exact digest, and verifies the
    destination digest and OCI platform metadata.
-4. The completion transaction marks the location READY and changes matching
-   PENDING release reservations to READY. Only then can release lookup return
-   the artifact.
-5. A terminal pre-READY copy failure marks the reservation FAILED without
-   exposing the release. Retry returns the same reservation to PENDING.
+4. The completion transaction marks the location and publication READY and
+   inserts the immutable release row when requested. Release lookup therefore
+   cannot observe a pending alias.
+5. A terminal pre-READY copy failure marks the publication FAILED without
+   creating a release. Retry returns the same publication to PENDING.
 
 An existing READY release is immutable. A conflicting digest is rejected. A
 failed replacement never changes another release or any deployment already
@@ -301,6 +302,7 @@ container_image_catalog
 container_image_profile_revisions
 container_images
 container_image_sources
+container_image_publications
 container_image_releases
 container_image_locations
 container_image_references
@@ -316,9 +318,11 @@ Important constraints include:
 
 - unique `(workspace, source_digest)` artifact identity;
 - unique `(workspace, source_ref)` source alias;
-- unique `(workspace, release)` reservation;
-- release state in `PENDING|READY|FAILED`;
-- READY release requires a canonical location ID for the same artifact;
+- unique non-null `(workspace, requested_release)` across retained publications;
+- publication state in `PENDING|READY|FAILED`, with one canonical location and
+  bounded idempotency key/request hash;
+- every release row points to the READY publication and artifact that created
+  it, and no release row exists before that transaction;
 - unique physical location identity for artifact/profile/target/fingerprint;
 - canonical versus regional dependency checks;
 - closed location state and lease combinations;
