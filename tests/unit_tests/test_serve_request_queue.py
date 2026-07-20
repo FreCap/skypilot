@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 import json
+import time
 from typing import Any
 from unittest import mock
 
@@ -944,6 +945,111 @@ def test_queue_prefers_ready_reserved_compatible_card():
         lb._waiting_request_count = 1
         lb._dispatch_request_queue_locked()
         assert getattr(request, '_skyserve_granted_accelerator') == 'A100'
+    finally:
+        loop.close()
+
+
+def test_queue_consumes_reserved_card_preference_once_per_ready_slot():
+    lb = _make_lb(max_concurrency=2)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=2),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._replica_info_by_url = {
+        'l4-paid': {
+            'gpu_type': 'L4',
+            'is_zero_cost': 'false',
+        },
+        'a100-reserved': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'true',
+        },
+        'a100-paid': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(
+        ['l4-paid', 'a100-reserved', 'a100-paid'])
+    loop = asyncio.new_event_loop()
+    try:
+        requests = [_request(), _request()]
+        waiters = {}
+        for sequence, request in enumerate(requests):
+            setattr(request, '_skyserve_compatible_accelerators',
+                    ('L4', 'A100'))
+            waiters[sequence] = load_balancer._RequestQueueWaiter(
+                request, 50, sequence, loop.create_future())
+        lb._request_queue_waiters = {50: waiters}
+        lb._waiting_request_count = 2
+
+        lb._dispatch_request_queue_locked()
+
+        assert getattr(requests[0], '_skyserve_granted_accelerator') == 'A100'
+        assert getattr(requests[1], '_skyserve_granted_accelerator') == 'L4'
+    finally:
+        loop.close()
+
+
+def test_zero_dispatch_capacity_skips_compatibility_matching():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    loop = asyncio.new_event_loop()
+    try:
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', ('A100',))
+        waiter = load_balancer._RequestQueueWaiter(request, 50, 0,
+                                                   loop.create_future())
+        lb._request_queue_waiters = {50: {0: waiter}}
+        lb._waiting_request_count = 1
+        lb._active_request_count = 1
+
+        with mock.patch.object(
+                lb,
+                '_build_request_queue_grant_plan_locked',
+                side_effect=AssertionError('matching should be skipped')):
+            lb._dispatch_request_queue_locked()
+
+        assert not waiter.granted
+        assert lb._waiting_request_count == 1
+    finally:
+        loop.close()
+
+
+def test_dense_compatibility_matching_is_bounded_by_profiles_and_slots():
+    cards = tuple(f'GPU-{index}' for index in range(8))
+    lb = _make_lb(max_concurrency=128, max_size=1000)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=128, max_size=1000),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': list(cards),
+    })
+    loop = asyncio.new_event_loop()
+    try:
+        waiters = {}
+        for sequence in range(500):
+            request = _request()
+            mask = 1 + sequence % 255
+            compatible = tuple(
+                card for index, card in enumerate(cards) if mask & (1 << index))
+            setattr(request, '_skyserve_compatible_accelerators', compatible)
+            waiters[sequence] = load_balancer._RequestQueueWaiter(
+                request, 50, sequence, loop.create_future())
+        lb._request_queue_waiters = {50: waiters}
+        lb._waiting_request_count = len(waiters)
+
+        started = time.monotonic()
+        plan = lb._build_request_queue_grant_plan_locked(
+            {card: 16 for card in cards}, {card: 0 for card in cards}, 128)
+        elapsed = time.monotonic() - started
+
+        assert len(plan) == 128
+        assert elapsed < 2
     finally:
         loop.close()
 

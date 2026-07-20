@@ -67,6 +67,14 @@ Process numeric-priority tiers from highest to lowest. Within one tier, group au
 2. give a scarce ready slot to the compatibility profile whose best non-selected fallback is worse;
 3. preserve FIFO sequence when fallback quality is equal.
 
+The synchronous load-balancer matcher does no work when the global dispatch
+budget is zero. Otherwise it stops after filling the current dispatch budget
+or the exact-card slot snapshot, whichever is smaller. Once one waiter from a
+compatibility profile cannot augment an unchanged matching, later waiters from
+that identical profile are not retried in the same pass. Runtime therefore
+scales with the bounded profile graph and immediately grantable slots, not with
+repeated recursive walks over the full backlog.
+
 Define fallback quality from the same exact-card supply snapshot as an ordered tuple, not from compatibility count:
 
 ```text
@@ -81,6 +89,10 @@ ready reserved/zero-cost alternative
 A ready card is an admission edge only when it is in the waiter's exact compatibility set. Provisioning/reserved/paid alternatives influence which waiter most needs a scarce ready slot, but they do not become routable until ready. A provisioning attempt that exceeds its startup SLA or enters failure stops counting as a healthy fallback and triggers replanning.
 
 Reserved-first is a replica-assignment tie-break after numeric priority, maximum immediate admission, and scarce-card protection. It must not let a flexible request take the only ready reserved A100 from an equal-priority A100-only request when a paid L4 can serve the flexible request. Within an equivalent exact-card assignment, route to a healthy reserved replica with a free concurrency slot before a paid replica; never overload reserved capacity merely to preserve the cost preference.
+
+Reserved preference is consumed per free zero-cost slot while constructing a
+batch. A card with one free reserved slot is preferred for at most one planned
+assignment; subsequent assignments compare its paid slots normally.
 
 Example for equal numeric priority:
 
@@ -232,6 +244,10 @@ Tests:
 - Add deterministic concurrency cases: 1000 same-priority flexible L4/A100/H100 waiters, then an A100-only waiter; the constrained waiter gets the next A100 slot, L4 continues serving flexible work, and no running request is interrupted.
 - Test numeric dominance separately: priority-50 flexible remains ahead of priority-20 A100-only for an A100 slot.
 - Test the crossed two-card case: `{L4,A100}` and `{A100,H100}` use A100/H100 when L4 is unavailable and H100 is ready; with only A100 and equally unavailable alternatives FIFO wins; with paid L4 versus paid H100 fallback, assign A100 to the request avoiding the worse fallback and target the cheaper cold card for the other.
+- Test that a zero dispatch budget bypasses matching, that one reserved slot
+  influences only one assignment in a batch, and that 500 waiters spanning all
+  255 nonempty profiles over eight cards fill 128 slots within a bounded
+  load-balancer event-loop budget.
 - Test compatible replica retry preserves one admission owner and never leaks occupancy; exhaustion fails retryably without widening compatibility.
 
 Acceptance gate:

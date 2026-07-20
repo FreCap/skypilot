@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import heapq
 import json
 import logging
 import os
@@ -1147,16 +1148,20 @@ class SkyServeLoadBalancer:
         self,
         accelerator_slots: dict[str, int],
         zero_cost_slots: dict[str, int],
+        max_grants: int,
     ) -> list[tuple[_RequestQueueWaiter, str]]:
         """Build a maximum-cardinality strict-priority matching plan.
 
         The loop-local closures execute synchronously and never escape their
-        tier iteration. Each priority tier is matched against the remaining
-        exact-card slots. Within a tier, requests with fewer actual ready
-        slots and worse non-ready fallback are processed first; FIFO breaks
-        true ties. The augmenting-path matcher can move an earlier request to
-        another compatible card, but never drops it to admit a later peer.
+        tier iteration. Each priority tier is grouped by its bounded exact-card
+        compatibility profile and matched against the remaining slots. Within
+        a tier, profiles with fewer actual ready slots and worse non-ready
+        fallback are processed first; FIFO merges profiles that truly tie. The
+        augmenting-path matcher can move an earlier request to another
+        compatible card, but never drops it to admit a later peer.
         """
+        if max_grants <= 0:
+            return []
         waiters = self._request_queue_waiters_for_instance()
         remaining = dict(accelerator_slots)
         plan: list[tuple[_RequestQueueWaiter, str]] = []
@@ -1168,22 +1173,38 @@ class SkyServeLoadBalancer:
                 waiter for waiter in waiters[priority].values()
                 if not waiter.abandoned
             ]
+            tier_grant_limit = min(max_grants - len(plan),
+                                   sum(remaining.values()))
+            if tier_grant_limit <= 0:
+                break
 
             def compatible_cards(
                     waiter: _RequestQueueWaiter) -> tuple[str, ...]:
                 compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
                                      None)
-                return (tuple(compatible)
-                        if compatible is not None else tuple(configured))
+                if compatible is None:
+                    return tuple(configured)
+                allowed = set(compatible)
+                return tuple(card for card in configured if card in allowed)
 
-            tier.sort(key=lambda waiter: (
-                sum(
-                    remaining.get(card, 0) for card in compatible_cards(waiter)
-                ),
-                -self._request_queue_fallback_rank_locked(
-                    compatible_cards(waiter), remaining),
-                waiter.sequence,
-            ))
+            # All waiters in a profile have identical matching edges. Keep
+            # FIFO only within the bounded profile set and stop retrying a
+            # profile after one waiter cannot augment the current matching.
+            # This avoids traversing an arbitrarily large backlog after every
+            # ready slot is already assigned.
+            profile_waiters: dict[tuple[str, ...],
+                                  list[_RequestQueueWaiter]] = {}
+            for waiter in tier:
+                profile_waiters.setdefault(compatible_cards(waiter),
+                                           []).append(waiter)
+            profile_heap: list[tuple[int, int, int, tuple[str, ...], int]] = []
+            for compatible, queued in profile_waiters.items():
+                first = queued[0]
+                heapq.heappush(
+                    profile_heap,
+                    (sum(remaining.get(card, 0) for card in compatible),
+                     -self._request_queue_fallback_rank_locked(
+                         compatible, remaining), first.sequence, compatible, 0))
             assignments: dict[int, str] = {}
             assigned_by_card: dict[str, list[_RequestQueueWaiter]] = {
                 card: [] for card in remaining
@@ -1196,7 +1217,8 @@ class SkyServeLoadBalancer:
                 ]
                 return sorted(cards,
                               key=lambda card: (
-                                  0 if zero_cost_slots.get(card, 0) > 0 else 1,
+                                  0 if len(assigned_by_card[card]) <
+                                  zero_cost_slots.get(card, 0) else 1,
                                   card_order.get(card, len(card_order)),
                               ))
 
@@ -1222,7 +1244,7 @@ class SkyServeLoadBalancer:
                     # Move an already-admitted peer to another compatible
                     # card to preserve maximum immediate admissions.
                     for occupant in list(reversed(occupants)):
-                        if assign(occupant, set(seen_cards), set(seen_waiters),
+                        if assign(occupant, seen_cards, seen_waiters,
                                   assigned_by_card, assignments):
                             occupants.remove(occupant)
                             occupants.append(waiter)
@@ -1231,9 +1253,24 @@ class SkyServeLoadBalancer:
                 return False
 
             accepted: list[_RequestQueueWaiter] = []
-            for waiter in tier:
-                if assign(waiter, set(), set(), assigned_by_card, assignments):
-                    accepted.append(waiter)
+            while profile_heap and len(accepted) < tier_grant_limit:
+                _, fallback_rank, _, compatible, index = heapq.heappop(
+                    profile_heap)
+                queued = profile_waiters[compatible]
+                waiter = queued[index]
+                if not assign(waiter, set(), set(), assigned_by_card,
+                              assignments):
+                    # A later waiter from this exact profile has the same
+                    # edges and cannot augment an unchanged matching either.
+                    continue
+                accepted.append(waiter)
+                next_index = index + 1
+                if next_index < len(queued):
+                    heapq.heappush(
+                        profile_heap,
+                        (sum(remaining.get(card, 0) for card in compatible),
+                         fallback_rank, queued[next_index].sequence, compatible,
+                         next_index))
             for waiter in accepted:
                 card = assignments[waiter.sequence]
                 plan.append((waiter, card))
@@ -1430,14 +1467,16 @@ class SkyServeLoadBalancer:
         else:
             dispatch_limit, _ = self._request_queue_limits()
             available = max(0, dispatch_limit - self._current_dispatch_load())
+        if available <= 0:
+            return
         slot_snapshot = (self._request_queue_accelerator_slots_locked()
                          if self._request_queue_config is not None else None)
         accelerator_slots, zero_cost_slots = (slot_snapshot if slot_snapshot
                                               is not None else (None, None))
         if accelerator_slots is not None and zero_cost_slots is not None:
             grant_plan = self._build_request_queue_grant_plan_locked(
-                accelerator_slots, dict(zero_cost_slots))
-            for waiter, accelerator in grant_plan[:available]:
+                accelerator_slots, dict(zero_cost_slots), available)
+            for waiter, accelerator in grant_plan:
                 if not self._remove_request_queue_waiter_locked(waiter):
                     continue
                 setattr(waiter.request, _REQUEST_GRANTED_ACCELERATOR_ATTR,
