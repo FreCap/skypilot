@@ -63,6 +63,10 @@ async def _handle_interactive_auth_websocket(session_id: str) -> None:
 
     stdin_dup_fd = None
     stdout_dup_fd = None
+    stdin_dup_file: typing.BinaryIO | None = None
+    stdout_dup_file: typing.BinaryIO | None = None
+    stdin_transport: asyncio.BaseTransport | None = None
+    stdout_transport: asyncio.BaseTransport | None = None
     try:
         # Duplicate stdin/stdout fds before passing to asyncio.
         # When asyncio's loop.connect_read/write_pipe() is called,
@@ -81,12 +85,15 @@ async def _handle_interactive_auth_websocket(session_id: str) -> None:
             stdin_protocol = asyncio.StreamReaderProtocol(stdin_reader)
             stdin_dup_file = os.fdopen(stdin_dup_fd, 'rb', buffering=0)
             stdin_dup_fd = None  # File object now owns the FD
-            await loop.connect_read_pipe(lambda: stdin_protocol, stdin_dup_file)
+            stdin_transport, _ = await loop.connect_read_pipe(
+                lambda: stdin_protocol, stdin_dup_file)
+            stdin_dup_file = None  # Transport now owns the file object
 
             stdout_dup_file = os.fdopen(stdout_dup_fd, 'wb', buffering=0)
             stdout_dup_fd = None  # File object now owns the FD
             stdout_transport, stdout_protocol = await loop.connect_write_pipe(
                 asyncio.streams.FlowControlMixin, stdout_dup_file)
+            stdout_dup_file = None  # Transport now owns the file object
             stdout_writer = asyncio.StreamWriter(stdout_transport,
                                                  stdout_protocol, None, loop)
 
@@ -118,18 +125,31 @@ async def _handle_interactive_auth_websocket(session_id: str) -> None:
             stdin_task = asyncio.create_task(stdin_to_websocket())
             stdout_task = asyncio.create_task(websocket_to_stdout())
 
-            # Wait for websocket to close (auth complete)
-            await stdout_task
-            # Cancel stdin reader so it doesn't consume the next keystroke
-            stdin_task.cancel()
             try:
-                await stdin_task
-            except asyncio.CancelledError:
-                pass
+                # Wait for websocket to close (auth complete).
+                await stdout_task
+            finally:
+                # Stop both forwarding directions when authentication ends or
+                # the parent coroutine is cancelled. In particular, the stdin
+                # task must not survive and consume later terminal input.
+                stdin_task.cancel()
+                stdout_task.cancel()
+                await asyncio.gather(stdin_task,
+                                     stdout_task,
+                                     return_exceptions=True)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to handle interactive authentication: {e}')
         raise
     finally:
+        # The transports own the duplicated file objects. Closing them stops
+        # background pipe reads before restoring the user's terminal.
+        for transport in (stdin_transport, stdout_transport):
+            if transport is not None:
+                transport.close()
+        for pipe_file in (stdin_dup_file, stdout_dup_file):
+            if pipe_file is not None:
+                pipe_file.close()
+
         # Restore terminal settings if they were changed
         if old_settings:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,

@@ -109,3 +109,172 @@ def test_interactive_auth_websocket_bridge_and_terminal_handling():
                 os.close(fd)
             except OSError:
                 pass
+
+
+def test_interactive_auth_cancellation_cleans_up_forwarders():
+    """Cancelling the bridge must stop both forwarding tasks."""
+    stdin_read, stdin_write = os.pipe()
+    stdout_read, stdout_write = os.pipe()
+
+    async def run_test():
+        read_started = asyncio.Event()
+        created_tasks = []
+        created_transports = []
+
+        class BlockingWebsocket:
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def send(self, data):
+                del data
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                read_started.set()
+                await asyncio.Future()
+
+        mock_ws = BlockingWebsocket()
+        loop = asyncio.get_running_loop()
+        real_create_task = asyncio.create_task
+        real_connect_read_pipe = loop.connect_read_pipe
+        real_connect_write_pipe = loop.connect_write_pipe
+
+        def capture_task(coro):
+            task = real_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        async def capture_read_pipe(*args, **kwargs):
+            result = await real_connect_read_pipe(*args, **kwargs)
+            created_transports.append(result[0])
+            return result
+
+        async def capture_write_pipe(*args, **kwargs):
+            result = await real_connect_write_pipe(*args, **kwargs)
+            created_transports.append(result[0])
+            return result
+
+        stdin_file = os.fdopen(os.dup(stdin_read), 'rb', buffering=0)
+        stdout_file = os.fdopen(os.dup(stdout_write), 'wb', buffering=0)
+        try:
+            with mock.patch('sys.stdin', stdin_file), \
+                 mock.patch('sys.stdout', stdout_file), \
+                 mock.patch(
+                     'sky.client.interactive_utils.websockets.connect',
+                     return_value=mock_ws), \
+                 mock.patch('sky.server.common.get_server_url',
+                            return_value='http://test'), \
+                 mock.patch(
+                     'sky.client.service_account_auth.get_service_account_headers',
+                     return_value={}), \
+                 mock.patch(
+                     'sky.server.common.get_cookie_header_for_url',
+                     return_value={}), \
+                 mock.patch('asyncio.create_task', side_effect=capture_task), \
+                 mock.patch.object(loop,
+                                   'connect_read_pipe',
+                                   side_effect=capture_read_pipe), \
+                 mock.patch.object(loop,
+                                   'connect_write_pipe',
+                                   side_effect=capture_write_pipe):
+                auth_task = real_create_task(
+                    interactive_utils._handle_interactive_auth_websocket(
+                        'test'))
+                await asyncio.wait_for(read_started.wait(), timeout=5)
+                auth_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await auth_task
+                await asyncio.sleep(0)
+
+            assert len(created_tasks) == 2
+            assert all(task.done() for task in created_tasks)
+            assert len(created_transports) == 2
+            assert all(
+                transport.is_closing() for transport in created_transports)
+        finally:
+            for task in created_tasks:
+                task.cancel()
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+            stdin_file.close()
+            stdout_file.close()
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        for fd in (stdin_read, stdin_write, stdout_read, stdout_write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_interactive_auth_pipe_registration_failure_closes_duplicate_fds():
+    """A failed transport setup must not leak either duplicated descriptor."""
+    stdin_read, stdin_write = os.pipe()
+    stdout_read, stdout_write = os.pipe()
+
+    async def run_test():
+        duplicated_fds = []
+        real_dup = os.dup
+
+        def capture_dup(fd):
+            duplicated_fd = real_dup(fd)
+            duplicated_fds.append(duplicated_fd)
+            return duplicated_fd
+
+        class MockWebsocket:
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                del args
+
+        stdin_file = os.fdopen(real_dup(stdin_read), 'rb', buffering=0)
+        stdout_file = os.fdopen(real_dup(stdout_write), 'wb', buffering=0)
+        loop = asyncio.get_running_loop()
+        try:
+            with mock.patch('sys.stdin', stdin_file), \
+                 mock.patch('sys.stdout', stdout_file), \
+                 mock.patch('os.dup', side_effect=capture_dup), \
+                 mock.patch(
+                     'sky.client.interactive_utils.websockets.connect',
+                     return_value=MockWebsocket()), \
+                 mock.patch('sky.server.common.get_server_url',
+                            return_value='http://test'), \
+                 mock.patch(
+                     'sky.client.service_account_auth.get_service_account_headers',
+                     return_value={}), \
+                 mock.patch(
+                     'sky.server.common.get_cookie_header_for_url',
+                     return_value={}), \
+                 mock.patch.object(
+                     loop,
+                     'connect_read_pipe',
+                     side_effect=RuntimeError('pipe registration failed')), \
+                 pytest.raises(RuntimeError, match='pipe registration failed'):
+                await interactive_utils._handle_interactive_auth_websocket(
+                    'test')
+
+            assert len(duplicated_fds) == 2
+            for fd in duplicated_fds:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+        finally:
+            stdin_file.close()
+            stdout_file.close()
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        for fd in (stdin_read, stdin_write, stdout_read, stdout_write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
