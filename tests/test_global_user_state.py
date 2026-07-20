@@ -111,6 +111,18 @@ def test_get_glob_cluster_names_postgres_branch_or_combines_similar_to(
     assert compiled.count('SIMILAR TO') == len(patterns)
 
 
+def test_get_cluster_yaml_str_multiple_preserves_duplicate_inputs(
+        _mock_db_conn):
+    """Batched YAML reads must stay positionally aligned with their inputs."""
+    yaml_str = 'provider:\n  module: sky.clouds.aws\n'
+    global_user_state.set_cluster_yaml('duplicate', yaml_str)
+
+    result = global_user_state.get_cluster_yaml_str_multiple(
+        ['/first/duplicate.yml', '/second/duplicate.yml'])
+
+    assert result == [yaml_str, yaml_str]
+
+
 @pytest.mark.skipif(sys.platform != 'linux', reason='Only test in CI.')
 def test_enabled_clouds_empty():
     # In test environment, no cloud should be enabled.

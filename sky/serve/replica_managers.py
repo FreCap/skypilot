@@ -5640,8 +5640,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
                 yaml_paths)
             provider_configs = {
-                replica_id: config['provider']
-                for replica_id, config in zip(yaml_replica_ids, yaml_configs)
+                replica_id: config['provider'] for replica_id, config in zip(
+                    yaml_replica_ids, yaml_configs, strict=True)
             }
 
         urls: dict[int, str | None] = {}
