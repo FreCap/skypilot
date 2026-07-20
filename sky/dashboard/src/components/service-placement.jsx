@@ -545,7 +545,7 @@ function outcomeTone(outcome) {
   return 'error';
 }
 
-function HistoryCard({ history, loadingMore, onLoadMore }) {
+function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
   const [expanded, setExpanded] = useState(new Set());
   const toggle = (eventId) => {
     setExpanded((current) => {
@@ -651,7 +651,7 @@ function HistoryCard({ history, loadingMore, onLoadMore }) {
           <button
             type="button"
             onClick={onLoadMore}
-            disabled={loadingMore}
+            disabled={requestPending}
             className="text-sm font-medium text-sky-blue hover:text-sky-blue-bright disabled:text-gray-400"
           >
             {loadingMore ? 'Loading…' : 'Load older decisions'}
@@ -664,10 +664,12 @@ function HistoryCard({ history, loadingMore, onLoadMore }) {
 
 export function ServicePlacement({ serviceName }) {
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [pendingAction, setPendingAction] = useState('refresh');
   const [error, setError] = useState(null);
   const requestVersionRef = useRef(0);
+  const loading = pendingAction === 'refresh';
+  const loadingMore = pendingAction === 'append';
+  const requestPending = pendingAction !== null;
 
   const fetchData = useCallback(
     async ({ cursor = null, append = false } = {}) => {
@@ -676,7 +678,7 @@ export function ServicePlacement({ serviceName }) {
       requestVersionRef.current = requestVersion;
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
-      append ? setLoadingMore(true) : setLoading(true);
+      setPendingAction(append ? 'append' : 'refresh');
       setError(null);
       try {
         const next = await getServicePlacement({ serviceName, cursor });
@@ -700,8 +702,7 @@ export function ServicePlacement({ serviceName }) {
         );
       } finally {
         if (isCurrentRequest()) {
-          setLoading(false);
-          setLoadingMore(false);
+          setPendingAction(null);
         }
       }
     },
@@ -711,7 +712,7 @@ export function ServicePlacement({ serviceName }) {
   useEffect(() => {
     setData(null);
     setError(null);
-    setLoading(true);
+    setPendingAction('refresh');
     fetchData();
     return () => {
       requestVersionRef.current += 1;
@@ -744,7 +745,7 @@ export function ServicePlacement({ serviceName }) {
         <button
           type="button"
           onClick={() => fetchData()}
-          disabled={loading}
+          disabled={requestPending}
           className="inline-flex items-center text-sm font-medium text-sky-blue hover:text-sky-blue-bright disabled:text-gray-400"
         >
           <RotateCwIcon className="mr-1.5 h-4 w-4" />
@@ -757,6 +758,7 @@ export function ServicePlacement({ serviceName }) {
       <HistoryCard
         history={data.history}
         loadingMore={loadingMore}
+        requestPending={requestPending}
         onLoadMore={() =>
           fetchData({ cursor: data.history.nextCursor, append: true })
         }

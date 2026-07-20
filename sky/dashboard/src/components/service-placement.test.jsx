@@ -26,10 +26,12 @@ jest.mock('@/data/connectors/services', () => ({
 
 function deferred() {
   let resolve;
-  const promise = new Promise((promiseResolve) => {
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
     resolve = promiseResolve;
+    reject = promiseReject;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 const placement = {
@@ -366,4 +368,104 @@ it('loads older decisions with the opaque cursor and appends them', async () => 
     serviceName: 'svc',
     cursor: 'older-cursor',
   });
+});
+
+it('keeps refresh from superseding an in-flight history page', async () => {
+  const older = deferred();
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      history: {
+        ...placement.history,
+        nextCursor: 'older-cursor',
+      },
+    })
+    .mockImplementationOnce(() => older.promise);
+
+  render(<ServicePlacement serviceName="svc" />);
+  const loadOlder = await screen.findByRole('button', {
+    name: 'Load older decisions',
+  });
+  fireEvent.click(loadOlder);
+
+  const refresh = screen.getByRole('button', { name: 'Refresh' });
+  expect(refresh).toBeDisabled();
+  fireEvent.click(refresh);
+  expect(getServicePlacement).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    older.resolve({
+      ...placement,
+      history: { ...placement.history, nextCursor: null },
+    });
+    await older.promise;
+  });
+  expect(refresh).toBeEnabled();
+});
+
+it('keeps history pagination from superseding an in-flight refresh', async () => {
+  const refresh = deferred();
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      history: {
+        ...placement.history,
+        nextCursor: 'older-cursor',
+      },
+    })
+    .mockImplementationOnce(() => refresh.promise);
+
+  render(<ServicePlacement serviceName="svc" />);
+  const loadOlder = await screen.findByRole('button', {
+    name: 'Load older decisions',
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+  expect(loadOlder).toBeDisabled();
+  fireEvent.click(loadOlder);
+  expect(getServicePlacement).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    refresh.resolve({
+      ...placement,
+      history: { ...placement.history, nextCursor: 'older-cursor' },
+    });
+    await refresh.promise;
+  });
+  expect(loadOlder).toBeEnabled();
+});
+
+it('releases both controls after a placement request fails', async () => {
+  const refresh = deferred();
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      history: {
+        ...placement.history,
+        nextCursor: 'older-cursor',
+      },
+    })
+    .mockImplementationOnce(() => refresh.promise);
+
+  render(<ServicePlacement serviceName="svc" />);
+  const loadOlder = await screen.findByRole('button', {
+    name: 'Load older decisions',
+  });
+  const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+  fireEvent.click(refreshButton);
+
+  await act(async () => {
+    refresh.reject(new Error('transient failure'));
+    try {
+      await refresh.promise;
+    } catch (_) {
+      // The component owns and renders this expected failure.
+    }
+  });
+
+  expect(
+    await screen.findByText('Failed to load placement data.')
+  ).toBeTruthy();
+  expect(refreshButton).toBeEnabled();
+  expect(loadOlder).toBeEnabled();
 });
