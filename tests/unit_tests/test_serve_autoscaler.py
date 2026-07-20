@@ -1141,6 +1141,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     def _replica(self, replica_id, card, *, ready=True, zero_cost=False):
         info = mock.Mock()
         info.replica_id = replica_id
+        info.cluster_name = f'svc-{replica_id}'
         info.version = 1
         info.is_terminal = False
         info.is_ready = ready

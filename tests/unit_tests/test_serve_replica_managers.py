@@ -145,7 +145,7 @@ run: echo hi
         # must load resources around the persisted physical spec rather than
         # applying today's hidden default to historical state.
         with pytest.raises(ValueError,
-                           match='target_concurrency_per_replica: 1'):
+                           match='graceful_drain_async_occupancy: true'):
             replica_managers.task_lib.Task.from_yaml_str(legacy_yaml)
 
         persisted_spec = mock.MagicMock()
