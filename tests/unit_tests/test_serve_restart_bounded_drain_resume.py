@@ -1,10 +1,39 @@
 """Adversarial probes for PR #699: bounded precommit drains across restart."""
 # pylint: disable=protected-access
+import threading
 from unittest import mock
 
 from sky.serve import replica_managers
 from sky.utils import common_utils
-from tests.unit_tests.test_serve_replica_managers import _make_manager
+
+
+def _make_manager(service_name='svc', next_replica_id=1):
+    """Bare SkyPilotReplicaManager skipping the heavy __init__ (mirrors the
+    helper in test_serve_replica_managers.py, which CI cannot import across
+    test modules)."""
+    mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
+    mgr.lock = threading.RLock()
+    mgr._service_name = service_name
+    mgr._next_replica_id = next_replica_id
+    mgr.latest_version = 1
+    mgr.yaml_content = 'resources: {}'
+    mgr._launch_thread_pool = {}
+    mgr._down_thread_pool = {}
+    mgr._failed_cleanup_retry_attempts = {}
+    mgr._failed_cleanup_retry_at = {}
+    mgr._tick_version_spec_cache = {}
+    mgr._spot_placer = None
+    mgr._pending_version = None
+    mgr._uses_logical_replicas = False
+    mgr._logical_reconcile_snapshot = None
+    mgr._logical_target = None
+    mgr._logical_state_lock = threading.RLock()
+    mgr._logical_controller_epoch = 'test-controller-epoch'
+    mgr._wait_for_idle_trackers = {}
+    mgr._recovering_logical_retirement_ids = set()
+    mgr._logical_retirement_recovery_deadline = None
+    mgr._logical_retirement_reactivation_generation = None
+    return mgr
 
 
 def _bounded_precommit_info(replica_id=1, epoch='old-epoch'):
