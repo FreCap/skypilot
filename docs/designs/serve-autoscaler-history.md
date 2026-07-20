@@ -135,6 +135,29 @@ do not count as healthy or unhealthy.
   a rolling upgrade. An old dashboard ignores the additional response fields.
 - Cleanup runs with the existing hourly history retention pass.
 
+## Simulation use and known gaps
+
+The history is the SkyServe side of the reproducible input bundle defined by
+the [autoscaling simulation runbook](serve-autoscaling-simulation.md). It
+provides request and rejection buckets, actual targets, ready and provisioning
+capacity, controller/version transitions, and aggregate pressure. Those fields
+are sufficient to calibrate an aggregate replay and to detect a simulator that
+does not resemble the real controller.
+
+It is not a complete request-level trace. In particular, it does not persist
+request duration, priority, queue wait, stable job identity, retry lineage, or
+historical free GPU supply. Simulations that evaluate priority patience or
+provider spill must join privacy-safe request facts from the caller and
+capacity observations from the relevant infrastructure telemetry. If those
+inputs are unavailable, the simulation must report sensitivity ranges and
+must not present one assumed mix as observed production behavior.
+
+The 72-hour retention also makes the export itself part of incident response.
+Capture the immutable bundle before the relevant window expires. Store the
+SkyPilot commit, service hash, service version, sanitized policy, trace bounds,
+and source provenance with the export so a later replay cannot silently use a
+different implementation or service incarnation.
+
 ## Alternatives considered
 
 Adding the target to request rows was rejected because idle minutes have no

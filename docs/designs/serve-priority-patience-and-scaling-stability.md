@@ -1,5 +1,21 @@
 # Priority-aware queue patience and stable SkyServe scaling
 
+## Status
+
+Implemented and deployed on 2026-07-20. Exact feature commit
+`332a3ed64266708c51bf87378a632755f93ff13d` received a Fable `PURSUE` verdict,
+then merged as commit `ac0ade92d558fb5ee1fe421665318785c9b1ed1c` and was
+released as SkyPilot `1.1.575`. The production `boltz-l4-fleet` policy was
+applied as service version 36 with the 600/60-second priority thresholds,
+normal and adaptive scale-up waves, five-minute downscale delay, and
+independent 50 percent downscale limits described below.
+
+The numerical production policy is an initial operating point, not a permanent
+default recommendation for every service. Future tuning must follow the
+[SkyServe autoscaling simulation runbook](serve-autoscaling-simulation.md) and
+compare a candidate against the exact live baseline on held-out traffic and
+supply traces.
+
 ## Problem
 
 SkyServe already supports strict request priority, concurrency-native logical
@@ -330,6 +346,25 @@ Autoscaler status exposes:
 These values flow through the existing Serve status surface. Minute history
 keeps its existing aggregate schema in this change. Persisting priority maps
 would create high-cardinality product policy and is deliberately deferred.
+
+## Data-driven tuning requirement
+
+A dashboard screenshot or one burst is evidence for an investigation, not a
+sufficient basis for changing a policy. Any later change to queue patience,
+utilization, expected duration, minimum capacity, scale-up waves, downscale
+hysteresis, or downscale limits must use the simulation runbook linked above.
+
+The comparison must include the currently deployed policy unchanged, use the
+same request and capacity traces for every candidate, model launch delay and
+failure, and report results by priority. When request priority, duration, or
+historical cluster supply is unavailable, the report must label the missing
+input and sweep a bounded range instead of substituting one silent guess.
+
+The simulator is not a proof of production behavior. Before a policy is
+adopted, its baseline replay must be calibrated against observed targets,
+ready and provisioning capacity, queue depth, and rejections. A candidate that
+only wins under an uncalibrated or optimistic model is not eligible for
+rollout.
 
 ## Alternatives considered
 
