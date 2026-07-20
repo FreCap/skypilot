@@ -23,7 +23,8 @@ estimated hourly cost long after their provider resources are gone.
   autoscaler hysteresis.
 - Label `capacity_target` as the traffic or reservation target because it is
   their maximum.
-- Label `total_capacity` as non-failed capacity, including stopping rows.
+- Label `total_capacity` as non-failed tracked capacity, including stopping and
+  preempted rows.
 - Describe detail-card denominators as ready versus non-failed capacity and
   failed counts as history.
 - Estimate cost only for rows with plausible current provider billability:

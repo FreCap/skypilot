@@ -172,7 +172,7 @@ describe('RequestHistoryCard semantics', () => {
       screen.getByText(/Traffic target includes autoscaler hysteresis/)
     ).toBeTruthy();
     expect(screen.getByTestId('history-series').textContent).toContain(
-      'Traffic target (with hysteresis)|Traffic or reservation target|Ready capacity|Provisioning capacity|Non-failed capacity (incl. stopping)'
+      'Traffic target (with hysteresis)|Traffic or reservation target|Ready capacity|Provisioning capacity|Non-failed tracked capacity'
     );
     expect(
       screen.getByText('Peak traffic target (with hysteresis)')

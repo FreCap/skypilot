@@ -243,7 +243,7 @@ export function RequestHistoryCard({
               [2, 3]
             ),
             capacityLine(
-              'Non-failed capacity (incl. stopping)',
+              'Non-failed tracked capacity',
               view.totalCapacities,
               'rgb(100, 116, 139)',
               [1, 3]
@@ -321,8 +321,8 @@ export function RequestHistoryCard({
           <div className="text-sm text-gray-500">
             Traffic target includes autoscaler hysteresis. Traffic or
             reservation target is the larger of traffic and reserved-capacity
-            fill. Non-failed capacity includes stopping rows until cleanup
-            finishes
+            fill. Non-failed tracked capacity includes stopping and preempted
+            rows until cleanup finishes
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
