@@ -427,13 +427,19 @@ different digest-matching registry reference and thereby bypass the physical
 destination fingerprint, and rotating a failed import to an equivalent mirror
 cannot rename existing canonical or regional content.
 
-Changing a manager identity, pull-auth strategy, or ownership boundary does not
-create a new artifact or physical location. It transfers an explicit policy
-revision onto the same verified bytes while no operation owns the row. Changing
-the canonical registry authority, complete repository-generation prefix, realm
-generation, shard policy, or rendered workspace namespace creates a new
-physical location so old
-and new routes can coexist during migration.
+Changing a manager identity or pull-auth strategy within one ownership kind does
+not create a new artifact or physical location. It transfers an explicit policy
+revision onto the same verified bytes only while no copy, verify, build,
+eviction, purge, or retirement operation owns the row. Existing durable
+consumers keep the stable location ID and their persisted plan; new launches and
+restarts resolve the new policy. Ownership kind is physical custody, not a
+mutable policy label. Changing `EXTERNAL` to `MANAGED` or `MANAGED` to
+`EXTERNAL` always creates
+a disjoint realm generation, repository-generation prefix, target custody, and
+physical location. Changing the canonical registry authority, complete
+repository-generation prefix, realm generation, shard policy, or rendered
+workspace namespace likewise creates a new physical location so old and new
+routes can coexist during migration.
 
 The following is the target module split created by this PR, not a claim about
 the branch's current file tree. The foundation currently has `state.py`,
@@ -753,8 +759,11 @@ active profile revisions and can include retained historical rows. Location rows
 expose distribution, target,
 canonical status, policy revision, state, attempts, next retry, last
 verification, last use, immutable reference, digest, and closed diagnostic
-code. Fingerprints are available behind a diagnostic disclosure, not used as
-primary labels.
+code. Historical rows additionally show policy-transfer or physical-retirement
+kind, rollback-grace deadline, regional/canonical progress, external
+acknowledgement requirement, retained custody revision, and whether quota has
+been released. Fingerprints are available behind a diagnostic disclosure, not
+used as primary labels.
 
 Authorized workspace users can open dialogs for the existing safe operations:
 
@@ -794,7 +803,11 @@ profile, target, Kubernetes/VM binding, and workspace policy field; credential
 references are selected by name and secret values are never fetched. The editor
 shows the normalized secret-free diff/fingerprint, requires an explicit
 monotonic revision on semantic changes, validates endpoint/locality ambiguity
-and quota feasibility server-side, and applies through the managed-image
+and quota feasibility server-side, and explicitly labels whether the change is
+an in-place policy transfer or a new physical generation. For the latter it
+shows the disjoint prefix, rollback grace, pending custody/retirement counts,
+blocked references or leases, and closed operator runbook without blocking the
+config apply on background cleanup. It applies through the managed-image
 compare-and-swap activation transaction described below. The raw Settings
 editor invokes that same transaction whenever its diff touches an image
 section. It offers YAML preview/export for GitOps users. It does
@@ -949,6 +962,7 @@ container_registries:
       realm_generation: 1
       repository_shards: 16
       namespace_root: skypilot/boltz
+      retirement_grace_hours: 24
       canonical:
         provider: aws
         account: "699..."
@@ -1007,7 +1021,7 @@ workspaces:
       max_lifetime_publication_generations: 4000000
       max_publication_records: 2000000
       max_location_records: 5000000
-      max_locations_per_artifact: 128
+      max_retained_locations_per_artifact: 512
       max_materialized_bytes: null  # null disables the optional byte budget
       max_user_retry_generations_per_location: 3
 ```
@@ -1020,6 +1034,10 @@ immutable names cannot consume an impossible record budget. The per-artifact
 lifetime setting is capped at 256 by the parser and database check. Lower
 operational limits use release/retained-record quotas, not an internally
 contradictory lifetime ceiling.
+`retirement_grace_hours` is bounded from 1 through 168, defaults to 24 when
+omitted, and never makes activation wait for grace or cleanup.
+`max_retained_locations_per_artifact` is bounded from 256 through the database
+hard maximum 512. The separate profile target ceiling remains 128.
 
 Defaults mean models do not repeat registry choices. A task-level
 `distribution` is an override within the workspace allowlist, not a credential
@@ -1053,18 +1071,23 @@ requires equal canonical authority and generation prefix followed by equal
 workspace and stored shard index. Changing one tuple member cannot render the
 same path, and a longer configured root cannot absorb the fixed suffix.
 
-More than one profile may reference the same capacity realm only when every
-canonical `(registry authority, repository-generation prefix)` is disjoint.
-Activation rejects overlap with every active profile and every retained
-ACTIVE, DRAINING, or RETIRED target custody/realm generation, even when provider
-adapters, endpoint/base-path splits, or account metadata differ, because
-historical purge authority must not race newly assigned bytes. For each bounded
+More than one distribution may reference one capacity realm only when every
+canonical `(registry authority, repository-generation prefix)` is disjoint. A
+policy-only revision of the same distribution may reference its exact existing
+realm-generation row only when authority, complete prefix, shard policy,
+renderer, and ownership kind are identical; this is POLICY_TRANSFER, not a new
+reservation. Activation rejects every new physical generation whose prefix
+overlaps an ACTIVE, DRAINING, or RETIRED target custody/realm generation, even
+when provider adapters, endpoint/base-path splits, or account metadata differ,
+because historical purge or retirement authority must not race newly assigned
+bytes. For each bounded
 submitted target, the activation transaction performs one exact indexed
 reservation lookup/insert under sorted realm locks. The database unique key
 makes concurrent activations converge or conflict without scanning historical
 custody or using a stale preflight. It never enumerates workspaces because the
 universal suffix is injective. A RETIRED prefix becomes reusable only after no
-location, DELETE_UNKNOWN outcome, manifest audit record, or purge lease remains
+location, DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN outcome, manifest audit
+record, or purge/retirement lease remains
 and its reservation has been explicitly compacted. The canonical authority,
 complete repository-generation prefix, and immutable shard policy are always
 part of destination identity even if adapter metadata happens to repeat.
@@ -1084,8 +1107,20 @@ managed AWS and `gcp-external` for externally provisioned GAR. A future
 target-scoped ownership model would require target-scoped manager generations
 and is not implied by this schema.
 
-The image configuration admits at most 256 distributions and 128 targets per
-distribution. Validation rejects a larger proposal before the apply transaction.
+Ownership kind is immutable for a realm generation, target custody, and
+location. An ownership-kind change is admitted only as a new physical
+generation. In particular, external bytes are never relabeled managed: the new
+managed generation must pass the same empty-prefix and exclusive-writer gate as
+every other managed generation, then copy or adopt content into its newly
+reserved locations. A managed-to-external transition similarly uses a new
+externally controlled prefix while SkyPilot retains the old managed custody and
+guard until historical retirement completes. Only identity, pull-auth, and
+other policy rotation within one unchanged ownership kind can reuse physical
+bytes.
+
+The image configuration admits at most 256 distributions and 128 total targets
+per distribution, counting the canonical target plus every regional target.
+Validation rejects a larger proposal before the apply transaction.
 Consequently replacing the whole image section advances at most 256 global head
 rows, independent of the number of workspaces or artifacts.
 
@@ -1131,27 +1166,56 @@ increment it. The complete revision fingerprint includes all of those fields.
 one global active revision and fingerprint per distribution. A profile edit is
 therefore constant-work regardless of workspace count; workspace policy and
 realm allocation remain separate rows and are checked at admission.
-`container_image_profile_revisions` retains every
-accepted secret-free normalized revision, and
+`container_image_profile_revisions` retains every accepted secret-free
+normalized revision plus its checked total target count from 1 through 128, and
 `container_image_target_custodies` retains each revision/target's provider,
 account/project, endpoint policy metadata, provider-neutral canonical registry
 authority/repository-generation prefix, physical root fingerprint, ownership
 kind/tags, immutable registry-guard generation and normalized contract digest,
 versioned manager-credential reference/principal fingerprint,
-distinct nullable versioned purge-credential reference/principal fingerprint,
-and `ACTIVE|DRAINING|RETIRED` custody state.
+and distinct nullable versioned purge-credential reference/principal
+fingerprint. Those contract fields are immutable. Its mutable operational fields
+are closed `transition_kind NONE|POLICY_TRANSFER|PHYSICAL_RETIREMENT`,
+`custody_state ACTIVE|DRAINING|RETIRED`, nonnegative `open_location_count`,
+monotonic `retirement_generation`, nonnegative
+`retirement_enrolled_count`, nullable `retire_not_before`, a durable
+`retirement_scan_after_location_id` keyset cursor, `retirement_next_scan_at`, and
+a nonnegative `retirement_scan_attempt_count` plus closed error code and fenced
+scan lease owner/token/expiry triple. `POLICY_TRANSFER` means the same
+physical root and ownership kind may move exact operation-lease-free rows to the
+new revision without deletion while preserving durable references on the stable
+location ID. `PHYSICAL_RETIREMENT` means old bytes must be
+retired under this custody before its root reservation can be compacted.
+Physical retirement uses a validated profile-level grace that defaults to 24
+hours and is bounded from one hour through seven days. Activation sets
+`retire_not_before` from database time and commits without waiting for it.
 Its `(id, ownership_kind)` pair is unique for the location composite foreign
-key.
+key. Location insert increments `open_location_count` in the same transaction;
+policy transfer moves one count between exact custodies; location compaction
+decrements it once. A custody cannot become RETIRED while the counter is
+nonzero, and a bounded repair counts the custody-prefixed location index under
+that custody lock.
+Named checks require ACTIVE with transition NONE and no scan lease; DRAINING
+POLICY_TRANSFER with null grace and non-null next-scan time; DRAINING
+PHYSICAL_RETIREMENT with a positive generation and non-null grace/next-scan
+time; either DRAINING kind with an all-null or structurally complete scan lease;
+and RETIRED with zero open locations and no scan lease. Activation of
+PHYSICAL_RETIREMENT increments the generation and resets enrolled count to zero;
+the first and each later enrollment increment the count under the custody lock.
+A custody retry generation is monotonic and an attempt reset is accepted only
+through its fenced admin mutation.
 Secrets remain in the configured secret provider. A credential reference may
-be retired only after every location, delete-unknown row, and audit-retained
-manifest owned by that custody is settled. Managed custody snapshots require a
-purge identity whenever canonical purge is enabled; external custody requires
-it to be null. Activation resolves each symbolic config name to an immutable
+be retired only after every location, delete-unknown or
+retire-delete-unknown row, and audit-retained manifest owned by that custody is
+settled. Every production managed custody snapshot requires a distinct purge
+identity because superseded physical generations include canonical manifests;
+artifact purge remains a separately authorized admin operation. External
+custody requires the purge identity to be null. Activation resolves each symbolic config name to an immutable
 secret-provider generation and expected cloud principal; config-name reuse
-cannot retarget historical custody. Purge uses the location's historical purge
-generation, repair uses its historical manager generation, and each verifies
-the expected caller principal before provider I/O. Neither substitutes current
-profile credentials.
+cannot retarget historical custody. Artifact purge and physical retirement use
+the location's historical purge credential generation, availability repair uses
+its historical manager generation, and each verifies the expected caller
+principal before provider I/O. Neither substitutes current profile credentials.
 
 An older API or worker replica cannot roll the policy back, and two different
 configurations cannot claim the same revision. Advancing a revision never waits
@@ -1161,7 +1225,8 @@ COPY, EXTERNAL_VERIFY, ordinary EVICT, and READY VERIFY leases. Migration 023
 creates one activation-only partial index for each kind, keyed
 `(distribution, profile_revision, lease_expires_at, id)`. Their literal
 predicates require the kind's structurally complete lease and
-`purge_generation = 0`, but deliberately contain no `attempt_count` predicate;
+`purge_generation = 0 AND retirement_generation = 0`, but deliberately contain
+no `attempt_count` predicate;
 the query adds the half-open `lease_expires_at > :locked_now` bound. Migration
 024 adds the fifth exact index/probe for a live BUILD_OUTPUT location lease,
 also without an attempt cap. A hit aborts the whole config apply immediately
@@ -1170,10 +1235,11 @@ the owning worker commits or the lease expires. Thus a live twentieth claim is
 visible even though its future expired-reclaim path requires operator action.
 Because every new claim needs the already-held catalog/profile fence, no lease
 can appear between the locked probes and head update. Historical
-PURGE_DELETE/PURGE_INSPECT leases deliberately use retained custody and do not
-require an active head. There is no persistent draining state or in-transaction
-polling in v0. Keeping the activation kinds separate lets PostgreSQL use exact
-partial indexes instead of scanning an OR-shaped profile predicate. The four
+PURGE_DELETE/PURGE_INSPECT and RETIRE_DELETE/RETIRE_INSPECT leases deliberately
+use retained custody and do not require an active head. Persistent DRAINING is a
+bounded background workset, never in-transaction polling. Keeping the activation
+kinds separate lets PostgreSQL use exact partial indexes instead of scanning an
+OR-shaped profile predicate. The four
 migration-023 names are `ix_ci_loc_activate_copy`,
 `ix_ci_loc_activate_external_verify`, `ix_ci_loc_activate_evict`, and
 `ix_ci_loc_activate_verify`; migration 024 adds
@@ -1181,34 +1247,54 @@ migration-023 names are `ix_ci_loc_activate_copy`,
 
 | Activation index | Literal predicate |
 | --- | --- |
-| COPY | `ownership_kind = 'MANAGED' AND purge_generation = 0 AND state = 'COPYING' AND lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| EXTERNAL_VERIFY | `ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND state = 'VERIFYING' AND lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| EVICT | `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation = 0 AND state = 'EVICTING' AND lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| VERIFY | `purge_generation = 0 AND state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
-| BUILD_OUTPUT, migration 024 | `ownership_kind = 'MANAGED' AND canonical IS TRUE AND purge_generation = 0 AND origin_kind = 'BUILD' AND state = 'COPYING' AND lease_kind = 'BUILD_OUTPUT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| COPY | `ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0 AND state = 'COPYING' AND lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| EXTERNAL_VERIFY | `ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0 AND state = 'VERIFYING' AND lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| EVICT | `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation = 0 AND retirement_generation = 0 AND state = 'EVICTING' AND lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| VERIFY | `purge_generation = 0 AND retirement_generation = 0 AND state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| BUILD_OUTPUT, migration 024 | `ownership_kind = 'MANAGED' AND canonical IS TRUE AND purge_generation = 0 AND retirement_generation = 0 AND origin_kind = 'BUILD' AND state = 'COPYING' AND lease_kind = 'BUILD_OUTPUT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
 
 No predicate contains `attempt_count`, `next_retry_at`, or a database clock.
 Each probe binds the exact old active revision and adds
-`lease_expires_at > :locked_now`. Activation inserts
-the immutable revision/custody snapshot and changes only the head authority row.
-It never rewrites the dominant profile
-location population. Old rows become ineligible immediately through the head
-join and are
-transferred lazily, one locked physical location at a time, when the new policy
-touches them. At that exact-row boundary, uncertain `COPYING` with an ordinary
-COPY lease becomes retryable FAILED, uncertain `EVICTING` with an ordinary
-EVICT lease conservatively becomes MISSING, and inactive or
-semantically impossible ownership is cleared without consulting the canonical
-manifest. EXTERNAL_VERIFY, BUILD_OUTPUT, PURGE_DELETE, and PURGE_INSPECT are
-settled only by their owning state machines. Expiry is half-open: a lease is owned only while
-`expires_at > now`, and is reclaimable at `expires_at <= now`. Only a
-structurally complete lease on `COPYING`, `EVICTING`, or a requested READY
-verification counts as active, and the database constraint rejects a complete
-lease on any other state. A lost canonical manifest or exact-second late worker
+`lease_expires_at > :locked_now`. Activation inserts the immutable
+revision/custody snapshot, changes only the head authority row, and marks at most
+the profile's 128 superseded target custodies DRAINING with the appropriate
+transition kind. PHYSICAL_RETIREMENT increments each affected custody's
+retirement generation exactly once and resets its enrolled count;
+POLICY_TRANSFER does not change either value. It never
+rewrites the dominant location population. Old rows
+become unavailable immediately through the head join. A bounded
+historical-generation reconciler later scans each DRAINING custody by its durable
+location-ID cursor. For `POLICY_TRANSFER`, it transfers one exact row only while
+no materialization, verification, build-publication, eviction, purge, or
+retirement operation owns it; durable consumer references remain attached to
+the stable row. For `PHYSICAL_RETIREMENT`, activation has incremented the
+custody's positive retirement generation and the reconciler enrolls
+the exact row into the disjoint retirement state machine after rollback grace
+and reference fences pass. Every complete ordinary lease encountered after
+activation is necessarily expired. Under the exact row lock, the historical
+reconciler turns uncertain COPY into retryable FAILED, uncertain EVICT into
+MISSING, an expired READY VERIFY into READY with a deferred request, and expired
+EXTERNAL_VERIFY into AWAITING_EXTERNAL_PUSH with bounded diagnostic state. It
+repairs malformed ordinary lease triples through the same conservative helper,
+then transfers or enrolls on a later scan. Impossible ownership is never cleared
+or relabeled. BUILD_OUTPUT, artifact PURGE_DELETE/PURGE_INSPECT, and retirement
+leases are settled only by their owning state machines. Expiry is half-open: a lease is owned only while
+`expires_at > now`, and is reclaimable at `expires_at <= now`. Named checks
+allow only COPY or BUILD_OUTPUT on COPYING, EXTERNAL_VERIFY on VERIFYING, EVICT
+or PURGE_DELETE on EVICTING, VERIFY on requested READY, PURGE_INSPECT on
+DELETE_UNKNOWN, RETIRE_DELETE on RETIRING, and RETIRE_INSPECT on
+RETIRE_DELETE_UNKNOWN. Activation counts only its five ordinary/build kinds;
+every other pair is historical work that does not require the active head. A
+lost canonical manifest or exact-second late worker
 therefore cannot deadlock or mutate the repair revision. A broken historical
 credential keeps its custody in DRAINING with an operator-visible closed error
-and blocks purge completion; it is never silently replaced by unrelated current
-authority. There is no
+and blocks retirement or purge completion; it is never silently replaced by
+unrelated current authority. Config rollback may reactivate a DRAINING custody
+only while `retirement_enrolled_count = 0`, no scan/delete lease exists, and no
+physical delete has started. It preserves the monotonic custody generation,
+clears the canceled transition/grace/due fields, and fences any old scan token.
+After that boundary it fails closed with
+`IMAGE_GENERATION_RETIREMENT_STARTED`. There is no
 implicit revision or synthetic legacy fingerprint in either the configuration
 parser or location API. The final revision compare-and-swap must affect exactly
 one row; a concurrent activation is surfaced for retry rather than silently
@@ -1244,10 +1330,14 @@ evidence generations, follows the global lock phases, inserts immutable realm,
 profile-revision, and custody rows, advances each changed distribution's one
 global profile head, writes
 the complete YAML value, and increments the singleton generation/digest in one
-commit. All changed profile keys are sorted. Removing a profile first moves its
-retained custody to DRAINING and is rejected when that would orphan active
-authority. No cloud, registry, filesystem, ConfigMap, or secret-provider I/O
-occurs under the transaction.
+commit. All changed profile keys are sorted. An unchanged physical root and
+ownership kind selects POLICY_TRANSFER; every root or ownership change selects
+PHYSICAL_RETIREMENT and a disjoint realm generation. Removing a profile first
+moves its at-most-128 retained target custodies to DRAINING with
+PHYSICAL_RETIREMENT and is rejected only when the new config would orphan
+required current authority. Existing durable consumers retain their exact old
+rows until they release them. No cloud, registry, filesystem, ConfigMap, or
+secret-provider I/O occurs under the transaction.
 
 Both the typed image editor and raw Settings editor use this helper. A raw edit
 that does not change image configuration still takes the same config-row
@@ -1419,8 +1509,10 @@ Node provisioning may last minutes. The READY commit therefore reads the
 durable INIT handle and preserves the plan only when the complete execution
 state and existing location reference are identical to the handle that was
 actually rendered. It does not re-resolve against a revision activated during
-provisioning. A later real restart re-resolves before rendering and atomically
-moves the handle and reference to the current revision.
+provisioning. A same-physical, same-ownership POLICY_TRANSFER preserves that
+stable location reference and does not rewrite the INIT plan. A later real
+restart re-resolves before rendering and atomically moves the handle and
+reference to the current revision.
 
 ## Durable data model and authority
 
@@ -1447,7 +1539,10 @@ compactable child-record counters are released under their narrower
 proved-absence rules. Every newly
 inserted publication row increments `publication_generation_count` exactly
 once, and no release, retry, purge, audit compaction, or row deletion decrements
-it. That lifetime counter is the finite bound on the immutable audit history.
+it. `release_reservation_count` is reconstructible as the indexed count of this
+workspace's publications whose state is not RELEASED, including READY, FAILED,
+and CANCELLED. `publication_generation_count` is the finite bound on the
+immutable audit history.
 
 ### `container_image_catalog_summaries` and `container_image_catalog_facets`
 
@@ -1522,18 +1617,28 @@ exact revision in the exact matching facet index;
 it never scans historical revisions or an unbounded set of profile heads.
 Filtered queries deduplicate one bounded page of artifact IDs, then load
 artifacts and revision-independent summaries in a fixed number of statements.
-An artifact's authoritative `location_count` is locked on insertion and has a
-database check of 0 through 128; workspace policy may set a lower limit. That
-hard bound, not an unenforced configuration promise, caps duplicate qualifying
-facets per artifact. Unfiltered pages use the artifact ordering index directly.
+An artifact's authoritative retained `location_count` is locked on insertion
+and has a database check of 0 through 512; workspace policy may set a lower
+limit no smaller than 256. This permits one complete 128-target generation to
+coexist with its replacement and bounds four complete generations while
+30-day retirement audit retention is pending. A fifth full generation fails
+location intent with `IMAGE_RETAINED_LOCATION_LIMIT` until retirement compacts
+older rows; activation itself still performs no artifact scan. Separately, a
+profile revision stores a checked target count of at most 128, and a uniqueness
+constraint admits at most one location per `(artifact_id, target_custody_id)`.
+Those database-backed facts cap qualifying current-revision facets at 128 per
+artifact even though retained history is larger. Unfiltered pages use the
+artifact ordering index directly.
 
 ### `container_image_realm_generations` and `container_image_realm_allocations`
 
 One immutable realm-generation target row stores the provider-neutral canonical
 registry `host[:port]`, complete repository-generation prefix, owning
-distribution, provider-policy metadata, Terraform-declared or externally
-attested workspace capacity, shard count from 1 through 256, fixed two-hex
-renderer, quota/inventory snapshot digest, and ownership identity. Canonical and regional
+distribution, immutable `ownership_kind`, provider-policy metadata,
+Terraform-declared or externally attested workspace capacity, shard count from
+1 through 256, fixed two-hex renderer, quota/inventory snapshot digest, and
+registry-guard ownership identity, which excludes rotatable manager and runtime
+credential generations. Canonical and regional
 targets receive separate rows, while policy-only profile revisions reuse the
 same row. This existing table is the physical-root reservation, not an
 additional eighteenth table.
@@ -1574,9 +1679,11 @@ The bounded activation transaction locks realm reservations and global heads in
 their shared order, preventing two distributions from authorizing the same
 rendered physical destination; sharing
 capacity metadata never implies shared location authority. Realm and allocation
-rows are retained while any artifact, location, publication, delete-unknown
-outcome, purge lease, or manifest audit tombstone uses them. Explicit compaction
-deletes the reservation only after those exact absence checks. This is capacity
+rows are retained while any artifact, location, publication, delete-unknown or
+retire-delete-unknown outcome, purge or retirement lease, target custody, or
+manifest audit tombstone uses them. Explicit compaction deletes the reservation
+only after those exact absence checks and after every custody using it has
+reached RETIRED and completed audit retention. This is capacity
 authority only, not cloud state; the provider adapter still proves repository
 ownership and handles quota drift.
 
@@ -1643,9 +1750,10 @@ One row per `(workspace, digest)`:
   rewriting this initial provenance;
 - lifecycle state (`ACTIVE`, `TOMBSTONED`, `PURGING`, or `PURGED`), tombstone
   actor/reason/time, and purge completion time;
-- nonnegative lifetime `publication_generation_count` capped at 256, retained
-  `publication_record_count` capped at 256, and `location_count` capped at 128,
-  maintained under the artifact lock for bounded child records;
+- nonnegative active `active_release_reservation_count` capped by
+  `max_releases_per_artifact`, lifetime `publication_generation_count` capped at
+  256, retained `publication_record_count` capped at 256, and `location_count`
+  capped at 512, maintained under the artifact lock for bounded child records;
 - timestamps and creator hash;
 - no profile, endpoint, runtime auth, or credential data.
 
@@ -1673,6 +1781,18 @@ location to reference a build even when the artifact's immutable initial
 producer remains `external_oci`; origin proves that location's bytes, not who
 first registered the workspace digest.
 
+`active_release_reservation_count` is the artifact-local authority for active
+publication names. It equals the bounded indexed count of that artifact's
+publication rows whose state is not RELEASED. Reservation creation increments
+it once in the same workspace-quota/artifact transaction that increments the
+workspace active reservation, both lifetime generation counters, and both
+retained-record counters. A never-READY RELEASED transaction decrements the two
+active counters exactly once and no other transition decrements them. READY,
+FAILED, and CANCELLED remain charged. A fenced operator repair locks the
+workspace quota then artifact and recomputes the per-artifact count through
+`ix_container_image_publications_artifact_order`; at most 256 rows exist, so it
+never performs an unbounded scan or trusts a negative repair result.
+
 ### `container_image_sources`
 
 One immutable source alias bound to one artifact. Multiple digest-pinned
@@ -1685,7 +1805,10 @@ inherits the first historical source stored on the artifact.
 One immutable workspace-scoped name bound to one artifact. Multiple release
 names may point to the same content. Literal migration 023 creates a release
 row only through canonical READY finalization and records its authorizing
-publication and canonical location. Pending intent exists only in
+publication plus `published_location_id`, physical fingerprint, and audit hash
+as immutable scalar evidence, not as a live location foreign key. Runtime
+resolution uses the release's artifact ID and current profile, never that
+historical location. Pending intent exists only in
 `container_image_publications`. Rebinding an existing successful release to a
 different digest fails. Selectors require an ACTIVE artifact, so pending or
 tombstoned content cannot be newly adopted.
@@ -1696,7 +1819,9 @@ One durable reservation generation per `(workspace, release)`, with at most one
 non-RELEASED generation active while a release is pending:
 
 ```text
-id, workspace, release, image_id, canonical_location_id,
+id, workspace, release, image_id,
+canonical_location_id NULL, completed_location_id NULL,
+completed_location_fingerprint NULL, completed_location_audit_hash NULL,
 state PENDING|READY|FAILED|CANCELLED|RELEASED,
 attempt_count, retry_generation, reservation_generation,
 error_code,
@@ -1709,6 +1834,16 @@ Migration 023 creates
 `(workspace, image_id, created_at DESC, id DESC)` for the bounded history
 endpoint. Its cursor adds `(created_at, id) < (:created_at, :id)` after the exact
 workspace/artifact prefix.
+
+`canonical_location_id` is the only live location foreign key and exists only
+while a never-READY publication may still finalize or retry. READY completion
+moves its UUID into `completed_location_id`, stores the bounded physical
+fingerprint/audit hash, clears the live foreign key, and creates the release's
+matching scalar evidence in the same transaction. The completed ID is an audit
+identifier, not a foreign key or runtime route. Never-READY RELEASED clears its
+live foreign key after all finalizer/lease fences. Therefore permanent release
+and bounded publication history preserve provenance without pinning a retired
+location row or realm allocation forever.
 
 The reservation prevents two digests from racing for a name without making the
 name launchable. Canonical READY completion follows the global phases through
@@ -1726,9 +1861,10 @@ the publication ID without locking, then locks quota, profile, artifact,
 canonical location if present, publication, and active-name release key in the
 global order; it requires
 FAILED or CANCELLED, no durable consumer, no live lease, and no release row;
-records actor, reason, time, and terminal `RELEASED`; restores only the workspace
-and per-artifact active name-reservation counters, never either lifetime
-generation counter; and removes only that generation from the partial unique
+records actor, reason, time, and terminal `RELEASED`; decrements only workspace
+`release_reservation_count` and artifact
+`active_release_reservation_count`, never either lifetime generation counter;
+clears its live `canonical_location_id`; and removes only that generation from the partial unique
 active-name index. A later publication may reuse the text with a new
 `reservation_generation` only while both lifetime limits permit it. Every worker and finalizer is fenced by
 publication ID and generation, so a late callback for the released reservation
@@ -1751,6 +1887,10 @@ durably written to audit, and the row is deleted. READY rows remain while their
 immutable release points at them. A workspace or artifact at either lifetime or
 retained-record limit fails before copy work rather than accumulating unbounded
 typo/reuse history.
+Workspace active-reservation repair is the indexed count of publication rows in
+that workspace whose state is not RELEASED; artifact repair is the same count
+under the exact artifact prefix. Neither repair infers an active reservation
+from a retained RELEASED row.
 Reactivation increments
 `retry_generation` on the same row and consumes retry-attempt budget, but never
 consumes another generation, name, or record slot. Consequently the READY finalizer cannot finish a
@@ -1785,6 +1925,16 @@ One row per artifact and materialization identity:
   `purge_dependents_settled BOOLEAN NOT NULL DEFAULT FALSE`; the last field is
   meaningful only on a canonical row and becomes TRUE transactionally when all
   exact regional/external children have reached their required purge terminal;
+- `retirement_generation`, `retirement_attempt_count`,
+  `retirement_requested_at`, `retirement_next_retry_at`, and
+  `retirement_dependents_settled BOOLEAN NOT NULL DEFAULT FALSE`, plus closed
+  reason `SUPERSEDED_PHYSICAL_GENERATION`; these fields belong only to
+  historical physical-generation retirement and never share a nonzero
+  generation with artifact purge;
+- nullable closed `external_ack_kind PURGE|RETIRE`, matching generation,
+  bounded actor, time, non-secret evidence reference, and immutable audit hash;
+  the tuple is all-null outside an acknowledged external terminal and exactly
+  matches the one nonzero lifecycle generation inside it;
 - for a canonical location, closed `origin_kind SOURCE|BUILD` plus exactly one
   immutable `source_id` or `build_id`; regional rows inherit this provenance
   through their exact canonical location and carry neither field themselves;
@@ -1793,8 +1943,9 @@ One row per artifact and materialization identity:
   uncharged representation, while a non-null value, including zero, is the
   authoritative workspace quota charge for this physical location;
 - state; closed migration-023 lease kind
-  `COPY|VERIFY|EXTERNAL_VERIFY|EVICT|PURGE_DELETE|PURGE_INSPECT`; fenced lease;
-  retry, verification, use, and eviction metadata. Migration 024 adds
+  `COPY|VERIFY|EXTERNAL_VERIFY|EVICT|PURGE_DELETE|PURGE_INSPECT|RETIRE_DELETE|RETIRE_INSPECT`;
+  fenced lease; retry, verification, use, eviction, and retirement metadata.
+  Migration 024 adds
   `BUILD_RESERVED` plus the generation/attempt/token-bound `BUILD_OUTPUT` lease
   kind.
 
@@ -1809,9 +1960,9 @@ transitions:
 | new managed SOURCE canonical or regional intent | starts NULL; after exact source inspection and before any registry authority or I/O, NULL becomes the exact logical compressed size and the workspace counter increases once |
 | new external adoption intent | starts NULL; successful destination verification reserves the exact size in the READY transaction, while absence, mismatch, or `EXTERNAL_BYTE_QUOTA_EXCEEDED` leaves it NULL |
 | migration-024 BUILD_RESERVED output | the reservation transaction sets the exact independently verified staging size before publisher authority or canonical I/O |
-| COPY, VERIFY, EXTERNAL_VERIFY, READY, FAILED, MISSING, EVICTING, or DELETE_UNKNOWN | preserves the existing NULL or non-null value; retry never charges a non-null row twice, and verification loss never guesses that bytes disappeared |
+| COPY, VERIFY, EXTERNAL_VERIFY, READY, FAILED, MISSING, EVICTING, DELETE_UNKNOWN, RETIRING, or RETIRE_DELETE_UNKNOWN | preserves the existing NULL or non-null value; retry never charges a non-null row twice, and verification loss never guesses that bytes disappeared |
 | rematerialization of an EVICTED uncharged location | rechecks current quota and sets the exact charge before new I/O |
-| confirmed managed eviction/purge or exact external purge acknowledgement | atomically clears a non-null charge and decrements the workspace counter once; a repeated terminal transition observes NULL and is a no-op |
+| confirmed managed eviction/purge/retirement or exact external purge/retirement acknowledgement | atomically clears a non-null charge and decrements the workspace counter once; a repeated terminal transition observes NULL and is a no-op |
 | location compaction | allowed only while the field is NULL |
 
 Once non-null, the byte value is immutable until confirmed absence clears it. A
@@ -1835,7 +1986,9 @@ and an evictable cache in another. A uniqueness constraint also prevents two
 logical locations for one artifact from publishing the same physical manifest
 reference. Renaming a target alias in a new profile revision transfers that
 same physical row under the revision lock; it does not manufacture a duplicate
-location or reject an otherwise unchanged endpoint.
+location or reject an otherwise unchanged endpoint. This transfer is legal only
+when old and new custody have the same ownership kind and physical root. An
+ownership-kind change can never satisfy the row-transfer predicate.
 
 A named PostgreSQL check requires a canonical row to have
 `canonical_location_id IS NULL` and
@@ -1847,7 +2000,8 @@ canonical location belongs to the same artifact and profile revision. Every
 canonical transition into READY updates all of its exact current-revision
 regional children to TRUE in the same transaction; every transition out of
 READY updates them to FALSE before commit. The database-enforced maximum of 128
-locations per artifact makes that fan-out bounded. Claims still lock and recheck
+target custodies in one profile revision makes that exact-revision fan-out
+bounded. Claims still lock and recheck
 the canonical row, so this field accelerates discovery but never replaces
 authority. A keyset integrity job detects and repairs false-negative or
 historically corrupt projections one bounded artifact page at a time; it never
@@ -1861,7 +2015,7 @@ acknowledgement lock their exact canonical and set the flag TRUE only when every
 child in that purge generation is EVICTED or EXTERNAL_PURGED. Any retry or
 reopened child clears it. Canonical purge claims
 use the projection only for discovery, then lock/recheck the artifact and all
-at-most-128 locations. Lease-kind checks prevent an ordinary EVICT worker from
+at-most-512 retained locations. Lease-kind checks prevent an ordinary EVICT worker from
 adopting `PURGE_DELETE` or `PURGE_INSPECT` work and prevent the purge worker from
 adopting ordinary cache eviction.
 
@@ -2090,6 +2244,17 @@ external admin purge only:
 PENDING|AWAITING_EXTERNAL_PUSH|VERIFYING|FAILED|MISSING|READY|EVICTED
   -> EXTERNAL_PURGE_PENDING
 EXTERNAL_PURGE_PENDING -> EXTERNAL_PURGED
+
+superseded managed physical generation only:
+PENDING|FAILED|MISSING|READY|EVICTED
+  -> RETIRE_PENDING -> RETIRING -> RETIRED
+                                      \-> RETIRE_DELETE_UNKNOWN
+RETIRE_DELETE_UNKNOWN
+  -> inspection -> RETIRED|RETIRE_PENDING|RETIRE_DELETE_UNKNOWN
+
+superseded external physical generation only:
+PENDING|AWAITING_EXTERNAL_PUSH|FAILED|MISSING|READY|EVICTED
+  -> EXTERNAL_RETIRE_PENDING -> EXTERNAL_RETIRED
 ```
 
 External-adoption claims use the ordinary fenced lease fields while VERIFYING.
@@ -2115,6 +2280,17 @@ callback for external rows: failed out-of-band work remains
 `EXTERNAL_PURGE_PENDING` until an admin truthfully acknowledges it. Schema checks
 forbid external purge states on managed locations and managed purge states on
 external locations.
+
+Retirement terminal states are intentionally different from EVICTED and
+artifact-purge terminals. RETIRED and EXTERNAL_RETIRED cannot rematerialize,
+cannot be selected by a current head, and become compactable only after audit
+retention. External retirement uses the same bounded evidence and
+never-pushed-attestation semantics as external purge, but its acknowledgement is
+fenced by location ID plus retirement generation, stores
+`external_ack_kind=RETIRE`, and leaves the ACTIVE or TOMBSTONED artifact itself
+intact. Repeating the same generation/evidence hash is idempotent; changing
+terminal evidence requires a separate audited correction event. There is no
+automatic external delete callback.
 
 Workers claim by stable location ID with an owner, token, and lease expiry.
 Heartbeats extend only the matching claim. Completion is fenced by the token.
@@ -2220,14 +2396,14 @@ Migration 023 spells the partial predicates literally. Every ordinary managed
 automatic-work canonical index begins with:
 
 ```text
-ownership_kind = 'MANAGED' AND purge_generation = 0
+ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0
   AND canonical IS TRUE AND attempt_count < 20
 ```
 
 Every ordinary managed automatic-work regional index begins with:
 
 ```text
-ownership_kind = 'MANAGED' AND purge_generation = 0
+ownership_kind = 'MANAGED' AND purge_generation = 0 AND retirement_generation = 0
   AND canonical IS FALSE AND canonical_dependency_ready IS TRUE
   AND attempt_count < 20
 ```
@@ -2272,14 +2448,14 @@ binds the exact active profile returned by the bounded profile-head cursor and
 does not need an unbounded workspace enumeration. The canonical base is:
 
 ```text
-ownership_kind = 'EXTERNAL' AND purge_generation = 0
+ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0
   AND canonical IS TRUE AND attempt_count < 20
 ```
 
 The regional base is:
 
 ```text
-ownership_kind = 'EXTERNAL' AND purge_generation = 0
+ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND retirement_generation = 0
   AND canonical IS FALSE AND canonical_dependency_ready IS TRUE
   AND attempt_count < 20
 ```
@@ -2316,13 +2492,14 @@ possibly millions of empty custodies. Discovery work is therefore proportional
 to eligible or contended locations in that queue, never to total historical
 custody cardinality. Regional predicates begin
 `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation > 0
-AND purge_attempt_count < 20`;
+AND retirement_generation = 0 AND purge_attempt_count < 20`;
 canonical predicates begin the literal base:
 
 ```text
 ownership_kind = 'MANAGED' AND canonical IS TRUE
   AND purge_dependents_settled IS TRUE
-  AND purge_generation > 0 AND purge_attempt_count < 20
+  AND purge_generation > 0 AND retirement_generation = 0
+  AND purge_attempt_count < 20
 ```
 
 Exact suffixes and ordering columns are:
@@ -2362,18 +2539,156 @@ ix_ci_loc_purge_canonical_inspect_incomplete
 Migration 023 spells out every definition; it does not derive them from live
 metadata.
 
-The due queries add `next_retry_at <= :now`, `purge_next_retry_at <= :now`, or
+### Historical physical-generation retirement
+
+Profile activation and artifact purge are different lifecycle authorities. A
+profile change may make an old physical generation unreachable while the
+artifact remains ACTIVE, so it cannot rely on the artifact's PURGING state or
+reuse `purge_generation`. Migration 023 therefore creates a disjoint bounded
+retirement workset on the existing custody and location rows, not an eighteenth
+table.
+
+Activation marks only the at-most-128 superseded target custodies. A single
+global partial index
+`ix_ci_target_custody_retirement_due(retirement_next_scan_at, id)` includes
+`transition_kind`, `retirement_generation`, and the durable scan cursor and has
+the literal predicate `custody_state = 'DRAINING' AND transition_kind <> 'NONE'
+AND retirement_scan_attempt_count < 20`.
+The claim adds `retirement_next_scan_at <= :now` and takes a fenced short scan
+lease. The worker reads at most 128 locations from
+`(target_custody_id, id)`, persists the last visited ID, wraps once, and never
+enumerates other custodies. Reference release or lease settlement wakes only the
+exact custody by moving its next-scan time forward. `open_location_count` is
+decremented only by exact location compaction, not merely by enrolling or
+deleting bytes. Successful page progress resets scan failures; claim 20 requires
+the exact admin retry that increments the custody retry generation and resets
+only this scan budget.
+
+For `POLICY_TRANSFER`, the worker locks old custody, new custody, artifact,
+canonical, and exact location in the global order. It may replace the location's
+custody/profile/policy fields only when physical fingerprint, realm generation,
+ownership kind, artifact digest, and rendered destination are unchanged; no
+ordinary, build, purge, or retirement lease exists; and neither custody has
+started physical retirement. Durable consumers remain attached to the same
+location ID and keep their already persisted execution plan. The transaction
+decrements old and increments new `open_location_count`. It does not change byte
+charge, shard reservation, or provider content. A failed predicate leaves the
+row on the old custody for another bounded scan.
+
+For `PHYSICAL_RETIREMENT`, the enrollment transaction locks the same exact
+objects and requires all of the following: rollback grace has passed; no active
+head uses the old custody; the artifact is ACTIVE or TOMBSTONED, never PURGING or
+PURGED; no durable location reference exists; no active publication or finalizer
+is bound to the old location; and no ordinary, BUILD_OUTPUT, artifact-purge, or
+retirement lease is live. For a BUILD-origin canonical it invokes the registered
+location-lifecycle extension inside this transaction before changing the row.
+It then copies the custody's exact positive generation to the previously-zero
+location retirement generation, increments `retirement_enrolled_count`, sets
+reason `SUPERSEDED_PHYSICAL_GENERATION`, and enters RETIRE_PENDING or
+EXTERNAL_RETIRE_PENDING. Regional children enroll
+and terminate before their
+exact canonical. A canonical becomes claimable only after a locked recheck of
+all at-most-128 children sets `retirement_dependents_settled` TRUE.
+
+Managed retirement has sixteen global state-and-due partial indexes, exactly
+parallel to artifact purge but with `retirement_*` fields and no active-head or
+custody-first scan. Each is keyed `(<order-column>, id)` and includes
+`target_custody_id`, `artifact_id`, and `canonical_location_id`. The regional
+base is:
+
+```text
+ownership_kind = 'MANAGED' AND canonical IS FALSE
+  AND purge_generation = 0 AND retirement_generation > 0
+  AND retirement_attempt_count < 20
+```
+
+The canonical base is:
+
+```text
+ownership_kind = 'MANAGED' AND canonical IS TRUE
+  AND retirement_dependents_settled IS TRUE
+  AND purge_generation = 0 AND retirement_generation > 0
+  AND retirement_attempt_count < 20
+```
+
+The exact suffixes and order columns are:
+
+| Retirement queue | Literal predicate suffix | Order column |
+| --- | --- | --- |
+| delete fresh | `state = 'RETIRE_PENDING' AND retirement_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_requested_at` |
+| delete deferred | `state = 'RETIRE_PENDING' AND retirement_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_next_retry_at` |
+| delete lease | `state = 'RETIRING' AND lease_kind = 'RETIRE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
+| incomplete delete lease | `state = 'RETIRING' AND (lease_kind IS NULL OR lease_kind = 'RETIRE_DELETE') AND NOT (lease_kind = 'RETIRE_DELETE' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
+| inspect fresh | `state = 'RETIRE_DELETE_UNKNOWN' AND retirement_next_retry_at IS NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_requested_at` |
+| inspect deferred | `state = 'RETIRE_DELETE_UNKNOWN' AND retirement_next_retry_at IS NOT NULL AND lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL` | `retirement_next_retry_at` |
+| inspection lease | `state = 'RETIRE_DELETE_UNKNOWN' AND lease_kind = 'RETIRE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` | `lease_expires_at` |
+| incomplete inspection lease | `state = 'RETIRE_DELETE_UNKNOWN' AND (lease_kind IS NULL OR lease_kind = 'RETIRE_INSPECT') AND NOT (lease_kind IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL) AND NOT (lease_kind = 'RETIRE_INSPECT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL)` | `updated_at` |
+
+The literal names, in that row order for regional then canonical, are:
+
+```text
+ix_ci_loc_retire_regional_delete_fresh
+ix_ci_loc_retire_regional_delete_deferred
+ix_ci_loc_retire_regional_delete_lease
+ix_ci_loc_retire_regional_delete_incomplete
+ix_ci_loc_retire_regional_inspect_fresh
+ix_ci_loc_retire_regional_inspect_deferred
+ix_ci_loc_retire_regional_inspect_lease
+ix_ci_loc_retire_regional_inspect_incomplete
+ix_ci_loc_retire_canonical_delete_fresh
+ix_ci_loc_retire_canonical_delete_deferred
+ix_ci_loc_retire_canonical_delete_lease
+ix_ci_loc_retire_canonical_delete_incomplete
+ix_ci_loc_retire_canonical_inspect_fresh
+ix_ci_loc_retire_canonical_inspect_deferred
+ix_ci_loc_retire_canonical_inspect_lease
+ix_ci_loc_retire_canonical_inspect_incomplete
+```
+
+The managed worker uses the retained old purge identity and guard, performs only
+exact-digest manifest delete or inspection, and never deletes a repository.
+Ambiguous delete enters RETIRE_DELETE_UNKNOWN. Exact proved absence atomically
+enters RETIRED, clears a non-null byte charge, and decrements the workspace byte
+counter once. External retirement is never automatically claimed. An admin must
+record bounded deletion evidence or a truthful never-pushed attestation before
+EXTERNAL_RETIRED clears the charge. Artifact purge and retirement cannot race:
+if PURGING wins first, the retirement scanner skips the artifact and artifact
+purge owns all unenrolled locations; if any location has a nonterminal
+retirement generation, `sky image purge` fails closed with
+`IMAGE_RETIREMENT_IN_PROGRESS` until that generation settles. Already terminal
+RETIRED or EXTERNAL_RETIRED rows are proved-absent inputs to later artifact
+purge and are never restamped. Tombstone may coexist because it creates no
+delete lease.
+
+After the fixed v0 30-day retirement audit retention, a keyset-bounded
+compactor locks workspace quota, realm allocation, custody, artifact, canonical,
+and exact terminal location. It requires RETIRED or EXTERNAL_RETIRED, a NULL byte
+charge, zero durable references and leases, and committed compact audit evidence.
+It also proves no publication live-location foreign key or producer-extension
+pointer remains; completed publication/release audit UUIDs are deliberately not
+foreign keys. It removes the facet/location, decrements workspace `location_record_count`,
+artifact `location_count`, custody `open_location_count`, and the exact shard
+reservation once. When a DRAINING custody reaches zero locations, has no scan
+lease or audit reference, and retention has passed, it becomes RETIRED and may
+be compacted. Realm/prefix reservation compaction additionally requires no
+custody, allocation, location, or audit reference. RETIRED locations are never
+rematerialized, unlike ordinary EVICTED cache rows.
+
+The due queries add `next_retry_at <= :now`, `purge_next_retry_at <= :now`,
+`retirement_next_scan_at <= :now`, `retirement_next_retry_at <= :now`, or
 `lease_expires_at <= :now` as index scan bounds. Claim 20 is excluded from
 automatic work but remains repairable through the exact authorized retry, which
 increments the appropriate retry generation and resets only that queue's
 attempt counter. The composite custody foreign key makes the denormalized
 ownership kind authoritative. Named location checks make the queue families
 disjoint: ordinary managed states require MANAGED custody and
-`purge_generation = 0`; external adoption states require EXTERNAL custody and
-`purge_generation = 0`; managed purge states require MANAGED custody and
-`purge_generation > 0`; external purge states require EXTERNAL custody and
-`purge_generation > 0`. COPY/VERIFY/EVICT, EXTERNAL_VERIFY, and
-PURGE_DELETE/PURGE_INSPECT leases are accepted only in their respective family
+both generations zero; external adoption states require EXTERNAL custody and
+both generations zero; managed and external artifact-purge states require their
+matching custody, `purge_generation > 0`, and `retirement_generation = 0`;
+managed and external retirement states require their matching custody,
+`purge_generation = 0`, and `retirement_generation > 0`.
+COPY/VERIFY/EVICT, EXTERNAL_VERIFY, PURGE_DELETE/PURGE_INSPECT, and
+RETIRE_DELETE/RETIRE_INSPECT leases are accepted only in their respective family
 and state. Migration 024 atomically replaces those named checks and affected
 partial indexes so `BUILD_RESERVED`, a BUILD-origin COPYING/FAILED row, and a
 `BUILD_OUTPUT` lease are builder-only and remain excluded from every ordinary
@@ -2382,11 +2697,11 @@ including zero-eligible and late-eligible populations, is checked in rather
 than assumed.
 The second phase for availability work takes the shared profile-generation lock,
 the exact canonical lock, and the regional row lock in the established order.
-For purge, the global index first yields an unlocked location ID and its retained
-custody ID; the claim transaction then locks that exact custody in phase 3,
-artifact in phase 5, and canonical/regional locations in phase 8 before
-rechecking every predicate. PostgreSQL uses `FOR UPDATE SKIP LOCKED` for the
-final row lock. Workers that initially route to the same row seek forward
+For purge or retirement, the corresponding global index first yields an
+unlocked location ID and its retained custody ID; the claim transaction then
+locks that exact custody in phase 3, artifact in phase 5, and
+canonical/regional locations in phase 8 before rechecking every predicate.
+PostgreSQL uses `FOR UPDATE SKIP LOCKED` for the final row lock. Workers that initially route to the same row seek forward
 through the relevant global or profile index until they claim distinct work,
 with a hard per-queue seek budget so a single claim cannot retain earlier locks
 across an unbounded race set.
@@ -2480,6 +2795,10 @@ sky image tombstone --artifact-id UUID --reason CODE --yes
 sky image purge --artifact-id UUID [--retry] --yes   # admin only
 sky image purge acknowledge-external --artifact-id UUID \
     --location-id UUID --evidence-reference REF --yes
+sky image retirement retry --custody-id UUID --yes                 # admin
+sky image retirement retry --location-id UUID --yes                # admin
+sky image retirement acknowledge-external --location-id UUID \
+    --generation N --evidence-reference REF --yes                       # admin
 ```
 
 Tombstone is an admin-only PostgreSQL transaction. It follows the global lock
@@ -2489,23 +2808,32 @@ data-plane or build-publication lease, or active publication; marks the artifact
 TOMBSTONED; and makes all selectors unavailable for new launches.
 
 The catalog defines a narrow `CatalogLifecycleExtension` protocol whose
-`retire_outputs_in_session(session, artifact_id)` callback receives the existing
-transaction. Producer modules register implementations at API startup; catalog
-lifecycle code never imports `build_state.py`. With no extension registered,
-SOURCE artifacts need no callback. A managed-build artifact fails closed with
-`PRODUCER_LIFECYCLE_EXTENSION_UNAVAILABLE` rather than committing a partial
-tombstone. Migration 024 and API-63 startup register the builder implementation
-even when the separate build controller is disabled. It changes every READY
-build producing the artifact to `OUTPUT_RETIRED` in the same transaction. Build
-cache-hit transactions independently read the output ID, lock artifact then
-build row, and revalidate lifecycle as defense in depth. Tombstone preserves
+`retire_outputs_in_session(session, artifact_id)` and
+`retire_location_in_session(session, artifact_id, location_id)` callbacks
+receive the existing transaction. Producer modules register implementations at
+API startup; catalog lifecycle code never imports `build_state.py`. SOURCE
+artifacts and SOURCE-origin locations need no callback. A managed-build artifact
+or BUILD-origin location fails closed with
+`PRODUCER_LIFECYCLE_EXTENSION_UNAVAILABLE` rather than committing partial
+lifecycle state. Migration 024 and API-63 startup register the builder
+implementation even when the separate build controller is disabled. Artifact
+tombstone changes every READY build producing that artifact to OUTPUT_RETIRED.
+Before physical-generation retirement enrolls a BUILD-origin location, the
+location callback either repoints the build to an already READY current-profile
+location for the same build and digest or changes that build to OUTPUT_RETIRED;
+it never leaves a READY cache entry pointing at retiring bytes. Both changes are
+in the caller's transaction. Build cache-hit transactions independently read
+the output ID, lock artifact then build row, and revalidate lifecycle as defense
+in depth. Tombstone preserves
 immutable identity and actor-attributed audit metadata. Existing running
 consumers are a hard precondition failure, never a force flag.
 
-Purge changes TOMBSTONED to PURGING and queues every managed regional and
+Purge first rejects any nonterminal historical-generation retirement. It then
+changes TOMBSTONED to PURGING and queues every remaining managed regional and
 canonical location for deletion, regional first. External locations enter
 `EXTERNAL_PURGE_PENDING` and require an admin to record a bounded, non-secret evidence
-reference after the external owner deletes them. Every worker
+reference after the external owner deletes them. Already terminal RETIRED or
+EXTERNAL_RETIRED locations remain disjoint and count as proved absent. Every worker
 attempt rechecks lifecycle state, zero references, exact digest, active profile
 revision for availability work, or the location's retained historical custody
 for purge work, plus provider capability and repository ownership immediately before
@@ -2519,8 +2847,9 @@ managed content. Canonical deletion is allowed only after every managed
 regional location is EVICTED and every external location is acknowledged.
 
 PURGED is committed only when every SkyPilot-controlled manifest reference has
-been proven absent, every managed location is EVICTED, every external location
-is `EXTERNAL_PURGED`, and every location's `charged_materialized_bytes` is NULL.
+been proven absent, every managed location is EVICTED or RETIRED, every external
+location is `EXTERNAL_PURGED` or EXTERNAL_RETIRED, and every location's
+`charged_materialized_bytes` is NULL.
 The location terminal transactions have already decremented the workspace
 counter, so artifact finalization never performs a second byte release. This
 proves loss of runtime reachability
@@ -2584,10 +2913,12 @@ It must not receive:
 - canonical manifest deletion;
 - mutation of colliding resources without SkyPilot ownership metadata.
 
-Canonical purge uses a separate, opt-in purge identity. It can delete a
-manifest only inside ownership-tagged SkyPilot repositories after the central
-database has issued an artifact-scoped purge lease. The ordinary API, copy
-worker, and runtime identities cannot assume it. Repository deletion remains
+Canonical deletion uses a separate purge identity. It can delete a manifest
+only inside ownership-tagged SkyPilot repositories after the central database
+has issued an artifact-purge or physical-retirement lease. Artifact purge is
+admin opt-in; superseded-generation retirement is automatic only after its
+configured grace and zero-reference fences. The ordinary API, copy worker, and
+runtime identities cannot assume the role. Repository deletion remains
 forbidden even to the purge identity.
 
 ### Purge executor and identity boundary
@@ -2603,23 +2934,29 @@ identity. Helm installs a separate, independently scalable
 Kubernetes ServiceAccount and, on AWS, a dedicated IRSA role that the API,
 copy-worker ServiceAccount, builder, and workloads cannot assume.
 
-The purge reconciler claims only locations belonging to a PURGING artifact and
-in `PURGE_PENDING`, `EVICTING`, or `DELETE_UNKNOWN`. It uses the exact retained
-target-custody ID and its immutable `purge_identity` credential generation plus
-principal fingerprint, artifact/location ID, purge generation, expected digest,
-owner, random token, and lease expiry.
+The deployment runs two disjoint reconcilers. The artifact-purge reconciler
+claims only locations belonging to a PURGING artifact and in `PURGE_PENDING`,
+`EVICTING`, or `DELETE_UNKNOWN`. The historical-generation reconciler claims a
+DRAINING target custody scan lease and managed locations in `RETIRE_PENDING`,
+`RETIRING`, or `RETIRE_DELETE_UNKNOWN`; external retirement remains
+administrator-acknowledged. Both use the exact retained target-custody ID and
+its immutable `purge_identity` credential generation plus principal fingerprint,
+artifact/location ID, the matching purge or retirement generation, expected
+digest, owner, random token, and lease expiry. They never translate one work
+kind into the other.
 The global state-and-due partial indexes above are the only automatic discovery
-path; they reveal eligible location IDs without scanning historical custody,
-then the claim locks the row's one exact retained custody. Regional work is
-claimable first. A canonical claim is
-eligible only after a locked recheck proves every managed regional location
-EVICTED and every external location EXTERNAL_PURGED. Provider I/O occurs after
+paths; they reveal eligible location or custody IDs without scanning historical
+custody cardinality, then the claim locks the row's one exact retained custody.
+Regional work is claimable first. A canonical claim is
+eligible only after a locked recheck proves every managed regional location has
+the terminal required by its work kind and every external location has its
+matching acknowledged terminal. Provider I/O occurs after
 the short claim transaction. Claim and completion lock the catalog fence,
 retained target custody, artifact, canonical location, then regional locations
 in the global order and revalidate the token and evidence. A shutdown
 before provider I/O may surrender its lease; after a delete call starts, it
 must leave the lease to expire so restart recovery inspects the digest and uses
-DELETE_UNKNOWN rather than guessing success.
+DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN rather than guessing success.
 
 The purge role's ECR surface is closed. It may use
 `GetAuthorizationToken`, `DescribeRepositories`, `ListTagsForResource`,
@@ -2637,9 +2974,11 @@ Helm values expose `purgeWorker.enabled`, `replicaCount`, `maxInFlight`, lease
 and heartbeat periods, ServiceAccount name/annotations, resources, probes,
 metrics, and optional metrics-backed autoscaling separately from the copy
 worker. It defaults disabled and validation rejects enabling it without a
-dedicated identity reference. Metrics include purge queue depth and oldest age,
-regional/canonical claims, delete and inspection latency, DELETE_UNKNOWN age,
-lease loss, limiter wait/throttle, and closed outcomes. Rollback disables new
+dedicated identity reference. Metrics distinguish artifact purge from
+generation retirement and include custody scan depth/age, purge and retirement
+queue depth/age, regional/canonical claims, delete and inspection latency,
+DELETE_UNKNOWN and RETIRE_DELETE_UNKNOWN age, lease loss, limiter wait/throttle,
+and closed outcomes. Rollback disables new
 claims, drains or expires existing leases, and leaves PostgreSQL intent for a
 compatible purger. Restart tests kill the worker before a call, after an
 ambiguous call, and before completion, proving eventual inspection without a
@@ -2897,11 +3236,16 @@ An existing namespace root never silently changes shard count. Capacity
 expansion creates a new realm generation whose fixed `g<realm_generation>`
 segment produces a different repository prefix, plus a new profile revision.
 Activation proves the new prefix does not overlap any retained generation
-before it directs new writes there. It keeps old READY routes readable, lazily
-prepares content
-on observed use, and retains old durable references until they drain. Only then
-does ordinary ownership-fenced lifecycle purge the old generation. The
-migration has no all-artifact eager-copy step.
+before it directs new writes there. New placement resolves only the new head;
+existing durably pinned consumers keep their old READY route, new content is
+prepared lazily on observed use, and old references drain without an eager
+rewrite. Only then
+does the disjoint historical physical-generation retirement engine delete and
+compact the old generation under its retained custody. Artifact purge is not
+required and the artifact remains ACTIVE. Rollback may reactivate the old head
+during the default 24-hour grace only before retirement stamps its first
+location; afterward rollback fails closed and must activate another new
+generation. The migration has no all-artifact eager-copy step.
 
 Terraform outputs a secret-free profile fragment without `revision`, plus the
 complete normalized `profile_fingerprint`. The administrator supplies the
@@ -3071,6 +3415,10 @@ sky image infrastructure inventory aws --account ACCOUNT --regions R[,R...] \
 sky image publication release-name PUBLICATION_ID --reason CODE --yes # admin
 sky image tombstone --artifact-id UUID --reason CODE --yes       # admin
 sky image purge --artifact-id UUID [--retry] --yes               # admin
+sky image retirement retry --custody-id UUID --yes                # admin
+sky image retirement retry --location-id UUID --yes               # admin
+sky image retirement acknowledge-external --location-id UUID \
+    --generation N --evidence-reference REF --yes                # admin
 ```
 
 `register` establishes immutable catalog identity and canonical intent.
@@ -3146,9 +3494,9 @@ the reproducible PostgreSQL fixture, captured plans, database settings, host
 description, and raw result artifact. The release gate requires those plans to
 use the READY-canonical and canonical-location-prefixed regional partial indexes
 without scanning dependency-blocked rows. The same fixture freezes every
-external-adoption and purge queue plan, including historical-custody rotation,
-canonical purge dependency blocking, zero eligible rows, claim-20 exclusion,
-and a late eligible row behind one million ineligible rows.
+external-adoption, purge, target-custody retirement-scan, and location-retirement
+queue plan, including canonical dependency blocking, zero eligible rows,
+claim-20 exclusion, and a late eligible row behind one million ineligible rows.
 A separate PostgreSQL page-advance regression places work beyond the first
 eight 16-profile pages and proves reconciliation and eviction listing plus
 atomic claiming eventually reach it.
@@ -3166,8 +3514,8 @@ disk spill and sequential million-row scans, and complete under 200 ms p95 on
 the release benchmark host. An unfiltered page may examine at most twice its
 artifact limit. A distribution-filtered page first resolves one profile head,
 must use the exact active-revision facet index, and may examine at most
-`limit * 128` qualifying facet rows under the database-enforced per-artifact
-hard bound to deduplicate one page. An exact zero-match probe is an index-only
+`limit * 128` qualifying facet rows under the database-enforced revision target
+count plus artifact/custody uniqueness to deduplicate one page. An exact zero-match probe is an index-only
 lookup over one distribution and revision. State-only queries do not exist, so
 historical facets and an unbounded number of profile heads cannot invalidate the
 claim. Executor memory stays below 64 MiB. The fixture also injects
@@ -3249,8 +3597,8 @@ request executors and restart recovery is exercised.
 - [ ] Build the complete Images dashboard, artifact detail, safe actions,
   workspace handling, responsive states, and dashboard test/build coverage.
 - [ ] Add admin-only tombstone/purge state, CLI/API, audit, retry, AWS ownership
-  fencing, and the separately authorized purge reconciler without a dashboard
-  delete action.
+  fencing, historical-generation retirement/compaction, and the separately
+  authorized purge reconciler without a dashboard delete action.
 - [ ] Implement the complete AWS ECR capability slice and reusable AWS control
   plane, VM-pool, image-distribution, and dedicated-account Terraform example,
   including generation-qualified balanced shard allocation and the closed
@@ -3301,7 +3649,9 @@ external profile remains the rollback path at every phase.
   repository deletion authorization for each advertised managed provider;
 - completed manual canonical lifecycle and purge-recovery exercise;
 - Kubernetes secret-name injection if that auth mode is advertised;
-- READY periodic revalidation and orphaned profile-revision cleanup;
+- READY periodic revalidation plus the bounded policy-transfer and historical
+  physical-generation retirement engines, global due indexes, external
+  acknowledgement, audit retention, and custody/realm compaction;
 - PostgreSQL migration tests;
 - old-client/new-server and new-client/old-server compatibility validation;
 - full provider integration tests, including negative IAM tests.
@@ -3331,10 +3681,16 @@ Unit tests must cover:
   invariants; a never-READY name can be released only under every stated
   precondition, restores quota once, and rejects stale finalizers, while a name
   that was ever READY remains immutable; workspace and per-artifact publication
-  lifetime-generation caps cannot be bypassed or released by repeated RELEASED
-  generations, retained-record caps remain independent, and
+  active-reservation counters increment and decrement atomically, never underflow,
+  and repair to the exact non-RELEASED indexed counts, including retained
+  RELEASED rows that consume neither active counter; workspace and per-artifact
+  publication lifetime-generation caps cannot be bypassed or released by
+  repeated RELEASED generations, retained-record caps remain independent, and
   keyset-bounded post-retention compaction writes audit before releasing exactly
-  one retained-record slot and zero lifetime slots;
+  one retained-record slot and zero lifetime slots; READY finalization moves the
+  live canonical foreign key to immutable scalar audit evidence, never-READY
+  RELEASED clears it, and permanent release/publication history does not pin
+  physical-generation compaction;
   publishing another release for an already READY canonical route finalizes
   immediately through the same locked validator;
   artifact-ID publication creates no source row, requires one authorized ACTIVE
@@ -3343,8 +3699,10 @@ Unit tests must cover:
   prepare remains the only explicit regional fan-out operation;
 - fresh real-PostgreSQL 022-to-023 migration from frozen literal DDL, exact
   parity with checked-in distribution metadata, the exact 17-table inventory
-  listed above with every named check/index/foreign key, absence of obsolete
-  legacy tables/columns, the API-62 minimum-image-plane fence, both monotonic
+  listed above with every named check/index/foreign key, including active
+  artifact release reservations, custody transition/scan authority, disjoint
+  location retirement generations, and all retirement due indexes; absence of
+  obsolete legacy tables/columns, the API-62 minimum-image-plane fence, both monotonic
   state-ever-created witnesses and TRUE-to-FALSE trigger, atomic first
   distribution-state marking, and no live-metadata imports. A version-61-style
   connection without the custom setting cannot read or write the mandatory
@@ -3513,10 +3871,12 @@ Unit tests must cover:
   external templates; a provider-neutral `(registry host:port, complete
   repository-generation prefix)` reservation makes explicit/derived registries,
   provider aliases, and endpoint/root decompositions collide physically;
-  different shard counts cannot overlap on shard zero; activation rejects
-  overlap with active heads and retained ACTIVE/DRAINING/RETIRED custody,
-  including through one shared capacity realm, concurrent reservation inserts,
-  and historical purger authority; and
+  different shard counts cannot overlap on shard zero; only an exact
+  same-distribution, same-ownership POLICY_TRANSFER may reuse its existing realm
+  row, while every new physical generation rejects overlap with active heads and
+  retained ACTIVE/DRAINING/RETIRED custody, including through one shared
+  capacity realm, concurrent reservation inserts, and historical purge or
+  retirement authority; and
   copy I/O writing through a deterministic immutable tag before digest-only
   verification;
 - final cluster-commit acceptance of release and digest-equivalent source
@@ -3544,8 +3904,9 @@ Unit tests must cover:
   complete fenced ownership;
 - impossible READY ownership is rejected by the schema and repaired at the
   unchanged-generation exact-row boundary for historical corruption;
-- dominant-profile activation does not rewrite untouched location rows, while
-  old generations remain immediately unclaimable in PostgreSQL;
+- dominant-profile activation rewrites only the at-most-128 superseded custody
+  heads, not untouched location rows, while old generations remain immediately
+  unavailable to new placement in PostgreSQL;
 - exact regional-to-canonical revision binding across endpoint migrations;
 - final exact-canonical fencing for standalone and cluster-handle references;
 - real PostgreSQL overlaps in which those transactions hold the canonical row
@@ -3560,7 +3921,11 @@ Unit tests must cover:
   plus a forced crossed-release PostgreSQL overlap proving global
   phased lock order yields one success and one value conflict without a
   database deadlock;
-- ownership and auth policy transfer reusing the same physical bytes;
+- manager/auth policy transfer within one ownership kind reusing the same
+  physical row after operation-lease fences while preserving durable references
+  and persisted INIT plans, while EXTERNAL-to-MANAGED and
+  MANAGED-to-EXTERNAL changes allocate a disjoint empty generation and never
+  relabel bytes;
 - target-alias rename reusing the same physical row under a new revision;
 - endpoint revision producing a distinct materialization;
 - fail-closed managed-required dry runs and no optimizer mutation;
@@ -3590,22 +3955,25 @@ Unit tests must cover:
   uncapped activation-only active-lease probes, PostgreSQL partial-index plans,
   and bounded
   `EXPLAIN ANALYZE` behavior for activation plus all list/claim paths;
-- all eight canonical/regional external-adoption and all sixteen
-  regional/canonical purge partial indexes use their frozen literal predicates,
-  profile-first or global due-work keys, ordering columns, attempt counters,
+- all eight canonical/regional external-adoption, all sixteen
+  regional/canonical purge, all sixteen regional/canonical physical-retirement,
+  and the global custody-retirement-scan partial indexes use their frozen
+  literal predicates, profile-first or global due-work keys, ordering columns, attempt counters,
   due-time scan bounds, lease-kind checks, and independent keyset cursors;
   exact-profile external probes require no workspace enumeration, and
   million-row zero/late-eligible plans cannot scan blocked dependencies, active
   heads, empty retained custodies for historical purge, or another queue family;
-  with one due purge behind one million retained custodies, discovery reads the
-  one global eligible entry before locking only its exact custody, and worker
-  restart does not reintroduce custody-cardinality work;
+  with one due purge or retirement behind one million retained custodies,
+  discovery reads the one global eligible entry before locking only its exact
+  custody, and worker restart does not reintroduce custody-cardinality work;
 - named location checks and partial indexes make ordinary MANAGED,
-  EXTERNAL-adoption, MANAGED-purge, EXTERNAL-purge, and migration-024 BUILD
-  families disjoint by ownership, purge generation, state, origin, and exact
-  lease kind; malformed/incomplete recovery finds only its own family, ordinary
-  COPY never claims BUILD_OUTPUT, ordinary EVICT never claims PURGE_DELETE, and
-  external FAILED rows never enter managed FAILED/MISSING retry;
+  EXTERNAL-adoption, MANAGED-purge, EXTERNAL-purge, MANAGED-retirement,
+  EXTERNAL-retirement, and migration-024 BUILD families disjoint by ownership,
+  purge/retirement generation, state, origin, and exact lease kind;
+  malformed/incomplete recovery finds only its own family, ordinary COPY never
+  claims BUILD_OUTPUT, ordinary EVICT never claims PURGE_DELETE or
+  RETIRE_DELETE, and external FAILED rows never enter managed FAILED/MISSING
+  retry;
 - large-profile PostgreSQL keyset page-advance liveness for reconciliation
   listing and claiming;
 - seek-forward PostgreSQL eviction collisions in which eight workers initially
@@ -3636,8 +4004,10 @@ Unit tests must cover:
 - endpoint, namespace, account, manager-identity, distinct purge-identity, and
   credential-reference rotation retaining historical target custody and its
   physical-root reservation until old locations, audit manifests, leases, and
-  DELETE_UNKNOWN outcomes drain, including purge through only that old purge
-  authority;
+  DELETE_UNKNOWN or RETIRE_DELETE_UNKNOWN outcomes drain, including purge and
+  physical retirement through only that old purge authority; same-root,
+  same-ownership policy transfer moves counts and authority without byte or
+  shard changes, while a root or ownership change uses a disjoint generation;
 - one global profile-head update immediately excluding old-revision facets in
   every workspace without population rewrites or workspace-count fan-out, plus
   projection drift detection/repair and authority-path independence;
@@ -3665,10 +4035,24 @@ Unit tests must cover:
   lifetime artifact count and PURGED digest row never released or resurrected
   while byte/child quota is released exactly once; and absence of delete actions
   from the dashboard;
+- superseded-generation retirement for ACTIVE and TOMBSTONED artifacts, with
+  regional-before-canonical managed deletion, retained old custody, exact
+  external acknowledgement, nonterminal-retirement versus artifact-purge
+  exclusion, terminal-retirement reuse as purge absence evidence, charge
+  clearing, nonrematerializable terminal states, 30-day audit retention, one
+  complete 128-target generation coexisting with its replacement under the
+  512-row retained hard cap, a fifth full generation failing before location
+  insertion without an activation scan, exact
+  location/custody/allocation/realm compaction, rollback only before first
+  enrollment through the custody's monotonic generation/enrolled-count fence,
+  registered BUILD-origin location retirement that atomically
+  repoints an exact READY replacement or marks its cache output retired, and one
+  blocked due retirement behind one million retained custodies;
 - purge API intent-only behavior; a separately deployed ServiceAccount/role
-  claiming only PURGING work; inability of API/copy identities to assume that
-  role; exact retained `purge_identity` selection; same-generation
-  `purge_dependents_settled` propagation and final at-most-128-row lock recheck;
+  claiming disjoint PURGING and managed historical-retirement work; inability
+  of API/copy identities to assume that role; exact retained `purge_identity`
+  selection; same-generation
+  `purge_dependents_settled` propagation and final at-most-512-row lock recheck;
   closed read plus `BatchDeleteImage` IAM/limiter mapping; runtime
   rejection of repository deletion and every unmapped call; and before-call,
   ambiguous-after-call, completion, graceful-drain, lease-expiry, restart, and
@@ -3766,7 +4150,9 @@ Dashboard and catalog coverage additionally proves:
   duplicate submissions;
 - the admin Image distribution editor round-trips every profile/binding/policy
   field, validates and previews a generation-fenced diff, never exposes secret
-  values, and reports infrastructure/capability states; and
+  values, distinguishes policy transfer from physical-generation replacement,
+  and reports infrastructure/capability plus bounded retirement progress and
+  blockers without waiting for cleanup; and
 - navigation, responsive rendering, keyboard focus, empty/error/permission,
   and old-server states pass Jest and a production Next.js build.
 

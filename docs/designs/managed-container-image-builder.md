@@ -1155,13 +1155,24 @@ attempt that reaches canonical reservation:
 
 ```text
 build_id, retry_generation, attempt_number, attempt_token_hash,
-image_id, canonical_location_id, digest, platform_set,
+image_id, canonical_location_id NULL, published_location_id NULL,
+published_location_fingerprint NULL, published_location_audit_hash NULL,
+digest, platform_set,
 verified_materialized_bytes BIGINT,
 state RESERVED|COPYING|VERIFYING|READY|CANCEL_REQUESTED|FAILED,
 lease_owner/token/expires_at, error_code NULL, created_at, updated_at
 
 UNIQUE (build_id, retry_generation, attempt_number)
 ```
+
+`canonical_location_id` is a live foreign key only while RESERVED, COPYING,
+VERIFYING, CANCEL_REQUESTED, or FAILED output work may still finalize or recover.
+READY completion moves its UUID/fingerprint into immutable scalar publication
+evidence, clears that live foreign key, and writes the build row's mutable
+current canonical-location foreign key in the same transaction. Cache hits use
+the build pointer plus output digest/evidence. A retired output clears or
+repoints the build pointer through the lifecycle extension, so immutable output
+history never pins location or realm compaction.
 
 The table is the build-publication lease and catalog-to-builder lifecycle
 bridge. Before canonical repository provisioning, credentials, or copy I/O, a
@@ -1217,8 +1228,9 @@ converges without rewriting an immutable tag. The READY transaction takes the
 same locks, rechecks ACTIVE lifecycle, exact profile, the non-null location
 charge equal to independently verified staging size,
 generation, attempt, both lease tokens, digest, platform/config evidence, and
-origin binding, then atomically marks location, output, and build READY and
-stores `output_image_id` and `canonical_location_id`. A convergence candidate
+origin binding, then atomically marks location, output, and build READY, moves
+the output's live canonical ID into scalar audit evidence, and stores the build's
+`output_image_id` and current `canonical_location_id`. A convergence candidate
 first reacquires and revalidates the existing READY location, then commits the
 build with `cache_outcome=CONTENT_CONVERGED`; it does not claim that the
 canonical location was produced by this build. A new-profile same-digest route
@@ -1352,11 +1364,23 @@ automatically.
 
 Catalog tombstone does not duplicate builder SQL or import the builder module.
 API-63 builder startup registers a `CatalogLifecycleExtension` whose
-session-taking callback delegates to
-`build_state.retire_outputs_in_session(session, artifact_id)` after the catalog
-locks the artifact and before commit, so artifact lifecycle and every READY
-build transition to `OUTPUT_RETIRED` atomically. The extension is registered
-even when the separate controller is disabled; a managed-build artifact fails
+session-taking callbacks delegate to
+`build_state.retire_outputs_in_session(session, artifact_id)` and
+`build_state.retire_location_in_session(session, artifact_id, location_id)`
+after the catalog locks the artifact and before commit. Artifact tombstone uses
+the first callback, so catalog lifecycle and every READY build transition to
+OUTPUT_RETIRED commit atomically. Historical
+physical-generation retirement uses the location callback: if another READY
+current-profile location has the same build ID, artifact, digest, and origin,
+the callback moves the build's current canonical pointer under the shared lock
+order; otherwise it marks the build OUTPUT_RETIRED before the old location can
+enter retirement and clears that pointer. For a lease-free terminal failed or
+canceled output whose live publication foreign key names the location, it first
+moves the ID/fingerprint to bounded terminal audit evidence and clears the live
+foreign key. An active output lease makes enrollment retry later. It never
+leaves a READY spec-cache row or terminal output pointer on retiring bytes and
+never performs provider I/O in the transaction. The extension is
+registered even when the separate controller is disabled; a managed-build artifact fails
 closed if it is unavailable. The defensive cache-hit revalidation above uses
 the same state helper. Because a purged digest is
 permanently nonresurrectable in the catalog, retrying the same row is denied. A
@@ -1526,6 +1550,10 @@ workspace, resource ID, and closed outcome without source contents.
 - A build output follows the catalog's tombstone/purge lifecycle. Purging an
   output never silently deletes shared cache or source context before their own
   references and retention expire.
+- Historical physical-generation retirement calls the registered builder
+  extension before enrolling a BUILD-origin canonical location. It either
+  repoints the READY build to an already verified current route or retires the
+  cache output, so deletion cannot leave a false READY cache hit.
 
 ## Rollout and test gates
 
@@ -1681,10 +1709,13 @@ collision with SOURCE or other-BUILD non-READY routes, tombstoned and purged
 digests, output
 digest/platform mismatch, SOURCE-versus-BUILD runtime validation, content
 convergence without provenance rewriting, and ordinary artifact-ID
-READY-fast-path publication. Cache tests exercise the shared session-taking
-OUTPUT_RETIRED transition and defensive lock-order revalidation for every
-artifact and location lifecycle state, including profile activation racing the
-exact phase-1/3/5/6/8/10 cache-hit transaction.
+READY-fast-path publication. Cache tests exercise both shared session-taking
+lifecycle callbacks, exact-current-route repointing, OUTPUT_RETIRED when no
+replacement exists, terminal output live-FK clearing into scalar audit evidence,
+failure closed when the extension is unavailable, and
+defensive lock-order revalidation for every artifact and location lifecycle
+state, including profile activation and physical-retirement enrollment racing
+the exact phase-1/3/5/6/8/10 cache-hit transaction.
 
 Interface and operations tests cover task client preflight, server rejection
 and static policy-token binding before request persistence, exclusion of the
