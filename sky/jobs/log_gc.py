@@ -6,6 +6,7 @@ import pathlib
 import shutil
 import threading
 import time
+from typing import Optional, Set, Tuple
 
 import filelock
 
@@ -50,10 +51,15 @@ def gc_controller_logs_for_job():
             logger.info(f'GC controller logs for job: retention '
                         f'{controller_logs_retention} seconds')
             try:
+                # Rows whose cleanup failed in this pass; excluded from later
+                # rounds so the pass pages past them instead of retrying them
+                # in a tight loop. They stay eligible for the next pass.
+                failed_job_ids: set = set()
                 finished = False
                 while not finished:
                     finished = _clean_controller_logs_with_retention(
-                        controller_logs_retention)
+                        controller_logs_retention,
+                        failed_job_ids=failed_job_ids)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Error GC controller logs for job: {e}',
                              exc_info=True)
@@ -78,10 +84,12 @@ def gc_task_logs_for_job():
             logger.info('GC task logs for job: '
                         f'retention {task_logs_retention} seconds')
             try:
+                # See gc_controller_logs_for_job for the failed-row paging.
+                failed_tasks: set = set()
                 finished = False
                 while not finished:
                     finished = _clean_task_logs_with_retention(
-                        task_logs_retention)
+                        task_logs_retention, failed_tasks=failed_tasks)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Error GC task logs for job: {e}', exc_info=True)
         else:
@@ -92,17 +100,29 @@ def gc_task_logs_for_job():
         time.sleep(_next_gc_interval(task_logs_retention))
 
 
-def _clean_controller_logs_with_retention(retention_seconds: int,
-                                          batch_size: int = 100):
+def _clean_controller_logs_with_retention(
+        retention_seconds: int,
+        batch_size: int = 100,
+        failed_job_ids: Optional[Set[int]] = None):
     """Clean controller logs with retention.
+
+    Args:
+        failed_job_ids: Jobs whose cleanup failed earlier in this pass.
+            Updated in place with this round's failures and excluded from
+            selection, so each failing row is attempted at most once per
+            pass and cannot starve the rows behind it.
 
     Returns:
         Whether the GC of this round has finished, False means there might
         still be more controller logs to clean.
     """
     assert batch_size > 0, 'Batch size must be positive'
-    jobs = managed_job_state.get_controller_logs_to_clean(retention_seconds,
-                                                          batch_size=batch_size)
+    if failed_job_ids is None:
+        failed_job_ids = set()
+    jobs = managed_job_state.get_controller_logs_to_clean(
+        retention_seconds,
+        batch_size=batch_size,
+        exclude_job_ids=failed_job_ids)
     cleaned_at = time.time()
     ts_str = datetime.fromtimestamp(cleaned_at).strftime('%Y-%m-%d %H:%M:%S')
     cleaned_message = f'Controller log has been cleaned at {ts_str}.\n'
@@ -126,31 +146,42 @@ def _clean_controller_logs_with_retention(retention_seconds: int,
                 f'Failed to clean controller logs for job '
                 f'{job_id}: {e}',
                 exc_info=True)
+            failed_job_ids.add(job_id)
             continue
         job_ids_to_update.append(job_id)
     managed_job_state.set_controller_logs_cleaned(job_ids=job_ids_to_update,
                                                   logs_cleaned_at=cleaned_at)
-    # A full batch where every row failed would be re-selected verbatim on
-    # the next pass; end the round so the caller backs off until the next
-    # scheduled interval instead of spinning on the same failing rows.
-    complete = len(jobs) < batch_size or not job_ids_to_update
+    # Failed rows are excluded from later selections in this pass, so every
+    # round strictly shrinks the candidate pool: a short batch means the
+    # pool is exhausted and the pass is complete.
+    complete = len(jobs) < batch_size
     logger.info(f'Cleaned {len(job_ids_to_update)}/{len(jobs)} controller '
                 f'logs with retention '
                 f'{retention_seconds} seconds, complete: {complete}')
     return complete
 
 
-def _clean_task_logs_with_retention(retention_seconds: int,
-                                    batch_size: int = 100):
+def _clean_task_logs_with_retention(
+        retention_seconds: int,
+        batch_size: int = 100,
+        failed_tasks: Optional[Set[Tuple[int, int]]] = None):
     """Clean task logs with retention.
+
+    Args:
+        failed_tasks: (job_id, task_id) pairs whose cleanup failed earlier
+            in this pass. Updated in place and excluded from selection; see
+            _clean_controller_logs_with_retention.
 
     Returns:
         Whether the GC of this round has finished, False means there might
         still be more task logs to clean.
     """
     assert batch_size > 0, 'Batch size must be positive'
+    if failed_tasks is None:
+        failed_tasks = set()
     tasks = managed_job_state.get_task_logs_to_clean(retention_seconds,
-                                                     batch_size=batch_size)
+                                                     batch_size=batch_size,
+                                                     exclude_tasks=failed_tasks)
     tasks_to_update = []
     for task in tasks:
         local_log_file = pathlib.Path(task['local_log_file'])
@@ -175,14 +206,15 @@ def _clean_task_logs_with_retention(retention_seconds: int,
                 f'Failed to clean task logs for job '
                 f'{task["job_id"]}, task {task["task_id"]}: {e}',
                 exc_info=True)
+            failed_tasks.add((task['job_id'], task['task_id']))
             continue
         # We have at least once semantic guarantee for the cleanup here.
         tasks_to_update.append((task['job_id'], task['task_id']))
     managed_job_state.set_task_logs_cleaned(tasks=list(tasks_to_update),
                                             logs_cleaned_at=time.time())
-    # See _clean_controller_logs_with_retention: an all-failed full batch
-    # must end the round to avoid a sleepless re-selection loop.
-    complete = len(tasks) < batch_size or not tasks_to_update
+    # See _clean_controller_logs_with_retention: failed rows are excluded
+    # from later selections, so a short batch means the pass is complete.
+    complete = len(tasks) < batch_size
     logger.info(f'Cleaned {len(tasks_to_update)}/{len(tasks)} task logs with '
                 f'retention '
                 f'{retention_seconds} seconds, complete: {complete}')
