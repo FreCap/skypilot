@@ -4447,12 +4447,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # not hide it.
                 recovering_ids.discard(replica_id)
                 continue
-            if (info.status_property.logical_retirement_controller_epoch ==
-                    self._logical_controller_epoch):
-                # A prior persist may have committed even if its caller saw an
-                # exception. A fresh read distinguishes that safe adoption.
-                recovering_ids.discard(replica_id)
-                continue
             candidates.append(info)
 
         if not candidates:
@@ -4501,6 +4495,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                     snapshot.generation <= reactivation_generation):
                 return
             self._logical_retirement_reactivation_generation = None
+
+            old_epoch_candidates = []
+            for info in candidates:
+                status = info.status_property
+                if (status.logical_retirement_controller_epoch
+                        != self._logical_controller_epoch):
+                    old_epoch_candidates.append(info)
+                    continue
+                # Adoption changes durable shutdown authority. Do not admit
+                # that shutdown from the same LB generation whose pre-adoption
+                # view authorized the re-fence. A strictly newer matching
+                # snapshot/target releases it to the normal admission path.
+                selection_generation = (status.logical_retirement_generation)
+                assert type(selection_generation) is int
+                if snapshot.generation > selection_generation:
+                    recovering_ids.discard(info.replica_id)
+            candidates = old_epoch_candidates
+            if not candidates:
+                self._clear_logical_retirement_recovery_if_done()
+                return
 
             committed_capacity = self._logical_committed_capacity(
                 replica_infos, snapshot, self.latest_version,
@@ -4584,13 +4598,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'{info.replica_id}; keeping it off-route for retry: '
                         f'{common_utils.format_exception(e)}')
                     continue
-                recovering_ids.discard(info.replica_id)
                 adopted += 1
             if adopted:
                 logger.info(
                     f'Adopted {adopted} recovered logical retirements under '
-                    'the current controller fence while preserving their '
-                    'durable drain deadlines.')
+                    'the current controller fence; keeping them off-route '
+                    'until a newer capacity generation revalidates admission '
+                    'while preserving their durable drain deadlines.')
         self._clear_logical_retirement_recovery_if_done()
 
     def _detach_committed_logical_retirement(self, info: ReplicaInfo) -> None:
