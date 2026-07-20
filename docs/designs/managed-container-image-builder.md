@@ -53,8 +53,11 @@ A candidate build specification is:
 ```yaml
 base: ghcr.io/boltz-bio/runtime@sha256:<digest>
 setup:
-  - apt-get update && apt-get install -y libgl1
-  - pip install --require-hashes -r requirements.txt
+  - run: apt-get update && apt-get install -y libgl1
+    inputs: []
+  - run: pip install --require-hashes -r /inputs/requirements.txt
+    inputs:
+      - requirements.txt
 context:
   path: .
   include:
@@ -72,9 +75,12 @@ output:
 ```
 
 `setup` is intentionally supported as a build layer. It is an explicit build
-field, not the workload's runtime `setup`. Commands run in order in an isolated
-BuildKit executor. Changing a setup command, base digest, referenced setup file,
-build argument, or platform invalidates the appropriate cache suffix.
+field, not the workload's runtime `setup`. Each step requires `run` and an
+explicit bounded `inputs` list. The executor mounts only those context files at
+`/inputs`; arbitrary shell commands cannot silently read undeclared context.
+Commands run in order in an isolated BuildKit executor. Changing a setup command,
+base digest, declared input, build argument, or platform invalidates the
+appropriate cache suffix.
 
 `source.mode: late_bound` excludes application files from the dependency image
 and uploads them through the normal SkyPilot workdir/file-mount path at launch.
@@ -158,7 +164,7 @@ The cache key includes:
 - target platform;
 - ordered setup commands;
 - declared build arguments excluding secrets;
-- digests of files read by each setup step; and
+- digests of every explicitly mounted setup input; and
 - compiler/runtime policy version.
 
 Secret values never enter a cache key or layer. Secret mounts are ephemeral and
@@ -222,7 +228,7 @@ than migration 024. It must demonstrate:
 5. crash recovery before and after BuildKit output publication;
 6. trusted promotion into the existing distribution publication contract; and
 7. deterministic handling when the advisory release name loses a publication
-   race; and
+   race;
 8. zero secret values in image history, logs, database rows, or attestations.
 
 The prototype may live behind an internal command or test harness. It cannot be
@@ -268,6 +274,8 @@ separate runtime product. Neither is hidden inside the builder migration.
 
 - deterministic context manifest across filesystem ordering;
 - include/exclude and symlink escape rejection;
+- setup schema requires explicit inputs, undeclared context is inaccessible, and
+  only a command or mounted-input digest change invalidates its cache suffix;
 - upload deduplication, resume, size bounds, and expired credentials;
 - cache key changes for every declared input and stability for late-bound code;
 - secret non-retention in layers, history, logs, cache metadata, and provenance;
