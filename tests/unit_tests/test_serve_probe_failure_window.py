@@ -65,6 +65,8 @@ class TestConsecutiveFailureWindow(unittest.TestCase):
              mock.patch.object(serve_state, 'get_specs',
                                return_value={1: mock.Mock()}), \
              mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'get_replica_infos_from_ids',
+                               return_value={}), \
              mock.patch.object(serve_state, 'set_service_uptime'):
             manager._probe_all_replicas()
 

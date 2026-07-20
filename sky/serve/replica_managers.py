@@ -5610,7 +5610,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         return urls
 
     @with_lock
-    def _probe_all_replicas(self) -> None:
+    def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Readiness probe replicas.
 
         This function will probe all replicas to make sure the service is
@@ -5618,6 +5618,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             (1) the initial delay for each replica;
             (2) the start of the current consecutive-failure window.
         The replica will be terminated if any of the thresholds exceeded.
+
+        Returns:
+            The end-of-round fleet snapshot: every replica row as of the end
+            of this probe round, with rows mutated by teardown/preemption
+            re-read from the DB. Callers can derive the service status from
+            it without re-deserializing the whole fleet.
         """
         # Reset the per-tick spec memo so this probe round reads each version's
         # spec from the DB at most once and never reuses a spec across ticks.
@@ -5630,7 +5636,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if info.status_property.should_track_service_status()
         ]
         if not infos_to_probe:
-            return
+            return infos
         if not self._is_pool:
             versions = {info.version for info in infos_to_probe}
             specs = {
@@ -5723,6 +5729,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             pending_writes: list[tuple[int, ReplicaInfo]] = []
             replicas_to_teardown: list[int] = []
+            preempted_replica_ids: set[int] = set()
             for future_result in probe_results:
                 info, probe_succeeded, probe_time = future_result
                 info.status_property.service_ready_now = probe_succeeded
@@ -5752,6 +5759,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # preemptive marking + teardown).
                         is_preempted = self._handle_preemption(info)
                     if is_preempted:
+                        preempted_replica_ids.add(info.replica_id)
                         continue
 
                     if info.first_not_ready_time is None:
@@ -5811,14 +5819,39 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
 
+        # The round mutated (and persisted) the in-memory `infos` objects, so
+        # they ARE the fresh fleet state -- except the few rows the teardown
+        # paths rewrote through their own DB re-read (_terminate_replica /
+        # _handle_preemption). Re-read only those by id so the returned
+        # snapshot matches a post-round full read without re-deserializing
+        # the whole fleet (a second full unpickle per 10s round is a real
+        # cost at ~1k replicas).
+        mutated_ids = set(replicas_to_teardown) | preempted_replica_ids
+        if not mutated_ids:
+            return infos
+        refreshed = serve_state.get_replica_infos_from_ids(
+            self._service_name, sorted(mutated_ids))
+        snapshot = []
+        for info in infos:
+            if info.replica_id not in mutated_ids:
+                snapshot.append(info)
+                continue
+            refreshed_info = refreshed.get(info.replica_id)
+            # A missing row means the teardown path already removed the
+            # replica record; a post-round full read would not see it either.
+            if refreshed_info is not None:
+                snapshot.append(refreshed_info)
+        return snapshot
+
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
         while True:
             logger.debug('Running replica prober.')
             try:
-                self._probe_all_replicas()
-                replica_infos = serve_state.get_replica_infos(
-                    self._service_name)
+                # Reuse the probe round's end-of-round snapshot instead of
+                # re-reading (and re-deserializing) the whole fleet from the
+                # DB a second time per tick.
+                replica_infos = self._probe_all_replicas()
                 # TODO(zhwu): when there are multiple load balancers, we need
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.

@@ -146,6 +146,8 @@ class TestProbeRoundBatching(unittest.TestCase):
                 serve_state, 'add_or_update_replica',
                 side_effect=AssertionError(
                     'probe round must not issue per-replica upserts')), \
+             mock.patch.object(serve_state, 'get_replica_infos_from_ids',
+                               return_value={}), \
              mock.patch.object(serve_state, 'set_service_uptime'):
             manager._terminate_replica.side_effect = (
                 lambda *a, **k: calls.append('teardown'))
@@ -223,6 +225,87 @@ class TestProbeRoundBatching(unittest.TestCase):
 
         mock_get_specs.assert_not_called()
         info.probe_pool.assert_called_once_with()
+
+    def test_probe_round_returns_fleet_snapshot_without_second_full_read(self):
+        manager = self._make_manager()
+        tracked = _replica_info(1, True)
+        untracked = _replica_info(2, True)
+        untracked.status_property.should_track_service_status.return_value = (
+            False)
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[tracked, untracked]) as full_read, \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(
+                 serve_state, 'get_replica_infos_from_ids',
+                 side_effect=AssertionError(
+                     'no teardown -> no keyed re-read')), \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'):
+            snapshot = manager._probe_all_replicas()
+
+        # One full-fleet deserialization per round, and the returned snapshot
+        # covers the whole fleet (untracked replicas included).
+        self.assertEqual(full_read.call_count, 1)
+        self.assertEqual(snapshot, [tracked, untracked])
+
+    def test_probe_round_rereads_torn_down_rows_and_drops_missing(self):
+        manager = self._make_manager()
+        # Replicas 2 and 3 fail past the (0s) consecutive-failure threshold
+        # -> teardown this round. Replica 2's row is rewritten by teardown;
+        # replica 3's row is removed entirely.
+        infos = [
+            _replica_info(1, True),
+            _replica_info(2, False),
+            _replica_info(3, False),
+        ]
+        refreshed_2 = _replica_info(2, False)
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(
+                 serve_state, 'get_replica_infos_from_ids',
+                 return_value={2: refreshed_2}) as keyed_read, \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'):
+            snapshot = manager._probe_all_replicas()
+
+        keyed_read.assert_called_once_with('svc', [2, 3])
+        self.assertEqual(snapshot, [infos[0], refreshed_2])
+
+    def test_prober_tick_feeds_snapshot_to_status_update(self):
+        manager = self._make_manager()
+        manager._update_mode = mock.Mock()
+        info = _replica_info(1, True)
+
+        class _StopLoop(BaseException):
+            pass
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[info]) as full_read, \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'set_service_status_and_active_versions_from_replica'
+             ) as status_update, \
+             mock.patch.object(replica_managers.time, 'sleep',
+                               side_effect=_StopLoop):
+            manager._get_endpoint_probe_interval_seconds = mock.Mock(
+                return_value=10)
+            with self.assertRaises(_StopLoop):
+                manager._replica_prober()
+
+        # The tick must not re-read the fleet for the status update: exactly
+        # one full read (inside the probe round), and the status update is
+        # fed the round's returned snapshot.
+        self.assertEqual(full_read.call_count, 1)
+        status_update.assert_called_once_with('svc', [info],
+                                              manager._update_mode)
 
     def test_no_tracked_replicas_skips_probe_round_work(self):
         manager = self._make_manager()

@@ -2075,7 +2075,10 @@ class TestInfrastructureInterruptionRecovery:
                                return_value=[info]), \
              mock.patch.object(replica_managers.serve_state,
                                'get_specs',
-                               return_value={1: mock.Mock()}):
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={}):
             manager._probe_all_replicas()
 
         manager._cloud_instance_looks_alive.assert_called_once_with(info)
