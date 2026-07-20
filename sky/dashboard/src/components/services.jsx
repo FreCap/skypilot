@@ -172,41 +172,63 @@ export function ServicesTable({
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const requestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
 
-  const fetchData = useCallback(async () => {
-    const requestVersion = requestVersionRef.current + 1;
-    requestVersionRef.current = requestVersion;
-    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
+  const runFetch = useCallback(
+    async (requestVersion) => {
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
 
-    setLoading(true);
-    try {
-      // The list view only needs per-service aggregates: use the cheap
-      // summary query (the full one serializes every replica and takes
-      // tens of seconds at fleet scale).
-      const servicesResponse = await dashboardCache.get(getServices, [
-        { summaryOnly: true },
-      ]);
-      if (!isCurrentRequest()) {
-        return;
+      setLoading(true);
+      try {
+        // The list view only needs per-service aggregates: use the cheap
+        // summary query (the full one serializes every replica and takes
+        // tens of seconds at fleet scale).
+        const servicesResponse = await dashboardCache.get(getServices, [
+          { summaryOnly: true },
+        ]);
+        if (!isCurrentRequest()) {
+          return;
+        }
+        setData(servicesResponse.services || []);
+        setControllerStopped(servicesResponse.controllerStopped || false);
+        if (onFetched) {
+          onFetched(new Date());
+        }
+      } catch (error) {
+        if (!isCurrentRequest()) {
+          return;
+        }
+        console.error('Failed to fetch services:', error);
+        setData([]);
+      } finally {
+        if (isCurrentRequest()) {
+          setLoading(false);
+          setIsInitialLoad(false);
+        }
       }
-      setData(servicesResponse.services || []);
-      setControllerStopped(servicesResponse.controllerStopped || false);
-      if (onFetched) {
-        onFetched(new Date());
+    },
+    [setLoading, onFetched]
+  );
+
+  const fetchData = useCallback(
+    ({ supersede = false } = {}) => {
+      if (activeRequestRef.current !== null && !supersede) {
+        return activeRequestRef.current;
       }
-    } catch (error) {
-      if (!isCurrentRequest()) {
-        return;
-      }
-      console.error('Failed to fetch services:', error);
-      setData([]);
-    } finally {
-      if (isCurrentRequest()) {
-        setLoading(false);
-        setIsInitialLoad(false);
-      }
-    }
-  }, [setLoading, onFetched]);
+
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const request = runFetch(requestVersion);
+      activeRequestRef.current = request;
+      return request.finally(() => {
+        if (activeRequestRef.current === request) {
+          activeRequestRef.current = null;
+        }
+      });
+    },
+    [runFetch]
+  );
 
   const sortedData = useMemo(() => {
     return sortData(data, sortConfig.key, sortConfig.direction);
@@ -215,13 +237,15 @@ export function ServicesTable({
   // Expose fetchData to parent component
   useEffect(() => {
     if (refreshDataRef) {
-      refreshDataRef.current = fetchData;
+      const refresh = () => fetchData({ supersede: true });
+      refreshDataRef.current = refresh;
+      return () => {
+        if (refreshDataRef.current === refresh) {
+          refreshDataRef.current = null;
+        }
+      };
     }
-    return () => {
-      if (refreshDataRef?.current === fetchData) {
-        refreshDataRef.current = null;
-      }
-    };
+    return undefined;
   }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
@@ -238,6 +262,7 @@ export function ServicesTable({
     return () => {
       isCurrent = false;
       requestVersionRef.current += 1;
+      activeRequestRef.current = null;
       clearInterval(interval);
     };
   }, [refreshInterval, fetchData]);
