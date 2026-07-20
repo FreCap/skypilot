@@ -1201,14 +1201,13 @@ class AWS(clouds.Cloud):
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
     def _aws_configure_list(cls) -> bytes | None:
-        cmd = 'aws configure list'
+        cmd = ['aws', 'configure', 'list']
         # Profile takes precedence over default configs.
         profile = aws.get_workspace_profile()
         if profile is not None:
             # If profile does not exist, we will get returncode 255.
-            cmd += f' --profile {profile}'
+            cmd.extend(['--profile', profile])
         proc = subprocess.run(cmd,
-                              shell=True,
                               check=False,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
