@@ -1648,6 +1648,12 @@ class ReplicaManager:
                                          str | None] | None = None
         self._logical_reconcile_snapshot: LogicalReconcileSnapshot | None = (
             None)
+        # Exact capacity/occupancy evidence paired with _logical_target when
+        # that target is published. A later LB sync may advance the live
+        # snapshot while the autoscaler is waiting for the manager lock; keep
+        # the decision snapshot so a fresh rolling-drain selection is not
+        # erased before it can be persisted.
+        self._logical_target_snapshot: LogicalReconcileSnapshot | None = None
         self._logical_state_lock = threading.RLock()
         self._logical_controller_epoch = uuid.uuid4().hex
         # Degraded replacements are protected from recursively replacing one
@@ -1723,6 +1729,40 @@ class ReplicaManager:
         """Publish the target computed from an exact reconcile generation."""
         with self._logical_state_lock:
             self._logical_target = (version, generation, target_capacity)
+            snapshot = self._logical_reconcile_snapshot
+            self._logical_target_snapshot = (
+                snapshot
+                if snapshot is not None and snapshot.version == version and
+                snapshot.generation == generation else None)
+
+    def _logical_scale_up_fence_holds(
+            self,
+            version: int,
+            decision_generation: int,
+            target_capacity: int,
+            require_exact_generation: bool = False) -> bool:
+        """Whether a logical scale-up intent is still authorized.
+
+        Capacity reports may advance while the autoscaler waits for the
+        replica-manager lock on a large fleet. A newer snapshot is stronger
+        capacity evidence, not a superseding demand decision. The separately
+        published target remains stamped with its producer generation and is
+        the authority that invalidates the intent when the autoscaler takes a
+        newer decision tick.
+        """
+        snapshot = self._logical_reconcile_snapshot
+        pending_version = getattr(self, '_pending_version', None)
+        generation_matches = (snapshot is not None and
+                              (snapshot.generation == decision_generation
+                               if require_exact_generation else
+                               snapshot.generation >= decision_generation))
+        return (snapshot is not None and snapshot.version == version and
+                generation_matches and
+                self._logical_snapshot_is_fresh(snapshot) and
+                self.latest_version == version and
+                (pending_version is None or pending_version <= version) and
+                self._logical_target == (version, decision_generation,
+                                         target_capacity))
 
     @staticmethod
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
@@ -2489,6 +2529,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         recovering_existing_replica: bool = False,
         logical_reconcile_fence: tuple[int, int, int] | None = None,
+        logical_reconcile_fence_requires_exact_generation: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -2759,13 +2800,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         if logical_reconcile_fence is not None:
             fence_version, fence_generation, fence_target = (
                 logical_reconcile_fence)
-            current_snapshot = self._logical_reconcile_snapshot
-            if (current_snapshot is None or
-                    current_snapshot.version != fence_version or
-                    current_snapshot.generation != fence_generation or
-                    not self._logical_snapshot_is_fresh(current_snapshot) or
-                    self.latest_version != fence_version or self._logical_target
-                    != (fence_version, fence_generation, fence_target)):
+            if not self._logical_scale_up_fence_holds(
+                    fence_version,
+                    fence_generation,
+                    fence_target,
+                    require_exact_generation=(
+                        logical_reconcile_fence_requires_exact_generation)):
                 logger.info('Logical launch selection was superseded before '
                             'row persistence; dropping the unpersisted pin.')
                 return False
@@ -2835,16 +2875,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             if logical_reconcile_fence is not None:
                 fence_version, fence_generation, fence_target = (
                     logical_reconcile_fence)
-                current_snapshot = self._logical_reconcile_snapshot
-                pending_version = getattr(self, '_pending_version', None)
-                if (current_snapshot is None or
-                        current_snapshot.version != fence_version or
-                        current_snapshot.generation != fence_generation or
-                        not self._logical_snapshot_is_fresh(current_snapshot) or
-                        self.latest_version != fence_version or
-                    (pending_version is not None and
-                     pending_version > fence_version) or self._logical_target
-                        != (fence_version, fence_generation, fence_target)):
+                if not self._logical_scale_up_fence_holds(
+                        fence_version,
+                        fence_generation,
+                        fence_target,
+                        require_exact_generation=(
+                            logical_reconcile_fence_requires_exact_generation)):
                     logger.info('Logical launch was superseded at its final '
                                 'row-persistence fence.')
                     return False
@@ -3156,6 +3192,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         logical_reconcile_fence: tuple[int, int, int] | None = None,
+        logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
     ) -> bool:
         """Allocate an id and enqueue one replica launch. Lock must be held.
@@ -3193,6 +3230,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if logical_reconcile_fence is not None:
                 launch_kwargs['logical_reconcile_fence'] = (
                     logical_reconcile_fence)
+                launch_kwargs[
+                    'logical_reconcile_fence_requires_exact_generation'] = (
+                        logical_reconcile_fence_requires_exact_generation)
             if unknown_capacity_replacement:
                 launch_kwargs['prior_unknown_capacity_replacement'] = True
             launched = self._launch_replica(self._next_replica_id,
@@ -3316,20 +3356,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale target sent to a physical '
                                'replica service.')
-        snapshot = self._logical_reconcile_snapshot
-        if (snapshot is None or snapshot.version != version or
-                snapshot.generation != reconcile_generation or
-                version != self.latest_version or
-                not self._logical_snapshot_is_fresh(snapshot)):
+        if not self._logical_scale_up_fence_holds(version, reconcile_generation,
+                                                  target_capacity):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
             return
-        if self._logical_target != (version, reconcile_generation,
-                                    target_capacity):
-            logger.info('Discarding logical scale-up intent whose target is '
-                        'not the manager\'s current published target.')
-            return
+        snapshot = self._logical_reconcile_snapshot
+        assert snapshot is not None
+        # An unknown backend may have recovered while this decision waited for
+        # the manager lock. A newer snapshot can safely narrow the bounded
+        # replacement set even though the still-current target remains valid.
+        if snapshot.generation != reconcile_generation:
+            replace_unknown_replica_ids = ()
+        else:
+            replace_unknown_replica_ids = tuple(
+                replica_id for replica_id in replace_unknown_replica_ids
+                if replica_id in snapshot.unknown_replica_ids)
 
         if not self._uses_shared_zero_cost_demand_budget():
             self._scale_up_to_logical_capacity_locked(
@@ -3407,16 +3450,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 demand_count_override=target_capacity - committed,
                 capacity_replica_infos=capacity_replica_infos)
         while committed < target_capacity:
-            current_snapshot = self._logical_reconcile_snapshot
-            pending_version = getattr(self, '_pending_version', None)
-            if (current_snapshot is None or
-                    current_snapshot.generation != reconcile_generation or
-                    current_snapshot.version != version or
-                    not self._logical_snapshot_is_fresh(current_snapshot) or
-                    self.latest_version != version or
-                (pending_version is not None and pending_version > version) or
-                    self._logical_target != (version, reconcile_generation,
-                                             target_capacity)):
+            if not self._logical_scale_up_fence_holds(
+                    version,
+                    reconcile_generation,
+                    target_capacity,
+                    require_exact_generation=bool(replace_unknown_replica_ids)):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
                 break
@@ -3424,6 +3462,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             launch_kwargs: dict[str, Any] = {}
             if replace_unknown_replica_ids:
                 launch_kwargs['unknown_capacity_replacement'] = True
+                launch_kwargs[
+                    'logical_reconcile_fence_requires_exact_generation'] = True
             launched = self._scale_up_one_locked(
                 None,
                 used_replica_ids,
@@ -4010,8 +4050,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         ready_capacity = 0
         for candidate in replica_infos:
             if (candidate.replica_id in excluded_replica_ids or
-                    candidate.is_terminal or candidate.version != version or
-                    not candidate.is_ready):
+                    candidate.is_terminal or not candidate.is_ready or
+                    getattr(candidate.status_property, 'is_scale_down',
+                            False) is True):
+                continue
+            if candidate.version < version:
+                ready_capacity += 1
+                continue
+            if candidate.version != version:
                 continue
             observed = snapshot.observed_slots_by_replica_id.get(
                 candidate.replica_id)
@@ -4753,7 +4799,18 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise RuntimeError('Logical scale-down sent to a physical '
                                'replica service.')
         with self._logical_state_lock:
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = getattr(self, '_logical_target_snapshot', None)
+            if snapshot is None:
+                # Compatibility for lightweight embedders/tests that publish
+                # the exact current snapshot and target directly instead of
+                # calling publish_logical_target(). This fallback cannot revive
+                # an overwritten production decision because generations only
+                # increase.
+                current_snapshot = self._logical_reconcile_snapshot
+                if (current_snapshot is not None and
+                        current_snapshot.version == version and
+                        current_snapshot.generation == reconcile_generation):
+                    snapshot = current_snapshot
             pending_version = getattr(self, '_pending_version', None)
             if (snapshot is None or snapshot.version != version or
                     snapshot.generation != reconcile_generation or
@@ -4779,10 +4836,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             for candidate in replica_infos:
                 committed_width = 0
                 ready_width = 0
-                if (not candidate.is_terminal and
-                        candidate.version == version and
-                        getattr(candidate.status_property, 'is_scale_down',
-                                False) is not True):
+                contributes = (not candidate.is_terminal and
+                               getattr(candidate.status_property,
+                                       'is_scale_down', False) is not True)
+                if contributes and candidate.version == version:
                     planned = int(getattr(candidate, 'planned_capacity', 1))
                     observed = snapshot.observed_slots_by_replica_id.get(
                         candidate.replica_id)
@@ -4793,8 +4850,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         committed_width = ready_width
                     else:
                         committed_width = planned
-                    ready_capacity += ready_width
-                    committed_capacity += committed_width
+                elif (contributes and candidate.version < version and
+                      candidate.is_ready):
+                    # Historical physical rows do not carry authoritative
+                    # logical widths, but every READY old backend provides at
+                    # least one serving slot. Match the rolling bridge's
+                    # conservative coverage floor at the final manager fence.
+                    committed_width = 1
+                    ready_width = 1
+                ready_capacity += ready_width
+                committed_capacity += committed_width
                 capacity_by_id[candidate.replica_id] = (committed_width,
                                                         ready_width)
 
@@ -4814,8 +4879,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 has_served = (info.status_property.first_ready_time is not None
                               and info.status_property.first_ready_time >= 0)
                 if not has_served:
-                    victim_width = (int(getattr(info, 'planned_capacity', 1))
-                                    if info.version == version else 0)
+                    victim_width = committed_width
                     if committed_capacity - victim_width < target_capacity:
                         continue
                     self._terminate_replica(replica_id,
@@ -4828,14 +4892,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                             snapshot.in_flight_by_replica_id.get(replica_id)
                             != 0):
                         continue
-                    victim_ready_width = 0
-                    if info.version == version:
+                    victim_ready_width = ready_width
+                    if info.version == version and victim_ready_width == 0:
                         observed = snapshot.observed_slots_by_replica_id.get(
                             replica_id)
                         if observed is None:
                             continue
-                        victim_ready_width = min(
-                            int(getattr(info, 'planned_capacity', 1)), observed)
                     if ready_capacity - victim_ready_width < target_capacity:
                         continue
                     self._defer_scale_down_until_idle(
