@@ -1,8 +1,19 @@
 """Test the GCP class."""
 
+from unittest import mock
+
 import pytest
 
 from sky.clouds import gcp as gcp_mod
+
+
+def test_failover_disk_tier_rejects_missing_fallback():
+    with mock.patch.object(gcp_mod.GCP,
+                           'check_disk_tier',
+                           return_value=(False, 'unsupported')):
+        with pytest.raises(AssertionError,
+                           match='Low disk tier should always be supported'):
+            gcp_mod.GCP.failover_disk_tier('n1-standard-4', None)
 
 
 class TestGetGpuImageId:
