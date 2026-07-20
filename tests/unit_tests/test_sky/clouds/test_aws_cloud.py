@@ -660,6 +660,16 @@ class TestAwsConfigureList:
 
     @mock.patch('sky.adaptors.aws.get_workspace_profile')
     @mock.patch('subprocess.run')
+    def test_missing_cli_returns_none(self, mock_run, mock_get_profile):
+        """Missing AWS CLI preserves the identity fallback contract."""
+        mock_get_profile.return_value = None
+        mock_run.side_effect = FileNotFoundError
+        aws_mod.AWS._aws_configure_list.cache_clear()
+
+        assert aws_mod.AWS._aws_configure_list() is None
+
+    @mock.patch('sky.adaptors.aws.get_workspace_profile')
+    @mock.patch('subprocess.run')
     def test_profile_name_passed_as_single_argument(self, mock_run,
                                                     mock_get_profile):
         """Profile names with spaces and quotes remain one CLI argument."""
