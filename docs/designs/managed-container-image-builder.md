@@ -847,8 +847,9 @@ It also adds `build_id` to canonical locations and replaces every affected
 named 023 contract in one transaction: artifact producer one-of; canonical
 origin one-of; location-state check with `BUILD_RESERVED`; lease-kind/state
 check with `BUILD_OUTPUT`; facet state check; builder claim/expiry/output partial
-indexes; the profile-activation active-lease predicate extended with
-BUILD_OUTPUT; ordinary COPY repair indexes that explicitly exclude it; and
+indexes; the uncapped profile-first
+`ix_ci_loc_activate_build_output` live-lease index and exact activation probe;
+ordinary COPY repair indexes that explicitly exclude BUILD_OUTPUT; and
 producer-aware lifecycle/purge predicates. SQLAlchemy enums,
 response validation, repair routines, and schema-parity fixtures change in the
 same builder merge train. A fresh database runs literal 022 to 023 to 024 and
@@ -863,20 +864,26 @@ ceiling held at 023. It continues distribution work but returns
 explicit 023 common-column projection and cannot select or write 024-only
 columns/enums; a superset ORM `SELECT *` is forbidden. Only after every API,
 controller, copy-worker, and purge-worker image-plane process reports API 63 and
-no API-62 database session remains does a dedicated Job take the shared
-compatibility advisory lock and apply 024. While admission is disabled, 024
-adds only nullable
-columns/tables and broader checks; it writes no BUILD producer, state, or lease
-value. API-63 processes then verify exact revision 024 before the ceiling is
-removed, and the same image rolls once more so every process starts on the 024
-projection. A still-restarting 023-projection process remains valid against the
-additive schema and cannot emit BUILD state.
+no API-62 database session remains does a dedicated Job take the exclusive
+compatibility advisory transaction lock. That preflight is operational evidence,
+not the safety boundary. Every image transaction has held the shared form since
+API 62. The Job waits for those transactions, locks the catalog singleton,
+rechecks revision 023, and atomically sets
+`minimum_image_api_version = 63`, applies 024, and stamps revision 024. While
+admission is disabled, 024 adds only nullable columns/tables and broader checks;
+it writes no BUILD producer, state, or lease value. A failed DDL transaction
+also rolls the fence back. After commit, every API-62 checkout, image operation,
+and readiness probe fails the database fence, including a process that began
+after the preflight. API-63 processes then verify exact revision 024 before the
+ceiling is removed, and the same image rolls once more so every process starts
+on the 024 projection. A still-restarting 023-projection API-63 process remains
+valid against the additive schema and cannot emit BUILD state.
 
 The API-63 activation transaction locks the catalog singleton, verifies
-migration 024 and healthy API/controller/publisher/purge capability evidence,
-then raises the migration-023 `minimum_image_writer_api_version` fence from 62
-to 63 before any builder intent is admitted. The first transaction that will
-create any 024-owned row or BUILD value sets the migration-023 catalog
+migration 024, the already-63 image-plane fence, and healthy
+API/controller/publisher/purge capability evidence before any builder intent is
+admitted. The first transaction that will create any 024-owned row or BUILD
+value sets the migration-023 catalog
 singleton's `builder_state_ever_created` flag TRUE while holding the phase-1
 lock, before it acquires any later-phase row. Migration 024 adds named BEFORE
 triggers on every builder table and BUILD-bearing distribution column that
@@ -885,15 +892,15 @@ trigger forbids TRUE-to-FALSE, so cleanup cannot erase the witness.
 
 Returning to API 62 before the witness is a guarded 024-to-023 schema downgrade,
 not a fence-only update. With builder admission disabled and API-63 plus
-builder/image-worker database sessions stopped, the downgrade takes the shared
-compatibility advisory lock and affected tables in global order, proves the
-witness false and every 024 row/BUILD value absent, then atomically restores the
-writer fence to 62, removes 024-owned schema, and stamps 023. API 62 starts only
-after that commit. Any witness or owned value makes PostgreSQL reject the whole
-downgrade and retain revision 024/fence 63. Once the flag is TRUE, rollback is
-only to a 024-aware API-63 binary with builder admission disabled. API-62
-image-plane/schema rollback is permanently forbidden, while unrelated
-operations remain available during an API-63 binary rollback.
+builder/image-worker database sessions stopped, the downgrade takes the
+exclusive compatibility advisory lock and affected tables in global order,
+proves the witness false and every 024 row/BUILD value absent, then atomically
+restores the image-plane fence to 62, removes 024-owned schema, and stamps 023.
+API 62 starts only after that commit. Any witness or owned value makes
+PostgreSQL reject the whole downgrade and retain revision 024/fence 63. Once the
+flag is TRUE, rollback is only to a 024-aware API-63 binary with builder
+admission disabled. API-62 image-plane/schema rollback is permanently forbidden,
+while unrelated operations remain available during an API-63 binary rollback.
 
 One `container_image_context_uploads` row contains only:
 
@@ -1148,7 +1155,8 @@ attempt that reaches canonical reservation:
 
 ```text
 build_id, retry_generation, attempt_number, attempt_token_hash,
-image_id, canonical_location_id, digest, platform_set, reserved_bytes,
+image_id, canonical_location_id, digest, platform_set,
+verified_materialized_bytes BIGINT,
 state RESERVED|COPYING|VERIFYING|READY|CANCEL_REQUESTED|FAILED,
 lease_owner/token/expires_at, error_code NULL, created_at, updated_at
 
@@ -1163,8 +1171,9 @@ canonical location, attempt/output. It then:
 
 1. revalidates generation, attempt, and attempt token and rejects a digest whose
    artifact is TOMBSTONED, PURGING, or PURGED permanently;
-2. for a new digest, reserves artifact, location, and exact logical byte quota,
-   creates the ACTIVE `managed_build` artifact, creates its canonical
+2. for a new digest, reserves artifact and location, sets the location's exact
+   `charged_materialized_bytes` plus workspace counter, creates the ACTIVE
+   `managed_build` artifact, creates its canonical
    `origin_kind=BUILD` location in `BUILD_RESERVED`, and inserts the RESERVED
    output lease with the generation, attempt, and token hash;
 3. for a prior provisional output from this same build, reacquires it only
@@ -1176,8 +1185,9 @@ canonical location, attempt/output. It then:
 5. for an ACTIVE same-digest artifact with no canonical location under the
    requested managed profile, preserves its initial producer and every existing
    location, requires its stored platform/size evidence to match the independent
-   staging verifier, reserves only the new location and exact materialized-byte
-   quota, creates a BUILD-origin canonical location for this build in
+   staging verifier, sets only the new location's exact
+   `charged_materialized_bytes` and workspace counter, creates a BUILD-origin
+   canonical location for this build in
    `BUILD_RESERVED`, and inserts the RESERVED output lease; or
 6. rejects an ACTIVE artifact whose requested profile already has a non-READY
    canonical location owned by another source or build with closed
@@ -1188,10 +1198,14 @@ Artifact count is never charged for an existing digest. The READY convergence
 path charges neither location nor bytes again; the new-profile BUILD route
 charges exactly one location and its materialized bytes because it creates new
 physical custody.
-`reserved_bytes` is the verified manifest's logical compressed size, the same
-counter definition used by distribution quota, rather than an estimate of
-provider layer deduplication. Failure to reserve it ends the attempt before
-canonical paid I/O. No source row or release is created.
+The catalog location's nullable `charged_materialized_bytes`, not the output's
+immutable `verified_materialized_bytes` evidence, is the sole
+distribution-quota authority. A named check requires the output evidence to be
+nonnegative. The builder sets both values to the verifier's logical compressed
+size, rather than an estimate of provider layer deduplication, in the reservation
+transaction. Failure to reserve it ends the attempt before canonical paid I/O.
+The output row retains the independently measured size for equality checks. No
+source row or release is created.
 
 Only the current RESERVED output lease can obtain short-lived authority for its
 exact stored-assigned-shard canonical repository and immutable tag. The trusted
@@ -1200,7 +1214,8 @@ sets the output and location to COPYING, copies the exact staging digest, then
 sets VERIFYING and independently verifies the destination. A reclaimed lease
 always inspects the immutable destination before copying, so a crash after push
 converges without rewriting an immutable tag. The READY transaction takes the
-same locks, rechecks ACTIVE lifecycle, exact profile, quota reservation,
+same locks, rechecks ACTIVE lifecycle, exact profile, the non-null location
+charge equal to independently verified staging size,
 generation, attempt, both lease tokens, digest, platform/config evidence, and
 origin binding, then atomically marks location, output, and build READY and
 stores `output_image_id` and `canonical_location_id`. A convergence candidate
@@ -1212,10 +1227,10 @@ location's BUILD origin without rewriting the artifact's initial producer.
 Regional copies and runtime validation follow the recorded exact canonical
 origin. Release publication is a separate post-READY artifact publication.
 
-A stale publisher may finish staging inspection or even canonical I/O after losing its
-token, but it cannot adopt the result. The provisional artifact, location,
-reserved bytes, and output record already exist, so there is no rowless
-canonical orphan. Ambiguous or failed canonical outcomes remain charged and
+A stale publisher may finish staging inspection or even canonical I/O after
+losing its token, but it cannot adopt the result. The provisional artifact,
+location, authoritative location byte charge, and output record already exist,
+so there is no rowless canonical orphan. Ambiguous or failed canonical outcomes remain charged and
 are inspected under the output lease. After the lease settles, a FAILED or
 CANCELLED build output with no release, publication, source alias, durable
 reference, or other READY build is eligible after retention for the catalog's
@@ -1638,20 +1653,28 @@ Catalog integration tests cover fresh literal 022-to-023-to-024 migration,
 metadata parity, API-63-at-023 schema-ceiling compatibility with builder routes
 closed, SQL capture proving every distribution query/write uses only the 023
 projection before migration and remains valid after additive 024, migration-Job
-refusal while any API-62 process/session remains, exact revision-024 restart,
-and API-62 startup rejection against 024. They prove
-atomic minimum-writer activation before any BUILD value, expired old-lease
-recovery, transactional first-state setting of the irreversible builder witness,
+refusal while any API-62 process/session remains, an API-62 process beginning
+after preflight and racing checkout/read/readiness against the exclusive
+migration transaction, exact revision-024 restart, and database-fenced API-62
+rejection after commit. They prove the 62-to-63 minimum-image-plane transition
+is atomic with 024, rolls back with failed DDL, and precedes every BUILD value;
+an API-62 distribution claim committed immediately before the exclusive lock
+can finish only provider I/O, has its later heartbeat/finalizer rejected, and is
+recovered by API 63 after exact lease expiry;
+expired old-lease recovery, transactional first-state setting of the
+irreversible builder witness,
 direct-write rejection while that witness is FALSE, and TRUE-to-FALSE
 rejection. A pre-witness locked 024-to-023 downgrade restores the fence to 62
 only after exact absence; every witness/row/value and old/new writer race keeps
 revision 024 and fence 63. Tests also cover post-state API-62 rollback rejection,
-disabled-builder API-63 rollback, activation fencing, the
-named constraint replacement, pre-I/O artifact/location/byte reservation,
+disabled-builder API-63 rollback, activation fencing including an uncapped live
+twentieth BUILD_OUTPUT claim, the named constraint replacement, pre-I/O
+artifact/location/byte reservation,
 generation/attempt/token-scoped output and staging records, crashes and stale
 attempts before and after canonical push, immutable-tag recovery, cancellation
 races, no rowless canonical content, ordinary abandoned-output tombstone/purge,
-DELETE_UNKNOWN charging, concurrent identical build convergence, READY
+DELETE_UNKNOWN charging, per-location byte authority and workspace-sum repair,
+concurrent identical build convergence, READY
 same-digest convergence, creation of a new BUILD-origin managed canonical route
 for an ACTIVE external-only same digest without rewriting initial provenance,
 collision with SOURCE or other-BUILD non-READY routes, tombstoned and purged
@@ -1697,7 +1720,7 @@ BuildKit build and cache hit, one ECR publication, dashboard production
 build/manual pass, Terraform validation, and a security review of the executor,
 Job manifest, and credential scopes. The activation runbook proves the
 dedicated tainted builder pool, sandbox RuntimeClass, fixed builder namespace,
-reserved prototype-workspace exclusion, minimum-writer-version transition,
+reserved prototype-workspace exclusion, minimum-image-version transition,
 admission policy, writable-volume allowlist, network policy, node-loss cleanup,
 and disabled-builder behavior before and after Helm rollback. The builder joins
 the distribution design's exhaustive paired exact-head implementation gate only

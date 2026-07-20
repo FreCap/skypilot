@@ -150,15 +150,16 @@ constraint, queue/claim index, active-revision join index, and catalog-query
 index described below. The catalog singleton includes the nonnegative central
 config generation, 64-hex image-config digest, and a bounded JSONB apply-result
 ledger used by the atomic activation protocol, plus
-`minimum_image_writer_api_version` initialized to 62 and monotonic
+`minimum_image_api_version` initialized to 62 and the monotonic
 `distribution_state_ever_created`/`builder_state_ever_created` booleans
 initialized FALSE. A named migration-023 trigger rejects either flag changing
 from TRUE to FALSE. The first durable distribution mutation sets the
 distribution flag while holding the phase-1 catalog lock; named BEFORE triggers
 on distribution-owned rows reject creation before that flag is TRUE. Every
-API-62 image read,
-mutation, worker claim, heartbeat, and finalizer checks that fence before it can
-decode or write polymorphic location/provenance state. Each ledger entry
+image read, mutation, worker claim, heartbeat, and finalizer takes the shared
+compatibility advisory transaction lock and checks the singleton fence before
+it can decode or write polymorphic
+location/provenance state. Each ledger entry
 contains a UUIDv7 idempotency key, request hash, committed generation and config
 digest, and completion time. A database check caps it at 256 entries. Unexpired
 entries are
@@ -176,11 +177,12 @@ mandatory `api_server_config` row with an empty mapping only when the row is
 absent. It then installs a named
 `trg_config_yaml_image_writer_fence` `BEFORE INSERT OR UPDATE OR DELETE`
 trigger, the `pol_config_yaml_image_reader_fence` forced-RLS policy, and the
-schema-qualified `container_image_require_api_62()` and
+schema-qualified `container_image_require_api_62()`,
+`container_image_require_current_api()`, and
 `container_image_guard_config_write()` functions with pinned search paths. The
 trigger rejects every
 writer whose session API version is below the catalog's
-`minimum_image_writer_api_version`, and it rejects deletion of the mandatory
+`minimum_image_api_version`, and it rejects deletion of the mandatory
 row. The RLS predicate raises, rather than filtering the row, when the session
 API version is absent, malformed, or below 62. `ENABLE ROW LEVEL SECURITY` plus
 `FORCE ROW LEVEL SECURITY` makes the predicate apply to the table owner too.
@@ -193,20 +195,37 @@ API 62 sets the transaction-independent custom PostgreSQL setting
 before its first application statement, including fresh connections after pool
 recycle. Alembic's separately constructed migration connection sets the same
 value at the start of 023 before it enables the guard. The setting is a
-compatibility declaration, not an authorization
-credential. API 61 and older binaries do not set it, so their mandatory
-startup/config-reload query raises at the database boundary and they cannot
-fall back to file configuration. The write trigger additionally fences an
-already-running old writer that was waiting on the config row. Future APIs may
-read ordinary configuration at version 62 after builder activation, but the
-write trigger follows `minimum_image_writer_api_version`, so an API-62 process
-cannot overwrite API-63 image configuration. Managed-image operations retain
-their narrower catalog fence. New migration code also rejects a database
-revision newer than its compiled target instead of treating it as current. API
-startup performs that check for every central Alembic history before readiness,
-not only on the first lazy table access; the sole lower-revision exception is an
-explicit deployment schema ceiling with its corresponding feature routes
-closed.
+compatibility declaration, not an authorization credential. API 61 and older
+binaries do not set it, so their mandatory startup/config-reload query raises at
+the database boundary and they cannot fall back to file configuration. The
+write trigger additionally fences an already-running old writer that was
+waiting on the config row.
+
+At revision 023 or later, every synchronous and asynchronous pool checkout runs
+a short transaction that takes the fixed shared compatibility advisory lock and
+calls `container_image_require_current_api()`. Every image read transaction,
+mutation, queue claim, heartbeat, finalizer, config reload, and readiness check
+repeats that sequence before touching image state; the transaction keeps the
+shared advisory lock until its image statements commit, then follows the normal
+phase-1 singleton lock mode required by that operation. Schema migration and
+whole-config activation take the exclusive form of that same advisory lock.
+Concurrent image operations remain mutually compatible,
+but a migration waits for all short in-flight image transactions and prevents a
+new one from crossing its fence update. A connection checked out before a fence
+change is not trusted by a later operation. Against the explicitly tolerated
+revision-022 ceiling, the checkout instead proves that all image routes are
+closed because the singleton and function do not exist yet.
+
+The config-row read policy remains the fixed API-62 bootstrap guard, while the
+config write trigger and every image-plane operation follow
+`minimum_image_api_version`. Thus an API-62 binary cannot read image state,
+write API-63 image configuration, or remain ready after the fence advances,
+even though ordinary version-62 config reads still have a decodable schema.
+New migration code also rejects a database revision newer than its compiled
+target instead of treating it as current. API startup performs that check for
+every central Alembic history before readiness, not only on the first lazy table
+access; the sole lower-revision exception is an explicit deployment schema
+ceiling with its corresponding feature routes closed.
 
 Migration 023 creates external-OCI-only artifact provenance and
 SOURCE-only canonical origins. It never creates the obsolete single-counter
@@ -228,33 +247,42 @@ routes `IMAGE_SCHEMA_PENDING` but continues revision-023 distribution work
 through a frozen 023 common-column projection that never selects or writes a
 024-added column or enum. Distribution queries name their columns explicitly;
 they do not use a superset ORM `SELECT *` or live reflection.
-After the live-version and database-session preflight proves no API-62
-image-plane process remains, a dedicated Job takes the compatibility advisory
-lock and applies 024. It writes no BUILD producer, state, or lease value. The
-ceiling is then removed and every API-63 process verifies exact revision 024.
-The same image is rolled once more so every process starts with the 024
-projection before builder activation. During that short restart overlap,
-revision-023 projection processes remain valid against the additive 024 schema
-and still cannot emit BUILD state.
 
-API-63 builder activation atomically advances
-`minimum_image_writer_api_version` to 63 before the first builder row or BUILD
-value can commit. The first transaction that creates any migration-024 row or
-BUILD-owned value also sets `builder_state_ever_created` TRUE under that same
-phase-1 lock before acquiring later-phase rows. Migration 024 installs named
-BEFORE triggers on every builder table and every BUILD-bearing column that
-reject the value unless the flag is already TRUE; the monotonic migration-023
-trigger makes the historical witness irreversible.
+The live-version and database-session preflight must report no API-62 image-plane
+process, but it is an operational check rather than the safety fence. The
+dedicated Job takes the exclusive compatibility advisory transaction lock,
+waits for all earlier shared image transactions, locks the catalog singleton
+`FOR UPDATE`, rechecks exact revision 023, and in one PostgreSQL transaction
+sets `minimum_image_api_version = 63`, applies 024, and stamps revision 024. It
+writes no BUILD producer, state, or lease value. Rollback of any DDL also rolls
+back the fence. After commit, every API-62 pool checkout, image transaction, and
+readiness probe fails at the database boundary. An API-62 process that started
+after the preflight either finished a shared transaction before the exclusive
+lock or observes fence 63 afterward; it cannot survive the migration through a
+TOCTOU window.
+
+API-63 processes verify exact revision 024 before the ceiling is removed, and
+the same image rolls once more so every process starts with the 024 projection
+before builder activation. During that short restart overlap, revision-023
+projection processes remain valid against the additive 024 schema and still
+cannot emit BUILD state. API-63 builder activation verifies the already-63
+image-plane fence and healthy capability evidence; it does not change the
+schema-compatibility fence. The first transaction that creates any
+migration-024 row or BUILD-owned value sets `builder_state_ever_created` TRUE
+under that same phase-1 lock before acquiring later-phase rows. Migration 024
+installs named BEFORE triggers on every builder table and every BUILD-bearing
+column that reject the value unless the flag is already TRUE; the monotonic
+migration-023 trigger makes the historical witness irreversible.
 
 A pre-witness return to API 62 is likewise a schema rollback, never a fence-only
 change. With builder admission disabled, the supported rollback stops API-63
 and builder/image-worker database sessions for a short maintenance window. The
-024 downgrade takes the compatibility advisory lock and all affected tables in
-global order, requires `builder_state_ever_created = FALSE`, and proves the
+024 downgrade takes the exclusive compatibility advisory lock and all affected
+tables in global order, requires `builder_state_ever_created = FALSE`, and proves the
 absence of every 024 row and BUILD-owned value. Only then does one transaction
-restore `minimum_image_writer_api_version = 62`, remove the 024 schema changes,
+restore `minimum_image_api_version = 62`, remove the 024 schema changes,
 and stamp revision 023 before API 62 starts. Any witness or owned value raises
-in PostgreSQL and preserves revision 024 plus the writer fence. Once builder
+in PostgreSQL and preserves revision 024 plus the image-plane fence. Once builder
 state exists, rollback is only to a migration-024-aware API-63 binary with
 builder admission disabled; API-62 image-plane and schema rollback are
 permanently forbidden. Unrelated operations remain available during an API-63
@@ -314,7 +342,7 @@ admission, stops API and image-worker database sessions for this short
 maintenance window, runs that guarded downgrade, and only then starts a
 below-62 binary. This prevents a version-62 writer from recreating state across
 the downgrade boundary. After either monotonic flag becomes TRUE, rollback is
-only to a migration-aware binary at or above its minimum writer fence.
+only to a migration-aware binary at or above its minimum image-plane fence.
 
 Future image migrations use ordinary expand, dual-read/write where needed,
 backfill, and contract phases. They do not inherit a standing right to revoke
@@ -1063,8 +1091,9 @@ rows, independent of the number of workspaces or artifacts.
 
 The workspace quota row tracks artifact, active release-name-reservation,
 lifetime publication-generation, retained publication-record, and
-location-record counts plus READY materialized bytes. Artifact, publication,
-and location-intent creation reserve count quota in their transaction. One
+location-record counts plus bytes reserved for physical materializations.
+Artifact, publication, and location-intent creation reserve count quota in their
+transaction. One
 publication consumes one workspace and one per-artifact lifetime-generation
 slot, both non-releasable, plus the active digest-bound name reservations and one retained
 publication-record slot before copy work begins. At most 256 lifetime
@@ -1073,18 +1102,26 @@ restores only the active name reservation; its lifetime slots remain charged
 forever and its retained record remains charged until terminal-history
 compaction. Finalizing its release
 does not consume a second slot, and FAILED or CANCELLED state does not free
-either permanently digest-bound reservation. Before registry I/O, the worker inspects exact
-manifest size and atomically reserves byte quota when configured; a race that
-loses quota does not begin the copy or publish a release. Eviction or confirmed
-purge releases READY byte quota, while location-record quota is released only
-when an orphaned
+either permanently digest-bound reservation. Before registry I/O, the worker
+inspects exact manifest size and atomically writes that location's nullable
+`charged_materialized_bytes` while incrementing the workspace byte counter. A
+configured maximum is enforced in that transaction; a race that loses quota
+does not begin the copy or publish a release. Ambiguous and failed managed
+outcomes retain that charge. Confirmed eviction or purge clears it exactly once,
+while location-record quota is released only when an orphaned
 historical row or terminal publication is compacted under its audit retention
 policy. Compaction first writes the bounded immutable outcome to the audit sink,
 then removes the query row and releases only retained publication-record or
 location-record quota. User retries
 increment a per-location generation counter and require an admin after the
-workspace limit. Quota counters are repaired from source tables by a bounded
-operator reconciliation job and never trusted to authorize a negative count.
+workspace limit. The authoritative repair equation is
+`workspace.materialized_bytes =
+COALESCE(SUM(container_image_locations.charged_materialized_bytes), 0)` over
+non-null rows
+in that workspace. A workspace-scoped operator reconciliation locks the quota
+row, computes that sum through the workspace/charge index, and repairs only that
+row; it never scans or locks another workspace. Quota counters are never trusted
+to authorize a negative count.
 
 `revision` is a positive monotonic administrator-controlled generation for the
 complete profile. Any endpoint, ownership, manager identity, purge identity,
@@ -1119,19 +1156,40 @@ profile credentials.
 An older API or worker replica cannot roll the policy back, and two different
 configurations cannot claim the same revision. Advancing a revision never waits
 inside its transaction. After taking its earlier config/catalog and profile
-locks, activation uses one partial profile-prefixed `LIMIT 1` probe for live
-COPY, EXTERNAL_VERIFY, ordinary EVICT, and READY VERIFY leases. A hit aborts the
-whole config apply immediately with closed `IMAGE_PROFILE_BUSY`; the caller
-retries with bounded jitter after the owning worker commits or the lease
-expires. Because every new claim needs the already-held catalog/profile fence,
-no lease can appear between the locked probe and head update. Historical
+locks, activation runs four exact profile-prefixed `LIMIT 1` probes for live
+COPY, EXTERNAL_VERIFY, ordinary EVICT, and READY VERIFY leases. Migration 023
+creates one activation-only partial index for each kind, keyed
+`(distribution, profile_revision, lease_expires_at, id)`. Their literal
+predicates require the kind's structurally complete lease and
+`purge_generation = 0`, but deliberately contain no `attempt_count` predicate;
+the query adds the half-open `lease_expires_at > :locked_now` bound. Migration
+024 adds the fifth exact index/probe for a live BUILD_OUTPUT location lease,
+also without an attempt cap. A hit aborts the whole config apply immediately
+with closed `IMAGE_PROFILE_BUSY`; the caller retries with bounded jitter after
+the owning worker commits or the lease expires. Thus a live twentieth claim is
+visible even though its future expired-reclaim path requires operator action.
+Because every new claim needs the already-held catalog/profile fence, no lease
+can appear between the locked probes and head update. Historical
 PURGE_DELETE/PURGE_INSPECT leases deliberately use retained custody and do not
-require an active head. Migration 024 replaces the predicate to include live
-BUILD_OUTPUT leases, so profile activation cannot strand a builder publication
-mid-copy. There is no persistent draining state or in-transaction polling in
-v0.
-Keeping those kinds separate lets PostgreSQL use its state-specific partial
-indexes instead of scanning an OR-shaped profile predicate. Activation inserts
+require an active head. There is no persistent draining state or in-transaction
+polling in v0. Keeping the activation kinds separate lets PostgreSQL use exact
+partial indexes instead of scanning an OR-shaped profile predicate. The four
+migration-023 names are `ix_ci_loc_activate_copy`,
+`ix_ci_loc_activate_external_verify`, `ix_ci_loc_activate_evict`, and
+`ix_ci_loc_activate_verify`; migration 024 adds
+`ix_ci_loc_activate_build_output`. Their exact predicates are:
+
+| Activation index | Literal predicate |
+| --- | --- |
+| COPY | `ownership_kind = 'MANAGED' AND purge_generation = 0 AND state = 'COPYING' AND lease_kind = 'COPY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| EXTERNAL_VERIFY | `ownership_kind = 'EXTERNAL' AND purge_generation = 0 AND state = 'VERIFYING' AND lease_kind = 'EXTERNAL_VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| EVICT | `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation = 0 AND state = 'EVICTING' AND lease_kind = 'EVICT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| VERIFY | `purge_generation = 0 AND state = 'READY' AND target_ref IS NOT NULL AND verification_requested_at IS NOT NULL AND lease_kind = 'VERIFY' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+| BUILD_OUTPUT, migration 024 | `ownership_kind = 'MANAGED' AND canonical IS TRUE AND purge_generation = 0 AND origin_kind = 'BUILD' AND state = 'COPYING' AND lease_kind = 'BUILD_OUTPUT' AND lease_owner IS NOT NULL AND lease_owner <> '' AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL` |
+
+No predicate contains `attempt_count`, `next_retry_at`, or a database clock.
+Each probe binds the exact old active revision and adds
+`lease_expires_at > :locked_now`. Activation inserts
 the immutable revision/custody snapshot and changes only the head authority row.
 It never rewrites the dominant profile
 location population. Old rows become ineligible immediately through the head
@@ -1161,7 +1219,7 @@ reported as applied.
 The central PostgreSQL configuration row and global image profile heads are one
 authority boundary. Migration 023 extends the singleton
 `container_image_catalog` row with `active_config_generation`,
-`active_image_config_digest`, `minimum_image_writer_api_version`, and
+`active_image_config_digest`, `minimum_image_api_version`, and
 the monotonic `distribution_state_ever_created` and
 `builder_state_ever_created` witnesses, plus `config_apply_results`, the bounded
 JSONB apply-result ledger described above. Apply keys are UUIDv7 values, are accepted
@@ -1371,7 +1429,10 @@ moves the handle and reference to the current revision.
 One row per workspace stores `artifact_count`, `release_reservation_count`,
 non-releasable `publication_generation_count`, retained
 `publication_record_count`, `location_record_count`, and `materialized_bytes`
-as nonnegative counters plus update time. PostgreSQL
+as nonnegative counters plus update time. `materialized_bytes` means reserved
+logical compressed bytes for every location whose
+`charged_materialized_bytes` is non-null, including failed or ambiguous
+materializations, rather than only READY bytes. PostgreSQL
 check constraints reject negative or signed-64-bit-overflow values. All quota
 authorizations lock this row before the artifact/location they may create, so
 concurrent users cannot oversubscribe a limit. Policy limits remain validated
@@ -1380,8 +1441,10 @@ the counters. `artifact_count` is deliberately a lifetime distinct-digest count:
 creating the first `(workspace, digest)` increments it exactly once, and
 tombstone, purge, audit compaction, or release removal never decrements it. A
 workspace that exhausts this v0 safety bound must receive an explicit quota
-increase or use a new workspace. Materialized-byte and compactable child-record
-counters are released under their narrower proved-absence rules. Every newly
+increase or use a new workspace. The byte counter is reconstructible exactly as
+the indexed sum of non-null per-location charges. Materialized-byte and
+compactable child-record counters are released under their narrower
+proved-absence rules. Every newly
 inserted publication row increments `publication_generation_count` exactly
 once, and no release, retry, purge, audit compaction, or row deletion decrements
 it. That lifetime counter is the finite bound on the immutable audit history.
@@ -1703,6 +1766,8 @@ existing bytes.
 One row per artifact and materialization identity:
 
 - stable location ID;
+- denormalized workspace plus artifact ID, protected by the artifact binding and
+  used by bounded queue and quota-repair indexes;
 - distribution name and target display name;
 - lowercase 64-hex physical destination fingerprint, separate lowercase
   64-hex policy fingerprint, profile revision, target-custody ID, realm
@@ -1724,11 +1789,38 @@ One row per artifact and materialization identity:
   immutable `source_id` or `build_id`; regional rows inherit this provenance
   through their exact canonical location and carry neither field themselves;
 - secret-free digest-pinned destination reference;
+- nullable nonnegative `charged_materialized_bytes BIGINT`; NULL is the sole
+  uncharged representation, while a non-null value, including zero, is the
+  authoritative workspace quota charge for this physical location;
 - state; closed migration-023 lease kind
   `COPY|VERIFY|EXTERNAL_VERIFY|EVICT|PURGE_DELETE|PURGE_INSPECT`; fenced lease;
   retry, verification, use, and eviction metadata. Migration 024 adds
   `BUILD_RESERVED` plus the generation/attempt/token-bound `BUILD_OUTPUT` lease
   kind.
+
+Migration 023 adds a partial workspace-first index on
+`(workspace, charged_materialized_bytes, id) WHERE charged_materialized_bytes IS
+NOT NULL` and a named nonnegative check. The workspace counter and location
+field change in the same phase-2/phase-8 transaction. The field has these closed
+transitions:
+
+| Location path | Byte-charge transition |
+| --- | --- |
+| new managed SOURCE canonical or regional intent | starts NULL; after exact source inspection and before any registry authority or I/O, NULL becomes the exact logical compressed size and the workspace counter increases once |
+| new external adoption intent | starts NULL; successful destination verification reserves the exact size in the READY transaction, while absence, mismatch, or `EXTERNAL_BYTE_QUOTA_EXCEEDED` leaves it NULL |
+| migration-024 BUILD_RESERVED output | the reservation transaction sets the exact independently verified staging size before publisher authority or canonical I/O |
+| COPY, VERIFY, EXTERNAL_VERIFY, READY, FAILED, MISSING, EVICTING, or DELETE_UNKNOWN | preserves the existing NULL or non-null value; retry never charges a non-null row twice, and verification loss never guesses that bytes disappeared |
+| rematerialization of an EVICTED uncharged location | rechecks current quota and sets the exact charge before new I/O |
+| confirmed managed eviction/purge or exact external purge acknowledgement | atomically clears a non-null charge and decrements the workspace counter once; a repeated terminal transition observes NULL and is a no-op |
+| location compaction | allowed only while the field is NULL |
+
+Once non-null, the byte value is immutable until confirmed absence clears it. A
+later inspection that computes a different size fails closed rather than
+rewriting quota evidence. Deterministic pre-I/O cancellation may release a
+charge only through the same fenced absence-inspection terminal transition;
+ordinary failure alone never does. Workspace repair takes the quota lock and
+sums this field, so an uncharged external quota failure, an ambiguous managed
+copy, and a BUILD_RESERVED output are distinguishable after any crash.
 
 The physical fingerprint excludes profile and target aliases, provider adapter
 labels, account/project/region metadata, and auth configuration. It includes
@@ -1870,7 +1962,7 @@ uses the same phases, with keys sorted lexicographically inside each phase:
 
 | Phase | Rows or locks |
 | --- | --- |
-| 0 | fixed compatibility advisory transaction lock, only for whole-config writes and schema migration |
+| 0 | fixed compatibility advisory transaction lock, shared by every image transaction/check and exclusive for whole-config writes or schema migration |
 | 1 | central `config_yaml` row when needed, then catalog singleton/config generation |
 | 2 | distribution workspace quota, builder workspace quota, builder UTC-day usage, then realm generation/allocation |
 | 3 | profile head, immutable revision, and target custody |
@@ -1910,7 +2002,7 @@ uses 1/2/6/7; active cancellation that has output custody uses
 1/2/3/4/5/6/8/10/13/14, and artifact tombstone/purge walks
 1/2/5/6/7/8/9/10/11/12/13/14. Every managed-image mutation and worker claim
 takes `FOR KEY SHARE` on the phase-1 catalog singleton and verifies its locally
-loaded config generation plus `minimum_image_writer_api_version`; bounded reads
+loaded config generation plus `minimum_image_api_version`; bounded reads
 check the same version before decoding polymorphic state. A first-state writer
 takes `FOR UPDATE` instead, monotonically sets the appropriate distribution or
 builder witness before later phases, and cannot clear it. Config apply takes
@@ -2115,8 +2207,9 @@ claim. Reconciliation listing, reconciliation claiming, eviction listing, and
 eviction claiming use independent cursors. End-of-table wrap is another
 bounded keyset query, never an `OFFSET` or full-table materialization. Repeated
 calls therefore revisit every profile while each call retains a fixed work
-budget at the parser's 256-active-profile ceiling. Retained purge custody uses
-its separate custody cursor and never inflates this active-head scan.
+budget at the parser's 256-active-profile ceiling. Purge discovery instead uses
+its global eligible-work indexes below and never enumerates retained custody or
+inflates this active-head scan.
 Each cursor also rotates the returned page, preserving alternating profile
 fairness when a small catalog wraps on every call.
 For regional work, the first phase starts from state-specific partial indexes
@@ -2124,14 +2217,14 @@ containing only rows whose denormalized exact-canonical dependency is READY.
 The READY dependency is therefore an index predicate, not a filter that the
 optimizer can satisfy by scanning dependency-blocked regional rows.
 Migration 023 spells the partial predicates literally. Every ordinary managed
-canonical index begins with:
+automatic-work canonical index begins with:
 
 ```text
 ownership_kind = 'MANAGED' AND purge_generation = 0
   AND canonical IS TRUE AND attempt_count < 20
 ```
 
-Every ordinary managed regional index begins with:
+Every ordinary managed automatic-work regional index begins with:
 
 ```text
 ownership_kind = 'MANAGED' AND purge_generation = 0
@@ -2168,9 +2261,12 @@ ordinary `VERIFY` queue because it performs no source reconstruction.
 The ordered columns contain the corresponding due timestamp followed by `id`;
 `next_retry_at <= :now` and `lease_expires_at <= :now` remain runtime scan bounds
 because PostgreSQL partial predicates cannot contain the changing database
-clock.
+clock. The `< 20` base is confined to fresh/retry and complete or incomplete
+automatic-reclaim indexes. It is absent from the five activation-only live-lease
+indexes above.
 
-External adoption has separately named canonical and regional indexes. Their
+External adoption has separately named automatic-work canonical and regional
+indexes. Their
 keys are `(distribution, profile_revision, <order-column>, id)`, so each probe
 binds the exact active profile returned by the bounded profile-head cursor and
 does not need an unbounded workspace enumeration. The canonical base is:
@@ -2210,11 +2306,15 @@ ix_ci_loc_ext_regional_lease
 ix_ci_loc_ext_regional_incomplete
 ```
 
-Purge indexes never join the active profile head. The purge worker rotates at
-most 16 retained `target_custody_id` values through independent listing and
-claim primary-key keyset cursors; end-of-catalog wrap is one bounded query, and
-seek-forward uses the same per-custody collision budget as copy claims. Every
-index begins with that ID. Regional predicates begin
+Purge indexes never join the active profile head and never enumerate retained
+custody. Each of the sixteen state-specific partial indexes is global across
+custodies, keyed `(<order-column>, id)` and including `target_custody_id`,
+`artifact_id`, and `canonical_location_id` for index-only discovery. Listing
+and claiming keep independent queue-kind keyset cursors; a lost cursor or worker
+restart begins again at the oldest globally eligible item, not at the first of
+possibly millions of empty custodies. Discovery work is therefore proportional
+to eligible or contended locations in that queue, never to total historical
+custody cardinality. Regional predicates begin
 `ownership_kind = 'MANAGED' AND canonical IS FALSE AND purge_generation > 0
 AND purge_attempt_count < 20`;
 canonical predicates begin the literal base:
@@ -2280,13 +2380,16 @@ partial indexes so `BUILD_RESERVED`, a BUILD-origin COPYING/FAILED row, and a
 repair predicate. PostgreSQL partial-index planner matching for every family,
 including zero-eligible and late-eligible populations, is checked in rather
 than assumed.
-The second phase takes the shared
-profile-generation lock, the exact canonical lock, and the regional row lock
-in the established order, then rechecks every safety predicate on the selected
-primary-key row. PostgreSQL uses `FOR UPDATE SKIP LOCKED` for the final row
-lock. Workers that initially route to the same row seek forward through the
-index until they claim distinct work, with a hard per-profile seek budget so a
-single claim cannot retain the generation lock across an unbounded race set.
+The second phase for availability work takes the shared profile-generation lock,
+the exact canonical lock, and the regional row lock in the established order.
+For purge, the global index first yields an unlocked location ID and its retained
+custody ID; the claim transaction then locks that exact custody in phase 3,
+artifact in phase 5, and canonical/regional locations in phase 8 before
+rechecking every predicate. PostgreSQL uses `FOR UPDATE SKIP LOCKED` for the
+final row lock. Workers that initially route to the same row seek forward
+through the relevant global or profile index until they claim distinct work,
+with a hard per-queue seek budget so a single claim cannot retain earlier locks
+across an unbounded race set.
 Claiming never groups or sorts the full eligible location queue. Reconcilers
 take compatible `FOR KEY SHARE` locks on
 one generation, so hundreds of workers can claim different rows in the same
@@ -2416,8 +2519,11 @@ managed content. Canonical deletion is allowed only after every managed
 regional location is EVICTED and every external location is acknowledged.
 
 PURGED is committed only when every SkyPilot-controlled manifest reference has
-been proven absent, every managed location is EVICTED, and every external
-location is `EXTERNAL_PURGED`. This proves loss of runtime reachability
+been proven absent, every managed location is EVICTED, every external location
+is `EXTERNAL_PURGED`, and every location's `charged_materialized_bytes` is NULL.
+The location terminal transactions have already decremented the workspace
+counter, so artifact finalization never performs a second byte release. This
+proves loss of runtime reachability
 through SkyPilot, not physical blob erasure: managed v0 roots are single image
 manifests, and ECR or another registry may retain their unreferenced shared
 layers until provider garbage collection.
@@ -2502,8 +2608,10 @@ in `PURGE_PENDING`, `EVICTING`, or `DELETE_UNKNOWN`. It uses the exact retained
 target-custody ID and its immutable `purge_identity` credential generation plus
 principal fingerprint, artifact/location ID, purge generation, expected digest,
 owner, random token, and lease expiry.
-Its bounded custody cursor and the exact partial indexes above are the only
-discovery path. Regional work is claimable first. A canonical claim is
+The global state-and-due partial indexes above are the only automatic discovery
+path; they reveal eligible location IDs without scanning historical custody,
+then the claim locks the row's one exact retained custody. Regional work is
+claimable first. A canonical claim is
 eligible only after a locked recheck proves every managed regional location
 EVICTED and every external location EXTERNAL_PURGED. Provider I/O occurs after
 the short claim transaction. Claim and completion lock the catalog fence,
@@ -3236,12 +3344,15 @@ Unit tests must cover:
 - fresh real-PostgreSQL 022-to-023 migration from frozen literal DDL, exact
   parity with checked-in distribution metadata, the exact 17-table inventory
   listed above with every named check/index/foreign key, absence of obsolete
-  legacy tables/columns, the API-62 minimum-writer fence, both monotonic
+  legacy tables/columns, the API-62 minimum-image-plane fence, both monotonic
   state-ever-created witnesses and TRUE-to-FALSE trigger, atomic first
   distribution-state marking, and no live-metadata imports. A version-61-style
   connection without the custom setting cannot read or write the mandatory
   config row and its server bootstrap fails; sync/async version-62 connections
   survive pool recycle; a superuser or `BYPASSRLS` application role is rejected;
+  SQL instrumentation enumerates every image read, mutation, worker claim,
+  heartbeat, finalizer, config reload, pool-checkout, and readiness entry point
+  and proves it takes the shared compatibility lock and current-API check;
   the staged 022 rollout keeps image routes closed; and the dedicated Job
   refuses migration while a below-62 live replica remains. A locked clean
   downgrade restores 022, while either witness, any owned row, image config,
@@ -3420,7 +3531,10 @@ Unit tests must cover:
   interleavings in which a committed live lease returns `IMAGE_PROFILE_BUSY`
   without polling under config/catalog/head locks, the worker finalizes after
   that rollback, and a bounded-jitter retry succeeds; an exactly expired lease
-  cannot block activation or let its stale finalizer commit;
+  cannot block activation or let its stale finalizer commit; a live twentieth
+  COPY, VERIFY, EVICT, or EXTERNAL_VERIFY claim remains visible through its
+  uncapped activation-only index while its expired automatic-reclaim index is
+  correctly exhausted, and migration 024 proves the same for BUILD_OUTPUT;
 - expired COPYING and EVICTING settlement after canonical loss, followed by
   successful profile repair in real PostgreSQL;
 - exact-expiry READY verification fencing and malformed future COPY lease
@@ -3473,15 +3587,19 @@ Unit tests must cover:
 - partial reconciliation and eviction index predicates exclude exhausted
   automatic attempts, including zero-eligible PostgreSQL proofs;
 - disjoint fresh and deferred verification/eviction queues, state-specific
-  active-lease probes, PostgreSQL partial-index plans, and bounded
+  uncapped activation-only active-lease probes, PostgreSQL partial-index plans,
+  and bounded
   `EXPLAIN ANALYZE` behavior for activation plus all list/claim paths;
 - all eight canonical/regional external-adoption and all sixteen
   regional/canonical purge partial indexes use their frozen literal predicates,
-  profile-first or custody-first keys, ordering columns, attempt counters,
+  profile-first or global due-work keys, ordering columns, attempt counters,
   due-time scan bounds, lease-kind checks, and independent keyset cursors;
   exact-profile external probes require no workspace enumeration, and
   million-row zero/late-eligible plans cannot scan blocked dependencies, active
-  heads for historical purge, or another queue family;
+  heads, empty retained custodies for historical purge, or another queue family;
+  with one due purge behind one million retained custodies, discovery reads the
+  one global eligible entry before locking only its exact custody, and worker
+  restart does not reintroduce custody-cardinality work;
 - named location checks and partial indexes make ordinary MANAGED,
   EXTERNAL-adoption, MANAGED-purge, EXTERNAL-purge, and migration-024 BUILD
   families disjoint by ownership, purge generation, state, origin, and exact
@@ -3539,10 +3657,14 @@ Unit tests must cover:
   schema, ordering, idempotence, correction audit, and managed/external state
   constraints; exact ownership and digest fences; DELETE_UNKNOWN and
   preexisting MISSING absence inspection; retry; build-output lease exclusion
-  plus narrowly qualified `BUILD_OUTPUT_ABANDONED`; audit retention; quota
-  release only after proved deletion and at PURGED; lifetime artifact count and
-  PURGED digest row never released or resurrected while byte/child quota is
-  released exactly once; and absence of delete actions from the dashboard;
+  plus narrowly qualified `BUILD_OUTPUT_ABANDONED`; audit retention; every
+  SOURCE, external, BUILD_RESERVED, failure, retry, verification-loss, eviction,
+  and purge byte-charge transition; per-location quota release only after proved
+  deletion or exact external acknowledgement, with PURGED requiring every charge
+  NULL; workspace repair equaling the sum of non-null per-location charges;
+  lifetime artifact count and PURGED digest row never released or resurrected
+  while byte/child quota is released exactly once; and absence of delete actions
+  from the dashboard;
 - purge API intent-only behavior; a separately deployed ServiceAccount/role
   claiming only PURGING work; inability of API/copy identities to assume that
   role; exact retained `purge_identity` selection; same-generation
@@ -3571,9 +3693,15 @@ Unit tests must cover:
   representable config/head split;
 - staged API-63-at-023 builder rollout, migration-Job rejection while any API-62
   process/session remains, exact 023 common-column SQL projection across the
-  additive migration, revision-024 restart/verification, and API-62 startup
-  rejection against 024; atomic writer-fence 62-to-63 activation before the
-  first BUILD value; expired old-lease recovery; atomic first-state setting of
+  additive migration, and a forced API-62-start/check-out/image-operation race
+  against the exclusive 024 transaction proving the shared transaction lock and
+  atomic minimum-image-plane-fence update admit no TOCTOU survivor; an API-62
+  claim committed just before that lock may finish only its out-of-transaction
+  provider call, while its heartbeat/finalizer is rejected and API 63 recovers
+  the fenced lease after expiry;
+  revision-024 restart/verification and API-62 readiness rejection against 024;
+  the already-63 fence before the first BUILD value; expired old-lease recovery;
+  atomic first-state setting of
   the irreversible builder witness; rejection of 024 or BUILD writes while it
   is FALSE and of TRUE-to-FALSE updates; guarded pre-witness 024-to-023
   downgrade plus fence restoration; and permanent API-62 image-plane/schema
