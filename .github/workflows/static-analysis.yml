@@ -82,7 +82,7 @@ jobs:
           python -m mypy.stubtest \
             sky.skylet.log_lib sky.utils.command_runner \
             --concise \
-            --ignore-missing-stub \
+            --allowlist .stubtest-allowlist \
             --mypy-config-file .stubtest.ini
 
   async-lifecycle:

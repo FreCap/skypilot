@@ -98,6 +98,13 @@ next_target = min(raw_target, current_committed_capacity + step)
 Current committed capacity is latest-version nonterminal planned logical
 capacity, including ready and provisioning backends. This prevents repeated
 ticks from authorizing the same missing capacity while launches are pending.
+On a version update, the previous version's adopted target is not treated as
+already-authorized capacity for the new version. When the wave limiter is
+enabled, the new version resets its adopted target to `min_replicas`; the next
+fresh or stale recompute may then authorize at most one wave above the new
+version's committed capacity. This keeps a rolling update from inheriting an
+arbitrarily large target and launching that entire target from zero in one
+reconciliation.
 Because the adopted target is controller-local, the first fresh recompute
 after a controller rebuild first raises its actuation baseline to current
 committed capacity. Any lower raw demand then goes through the ordinary
@@ -113,6 +120,63 @@ The limiter applies to demand-driven logical scale-up, including the stale
 arrival floor. It does not throttle failed replica cleanup, explicit service
 operations, or old-version retirement. Unknown-capacity replacement remains
 bounded by its existing incident controls.
+
+### Rolling replacement bridge
+
+A logical rolling update must not wait for latest-version ready capacity to
+reach the complete adopted target before retiring any old backend. That rule
+can deadlock convergence when replacement supply is scarce, and it preserves a
+large obsolete fleet even when current demand is small.
+
+Old physical backends predate authoritative logical-width observations. Treat
+each READY old backend as a conservative floor of one logical slot. For every
+fresh demand report, calculate:
+
+```text
+coverage_target = max(raw_target, adopted_target)
+
+required_ready_old_backends = max(
+    0,
+    coverage_target - latest_version_ready_logical_capacity)
+
+excess_ready_old_backends = max(
+    0,
+    ready_old_backends - required_ready_old_backends)
+```
+
+An old backend that is not READY contributes no serving coverage and may be
+retired first. A READY old backend is eligible only when the load balancer
+reports it idle. Retire at most 20 eligible old physical backends per
+autoscaler tick, taking non-READY backends before excess idle READY backends.
+Busy or occupancy-unknown old backends remain protected. The conservative
+one-slot floor guarantees the remaining old backend count plus observed latest
+logical capacity is never below the larger of raw demand and the adopted
+target.
+
+The 20-backend cap bounds each transition without tying rollout progress to a
+wall-clock rate limit. If five new logical slots become ready, up to five
+additional READY old backends become excess. If the old fleet was already far
+above the coverage target, repeated 20-backend batches remove that proven
+excess even before replacement supply reaches the complete target. Stale
+demand reports continue to prohibit all rolling retirement. A pending logical
+scale-up wave does not block the bridge because the raw-demand side of the
+coverage target already protects work that the adopted target has not reached.
+
+### Load-balancer demand handoff
+
+An HA load-balancer promotion temporarily preserves the previous active slot's
+demand gauges so a cold promoted process cannot prove idle capacity and trigger
+an early drain. The 60-second handoff countdown starts after the promoted,
+authoritative slot reports the complete demand-gauge contract: in-flight work,
+queue depth, retained and recent rejections, and explicit unknown-occupancy
+URLs. It does not wait for every backend occupancy probe to succeed.
+
+Backends missing a fresh occupancy sample remain represented in the current
+report's unknown set and stay individually protected from retirement. Coupling
+the whole demand handoff to complete occupancy would instead let one
+unreachable backend preserve an obsolete queue or rejection snapshot forever.
+Older load balancers that omit any required demand gauge continue to hold the
+handoff floor, preserving mixed-version safety.
 
 ### Scale-down wave
 
@@ -188,8 +252,15 @@ occupancy as fail-closed active work.
 ### 3. Bounded actuation
 
 Apply the scale-up wave to fresh and stale target increases. Persist its
-timestamp through in-process service updates. Apply the 50 percent downscale
-wave after hysteresis and reset the counter after each permitted reduction.
+timestamp through in-process service updates. Reset a newly committed
+version's adopted target to its minimum so an inherited old-version target
+cannot bypass the first wave. Apply the 50 percent downscale wave after
+hysteresis and reset the counter after each permitted reduction. During a
+logical rolling update, preserve coverage using observed latest-version
+logical capacity plus a conservative one-slot floor per READY old backend, and
+retire eligible old physical backends in batches of at most 20 per tick.
+Start the HA demand-handoff expiry from the first complete authoritative demand
+gauge report even when some backend occupancy samples remain unknown.
 
 ### 4. Production consumer and rollout
 
@@ -229,11 +300,19 @@ Rejected. Actual occupancy is more reliable for accepted asynchronous jobs,
 and pure request rate loses the safety floor for long-running and
 unknown-occupancy work.
 
-### Apply scale limits to rollout retirement
+### Wait for complete latest-version capacity before any retirement
 
-Rejected. A rollout is not an ordinary demand decrease, and rate-limiting old
-version cleanup can prolong duplicate fleets. Rollout convergence remains
-separately observable and busy old replicas remain protected.
+Rejected. It prevents progress when the latest version cannot acquire the full
+target and keeps obvious old-version excess online. Coverage can instead be
+proven incrementally from latest logical capacity plus a conservative
+one-slot-per-old-backend floor.
+
+### Apply the five-minute demand rate limit to rollout retirement
+
+Rejected. A rollout is not an ordinary demand decrease, and waiting five
+minutes between old-version batches would prolong duplicate fleets. The
+per-tick 20-backend batch is an actuation bound, while busy-backend and fresh
+demand coverage checks provide the safety gate.
 
 ## Rollout and rollback
 
@@ -266,8 +345,17 @@ rate to 100, then restore the previous control-plane image if required.
   shrink capacity.
 - Verify 50 percent downscale requires a fresh complete five-minute window per
   wave and works for mixed 1, 4, and 8-slot backends.
-- Verify busy replica, rolling update, failed cleanup, and cost-rebalance safety
-  remain unchanged or exempt as specified.
+- Verify logical rolling retirement starts before latest capacity reaches the
+  complete target, never reduces conservative coverage below raw or adopted
+  demand, retires non-READY old backends first, protects busy or unknown old
+  backends, and emits no more than 20 victims per tick.
+- Verify an authoritative HA demand report starts the handoff expiry when all
+  demand gauges are present, while incomplete or legacy reports retain the
+  previous floor. Missing occupancy samples must still protect those replicas
+  through the unknown-occupancy set without preserving stale queue or rejection
+  gauges.
+- Verify failed cleanup and cost-rebalance safety remain unchanged or exempt as
+  specified.
 - Run focused Serve tests, format changed files, then rerun the focused suite.
 
 ## Manual production test

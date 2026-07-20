@@ -446,6 +446,10 @@ class RequestsAggregator:
         """Add a request to the request aggregator."""
         raise NotImplementedError
 
+    def add_rejection(self) -> None:
+        """Record one terminal load-balancer rejection."""
+        raise NotImplementedError
+
     def clear(self) -> None:
         """Clear all current request aggregator."""
         raise NotImplementedError
@@ -500,6 +504,8 @@ class RequestTimestamp(RequestsAggregator):
         # acknowledged minute advances the same cumulative counter.
         self._request_history: dict[int, int] = {}
         self._acknowledged_request_history: dict[int, int] = {}
+        self._rejection_history: dict[int, int] = {}
+        self._acknowledged_rejection_history: dict[int, int] = {}
         # Pruning rebuilds both bounded history dictionaries. Keep that work on
         # minute boundaries (and controller snapshots), never on every request.
         self._last_pruned_request_history_bucket: int | None = None
@@ -526,12 +532,24 @@ class RequestTimestamp(RequestsAggregator):
         if bucket_start != self._last_pruned_request_history_bucket:
             self._prune_request_history(bucket_start)
 
+    def add_rejection(self) -> None:
+        """Record one terminal 503 in its completion-minute bucket."""
+        timestamp = time.time()
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
+        self._rejection_history[bucket_start] = (
+            self._rejection_history.get(bucket_start, 0) + 1)
+        if bucket_start != self._last_pruned_request_history_bucket:
+            self._prune_request_history(bucket_start)
+
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
         self.compatibility_profiles.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
+        self._rejection_history.clear()
+        self._acknowledged_rejection_history.clear()
         self._last_pruned_request_history_bucket = None
 
     def _prune_request_history(self, newest_bucket: int) -> None:
@@ -548,6 +566,16 @@ class RequestTimestamp(RequestsAggregator):
             for bucket, count in self._acknowledged_request_history.items()
             if bucket >= oldest_bucket
         }
+        self._rejection_history = {
+            bucket: count
+            for bucket, count in self._rejection_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._acknowledged_rejection_history = {
+            bucket: count
+            for bucket, count in self._acknowledged_rejection_history.items()
+            if bucket >= oldest_bucket
+        }
         self._last_pruned_request_history_bucket = newest_bucket
 
     def request_history_snapshot(self) -> dict[str, Any] | None:
@@ -555,12 +583,23 @@ class RequestTimestamp(RequestsAggregator):
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
         self._prune_request_history(newest_bucket)
-        buckets = [{
-            'bucket_start': bucket,
-            'request_count': count,
-        }
-                   for bucket, count in sorted(self._request_history.items())
-                   if count > self._acknowledged_request_history.get(bucket, 0)]
+        bucket_starts = sorted(
+            set(self._request_history) | set(self._rejection_history))
+        buckets = []
+        for bucket in bucket_starts:
+            request_count = self._request_history.get(bucket, 0)
+            rejected_count = self._rejection_history.get(bucket, 0)
+            if (request_count <= self._acknowledged_request_history.get(
+                    bucket, 0) and
+                    rejected_count <= self._acknowledged_rejection_history.get(
+                        bucket, 0)):
+                continue
+            bucket_payload = {
+                'bucket_start': bucket,
+                'request_count': request_count,
+                'rejected_count': rejected_count,
+            }
+            buckets.append(bucket_payload)
         if not buckets:
             return None
         return {
@@ -581,13 +620,19 @@ class RequestTimestamp(RequestsAggregator):
         for bucket in snapshot.get('buckets', []):
             bucket_start = bucket.get('bucket_start')
             request_count = bucket.get('request_count')
+            rejected_count = bucket.get('rejected_count', 0)
             current_count = self._request_history.get(bucket_start)
-            if current_count is None:
-                continue
-            accepted_count = min(current_count, request_count)
-            self._acknowledged_request_history[bucket_start] = max(
-                accepted_count,
-                self._acknowledged_request_history.get(bucket_start, 0))
+            if current_count is not None:
+                accepted_count = min(current_count, request_count)
+                self._acknowledged_request_history[bucket_start] = max(
+                    accepted_count,
+                    self._acknowledged_request_history.get(bucket_start, 0))
+            current_rejected = self._rejection_history.get(bucket_start)
+            if current_rejected is not None:
+                accepted_rejected = min(current_rejected, rejected_count)
+                self._acknowledged_rejection_history[bucket_start] = max(
+                    accepted_rejected,
+                    self._acknowledged_rejection_history.get(bucket_start, 0))
 
     def drain(self) -> dict[str, Any]:
         """Take the current timestamps, leaving later arrivals untouched."""

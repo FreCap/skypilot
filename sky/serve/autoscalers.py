@@ -27,6 +27,8 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
+_LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
+
 
 class AutoscalerDecisionOperator(enum.Enum):
     SCALE_UP = 'scale_up'
@@ -3484,6 +3486,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
+        if (self.replica_unit == 'logical' and
+                self.max_scale_up_rate_percentage is not None):
+            # target_num_replicas described the previous version's launch
+            # intent.  The new version has no committed capacity yet, so
+            # carrying that target across the update would let its first
+            # reconciliation bypass the scale-up wave and launch the whole
+            # inherited target from zero.  Start at the new minimum; the next
+            # fresh or stale recompute authorizes at most one configured wave.
+            self.target_num_replicas = self.min_replicas
         self._snap_target_on_next_recompute = True
         self._last_logical_target_state = None
 
@@ -3502,40 +3513,71 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         - SIGNAL GAP: no retirements at all while the demand report is
           stale (a rebuilt controller at target=min_replicas would
           otherwise mass-retire a live fleet before the first sync).
-        - Idle-preferred victims: among READY old replicas, busy ones
-          (fresh in-flight > 0 or unknown) are preferentially KEPT as
-          coverage, so the retired remainder skews to idle replicas and
-          mid-job kills are avoided when coverage allows. This is a
-          preference, not a hard gate -- a rolling update must still
-          complete when every old replica is busy.
+        - Idle-only victims: among READY old replicas, busy ones (fresh
+          in-flight > 0 or unknown) are kept as coverage so in-progress jobs
+          are never aborted. They become eligible on a later idle tick.
         """
         if not self._fresh_for_tick():
             return []
-        if self._upscale_pending:
-            logger.info('Concurrency autoscaler suppressing outdated-replica '
-                        'drain while an upscale is pending hysteresis.')
-            return []
-        if self.replica_unit == 'logical':
+        if (self.replica_unit == 'logical' and
+                self.update_mode == serve_utils.UpdateMode.ROLLING):
             old_nonterminal = [
                 info for info in replica_infos
-                if info.version < self.latest_version and not info.is_terminal
+                if (info.version < self.latest_version and not info.is_terminal
+                    and getattr(info.status_property, 'is_scale_down',
+                                False) is not True)
             ]
             if not old_nonterminal:
                 return []
             latest_ready_capacity = sum(
                 self._ready_capacity(info)
                 for info in replica_infos
-                if info.version == self.latest_version)
-            if latest_ready_capacity < self.get_final_target_num_replicas():
-                # The activation bridge deliberately gives legacy backends no
-                # inferred logical width. Launch and observe the complete new
-                # logical target before retiring any old backend.
-                return []
-            return [
-                info.replica_id
-                for info in old_nonterminal
-                if not self._replica_is_busy(info)
+                if (info.version == self.latest_version and getattr(
+                    info.status_property, 'is_scale_down', False) is not True))
+
+            # Old physical rows predate authoritative logical-width reports.
+            # Every READY backend nevertheless represents at least one serving
+            # slot, so counting one slot per old backend is a conservative
+            # coverage floor. Keep enough old READY backends to cover both raw
+            # demand and the adopted target while latest-version observed
+            # logical capacity comes online. This permits incremental rollout
+            # progress even when the complete latest target cannot be placed.
+            coverage_target = max(self.get_final_target_num_replicas(),
+                                  self._raw_target_num_replicas)
+            old_ready = [info for info in old_nonterminal if info.is_ready]
+            required_ready_old = max(0, coverage_target - latest_ready_capacity)
+            excess_ready_old = max(0, len(old_ready) - required_ready_old)
+
+            # Never-served old replicas add no live coverage and can be
+            # retired first. Probe-blipped or occupancy-unknown backends still
+            # count as busy through _replica_is_busy and remain protected.
+            idle_nonready_old = [
+                info for info in old_nonterminal
+                if not info.is_ready and not self._replica_is_busy(info)
             ]
+            idle_ready_old = [
+                info for info in old_ready if not self._replica_is_busy(info)
+            ]
+            batch_limit = _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK
+            selected_nonready = _select_nonterminal_replicas_to_scale_down(
+                min(batch_limit, len(idle_nonready_old)), idle_nonready_old)
+            remaining_limit = batch_limit - len(selected_nonready)
+            selected_ready = _select_nonterminal_replicas_to_scale_down(
+                min(remaining_limit, excess_ready_old, len(idle_ready_old)),
+                idle_ready_old)
+            selected = selected_nonready + selected_ready
+            logger.info(
+                'Logical rolling drain: coverage_target=%s, '
+                'latest_ready_capacity=%s, ready_old=%s, '
+                'required_ready_old=%s, idle_nonready_old=%s, '
+                'selected=%s.', coverage_target, latest_ready_capacity,
+                len(old_ready), required_ready_old, len(idle_nonready_old),
+                len(selected))
+            return selected
+        if self._upscale_pending:
+            logger.info('Concurrency autoscaler suppressing outdated-replica '
+                        'drain while an upscale is pending hysteresis.')
+            return []
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
             return super()._select_outdated_replicas_to_scale_down(
                 replica_infos, active_versions)

@@ -67,9 +67,20 @@ serve_request_activity_history_table = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
     sqlalchemy.Column('request_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('rejected_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default=sqlalchemy.text('0')),
+    sqlalchemy.Column('rejection_count_available',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
     sqlalchemy.CheckConstraint(
         'request_count >= 0',
         name='serve_request_activity_history_nonnegative'),
+    sqlalchemy.CheckConstraint(
+        'rejected_count >= 0',
+        name='serve_request_activity_history_rejected_nonnegative'),
 )
 sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.service_name,
@@ -77,6 +88,46 @@ sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.bucket_start.desc())
 sqlalchemy.Index('serve_request_activity_history_bucket_idx',
                  serve_request_activity_history_table.c.bucket_start)
+
+serve_autoscaler_history_table = sqlalchemy.Table(
+    'serve_autoscaler_history',
+    metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      primary_key=True),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('controller_session_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('version', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('replica_unit', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('demand_target', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('capacity_target', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('ready_capacity', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('provisioning_capacity',
+                      sqlalchemy.Integer,
+                      nullable=False),
+    sqlalchemy.Column('total_capacity', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('peak_in_flight', sqlalchemy.Integer, nullable=True),
+    sqlalchemy.Column('peak_queue_depth', sqlalchemy.Integer, nullable=True),
+    sqlalchemy.CheckConstraint(
+        'version >= 1 AND demand_target >= 0 AND capacity_target >= 0 AND '
+        'ready_capacity >= 0 AND provisioning_capacity >= 0 AND '
+        'total_capacity >= 0 AND (peak_in_flight IS NULL OR '
+        'peak_in_flight >= 0) AND (peak_queue_depth IS NULL OR '
+        'peak_queue_depth >= 0)',
+        name='serve_autoscaler_history_nonnegative'),
+    sqlalchemy.CheckConstraint('capacity_target >= demand_target',
+                               name='serve_autoscaler_history_capacity_target'),
+)
+sqlalchemy.Index('serve_autoscaler_history_lookup_idx',
+                 serve_autoscaler_history_table.c.service_name,
+                 serve_autoscaler_history_table.c.service_hash,
+                 serve_autoscaler_history_table.c.bucket_start.desc())
+sqlalchemy.Index('serve_autoscaler_history_bucket_idx',
+                 serve_autoscaler_history_table.c.bucket_start)
 
 _COUNT_COLUMNS = (
     'ready_count',
@@ -223,6 +274,9 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
                 sqlalchemy.delete(serve_request_activity_history_table).where(
                     serve_request_activity_history_table.c.bucket_start <
                     cutoff))
+            connection.execute(
+                sqlalchemy.delete(serve_autoscaler_history_table).where(
+                    serve_autoscaler_history_table.c.bucket_start < cutoff))
     return len(history_rows)
 
 
@@ -260,6 +314,8 @@ def _request_history_rows(
             raise ValueError('request_history bucket must be an object.')
         bucket_start = bucket.get('bucket_start')
         request_count = bucket.get('request_count')
+        rejection_count_available = 'rejected_count' in bucket
+        rejected_count = bucket.get('rejected_count', 0)
         if (not isinstance(bucket_start, int) or
                 isinstance(bucket_start, bool) or
                 bucket_start % BUCKET_SECONDS != 0):
@@ -269,9 +325,16 @@ def _request_history_rows(
             raise ValueError('request_history bucket_start must be unique.')
         seen_bucket_starts.add(bucket_start)
         if (not isinstance(request_count, int) or
-                isinstance(request_count, bool) or request_count <= 0):
-            raise ValueError('request_history request_count must be a positive '
-                             'integer.')
+                isinstance(request_count, bool) or request_count < 0):
+            raise ValueError('request_history request_count must be a '
+                             'nonnegative integer.')
+        if (not isinstance(rejected_count, int) or
+                isinstance(rejected_count, bool) or rejected_count < 0):
+            raise ValueError('request_history rejected_count must be a '
+                             'nonnegative integer.')
+        if request_count == 0 and rejected_count == 0:
+            raise ValueError('request_history bucket must contain a request '
+                             'or rejection count.')
         bucket_datetime = _utc_datetime(bucket_start)
         if not oldest_bucket <= bucket_datetime <= newest_bucket:
             raise ValueError('request_history bucket_start is outside the '
@@ -283,6 +346,8 @@ def _request_history_rows(
             'bucket_start': bucket_datetime,
             'observed_at': observed_at,
             'request_count': request_count,
+            'rejected_count': rejected_count,
+            'rejection_count_available': rejection_count_available,
         })
     return rows
 
@@ -314,6 +379,8 @@ def record_request_activity(
         insert = postgresql.insert(serve_request_activity_history_table).values(
             rows)
         excluded = insert.excluded
+        rejection_available = (
+            serve_request_activity_history_table.c.rejection_count_available)
         connection.execute(
             insert.on_conflict_do_update(
                 index_elements=[
@@ -329,8 +396,143 @@ def record_request_activity(
                     'request_count': sqlalchemy.func.greatest(
                         serve_request_activity_history_table.c.request_count,
                         excluded.request_count),
+                    'rejected_count': sqlalchemy.func.greatest(
+                        serve_request_activity_history_table.c.rejected_count,
+                        excluded.rejected_count),
+                    'rejection_count_available': sqlalchemy.or_(
+                        rejection_available,
+                        excluded.rejection_count_available),
                 }))
     return len(rows)
+
+
+def _nonnegative_int(value: Any,
+                     field: str,
+                     *,
+                     nullable: bool = False) -> int | None:
+    if value is None and nullable:
+        return None
+    if (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+        suffix = ' or null' if nullable else ''
+        raise ValueError(f'{field} must be a nonnegative integer{suffix}.')
+    return value
+
+
+def record_autoscaler_snapshot(
+    service_name: str,
+    service_hash: str,
+    controller_session_id: str,
+    *,
+    version: int,
+    replica_unit: str,
+    demand_target: int,
+    capacity_target: int,
+    ready_capacity: int,
+    provisioning_capacity: int,
+    total_capacity: int,
+    peak_in_flight: int | None = None,
+    peak_queue_depth: int | None = None,
+    timestamp: float | None = None,
+) -> int:
+    """Persist one controller-authored autoscaler observation.
+
+    Latest target/capacity fields win within a minute while pressure gauges
+    retain their peak. Non-PostgreSQL deployments accept and drop the sample.
+    """
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash):
+        raise ValueError('service_name and service_hash must be non-empty.')
+    if (not isinstance(controller_session_id, str) or
+            len(controller_session_id) != 32 or
+            any(character not in '0123456789abcdef'
+                for character in controller_session_id)):
+        raise ValueError('controller_session_id must be a lowercase hex UUID.')
+    if (not isinstance(version, int) or isinstance(version, bool) or
+            version < 1):
+        raise ValueError('version must be a positive integer.')
+    if replica_unit not in {'physical_backend', 'logical_slot'}:
+        raise ValueError('replica_unit must identify physical or logical '
+                         'capacity.')
+    demand_target = _nonnegative_int(demand_target, 'demand_target')
+    capacity_target = _nonnegative_int(capacity_target, 'capacity_target')
+    ready_capacity = _nonnegative_int(ready_capacity, 'ready_capacity')
+    provisioning_capacity = _nonnegative_int(provisioning_capacity,
+                                             'provisioning_capacity')
+    total_capacity = _nonnegative_int(total_capacity, 'total_capacity')
+    peak_in_flight = _nonnegative_int(peak_in_flight,
+                                      'peak_in_flight',
+                                      nullable=True)
+    peak_queue_depth = _nonnegative_int(peak_queue_depth,
+                                        'peak_queue_depth',
+                                        nullable=True)
+    assert demand_target is not None
+    assert capacity_target is not None
+    assert ready_capacity is not None
+    assert provisioning_capacity is not None
+    assert total_capacity is not None
+    if capacity_target < demand_target:
+        raise ValueError('capacity_target must be at least demand_target.')
+
+    engine = _postgres_engine()
+    if engine is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    bucket_start = observed_at.replace(second=0, microsecond=0)
+    row = {
+        'service_name': service_name,
+        'service_hash': service_hash,
+        'bucket_start': bucket_start,
+        'observed_at': observed_at,
+        'controller_session_id': controller_session_id,
+        'version': version,
+        'replica_unit': replica_unit,
+        'demand_target': demand_target,
+        'capacity_target': capacity_target,
+        'ready_capacity': ready_capacity,
+        'provisioning_capacity': provisioning_capacity,
+        'total_capacity': total_capacity,
+        'peak_in_flight': peak_in_flight,
+        'peak_queue_depth': peak_queue_depth,
+    }
+    table = serve_autoscaler_history_table
+    with engine.begin() as connection:
+        insert = postgresql.insert(table).values(row)
+        excluded = insert.excluded
+        newest = excluded.observed_at >= table.c.observed_at
+
+        def latest(column: str) -> Any:
+            return sqlalchemy.case((newest, getattr(excluded, column)),
+                                   else_=getattr(table.c, column))
+
+        def peak(column: str) -> Any:
+            existing = getattr(table.c, column)
+            incoming = getattr(excluded, column)
+            return sqlalchemy.case(
+                (existing.is_(None), incoming), (incoming.is_(None), existing),
+                else_=sqlalchemy.func.greatest(existing, incoming))
+
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    table.c.service_name,
+                    table.c.service_hash,
+                    table.c.bucket_start,
+                ],
+                set_={
+                    'observed_at': sqlalchemy.func.greatest(
+                        table.c.observed_at, excluded.observed_at),
+                    'controller_session_id': latest('controller_session_id'),
+                    'version': latest('version'),
+                    'replica_unit': latest('replica_unit'),
+                    'demand_target': latest('demand_target'),
+                    'capacity_target': latest('capacity_target'),
+                    'ready_capacity': latest('ready_capacity'),
+                    'provisioning_capacity': latest('provisioning_capacity'),
+                    'total_capacity': latest('total_capacity'),
+                    'peak_in_flight': peak('peak_in_flight'),
+                    'peak_queue_depth': peak('peak_queue_depth'),
+                }))
+    return 1
 
 
 def get_status_history(
@@ -361,6 +563,8 @@ def get_status_history(
             'retention_hours': RETENTION_HOURS,
             'samples': [],
             'request_samples': [],
+            'autoscaler_samples': [],
+            'rejection_history_available': False,
             'request_window_seconds':
                 constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
             'requests_last_hour': 0,
@@ -387,6 +591,8 @@ def get_status_history(
                 'retention_hours': RETENTION_HOURS,
                 'samples': [],
                 'request_samples': [],
+                'autoscaler_samples': [],
+                'rejection_history_available': False,
                 'request_window_seconds':
                     constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
                 'requests_last_hour': 0,
@@ -408,6 +614,14 @@ def get_status_history(
                 request_history.c.bucket_start,
                 sqlalchemy.func.sum(  # pylint: disable=not-callable
                     request_history.c.request_count).label('request_count'),
+                sqlalchemy.func.sum(  # pylint: disable=not-callable
+                    request_history.c.rejected_count).label('rejected_count'),
+                sqlalchemy.func.bool_and(  # pylint: disable=not-callable
+                    request_history.c.rejection_count_available).label(
+                        'rejection_count_available'),
+                sqlalchemy.func.bool_or(  # pylint: disable=not-callable
+                    request_history.c.rejection_count_available).label(
+                        'rejection_count_supported'),
             ).where(
                 request_history.c.service_name == service_name,
                 request_history.c.service_hash == service_hash,
@@ -415,6 +629,14 @@ def get_status_history(
                 request_history.c.bucket_start <= observed_at,
             ).group_by(request_history.c.bucket_start).order_by(
                 request_history.c.bucket_start)).all()
+        autoscaler_history = serve_autoscaler_history_table
+        autoscaler_rows = session.execute(
+            sqlalchemy.select(autoscaler_history).where(
+                autoscaler_history.c.service_name == service_name,
+                autoscaler_history.c.service_hash == service_hash,
+                autoscaler_history.c.bucket_start >= window_start,
+                autoscaler_history.c.bucket_start <= observed_at,
+            ).order_by(autoscaler_history.c.bucket_start)).mappings().all()
 
     samples = []
     for row in rows:
@@ -427,10 +649,29 @@ def get_status_history(
             },
             'total_count': row['total_count'],
         })
-    request_samples = [{
-        'timestamp': row.bucket_start.timestamp(),
-        'request_count': int(row.request_count),
-    } for row in request_rows]
+    request_samples = []
+    for row in request_rows:
+        rejected_count = (int(row.rejected_count)
+                          if row.rejection_count_available else None)
+        request_samples.append({
+            'timestamp': row.bucket_start.timestamp(),
+            'request_count': int(row.request_count),
+            'rejected_count': rejected_count,
+        })
+    autoscaler_samples = [{
+        'timestamp': row['bucket_start'].timestamp(),
+        'observed_at': row['observed_at'].timestamp(),
+        'controller_session_id': row['controller_session_id'],
+        'version': row['version'],
+        'replica_unit': row['replica_unit'],
+        'demand_target': row['demand_target'],
+        'capacity_target': row['capacity_target'],
+        'ready_capacity': row['ready_capacity'],
+        'provisioning_capacity': row['provisioning_capacity'],
+        'total_capacity': row['total_capacity'],
+        'peak_in_flight': row['peak_in_flight'],
+        'peak_queue_depth': row['peak_queue_depth'],
+    } for row in autoscaler_rows]
     current_bucket = observed_at.replace(second=0, microsecond=0)
     request_window_start = current_bucket - datetime.timedelta(
         seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS - BUCKET_SECONDS)
@@ -447,6 +688,9 @@ def get_status_history(
         'window_end': observed_at.timestamp(),
         'samples': samples,
         'request_samples': request_samples,
+        'autoscaler_samples': autoscaler_samples,
+        'rejection_history_available': any(
+            row.rejection_count_supported for row in request_rows),
         'request_window_seconds': constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
         'requests_last_hour': requests_last_hour,
     }

@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import autoscalers
 from sky.serve import controller
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1491,6 +1492,60 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
 
+    def test_logical_scale_down_waves_are_batched_without_reordering(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 1
+        decision_autoscaler.get_decision_interval.return_value = 0
+
+        def _logical_down(replica_id, generation=7):
+            return autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+                autoscalers.LogicalScaleDownTarget(
+                    version=1,
+                    reconcile_generation=generation,
+                    target_capacity=4,
+                    replica_id=replica_id))
+
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            _logical_down(1),
+            _logical_down(2),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP, None),
+            _logical_down(3),
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 99),
+            _logical_down(4, generation=8),
+        ]
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        actuation_calls = [
+            call for call in ctrl._replica_manager.method_calls  # pylint: disable=protected-access
+            if call[0] in ('scale_down_logically_batch', 'scale_up_batch',
+                           'scale_down')
+        ]
+        assert actuation_calls == [
+            mock.call.scale_down_logically_batch([1, 2], 4, 1, 7),
+            mock.call.scale_up_batch([None], expected_version=1),
+            mock.call.scale_down_logically_batch([3], 4, 1, 7),
+            mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
+            mock.call.scale_down_logically_batch([4], 4, 1, 8),
+        ]
+
 
 class TestTranslateInFlight:
     """The LB reports in-flight work keyed by replica url; the autoscaler
@@ -1788,6 +1843,8 @@ class _StatefulDemandAutoscaler:
     def __init__(self) -> None:
         self.replica_unit = 'physical_backend'
         self.latest_version = 1
+        self.max_replicas = 100
+        self.target_num_replicas = 1
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
@@ -1795,6 +1852,19 @@ class _StatefulDemandAutoscaler:
         self.rejected_in_window = 5
         self.collect_calls = 0
         self.reports = []
+
+    def get_final_target_num_replicas(self):
+        return self.target_num_replicas
+
+    def has_recomputed_with_fresh_data(self):
+        return True
+
+    def info(self):
+        return {
+            'target_num_replicas': self.target_num_replicas,
+            'in_flight_total': sum(self.in_flight_by_replica_id.values()),
+            'queue_depth': self.queue_depth,
+        }
 
     def collect_request_information(self, report) -> None:
         self.collect_calls += 1
@@ -1968,6 +2038,49 @@ class TestAuthoritativeLbReportIngestion:
             'service-hash',
             f"lb-a:{'a' * 32}",
             report['request_history'],
+        )
+
+    def test_autoscaler_history_distinguishes_demand_and_fill_targets(self):
+        ctrl, _, _ = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._history_session_id = 'c' * 32  # pylint: disable=protected-access
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        autoscaler = mock.Mock()
+        autoscaler.get_final_target_num_replicas.return_value = 7
+        autoscaler.info.return_value = {
+            'fill_target': 12,
+            'in_flight_total': 5,
+            'queue_depth': 4,
+        }
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        replica_counts = {
+            'replica_unit': 'physical_backend',
+            'ready_replicas': 9,
+            'total_replicas': 14,
+        }
+        capacity_hint = {'provisioning_replicas': 3}
+
+        with mock.patch.object(controller.serve_history,
+                               'record_autoscaler_snapshot',
+                               return_value=1) as record_history:
+            written = ctrl._record_autoscaler_history(  # pylint: disable=protected-access
+                replica_counts, capacity_hint)
+
+        assert written == 1
+        record_history.assert_called_once_with(
+            'svc',
+            'service-hash',
+            'c' * 32,
+            version=3,
+            replica_unit='physical_backend',
+            demand_target=7,
+            capacity_target=12,
+            ready_capacity=9,
+            provisioning_capacity=3,
+            total_capacity=14,
+            peak_in_flight=5,
+            peak_queue_depth=4,
+            timestamp=None,
         )
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])

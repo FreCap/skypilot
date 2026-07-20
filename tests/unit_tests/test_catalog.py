@@ -74,6 +74,10 @@ def test_read_catalog_triggers_update_on_stale_file(mock_get):
             content_on_disk = f.read()
         assert content_on_disk == NEW_DUMMY_CSV
         pd.testing.assert_frame_equal(df._df, pd.read_csv(abs_catalog_path))
+        assert mock_get.call_count == 2
+        assert all(call.kwargs['timeout'] ==
+                   catalog_common.DEFAULT_HTTP_TIMEOUT_SECONDS
+                   for call in mock_get.call_args_list)
     finally:
         if os.path.exists(abs_catalog_path):
             os.remove(abs_catalog_path)

@@ -2000,6 +2000,9 @@ class SkyServeLoadBalancer:
             self._reject_fallback_seq += 1
             key = f'_headerless_{self._reject_fallback_seq}'
         self._prune_reject_window()[key] = time.monotonic()
+        request_aggregator = getattr(self, '_request_aggregator', None)
+        if request_aggregator is not None:
+            request_aggregator.add_rejection()
 
     def _clear_rejection(self, request: fastapi.Request) -> None:
         """Release stale backlog pressure once the same stable job lands."""
