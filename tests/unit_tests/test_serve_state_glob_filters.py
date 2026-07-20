@@ -107,3 +107,44 @@ def test_get_glob_service_names_issues_single_query(_mock_serve_db):
 
     assert sorted(names) == ['pool-alpha', 'serve-alpha', 'serve-beta']
     assert len(statements) == 1
+
+
+def test_get_glob_service_names_treats_like_metacharacters_literally(
+        _mock_serve_db):
+    del _mock_serve_db
+    _add_service('my_svc', pool=False)
+    _add_service('myXsvc', pool=False)
+    _add_service('my%svc', pool=False)
+
+    # '_' and '%' in a pattern are literals, not SQL wildcards.
+    assert serve_state.get_glob_service_names(['my_svc']) == ['my_svc']
+    assert serve_state.get_glob_service_names(['my%svc']) == ['my%svc']
+    # Glob wildcards still work: '?' is any single char, '*' any run.
+    assert sorted(serve_state.get_glob_service_names(['my?svc'])) == [
+        'my%svc',
+        'myXsvc',
+        'my_svc',
+    ]
+    assert sorted(serve_state.get_glob_service_names(['my*'])) == [
+        'my%svc',
+        'myXsvc',
+        'my_svc',
+    ]
+
+
+def test_orphaned_child_names_glob_is_literal_for_metacharacters(
+        _mock_serve_db):
+    engine = _mock_serve_db
+    with engine.begin() as conn:
+        for name in ('child_a', 'childXa'):
+            conn.execute(serve_state.version_specs_table.insert().values(
+                service_name=name, version=1))
+
+    assert sorted(serve_state.get_orphaned_service_child_names()) == [
+        'childXa',
+        'child_a',
+    ]
+    assert serve_state.get_orphaned_service_child_names(['child_a'
+                                                        ]) == ['child_a']
+    assert sorted(serve_state.get_orphaned_service_child_names(
+        ['child?a'])) == ['childXa', 'child_a']
