@@ -680,6 +680,35 @@ def test_file_mount_upload_routes_preserve_server_import_surface(
 
 
 @pytest.mark.asyncio
+async def test_upload_rejects_invalid_id_before_cleanup_registration(tmp_path):
+    upload_id = '../../existing-directory'
+    cleanup_key = (upload_id, 'user')
+    (tmp_path / 'user' / 'file_mounts').mkdir(parents=True)
+    existing_directory = tmp_path / 'existing-directory'
+    existing_directory.mkdir()
+    cleanup_registry = {}
+
+    with mock.patch.object(file_mount_uploads, 'upload_ids_to_cleanup',
+                           cleanup_registry):
+        with pytest.raises(ValueError, match='Invalid upload_id'):
+            await server.upload_zip_file(types.SimpleNamespace(), 'user',
+                                         upload_id, 0, 1)
+        assert cleanup_key not in cleanup_registry
+
+        with mock.patch.object(file_mount_uploads.common,
+                               'API_SERVER_CLIENT_DIR', tmp_path):
+            with mock.patch.object(
+                    file_mount_uploads.asyncio,
+                    'sleep',
+                    new=mock.AsyncMock(
+                        side_effect=[None, asyncio.CancelledError()])):
+                with pytest.raises(asyncio.CancelledError):
+                    await file_mount_uploads.cleanup_upload_ids()
+
+    assert existing_directory.exists()
+
+
+@pytest.mark.asyncio
 async def test_upload_blob_publishes_extracted_content(tmp_path):
     blob_id = 'b' * 64
 
