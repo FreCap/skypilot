@@ -1833,7 +1833,14 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
                                               'purge': purge,
                                           })
 
-    message: str = resp.json()['message']
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    # HTTPException responses (e.g. 400/404 validation errors) use FastAPI's
+    # default {'detail': ...} shape; the controller's generic error handler
+    # and success responses use {'message': ...}.
+    message: str = str(body.get('message') or body.get('detail') or resp.text)
     if resp.status_code != 200:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Failed to terminate replica {replica_id} '

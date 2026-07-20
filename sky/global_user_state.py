@@ -3551,30 +3551,33 @@ def get_cluster_yaml_str(cluster_yaml_path: str | None) -> str | None:
     return row.yaml
 
 
-def get_cluster_yaml_str_multiple(cluster_yaml_paths: list[str]) -> list[str]:
-    """Get the cluster yaml from the database or the local file system.
-    """
+def get_cluster_yaml_str_multiple(
+        cluster_yaml_paths: list[str]) -> list[str | None]:
+    """Get cluster YAMLs while preserving input order and cardinality."""
+    if not cluster_yaml_paths:
+        return []
+
     engine = _db_manager.get_engine()
-    cluster_names_to_yaml_paths = {}
+    cluster_names = []
+    cluster_names_to_yaml_paths: dict[str, str] = {}
     for cluster_yaml_path in cluster_yaml_paths:
         cluster_name, _ = os.path.splitext(os.path.basename(cluster_yaml_path))
+        cluster_names.append(cluster_name)
         cluster_names_to_yaml_paths[cluster_name] = cluster_yaml_path
 
-    cluster_names = list(cluster_names_to_yaml_paths.keys())
+    unique_cluster_names = list(cluster_names_to_yaml_paths)
     with orm.Session(engine) as session:
         rows = session.query(cluster_yaml_table).filter(
-            cluster_yaml_table.c.cluster_name.in_(cluster_names)).all()
-    row_cluster_names_to_yaml = {row.cluster_name: row.yaml for row in rows}
+            cluster_yaml_table.c.cluster_name.in_(unique_cluster_names)).all()
+    cluster_names_to_yaml: dict[str, str | None] = {
+        row.cluster_name: row.yaml for row in rows
+    }
 
-    yaml_strs = []
-    for cluster_name in cluster_names:
-        if cluster_name in row_cluster_names_to_yaml:
-            yaml_strs.append(row_cluster_names_to_yaml[cluster_name])
-        else:
-            yaml_str = _set_cluster_yaml_from_file(
+    for cluster_name in unique_cluster_names:
+        if cluster_name not in cluster_names_to_yaml:
+            cluster_names_to_yaml[cluster_name] = _set_cluster_yaml_from_file(
                 cluster_names_to_yaml_paths[cluster_name], cluster_name)
-            yaml_strs.append(yaml_str)
-    return yaml_strs
+    return [cluster_names_to_yaml[name] for name in cluster_names]
 
 
 def _set_cluster_yaml_from_file(cluster_yaml_path: str,

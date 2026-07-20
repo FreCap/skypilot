@@ -21,6 +21,7 @@ from sky.batch import coordinator
 from sky.batch import io_formats
 from sky.batch import utils
 from sky.batch import worker
+from sky.jobs import batch_state as batch_state_lib
 from sky.jobs import controller as jobs_controller
 from sky.jobs import state
 from sky.utils.db import migration_utils
@@ -161,7 +162,7 @@ def test_expired_batch_attempt_is_reclaimed_once(batch_state_db):
 def test_batch_returning_fallback_preserves_claim_and_requeue(
         batch_state_db, monkeypatch):
     del batch_state_db
-    monkeypatch.setattr(state, '_supports_update_returning',
+    monkeypatch.setattr(batch_state_lib, '_supports_update_returning',
                         lambda engine: False)
     _create_batch_job(80, 'owner-a')
     assert state.save_batch_states(80, [[0, 4]], 'owner-a')
@@ -262,7 +263,7 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
     takeover_done = threading.Event()
     new_launch = mock.Mock()
     errors = []
-    original_lock = state._lock_batch_coordinator_owner
+    original_lock = batch_state_lib._lock_batch_coordinator_owner
 
     def _pause_old_owner(session, job_id, owner_token):
         owned = original_lock(session, job_id, owner_token)
@@ -272,7 +273,7 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
                 raise RuntimeError('test timed out releasing old owner')
         return owned
 
-    monkeypatch.setattr(state, '_lock_batch_coordinator_owner',
+    monkeypatch.setattr(batch_state_lib, '_lock_batch_coordinator_owner',
                         _pause_old_owner)
 
     def _old_claim():
@@ -457,8 +458,69 @@ def test_schema_023_adds_batch_coordinator_ownership_tokens(tmp_path):
     } <= worker_columns
 
 
-def test_spot_jobs_database_targets_batch_attempt_migration(
-        tmp_path, monkeypatch):
+def test_schema_024_indexes_shared_api_tokens(tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "tokens.db"}')
+    old_metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'api_access_tokens', old_metadata,
+        sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('token_id', sqlalchemy.Text, nullable=False))
+    sqlalchemy.Table(
+        'alembic_version_spot_jobs_db', old_metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True))
+    old_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO alembic_version_spot_jobs_db (version_num) '
+                "VALUES ('023')"))
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '024')
+
+    indexes = {
+        index['name']: index['column_names']
+        for index in sqlalchemy.inspect(engine).get_indexes('api_access_tokens')
+    }
+    assert indexes['ix_api_access_tokens_token_id'] == ['token_id']
+
+
+def test_schema_024_builds_postgres_index_concurrently(monkeypatch):
+    migration = importlib.import_module(
+        'sky.schemas.db.spot_jobs.024_add_api_access_token_index')
+    bind = mock.Mock()
+    bind.dialect.name = 'postgresql'
+    inspector = mock.Mock()
+    inspector.get_indexes.return_value = []
+    create_index = mock.Mock()
+    monkeypatch.setattr(migration.op, 'get_bind', lambda: bind)
+    monkeypatch.setattr(migration.sa, 'inspect', lambda _: inspector)
+    monkeypatch.setattr(migration.op, 'create_index', create_index)
+
+    @contextlib.contextmanager
+    def autocommit_block():
+        yield
+
+    context = mock.Mock()
+    context.autocommit_block = autocommit_block
+    monkeypatch.setattr(migration.op, 'get_context', lambda: context)
+
+    migration.upgrade()
+
+    create_index.assert_called_once_with('ix_api_access_tokens_token_id',
+                                         'api_access_tokens', ['token_id'],
+                                         postgresql_concurrently=True)
+
+
+def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
     upgrade = mock.Mock()
     monkeypatch.setattr(migration_utils, 'safe_alembic_upgrade', upgrade)
@@ -466,8 +528,8 @@ def test_spot_jobs_database_targets_batch_attempt_migration(
     state.create_table(engine)
 
     upgrade.assert_called_once_with(engine, migration_utils.SPOT_JOBS_DB_NAME,
-                                    '023')
-    assert migration_utils.SPOT_JOBS_VERSION == '023'
+                                    '024')
+    assert migration_utils.SPOT_JOBS_VERSION == '024'
     engine.dispose()
 
 

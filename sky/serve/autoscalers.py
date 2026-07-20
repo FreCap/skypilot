@@ -1341,8 +1341,9 @@ class _AutoscalerWithHysteresis(Autoscaler):
             spec.downscale_delay_seconds
             if spec.downscale_delay_seconds is not None else
             constants.AUTOSCALER_DEFAULT_DOWNSCALE_DELAY_SECONDS)
+        self.downscale_delay_seconds: float = float(downscale_delay_seconds)
         self.scale_down_threshold: int = int(
-            downscale_delay_seconds /
+            self.downscale_delay_seconds /
             constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS)
 
     def __init__(self,
@@ -2937,6 +2938,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage: int = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         self._last_scale_up_wave_at: float | None = None
+        # Logical downscale hysteresis is elapsed-time based. A nominal
+        # decision tick can stretch substantially while probing a large fleet,
+        # so a tick counter cannot implement a duration contract. This state is
+        # deliberately controller-local and resets conservatively on rebuilds
+        # and service updates.
+        self._downscale_started_at: float | None = None
         self._raw_target_num_replicas: int = self.target_num_replicas
         self._latest_committed_capacity: int = 0
         self._rejected_concurrency: float = 0.0
@@ -3642,6 +3649,37 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             math.ceil(committed * self.max_scale_down_rate_percentage / 100.0))
         return max(raw_target, committed - allowance)
 
+    def _reset_downscale_hysteresis(self) -> None:
+        self.downscale_counter = 0
+        self._downscale_started_at = None
+
+    def _downscale_hysteresis_elapsed(self) -> bool:
+        """Whether this lower-target observation completes its delay.
+
+        Logical concurrency policies use elapsed monotonic time. Other
+        concurrency modes retain the legacy decision-count behavior.
+        """
+        self.downscale_counter += 1
+        if self.replica_unit != 'logical':
+            return self.downscale_counter >= self.scale_down_threshold
+        now = time.monotonic()
+        if self._downscale_started_at is None:
+            # Preserve the established one-tick default: the first lower
+            # observation represents the nominal decision interval that just
+            # elapsed. Further progress is real monotonic time, never loop
+            # counts, so slow large-fleet ticks cannot stretch the duration.
+            initial_credit = min(
+                self.downscale_delay_seconds,
+                float(constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS))
+            self._downscale_started_at = now - initial_credit
+        return (now - self._downscale_started_at
+                >= self.downscale_delay_seconds)
+
+    def _downscale_elapsed_seconds(self) -> float:
+        if self._downscale_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._downscale_started_at)
+
     def _outstanding_work(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'] | None = None,
@@ -4028,6 +4066,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._upscale_pending = False
 
         if not self._fresh_for_tick():
+            if self.replica_unit == 'logical':
+                # A signal gap cannot prove continuous low demand. Require a
+                # complete fresh elapsed window after reports recover.
+                self._reset_downscale_hysteresis()
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
             # ride every sync). Raise-only floor, applied without
             # hysteresis -- while blind we must not delay growth, and we
@@ -4143,40 +4185,40 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # the configured downscale delay has proved sustained idleness.
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
-            self.downscale_counter = 0
+            self._reset_downscale_hysteresis()
             if target_num_replicas >= self.target_num_replicas:
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
                 apply_target = True
             else:
-                self.downscale_counter = 1
-                if self.downscale_counter >= self.scale_down_threshold:
-                    self.downscale_counter = 0
+                if self._downscale_hysteresis_elapsed():
+                    self._reset_downscale_hysteresis()
                     self.target_num_replicas = self._limit_logical_scale_down(
                         target_num_replicas, replica_infos)
                     apply_target = True
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
+            self._reset_downscale_hysteresis()
             self._adopt_scale_up_target(target_num_replicas, replica_infos)
             apply_target = True
         elif (target_num_replicas > self.target_num_replicas or
               target_map_increases):
             self.upscale_counter += 1
-            self.downscale_counter = 0
+            self._reset_downscale_hysteresis()
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
                 apply_target = True
         elif (target_num_replicas < self.target_num_replicas or
               target_map_changed):
-            self.downscale_counter += 1
             self.upscale_counter = 0
-            if self.downscale_counter >= self.scale_down_threshold:
-                self.downscale_counter = 0
+            if self._downscale_hysteresis_elapsed():
+                self._reset_downscale_hysteresis()
                 self.target_num_replicas = self._limit_logical_scale_down(
                     target_num_replicas, replica_infos)
                 apply_target = True
         else:
-            self.upscale_counter = self.downscale_counter = 0
+            self.upscale_counter = 0
+            self._reset_downscale_hysteresis()
 
         if apply_target and candidate_target_by_accelerator is not None:
             adopted_map, attribution_complete = (
@@ -4201,6 +4243,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self.target_num_replicas_by_accelerator.get(card, 0)
                 for card in candidate_target_by_accelerator)))
 
+        if self.replica_unit == 'logical':
+            downscale_status = (
+                f'Downscale observations: {self.downscale_counter}. '
+                f'Downscale elapsed: {self._downscale_elapsed_seconds():.1f}/'
+                f'{self.downscale_delay_seconds:.1f}s. ')
+        else:
+            downscale_status = (f'Downscale counter: {self.downscale_counter}/'
+                                f'{self.scale_down_threshold}. ')
         logger.info(
             f'Concurrency: outstanding work: {outstanding}. '
             f'Latest-version capacities: {latest_capacities}. '
@@ -4211,8 +4261,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             f'{self.target_num_replicas_by_accelerator}. '
             f'Upscale counter: {self.upscale_counter}/'
             f'{self.scale_up_threshold}. '
-            f'Downscale counter: {self.downscale_counter}/'
-            f'{self.scale_down_threshold}. ')
+            f'{downscale_status}')
 
     def generate_scaling_decisions(
         self,
@@ -4331,6 +4380,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
+        self._reset_downscale_hysteresis()
         if (self.replica_unit == 'logical' and
                 self.max_scale_up_rate_percentage is not None):
             # target_num_replicas described the previous version's launch
@@ -4885,6 +4935,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'committed_capacity': self._latest_committed_capacity,
             'target_utilization_percentage': self.target_utilization_percentage,
             'latest_scale_up_wave_at': self._last_scale_up_wave_at,
+            'downscale_elapsed_seconds': self._downscale_elapsed_seconds(),
+            'downscale_delay_seconds': self.downscale_delay_seconds,
             'unknown_in_flight_replicas': len(
                 self._unknown_in_flight_replica_ids),
             'report_age_seconds': report_age,

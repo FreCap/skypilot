@@ -1207,10 +1207,13 @@ class AWS(clouds.Cloud):
         if profile is not None:
             # If profile does not exist, we will get returncode 255.
             cmd.extend(['--profile', profile])
-        proc = subprocess.run(cmd,
-                              check=False,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.run(cmd,
+                                  check=False,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
         if proc.returncode != 0:
             return None
         return proc.stdout

@@ -118,7 +118,8 @@ def download_logs_from_api_server(
         'POST',
         '/download',
         json=json.loads(body.model_dump_json()),
-        stream=True)
+        stream=True,
+        timeout=(API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None))
     if response.status_code == 200:
         remote_home_path = response.headers.get('X-Home-Path')
         assert remote_home_path is not None, response.headers

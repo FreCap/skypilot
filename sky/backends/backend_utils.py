@@ -479,11 +479,11 @@ def _optimize_file_mounts(tmp_yaml_path: str) -> None:
         # cp <local_src> <local_runtime_files_dir>/<unique name of local_src>.
         full_local_src = str(pathlib.Path(local_src).expanduser())
         unique_name = local_source_to_unique_name[local_src]
-        # !r to add quotes for paths containing spaces.
-        subprocess.run(
-            f'cp -r {full_local_src!r} {local_runtime_files_dir}/{unique_name}',
-            shell=True,
-            check=True)
+        subprocess.run([
+            'cp', '-r', full_local_src,
+            f'{local_runtime_files_dir}/{unique_name}'
+        ],
+                       check=True)
 
     yaml_utils.dump_yaml(tmp_yaml_path, yaml_config)
 
@@ -511,7 +511,7 @@ def path_size_megabytes(path: str) -> int:
                 shlex.quote(str(resolved_path / command_runner.GIT_EXCLUDE)))
     rsync_command = (f'rsync {command_runner.RSYNC_DISPLAY_OPTION} '
                      f'{rsync_filter} '
-                     f'{git_exclude_filter} --dry-run {path!r}')
+                     f'{git_exclude_filter} --dry-run {shlex.quote(path)}')
     rsync_output = ''
     try:
         # rsync sometimes fails `--dry-run` for MacOS' rsync build, however this function is only used to display
@@ -1502,7 +1502,7 @@ def _add_auth_to_cluster_config(cloud: clouds.Cloud, tmp_yaml_path: str):
     elif isinstance(cloud, clouds.Verda):
         config = auth.setup_verda_authentication(config)
     else:
-        assert False, cloud
+        raise AssertionError(cloud)
     yaml_utils.dump_yaml(tmp_yaml_path, config)
 
 
@@ -1942,7 +1942,7 @@ def ssh_credentials_from_handles(
     cluster_yaml_dicts_to_index = {
         cluster_yaml_path: cluster_yaml_dict
         for cluster_yaml_path, cluster_yaml_dict in zip(
-            non_empty_cluster_yaml_paths, cluster_yaml_dicts)
+            non_empty_cluster_yaml_paths, cluster_yaml_dicts, strict=True)
     }
 
     credentials_to_return: list[dict[str, Any]] = []
@@ -2695,7 +2695,7 @@ def check_can_clone_disk_and_override_task(
                     f'Cannot clone disk across cloud from {original_cloud} to '
                     f'{task_resources_cloud_str} for resources {task_resources_str}.'
                 )
-        assert False, 'Should not reach here.'
+        raise AssertionError('Should not reach here.')
     # set the new_task_resources to be the same type (list or set) as the
     # original task.resources
     if has_override:

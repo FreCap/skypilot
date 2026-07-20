@@ -1,14 +1,18 @@
 """Unit tests for sky.jobs.state module."""
 
+import ast
 import asyncio
 import contextlib
 import datetime
+import inspect
+import textwrap
 import time
 from unittest import mock
 
 import filelock
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
@@ -447,6 +451,19 @@ class TestGetManagedJobsHighestPriority:
 class TestSchedulerBackoffState:
     """Tests for scheduler launch-backoff transitions."""
 
+    @pytest.mark.parametrize(
+        'function',
+        [
+            state._retry_schedule_state_update,  # pylint: disable=protected-access
+            state.scheduler_set_waiting,
+            state.scheduler_set_done,
+        ])
+    def test_row_count_guards_are_runtime_checks(self, function):
+        source = textwrap.dedent(inspect.getsource(function))
+        tree = ast.parse(source)
+
+        assert not any(isinstance(node, ast.Assert) for node in ast.walk(tree))
+
     def test_launching_transitions_to_backoff(self, _mock_managed_jobs_db_conn):
         job_id = state.set_job_info_without_job_id(name='job1',
                                                    workspace='ws1',
@@ -466,6 +483,30 @@ class TestSchedulerBackoffState:
 
         assert (state.get_job_schedule_state(job_id) ==
                 state.ManagedJobScheduleState.ALIVE_BACKOFF)
+
+    def test_missing_job_transition_raises_with_python_optimization(
+            self, _mock_managed_jobs_db_conn):
+
+        async def _transition():
+            await state.scheduler_set_backoff_async(123456789)
+
+        with pytest.raises(AssertionError, match=r'123456789'):
+            asyncio.run(_transition())
+
+    def test_sync_row_count_guards_survive_python_optimization(
+            self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='job1',
+                                                   workspace='ws1',
+                                                   entrypoint='ep1',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+
+        with pytest.raises(AssertionError):
+            state.scheduler_set_waiting([job_id, 123456789], '/tmp/dag.yaml',
+                                        '/tmp/user.yaml', '/tmp/env', None, 100)
+        with pytest.raises(AssertionError, match=r'123456789'):
+            state.scheduler_set_done(123456789)
 
 
 class TestBuildManagedJobsWithFiltersNoStatusQuery:
@@ -939,6 +980,42 @@ class TestGetLatestRecoveryReasons:
         assert state.get_latest_recovery_reasons([1]) == {}
 
 
+def test_job_event_timeline_async_write_and_retention(
+        _mock_managed_jobs_db_conn):
+    now = datetime.datetime.now()
+    old = now - datetime.timedelta(hours=2)
+    state.add_job_event(1,
+                        None,
+                        state.ManagedJobStatus.PENDING,
+                        'job queued',
+                        timestamp=old)
+    state.add_job_event(1,
+                        0,
+                        state.ManagedJobStatus.STARTING,
+                        'task starting',
+                        timestamp=now)
+    asyncio.run(
+        state.add_job_event_async(1,
+                                  0,
+                                  state.ManagedJobStatus.FAILED,
+                                  'task failed',
+                                  code='runtime',
+                                  timestamp=now +
+                                  datetime.timedelta(seconds=1)))
+
+    task_events = state.get_job_events(1, task_id=0)
+    assert [event['reason'] for event in task_events
+           ] == ['task failed', 'task starting', 'job queued']
+    assert task_events[0]['new_status'] is state.ManagedJobStatus.FAILED
+    assert task_events[0]['code'] == 'runtime'
+
+    asyncio.run(state.cleanup_job_events_with_retention_async(1))
+
+    remaining_events = state.get_job_events(1)
+    assert [event['reason'] for event in remaining_events
+           ] == ['task failed', 'task starting']
+
+
 # Fixed epoch timestamps (seconds) for the time-range fixture. submitted_at is
 # stored as epoch seconds (a sqlalchemy.Float column), matching time.time().
 _T100 = 100.0
@@ -1380,3 +1457,32 @@ class TestGetJobsStatusCheckInfo:
         job_ids = list(_seed_test_jobs.values())
         info = state.get_jobs_status_check_info(job_ids)
         assert set(info) == set(job_ids)
+
+    def test_issues_exactly_one_select_per_chunk(self,
+                                                 _mock_managed_jobs_db_conn,
+                                                 _seed_test_jobs, monkeypatch):
+        # The batched helper must stay one slim SELECT per id chunk: no
+        # per-job queries and no hidden extra round trips.
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+        job_ids = list(_seed_test_jobs.values())
+        assert len(job_ids) > 2
+        expected_chunks = -(-len(job_ids) // 2)
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_status_check_info(job_ids)
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert set(info) == set(job_ids)
+        assert select_count == expected_chunks

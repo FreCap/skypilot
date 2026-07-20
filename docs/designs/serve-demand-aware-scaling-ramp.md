@@ -130,12 +130,56 @@ interval, so an exact-generation fence can discard every scale-up or retirement
 batch forever. While the exact published
 `(version, decision_generation, target)` remains current, actuation may use any
 fresh capacity snapshot from the same version whose generation is at least the
-decision generation. A newer published target or version still supersedes the
-intent. Scale-up rechecks the fence and newest committed capacity before each
-replica row is persisted. Scale-down recomputes coverage and verifies each
-selected victim is still known idle in the newest snapshot before marking it
-off-route. Scale-down counts one conservative slot per ready old-version
-backend, but backends already off route never count toward coverage.
+decision generation. A newer published target or version still supersedes an
+unaccepted batch. Scale-up rechecks the fence and newest committed capacity
+before each replica row is persisted. Scale-down recomputes coverage and
+verifies each selected victim is still known idle in the newest snapshot before
+marking it off-route. Scale-down counts one conservative slot per ready
+old-version backend, but backends already off route never count toward
+coverage.
+
+A same-version target change does not blanket-cancel retirements that were
+already durably accepted and taken off route. Before irreversible teardown,
+each accepted retirement uses the newest fresh snapshot and current target to
+recompute coverage without that victim. Ready capacity remains the requirement
+for irreversible teardown. If ready capacity is temporarily short but
+non-retiring, never-ready current-version capacity already committed to
+provisioning covers the target, the accepted retirement stays off route and
+waits for that capacity to become ready. Previously ready but currently degraded
+or unobservable capacity does not qualify. Only a shortfall not covered by
+either ready or committed capacity reactivates enough accepted retirements to
+cover the gap; later victims then re-evaluate against that restored capacity. A
+version change, pending newer version, stale demand snapshot, or unavailable
+current target continues to block or abort retirement as appropriate. This
+prevents one scale-up decision from both launching replacement capacity and
+reactivating a large old fleet while preserving the ready-capacity fence before
+destructive cleanup.
+
+A recovered uncommitted retirement must not proceed to shutdown admission in
+the same load-balancer generation that re-fenced it under the new controller
+epoch. Re-fencing changes durable authority, while the snapshot that authorized
+the write predates that new state. The manager keeps each adopted victim in the
+recovery gate, and off route, until a strictly newer fresh snapshot and matching
+published target arrive. It then releases the victim to the ordinary current
+target, coverage, and idle revalidation path. This one-generation barrier also
+prevents a controller or load-balancer handoff from turning transient occupancy
+uncertainty into a fleet-wide reactivation feedback loop. If no newer evidence
+arrives, the recovery deadline remains diagnostic and the victim stays
+off-route; timeout alone is never route-admission authority.
+
+Recovery adoption and final teardown use the same logical actuation fence as
+ordinary retirement: the fresh capacity snapshot may be newer than the current
+published target generation, but never older. The post-adoption barrier remains
+separate and still requires a snapshot strictly newer than the generation that
+re-fenced the victim.
+
+The recovery gate also owns every queued shutdown-admission row while that
+replica remains indexed for recovery. The admission pass must check membership
+under the same logical-state lock before evaluating the persisted controller
+fence. Otherwise a pre-restart queued worker can observe the obsolete epoch,
+abort the retirement, and advertise the backend while the recovery pass is
+still adopting the same row.
+
 Unknown-capacity replacement stays tied to the exact decision generation; a
 newer snapshot may narrow or cancel the set but cannot authorize new overlap
 from stale evidence.
@@ -172,6 +216,48 @@ one-slot floor guarantees the remaining old backend count plus observed latest
 logical capacity is never below the larger of raw demand and the adopted
 target.
 
+An in-process service update is also a retirement-authority transition. A
+newer pending version freezes already selected victims instead of returning
+them to routing. Irreversibly committed teardowns continue through the shared
+termination pool. Uncommitted, off-route victims retain their original drain
+deadlines and are handed to the same bounded recovery path used after a
+controller restart; they may be re-fenced only after the new version publishes
+a fresh target and capacity snapshot. If that snapshot proves a current-version
+capacity shortfall, recovery may reactivate only the capacity needed to cover
+the shortfall, with at most 20 physical victims reactivated per fresh
+generation. Active old-version victims are eligible for this bounded fallback
+and contribute the same conservative one-slot coverage floor used by the
+rolling bridge. Runtime-equivalent uncommitted victims are relabelled to the new
+version while remaining off route, so they can satisfy such a shortfall without
+a replacement launch; irreversibly committed victims keep their original
+version and finish teardown.
+
+Uncommitted victims include both strict idle-wait rows and outdated rows whose
+idle deadline expired, whose replacement-capacity proof was confirmed, and
+whose teardown is still queued behind the shared termination budget. The
+latter bounded precommit rows are already off route but have not crossed the
+irreversible `RUNNING` admission boundary. A controller restart or version
+update must index them into recovery before rebuilding a teardown worker. Fresh
+evidence may then adopt them under the new controller epoch, or reactivate only
+the measured shortfall under the same 20-backend cap. Merely changing the
+controller epoch must not return the queued fleet to routing. Adoption retains
+the bounded precommit marker through the one-generation recovery barrier so an
+equivalent-version relabel cannot bypass the newer-evidence requirement.
+
+The recovery deadline is diagnostic, not independent route-admission
+authority. If no fresh authoritative target and capacity snapshot at least as
+new as that target exists when it expires, recovery keeps every uncommitted
+victim off route and renews the deadline. Re-advertising capacity cannot repair
+availability while the load balancer cannot synchronize, and doing so blindly
+can resurrect the complete old fleet during a large controller rebuild. Once
+fresh evidence arrives,
+ready or never-ready provisioning capacity already committed to the elected
+version may cover the target and allow recovery to re-fence the drains without
+reactivation. Only a measured remaining shortfall permits the bounded fallback
+above. During a successful policy-only or runtime-equivalent update,
+asynchronously draining backends must therefore stay off route instead of the
+whole old fleet becoming READY again.
+
 The 20-backend cap bounds each transition without tying rollout progress to a
 wall-clock rate limit. If five new logical slots become ready, up to five
 additional READY old backends become excess. If the old fleet was already far
@@ -180,6 +266,59 @@ excess even before replacement supply reaches the complete target. Stale
 demand reports continue to prohibit all rolling retirement. A pending logical
 scale-up wave does not block the bridge because the raw-demand side of the
 coverage target already protects work that the adopted target has not reached.
+
+### Drain-proof handoff and recovery
+
+The strict drain tracker requires one authoritative load-balancer incarnation
+to acknowledge a backend before a later clean report can prove that it is
+idle. Route removal can otherwise race the sync cadence: the controller starts
+the tracker immediately after the last report that still listed the backend,
+the load balancer drops an idle client before its next report, and the tracker
+never observes the backend at all. The backend then stays off route until the
+full bounded drain deadline even though the same load balancer had already
+reported it as routable immediately before retirement.
+
+Tracker construction may seed that acknowledgement from the manager's latest
+authoritative, fresh report when the backend appears in the routing,
+in-flight, draining, or unknown-occupancy view. The seed is tied to that exact
+load-balancer session. A later report from the same session must still show the
+backend clean, and a session change clears the seed. A pre-retirement unknown
+occupancy sample also seeds the unknown taint, so absence cannot prove an async
+backend idle; only a later explicit zero can. Stale reports and reports without
+an authoritative routing view never seed a tracker. This relies on the load
+balancer's existing occupancy contract: every routed async backend without a
+fresh gauge appears in the unknown set. The post-retirement drain proof already
+depends on the same contract.
+
+Controller recovery rebuilds trackers for every durable strict idle wait and
+bounded precommit row. Resolving each replica URL independently repeats cluster
+record and provider-config reads around the endpoint lookup while the manager
+lock blocks probing and autoscaling. Recovery instead resolves all waiting
+replica URLs from one batched cluster and provider-config snapshot, then
+registers the trackers from that mapping. Provider endpoint lookup remains per
+replica where required. If the batch fails, recovery falls back to the existing
+per-replica resolution so the optimization cannot weaken cleanup correctness.
+
+### Launch completion and teardown progress
+
+The replica-manager refresher holds the manager lock while reconciling launch
+and teardown workers. A large launch wave may finish many workers in one
+refresh. Persisting each completed launch in a separate transaction makes the
+lock-held pass grow with the wave size and can delay admission of already
+selected teardown workers behind repeated PostgreSQL round trips. The rolling
+bridge is then visibly bounded but provider cleanup does not keep pace.
+
+The refresher reads all completed-launch replica rows in its existing batch,
+applies their launch and placement outcomes in memory, and persists those
+completed-launch transitions with one existing multi-row upsert. It removes
+the completed workers from local tracking and schedules failed-launch cleanup
+only after that batch commit succeeds. If the batch write fails, the workers
+remain tracked and the next refresh retries the same durable transition.
+
+This changes only persistence cardinality and retry atomicity for completed
+launches. Pending-launch authorization, placement benching, launch and
+termination admission order, shared resource limits, demand sizing, retirement
+selection, and provider cleanup behavior remain unchanged.
 
 ### Load-balancer demand handoff
 
@@ -200,8 +339,9 @@ handoff floor, preserving mixed-version safety.
 
 ### Scale-down wave
 
-After raw demand remains lower for `downscale_delay_seconds`, ordinary
-demand-driven logical downscale may reduce the adopted target by at most:
+After raw demand remains lower for `downscale_delay_seconds` of elapsed wall
+clock time, ordinary demand-driven logical downscale may reduce the adopted
+target by at most:
 
 ```text
 allowance = max(
@@ -213,12 +353,23 @@ next_target = max(raw_target,
                   current_committed_capacity - allowance)
 ```
 
-After adopting this lower target, the downscale counter resets. Another lower
-wave requires a new complete delay window. Busy-replica and stale-signal safety
-continue to clip actual victims. Controller reconstruction may restore the
-committed fleet as the target baseline only for the first fresh recompute. An
-adopted lower target must not rebound to committed capacity on later ticks while
-asynchronous retirement is still catching up.
+The elapsed window starts when a fresh recompute first observes raw demand
+below the adopted target. For compatibility with the established one-tick
+default, that first observation receives at most one nominal decision interval
+of evidence; all remaining progress uses monotonic elapsed time. A demand
+rebound to or above the adopted target, a stale demand report, a version
+update, or an accepted lower wave resets the window. Controller reconstruction
+also starts with no prior timer evidence. Another lower wave requires a new
+complete elapsed window.
+
+Decision-loop counts are diagnostic only. They cannot implement this delay:
+large-fleet probing can make a nominal 20-second decision tick take much
+longer, which turned a configured 300-second delay into roughly 9.5 minutes in
+production. Busy-replica and stale-signal safety continue to clip actual
+victims. Controller reconstruction may restore the committed fleet as the
+target baseline only for the first fresh recompute. An adopted lower target
+must not rebound to committed capacity on later ticks while asynchronous
+retirement is still catching up.
 
 Failed/stopping cleanup, explicit shutdown, cost rebalance, and old-version
 retirement remain exempt. These are lifecycle actions rather than ordinary
@@ -277,11 +428,13 @@ occupancy as fail-closed active work.
 Apply the scale-up wave to fresh and stale target increases. Persist its
 timestamp through in-process service updates. Reset a newly committed
 version's adopted target to its minimum so an inherited old-version target
-cannot bypass the first wave. Apply the 50 percent downscale wave after
-hysteresis and reset the counter after each permitted reduction. During a
-logical rolling update, preserve coverage using observed latest-version
-logical capacity plus a conservative one-slot floor per READY old backend, and
-retire eligible old physical backends in batches of at most 20 per tick.
+cannot bypass the first wave. Gate the 50 percent downscale wave on elapsed
+wall-clock hysteresis and reset its timer after each permitted reduction,
+without changing legacy count-based hysteresis for other autoscaler modes.
+During a logical rolling update, preserve coverage using observed
+latest-version logical capacity plus a conservative one-slot floor per READY
+old backend, and retire eligible old physical backends in batches of at most 20
+per tick.
 Start the HA demand-handoff expiry from the first complete authoritative demand
 gauge report even when some backend occupancy samples remain unknown.
 
@@ -293,9 +446,9 @@ Keep the public load-balancer endpoint unchanged.
 
 Monitor through 08:00 EST. Success means the applied target follows actual
 in-flight work plus duration-normalized rejection pressure, target increases
-obey the 10-or-20-percent per-minute ceiling, ordinary downscale obeys the
-five-minute 50-percent waves, and physical capacity converges without request
-or error regression.
+obey the configured minimum-or-percentage per-minute ceiling, ordinary
+downscale obeys the five-minute 50-percent waves, and physical capacity
+converges without request or error regression.
 
 ## Alternatives considered
 
@@ -337,6 +490,14 @@ minutes between old-version batches would prolong duplicate fleets. The
 per-tick 20-backend batch is an actuation bound, while busy-backend and fresh
 demand coverage checks provide the safety gate.
 
+### Keep using nominal decision-loop counts for downscale
+
+Rejected. The controller's decision interval is a scheduling target, not a
+duration guarantee. Fleet probing and reconciliation can stretch a tick, so a
+15-tick threshold does not reliably represent 300 seconds. Changing only the
+logical concurrency downscale gate avoids broad hysteresis changes for legacy
+request-rate and physical-backend policies.
+
 ## Rollout and rollback
 
 The user approved direct production deployment without a test-fleet gate.
@@ -364,23 +525,43 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify provisioning capacity is committed and prevents duplicate waves.
 - Verify continuously advancing load-balancer snapshots cannot starve a
   still-current logical scale-up or retirement target, while a newer target or
-  version still fences it before persistence. Retirement must recompute
-  coverage and idle evidence from the newest snapshot.
+  version still fences an unaccepted batch before persistence. An accepted
+  same-version retirement must recompute coverage and idle evidence from the
+  newest target and snapshot, keeping covered victims off route and
+  reactivating only the capacity required for a shortfall.
 - Verify a backend that recovered between the decision snapshot and actuation
   is removed from the unknown-capacity replacement set.
 - Verify final manager admission and teardown fences count one slot per ready
   old backend, but never count a backend that is already off route.
+- Verify an adopted recovery retirement remains off route for its adoption
+  generation, is released when capacity advances while the current published
+  target remains authoritative, and remains off route when the diagnostic
+  recovery deadline expires without newer evidence.
+- Verify queued shutdown admission cannot abort or advertise a recovered
+  retirement before the recovery pass adopts and releases it.
 - Verify in-process updates preserve the rate timestamp and a rebuild never
   jumps directly to the raw target.
 - Verify a demand rebound does not cause scale-down and stale reports cannot
   shrink capacity.
-- Verify 50 percent downscale requires a fresh complete five-minute window per
-  wave, does not rebound while retirement lags, and works for mixed 1, 4, and
-  8-slot backends.
+- Verify 50 percent downscale requires 300 elapsed seconds per wave even when
+  decision ticks are irregular or slow, resets on a demand rebound or stale
+  report, does not rebound while retirement lags, and works for mixed 1, 4,
+  and 8-slot backends.
 - Verify logical rolling retirement starts before latest capacity reaches the
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old
   backends, and emits no more than 20 victims per tick.
+- Verify a newer pending version freezes old-version retirement admission,
+  committed teardowns remain irreversible, and an applied in-process update
+  re-fences both strict idle-wait and bounded precommit victims from fresh
+  new-version evidence without advertising the whole draining fleet again.
+  Repeat the same assertion for controller recovery, including bounded victims
+  whose drain deadlines expired while teardown admission was budget-delayed.
+- Verify a fresh pre-retirement routing acknowledgement allows the same LB
+  session's next clean report to finish an idle drain, while stale,
+  non-authoritative, restarted-session, and unknown-occupancy reports remain
+  fail-closed. Verify recovery resolves strict and bounded-precommit drain URLs
+  in one batch and falls back to per-replica resolution if that batch fails.
 - Verify an authoritative HA demand report starts the handoff expiry when all
   demand gauges are present, while incomplete or legacy reports retain the
   previous floor. Missing occupancy samples must still protect those replicas

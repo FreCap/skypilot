@@ -1088,20 +1088,31 @@ class TestLogicalScalingWaves(unittest.TestCase):
         _report(autoscaler,
                 in_flight={replica.replica_id: 0 for replica in replicas})
 
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 100)
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
-        converged_replicas = replicas[:50]
-        _report(
-            autoscaler,
-            in_flight={replica.replica_id: 0 for replica in converged_replicas})
-        autoscaler._set_target_num_replicas_with_concurrency_logic(
-            converged_replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
-        autoscaler._set_target_num_replicas_with_concurrency_logic(
-            converged_replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 25)
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 119.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+            converged_replicas = replicas[:50]
+            _report(autoscaler,
+                    in_flight={
+                        replica.replica_id: 0 for replica in converged_replicas
+                    })
+            clock.return_value = 200.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                converged_replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+            clock.return_value = 220.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                converged_replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 25)
 
     def test_rebuilt_target_uses_committed_fleet_as_downscale_baseline(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
@@ -1113,10 +1124,17 @@ class TestLogicalScalingWaves(unittest.TestCase):
         _report(autoscaler,
                 in_flight={replica.replica_id: 0 for replica in replicas})
 
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 100)
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 119.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
 
     def test_downscale_target_does_not_rebound_while_retirement_lags(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
@@ -1130,16 +1148,92 @@ class TestLogicalScalingWaves(unittest.TestCase):
         _report(autoscaler,
                 in_flight={replica.replica_id: 0 for replica in replicas})
 
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 100)
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 120.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
 
-        # Actuation is asynchronous, so committed capacity can still report
-        # the pre-wave fleet on the next tick. That must not undo the adopted
-        # target while the retirement batch catches up.
-        autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
+            # Actuation is asynchronous, so committed capacity can still
+            # report the pre-wave fleet on the next tick. That must not undo
+            # the adopted target while the retirement batch catches up.
+            clock.return_value = 121.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_downscale_uses_elapsed_time_when_decision_ticks_are_slow(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 250.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 379.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 380.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_downscale_elapsed_window_resets_on_rebound_and_stale_signal(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas})
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 250.0
+            autoscaler._tick_fresh = False
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            autoscaler._tick_fresh = None
+            self.assertIsNone(autoscaler._downscale_started_at)
+
+            clock.return_value = 260.0
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas})
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 539.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas},
+                    queue_depth=100)
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertIsNone(autoscaler._downscale_started_at)
+
+            clock.return_value = 600.0
+            _report(autoscaler,
+                    in_flight={replica.replica_id: 0 for replica in replicas})
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            clock.return_value = 879.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            clock.return_value = 880.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 50)
 
     def test_arrival_floor_never_lowers_target(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
@@ -1963,6 +2057,21 @@ class TestUpdateVersion(unittest.TestCase):
         autoscaler.update_version(2, _spec(knob=1.0, max_replicas=5),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_update_resets_logical_downscale_elapsed_window(self):
+        autoscaler = _make_autoscaler(knob=1.0,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300)
+        autoscaler._downscale_started_at = 123.0
+        autoscaler.downscale_counter = 4
+
+        autoscaler.update_version(
+            2,
+            _spec(knob=1.0, replica_unit='logical',
+                  downscale_delay_seconds=300), serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertIsNone(autoscaler._downscale_started_at)
+        self.assertEqual(autoscaler.downscale_counter, 0)
 
     def test_ramped_update_does_not_inherit_old_version_target(self):
         autoscaler = _make_autoscaler(

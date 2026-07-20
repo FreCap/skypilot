@@ -36,6 +36,12 @@ else:
 
 F = TypeVar('F', bound=Callable[..., Any])
 
+# Bound API calls by default without imposing a total-transfer deadline.
+# Requests interprets this tuple as connect timeout and per-read inactivity
+# timeout. Callers that intentionally wait indefinitely (for example, idle log
+# streams) can continue to pass an explicit read timeout of None.
+DEFAULT_REQUEST_TIMEOUT = (5, 600)
+
 
 class RetryContext:
     """State shared across retry attempts for a single decorated call.
@@ -371,7 +377,8 @@ def request(method, url, **kwargs) -> 'requests.Response':
 
 def request_without_retry(method, url, **kwargs) -> 'requests.Response':
     """Send a request to the API server without retry."""
-    response = _session.request(method, url, **kwargs)
+    timeout = kwargs.pop('timeout', DEFAULT_REQUEST_TIMEOUT)
+    response = _session.request(method, url, timeout=timeout, **kwargs)
     handle_server_unavailable(response)
     # TODO (kyuds): investigate into whether we can remove this as we
     # explicitly set in `get_api_server_status`.

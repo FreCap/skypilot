@@ -1,4 +1,6 @@
 """Unit tests for the SkyPilot REST API client module."""
+import ast
+import pathlib
 import threading
 import time
 from unittest import mock
@@ -10,6 +12,38 @@ from sky import exceptions
 from sky.server import rest
 
 request_err = requests.exceptions.ChunkedEncodingError("Test error")
+
+
+def test_streaming_api_calls_declare_timeout_policy():
+    """Require streaming callers to choose bounded or unbounded reads."""
+    repo_root = pathlib.Path(rest.__file__).resolve().parents[2]
+    violations = []
+    for path in (repo_root / 'sky').rglob('*.py'):
+        source = path.read_text(encoding='utf-8')
+        if 'make_authenticated_request' not in source or 'stream' not in source:
+            continue
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            is_authenticated_request = (
+                isinstance(function, ast.Attribute) and
+                function.attr == 'make_authenticated_request') or (
+                    isinstance(function, ast.Name) and
+                    function.id == 'make_authenticated_request')
+            if not is_authenticated_request:
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            stream = keywords.get('stream')
+            if (isinstance(stream, ast.Constant) and stream.value is True and
+                    'timeout' not in keywords):
+                violations.append(
+                    f'{path.relative_to(repo_root)}:{node.lineno}')
+
+    assert not violations, (
+        'Streaming API calls must explicitly choose their read-timeout policy: '
+        f'{violations}')
 
 
 class TestHandleResponseText:
@@ -538,9 +572,11 @@ class TestRestRequestFunctions:
         result = rest.request('POST', 'http://test.com', json={'key': 'value'})
 
         assert result == mock_response
-        mock_session.request.assert_called_once_with('POST',
-                                                     'http://test.com',
-                                                     json={'key': 'value'})
+        mock_session.request.assert_called_once_with(
+            'POST',
+            'http://test.com',
+            json={'key': 'value'},
+            timeout=rest.DEFAULT_REQUEST_TIMEOUT)
 
     @mock.patch('sky.server.rest._session')
     def test_get_successful_request(self, mock_session):
@@ -555,9 +591,11 @@ class TestRestRequestFunctions:
                               params={'param': 'value'})
 
         assert result == mock_response
-        mock_session.request.assert_called_once_with('GET',
-                                                     'http://test.com',
-                                                     params={'param': 'value'})
+        mock_session.request.assert_called_once_with(
+            'GET',
+            'http://test.com',
+            params={'param': 'value'},
+            timeout=rest.DEFAULT_REQUEST_TIMEOUT)
 
     @mock.patch('sky.server.rest._session')
     def test_post_with_503_response_retries(self, mock_session):
@@ -643,3 +681,20 @@ class TestRestRequestFunctions:
             params={'param': 'value'},
             headers={'User-Agent': 'SkyPilot'},
             timeout=30)
+
+    @mock.patch('sky.server.rest._session')
+    def test_explicit_unbounded_read_timeout_is_preserved(self, mock_session):
+        """Intentional long-lived streams can opt out of the read timeout."""
+        mock_response = mock.Mock(status_code=200, headers={})
+        mock_session.request.return_value = mock_response
+
+        result = rest.request_without_retry('GET',
+                                            'http://test.com/stream',
+                                            stream=True,
+                                            timeout=(5, None))
+
+        assert result == mock_response
+        mock_session.request.assert_called_once_with('GET',
+                                                     'http://test.com/stream',
+                                                     stream=True,
+                                                     timeout=(5, None))

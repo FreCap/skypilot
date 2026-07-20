@@ -182,6 +182,86 @@ def test_set_api_access_token_ids_rolls_back_entire_batch(
     assert _get_api_access_token_rows(engine) == []
 
 
+def test_api_access_token_cleanup_lookup_uses_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    terminal_job = _insert_job_info(engine)
+    _insert_task(engine, terminal_job, 0, status=ManagedJobStatus.SUCCEEDED)
+    state.set_api_access_token_ids([terminal_job], 'terminal-token')
+
+    with _count_sql_statements(engine) as counts:
+        token_id = state.get_releasable_api_access_token_id(terminal_job)
+
+    assert token_id == 'terminal-token'
+    assert counts['n'] == 1, counts
+
+
+@pytest.mark.parametrize('active_status', [
+    ManagedJobStatus.PENDING,
+    ManagedJobStatus.RUNNING,
+    ManagedJobStatus.CANCELLING,
+])
+def test_api_access_token_cleanup_waits_for_every_shared_job(
+        _mock_managed_jobs_db_conn, active_status):
+    engine = _mock_managed_jobs_db_conn
+    finished_job = _insert_job_info(engine)
+    active_job = _insert_job_info(engine)
+    _insert_task(engine, finished_job, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, active_job, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, active_job, 1, status=active_status)
+    state.set_api_access_token_ids([finished_job, active_job], 'shared-token')
+
+    with _count_sql_statements(engine) as counts:
+        token_id = state.get_releasable_api_access_token_id(finished_job)
+
+    assert token_id is None
+    assert counts['n'] == 1, counts
+
+
+def test_api_access_token_cleanup_releases_after_every_shared_job_finishes(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    succeeded_job = _insert_job_info(engine)
+    cancelled_job = _insert_job_info(engine)
+    _insert_task(engine, succeeded_job, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, cancelled_job, 0, status=ManagedJobStatus.CANCELLED)
+    state.set_api_access_token_ids([succeeded_job, cancelled_job],
+                                   'shared-token')
+
+    with _count_sql_statements(engine) as counts:
+        token_id = state.get_releasable_api_access_token_id(cancelled_job)
+
+    assert token_id == 'shared-token'
+    assert counts['n'] == 1, counts
+
+
+def test_api_access_token_cleanup_fails_closed_for_missing_task_row(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    finished_job = _insert_job_info(engine)
+    missing_task_job = _insert_job_info(engine)
+    _insert_task(engine, finished_job, 0, status=ManagedJobStatus.SUCCEEDED)
+    state.set_api_access_token_ids([finished_job, missing_task_job],
+                                   'shared-token')
+
+    with _count_sql_statements(engine) as counts:
+        token_id = state.get_releasable_api_access_token_id(finished_job)
+
+    assert token_id is None
+    assert counts['n'] == 1, counts
+
+
+def test_api_access_token_cleanup_missing_association_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        token_id = state.get_releasable_api_access_token_id(999999)
+
+    assert token_id is None
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_controller_processes_batches_and_normalizes(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
