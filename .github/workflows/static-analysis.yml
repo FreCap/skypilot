@@ -66,6 +66,8 @@ jobs:
           ruff check sky/backends/cloud_vm_ray_backend.py --select B905
           # Batch worker validation errors must reach the coordinator result.
           ruff check sky/batch/coordinator.py --select S110
+          # SQLite database-name validation must survive `python -O`.
+          ruff check sky/utils/db/db_utils.py --select S101
           # A mutable class default bypasses threading.local's per-thread
           # attribute storage and is shared by every thread. RUF012 is noisy
           # for intentional class constants, so scope it to local subclasses.
