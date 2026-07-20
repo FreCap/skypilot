@@ -2988,6 +2988,69 @@ class TestLogicalCapacityPlanning:
             in_flight_drain_cap_seconds=0)
         assert retiring.status_property.is_scale_down
 
+    def test_target_growth_waits_for_committed_current_version_capacity(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        provisioning = replica_managers.ReplicaInfo(replica_id=11,
+                                                    cluster_name='svc-11',
+                                                    replica_port='8080',
+                                                    is_spot=True,
+                                                    location=None,
+                                                    version=10,
+                                                    resources_override=None,
+                                                    planned_capacity=4)
+        mgr._logical_target = (10, 5, 5)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor, provisioning]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_not_called()
+        assert retiring.status_property.is_scale_down
+        assert retiring.status_property.wait_for_idle_before_termination
+
+    def test_target_growth_reactivates_after_committed_capacity_fails(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        failed = replica_managers.ReplicaInfo(replica_id=11,
+                                              cluster_name='svc-11',
+                                              replica_port='8080',
+                                              is_spot=True,
+                                              location=None,
+                                              version=10,
+                                              resources_override=None,
+                                              planned_capacity=4)
+        failed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        mgr._logical_target = (10, 5, 5)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor, failed]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert not retiring.status_property.wait_for_idle_before_termination
+
+    def test_target_growth_reactivates_after_latest_backend_degrades(self):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        degraded = self._ready_backend(11, 4)
+        degraded.version = 10
+        degraded.status_property.service_ready_now = False
+        mgr._logical_target = (10, 5, 5)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor, degraded]):
+            mgr._finish_logical_retirement(9, retiring)
+
+        mgr._terminate_replica.assert_not_called()
+        mgr._persist_replica.assert_called_once_with(9, retiring)
+        assert not retiring.status_property.is_scale_down
+        assert not retiring.status_property.wait_for_idle_before_termination
+
     def test_target_growth_reactivates_only_capacity_shortfall(self):
         mgr, first_retiring, first_survivor = (
             self._pending_logical_retirement())

@@ -141,14 +141,19 @@ coverage.
 A same-version target change does not blanket-cancel retirements that were
 already durably accepted and taken off route. Before irreversible teardown,
 each accepted retirement uses the newest fresh snapshot and current target to
-recompute coverage without that victim. If current non-retiring coverage is
-sufficient, the retirement remains valid. If it is insufficient, only enough
-accepted retirements are reactivated to cover the current shortfall; later
-victims then re-evaluate against that restored capacity. A version change,
-pending newer version, stale demand snapshot, or unavailable current target
-continues to block or abort retirement as appropriate. This preserves demand
-rebound safety without allowing a small target fluctuation to reactivate an
-entire large drain wave.
+recompute coverage without that victim. Ready capacity remains the requirement
+for irreversible teardown. If ready capacity is temporarily short but
+non-retiring, never-ready current-version capacity already committed to
+provisioning covers the target, the accepted retirement stays off route and
+waits for that capacity to become ready. Previously ready but currently degraded
+or unobservable capacity does not qualify. Only a shortfall not covered by
+either ready or committed capacity reactivates enough accepted retirements to
+cover the gap; later victims then re-evaluate against that restored capacity. A
+version change, pending newer version, stale demand snapshot, or unavailable
+current target continues to block or abort retirement as appropriate. This
+prevents one scale-up decision from both launching replacement capacity and
+reactivating a large old fleet while preserving the ready-capacity fence before
+destructive cleanup.
 Unknown-capacity replacement stays tied to the exact decision generation; a
 newer snapshot may narrow or cancel the set but cannot authorize new overlap
 from stale evidence.
