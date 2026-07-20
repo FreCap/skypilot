@@ -21,6 +21,7 @@ from sky.batch import coordinator
 from sky.batch import io_formats
 from sky.batch import utils
 from sky.batch import worker
+from sky.jobs import batch_state as batch_state_lib
 from sky.jobs import controller as jobs_controller
 from sky.jobs import state
 from sky.utils.db import migration_utils
@@ -161,7 +162,7 @@ def test_expired_batch_attempt_is_reclaimed_once(batch_state_db):
 def test_batch_returning_fallback_preserves_claim_and_requeue(
         batch_state_db, monkeypatch):
     del batch_state_db
-    monkeypatch.setattr(state, '_supports_update_returning',
+    monkeypatch.setattr(batch_state_lib, '_supports_update_returning',
                         lambda engine: False)
     _create_batch_job(80, 'owner-a')
     assert state.save_batch_states(80, [[0, 4]], 'owner-a')
@@ -262,7 +263,7 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
     takeover_done = threading.Event()
     new_launch = mock.Mock()
     errors = []
-    original_lock = state._lock_batch_coordinator_owner
+    original_lock = batch_state_lib._lock_batch_coordinator_owner
 
     def _pause_old_owner(session, job_id, owner_token):
         owned = original_lock(session, job_id, owner_token)
@@ -272,7 +273,7 @@ def test_new_launch_waits_for_paused_old_owner_transaction(
                 raise RuntimeError('test timed out releasing old owner')
         return owned
 
-    monkeypatch.setattr(state, '_lock_batch_coordinator_owner',
+    monkeypatch.setattr(batch_state_lib, '_lock_batch_coordinator_owner',
                         _pause_old_owner)
 
     def _old_claim():

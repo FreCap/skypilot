@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import sqlalchemy
 
+from sky.jobs import batch_state as batch_state_lib
 from sky.jobs import state
 
 testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
@@ -48,7 +49,7 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
     takeover_done = threading.Event()
     errors = []
     new_launch = mock.Mock()
-    original_lock = state._lock_batch_coordinator_owner
+    original_lock = batch_state_lib._lock_batch_coordinator_owner
 
     def _pause_old_owner(session, job_id, owner_token):
         owned = original_lock(session, job_id, owner_token)
@@ -58,7 +59,7 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
                 raise RuntimeError('test timed out releasing old owner')
         return owned
 
-    monkeypatch.setattr(state, '_lock_batch_coordinator_owner',
+    monkeypatch.setattr(batch_state_lib, '_lock_batch_coordinator_owner',
                         _pause_old_owner)
 
     def _old_claim():
