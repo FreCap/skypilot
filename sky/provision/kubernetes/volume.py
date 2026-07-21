@@ -693,11 +693,9 @@ def create_persistent_volume_claim(
 ) -> None:
     """Creates a persistent volume claim for SkyServe controller."""
     pvc_name = pvc_spec['metadata']['name']
-    use_existing = config is not None and config.config.get('use_existing')
 
     # When use_existing, search by both name and label
-    if use_existing:
-        assert config is not None  # Guaranteed by use_existing check above
+    if config is not None and config.config.get('use_existing'):
         volume_name = config.name  # User-specified name
         try:
             pvc = _find_pvc_by_name_or_label(context, namespace, volume_name)
@@ -746,9 +744,9 @@ def _get_pvc_spec(namespace: str,
     """Gets the PVC spec for the given storage config."""
     access_mode = config.config.get('access_mode')
     size = config.size
-    # The previous code assumes that the access_mode and size are always set.
-    assert access_mode is not None, f'access_mode is None for volume ' \
-                                    f'{config.name_on_cloud}'
+    if access_mode is None:
+        raise ValueError(
+            f'access_mode is required for volume {config.name_on_cloud}')
     pvc_spec: dict[str, Any] = {
         'metadata': {
             'name': config.name_on_cloud,

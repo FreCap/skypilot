@@ -579,11 +579,12 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
     try:
         pod = kubernetes.core_api(context).read_namespaced_pod(
             pod_name, namespace)
-        # Only reached from the 409 "object is being deleted" branch, so the pod
-        # must be terminating; assert to catch misuse from any future caller.
-        assert pod.metadata.deletion_timestamp is not None, (
-            f'_force_remove_terminating_pod called on non-terminating pod '
-            f'{pod_name}')
+        # The create response can race with a later read.  Fail closed if the
+        # pod is no longer terminating: deleting it with grace period 0 would
+        # otherwise remove a healthy pod.
+        if pod.metadata.deletion_timestamp is None:
+            raise config_lib.KubernetesError(
+                f'Refusing to force-remove non-terminating pod {pod_name}.')
         finalizers = pod.metadata.finalizers or []
     except kubernetes.api_exception() as e:
         if e.status == 404:

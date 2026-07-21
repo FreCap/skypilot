@@ -10,7 +10,6 @@ import React, {
 } from 'react';
 import { useRouter } from 'next/router';
 import { BASE_PATH, ENDPOINT } from '@/data/connectors/constants';
-import { apiClient } from '@/data/connectors/client';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import { checkGrafanaAvailability, getGrafanaUrl } from '@/utils/grafana';
@@ -20,6 +19,11 @@ import {
   trackPluginPageView,
   registerAnalyticsProvider,
 } from '@/lib/analytics';
+import {
+  extractJsPath,
+  fetchPluginManifest,
+  loadPluginScript,
+} from './plugin-loader';
 
 const PluginContext = createContext({
   topNavLinks: [],
@@ -186,102 +190,6 @@ function upsertById(collection, item) {
   const next = [...collection];
   next[index] = item;
   return next;
-}
-
-const pluginScriptPromises = new Map();
-
-function resolveScriptUrl(jsPath) {
-  if (!jsPath || typeof jsPath !== 'string') {
-    return null;
-  }
-  if (/^https?:\/\//.test(jsPath)) {
-    return jsPath;
-  }
-  if (typeof window === 'undefined') {
-    return jsPath;
-  }
-  try {
-    return new URL(jsPath, window.location.origin).toString();
-  } catch (error) {
-    console.warn(
-      '[SkyDashboardPlugin] Failed to resolve plugin script path:',
-      jsPath,
-      error
-    );
-    return null;
-  }
-}
-
-function loadPluginScript(jsPath, requiresEarlyInit = false) {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  const resolved = resolveScriptUrl(jsPath);
-  if (!resolved) {
-    return null;
-  }
-  if (pluginScriptPromises.has(resolved)) {
-    return pluginScriptPromises.get(resolved);
-  }
-
-  console.log('Loading plugin script:', resolved);
-  const promise = new Promise((resolve) => {
-    const script = document.createElement('script');
-    script.type = 'text/javascript';
-    script.async = true;
-    script.src = resolved;
-    if (requiresEarlyInit) script.dataset.requiresEarlyInit = 'true';
-    script.onload = () => resolve();
-    script.onerror = (error) => {
-      console.warn(
-        '[SkyDashboardPlugin] Failed to load plugin script:',
-        resolved,
-        error
-      );
-      resolve();
-    };
-    document.head.appendChild(script);
-  });
-
-  pluginScriptPromises.set(resolved, promise);
-  return promise;
-}
-
-async function fetchPluginManifest() {
-  try {
-    const response = await apiClient.get(`/api/plugins`);
-    if (!response.ok) {
-      console.warn(
-        '[SkyDashboardPlugin] Failed to fetch plugin manifest:',
-        response.status,
-        response.statusText
-      );
-      return [];
-    }
-    const payload = await response.json();
-    if (!payload || !Array.isArray(payload.plugins)) {
-      return [];
-    }
-    console.log('Plugin manifest:', payload.plugins);
-    return payload.plugins;
-  } catch (error) {
-    console.warn('[SkyDashboardPlugin] Error fetching plugin manifest:', error);
-    return [];
-  }
-}
-
-function extractJsPath(pluginDescriptor) {
-  if (!pluginDescriptor || typeof pluginDescriptor !== 'object') {
-    return null;
-  }
-  if (pluginDescriptor.js_extension_path) {
-    console.log(
-      'Extracting JS extension path:',
-      pluginDescriptor.js_extension_path
-    );
-    return pluginDescriptor.js_extension_path;
-  }
-  return null;
 }
 
 function normalizeNavLink(link) {

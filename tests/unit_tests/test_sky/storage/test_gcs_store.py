@@ -64,6 +64,31 @@ def test_gcs_store_validate_name_rejects_invalid_names(name, expected):
         storage_lib.GcsStore.validate_name(name)
 
 
+def test_gcs_store_rejects_missing_cross_cloud_source(monkeypatch):
+    store = _gcs_store(name='missing-bucket', source='s3://missing-bucket/path')
+    verify_source = mock.Mock(return_value=False)
+    monkeypatch.setattr(storage_gcs.data_utils, 'verify_s3_bucket',
+                        verify_source)
+
+    with pytest.raises(AssertionError, match='S3 Bucket should exist'):
+        store._validate()
+
+    verify_source.assert_called_once_with('missing-bucket')
+
+
+def test_gcs_store_rejects_mismatched_source_name(monkeypatch):
+    store = _gcs_store(name='destination-bucket',
+                       source='s3://source-bucket/path')
+    verify_source = mock.Mock(return_value=True)
+    monkeypatch.setattr(storage_gcs.data_utils, 'verify_s3_bucket',
+                        verify_source)
+
+    with pytest.raises(AssertionError, match='name should be the same'):
+        store._validate()
+
+    verify_source.assert_not_called()
+
+
 def test_gcs_directory_probe_quotes_ordinary_object_url(monkeypatch):
     url = 'gs://test-bucket/research team\'s "final"; results #1.csv'
     run = mock.Mock(return_value=mock.Mock(stdout=f'{url}\n'.encode()))

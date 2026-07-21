@@ -1,8 +1,16 @@
 """Tests for Kubernetes provision."""
 
+import datetime
+import json
+import multiprocessing
+import os
 import re
+import threading
+import time
+import types
 from unittest import mock
 
+import filelock
 import pytest
 
 from sky import clouds
@@ -478,6 +486,7 @@ def test_insufficient_resources_msg(monkeypatch):
         requested_features=None,
         local_wheel_path=None,
         wheel_hash=None,
+        extra_launch_context={},
     )
 
     zone = "Test Zone"
@@ -535,7 +544,6 @@ def test_pod_termination_reason_start_error(monkeypatch):
 
     Pod is in Failed state with container terminated due to StartError.
     """
-    import datetime
 
     now = datetime.datetime(2025, 1, 1, 0, 0, 0)
 
@@ -582,7 +590,6 @@ def test_pod_termination_reason_kueue_preemption(monkeypatch):
     Includes both the TerminationTarget condition (preemption) and
     Ready condition (container status), as seen in real API responses.
     """
-    import datetime
 
     now = datetime.datetime(2025, 1, 1, 0, 0, 0)
 
@@ -632,7 +639,6 @@ def test_pod_termination_reason_null_finished_at(monkeypatch):
 
     Regression test for SKY-4423.
     """
-    import datetime
 
     now = datetime.datetime(2025, 1, 1, 0, 0, 0)
 
@@ -1541,7 +1547,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
             monkeypatch, autoscaler_type=None, autoscale_detected=False)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError,
                            match='simulated-timeout'):
@@ -1565,7 +1570,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
             monkeypatch, autoscaler_type='gke', autoscale_detected=True)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError):
             instance._wait_for_pods_to_schedule(
@@ -1596,7 +1600,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
         long_timeout = instance._AUTOSCALE_DETECTED_TIMEOUT_SECONDS + 600
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError):
             instance._wait_for_pods_to_schedule(
@@ -1629,7 +1632,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
             monkeypatch, autoscaler_type='karpenter', autoscale_detected=True)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError):
             instance._wait_for_pods_to_schedule(
@@ -1665,7 +1667,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
                                                       autoscale_detected=False)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError):
             instance._wait_for_pods_to_schedule(
@@ -1696,7 +1697,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
                                                       autoscale_detected=False)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError):
             instance._wait_for_pods_to_schedule(
@@ -1728,7 +1728,6 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
                             add_event)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError,
                            match='simulated-timeout'):
@@ -1750,6 +1749,572 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
         kwargs = launch_progress_calls[0].kwargs
         assert kwargs['reason'].startswith('Launching (')
         assert kwargs['nop_if_duplicate'] is True
+
+
+class TestKarpenterGpuSchedulingFastFail:
+    """Tests the bounded Karpenter FailedScheduling Event diagnosis."""
+
+    _MESSAGE = ('Failed to schedule pod, incompatible requirements, label '
+                '"nvidia.com/gpu.product" does not have known values')
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR',
+                            str(tmp_path / 'failed-scheduling-event-cache'))
+        pod_scheduling._clear_failed_scheduling_event_cache_for_testing()
+        yield
+        pod_scheduling._clear_failed_scheduling_event_cache_for_testing()
+
+    @staticmethod
+    def _event(*,
+               uid='pod-uid',
+               message=None,
+               occurrence=None,
+               creation_timestamp=None,
+               event_time=None,
+               last_timestamp=None,
+               series_timestamp=None,
+               reason='FailedScheduling',
+               event_type='Warning',
+               reporting_component='karpenter',
+               source_component=None):
+        if message is None:
+            message = TestKarpenterGpuSchedulingFastFail._MESSAGE
+        if occurrence is not None:
+            creation_timestamp = occurrence
+        return types.SimpleNamespace(
+            reason=reason,
+            type=event_type,
+            message=message,
+            reporting_component=reporting_component,
+            source=types.SimpleNamespace(component=source_component),
+            involved_object=types.SimpleNamespace(uid=uid),
+            series=(types.SimpleNamespace(last_observed_time=series_timestamp)
+                    if series_timestamp is not None else None),
+            event_time=event_time,
+            last_timestamp=last_timestamp,
+            metadata=types.SimpleNamespace(
+                creation_timestamp=creation_timestamp),
+        )
+
+    @staticmethod
+    def _patch_events(monkeypatch, events):
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_event.return_value = types.SimpleNamespace(
+            items=events)
+        monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+        return core_api
+
+    def test_exact_current_event_fast_fails_with_gpu_classification(
+            self, monkeypatch):
+        cutoff = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   17,
+                                   tzinfo=datetime.timezone.utc)
+        events = [
+            self._event(uid='pod-uid',
+                        occurrence=cutoff,
+                        reporting_component='default-scheduler'),
+            self._event(uid='pod-uid', occurrence=cutoff),
+        ]
+        core_api = self._patch_events(monkeypatch, events)
+
+        with pytest.raises(config_lib.KubernetesError) as exc_info:
+            pod_scheduling._raise_for_karpenter_gpu_incompatibility(
+                'ns', 'ctx', {'pod-uid'}, cutoff)
+
+        assert exc_info.value.insufficent_resources == ['GPUs']
+        core_api.list_namespaced_event.assert_called_once_with(
+            namespace='ns',
+            field_selector='reason=FailedScheduling',
+            _request_timeout=kubernetes.API_TIMEOUT)
+
+    def test_source_component_can_identify_karpenter(self):
+        event = self._event(occurrence=datetime.datetime(2026, 7, 20, 17),
+                            reporting_component='another-reporter',
+                            source_component='karpenter')
+        assert pod_scheduling._karpenter_gpu_incompatibility(event) is not None
+
+    @pytest.mark.parametrize('event_kwargs', [
+        {
+            'message': _MESSAGE + '; another NodePool is temporarily full'
+        },
+        {
+            'message': ('incompatible requirements, label '
+                        '"karpenter.k8s.aws/instance-family" does not '
+                        'have known values')
+        },
+        {
+            'event_type': 'Normal'
+        },
+    ])
+    def test_ambiguous_or_non_gpu_event_does_not_match(self, event_kwargs):
+        event = self._event(occurrence=datetime.datetime(2026, 7, 20, 17),
+                            **event_kwargs)
+        assert pod_scheduling._karpenter_gpu_incompatibility(event) is None
+
+    def test_old_or_wrong_uid_event_does_not_fast_fail(self, monkeypatch):
+        cutoff = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   17,
+                                   tzinfo=datetime.timezone.utc)
+        old = cutoff - datetime.timedelta(seconds=1)
+        self._patch_events(monkeypatch, [
+            self._event(uid='pod-uid', occurrence=old),
+            self._event(uid='other-uid', occurrence=cutoff),
+        ])
+
+        pod_scheduling._raise_for_karpenter_gpu_incompatibility(
+            'ns', 'ctx', {'pod-uid'}, cutoff)
+
+    def test_latest_coalesced_occurrence_and_timestamp_precedence(self):
+        creation = datetime.datetime(2026, 7, 20, 15)
+        last = datetime.datetime(2026, 7, 20, 16, tzinfo=datetime.timezone.utc)
+        event_time = datetime.datetime(2026,
+                                       7,
+                                       20,
+                                       17,
+                                       tzinfo=datetime.timezone.utc)
+        series = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   18,
+                                   tzinfo=datetime.timezone.utc)
+        event = self._event(creation_timestamp=creation,
+                            last_timestamp=last,
+                            event_time=event_time,
+                            series_timestamp=series)
+
+        assert pod_scheduling._failed_scheduling_event_occurrence(
+            event) == series
+        event.series = None
+        assert pod_scheduling._failed_scheduling_event_occurrence(
+            event) == event_time
+        event.event_time = None
+        assert pod_scheduling._failed_scheduling_event_occurrence(event) == last
+        event.last_timestamp = None
+        assert pod_scheduling._failed_scheduling_event_occurrence(
+            event) == creation.replace(tzinfo=datetime.timezone.utc)
+
+    def test_old_creation_with_fresh_series_occurrence_fast_fails(
+            self, monkeypatch):
+        cutoff = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   17,
+                                   tzinfo=datetime.timezone.utc)
+        self._patch_events(monkeypatch, [
+            self._event(creation_timestamp=cutoff - datetime.timedelta(hours=1),
+                        series_timestamp=cutoff)
+        ])
+
+        with pytest.raises(config_lib.KubernetesError):
+            pod_scheduling._raise_for_karpenter_gpu_incompatibility(
+                'ns', 'ctx', {'pod-uid'}, cutoff)
+
+    def test_event_api_failure_is_negatively_cached(self, monkeypatch):
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_event.side_effect = RuntimeError('api down')
+        monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+
+        assert pod_scheduling._get_failed_scheduling_event_matches('ns',
+                                                                   'ctx') == {}
+        assert pod_scheduling._get_failed_scheduling_event_matches('ns',
+                                                                   'ctx') == {}
+        assert core_api.list_namespaced_event.call_count == 1
+
+    def test_shared_snapshot_survives_process_local_cache_clear(
+            self, monkeypatch):
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+
+        first = pod_scheduling._get_failed_scheduling_event_matches('ns', 'ctx')
+        pod_scheduling._clear_failed_scheduling_event_cache_for_testing()
+        second = pod_scheduling._get_failed_scheduling_event_matches(
+            'ns', 'ctx')
+
+        assert first == second
+        assert core_api.list_namespaced_event.call_count == 1
+
+    def test_classifier_and_heuristic_share_one_concurrent_refresh(
+            self, monkeypatch):
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+        barrier = threading.Barrier(8)
+        results = []
+
+        def classify():
+            barrier.wait()
+            results.append(
+                bool(
+                    pod_scheduling._get_failed_scheduling_event_matches(
+                        'ns', 'ctx')))
+
+        def detect_heuristic():
+            barrier.wait()
+            results.append(
+                pod_scheduling._cluster_maybe_autoscaling(
+                    'ns', 'ctx', occurrence - datetime.timedelta(seconds=1)))
+
+        threads = [threading.Thread(target=classify) for _ in range(4)]
+        threads += [threading.Thread(target=detect_heuristic) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert all(results)
+        assert core_api.list_namespaced_event.call_count == 1
+
+    def test_concurrent_callers_share_one_refresh(self, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+        call_count = 0
+        call_count_lock = threading.Lock()
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+
+        def list_events(**kwargs):
+            del kwargs
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+            entered.set()
+            assert release.wait(timeout=5)
+            return types.SimpleNamespace(
+                items=[self._event(occurrence=occurrence)])
+
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_event.side_effect = list_events
+        monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+        results = []
+
+        def get_matches():
+            results.append(
+                pod_scheduling._get_failed_scheduling_event_matches(
+                    'ns', 'ctx'))
+
+        threads = [threading.Thread(target=get_matches) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(timeout=5)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert call_count == 1
+        assert all(result['pod-uid'][0] == occurrence for result in results)
+
+    @pytest.mark.skipif('fork' not in multiprocessing.get_all_start_methods(),
+                        reason='requires process-level file-lock contention')
+    def test_processes_share_one_refresh_and_retry_from_snapshot(
+            self, monkeypatch):
+        del monkeypatch
+        process_context = multiprocessing.get_context('fork')
+        process_count = 4
+        barrier = process_context.Barrier(process_count)
+        refresh_entered = process_context.Event()
+        release_refresh = process_context.Event()
+        snapshot_ready = process_context.Event()
+        refresh_count = process_context.Value('i', 0)
+        results = process_context.Queue()
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        event = self._event(occurrence=occurrence)
+        cache_dir = pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR
+
+        def worker():
+            pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_DIR = cache_dir
+            pod_scheduling._clear_failed_scheduling_event_cache_for_testing()
+
+            class CoreApi:
+
+                def list_namespaced_event(self, **kwargs):
+                    del kwargs
+                    with refresh_count.get_lock():
+                        refresh_count.value += 1
+                    refresh_entered.set()
+                    assert release_refresh.wait(timeout=10)
+                    return types.SimpleNamespace(items=[event])
+
+            kubernetes.core_api = lambda *args, **kwargs: CoreApi()
+            barrier.wait(timeout=10)
+            first = pod_scheduling._get_failed_scheduling_event_matches(
+                'ns', 'ctx')
+            if first:
+                snapshot_ready.set()
+            else:
+                assert snapshot_ready.wait(timeout=10)
+            second = first
+            for _ in range(20):
+                if second:
+                    break
+                time.sleep(0.05)
+                second = pod_scheduling._get_failed_scheduling_event_matches(
+                    'ns', 'ctx')
+            results.put((bool(first), bool(second)))
+
+        processes = [
+            process_context.Process(target=worker) for _ in range(process_count)
+        ]
+        for process in processes:
+            process.start()
+        assert refresh_entered.wait(timeout=10)
+        # Keep the winner in the Kubernetes read long enough for every other
+        # process to take the nonblocking lock-contention path.
+        time.sleep(0.5)
+        release_refresh.set()
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+
+        process_results = [results.get(timeout=5) for _ in range(process_count)]
+        assert refresh_count.value == 1
+        assert sum(first for first, _ in process_results) == 1
+        assert all(second for _, second in process_results)
+
+    def test_cache_does_not_evict_pinned_entries(self, monkeypatch):
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_CACHE_MAX_ENTRIES', 2)
+        first = pod_scheduling._pin_failed_scheduling_event_cache_entry(
+            'ctx', 'first')
+        second = pod_scheduling._pin_failed_scheduling_event_cache_entry(
+            'ctx', 'second')
+        assert first is not None
+        assert second is not None
+        assert pod_scheduling._pin_failed_scheduling_event_cache_entry(
+            'ctx', 'third') is None
+
+        pod_scheduling._release_failed_scheduling_event_cache_entry(second)
+        third = pod_scheduling._pin_failed_scheduling_event_cache_entry(
+            'ctx', 'third')
+        assert third is not None
+        assert ('ctx', 'first') in pod_scheduling._FAILED_SCHEDULING_EVENT_CACHE
+        assert ('ctx',
+                'second') not in pod_scheduling._FAILED_SCHEDULING_EVENT_CACHE
+        pod_scheduling._release_failed_scheduling_event_cache_entry(third)
+        pod_scheduling._release_failed_scheduling_event_cache_entry(first)
+
+    def test_cache_entry_and_uid_match_bounds(self, monkeypatch):
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_CACHE_MAX_ENTRIES', 2)
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_CACHE_MAX_UID_MATCHES', 3)
+        cutoff = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   17,
+                                   tzinfo=datetime.timezone.utc)
+        events = [
+            self._event(uid=f'uid-{index}',
+                        occurrence=cutoff + datetime.timedelta(seconds=index))
+            for index in range(5)
+        ]
+        self._patch_events(monkeypatch, events)
+
+        matches = pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-1', 'ctx')
+        assert set(matches) == {'uid-2', 'uid-3', 'uid-4'}
+        pod_scheduling._get_failed_scheduling_event_matches('ns-2', 'ctx')
+        pod_scheduling._get_failed_scheduling_event_matches('ns-3', 'ctx')
+        assert len(pod_scheduling._FAILED_SCHEDULING_EVENT_CACHE) == 2
+
+    def test_shared_bucket_selection_is_stable(self):
+        first = pod_scheduling._failed_scheduling_event_shared_cache_paths(
+            'ctx', 'ns')
+        second = pod_scheduling._failed_scheduling_event_shared_cache_paths(
+            'ctx', 'ns')
+        assert first == second
+        assert first[0].endswith('.json')
+        assert first[1].endswith('.lock')
+        assert first[2].endswith('.json.tmp')
+
+    def test_full_fresh_shared_bucket_skips_colliding_identity(
+            self, monkeypatch):
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKETS', 1)
+        monkeypatch.setattr(
+            pod_scheduling,
+            '_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKET_MAX_ENTRIES', 2)
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+
+        assert pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-1', 'ctx')
+        assert pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-2', 'ctx')
+        assert pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-3', 'ctx') == {}
+        assert core_api.list_namespaced_event.call_count == 2
+
+    def test_expired_shared_bucket_entry_is_replaced(self, monkeypatch):
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKETS', 1)
+        monkeypatch.setattr(
+            pod_scheduling,
+            '_FAILED_SCHEDULING_EVENT_SHARED_CACHE_BUCKET_MAX_ENTRIES', 1)
+        monkeypatch.setattr(pod_scheduling,
+                            '_FAILED_SCHEDULING_EVENT_CACHE_TTL_SECONDS', 0)
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+
+        assert pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-1', 'ctx')
+        assert pod_scheduling._get_failed_scheduling_event_matches(
+            'ns-2', 'ctx')
+        bucket_path, _, _ = (
+            pod_scheduling._failed_scheduling_event_shared_cache_paths(
+                'ctx', 'ns-2'))
+        with open(bucket_path, encoding='utf-8') as bucket_file:
+            bucket = json.load(bucket_file)
+        assert bucket['entries'][0]['identity'] == (
+            pod_scheduling._failed_scheduling_event_shared_cache_identity(
+                'ctx', 'ns-2'))
+        assert core_api.list_namespaced_event.call_count == 2
+
+    @pytest.mark.parametrize('invalid_bucket', [
+        '{not-json',
+        json.dumps({
+            'version':
+                pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION,
+            'entries': [{
+                'identity': '["ctx","ns"]',
+                'refreshed_at': 1e30,
+                'last_accessed_at': 1e30,
+                'snapshot': {
+                    'latest_occurrence': None,
+                    'gpu_incompatibilities': [],
+                },
+            }],
+        }),
+        json.dumps({
+            'version':
+                pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION,
+            'entries': [{
+                'identity': '["ctx","ns"]',
+                'refreshed_at': float('nan'),
+                'last_accessed_at': 0,
+                'snapshot': {
+                    'latest_occurrence': None,
+                    'gpu_incompatibilities': [],
+                },
+            }],
+        }),
+    ])
+    def test_malformed_or_future_shared_bucket_is_repaired(
+            self, monkeypatch, invalid_bucket):
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+        bucket_path, _, staging_path = (
+            pod_scheduling._failed_scheduling_event_shared_cache_paths(
+                'ctx', 'ns'))
+        os.makedirs(os.path.dirname(bucket_path), exist_ok=True)
+        with open(bucket_path, 'w', encoding='utf-8') as bucket_file:
+            bucket_file.write(invalid_bucket)
+
+        assert pod_scheduling._get_failed_scheduling_event_matches('ns', 'ctx')
+        with open(bucket_path, encoding='utf-8') as bucket_file:
+            repaired = json.load(bucket_file)
+        assert repaired['version'] == (
+            pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION)
+        assert len(repaired['entries']) == 1
+        assert not os.path.exists(staging_path)
+        assert core_api.list_namespaced_event.call_count == 1
+
+    def test_invalid_utf8_shared_bucket_is_repaired(self, monkeypatch):
+        occurrence = datetime.datetime.now(datetime.timezone.utc)
+        core_api = self._patch_events(monkeypatch,
+                                      [self._event(occurrence=occurrence)])
+        bucket_path, _, _ = (
+            pod_scheduling._failed_scheduling_event_shared_cache_paths(
+                'ctx', 'ns'))
+        os.makedirs(os.path.dirname(bucket_path), exist_ok=True)
+        with open(bucket_path, 'wb') as bucket_file:
+            bucket_file.write(b'\xff\xfe')
+
+        assert pod_scheduling._get_failed_scheduling_event_matches('ns', 'ctx')
+        with open(bucket_path, encoding='utf-8') as bucket_file:
+            repaired = json.load(bucket_file)
+        assert repaired['version'] == (
+            pod_scheduling._FAILED_SCHEDULING_EVENT_SHARED_CACHE_VERSION)
+        assert core_api.list_namespaced_event.call_count == 1
+
+    def test_shared_lock_contention_skips_refresh(self, monkeypatch):
+        core_api = self._patch_events(monkeypatch, [
+            self._event(occurrence=datetime.datetime.now(datetime.timezone.utc))
+        ])
+        _, lock_path, _ = (
+            pod_scheduling._failed_scheduling_event_shared_cache_paths(
+                'ctx', 'ns'))
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with filelock.FileLock(lock_path):
+            assert pod_scheduling._get_failed_scheduling_event_matches(
+                'ns', 'ctx') == {}
+        assert core_api.list_namespaced_event.call_count == 0
+
+    def test_shared_filesystem_error_skips_refresh(self, monkeypatch):
+        core_api = self._patch_events(monkeypatch, [
+            self._event(occurrence=datetime.datetime.now(datetime.timezone.utc))
+        ])
+        bucket_path, _, _ = (
+            pod_scheduling._failed_scheduling_event_shared_cache_paths(
+                'ctx', 'ns'))
+        real_open = open
+
+        def fail_bucket_read(path, *args, **kwargs):
+            if path == bucket_path:
+                raise PermissionError('cache unavailable')
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr('builtins.open', fail_bucket_read)
+        assert pod_scheduling._get_failed_scheduling_event_matches('ns',
+                                                                   'ctx') == {}
+        assert core_api.list_namespaced_event.call_count == 0
+
+    def test_wait_loop_exits_without_autoscaler_config_for_exact_event(
+            self, monkeypatch):
+        cutoff = datetime.datetime(2026,
+                                   7,
+                                   20,
+                                   17,
+                                   tzinfo=datetime.timezone.utc)
+        cluster_name_on_cloud = 'my-cluster'
+        node = TestWaitForPodsToScheduleAutoscaleTimeout._make_node(
+            'pod-0', cluster_name_on_cloud)
+        pod = TestWaitForPodsToScheduleAutoscaleTimeout._make_pending_pod(
+            'pod-0', cluster_name_on_cloud)
+        pod.metadata.uid = 'pod-uid'
+
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+            items=[pod])
+        core_api.list_namespaced_event.return_value = types.SimpleNamespace(
+            items=[self._event(occurrence=cutoff)])
+        monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+        monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
+                            lambda *a, **k: None)
+        clock = TestWaitForPodsToScheduleAutoscaleTimeout._FakeClock()
+        monkeypatch.setattr(pod_scheduling.time, 'time', clock.time)
+        monkeypatch.setattr(pod_scheduling.time, 'sleep', clock.sleep)
+
+        with pytest.raises(config_lib.KubernetesError) as exc_info:
+            pod_scheduling._wait_for_pods_to_schedule(namespace='ns',
+                                                      context='ctx',
+                                                      new_nodes=[node],
+                                                      timeout=60,
+                                                      cluster_name='cn',
+                                                      create_pods_start=cutoff)
+
+        assert exc_info.value.insufficent_resources == ['GPUs']
+        assert clock.now == 0
 
 
 class TestWaitForPodsToScheduleBoundPod:
@@ -1882,7 +2447,6 @@ class TestWaitForPodsToScheduleBoundPod:
         raise_errors, core_api = self._wire_common_mocks(monkeypatch, pod)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         # A positive timeout; the function must return well before it without
         # raising because the pod is bound.
@@ -1913,7 +2477,6 @@ class TestWaitForPodsToScheduleBoundPod:
                                                   autoscaler_type=None)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
-        import datetime  # pylint: disable=import-outside-toplevel
 
         with pytest.raises(config_lib.KubernetesError,
                            match='simulated-timeout'):
@@ -3424,7 +3987,6 @@ class TestCreatePodFinalizerHandling:
                      'exists')
 
     def _conflict_exc(self):
-        import json
         return _make_api_exception(409,
                                    'Conflict',
                                    body=json.dumps(
@@ -3544,11 +4106,10 @@ class TestCreatePodFinalizerHandling:
         core_api_mock.delete_namespaced_pod.assert_not_called()
         assert core_api_mock.create_namespaced_pod.call_count == 2
 
-    def test_asserts_pod_is_terminating(self, monkeypatch):
+    def test_rejects_non_terminating_pod(self, monkeypatch):
         """The helper is only valid for a terminating pod; if the read returns a
 
-        live pod (no deletionTimestamp), the precondition assert fires rather
-        than force-deleting a healthy pod.
+        live pod (no deletionTimestamp), fail rather than force-deleting it.
         """
         conflict = self._conflict_exc()
         live_pod = mock.MagicMock()
@@ -3564,7 +4125,8 @@ class TestCreatePodFinalizerHandling:
                             lambda *a, **k: FakeApiException)
 
         pod_spec = {'metadata': {'name': 't-reco-head'}, 'spec': {}}
-        with pytest.raises(AssertionError):
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Refusing to force-remove'):
             instance._create_namespaced_pod_with_retries(
                 'default', pod_spec, None)
         # Must not have touched the live pod.

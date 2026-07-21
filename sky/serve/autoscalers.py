@@ -28,6 +28,14 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
+# Maximum consecutive downscale pressure vetoes per downscale episode.
+# Genuine rising pressure raises the raw target and takes the upscale
+# branch, which ends the episode on its own; the veto only needs to
+# protect against downscaling at the exact moment pressure begins.
+# Bounding it at 2 consecutive full hysteresis windows (worst case
+# ~2x downscale_delay_seconds extra hold) preserves that protection
+# while restoring downscale liveness under trickle traffic.
+_MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
 
 
 class AutoscalerDecisionOperator(enum.Enum):
@@ -2271,6 +2279,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             spec, 'scale_up_rate_min_replicas', None)
         self.scale_up_rate_period_seconds: int | None = getattr(
             spec, 'scale_up_rate_period_seconds', None)
+        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.adaptive_scale_up: dict[str, Any] | None = (
+            dict(adaptive_scale_up)
+            if isinstance(adaptive_scale_up, dict) else None)
+        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        self._queue_timeout_seconds: float | None = queue_config.get(
+            'timeout_seconds')
+        self._queue_timeout_thresholds: tuple[tuple[int, float], ...] = tuple(
+            (int(entry['min_priority']), float(entry['timeout_seconds']))
+            for entry in queue_config.get('timeout_seconds_by_priority', ()))
         # SkyServiceSpec exposes 50 for new specs and restores 100 for old
         # pickles. Attribute-less test/legacy objects preserve old behavior.
         self.max_scale_down_rate_percentage: int = int(
@@ -2284,7 +2302,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._downscale_started_at: float | None = None
         self._raw_target_num_replicas: int = self.target_num_replicas
         self._latest_committed_capacity: int = 0
+        self._latest_provisioning_capacity: int = 0
         self._rejected_concurrency: float = 0.0
+        self._weighted_queue_work: float = 0.0
+        self._arrival_floor_target: int = 0
         # Request timestamps back the arrival floor (the only up-signal
         # available while the demand report is stale), windowed exactly
         # like RequestRateAutoscaler's QPS window.
@@ -2299,8 +2320,35 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # absolute).
         self._in_flight_by_replica_id: dict[int, int] | None = None
         self._queue_depth: int = 0
+        self._queue_depth_by_priority: dict[int, int] | None = None
         self._rejected_in_window: int = 0
         self._rejected_in_recent_window: int | None = None
+        self._rejected_in_window_by_priority: dict[int, int] | None = None
+        self._rejected_in_recent_window_by_priority: dict[int,
+                                                          int] | None = None
+        self._unique_job_arrivals_60s: int | None = None
+        self._unique_job_arrivals_300s: int | None = None
+        self._headerless_arrivals_60s: int | None = None
+        self._headerless_arrivals_300s: int | None = None
+        self._offered_arrival_tracking_saturated: bool = False
+        self._pressure_baseline: tuple[int, int, int] | None = None
+        self._pressure_latched: bool = False
+        self._pressure_reasons: tuple[str, ...] = ()
+        self._pressure_streak: int = 0
+        self._adaptive_until: float | None = None
+        self._downscale_veto_reason: str | None = None
+        # Consecutive pressure vetoes within the current downscale episode
+        # (a run of recomputes whose raw target stays below the adopted
+        # target). Bounded by _MAX_CONSECUTIVE_DOWNSCALE_VETOES: under
+        # trickle traffic a tiny positive delta re-latches pressure nearly
+        # every quiet window, and an unbounded veto would restart the
+        # hysteresis timer forever, starving downscale indefinitely.
+        self._downscale_veto_streak: int = 0
+        self._pending_retention_floor: int | None = None
+        self._pending_capacity_at_adoption: int = 0
+        self._pending_budget_spent: int = 0
+        self._last_scale_down_allowance: int = 0
+        self._last_pending_allowance: int = 0
         # Replica ids whose declared async occupancy could not be sampled.
         # They contribute their full per-version capacity to outstanding work:
         # unknown is a potentially-full replica, never an idle zero.
@@ -2481,12 +2529,83 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         }
         queue_depth = request_aggregator_info.get('queue_depth')
         self._queue_depth = int(queue_depth) if queue_depth is not None else 0
+
+        def _priority_counts(value: Any) -> dict[int, int] | None:
+            if not isinstance(value, dict):
+                return None
+            return {
+                int(priority): int(count)
+                for priority, count in value.items()
+                if (str(priority).isdigit() and 0 <= int(priority) <= 100 and
+                    isinstance(count, int) and not isinstance(count, bool) and
+                    count >= 0)
+            }
+
+        self._queue_depth_by_priority = _priority_counts(
+            request_aggregator_info.get('queue_depth_by_priority'))
         rejected = request_aggregator_info.get('rejected_in_window')
         self._rejected_in_window = int(rejected) if rejected is not None else 0
         recent_rejected = request_aggregator_info.get(
             'rejected_in_recent_window')
         self._rejected_in_recent_window = (
             int(recent_rejected) if recent_rejected is not None else None)
+        self._rejected_in_window_by_priority = _priority_counts(
+            request_aggregator_info.get('rejected_in_window_by_priority'))
+        self._rejected_in_recent_window_by_priority = _priority_counts(
+            request_aggregator_info.get(
+                'rejected_in_recent_window_by_priority'))
+
+        def _optional_count(field: str) -> int | None:
+            value = request_aggregator_info.get(field)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < 0):
+                return None
+            return value
+
+        self._unique_job_arrivals_60s = _optional_count(
+            'unique_job_arrivals_60s')
+        self._unique_job_arrivals_300s = _optional_count(
+            'unique_job_arrivals_300s')
+        self._headerless_arrivals_60s = _optional_count(
+            'headerless_arrivals_60s')
+        self._headerless_arrivals_300s = _optional_count(
+            'headerless_arrivals_300s')
+        self._offered_arrival_tracking_saturated = (
+            request_aggregator_info.get('offered_arrival_tracking_saturated')
+            is True)
+        report_is_floored = request_aggregator_info.get(
+            'pressure_report_is_floored') is True
+        arrival_60 = self._offered_arrival_count(60)
+        pressure_sample = (self._queue_depth, self._rejected_in_recent_window or
+                           0, arrival_60)
+        if not report_is_floored:
+            if self._pressure_baseline is None:
+                self._pressure_streak = 0
+            else:
+                labels = ('queue_depth', 'recent_rejections',
+                          'offered_arrivals_60s')
+                reasons = tuple(label for label, current, previous in zip(
+                    labels, pressure_sample, self._pressure_baseline)
+                                if current > previous)
+                if reasons:
+                    self._pressure_latched = True
+                    self._pressure_reasons = reasons
+                    self._pressure_streak += 1
+                    if (self.adaptive_scale_up is not None and
+                            self._pressure_streak
+                            >= self.adaptive_scale_up['pressure_observations']):
+                        self._adaptive_until = (
+                            time.monotonic() +
+                            self.adaptive_scale_up['hold_seconds'])
+                else:
+                    self._pressure_streak = 0
+            self._pressure_baseline = pressure_sample
+        else:
+            # A maximum-merged handoff gauge is not an authoritative
+            # observation of new offered demand. It also breaks a run of
+            # consecutive pressure observations, while leaving an already
+            # active adaptive hold untouched until its normal expiry.
+            self._pressure_streak = 0
         self._unknown_in_flight_replica_ids = {
             int(replica_id) for replica_id in (request_aggregator_info.get(
                 'unknown_in_flight_replica_ids', []) or [])
@@ -2649,6 +2768,69 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return (self.target_concurrency_per_replica *
                 self.target_utilization_percentage / 100.0)
 
+    def _priority_timeout(self, priority: int) -> float | None:
+        timeout = self._queue_timeout_seconds
+        for min_priority, threshold_timeout in self._queue_timeout_thresholds:
+            if priority < min_priority:
+                break
+            timeout = threshold_timeout
+        return timeout
+
+    def _queue_work(self) -> float:
+        if (self.replica_unit != 'logical' or
+                self.expected_request_duration_seconds is None or
+                not self._queue_timeout_thresholds or
+                self._queue_depth_by_priority is None or
+                sum(self._queue_depth_by_priority.values())
+                < self._queue_depth):
+            # A mixed-version HA floor can carry aggregate demand from an old
+            # active beside an empty or partial priority map from the new
+            # active. Never let the optional map erase that proven queue.
+            return float(self._queue_depth)
+        work = 0.0
+        for priority, count in self._queue_depth_by_priority.items():
+            timeout = self._priority_timeout(priority)
+            weight = 1.0
+            if timeout is not None:
+                weight = min(1.0,
+                             self.expected_request_duration_seconds / timeout)
+            work += count * weight
+        return work
+
+    def _offered_arrival_count(self, window_seconds: int) -> int:
+        if self._offered_arrival_tracking_saturated:
+            return constants.LB_OFFERED_ARRIVAL_CAP
+        if window_seconds == constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS:
+            values = (self._unique_job_arrivals_60s,
+                      self._headerless_arrivals_60s)
+        else:
+            values = (self._unique_job_arrivals_300s,
+                      self._headerless_arrivals_300s)
+        if any(value is None for value in values):
+            return 0
+        return sum(typing.cast(int, value) for value in values)
+
+    def _arrival_work(self) -> float:
+        duration = self.expected_request_duration_seconds
+        if duration is None:
+            return 0.0
+        if (self._unique_job_arrivals_60s is None or
+                self._unique_job_arrivals_300s is None or
+                self._headerless_arrivals_60s is None or
+                self._headerless_arrivals_300s is None):
+            return (len(self.request_timestamps) * duration /
+                    self.qps_window_size)
+        recent = (self._offered_arrival_count(60) * duration /
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        retained = (1.15 * self._offered_arrival_count(300) * duration /
+                    constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
+        return max(recent, retained)
+
+    def _adaptive_scale_up_active(self) -> bool:
+        return (self.adaptive_scale_up is not None and
+                self._adaptive_until is not None and
+                time.monotonic() < self._adaptive_until)
+
     def _rejected_work(self) -> float:
         """Convert the retained rejection population to concurrent work."""
         if (self.replica_unit != 'logical' or
@@ -2693,9 +2875,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 < self.scale_up_rate_period_seconds):
             return self.target_num_replicas
         committed = self._latest_committed_logical_capacity(replica_infos)
-        step = max(
-            self.scale_up_rate_min_replicas,
-            math.ceil(committed * self.max_scale_up_rate_percentage / 100.0))
+        rate_percentage = self.max_scale_up_rate_percentage
+        min_replicas = self.scale_up_rate_min_replicas
+        if self._adaptive_scale_up_active():
+            assert self.adaptive_scale_up is not None
+            rate_percentage = self.adaptive_scale_up[
+                'max_scale_up_rate_percentage']
+            min_replicas = self.adaptive_scale_up['scale_up_rate_min_replicas']
+        assert rate_percentage is not None
+        assert min_replicas is not None
+        step = max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
         return max(self.target_num_replicas, min(raw_target, committed + step))
 
     def _adopt_scale_up_target(
@@ -2715,6 +2904,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self.target_num_replicas > old_target and
                 self.target_num_replicas > committed):
             self._last_scale_up_wave_at = time.time()
+        if self.target_num_replicas > old_target:
+            self._pending_retention_floor = None
+            self._pending_capacity_at_adoption = 0
+            self._pending_budget_spent = 0
 
     def _limit_logical_scale_down(
         self,
@@ -2727,7 +2920,44 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         allowance = max(
             1,
             math.ceil(committed * self.max_scale_down_rate_percentage / 100.0))
+        self._last_scale_down_allowance = allowance
         return max(raw_target, committed - allowance)
+
+    def _provisioning_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        provisioning_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+        }
+        return sum(
+            self._committed_capacity(info)
+            for info in replica_infos
+            if (not info.is_terminal and info.version == self.latest_version and
+                info.status in provisioning_statuses and getattr(
+                    info.status_property, 'is_scale_down', False) is not True))
+
+    def _adopt_scale_down_target(
+        self,
+        raw_target: int,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> None:
+        if self.replica_unit != 'logical':
+            self.target_num_replicas = raw_target
+            return
+        self.target_num_replicas = self._limit_logical_scale_down(
+            raw_target, replica_infos)
+        provisioning = self._provisioning_logical_capacity(replica_infos)
+        allowance = (max(
+            1,
+            math.ceil(provisioning * self.max_scale_down_rate_percentage /
+                      100.0)) if provisioning > 0 else 0)
+        self._last_pending_allowance = allowance
+        self._pending_capacity_at_adoption = provisioning
+        self._pending_retention_floor = max(0, provisioning - allowance)
+        self._pending_budget_spent = 0
 
     def _reset_downscale_hysteresis(self) -> None:
         self.downscale_counter = 0
@@ -2752,6 +2982,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self.downscale_delay_seconds,
                 float(constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS))
             self._downscale_started_at = now - initial_credit
+            # The current raw target already incorporates every report seen
+            # before this quiet interval. Only later positive deltas may veto
+            # its acceptance.
+            self._pressure_latched = False
+            self._pressure_reasons = ()
         return (now - self._downscale_started_at
                 >= self.downscale_delay_seconds)
 
@@ -2759,6 +2994,30 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if self._downscale_started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self._downscale_started_at)
+
+    def _consume_downscale_pressure_veto(self) -> bool:
+        if not self._pressure_latched:
+            self._downscale_veto_reason = None
+            self._downscale_veto_streak = 0
+            return False
+        if self._downscale_veto_streak >= _MAX_CONSECUTIVE_DOWNSCALE_VETOES:
+            # The latch is magnitude-blind: under trickle traffic a tiny
+            # positive delta re-arms it nearly every quiet window, and an
+            # unbounded veto would restart the hysteresis timer forever.
+            # After the cap, let the downscale proceed; a genuine burst
+            # raises the raw target and exits the downscale episode via
+            # the upscale branch anyway.
+            self._downscale_veto_reason = None
+            self._pressure_latched = False
+            self._pressure_reasons = ()
+            self._downscale_veto_streak = 0
+            return False
+        self._downscale_veto_streak += 1
+        self._downscale_veto_reason = ','.join(self._pressure_reasons)[:128]
+        self._pressure_latched = False
+        self._pressure_reasons = ()
+        self._reset_downscale_hysteresis()
+        return True
 
     def _outstanding_work(
         self,
@@ -2804,10 +3063,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # protects its own capacity.
             unknown_floor = max(original_unknown_floor,
                                 replacement_unknown_floor)
+        self._weighted_queue_work = self._queue_work()
         self._rejected_concurrency = self._rejected_work()
         return float(
-            sum(self._in_flight_by_replica_id.values()) + self._queue_depth +
-            self._rejected_concurrency + unknown_floor)
+            sum(self._in_flight_by_replica_id.values()) +
+            self._weighted_queue_work + self._rejected_concurrency +
+            unknown_floor)
 
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
@@ -2827,6 +3088,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             best_capacity = self._effective_logical_capacity_per_gpu()
             self._latest_committed_capacity = (
                 self._latest_committed_logical_capacity(replica_infos))
+            self._latest_provisioning_capacity = (
+                self._provisioning_logical_capacity(replica_infos))
         else:
             best_capacity = (latest_capacities[0] if latest_capacities else
                              self.target_concurrency_per_replica)
@@ -2837,6 +3100,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # A signal gap cannot prove continuous low demand. Require a
                 # complete fresh elapsed window after reports recover.
                 self._reset_downscale_hysteresis()
+                self._pressure_baseline = None
+                self._pressure_latched = False
+                self._pressure_reasons = ()
+                self._pressure_streak = 0
+                self._downscale_veto_streak = 0
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
             # ride every sync). Raise-only floor, applied without
             # hysteresis -- while blind we must not delay growth, and we
@@ -2874,7 +3142,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
             raw_target_num = math.ceil(outstanding / best_capacity)
+            arrival_work = self._arrival_work()
+            self._arrival_floor_target = self._clip_target_num_replicas(
+                math.ceil(arrival_work / best_capacity))
+            raw_target_num = max(raw_target_num, self._arrival_floor_target)
         else:
+            self._arrival_floor_target = 0
             raw_target_num = 0
             covered = 0.0
             for capacity in latest_capacities:
@@ -2914,32 +3187,40 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
             if target_num_replicas >= self.target_num_replicas:
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
             else:
                 if self._downscale_hysteresis_elapsed():
-                    self._reset_downscale_hysteresis()
-                    self.target_num_replicas = self._limit_logical_scale_down(
-                        target_num_replicas, replica_infos)
+                    if not self._consume_downscale_pressure_veto():
+                        self._reset_downscale_hysteresis()
+                        self._adopt_scale_down_target(target_num_replicas,
+                                                      replica_infos)
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
             self._adopt_scale_up_target(target_num_replicas, replica_infos)
         elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
             self._reset_downscale_hysteresis()
+            # A rising raw target ends the downscale episode: the next
+            # episode gets a fresh veto budget.
+            self._downscale_veto_streak = 0
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
         elif target_num_replicas < self.target_num_replicas:
             self.upscale_counter = 0
             if self._downscale_hysteresis_elapsed():
-                self._reset_downscale_hysteresis()
-                self.target_num_replicas = self._limit_logical_scale_down(
-                    target_num_replicas, replica_infos)
+                if not self._consume_downscale_pressure_veto():
+                    self._reset_downscale_hysteresis()
+                    self._adopt_scale_down_target(target_num_replicas,
+                                                  replica_infos)
         else:
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
 
         self._upscale_pending = (target_num_replicas > self.target_num_replicas)
 
@@ -3066,10 +3347,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                                   None)
         self.scale_up_rate_period_seconds = getattr(
             spec, 'scale_up_rate_period_seconds', None)
+        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.adaptive_scale_up = (dict(adaptive_scale_up) if isinstance(
+            adaptive_scale_up, dict) else None)
+        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        self._queue_timeout_seconds = queue_config.get('timeout_seconds')
+        self._queue_timeout_thresholds = tuple(
+            (int(entry['min_priority']), float(entry['timeout_seconds']))
+            for entry in queue_config.get('timeout_seconds_by_priority', ()))
         self.max_scale_down_rate_percentage = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
         self._reset_downscale_hysteresis()
+        self._downscale_veto_streak = 0
+        self._pending_retention_floor = None
+        self._pending_capacity_at_adoption = 0
+        self._pending_budget_spent = 0
         if (self.replica_unit == 'logical' and
                 self.max_scale_up_rate_percentage is not None):
             # target_num_replicas described the previous version's launch
@@ -3372,9 +3665,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         remaining_committed = committed
         remaining_ready = sum(
             self._ready_capacity(info) for info in latest_nonterminal_replicas)
+        provisioning_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+        }
+        remaining_pending = sum(
+            self._committed_capacity(info)
+            for info in latest_nonterminal_replicas
+            if info.status in provisioning_statuses)
         decisions: list[AutoscalerDecision] = []
         for info in candidates:
             committed_width = self._committed_capacity(info)
+            if (info.status in provisioning_statuses and
+                    self._pending_retention_floor is not None and
+                    remaining_pending - committed_width
+                    < self._pending_retention_floor):
+                # The frozen episode budget is measured in logical slots. A
+                # multi-slot victim that would overspend is conservatively
+                # skipped rather than rounded through the percentage cap.
+                continue
             if info.is_ready:
                 ready_width = self._ready_capacity(info)
                 if ready_width <= 0:
@@ -3394,6 +3704,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             elif remaining_committed - committed_width < target:
                 continue
             remaining_committed -= committed_width
+            if info.status in provisioning_statuses:
+                remaining_pending -= committed_width
             decisions.append(
                 AutoscalerDecision(
                     AutoscalerDecisionOperator.SCALE_DOWN,
@@ -3402,6 +3714,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         reconcile_generation=self._reconcile_generation,
                         target_capacity=target,
                         replica_id=info.replica_id)))
+        self._pending_budget_spent = max(
+            0, self._pending_capacity_at_adoption - remaining_pending)
         return decisions
 
     def _select_victims_capacity_and_cost_aware(
@@ -3449,19 +3763,48 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                            self._in_flight_by_replica_id is not None else None)
         report_age = (time.time() - self._report_received_at
                       if self._report_received_at is not None else None)
+        adaptive_remaining = 0.0
+        if self._adaptive_until is not None:
+            adaptive_remaining = max(0.0,
+                                     self._adaptive_until - time.monotonic())
         info.update({
             'replica_unit': self.replica_unit,
             'in_flight_total': in_flight_total,
             'queue_depth': self._queue_depth,
+            'queue_depth_by_priority': self._queue_depth_by_priority,
+            'weighted_queue_work': self._weighted_queue_work,
             'rejected_in_window': self._rejected_in_window,
             'rejected_in_recent_window': self._rejected_in_recent_window,
+            'rejected_in_window_by_priority':
+                self._rejected_in_window_by_priority,
+            'rejected_in_recent_window_by_priority':
+                self._rejected_in_recent_window_by_priority,
             'rejected_concurrency': self._rejected_concurrency,
+            'unique_job_arrivals_60s': self._unique_job_arrivals_60s,
+            'unique_job_arrivals_300s': self._unique_job_arrivals_300s,
+            'headerless_arrivals_60s': self._headerless_arrivals_60s,
+            'headerless_arrivals_300s': self._headerless_arrivals_300s,
+            'offered_arrival_tracking_saturated':
+                self._offered_arrival_tracking_saturated,
+            'arrival_floor_target': self._arrival_floor_target,
             'raw_target_num_replicas': self._raw_target_num_replicas,
             'committed_capacity': self._latest_committed_capacity,
+            'provisioning_capacity': self._latest_provisioning_capacity,
             'target_utilization_percentage': self.target_utilization_percentage,
             'latest_scale_up_wave_at': self._last_scale_up_wave_at,
+            'pressure_streak': self._pressure_streak,
+            'pressure_latched': self._pressure_latched,
+            'pressure_reasons': list(self._pressure_reasons),
+            'adaptive_scale_up_active': self._adaptive_scale_up_active(),
+            'adaptive_hold_remaining_seconds': adaptive_remaining,
             'downscale_elapsed_seconds': self._downscale_elapsed_seconds(),
             'downscale_delay_seconds': self.downscale_delay_seconds,
+            'downscale_veto_reason': self._downscale_veto_reason,
+            'downscale_veto_streak': self._downscale_veto_streak,
+            'scale_down_allowance': self._last_scale_down_allowance,
+            'pending_scale_down_allowance': self._last_pending_allowance,
+            'pending_retention_floor': self._pending_retention_floor,
+            'pending_budget_spent': self._pending_budget_spent,
             'unknown_in_flight_replicas': len(
                 self._unknown_in_flight_replica_ids),
             'report_age_seconds': report_age,
@@ -3477,8 +3820,25 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'request_timestamps': self.request_timestamps,
             'in_flight_by_replica_id': self._in_flight_by_replica_id,
             'queue_depth': self._queue_depth,
+            'queue_depth_by_priority': self._queue_depth_by_priority,
             'rejected_in_window': self._rejected_in_window,
             'rejected_in_recent_window': self._rejected_in_recent_window,
+            'rejected_in_window_by_priority':
+                self._rejected_in_window_by_priority,
+            'rejected_in_recent_window_by_priority':
+                self._rejected_in_recent_window_by_priority,
+            'unique_job_arrivals_60s': self._unique_job_arrivals_60s,
+            'unique_job_arrivals_300s': self._unique_job_arrivals_300s,
+            'headerless_arrivals_60s': self._headerless_arrivals_60s,
+            'headerless_arrivals_300s': self._headerless_arrivals_300s,
+            'offered_arrival_tracking_saturated':
+                self._offered_arrival_tracking_saturated,
+            'pressure_baseline': self._pressure_baseline,
+            'pressure_latched': self._pressure_latched,
+            'pressure_reasons': self._pressure_reasons,
+            'pressure_streak': self._pressure_streak,
+            'downscale_veto_streak': self._downscale_veto_streak,
+            'adaptive_until': self._adaptive_until,
             'unknown_in_flight_replica_ids': sorted(
                 self._unknown_in_flight_replica_ids),
             'report_received_at': self._report_received_at,
@@ -3503,11 +3863,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 'in_flight_by_replica_id')
         if 'queue_depth' in dynamic_states:
             self._queue_depth = dynamic_states.pop('queue_depth')
+        if 'queue_depth_by_priority' in dynamic_states:
+            self._queue_depth_by_priority = dynamic_states.pop(
+                'queue_depth_by_priority')
         if 'rejected_in_window' in dynamic_states:
             self._rejected_in_window = dynamic_states.pop('rejected_in_window')
         if 'rejected_in_recent_window' in dynamic_states:
             self._rejected_in_recent_window = dynamic_states.pop(
                 'rejected_in_recent_window')
+        for field in ('rejected_in_window_by_priority',
+                      'rejected_in_recent_window_by_priority',
+                      'unique_job_arrivals_60s', 'unique_job_arrivals_300s',
+                      'headerless_arrivals_60s', 'headerless_arrivals_300s',
+                      'offered_arrival_tracking_saturated', 'pressure_baseline',
+                      'pressure_latched', 'pressure_reasons', 'pressure_streak',
+                      'downscale_veto_streak', 'adaptive_until'):
+            key = field
+            if key in dynamic_states:
+                setattr(self, f'_{field}', dynamic_states.pop(key))
         if 'unknown_in_flight_replica_ids' in dynamic_states:
             self._unknown_in_flight_replica_ids = {
                 int(replica_id) for replica_id in dynamic_states.pop(

@@ -933,6 +933,7 @@ def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
         'controller_ip': '10.0.0.1',
         'hash': 'hash-a',
         'resource_scope': 'scope-a',
+        'yaml_content': 'yaml: v1',
     }, {
         'name': 'serve-b',
         'status': serve_state.ServiceStatus.FAILED_CLEANUP,
@@ -941,7 +942,26 @@ def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
         'controller_ip': '10.0.0.2',
         'hash': 'hash-b',
         'resource_scope': 'scope-b',
+        'yaml_content': 'yaml: v1',
     }]
+
+
+def test_get_service_liveness_snapshots_reports_latest_version_yaml(
+        _mock_serve_db):
+    """The snapshot carries the LATEST version's yaml, including NULL for a
+    placeholder version row, so liveness sweeps can retire unbootable rows
+    without a per-service joined read."""
+    assert _add_minimal_service('svc', yaml_content='yaml: v1') is True
+    serve_state.add_or_update_version(
+        'svc', 2, types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        'yaml: v2')
+    assert _add_minimal_service('placeholder', yaml_content=None) is True
+
+    records = serve_state.get_service_liveness_snapshots(pool=False)
+
+    by_name = {record['name']: record for record in records}
+    assert by_name['svc']['yaml_content'] == 'yaml: v2'
+    assert by_name['placeholder']['yaml_content'] is None
 
 
 class TestAddServiceWritesControllerIp:

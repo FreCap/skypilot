@@ -30,10 +30,10 @@ class TestLoadMapPairing:
 
     def test_pre_post_roundtrip(self):
         policy = _make_least_load()
-        policy.pre_execute_hook('http://a:8080', None)
-        policy.pre_execute_hook('http://a:8080', None)
-        policy.post_execute_hook('http://a:8080', None)
-        policy.post_execute_hook('http://a:8080', None)
+        token1 = policy.pre_execute_hook('http://a:8080', None)
+        token2 = policy.pre_execute_hook('http://a:8080', None)
+        policy.post_execute_hook('http://a:8080', None, token1)
+        policy.post_execute_hook('http://a:8080', None, token2)
         assert policy.load_map['http://a:8080'] == 0
 
     def test_post_on_pruned_key_does_not_recreate_negative(self):
@@ -76,8 +76,32 @@ class TestLoadMapPairing:
 
     def test_post_clamps_at_zero(self):
         policy = _make_least_load()
-        policy.post_execute_hook('http://b:8080', None)
+        token = policy.pre_execute_hook('http://b:8080', None)
+        policy.post_execute_hook('http://b:8080', None, token)
+        # Double release with a valid token: clamp at zero, never -1.
+        policy.post_execute_hook('http://b:8080', None, token)
         assert policy.load_map['http://b:8080'] == 0
+
+    def test_none_token_release_never_decrements(self):
+        """A request dispatched while its URL was pruned (pre returned
+        None, no increment) must not release a slot on completion, even
+        if the URL was re-added in between: the None token must not
+        bypass the generation guard and steal a live request's slot."""
+        policy = _make_least_load()
+        # A pruned before dispatch: pre does not account the request.
+        policy.set_ready_replicas(['http://b:8080'])
+        token = policy.pre_execute_hook('http://a:8080', None)
+        assert token is None
+        # A re-added; a live request takes a slot on the new generation.
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        live_token = policy.pre_execute_hook('http://a:8080', None)
+        assert policy.load_map['http://a:8080'] == 1
+        # The unaccounted request finishes: must be a no-op.
+        policy.post_execute_hook('http://a:8080', None, token)
+        assert policy.load_map['http://a:8080'] == 1
+        # The live request's own release still works.
+        policy.post_execute_hook('http://a:8080', None, live_token)
+        assert policy.load_map['http://a:8080'] == 0
 
 
 class TestTieBreakRandomization:

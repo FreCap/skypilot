@@ -452,6 +452,60 @@ def is_job_group_execution(execution: str | None) -> bool:
     return execution == dag_lib.DagExecution.PARALLEL.value
 
 
+def extract_task_priority_from_yaml_str(
+        yaml_str: str, task_id: int) -> tuple[int | None, str | None] | None:
+    """Extract a task's scheduling priority from a persisted DAG YAML.
+
+    A slim alternative to fully loading the DAG when only the priority
+    scalars are needed (e.g. the managed-job controller re-reading an
+    out-of-band priority change before a recovery). Unlike a full load, this
+    never constructs Task/Resources objects, so it succeeds even when the
+    rest of the spec cannot be rehydrated in the current process.
+
+    Returns (priority, priority_class) for the task at ``task_id``; either
+    may be None when the YAML does not set it. Returns None when the YAML is
+    unparseable, has no task document at ``task_id``, or carries
+    non-scalar/ill-typed priority fields.
+    """
+    try:
+        configs = yaml_utils.read_yaml_all_str(yaml_str)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not configs:
+        return None
+    if _is_job_group_configs(configs):
+        task_configs = configs[1:]
+    else:
+        # Mirror _load_chain_dag: a first document holding only pipeline
+        # header fields is not a task.
+        first_config = configs[0]
+        is_header = False
+        if first_config is not None:
+            first_keys = set(first_config.keys())
+            is_header = first_keys in ({'name'}, {'name', 'execution'})
+        task_configs = configs[1:] if is_header else configs
+    task_configs = [c for c in task_configs if c is not None]
+    if task_id < 0 or task_id >= len(task_configs):
+        return None
+    resources_config = task_configs[task_id].get('resources')
+    if not isinstance(resources_config, dict):
+        return (None, None)
+    group = resources_config.get('ordered') or resources_config.get('any_of')
+    entry: dict[str, Any] = resources_config
+    if isinstance(group, list) and group and isinstance(group[0], dict):
+        # Priority is uniform across a task's resources; take the first
+        # entry, falling back to fields shared at the top level.
+        entry = {**resources_config, **group[0]}
+    priority = entry.get('priority')
+    priority_class = entry.get('priority_class')
+    if priority is not None and (not isinstance(priority, int) or
+                                 isinstance(priority, bool)):
+        return None
+    if priority_class is not None and not isinstance(priority_class, str):
+        return None
+    return (priority, priority_class)
+
+
 def load_job_group_from_yaml(
     path: str,
     env_overrides: list[tuple[str, str]] | None = None,

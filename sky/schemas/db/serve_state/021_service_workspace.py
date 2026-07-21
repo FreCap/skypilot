@@ -1,7 +1,7 @@
 """Persist the user workspace and reconcile former revision 018 layouts.
 
-Revision ID: 020
-Revises: 019
+Revision ID: 021
+Revises: 020
 Create Date: 2026-07-18
 
 """
@@ -15,8 +15,8 @@ from sky.serve import placement_history
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
-revision: str = '020'
-down_revision: str | Sequence[str] | None = '019'
+revision: str = '021'
+down_revision: str | Sequence[str] | None = '020'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -28,7 +28,7 @@ def upgrade():
         # placement-history branch both used revision 018. A preview database
         # stamped 018 may therefore lack the placement table that current 018
         # owns. Repair it idempotently before adding the preview's workspace
-        # column so either history converges at revision 020.
+        # column so either history converges at revision 021.
         bind = op.get_bind()
         if bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             placement_history.serve_placement_events_table.create(

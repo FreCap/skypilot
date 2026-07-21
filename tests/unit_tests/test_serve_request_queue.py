@@ -81,6 +81,64 @@ def test_queue_config_round_trip_and_defaults():
     assert spec.copy().lb_request_queue == queue
 
 
+def test_priority_timeout_thresholds_round_trip_and_select_highest_match():
+    thresholds = [{
+        'min_priority': 0,
+        'timeout_seconds': 600,
+    }, {
+        'min_priority': 50,
+        'timeout_seconds': 60,
+    }]
+    spec = _make_spec(lb_request_queue={
+        'timeout_seconds': 20,
+        'timeout_seconds_by_priority': thresholds,
+    })
+    queue = spec.lb_request_queue
+    assert queue is not None
+    assert queue['timeout_seconds_by_priority'] == thresholds
+    assert service_spec_lib.SkyServiceSpec.from_yaml_config(
+        spec.to_yaml_config()).lb_request_queue == queue
+    assert load_balancer.SkyServeLoadBalancer._request_queue_timeout(queue,
+                                                                     0) == 600
+    assert load_balancer.SkyServeLoadBalancer._request_queue_timeout(queue,
+                                                                     49) == 600
+    assert load_balancer.SkyServeLoadBalancer._request_queue_timeout(queue,
+                                                                     50) == 60
+    assert load_balancer.SkyServeLoadBalancer._request_queue_timeout(
+        queue, 100) == 60
+
+
+@pytest.mark.parametrize('thresholds', [
+    [{
+        'min_priority': 50,
+        'timeout_seconds': 60,
+    }, {
+        'min_priority': 0,
+        'timeout_seconds': 600,
+    }],
+    [{
+        'min_priority': 50,
+        'timeout_seconds': 60,
+    }, {
+        'min_priority': 50,
+        'timeout_seconds': 600,
+    }],
+    [{
+        'min_priority': 101,
+        'timeout_seconds': 60,
+    }],
+    [{
+        'min_priority': 0,
+        'timeout_seconds': float('inf'),
+    }],
+])
+def test_invalid_priority_timeout_thresholds_rejected(thresholds):
+    with pytest.raises(ValueError):
+        _make_spec(lb_request_queue={
+            'timeout_seconds_by_priority': thresholds,
+        })
+
+
 def test_async_occupancy_defaults_per_replica_cap_to_global_cap():
     spec = _make_spec(lb_request_queue={
         'use_async_occupancy': True,
@@ -1024,6 +1082,103 @@ def test_timeout_and_cancellation_remove_waiters():
     asyncio.run(_run())
 
 
+def test_waiter_keeps_priority_timeout_selected_at_admission():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      max_concurrency=1,
+                      timeout_seconds=1,
+                      timeout_seconds_by_priority=[{
+                          'min_priority': 50,
+                          'timeout_seconds': 0.01,
+                      }])
+        lb._active_request_count = 1
+        request = _request_with_headers([
+            (constants.LB_REQUEST_PRIORITY_HEADER_BYTES, b'50')
+        ])
+        setattr(request, '_skyserve_request_priority', 50)
+        with mock.patch.object(
+                lb, '_request_queue_timeout',
+                wraps=lb._request_queue_timeout) as timeout_resolver:
+            waiter = asyncio.create_task(lb._acquire_request_slot(request))
+            while lb._waiting_request_count != 1:
+                await asyncio.sleep(0)
+            lb._request_queue_config = {
+                **(lb._request_queue_config or {}),
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 50,
+                    'timeout_seconds': 10,
+                }],
+            }
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await waiter
+
+        assert exc.value.status_code == 503
+        timeout_resolver.assert_called_once()
+        assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_offered_arrivals_deduplicate_stable_jobs_and_bound_headerless():
+    lb = _make_lb()
+    stable = _request()
+    stable.headers = {constants.LB_JOB_ID_HEADER: 'job-secret'}
+    headerless = _request()
+
+    with mock.patch.object(load_balancer.time,
+                           'monotonic',
+                           side_effect=[100.0, 101.0, 102.0, 102.0]):
+        lb._record_offered_arrival(stable)
+        lb._record_offered_arrival(stable)
+        lb._record_offered_arrival(headerless)
+        counts = lb._offered_arrival_counts()
+
+    assert counts == {
+        'unique_job_arrivals_60s': 1,
+        'unique_job_arrivals_300s': 1,
+        'headerless_arrivals_60s': 1,
+        'headerless_arrivals_300s': 1,
+        'offered_arrival_tracking_saturated': False,
+    }
+    assert 'job-secret' not in (lb._offered_arrivals_by_job or {})
+
+
+def test_offered_arrival_tracking_saturates_instead_of_evicting():
+    lb = _make_lb()
+    requests = []
+    for index in range(3):
+        request = _request()
+        request.headers = {constants.LB_JOB_ID_HEADER: f'job-{index}'}
+        requests.append(request)
+
+    with mock.patch.object(constants, 'LB_OFFERED_ARRIVAL_CAP', 2), \
+            mock.patch.object(load_balancer.time,
+                              'monotonic',
+                              return_value=100.0):
+        for request in requests:
+            lb._record_offered_arrival(request)
+        counts = lb._offered_arrival_counts()
+
+    assert counts['offered_arrival_tracking_saturated'] is True
+    assert counts['unique_job_arrivals_300s'] == 2
+
+
+def test_rejection_priority_bucket_tracks_latest_stable_job_priority():
+    lb = _make_lb()
+    request = _request()
+    request.headers = {constants.LB_JOB_ID_HEADER: 'job-1'}
+    setattr(request, '_skyserve_request_priority', 10)
+    lb._record_rejection(request)
+    setattr(request, '_skyserve_request_priority', 80)
+    lb._record_rejection(request)
+
+    assert lb._rejected_in_window() == 1
+    assert lb._rejected_by_priority() == {'80': 1}
+
+
 def test_disconnected_waiter_is_removed_without_dispatch():
 
     async def _run():
@@ -1304,12 +1459,18 @@ def test_capacity_reports_request_queue_state():
         lb._replica_total_slots = {url: 1}
         lb._replica_free_slots = {url: 1}
         lb._waiting_request_count = 2
+        lb._queue_depth = 3
+        lb._queue_depth_by_priority = {0: 2, 50: 1}
         response = await lb._capacity(mock.MagicMock())
         payload = json.loads(response.body)
         assert payload['request_queue_depth'] == 2
         assert payload['request_queue_capacity'] == 3
         assert payload['request_queue_dispatch_limit'] == 1
         assert payload['request_queue_uses_async_occupancy'] is True
+        assert payload['queue_depth'] == 3
+        assert payload['queue_depth_by_priority'] == {'0': 2, '50': 1}
+        assert payload['unique_job_arrivals_60s'] == 0
+        assert payload['unique_job_arrivals_300s'] == 0
 
     asyncio.run(_run())
 

@@ -60,6 +60,18 @@ const FAILED_REPLICA_STATUSES = new Set([
   'UNKNOWN',
 ]);
 
+// Rows in these states are durable intent or completed lifecycle history, not
+// current provider billability. Keep every other status conservative: stopping,
+// cleanup-failed, unknown, and future statuses may still have live resources.
+const NON_BILLABLE_COST_STATUSES = new Set([
+  'PENDING',
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+  'PREEMPTED',
+]);
+
 const HISTORY_COUNT_FIELDS = [
   ['ready_count', 'readyCount'],
   ['provisioning_count', 'provisioningCount'],
@@ -68,6 +80,18 @@ const HISTORY_COUNT_FIELDS = [
   ['preempted_count', 'preemptedCount'],
   ['stopping_count', 'stoppingCount'],
   ['total_count', 'totalCount'],
+];
+
+const OPTIONAL_HISTORY_COUNT_FIELDS = [
+  ['ready_reserved_count', 'readyReservedCount'],
+  ['logical_ready_count', 'logicalReadyCount'],
+  ['logical_ready_reserved_count', 'logicalReadyReservedCount'],
+  ['logical_provisioning_count', 'logicalProvisioningCount'],
+  ['logical_not_ready_count', 'logicalNotReadyCount'],
+  ['logical_errored_count', 'logicalErroredCount'],
+  ['logical_preempted_count', 'logicalPreemptedCount'],
+  ['logical_stopping_count', 'logicalStoppingCount'],
+  ['logical_total_count', 'logicalTotalCount'],
 ];
 
 export function normalizeReplicaHistory(history) {
@@ -90,6 +114,17 @@ export function normalizeReplicaHistory(history) {
             const value = Number(sample[source]);
             normalized[target] =
               Number.isInteger(value) && value >= 0 ? value : 0;
+          });
+          OPTIONAL_HISTORY_COUNT_FIELDS.forEach(([source, target]) => {
+            const rawValue = sample[source];
+            const value = Number(rawValue);
+            normalized[target] =
+              rawValue !== null &&
+              rawValue !== undefined &&
+              Number.isInteger(value) &&
+              value >= 0
+                ? value
+                : null;
           });
           return normalized;
         })
@@ -285,10 +320,13 @@ export function normalizeService(record) {
     (value) => Number.isInteger(value) && value >= 0
   );
 
-  const pricedReplicas = replicas.filter(
+  const costTrackedReplicas = replicas.filter(
+    (replica) => !NON_BILLABLE_COST_STATUSES.has(replica.status)
+  );
+  const pricedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCost !== null
   );
-  const excludedReplicas = replicas.filter(
+  const excludedReplicas = costTrackedReplicas.filter(
     (replica) => replica.hourlyCostExclusionReason
   );
   const hourlyCostExclusionReasons = {};
@@ -362,6 +400,7 @@ export function normalizeService(record) {
     estimatedHourlyCost,
     spotHourlyCost,
     onDemandHourlyCost,
+    costTrackedReplicaCount: costTrackedReplicas.length,
     pricedReplicaCount: pricedReplicas.length,
     hourlyCostExcludedReplicaCount,
     hourlyCostExclusionReasons,

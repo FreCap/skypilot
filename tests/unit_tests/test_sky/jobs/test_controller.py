@@ -2490,6 +2490,7 @@ class TestRunJobLoopOwnershipCleanup:
         manager.starting.add(3)
         manager._cancel_info[3] = (False, None)
         manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock()
 
         ctx = MagicMock()
         controller = MagicMock()
@@ -2507,9 +2508,121 @@ class TestRunJobLoopOwnershipCleanup:
                       return_value=(
                           managed_job_state.ManagedJobStatus.SUCCEEDED)), \
                 patch('sky.jobs.controller.scheduler.job_done_async',
-                      new_callable=AsyncMock):
+                      new_callable=AsyncMock) as job_done:
             await manager.run_job_loop(3, '/dev/null')
 
         assert 3 not in manager._cancel_info
         assert 3 not in manager.starting
         assert 3 not in manager.job_tasks
+        manager._cleanup_api_server_access_token.assert_called_once_with(3)
+        job_done.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('cleanup_error', [
+        None,
+        RuntimeError('token database unavailable'),
+    ])
+    async def test_cancel_releases_api_token_only_after_terminal_transition(
+            self, cleanup_error, caplog):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock()
+        events = []
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        controller.run = AsyncMock(side_effect=asyncio.CancelledError)
+        manager._download_logs_for_cancelled_job = AsyncMock()
+
+        async def set_cancelled(**_kwargs):
+            events.append('cancelled')
+
+        def cleanup_token(job_id):
+            assert job_id == 3
+            events.append('token')
+            if cleanup_error is not None:
+                raise cleanup_error
+
+        async def job_done(job_id):
+            assert job_id == 3
+            events.append('done')
+
+        async def passthrough_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      return_value=controller), \
+                patch('sky.jobs.controller._get_dag',
+                      return_value=MagicMock(tasks=[MagicMock()])), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_all_task_ids_statuses_async',
+                      new=AsyncMock(return_value=[
+                          (0, managed_job_state.ManagedJobStatus.RUNNING)
+                      ])), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'set_cancelling_async', new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'set_cancelled_async', side_effect=set_cancelled), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_status_async', new=AsyncMock(return_value=(
+                          managed_job_state.ManagedJobStatus.CANCELLED))), \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      side_effect=job_done), \
+                patch.object(manager,
+                             '_cleanup_api_server_access_token',
+                             side_effect=cleanup_token,
+                             create=True), \
+                patch('sky.jobs.controller.asyncio.to_thread',
+                      side_effect=passthrough_to_thread):
+            with pytest.raises(asyncio.CancelledError):
+                await manager.run_job_loop(3, '/dev/null')
+
+        assert events == ['cancelled', 'token', 'done']
+        if cleanup_error is not None:
+            assert 'token database unavailable' in caplog.text
+
+
+class TestApiAccessTokenCleanup:
+    """Tests batch-aware API token cleanup decisions."""
+
+    def test_active_sibling_defers_shared_token_revocation(self):
+        manager = ControllerManager('test-uuid')
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'get_releasable_api_access_token_id',
+                   return_value=None) as releasable, \
+                patch('sky.jobs.controller.global_user_state.'
+                      'delete_service_account_token') as delete:
+            manager._cleanup_api_server_access_token(7)
+
+        releasable.assert_called_once_with(7)
+        delete.assert_not_called()
+
+    def test_terminal_batch_revokes_shared_token_once(self):
+        manager = ControllerManager('test-uuid')
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'get_releasable_api_access_token_id',
+                   return_value='shared-token') as releasable, \
+                patch('sky.jobs.controller.global_user_state.'
+                      'delete_service_account_token',
+                      return_value=True) as delete:
+            manager._cleanup_api_server_access_token(8)
+
+        releasable.assert_called_once_with(8)
+        delete.assert_called_once_with('shared-token')
+
+    def test_concurrent_sibling_revocation_is_idempotent(self):
+        manager = ControllerManager('test-uuid')
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'get_releasable_api_access_token_id',
+                   return_value='shared-token'), \
+                patch('sky.jobs.controller.global_user_state.'
+                      'delete_service_account_token',
+                      return_value=False) as delete:
+            manager._cleanup_api_server_access_token(9)
+
+        delete.assert_called_once_with('shared-token')

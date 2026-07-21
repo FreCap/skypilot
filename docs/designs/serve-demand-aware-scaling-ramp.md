@@ -142,18 +142,23 @@ A same-version target change does not blanket-cancel retirements that were
 already durably accepted and taken off route. Before irreversible teardown,
 each accepted retirement uses the newest fresh snapshot and current target to
 recompute coverage without that victim. Ready capacity remains the requirement
-for irreversible teardown. If ready capacity is temporarily short but
-non-retiring, never-ready current-version capacity already committed to
-provisioning covers the target, the accepted retirement stays off route and
-waits for that capacity to become ready. Previously ready but currently degraded
-or unobservable capacity does not qualify. Only a shortfall not covered by
-either ready or committed capacity reactivates enough accepted retirements to
-cover the gap; later victims then re-evaluate against that restored capacity. A
-version change, pending newer version, stale demand snapshot, or unavailable
-current target continues to block or abort retirement as appropriate. This
-prevents one scale-up decision from both launching replacement capacity and
-reactivating a large old fleet while preserving the ready-capacity fence before
-destructive cleanup.
+for irreversible teardown and for immediate route coverage. Provisioning
+capacity remains committed for scale-up wave accounting, so it prevents
+duplicate launches, but it is not serving capacity and must not make a healthy
+uncommitted drain wait off route for minutes during a demand rebound. If ready
+capacity is short, reactivate only enough healthy uncommitted victims to cover
+the ready-capacity gap even when current-version capacity is already
+provisioning. Evaluate this shortfall before requiring the victim to be idle:
+idleness proves that destructive teardown is safe, but it is not required to
+put a still-running, previously healthy backend back into rotation. Later
+victims re-evaluate against the restored ready capacity, so the response remains
+proportional rather than returning the whole draining fleet. When provisioning
+later becomes ready, ordinary target reconciliation may retire the temporary
+overlap again. Previously ready but currently degraded or unobservable capacity
+does not qualify as ready coverage. A version change, pending newer version,
+stale demand snapshot, or unavailable current target continues to block or
+abort retirement as appropriate. This preserves the ready-capacity fence before
+destructive cleanup without making launch latency part of surge recovery.
 
 A recovered uncommitted retirement must not proceed to shutdown admission in
 the same load-balancer generation that re-fenced it under the new controller
@@ -166,6 +171,12 @@ prevents a controller or load-balancer handoff from turning transient occupancy
 uncertainty into a fleet-wide reactivation feedback loop. If no newer evidence
 arrives, the recovery deadline remains diagnostic and the victim stays
 off-route; timeout alone is never route-admission authority.
+
+Recovery adoption and final teardown use the same logical actuation fence as
+ordinary retirement: the fresh capacity snapshot may be newer than the current
+published target generation, but never older. The post-adoption barrier remains
+separate and still requires a snapshot strictly newer than the generation that
+re-fenced the victim.
 
 The recovery gate also owns every queued shutdown-admission row while that
 replica remains indexed for recovery. The admission pass must check membership
@@ -239,17 +250,20 @@ the bounded precommit marker through the one-generation recovery barrier so an
 equivalent-version relabel cannot bypass the newer-evidence requirement.
 
 The recovery deadline is diagnostic, not independent route-admission
-authority. If no fresh matching target and capacity snapshot exists when it
-expires, recovery keeps every uncommitted victim off route and renews the
-deadline. Re-advertising capacity cannot repair availability while the load
-balancer cannot synchronize, and doing so blindly can resurrect the complete
-old fleet during a large controller rebuild. Once fresh evidence arrives,
-ready or never-ready provisioning capacity already committed to the elected
-version may cover the target and allow recovery to re-fence the drains without
-reactivation. Only a measured remaining shortfall permits the bounded fallback
-above. During a successful policy-only or runtime-equivalent update,
-asynchronously draining backends must therefore stay off route instead of the
-whole old fleet becoming READY again.
+authority. If no fresh authoritative target and capacity snapshot at least as
+new as that target exists when it expires, recovery keeps every uncommitted
+victim off route and renews the deadline. Re-advertising capacity cannot repair
+availability while the load balancer cannot synchronize, and doing so blindly
+can resurrect the complete old fleet during a large controller rebuild. Once
+fresh evidence arrives,
+ready capacity may cover the target and allow recovery to re-fence the drains
+without reactivation. Never-ready provisioning capacity suppresses duplicate
+launches but does not cover the immediate route target. A measured ready
+shortfall permits the bounded fallback above even while sufficient future
+capacity is provisioning. During a successful policy-only or
+runtime-equivalent update, asynchronously draining backends still remain off
+route when ready capacity covers the target instead of the whole old fleet
+becoming READY again.
 
 The 20-backend cap bounds each transition without tying rollout progress to a
 wall-clock rate limit. If five new logical slots become ready, up to five
@@ -426,7 +440,9 @@ without changing legacy count-based hysteresis for other autoscaler modes.
 During a logical rolling update, preserve coverage using observed
 latest-version logical capacity plus a conservative one-slot floor per READY
 old backend, and retire eligible old physical backends in batches of at most 20
-per tick.
+per tick. On a target rebound, restore ready coverage first by reactivating only
+the required healthy uncommitted drains; keep provisioning capacity in the
+separate committed-capacity calculation that suppresses duplicate launches.
 Start the HA demand-handoff expiry from the first complete authoritative demand
 gauge report even when some backend occupancy samples remain unknown.
 
@@ -490,6 +506,15 @@ duration guarantee. Fleet probing and reconciliation can stretch a tick, so a
 logical concurrency downscale gate avoids broad hysteresis changes for legacy
 request-rate and physical-backend policies.
 
+### Treat provisioning capacity as immediate retirement coverage
+
+Rejected. Provisioning capacity is useful for suppressing duplicate launches,
+but it can take minutes to become routable. Keeping an already-running healthy
+backend off route while waiting for that future capacity turns cloud launch
+latency into avoidable queueing and rejection during a demand rebound. Reuse
+uncommitted drains for immediate coverage and tolerate temporary overlap when
+the pending capacity later becomes ready.
+
 ## Rollout and rollback
 
 The user approved direct production deployment without a test-fleet gate.
@@ -515,6 +540,12 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify zero-to-high demand adopts 10 slots, waits 60 seconds, then adopts the
   larger of 10 or 20 percent based on committed logical capacity.
 - Verify provisioning capacity is committed and prevents duplicate waves.
+- Verify provisioning capacity prevents duplicate launches but does not delay
+  direct reactivation of healthy uncommitted drains when ready capacity is
+  below the current target. Reactivate only the ready-capacity shortfall, return
+  a previously healthy victim directly to routing without a new launch even if
+  it is still completing in-flight work, and leave committed teardowns
+  irreversible.
 - Verify continuously advancing load-balancer snapshots cannot starve a
   still-current logical scale-up or retirement target, while a newer target or
   version still fences an unaccepted batch before persistence. An accepted
@@ -526,9 +557,9 @@ rate to 100, then restore the previous control-plane image if required.
 - Verify final manager admission and teardown fences count one slot per ready
   old backend, but never count a backend that is already off route.
 - Verify an adopted recovery retirement remains off route for its adoption
-  generation, is released only after a strictly newer matching target and
-  snapshot, and remains off route when the diagnostic recovery deadline expires
-  without newer evidence.
+  generation, is released when capacity advances while the current published
+  target remains authoritative, and remains off route when the diagnostic
+  recovery deadline expires without newer evidence.
 - Verify queued shutdown admission cannot abort or advertise a recovered
   retirement before the recovery pass adopts and releases it.
 - Verify in-process updates preserve the rate timestamp and a rebuild never

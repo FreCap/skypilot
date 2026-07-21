@@ -128,6 +128,11 @@ LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
 # CAP samples are kept -- ample for QPS autoscaling even at the top of the
 # supported RPS range across several sync intervals.
 LB_REQUEST_TIMESTAMP_CAP = 100_000
+# Deduplicated offered-arrival windows used by logical concurrency scaling.
+# Tracking saturates at the timestamp cap instead of evicting current-window
+# entries and under-reporting the heaviest load.
+LB_OFFERED_ARRIVAL_WINDOW_SECONDS = 300
+LB_OFFERED_ARRIVAL_CAP = LB_REQUEST_TIMESTAMP_CAP
 # The load balancer retains exact per-minute arrival counters for the recent
 # dashboard window. One extra bucket covers the partially elapsed boundary
 # minute without allowing a controller outage to grow LB memory unbounded.

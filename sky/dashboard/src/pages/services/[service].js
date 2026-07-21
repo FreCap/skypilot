@@ -454,8 +454,17 @@ export function ServiceDetailCard({
       }`
     );
   }
+  if (serviceData.costTrackedReplicaCount > 0) {
+    hourlyCostDetails.push(
+      `${serviceData.costTrackedReplicaCount} active, stopping, or cleanup-uncertain replica${
+        serviceData.costTrackedReplicaCount === 1 ? '' : 's'
+      }`
+    );
+  }
   if (serviceData.estimatedHourlyCost != null) {
-    hourlyCostDetails.push('Current catalog, compute only');
+    hourlyCostDetails.push(
+      'Current catalog, compute only, not a provider bill'
+    );
   }
 
   const excludedCostDetails = Object.entries(
@@ -525,15 +534,19 @@ export function ServiceDetailCard({
             <div>
               <div className="text-gray-600 font-medium text-base">
                 {usesLogicalReplicas
-                  ? 'Logical replicas (ready/total)'
-                  : 'Replicas (ready/total)'}
+                  ? 'Logical capacity (ready/non-failed)'
+                  : 'Replicas (ready/non-failed)'}
               </div>
               <div className="text-base mt-1">
                 {serviceData.replicasReady}/{serviceData.replicasTotal}
                 {serviceData.replicasFailed > 0 && (
                   <span className="text-red-700">
                     {' '}
-                    (+{serviceData.replicasFailed} failed)
+                    (+{serviceData.replicasFailed}{' '}
+                    {usesLogicalReplicas
+                      ? 'failed or cleanup-uncertain slots, including history'
+                      : 'failed or cleanup-uncertain replicas, including history'}
+                    )
                   </span>
                 )}
                 {serviceData.targetReplicas != null && (
@@ -546,11 +559,17 @@ export function ServiceDetailCard({
               {usesLogicalReplicas && (
                 <div className="text-sm text-gray-500 mt-1">
                   {serviceData.physicalReplicasReady}/
-                  {serviceData.physicalReplicasTotal} physical backends ready
+                  {serviceData.physicalReplicasTotal} physical backends
+                  {' (ready/non-failed)'}
                   {serviceData.physicalReplicasFailed > 0 && (
                     <span className="text-red-700">
                       {' '}
-                      (+{serviceData.physicalReplicasFailed} failed)
+                      (+{serviceData.physicalReplicasFailed} failed or
+                      cleanup-uncertain{' '}
+                      {serviceData.physicalReplicasFailed === 1
+                        ? 'backend'
+                        : 'backends'}
+                      , including history)
                     </span>
                   )}
                 </div>
@@ -586,7 +605,7 @@ export function ServiceDetailCard({
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Estimated compute cost
+                Estimated tracked compute cost
               </div>
               <div className="text-base mt-1">
                 {serviceData.estimatedHourlyCost != null

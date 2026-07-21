@@ -192,7 +192,7 @@ class TestGetEngine:
         """Test that db_name is required for SQLite."""
         monkeypatch.delenv('IS_SKYPILOT_SERVER', raising=False)
 
-        with pytest.raises(AssertionError,
+        with pytest.raises(ValueError,
                            match='db_name must be provided for SQLite'):
             db_utils.get_engine(db_name=None)
 
@@ -408,8 +408,7 @@ class TestGetEngine:
             mock_create.return_value = mock_engine
 
             # Should fall back to SQLite mode since IS_SKYPILOT_SERVER is not set
-            with pytest.raises(AssertionError,
-                               match='db_name must be provided'):
+            with pytest.raises(ValueError, match='db_name must be provided'):
                 db_utils.get_engine(db_name=None)
 
     def test_directory_created_for_sqlite(self, tmp_path, monkeypatch):

@@ -264,10 +264,6 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
         chunk_index: The chunk index, starting from 0.
         total_chunks: The total number of chunks.
     """
-    # Add the upload id to the cleanup list.
-    upload_ids_to_cleanup[(upload_id,
-                           user_hash)] = (datetime.datetime.now() +
-                                          _DEFAULT_UPLOAD_EXPIRATION_TIME)
     # Check upload_id to be a valid SkyPilot run_timestamp appended with 8 hex
     # characters, e.g. 'sky-2025-01-17-09-10-13-933602-35d31c22'.
     if not re.match(
@@ -275,6 +271,12 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
             r'[0-9]{2}-[0-9]{6}-[0-9a-f]{8}$', upload_id):
         raise ValueError(
             f'Invalid upload_id: {upload_id}. Please use a valid uuid.')
+
+    # Add only validated upload ids to the cleanup list. The cleanup daemon
+    # uses this value as a path component when removing expired uploads.
+    upload_ids_to_cleanup[(upload_id,
+                           user_hash)] = (datetime.datetime.now() +
+                                          _DEFAULT_UPLOAD_EXPIRATION_TIME)
 
     base_dir = await _prepare_client_mount_dir(user_hash, request)
     missing_chunks = await _receive_and_assemble_chunks(
@@ -383,19 +385,18 @@ async def unzip_file(zip_file_path: pathlib.Path,
 
     def _do_unzip() -> None:
         try:
+            extract_root = client_file_mounts_dir.resolve()
             with zipfile.ZipFile(zip_file_path, 'r') as zipf:
                 for member in zipf.infolist():
                     # Determine the new path
                     original_path = os.path.normpath(member.filename)
-                    new_path = client_file_mounts_dir / original_path.lstrip(
-                        '/')
+                    new_path = extract_root / original_path.lstrip('/')
 
                     # Security check: ensure extracted path stays within target
                     # directory to prevent Zip Slip attacks (path traversal via
                     # malicious "../" sequences in archive member names).
                     resolved_path = new_path.resolve()
-                    if not is_relative_to(resolved_path,
-                                          client_file_mounts_dir):
+                    if not is_relative_to(resolved_path, extract_root):
                         raise ValueError(
                             f'Zip member {member.filename!r} would extract '
                             'outside target directory. Aborted.')
@@ -404,12 +405,14 @@ async def unzip_file(zip_file_path: pathlib.Path,
                         # Symlink. Read the target path and create a symlink.
                         new_path.parent.mkdir(parents=True, exist_ok=True)
                         target = zipf.read(member).decode()
-                        assert not os.path.isabs(target), target
+                        if os.path.isabs(target):
+                            raise ValueError(
+                                f'Symlink target {target!r} must be relative. '
+                                'Aborted.')
                         # Since target is a relative path, we need to check that
-                        # it is under `client_file_mounts_dir` for security.
+                        # it is under `extract_root` for security.
                         full_target_path = (new_path.parent / target).resolve()
-                        if not is_relative_to(full_target_path,
-                                              client_file_mounts_dir):
+                        if not is_relative_to(full_target_path, extract_root):
                             raise ValueError(
                                 f'Symlink target {target} leads to a '
                                 'file not in userspace. Aborted.')

@@ -12,9 +12,11 @@ def test_ha_recovery_pool_liveness_skips_pool_yaml(tmp_path):
     with mock.patch.object(serve_state,
                            'get_glob_service_names',
                            return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[]) as snapshots, \
          mock.patch.object(serve_utils,
-                           '_get_service_status',
-                           return_value=None) as get_status, \
+                           '_get_service_status') as get_status, \
          mock.patch.object(serve_state,
                            'get_latest_committed_version',
                            return_value=None), \
@@ -37,10 +39,9 @@ def test_ha_recovery_pool_liveness_skips_pool_yaml(tmp_path):
                            'LocalProcessCommandRunner'):
         serve_utils.ha_recovery_for_consolidation_mode(pool=True)
 
-    get_status.assert_called_once_with('svc',
-                                       pool=True,
-                                       with_replica_info=False,
-                                       with_yaml=False)
+    snapshots.assert_called_once_with(pool=True)
+    # The sweep must never fall back to the per-service joined read.
+    get_status.assert_not_called()
 
 
 def test_update_pool_status_liveness_skips_pool_yaml():

@@ -14,14 +14,20 @@ def _mode_names(unused_patterns=None, pool=None):
     return ['pool-a'] if pool else ['service-a']
 
 
-def _service_record():
+def _service_record(name):
     return {
+        'name': name,
         'controller_pid': None,
         'controller_ip': None,
         'hash': 'service-hash',
         'resource_scope': 'service-hash',
         'status': serve_state.ServiceStatus.READY,
+        'yaml_content': 'yaml: v1',
     }
+
+
+def _mode_snapshots(pool):
+    return [_service_record(name) for name in _mode_names(pool=pool)]
 
 
 def _run_sweep(tmp_path, pool):
@@ -30,10 +36,10 @@ def _run_sweep(tmp_path, pool):
             mock.patch.object(serve_state,
                               'get_glob_service_names',
                               side_effect=_mode_names))
-        get_status = stack.enter_context(
-            mock.patch.object(serve_utils,
-                              '_get_service_status',
-                              return_value=_service_record()))
+        snapshots = stack.enter_context(
+            mock.patch.object(serve_state,
+                              'get_service_liveness_snapshots',
+                              side_effect=_mode_snapshots))
         committed = stack.enter_context(
             mock.patch.object(serve_state, 'get_latest_committed_version'))
         identity = stack.enter_context(
@@ -61,30 +67,24 @@ def _run_sweep(tmp_path, pool):
             reconcile = stack.enter_context(
                 mock.patch('sky.serve.lb_k8s.reconcile_lb_objects'))
         serve_utils.ha_recovery_for_consolidation_mode(pool=pool)
-    return names, get_status, committed, identity, retire, reconcile
+    return names, snapshots, committed, identity, retire, reconcile
 
 
 def test_pool_sweep_skips_service_rows_before_status_reads(tmp_path):
-    names, get_status, committed, identity, retire, _ = _run_sweep(tmp_path,
-                                                                   pool=True)
+    names, snapshots, committed, identity, retire, _ = _run_sweep(tmp_path,
+                                                                  pool=True)
     names.assert_called_once_with(None, pool=True)
-    get_status.assert_called_once_with('pool-a',
-                                       pool=True,
-                                       with_replica_info=False,
-                                       with_yaml=False)
+    snapshots.assert_called_once_with(pool=True)
     committed.assert_not_called()
     identity.assert_not_called()
     retire.assert_not_called()
 
 
 def test_service_sweep_reconciles_only_live_service_names(tmp_path):
-    names, get_status, committed, identity, retire, reconcile = _run_sweep(
+    names, snapshots, committed, identity, retire, reconcile = _run_sweep(
         tmp_path, pool=False)
     names.assert_called_once_with(None, pool=False)
-    get_status.assert_called_once_with('service-a',
-                                       pool=False,
-                                       with_replica_info=False,
-                                       with_yaml=False)
+    snapshots.assert_called_once_with(pool=False)
     committed.assert_not_called()
     identity.assert_not_called()
     retire.assert_not_called()

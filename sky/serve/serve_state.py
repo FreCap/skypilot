@@ -1612,7 +1612,15 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
     snapshot and avoids repeatedly joining and deserializing latest-version
     specs.  Requiring a version row preserves ``get_service_from_name()``'s
     behavior for orphan service rows left by interrupted legacy registration.
+
+    ``yaml_content`` carries the latest version's raw yaml (possibly NULL for
+    a placeholder version row) so liveness callers can detect unbootable
+    placeholder rows without a per-service joined read.
     """
+    latest_version = sqlalchemy.select(
+        version_specs_table.c.service_name,
+        sqlalchemy.func.max(version_specs_table.c.version).label('max_version'),
+    ).group_by(version_specs_table.c.service_name).alias('v')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(
@@ -1624,11 +1632,19 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
                 services_table.c.controller_ip,
                 services_table.c.hash,
                 services_table.c.resource_scope,
-            ).where(
-                services_table.c.pool == int(pool),
-                sqlalchemy.exists().where(version_specs_table.c.service_name ==
-                                          services_table.c.name),
-            ).order_by(services_table.c.name)).fetchall()
+                version_specs_table.c.yaml_content,
+            ).select_from(
+                services_table.join(
+                    latest_version, services_table.c.name ==
+                    latest_version.c.service_name).join(
+                        version_specs_table,
+                        sqlalchemy.and_(
+                            version_specs_table.c.service_name ==
+                            services_table.c.name,
+                            version_specs_table.c.version ==
+                            latest_version.c.max_version,
+                        ))).where(services_table.c.pool == int(pool)).order_by(
+                            services_table.c.name)).fetchall()
     return [{
         'name': row.name,
         'status': ServiceStatus[row.status],
@@ -1637,6 +1653,7 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
         'controller_ip': row.controller_ip,
         'hash': row.hash,
         'resource_scope': row.resource_scope,
+        'yaml_content': row.yaml_content,
     } for row in rows]
 
 

@@ -31,12 +31,34 @@ serve_replica_status_history_table = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
     sqlalchemy.Column('ready_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('ready_reserved_count', sqlalchemy.Integer,
+                      nullable=True),
     sqlalchemy.Column('provisioning_count', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('not_ready_count', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('errored_count', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('preempted_count', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('stopping_count', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('total_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('logical_ready_count', sqlalchemy.Integer, nullable=True),
+    sqlalchemy.Column('logical_ready_reserved_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_provisioning_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_not_ready_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_errored_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_preempted_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_stopping_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('logical_total_count', sqlalchemy.Integer, nullable=True),
     sqlalchemy.CheckConstraint(
         'ready_count >= 0 AND provisioning_count >= 0 AND '
         'not_ready_count >= 0 AND errored_count >= 0 AND '
@@ -46,6 +68,33 @@ serve_replica_status_history_table = sqlalchemy.Table(
         'total_count = ready_count + provisioning_count + '
         'not_ready_count + errored_count + preempted_count + stopping_count',
         name='serve_replica_status_history_total'),
+    sqlalchemy.CheckConstraint(
+        'ready_reserved_count IS NULL OR '
+        '(ready_reserved_count >= 0 AND '
+        'ready_reserved_count <= ready_count)',
+        name='serve_replica_status_history_reserved_ready'),
+    sqlalchemy.CheckConstraint(
+        '(logical_ready_count IS NULL AND '
+        'logical_ready_reserved_count IS NULL AND '
+        'logical_provisioning_count IS NULL AND '
+        'logical_not_ready_count IS NULL AND '
+        'logical_errored_count IS NULL AND '
+        'logical_preempted_count IS NULL AND '
+        'logical_stopping_count IS NULL AND '
+        'logical_total_count IS NULL) OR '
+        '(logical_ready_count >= 0 AND '
+        'logical_ready_reserved_count >= 0 AND '
+        'logical_ready_reserved_count <= logical_ready_count AND '
+        'logical_provisioning_count >= 0 AND '
+        'logical_not_ready_count >= 0 AND '
+        'logical_errored_count >= 0 AND '
+        'logical_preempted_count >= 0 AND '
+        'logical_stopping_count >= 0 AND '
+        'logical_total_count = logical_ready_count + '
+        'logical_provisioning_count + logical_not_ready_count + '
+        'logical_errored_count + logical_preempted_count + '
+        'logical_stopping_count)',
+        name='serve_replica_status_history_logical_counts'),
 )
 sqlalchemy.Index('serve_replica_status_history_lookup_idx',
                  serve_replica_status_history_table.c.service_name,
@@ -137,6 +186,13 @@ _COUNT_COLUMNS = (
     'preempted_count',
     'stopping_count',
 )
+_LOGICAL_COUNT_COLUMNS = tuple(f'logical_{column}' for column in _COUNT_COLUMNS)
+_OPTIONAL_STATUS_COLUMNS = (
+    'ready_reserved_count',
+    *_LOGICAL_COUNT_COLUMNS,
+    'logical_ready_reserved_count',
+    'logical_total_count',
+)
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine | None:
@@ -174,7 +230,7 @@ def _status_bucket(status: str | None) -> str:
 
 
 def _snapshot_query() -> sqlalchemy.Select:
-    """One compact snapshot of every non-pool service and physical row."""
+    """One compact physical and logical snapshot of every non-pool service."""
     services = serve_state.services_table
     replicas = serve_state.replicas_table
     version = sqlalchemy.func.coalesce(replicas.c.version,
@@ -186,6 +242,13 @@ def _snapshot_query() -> sqlalchemy.Select:
         replicas.c.service_name == services.c.name,
         replicas.c.sky_down_status.is_distinct_from(
             common_utils.ProcessStatus.SUCCEEDED.value))
+    raw_planned_capacity = replicas.c.replica_state[
+        'planned_capacity'].as_integer()
+    planned_capacity = sqlalchemy.case(
+        (raw_planned_capacity > 0, raw_planned_capacity), else_=1)
+    has_replica = replicas.c.replica_id.is_not(None)
+    reserved_fill = replicas.c.replica_state['reserved_fill'].as_boolean().is_(
+        True)
     return (sqlalchemy.select(
         services.c.name,
         services.c.hash,
@@ -193,6 +256,18 @@ def _snapshot_query() -> sqlalchemy.Select:
         replicas.c.status,
         sqlalchemy.func.count(  # pylint: disable=not-callable
             replicas.c.replica_id).label('count'),
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.sum(  # pylint: disable=not-callable
+                sqlalchemy.case((has_replica, planned_capacity), else_=0)),
+            0).label('logical_count'),
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.sum(  # pylint: disable=not-callable
+                sqlalchemy.case((reserved_fill, 1), else_=0)),
+            0).label('reserved_count'),
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.sum(  # pylint: disable=not-callable
+                sqlalchemy.case((reserved_fill, planned_capacity), else_=0)),
+            0).label('logical_reserved_count'),
     ).select_from(services.outerjoin(replicas, live_replica)).where(
         services.c.pool == 0,
         services.c.hash.is_not(None)).group_by(services.c.name, services.c.hash,
@@ -204,7 +279,8 @@ def _build_history_rows(
         bucket_start: datetime.datetime) -> list[dict[str, Any]]:
     """Collapse status groups into one exhaustive row per service/version."""
     grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
-    for service_name, service_hash, version, status, count in rows:
+    for (service_name, service_hash, version, status, count, logical_count,
+         reserved_count, logical_reserved_count) in rows:
         key = (service_name, service_hash, int(version))
         record = grouped.get(key)
         if record is None:
@@ -217,13 +293,27 @@ def _build_history_rows(
                 **{
                     column: 0 for column in _COUNT_COLUMNS
                 },
+                'ready_reserved_count': 0,
                 'total_count': 0,
+                **{
+                    column: 0 for column in _LOGICAL_COUNT_COLUMNS
+                },
+                'logical_ready_reserved_count': 0,
+                'logical_total_count': 0,
             }
             grouped[key] = record
         count = int(count)
         if count:
-            record[_status_bucket(status)] += count
+            bucket = _status_bucket(status)
+            record[bucket] += count
             record['total_count'] += count
+            logical_bucket = f'logical_{bucket}'
+            record[logical_bucket] += int(logical_count)
+            record['logical_total_count'] += int(logical_count)
+            if bucket == 'ready_count':
+                record['ready_reserved_count'] += int(reserved_count)
+                record['logical_ready_reserved_count'] += int(
+                    logical_reserved_count)
     return list(grouped.values())
 
 
@@ -250,6 +340,9 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
                 'observed_at': excluded.observed_at,
                 **{
                     column: getattr(excluded, column) for column in _COUNT_COLUMNS
+                },
+                **{
+                    column: getattr(excluded, column) for column in _OPTIONAL_STATUS_COLUMNS
                 },
                 'total_count': excluded.total_count,
             }
@@ -646,6 +739,9 @@ def get_status_history(
             'version': row['version'],
             **{
                 column: row[column] for column in _COUNT_COLUMNS
+            },
+            **{
+                column: row[column] for column in _OPTIONAL_STATUS_COLUMNS
             },
             'total_count': row['total_count'],
         })

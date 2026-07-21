@@ -357,12 +357,21 @@ describe('getServices', () => {
             observed_at: 1751633170,
             version: 2,
             ready_count: 3,
+            ready_reserved_count: 1,
             provisioning_count: 1,
             not_ready_count: 0,
             errored_count: 2,
             preempted_count: 0,
             stopping_count: 1,
             total_count: 7,
+            logical_ready_count: 24,
+            logical_ready_reserved_count: 8,
+            logical_provisioning_count: 8,
+            logical_not_ready_count: 0,
+            logical_errored_count: 16,
+            logical_preempted_count: 0,
+            logical_stopping_count: 8,
+            logical_total_count: 56,
           },
         ],
       },
@@ -390,10 +399,17 @@ describe('getServices', () => {
           timestamp: 1751633160,
           version: 2,
           readyCount: 3,
+          readyReservedCount: 1,
           provisioningCount: 1,
           erroredCount: 2,
           stoppingCount: 1,
           totalCount: 7,
+          logicalReadyCount: 24,
+          logicalReadyReservedCount: 8,
+          logicalProvisioningCount: 8,
+          logicalErroredCount: 16,
+          logicalStoppingCount: 8,
+          logicalTotalCount: 56,
         },
       ],
       requestSamples: [
@@ -571,6 +587,10 @@ describe('normalizeReplicaHistory', () => {
         readyCount: 2,
         erroredCount: 0,
         totalCount: 0,
+        readyReservedCount: null,
+        logicalReadyCount: null,
+        logicalReadyReservedCount: null,
+        logicalTotalCount: null,
       }),
     ]);
     expect(history.requestSamples).toEqual([
@@ -667,6 +687,60 @@ describe('normalizeService / normalizeReplica', () => {
 
     expect(service.estimatedHourlyCost).toBeNull();
     expect(service.costPerThousandRequests).toBeNull();
+    expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
+  });
+
+  it('prices current billability risk without charging historical rows', () => {
+    const statuses = [
+      ['READY', 1],
+      ['SHUTTING_DOWN', 2],
+      ['FAILED_CLEANUP', 3],
+      ['UNKNOWN', 4],
+      ['PENDING', 5],
+      ['FAILED', 6],
+      ['FAILED_INITIAL_DELAY', 7],
+      ['FAILED_PROBING', 8],
+      ['FAILED_PROVISION', 9],
+      ['PREEMPTED', 10],
+    ];
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_info: statuses.map(([status, replicaId]) => ({
+          replica_id: replicaId,
+          status,
+          hourly_cost: replicaId,
+        })),
+      })
+    );
+
+    expect(service.estimatedHourlyCost).toBe(10);
+    expect(service.costTrackedReplicaCount).toBe(4);
+    expect(service.pricedReplicaCount).toBe(4);
+    expect(service.hourlyCostExcludedReplicaCount).toBe(0);
+  });
+
+  it('does not report unpriced historical rows as current exclusions', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_info: [
+          {
+            replica_id: 1,
+            status: 'FAILED',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+          {
+            replica_id: 2,
+            status: 'SHUTTING_DOWN',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+        ],
+      })
+    );
+
+    expect(service.costTrackedReplicaCount).toBe(1);
+    expect(service.hourlyCostExcludedReplicaCount).toBe(1);
     expect(service.hourlyCostExclusionReasons).toEqual({ kubernetes: 1 });
   });
 

@@ -2461,7 +2461,10 @@ def stream_and_get(
     stream_request_id: server_common.RequestId[
         T] | None = server_common.get_stream_request_id(response)
     if request_id is not None and stream_request_id is not None:
-        assert request_id == stream_request_id
+        if request_id != stream_request_id:
+            raise RuntimeError(
+                f'Stream request ID mismatch: requested {request_id!r}, '
+                f'server returned {stream_request_id!r}.')
     if request_id is None:
         request_id = stream_request_id
     return stream_response(request_id,

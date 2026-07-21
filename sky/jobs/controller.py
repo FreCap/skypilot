@@ -2023,6 +2023,19 @@ class ControllerManager:
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
 
+    @staticmethod
+    def _cleanup_api_server_access_token(job_id: int) -> None:
+        """Revoke a managed-job token after its whole batch is terminal."""
+        token_id = managed_job_state.get_releasable_api_access_token_id(job_id)
+        if token_id is None:
+            return
+        if global_user_state.delete_service_account_token(token_id):
+            logger.info(f'Revoked API server access token for job {job_id}')
+        else:
+            logger.debug(
+                'API server access token for job %s was already '
+                'revoked by a sibling finalizer.', job_id)
+
     async def _cleanup(self,
                        job_id: int,
                        pool: str | None = None,
@@ -2138,19 +2151,6 @@ class ControllerManager:
                 await asyncio.to_thread(task_cleanup, task, job_id)
             except Exception as e:  # pylint: disable=broad-except
                 error = e
-
-        # Clean up API server access token if one was created for this job.
-        def _cleanup_api_server_access_token(job_id: int):
-            token_id = managed_job_state.get_api_access_token_id(job_id)
-            if token_id is not None:
-                global_user_state.delete_service_account_token(token_id)
-                logger.info(f'Revoked API server access token for job {job_id}')
-
-        try:
-            await asyncio.to_thread(_cleanup_api_server_access_token, job_id)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to revoke API server access token for '
-                           f'job {job_id}: {e}')
 
         if error is not None:
             # we only raise the last error that occurred, but its fine to lose
@@ -2496,6 +2496,13 @@ class ControllerManager:
                         failure_reason=(
                             'Unexpected error occurred. For details, '
                             f'run: sky jobs logs --controller {job_id}'))
+
+                try:
+                    await asyncio.to_thread(
+                        self._cleanup_api_server_access_token, job_id)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning('Failed to revoke API server access token '
+                                   f'for job {job_id}: {e}')
 
                 await scheduler.job_done_async(job_id)
 
