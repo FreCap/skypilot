@@ -974,15 +974,15 @@ def commit_ready_demand(*,
                 optimistic['profile_revision_id'],
                 schema.profile_revisions.c.workspace ==
                 optimistic['workspace'])).mappings().one()
-        location = session.execute(
-            sqlalchemy.select(schema.locations).where(
-                schema.locations.c.id ==
-                optimistic['location_id']).with_for_update()).mappings().one()
         artifact = session.execute(
             sqlalchemy.select(schema.images).where(
                 schema.images.c.id == optimistic['image_id'],
                 schema.images.c.workspace ==
                 optimistic['workspace']).with_for_update()).mappings().one()
+        location = session.execute(
+            sqlalchemy.select(schema.locations).where(
+                schema.locations.c.id ==
+                optimistic['location_id']).with_for_update()).mappings().one()
         if (str(location['state']) != models.ImageLocationState.READY.value or
                 location['lease_token'] is not None or
                 location['target_ref'] is None or

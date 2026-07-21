@@ -475,7 +475,8 @@ def test_one_thousand_service_replicas_share_one_version_target_owner(
     assert len(owners) == 1
     kind, owner, epoch = owners.pop()
     assert kind == 'service_version'
-    assert owner.startswith('boltz-l4-fleet:v7:target:')
+    assert owner.startswith(
+        'boltz-l4-fleet:incarnation:service-hash:v7:target:')
     assert epoch == 'service:service-hash:v7'
 
     other = consumers.scope_for_placement(
@@ -483,6 +484,17 @@ def test_one_thousand_service_replicas_share_one_version_target_owner(
             task, 'boltz-l4-fleet-1000', 'service', context),
         dataclasses.replace(placement, region='us-east-1'))
     assert other.consumer_owner != owner
+
+    recreated_context = dict(context)
+    recreated_context[
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY] = 'new-hash'
+    recreated = consumers.scope_for_placement(
+        cloud_vm_ray_backend._get_image_demand_attribution(
+            task, 'boltz-l4-fleet-0', 'service', recreated_context), placement)
+    assert recreated.consumer_owner != owner
+    assert recreated.consumer_owner.startswith(
+        'boltz-l4-fleet:incarnation:new-hash:v7:target:')
+    assert recreated.controller_epoch == 'service:new-hash:v7'
 
 
 def test_legacy_docker_image_survives_copy_pickle_and_yaml_round_trip() -> None:

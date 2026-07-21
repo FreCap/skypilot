@@ -262,7 +262,7 @@ def _ready_regional(
 def _warming_demand(
     active: topology_state.ProfileRevisionRecord,
     publication_record: catalog_state.PublicationRecord,
-    regional: topology_state.LocationRecord,
+    location: topology_state.LocationRecord,
     profile: models.ManagedRegistryProfile,
     *,
     owner: str = 'boltz-l4:v7',
@@ -278,7 +278,8 @@ def _warming_demand(
     assert publication_record.image_id is not None
     authority = catalog_state.get_catalog_authority_id(create=False)
     assert authority is not None
-    west = profile.targets[0]
+    target = next(target for target in (profile.canonical,) + profile.targets
+                  if target.target_fingerprint == location.target_fingerprint)
     return transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
         workspace='research',
@@ -288,15 +289,15 @@ def _warming_demand(
         controller_sequence=controller_sequence,
         allow_epoch_advance=allow_epoch_advance,
         target_key=(f'{publication_record.image_id}:'
-                    f'{west.target_fingerprint}'),
+                    f'{target.target_fingerprint}'),
         image_id=publication_record.image_id,
         runtime_digest=_DIGEST,
         profile_revision_id=active.id,
-        target_fingerprint=west.target_fingerprint,
-        location_id=regional.id,
+        target_fingerprint=target.target_fingerprint,
+        location_id=location.id,
         placement={
             'provider': 'aws',
-            'region': placement_region or west.region,
+            'region': placement_region or target.region,
             'backend': backend,
             'platform': 'linux/amd64',
             'consumer': {
@@ -307,24 +308,24 @@ def _warming_demand(
 
 
 def _pull_plan(active: topology_state.ProfileRevisionRecord,
-               regional: topology_state.LocationRecord) -> dict[str, Any]:
+               location: topology_state.LocationRecord) -> dict[str, Any]:
     configured = models.ManagedRegistryProfile.from_snapshot(
         active.config_snapshot)
     target = next(target for target in (configured.canonical,) +
                   configured.targets
-                  if target.target_fingerprint == regional.target_fingerprint)
+                  if target.target_fingerprint == location.target_fingerprint)
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
     binding = configured.bindings[binding_id]
     return {
         'version': 1,
-        'reference': regional.target_ref,
+        'reference': location.target_ref,
         'runtime_digest': _DIGEST,
         'platform': 'linux/amd64',
         'distribution': configured.name,
         'profile_revision_id': active.id,
         'target_id': target.name,
-        'target_fingerprint': regional.target_fingerprint,
+        'target_fingerprint': location.target_fingerprint,
         'auth_strategy': 'ecr_runtime_identity',
         'credential_helper': 'ecr-login',
         'runtime_principal': binding.principals[0],
@@ -910,6 +911,90 @@ def test_concurrent_regional_admission_converges_without_false_capacity(
     assert shard is not None
     assert shard.reserved_manifests == 1
     assert shard.reserved_declared_bytes == location.reserved_declared_bytes
+
+
+def test_ready_commit_and_regional_admission_follow_global_lock_order(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, canonical, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active, publication_record, canonical, profile)
+    assert publication_record.image_id is not None
+    target = profile.targets[0]
+    ready_holds_artifact = threading.Event()
+    allow_ready_location_lock = threading.Event()
+    admission_attempted_artifact = threading.Event()
+
+    def _is_artifact_lock(statement: str) -> bool:
+        normalized = ' '.join(statement.split()).upper()
+        return (' FROM CONTAINER_IMAGES ' in normalized and
+                ' FOR UPDATE' in normalized)
+
+    def _pause_ready_after_artifact(_connection, _cursor, statement,
+                                    _parameters, _context,
+                                    _executemany) -> None:
+        if (threading.current_thread().name.startswith('ready-commit') and
+                _is_artifact_lock(statement)):
+            ready_holds_artifact.set()
+            if not allow_ready_location_lock.wait(timeout=10):
+                raise TimeoutError('READY commit lock-order test timed out.')
+
+    def _observe_admission_artifact(_connection, _cursor, statement,
+                                    _parameters, _context,
+                                    _executemany) -> None:
+        if (threading.current_thread().name.startswith('regional-admission') and
+                _is_artifact_lock(statement)):
+            admission_attempted_artifact.set()
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                            _pause_ready_after_artifact)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _observe_admission_artifact)
+    ready_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='ready-commit')
+    admission_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='regional-admission')
+    try:
+        ready_future = ready_executor.submit(
+            transactions.commit_ready_demand,
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan=_pull_plan(active, canonical),
+            now=60)
+        assert ready_holds_artifact.wait(timeout=5)
+
+        # The READY transaction holds the artifact but must not yet hold the
+        # canonical location. The old location-then-artifact order fails this
+        # NOWAIT proof before PostgreSQL needs to detect a deadlock.
+        with orm.Session(image_database) as observer, observer.begin():
+            location_id = observer.execute(
+                sqlalchemy.select(schema.locations.c.id).where(
+                    schema.locations.c.id == canonical.id).with_for_update(
+                        nowait=True)).scalar_one()
+            assert location_id == canonical.id
+
+        admission_future = admission_executor.submit(
+            transactions.reserve_regional_location,
+            image_id=publication_record.image_id,
+            workspace='research',
+            profile_revision_id=active.id,
+            target_id=target.name,
+            canonical_location_id=canonical.id,
+            max_regional_locations=16,
+            now=61)
+        assert admission_attempted_artifact.wait(timeout=5)
+        allow_ready_location_lock.set()
+
+        assert ready_future.result(timeout=5).id == demand.id
+        assert admission_future.result(timeout=5).id == regional.id
+    finally:
+        allow_ready_location_lock.set()
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                _pause_ready_after_artifact)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _observe_admission_artifact)
+        ready_executor.shutdown(wait=True)
+        admission_executor.shutdown(wait=True)
 
 
 def test_shard_admission_retries_after_locked_home_fills(

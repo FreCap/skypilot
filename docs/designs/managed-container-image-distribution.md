@@ -570,6 +570,12 @@ is a stable owner plus an explicit controller epoch:
 - a Serve owner uses the service incarnation and version plus a normalized
   provider, region, backend, and platform target scope.
 
+The Serve incarnation is part of the stable owner key, not only its controller
+epoch. Recreating a service under the same name therefore starts a distinct
+version-target owner and cannot collide with a watermark left by the prior
+incarnation. All replicas of one incarnation, version, and target still share
+exactly one owner and demand.
+
 The controller epoch is not hashed into an arbitrary generation. The consumer
 watermark stores the bounded controller epoch and maps it, under row lock, to a
 monotonically increasing owner epoch. It also stores an optional monotonic
@@ -621,13 +627,14 @@ placement. Release-only and artifact-only selectors never infer or expose a
 source fallback.
 
 The runtime commits a secret-free pull plan only after a READY route is selected.
-`transactions.commit_ready_demand()` locks the location, then the demand,
-marks the demand itself as the durable eviction fence, and stores the plan in one
-PostgreSQL transaction. It rechecks profile revision, target fingerprint,
-reference, digest, platform, auth strategy, credential-helper class, lease-free
-READY state, and consumer epoch. Central demand state is the durable source for
-normal launch, Serve, and managed-job controllers, so their own
-SQLite-compatible state stores only the demand ID and generation.
+`transactions.commit_ready_demand()` locks the artifact before the location,
+then the consumer watermark and demand. It marks the demand itself as the
+durable eviction fence and stores the plan in one PostgreSQL transaction. It
+rechecks profile revision, target fingerprint, reference, digest, platform,
+auth strategy, credential-helper class, lease-free READY state, and consumer
+epoch. Central demand state is the durable source for normal launch, Serve, and
+managed-job controllers, so their own SQLite-compatible state stores only the
+demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
 An owner epoch with a live demand reloads that demand's exact immutable profile
@@ -800,15 +807,15 @@ location lease expiry, and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O
 occurs outside the claim transaction. Completion validates the applicable random
 lease token after acquiring the row lock and reading the current clock.
 
-Every command that locks more than one image row uses this order:
+Every command that locks more than one participating row uses this order:
 
-1. profile revision, provider budget, physical shard, and worker rows, ordered by
+1. a central durable consumer row, when normal cluster state participates;
+2. profile revision, provider budget, physical shard, and worker rows, ordered by
    class and ID;
-2. artifact and source rows, ordered by ID;
-3. canonical location before regional location, then location ID;
-4. publication and operation rows, ordered by ID;
-5. consumer watermark and demand rows, ordered by ID; and
-6. a central durable consumer row, when normal cluster state participates.
+3. artifact and source rows, ordered by ID;
+4. canonical location before regional location, then location ID;
+5. publication and operation rows, ordered by ID; and
+6. consumer watermark and demand rows, ordered by ID.
 
 Initial insert races rely on unique constraints and restart the transaction.
 No repository function acquires an earlier class after a later one. Canonical
@@ -816,8 +823,11 @@ completion and publication retry both lock location before publication.
 Inspection completion reads its publication optimistically, locks profile/shard,
 artifact/source, and location rows first, then locks and rechecks the publication
 token; an invalid token rolls the entire transaction back. Demand READY commit
-and lifecycle eviction both lock location before checking demands. This is the
-executable ownership contract for the component split.
+locks artifact before location and then watermark/demand. Lifecycle eviction
+locks shard and location before checking demands and does not acquire an
+artifact row. Authoritative cluster deletion already owns the central consumer
+row before it locks the image watermark and demand. This is the executable
+ownership contract for the component split.
 
 Migration 023 is run under a PostgreSQL migration-scoped advisory lock, not a
 runtime control-plane lock. The downgrade itself can inspect only database state.

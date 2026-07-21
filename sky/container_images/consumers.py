@@ -86,7 +86,8 @@ def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
                 workload_task_id is not None):
             return ImageConsumerContext(
                 consumer_kind='service_version',
-                consumer_owner=f'{workload_id}:v{workload_task_id}',
+                consumer_owner=(f'{workload_id}:incarnation:{service_hash}:'
+                                f'v{workload_task_id}'),
                 controller_epoch=(
                     f'service:{service_hash}:v{workload_task_id}'),
                 controller_sequence=workload_task_id,
