@@ -186,12 +186,17 @@ def list_hosts_with_devices_info(hosts, vcenter_name, datacenter_name,
         # Retrieve PCI devices information
         pci_devices = host.hardware.pciDevice
         pci_passthru_devices = host.config.pciPassthruInfo
-        for device, passthru_info in zip(pci_devices, pci_passthru_devices):
+        pci_passthru_by_id = {
+            passthru_info.id: passthru_info
+            for passthru_info in pci_passthru_devices
+        }
+        for device in pci_devices:
             if (decimal_to_four_char_hex(device.classId)[:2]
                     in DISPLAY_CONTROLLER_CLASS_ID_PREFIXES and
                     device.id not in VMWARE_VIRTUAL_DISPLAY_CONTROLLER_IDS):
                 # Get the device status
-                if passthru_info.passthruActive:
+                passthru_info = pci_passthru_by_id.get(device.id)
+                if (passthru_info is not None and passthru_info.passthruActive):
                     if device.id in used_device_ids:
                         device_status = 'Busy'
                     else:
