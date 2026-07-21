@@ -997,6 +997,34 @@ def test_ready_commit_and_regional_admission_follow_global_lock_order(
         admission_executor.shutdown(wait=True)
 
 
+def _locked_table(statement: str) -> str | None:
+    normalized = ' '.join(statement.split()).upper()
+    if ' FOR UPDATE' not in normalized:
+        return None
+    if ' FROM CONTAINER_IMAGE_CONSUMER_WATERMARKS ' in normalized:
+        return 'watermark'
+    if ' FROM CONTAINER_IMAGE_DEMANDS ' in normalized:
+        return 'demand'
+    return None
+
+
+def _wait_for_backend_lock(image_database: sqlalchemy.engine.Engine,
+                           backend_pid: int) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with image_database.connect() as observer:
+            waiting = bool(
+                observer.execute(
+                    sqlalchemy.text('SELECT wait_event_type = \'Lock\' '
+                                    'FROM pg_stat_activity WHERE pid = :pid'), {
+                                        'pid': backend_pid
+                                    }).scalar())
+        if waiting:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_terminal_compaction_and_release_follow_watermark_lock_order(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -1045,16 +1073,6 @@ def test_terminal_compaction_and_release_follow_watermark_lock_order(
     first_lock_table: dict[str, str] = {}
     release_backend: dict[str, int] = {}
 
-    def _locked_table(statement: str) -> str | None:
-        normalized = ' '.join(statement.split()).upper()
-        if ' FOR UPDATE' not in normalized:
-            return None
-        if ' FROM CONTAINER_IMAGE_CONSUMER_WATERMARKS ' in normalized:
-            return 'watermark'
-        if ' FROM CONTAINER_IMAGE_DEMANDS ' in normalized:
-            return 'demand'
-        return None
-
     def _pause_compaction_after_first_lock(_connection, _cursor, statement,
                                            _parameters, _context,
                                            _executemany) -> None:
@@ -1095,24 +1113,10 @@ def test_terminal_compaction_and_release_follow_watermark_lock_order(
             'research',
             now=1001)
         assert release_attempted_watermark.wait(timeout=5)
-        deadline = time.monotonic() + 5
-        release_blocked = False
-        while time.monotonic() < deadline:
-            with image_database.connect() as observer:
-                release_blocked = bool(
-                    observer.execute(
-                        sqlalchemy.text(
-                            'SELECT wait_event_type = \'Lock\' '
-                            'FROM pg_stat_activity WHERE pid = :pid'), {
-                                'pid': release_backend['pid']
-                            }).scalar())
-            if release_blocked:
-                break
-            time.sleep(0.01)
-        assert release_blocked
+        assert _wait_for_backend_lock(image_database, release_backend['pid'])
         allow_compaction_to_continue.set()
 
-        assert compaction_future.result(timeout=5) == (1, 0)
+        assert compaction_future.result(timeout=5) == 1
         assert release_future.result(timeout=5) is False
         assert demand_state.get_demand(expired.id, 'research') is None
         assert demand_state.get_demand(retained.id, 'research') is not None
@@ -1126,7 +1130,133 @@ def test_terminal_compaction_and_release_follow_watermark_lock_order(
         release_executor.shutdown(wait=True)
 
 
-def test_terminal_compaction_requires_proof_and_deletes_empty_owner(
+def test_terminal_compaction_cannot_resurrect_deleted_owner(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    owner = '42:task:0'
+    expired = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner=owner,
+        consumer_kind='managed_job_task',
+        controller_epoch='managed-job:42:task:0:recovery:0',
+        controller_sequence=0)
+    assert demand_state.supersede_demand(expired.id, 'research', now=51)
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind='managed_job_task',
+                                           consumer_owner=owner,
+                                           credential_expires_at=54,
+                                           now=54)
+    with image_database.begin() as connection:
+        connection.execute(schema.demands.update().where(
+            schema.demands.c.id == expired.id).values(expires_at=100))
+
+    compaction_holds_watermark = threading.Event()
+    allow_compaction_to_continue = threading.Event()
+    creator_attempted_insert = threading.Event()
+    creator_backend: dict[str, int] = {}
+
+    def _pause_compaction(_connection, _cursor, statement, _parameters,
+                          _context, _executemany) -> None:
+        if (threading.current_thread().name.startswith('demand-compaction') and
+                _locked_table(statement) == 'watermark' and
+                not compaction_holds_watermark.is_set()):
+            compaction_holds_watermark.set()
+            if not allow_compaction_to_continue.wait(timeout=10):
+                raise TimeoutError('Demand compaction race test timed out.')
+
+    def _observe_creator_insert(_connection, _cursor, statement, _parameters,
+                                _context, _executemany) -> None:
+        normalized = ' '.join(statement.split()).upper()
+        if (threading.current_thread().name.startswith('demand-creator') and
+                normalized.startswith(
+                    'INSERT INTO CONTAINER_IMAGE_CONSUMER_WATERMARKS')):
+            creator_backend['pid'] = int(_cursor.connection.get_backend_pid())
+            creator_attempted_insert.set()
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                            _pause_compaction)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _observe_creator_insert)
+    compaction_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='demand-compaction')
+    creator_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='demand-creator')
+    try:
+        compaction_future = compaction_executor.submit(
+            demand_state.compact_terminal_demands, now=1000, limit=10)
+        assert compaction_holds_watermark.wait(timeout=5)
+        creator_future = creator_executor.submit(
+            _warming_demand,
+            active,
+            publication_record,
+            regional,
+            profile,
+            owner=owner,
+            consumer_kind='managed_job_task',
+            controller_epoch='managed-job:42:task:0:recovery:1',
+            controller_sequence=1,
+            allow_epoch_advance=True,
+            request_id='zombie-replay',
+            now=1001)
+        assert creator_attempted_insert.wait(timeout=5)
+        assert _wait_for_backend_lock(image_database, creator_backend['pid'])
+        allow_compaction_to_continue.set()
+
+        with pytest.raises(demand_state.StaleConsumerGenerationError,
+                           match='authoritatively deleted'):
+            creator_future.result(timeout=5)
+        assert compaction_future.result(timeout=5) == 1
+        with pytest.raises(demand_state.StaleConsumerGenerationError,
+                           match='authoritatively deleted'):
+            _warming_demand(active,
+                            publication_record,
+                            regional,
+                            profile,
+                            owner=owner,
+                            consumer_kind='managed_job_task',
+                            controller_epoch='managed-job:42:task:0:recovery:1',
+                            controller_sequence=1,
+                            allow_epoch_advance=True,
+                            request_id='zombie-retry',
+                            now=1002)
+        assert demand_state.get_demand(expired.id, 'research') is None
+        with image_database.connect() as connection:
+            watermark = connection.execute(
+                sqlalchemy.select(schema.consumer_watermarks).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind ==
+                    'managed_job_task',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    owner)).mappings().one()
+            live_demands = connection.execute(
+                sqlalchemy.select(schema.demands.c.id).where(
+                    schema.demands.c.workspace == 'research',
+                    schema.demands.c.consumer_kind == 'managed_job_task',
+                    schema.demands.c.consumer_owner == owner,
+                    schema.demands.c.state.in_([
+                        models.ImageDemandState.WARMING.value,
+                        models.ImageDemandState.READY.value,
+                        models.ImageDemandState.FAILED.value,
+                    ]))).all()
+        assert watermark['owner_deleted_at'] == 54
+        assert watermark['credential_expires_at'] == 54
+        assert not live_demands
+    finally:
+        allow_compaction_to_continue.set()
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                _pause_compaction)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _observe_creator_insert)
+        compaction_executor.shutdown(wait=True)
+        creator_executor.shutdown(wait=True)
+
+
+def test_terminal_compaction_requires_proof_and_retains_owner_fence(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     active, publication_record, _, regional = _ready_regional(
@@ -1137,7 +1267,7 @@ def test_terminal_compaction_requires_proof_and_deletes_empty_owner(
         connection.execute(schema.demands.update().where(
             schema.demands.c.id == demand.id).values(expires_at=100))
 
-    assert demand_state.compact_terminal_demands(now=1000) == (0, 0)
+    assert demand_state.compact_terminal_demands(now=1000) == 0
     assert demand_state.get_demand(demand.id, 'research') is not None
 
     assert demand_state.mark_owner_deleted(workspace='research',
@@ -1145,7 +1275,7 @@ def test_terminal_compaction_requires_proof_and_deletes_empty_owner(
                                            consumer_owner=demand.consumer_owner,
                                            credential_expires_at=900,
                                            now=900)
-    assert demand_state.compact_terminal_demands(now=1000) == (1, 1)
+    assert demand_state.compact_terminal_demands(now=1000) == 1
     assert demand_state.get_demand(demand.id, 'research') is None
     with image_database.connect() as connection:
         watermark = connection.execute(
@@ -1156,12 +1286,115 @@ def test_terminal_compaction_requires_proof_and_deletes_empty_owner(
                     demand.consumer_kind,
                     schema.consumer_watermarks.c.consumer_owner ==
                     demand.consumer_owner)).first()
-    assert watermark is None
+    assert watermark is not None
 
     with pytest.raises(ValueError, match='page size'):
         demand_state.compact_terminal_demands(limit=0)
     with pytest.raises(ValueError, match='page size'):
         demand_state.compact_terminal_demands(limit=1001)
+
+
+def test_deleted_owner_rejects_legacy_generation_creation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    assert publication_record.image_id is not None
+    authority = catalog_state.get_catalog_authority_id(create=False)
+    assert authority is not None
+    owner = 'legacy-cluster'
+    placement = {
+        'provider': 'aws',
+        'region': profile.targets[0].region,
+        'backend': 'aws_vm',
+        'platform': 'linux/amd64',
+        'consumer': {
+            'request_id': 'legacy-request',
+        },
+    }
+    demand = transactions.create_warming_demand(
+        authority_id=authority,
+        workspace='research',
+        consumer_kind='cluster',
+        consumer_owner=owner,
+        consumer_generation=0,
+        target_key=(f'{publication_record.image_id}:'
+                    f'{regional.target_fingerprint}'),
+        owner_epoch=0,
+        image_id=publication_record.image_id,
+        runtime_digest=_DIGEST,
+        profile_revision_id=active.id,
+        target_fingerprint=regional.target_fingerprint,
+        location_id=regional.id,
+        placement=placement,
+        now=50)
+    assert demand_state.supersede_demand(demand.id, 'research', now=51)
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind='cluster',
+                                           consumer_owner=owner,
+                                           credential_expires_at=52,
+                                           now=52)
+
+    with pytest.raises(demand_state.StaleConsumerGenerationError,
+                       match='authoritatively deleted'):
+        transactions.create_warming_demand(
+            authority_id=authority,
+            workspace='research',
+            consumer_kind='cluster',
+            consumer_owner=owner,
+            consumer_generation=1,
+            target_key=(f'{publication_record.image_id}:'
+                        f'{regional.target_fingerprint}'),
+            owner_epoch=0,
+            image_id=publication_record.image_id,
+            runtime_digest=_DIGEST,
+            profile_revision_id=active.id,
+            target_fingerprint=regional.target_fingerprint,
+            location_id=regional.id,
+            placement=placement,
+            now=53)
+
+
+def test_owner_deletion_requires_no_live_demand_and_is_immutable(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active, publication_record, regional, profile)
+
+    assert not demand_state.mark_owner_deleted(
+        workspace='research',
+        consumer_kind=demand.consumer_kind,
+        consumer_owner=demand.consumer_owner,
+        credential_expires_at=100,
+        now=51)
+    assert demand_state.supersede_demand(demand.id, 'research', now=52)
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind=demand.consumer_kind,
+                                           consumer_owner=demand.consumer_owner,
+                                           credential_expires_at=100,
+                                           now=53)
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind=demand.consumer_kind,
+                                           consumer_owner=demand.consumer_owner,
+                                           credential_expires_at=100,
+                                           now=54)
+    with pytest.raises(ValueError, match='immutable'):
+        demand_state.mark_owner_deleted(workspace='research',
+                                        consumer_kind=demand.consumer_kind,
+                                        consumer_owner=demand.consumer_owner,
+                                        credential_expires_at=101,
+                                        now=55)
+    with pytest.raises(ValueError, match='expiry'):
+        demand_state.mark_owner_deleted(workspace='research',
+                                        consumer_kind=demand.consumer_kind,
+                                        consumer_owner=demand.consumer_owner,
+                                        credential_expires_at=-1)
+    with pytest.raises(ValueError, match='expiry'):
+        demand_state.mark_owner_deleted(workspace='research',
+                                        consumer_kind=demand.consumer_kind,
+                                        consumer_owner=demand.consumer_owner,
+                                        credential_expires_at=True)
 
 
 def test_shard_admission_retries_after_locked_home_fills(

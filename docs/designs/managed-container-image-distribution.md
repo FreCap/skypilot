@@ -659,9 +659,11 @@ readback remains fenced in `EVICTING` for another worker.
 Consumer terminal or supersede handling writes a tombstone and advances one
 stable-owner generation watermark in the same transaction. Demand creation
 locks that watermark, validates the explicit controller epoch, and rejects a
-generation below maximum seen or at/below maximum terminal; a replay of the
-exact live maximum-seen generation converges the existing demand. A WARMING
-request demand may expire
+generation below maximum seen, at/below maximum terminal, or owned by a consumer
+that was authoritatively deleted. Owner deletion is irreversible for that stable
+owner key; a later incarnation uses a new stable owner. A replay of the exact
+live maximum-seen generation converges the existing demand. A WARMING request
+demand may expire
 only when its request is terminal, no durable consumer attached, and it is at
 least 24 hours old. For clusters, jobs, and services, reconciliation requires two
 authoritative terminal observations separated by an hour before advancing a
@@ -690,20 +692,28 @@ runs. A cheap cross-region or warming option therefore cannot defeat a READY
 regional image merely because it originated from another `any_of` resource.
 
 Terminal demand rows compact after 30 days only when the consumer credential is
-revoked or provably expired and the owner watermark prevents resurrection. A
-watermark compacts only after authoritative owner deletion plus the maximum
-controller-credential and request-replay lifetime. If either proof is unavailable,
-the watermark and newest tombstone remain as bounded orphan candidates for
-administrator review. This retains at most one high-watermark row per stable
-consumer owner rather than every historical generation.
+revoked or provably expired and the owner watermark prevents resurrection. The
+watermark is the durable nonresurrection fence and never compacts automatically.
+Authoritative owner deletion locks that fence, succeeds only when the owner has
+no live demand, and records one immutable credential-expiry proof. Deleting the
+fence would let a controller transaction that had already passed authorization
+lose the row while waiting on its unique key and recreate the owner on retry.
+If owner-deletion or credential-expiry proof is unavailable, the newest
+tombstone also remains for administrator review. This retains at most one
+high-watermark row per stable consumer owner rather than every historical
+generation. At million-owner scale these narrow rows remain ordinary indexed
+PostgreSQL state; any future archival scheme must preserve an equivalent
+non-deletable owner fence.
 
 Compaction discovers a bounded page of terminal candidate keys without taking
 row locks, groups those keys by owner, and processes owners in deterministic key
 order. For each owner it locks the consumer watermark first, rechecks deletion,
 credential-expiry, and terminal-generation proof, then locks and rechecks only
-that page's eligible demand rows before deletion. It never locks a demand before
-its watermark, so concurrent replay, supersession, or authoritative release
-cannot form an inverse-lock cycle with lifecycle maintenance.
+that page's eligible demand rows before deletion. It retains the watermark after
+the last demand is removed. It never locks a demand before its watermark, so
+concurrent replay, supersession, authoritative release, or demand creation
+cannot form an inverse-lock cycle with lifecycle maintenance or erase the
+nonresurrection fence.
 
 The image plane gates only whether a new SkyServe replica is eligible to become
 READY. Registry READY, node pull complete, and replica healthy remain three
@@ -1799,3 +1809,14 @@ path, so concurrent idempotent release could deadlock and abort the synchronous
 lifecycle maintenance loop. This revision makes compaction discover candidates
 without locks, then process each owner in deterministic watermark-before-demand
 order with under-lock revalidation and a real-PostgreSQL concurrency proof.
+
+Implementation review round 6 at
+`7cc35c1c6eb214eb84bdca71f1bdaeee28adc8b1` returned Codex `RESHAPE` and
+Fable `PURSUE`. Codex found that deleting an empty owner watermark could race a
+creator already waiting in `INSERT ... ON CONFLICT DO NOTHING`. The real
+PostgreSQL reproduction refined the exact outcome: the waiter first observed a
+raw missing-row failure after the conflicting row disappeared, and a later retry
+could then recreate a fresh watermark without the terminal fence. This revision
+keeps one permanent watermark per stable owner, rejects creation after
+authoritative deletion under that row lock, removes orphan-watermark discovery,
+and proves both the blocked creator and its retry cannot resurrect the owner.
