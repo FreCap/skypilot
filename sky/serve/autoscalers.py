@@ -673,7 +673,7 @@ class Autoscaler:
         zero_cost_demand_placed_latest = 0
         num_nonterminal = 0
         num_latest_nonterminal = 0
-        zero_cost_infos: list['replica_managers.ReplicaInfo'] = []
+        zero_cost_infos: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.is_terminal:
                 continue
