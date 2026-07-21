@@ -997,6 +997,173 @@ def test_ready_commit_and_regional_admission_follow_global_lock_order(
         admission_executor.shutdown(wait=True)
 
 
+def test_terminal_compaction_and_release_follow_watermark_lock_order(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    owner = '42:task:0'
+    expired = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner=owner,
+        consumer_kind='managed_job_task',
+        controller_epoch='managed-job:42:task:0:recovery:0',
+        controller_sequence=0)
+    assert demand_state.supersede_demand(expired.id, 'research', now=51)
+    retained = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner=owner,
+        consumer_kind='managed_job_task',
+        controller_epoch='managed-job:42:task:0:recovery:1',
+        controller_sequence=1,
+        allow_epoch_advance=True,
+        request_id='request-2',
+        now=52)
+    assert demand_state.release_demand_authoritatively(retained.id,
+                                                       'research',
+                                                       now=53)
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind='managed_job_task',
+                                           consumer_owner=owner,
+                                           credential_expires_at=54,
+                                           now=54)
+    with image_database.begin() as connection:
+        connection.execute(schema.demands.update().where(
+            schema.demands.c.id == expired.id).values(expires_at=100))
+        connection.execute(schema.demands.update().where(
+            schema.demands.c.id == retained.id).values(expires_at=2000))
+
+    compaction_first_lock = threading.Event()
+    allow_compaction_to_continue = threading.Event()
+    release_attempted_watermark = threading.Event()
+    first_lock_table: dict[str, str] = {}
+    release_backend: dict[str, int] = {}
+
+    def _locked_table(statement: str) -> str | None:
+        normalized = ' '.join(statement.split()).upper()
+        if ' FOR UPDATE' not in normalized:
+            return None
+        if ' FROM CONTAINER_IMAGE_CONSUMER_WATERMARKS ' in normalized:
+            return 'watermark'
+        if ' FROM CONTAINER_IMAGE_DEMANDS ' in normalized:
+            return 'demand'
+        return None
+
+    def _pause_compaction_after_first_lock(_connection, _cursor, statement,
+                                           _parameters, _context,
+                                           _executemany) -> None:
+        if not threading.current_thread().name.startswith('demand-compaction'):
+            return
+        table = _locked_table(statement)
+        if table is None or compaction_first_lock.is_set():
+            return
+        first_lock_table['name'] = table
+        compaction_first_lock.set()
+        if not allow_compaction_to_continue.wait(timeout=10):
+            raise TimeoutError('Demand compaction lock-order test timed out.')
+
+    def _observe_release_watermark(_connection, _cursor, statement, _parameters,
+                                   _context, _executemany) -> None:
+        if (threading.current_thread().name.startswith('authoritative-release')
+                and _locked_table(statement) == 'watermark'):
+            release_backend['pid'] = int(_cursor.connection.get_backend_pid())
+            release_attempted_watermark.set()
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                            _pause_compaction_after_first_lock)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _observe_release_watermark)
+    compaction_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='demand-compaction')
+    release_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='authoritative-release')
+    try:
+        compaction_future = compaction_executor.submit(
+            demand_state.compact_terminal_demands, now=1000, limit=10)
+        assert compaction_first_lock.wait(timeout=5)
+        assert first_lock_table['name'] == 'watermark'
+
+        release_future = release_executor.submit(
+            demand_state.release_demand_authoritatively,
+            expired.id,
+            'research',
+            now=1001)
+        assert release_attempted_watermark.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        release_blocked = False
+        while time.monotonic() < deadline:
+            with image_database.connect() as observer:
+                release_blocked = bool(
+                    observer.execute(
+                        sqlalchemy.text(
+                            'SELECT wait_event_type = \'Lock\' '
+                            'FROM pg_stat_activity WHERE pid = :pid'), {
+                                'pid': release_backend['pid']
+                            }).scalar())
+            if release_blocked:
+                break
+            time.sleep(0.01)
+        assert release_blocked
+        allow_compaction_to_continue.set()
+
+        assert compaction_future.result(timeout=5) == (1, 0)
+        assert release_future.result(timeout=5) is False
+        assert demand_state.get_demand(expired.id, 'research') is None
+        assert demand_state.get_demand(retained.id, 'research') is not None
+    finally:
+        allow_compaction_to_continue.set()
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                _pause_compaction_after_first_lock)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _observe_release_watermark)
+        compaction_executor.shutdown(wait=True)
+        release_executor.shutdown(wait=True)
+
+
+def test_terminal_compaction_requires_proof_and_deletes_empty_owner(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active, publication_record, regional, profile)
+    assert demand_state.supersede_demand(demand.id, 'research', now=51)
+    with image_database.begin() as connection:
+        connection.execute(schema.demands.update().where(
+            schema.demands.c.id == demand.id).values(expires_at=100))
+
+    assert demand_state.compact_terminal_demands(now=1000) == (0, 0)
+    assert demand_state.get_demand(demand.id, 'research') is not None
+
+    assert demand_state.mark_owner_deleted(workspace='research',
+                                           consumer_kind=demand.consumer_kind,
+                                           consumer_owner=demand.consumer_owner,
+                                           credential_expires_at=900,
+                                           now=900)
+    assert demand_state.compact_terminal_demands(now=1000) == (1, 1)
+    assert demand_state.get_demand(demand.id, 'research') is None
+    with image_database.connect() as connection:
+        watermark = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.consumer_owner).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind ==
+                    demand.consumer_kind,
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    demand.consumer_owner)).first()
+    assert watermark is None
+
+    with pytest.raises(ValueError, match='page size'):
+        demand_state.compact_terminal_demands(limit=0)
+    with pytest.raises(ValueError, match='page size'):
+        demand_state.compact_terminal_demands(limit=1001)
+
+
 def test_shard_admission_retries_after_locked_home_fills(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     _activate_profile(image_database, profile)

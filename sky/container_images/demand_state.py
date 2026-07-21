@@ -871,51 +871,105 @@ def compact_terminal_demands(*,
                              now: int | None = None,
                              limit: int = 500) -> tuple[int, int]:
     """Compacts tombstones only behind a nonresurrection watermark proof."""
+    if not 1 <= limit <= 1000:
+        raise ValueError('Demand compaction page size is invalid.')
     current = int(time.time()) if now is None else now
     demands = schema.demands
     watermarks = schema.consumer_watermarks
     with orm.Session(catalog_state.engine()) as session, session.begin():
         candidate_rows = session.execute(
-            sqlalchemy.select(demands).where(
-                demands.c.state.in_([
-                    models.ImageDemandState.SUPERSEDED.value,
-                    models.ImageDemandState.RELEASED.value,
-                ]), demands.c.expires_at
-                <= current).order_by(demands.c.expires_at,
-                                     demands.c.id).limit(limit).with_for_update(
-                                         skip_locked=True)).mappings().all()
-        demand_ids: list[str] = []
-        for row in candidate_rows:
+            sqlalchemy.select(demands.c.id, demands.c.workspace,
+                              demands.c.consumer_kind,
+                              demands.c.consumer_owner).
+            select_from(
+                demands.join(
+                    watermarks,
+                    sqlalchemy.and_(
+                        watermarks.c.workspace == demands.c.workspace,
+                        watermarks.c.consumer_kind == demands.c.consumer_kind,
+                        watermarks.c.consumer_owner ==
+                        demands.c.consumer_owner))).where(
+                            demands.c.state.in_([
+                                models.ImageDemandState.SUPERSEDED.value,
+                                models.ImageDemandState.RELEASED.value,
+                            ]),
+                            demands.c.expires_at <= current,
+                            watermarks.c.owner_deleted_at.is_not(None),
+                            watermarks.c.credential_expires_at <= current,
+                            demands.c.consumer_generation
+                            <= watermarks.c.max_terminal_generation).order_by(
+                                demands.c.expires_at,
+                                demands.c.id).limit(limit)).mappings().all()
+        candidate_ids_by_owner: dict[tuple[str, str, str], list[str]] = {}
+        for candidate in candidate_rows:
+            owner_key = (str(candidate['workspace']),
+                         str(candidate['consumer_kind']),
+                         str(candidate['consumer_owner']))
+            candidate_ids_by_owner.setdefault(owner_key,
+                                              []).append(str(candidate['id']))
+        orphan_rows = session.execute(
+            sqlalchemy.select(
+                watermarks.c.workspace, watermarks.c.consumer_kind,
+                watermarks.c.consumer_owner).where(
+                    watermarks.c.owner_deleted_at.is_not(None),
+                    watermarks.c.credential_expires_at <= current,
+                    ~sqlalchemy.exists().where(
+                        demands.c.workspace == watermarks.c.workspace,
+                        demands.c.consumer_kind == watermarks.c.consumer_kind,
+                        demands.c.consumer_owner
+                        == watermarks.c.consumer_owner)).order_by(
+                            watermarks.c.owner_deleted_at,
+                            watermarks.c.credential_expires_at).limit(
+                                limit)).mappings().all()
+        owner_keys = set(candidate_ids_by_owner)
+        owner_keys.update((str(row['workspace']), str(row['consumer_kind']),
+                           str(row['consumer_owner'])) for row in orphan_rows)
+        deleted_demands = 0
+        deleted_watermarks = 0
+        for workspace, consumer_kind, consumer_owner in sorted(owner_keys):
             watermark = session.execute(
                 sqlalchemy.select(watermarks).where(
-                    watermarks.c.workspace == row['workspace'],
-                    watermarks.c.consumer_kind == row['consumer_kind'],
-                    watermarks.c.consumer_owner ==
-                    row['consumer_owner']).with_for_update()).mappings().one()
+                    watermarks.c.workspace == workspace,
+                    watermarks.c.consumer_kind == consumer_kind,
+                    watermarks.c.consumer_owner == consumer_owner).
+                with_for_update(skip_locked=True)).mappings().first()
+            if watermark is None:
+                continue
             credential_expiry = watermark['credential_expires_at']
-            if (watermark['owner_deleted_at'] is not None and
-                    credential_expiry is not None and
-                    int(credential_expiry) <= current and
-                    int(watermark['max_terminal_generation']) >= int(
-                        row['consumer_generation'])):
-                demand_ids.append(str(row['id']))
-        deleted_demands = 0
-        if demand_ids:
-            deleted_demands = session.execute(demands.delete().where(
-                demands.c.id.in_(demand_ids))).rowcount
-        watermark_keys = session.execute(
-            sqlalchemy.select(watermarks).where(
-                watermarks.c.owner_deleted_at.is_not(None),
-                watermarks.c.credential_expires_at <= current,
-                ~sqlalchemy.exists().where(
-                    demands.c.workspace == watermarks.c.workspace,
-                    demands.c.consumer_kind == watermarks.c.consumer_kind,
-                    demands.c.consumer_owner == watermarks.c.consumer_owner)).
-            limit(limit).with_for_update(skip_locked=True)).mappings().all()
-        deleted_watermarks = 0
-        for row in watermark_keys:
-            deleted_watermarks += session.execute(watermarks.delete().where(
-                watermarks.c.workspace == row['workspace'],
-                watermarks.c.consumer_kind == row['consumer_kind'],
-                watermarks.c.consumer_owner == row['consumer_owner'])).rowcount
+            owner_deletion_proved = (watermark['owner_deleted_at'] is not None
+                                     and credential_expiry is not None and
+                                     int(credential_expiry) <= current)
+            if not owner_deletion_proved:
+                continue
+            candidate_ids = candidate_ids_by_owner.get(
+                (workspace, consumer_kind, consumer_owner), [])
+            if candidate_ids:
+                locked_demands = session.execute(
+                    sqlalchemy.select(demands.c.id).where(
+                        demands.c.id.in_(candidate_ids),
+                        demands.c.workspace == workspace,
+                        demands.c.consumer_kind == consumer_kind,
+                        demands.c.consumer_owner == consumer_owner,
+                        demands.c.state.in_([
+                            models.ImageDemandState.SUPERSEDED.value,
+                            models.ImageDemandState.RELEASED.value,
+                        ]), demands.c.expires_at <= current,
+                        demands.c.consumer_generation
+                        <= int(watermark['max_terminal_generation'])).order_by(
+                            demands.c.id).with_for_update(
+                                skip_locked=True)).scalars().all()
+                if locked_demands:
+                    deleted_demands += session.execute(demands.delete().where(
+                        demands.c.id.in_(locked_demands))).rowcount
+            remaining_demand = session.execute(
+                sqlalchemy.select(demands.c.id).where(
+                    demands.c.workspace == workspace,
+                    demands.c.consumer_kind == consumer_kind,
+                    demands.c.consumer_owner == consumer_owner).limit(
+                        1)).first()
+            if remaining_demand is None:
+                deleted_watermarks += session.execute(watermarks.delete().where(
+                    watermarks.c.workspace == workspace,
+                    watermarks.c.consumer_kind == consumer_kind,
+                    watermarks.c.consumer_owner == consumer_owner)).rowcount
     return deleted_demands, deleted_watermarks

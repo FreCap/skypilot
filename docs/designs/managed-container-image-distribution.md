@@ -697,6 +697,14 @@ the watermark and newest tombstone remain as bounded orphan candidates for
 administrator review. This retains at most one high-watermark row per stable
 consumer owner rather than every historical generation.
 
+Compaction discovers a bounded page of terminal candidate keys without taking
+row locks, groups those keys by owner, and processes owners in deterministic key
+order. For each owner it locks the consumer watermark first, rechecks deletion,
+credential-expiry, and terminal-generation proof, then locks and rechecks only
+that page's eligible demand rows before deletion. It never locks a demand before
+its watermark, so concurrent replay, supersession, or authoritative release
+cannot form an inverse-lock cycle with lifecycle maintenance.
+
 The image plane gates only whether a new SkyServe replica is eligible to become
 READY. Registry READY, node pull complete, and replica healthy remain three
 distinct states and timestamps. SkyServe's existing capacity-aware rolling
@@ -1680,7 +1688,10 @@ commit by both Codex 5.6 and Claude Fable. A round counts only when both inspect
 the same commit and return `PURSUE`, `RESHAPE`, or `DROP`. An unavailable model is
 reported and is not replaced. Findings are fixed as one coherent batch before
 the next round. Completion requires three consecutive paired `PURSUE` rounds,
-with no more than six additional paired rounds in this review cycle.
+with no more than six additional paired rounds in one review cycle. A verified
+blocker resets the consecutive count. If a blocker is found too late to complete
+the streak inside that cycle, the blocker is fixed and one new bounded review
+cycle starts; the round budget never waives the three-consecutive requirement.
 
 Round 1 at `c1a8ce729c82cc606eef5cfd62abdf9fa9d7fd8e` returned Codex `RESHAPE`.
 Fable was unavailable because its CLI account reported no usage credits, so the
@@ -1762,3 +1773,29 @@ Serve migration chain at revision 021, regenerates the Helm schema, restores
 immutable YAML fixtures, removes the duplicate test-module basename, and
 updates Python 3.14 static-analysis contracts. Activation remains disabled until
 the resulting exact head passes every operational gate.
+
+Implementation review round 3 at
+`21958988d04e0f9fb66862dc309e1fc2d66d58ad` returned paired Codex `RESHAPE`
+and Fable `RESHAPE`. Both found that READY demand commit acquired a location
+before its artifact while regional admission used the opposite order. Fable
+also found that Serve omitted its incarnation from the stable owner key, so a
+same-name recreation at version one could collide permanently with the prior
+watermark. The next revision moved the artifact lock before location and added
+a deterministic real-PostgreSQL interleaving proof. It also put the durable
+service incarnation into the version-target owner while preserving one shared
+owner for 1,000 replicas.
+
+Implementation review round 4 at
+`2464318ba8bd3726cadd73145c6662a0af38d712` returned paired Codex `PURSUE`
+and Fable `PURSUE`. Both verified the repaired lock graph, service-incarnation
+ownership, prior blocker set, and disabled rollout boundary with no blocking
+finding.
+
+Implementation review round 5 repeated the exact immutable
+`2464318ba8bd3726cadd73145c6662a0af38d712` tree and returned Codex `RESHAPE`
+and Fable `PURSUE`. The deeper Codex pass found that terminal compaction still
+locked demand rows before their watermark, opposite every controller terminal
+path, so concurrent idempotent release could deadlock and abort the synchronous
+lifecycle maintenance loop. This revision makes compaction discover candidates
+without locks, then process each owner in deterministic watermark-before-demand
+order with under-lock revalidation and a real-PostgreSQL concurrency proof.
