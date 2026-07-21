@@ -589,7 +589,7 @@ def set_batch_succeeded(job_id: int, task_id: int, owner_token: str,
                 task_id=task_id,
                 new_status=ManagedJobStatus.SUCCEEDED.value,
                 reason='Job has succeeded',
-                timestamp=datetime.datetime.now()))
+                timestamp=datetime.datetime.now(datetime.timezone.utc)))
         else:
             status = session.execute(
                 sqlalchemy.select(spot_table.c.status).where(
@@ -640,7 +640,7 @@ def set_batch_failed(job_id: int, task_id: int, owner_token: str,
                 task_id=task_id,
                 new_status=ManagedJobStatus.FAILED.value,
                 reason=f'Job failed: {failure_reason}',
-                timestamp=datetime.datetime.now()))
+                timestamp=datetime.datetime.now(datetime.timezone.utc)))
             outcome = BatchLifecycleTransition.APPLIED
         else:
             status = session.execute(
