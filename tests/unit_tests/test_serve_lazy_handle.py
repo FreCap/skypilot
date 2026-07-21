@@ -503,7 +503,9 @@ class TestGetServiceStatusPickledParallel:
         }
 
     def test_returns_sorted_by_name(self):
-        names = ['svc-c', 'svc-a', 'svc-b']
+        # Vary lengths because pickle/base64 metadata otherwise happens to
+        # preserve lexical order for these ASCII names.
+        names = ['svc-z', 'service-aa', 'mid']
 
         def status(name, pool, *, with_replica_info, with_replica_counts,
                    with_target_num_replicas):
@@ -521,7 +523,7 @@ class TestGetServiceStatusPickledParallel:
             pickle.loads(base64.b64decode(s['name'].encode('utf-8')))
             for s in out
         ]
-        assert decoded_names == ['svc-a', 'svc-b', 'svc-c']
+        assert decoded_names == ['mid', 'service-aa', 'svc-z']
 
     def test_skips_none_results(self):
         """A service that vanished mid-call (`_get_service_status` returns

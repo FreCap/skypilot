@@ -2155,21 +2155,22 @@ def get_service_status_pickled(
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         statuses = list(ex.map(_run_in_context, service_names))
-    for status in statuses:
+    live_statuses = sorted(
+        (status for status in statuses if status is not None),
+        key=lambda status: status['name'])
+    for status in live_statuses:
         # The rendered YAML carries plaintext secrets (replicas need it
         # launchable), so it never leaves the controller for services:
         # clients get the redacted `service_yaml` instead. Pools keep it
         # because the batch coordinator and worker-count updates parse
         # `yaml_content`/`pool_yaml` back into a launchable task.
-        if status is not None and not status.get('pool'):
+        if not status.get('pool'):
             status.pop('yaml_content', None)
-    service_statuses: list[dict[str, str]] = [{
+    return [{
         k: base64.b64encode(pickle.dumps(v)).decode('utf-8')
         for k, v in s.items()
     }
-                                              for s in statuses
-                                              if s is not None]
-    return sorted(service_statuses, key=lambda x: x['name'])
+            for s in live_statuses]
 
 
 # TODO (kyuds): remove when serve codegen is removed
