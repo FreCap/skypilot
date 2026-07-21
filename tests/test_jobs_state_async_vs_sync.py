@@ -541,3 +541,34 @@ async def test_transition_failures_surface_details_for_all_functions(
         job_id, missing_task_id, time.time(), noop_callback))
     await expect_failure(lambda: state.set_succeeded_async(
         job_id, missing_task_id, time.time(), noop_callback))
+
+
+@pytest.mark.asyncio
+async def test_get_pool_and_execution_from_job_id_async(_mock_jobs_db_conn):
+    job_id = state.set_job_info_without_job_id(name='pool_exec_job',
+                                               workspace='default',
+                                               entrypoint='echo',
+                                               pool='my-pool',
+                                               pool_hash='hash',
+                                               user_hash='abcd1234',
+                                               execution='parallel')
+    pool, execution = await state.get_pool_and_execution_from_job_id_async(
+        job_id)
+    assert pool == 'my-pool'
+    assert execution == 'parallel'
+    assert pool == state.get_pool_from_job_id(job_id)
+
+    null_job_id = state.set_job_info_without_job_id(name='null_exec_job',
+                                                    workspace='default',
+                                                    entrypoint='echo',
+                                                    pool=None,
+                                                    pool_hash=None,
+                                                    user_hash='abcd1234')
+    pool, execution = await state.get_pool_and_execution_from_job_id_async(
+        null_job_id)
+    assert pool is None
+    assert execution is None
+
+    pool, execution = await state.get_pool_and_execution_from_job_id_async(9999)
+    assert pool is None
+    assert execution is None

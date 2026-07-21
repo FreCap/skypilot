@@ -1307,21 +1307,28 @@ def get_pool_from_job_id(job_id: int) -> str | None:
         return pool[0] if pool else None
 
 
-@db_retries.retry
-def get_execution_from_job_id(job_id: int) -> str | None:
-    """Get the DAG execution mode ('parallel'/'serial') from the job id.
+@db_retries.retry_async
+async def get_pool_and_execution_from_job_id_async(
+        job_id: int) -> tuple[str | None, str | None]:
+    """Get the pool and DAG execution mode from the job id in one query.
 
-    Returns None when the job is unknown or its row has no recorded execution
-    mode (writers may store an explicit NULL, e.g. legacy code paths that
-    predate the column). Callers can use this to decide JobGroup-ness without
-    fetching and re-parsing the full DAG YAML.
+    Both columns are fixed at submission time, so they can always be read
+    together. Each is None when the job is unknown or its row has no recorded
+    value (writers may store an explicit NULL for execution, e.g. legacy code
+    paths that predate the column). Callers use execution to decide
+    JobGroup-ness ('parallel' == JobGroup) without fetching and re-parsing the
+    full DAG YAML.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        execution = session.execute(
-            sqlalchemy.select(job_info_table.c.execution).where(
-                job_info_table.c.spot_job_id == job_id)).fetchone()
-        return execution[0] if execution else None
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        result = await session.execute(
+            sqlalchemy.select(job_info_table.c.pool,
+                              job_info_table.c.execution).where(
+                                  job_info_table.c.spot_job_id == job_id))
+        info = result.fetchone()
+        if info is None:
+            return None, None
+        return info[0], info[1]
 
 
 def set_current_cluster_name(job_id: int, current_cluster_name: str) -> None:

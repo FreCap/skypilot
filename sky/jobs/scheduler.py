@@ -387,7 +387,11 @@ async def scheduled_launch(
     multiple uses of this context are nested, behavior is undefined. Don't do
     that.
     """
-    pool = state.get_pool_from_job_id(job_id)
+    # Both values are fixed at submission, so one async read of the job_info
+    # row covers them without blocking the shared controller event loop the
+    # way the previous two synchronous single-column reads did.
+    pool, execution = await state.get_pool_and_execution_from_job_id_async(
+        job_id)
     # For pool, since there is no execution.launch, we don't need to have all
     # the ALIVE_WAITING state. The state transition will be
     # WAITING -> ALIVE -> DONE without any intermediate transitions.
@@ -409,7 +413,6 @@ async def scheduled_launch(
     # rows and unknown job_ids match the previous behavior
     # (get_job_dag_content returned None -> not a JobGroup).
     # TODO(zhwu): make JobGroup scheduler aware.
-    execution = state.get_execution_from_job_id(job_id)
     if dag_utils.is_job_group_execution(execution):
         yield
         return

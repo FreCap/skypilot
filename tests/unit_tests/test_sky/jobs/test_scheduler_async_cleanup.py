@@ -31,12 +31,11 @@ async def test_scheduled_launch_releases_slot_after_repeated_cancel():
             await asyncio.Future()
 
     background_before = set(asyncio_utils._background_tasks)
-    with mock.patch.object(scheduler.state,
-                           'get_pool_from_job_id',
-                           return_value=None), \
-         mock.patch.object(scheduler.state,
-                           'get_execution_from_job_id',
-                           return_value=None), \
+    with mock.patch.object(
+            scheduler.state,
+            'get_pool_and_execution_from_job_id_async',
+            new_callable=mock.AsyncMock,
+            return_value=(None, None)), \
          mock.patch.object(scheduler.state,
                            'scheduler_set_launching_async',
                            new_callable=mock.AsyncMock) as set_launching, \
