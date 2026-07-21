@@ -57,13 +57,15 @@ class TestCloudVmRayResourceHandleCardinality:
     def test_update_cluster_ips_rejects_mismatched_lists_under_optimization(
             self):
         if sys.flags.optimize == 0:
-            node_id = (f'{__file__}::TestCloudVmRayResourceHandleCardinality::'
-                       'test_update_cluster_ips_rejects_mismatched_lists_'
-                       'under_optimization')
-            result = subprocess.run([
-                sys.executable, '-O', '-m', 'pytest', '-n', '0', '--dist', 'no',
-                '-q', node_id
-            ],
+            # Load this module directly in the optimized child instead of
+            # starting a nested pytest session. Nested pytest competes with
+            # the already parallel unit suite for shared fixtures and has
+            # repeatedly exceeded this otherwise generous process timeout.
+            script = ('import runpy; '
+                      f'module = runpy.run_path({__file__!r}); '
+                      "module['TestCloudVmRayResourceHandleCardinality']()."
+                      'test_update_cluster_ips_rejects_mismatched_lists()')
+            result = subprocess.run([sys.executable, '-O', '-c', script],
                                     check=False,
                                     capture_output=True,
                                     text=True,
