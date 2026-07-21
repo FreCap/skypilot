@@ -560,6 +560,8 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
     acquired.__enter__.return_value = None
     lock = mock.MagicMock()
     lock.acquire.side_effect = [blocked, acquired]
+    resource_lock = mock.MagicMock()
+    resource_lock.acquire.return_value.__enter__.return_value = None
     status_fields = {
         'test-cluster': ('UP', record['status_updated_at']),
     }
@@ -576,8 +578,10 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
                            return_value=refresh_fields) as refresh_read, \
          mock.patch.object(backend_utils,
                            '_check_owner_identity_with_record'), \
-         mock.patch.object(backend_utils.locks, 'get_lock',
-                           return_value=lock), \
+         mock.patch.object(
+             backend_utils.locks,
+             'get_lock',
+             side_effect=[lock, resource_lock]) as get_lock, \
          mock.patch.object(backend_utils.time, 'sleep') as sleep, \
          mock.patch.object(backend_utils, '_update_cluster_status',
                            return_value=fresh_record) as update:
@@ -589,6 +593,12 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
     legacy_read.assert_not_called()
     assert refresh_read.call_count == 2
     assert lock.acquire.call_count == 2
+    resource_lock.acquire.assert_called_once_with(blocking=False)
+    assert get_lock.call_args_list == [
+        mock.call(backend_utils.cluster_status_lock_id('test-cluster')),
+        mock.call(
+            backend_utils.cluster_resource_operation_lock_id('test-cluster')),
+    ]
     sleep.assert_called_once_with(lock.poll_interval)
     update.assert_called_once_with('test-cluster', fresh_record, True, True,
                                    False)

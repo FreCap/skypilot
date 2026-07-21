@@ -3457,11 +3457,34 @@ def _reload_record_if_refresh_fields_changed(
         summary_response=summary_response)
 
 
+def _update_cluster_status_with_resource_lock(
+        cluster_name: str, record: dict[str, Any], retry_if_missing: bool,
+        include_user_info: bool, summary_response: bool,
+        resource_lock_already_held: bool) -> dict[str, Any] | None:
+    """Update status while excluding provider and shared-file mutations."""
+    if resource_lock_already_held:
+        return _update_cluster_status(cluster_name, record, retry_if_missing,
+                                      include_user_info, summary_response)
+
+    resource_lock = locks.get_lock(
+        cluster_resource_operation_lock_id(cluster_name))
+    try:
+        with resource_lock.acquire(blocking=False):
+            return _update_cluster_status(cluster_name, record,
+                                          retry_if_missing, include_user_info,
+                                          summary_response)
+    except locks.LockTimeout:
+        logger.debug('Refreshing status: resource operations are in progress '
+                     f'for cluster {cluster_name!r}. Using the cached status.')
+        return record
+
+
 def refresh_cluster_record(
         cluster_name: str,
         *,
         force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
         cluster_lock_already_held: bool = False,
+        cluster_resource_lock_already_held: bool = False,
         cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
         include_user_info: bool = True,
         summary_response: bool = False,
@@ -3489,6 +3512,11 @@ def refresh_cluster_record(
           status can lead to correctness issues - e.g. an launch in-progress may
           appear to be DOWN incorrectly. Even if this is set to False, the lock
           may not be acquired if the status does not need to be refreshed.
+        cluster_resource_lock_already_held: Whether the caller already holds
+          the per-cluster resource-operation lock. Callers must not set this
+          without also setting ``cluster_lock_already_held``. When False, a
+          refresh that cannot immediately acquire the resource-operation lock
+          returns the cached record.
         cluster_status_lock_timeout: The timeout to acquire the per-cluster
           lock. If timeout, the function will use the cached status. If the
           value is <0, do not timeout (wait for the lock indefinitely). By
@@ -3510,6 +3538,8 @@ def refresh_cluster_record(
           fetched from the cloud provider or there are leaked nodes causing
           the node number larger than expected.
     """
+    if cluster_resource_lock_already_held:
+        assert cluster_lock_already_held
 
     ctx = context_lib.get()
     record = global_user_state.get_cluster_from_name(
@@ -3542,10 +3572,9 @@ def refresh_cluster_record(
                 return record
 
             if cluster_lock_already_held:
-                return _update_cluster_status(cluster_name, record,
-                                              retry_if_missing,
-                                              include_user_info,
-                                              summary_response)
+                return _update_cluster_status_with_resource_lock(
+                    cluster_name, record, retry_if_missing, include_user_info,
+                    summary_response, cluster_resource_lock_already_held)
 
             # Try to acquire the lock so we can fetch the status.
             try:
@@ -3559,10 +3588,13 @@ def refresh_cluster_record(
                             record, force_refresh_statuses):
                         return record
                     # Update and return the cluster status.
-                    return _update_cluster_status(cluster_name, record,
-                                                  retry_if_missing,
-                                                  include_user_info,
-                                                  summary_response)
+                    return _update_cluster_status_with_resource_lock(
+                        cluster_name,
+                        record,
+                        retry_if_missing,
+                        include_user_info,
+                        summary_response,
+                        resource_lock_already_held=False)
 
             except locks.LockTimeout:
                 # lock.acquire() will throw a Timeout exception if the lock is not
@@ -3597,6 +3629,7 @@ def refresh_cluster_status_handle(
     *,
     force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
     cluster_lock_already_held: bool = False,
+    cluster_resource_lock_already_held: bool = False,
     cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
     retry_if_missing: bool = True,
 ) -> tuple[status_lib.ClusterStatus | None, backends.ResourceHandle | None]:
@@ -3610,6 +3643,7 @@ def refresh_cluster_status_handle(
         cluster_name,
         force_refresh_statuses=force_refresh_statuses,
         cluster_lock_already_held=cluster_lock_already_held,
+        cluster_resource_lock_already_held=(cluster_resource_lock_already_held),
         cluster_status_lock_timeout=cluster_status_lock_timeout,
         include_user_info=False,
         summary_response=True,
@@ -4851,6 +4885,11 @@ def get_endpoints(
 def cluster_status_lock_id(cluster_name: str) -> str:
     """Get the lock ID for cluster status operations."""
     return f'{cluster_name}_status'
+
+
+def cluster_resource_operation_lock_id(cluster_name: str) -> str:
+    """Get the lock ID for cluster provider and shared-file operations."""
+    return f'{cluster_name}_resource_operations'
 
 
 def cluster_file_mounts_lock_id(cluster_name: str) -> str:
