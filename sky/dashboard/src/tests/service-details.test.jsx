@@ -412,6 +412,93 @@ describe('useServiceDetails stale-response fencing', () => {
     }
   });
 
+  it('does not start a history poll while manual refresh already owns service history', async () => {
+    jest.useFakeTimers();
+    const refreshedSummary = deferred();
+    const refreshedFull = deferred();
+    let mounted = true;
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY' }],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY', replicas: [] }],
+      });
+
+    const { result, unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      dashboardCache.get
+        .mockImplementationOnce(() => refreshedSummary.promise)
+        .mockImplementationOnce(() => refreshedFull.promise);
+
+      let refreshPromise;
+      act(() => {
+        refreshPromise = result.current.refreshData();
+      });
+
+      expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+
+      // The manual refresh already owns the service summary request that
+      // carries replica history, so the timer must not start a duplicate poll.
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      await act(async () => {
+        refreshedSummary.resolve({
+          services: [
+            {
+              name: 'svc',
+              status: 'READY',
+              replicaHistory: { currentReadyReplicas: 2 },
+            },
+          ],
+        });
+        refreshedFull.resolve({
+          services: [{ name: 'svc', status: 'READY', replicas: ['r1'] }],
+        });
+        await refreshPromise;
+      });
+
+      dashboardCache.get.mockResolvedValueOnce({
+        services: [
+          {
+            name: 'svc',
+            replicaHistory: { currentReadyReplicas: 3 },
+          },
+        ],
+      });
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      jest.useRealTimers();
+    }
+  });
+
   it('does not reuse an old refresh owner after leaving and returning to a service', async () => {
     const oldSummary = deferred();
     const oldFull = deferred();
