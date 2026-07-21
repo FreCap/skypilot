@@ -695,6 +695,40 @@ def release_demand_authoritatively_in_session(session: orm.Session,
                                           now=now)
 
 
+def release_owner_authoritatively_in_session(session: orm.Session,
+                                             workspace: str, consumer_kind: str,
+                                             consumer_owner: str, *,
+                                             now: int) -> bool:
+    """Releases every live demand for one durably bound deleted owner."""
+    watermarks = schema.consumer_watermarks
+    demands = schema.demands
+    watermark = session.execute(
+        sqlalchemy.select(watermarks).where(
+            watermarks.c.workspace == workspace,
+            watermarks.c.consumer_kind == consumer_kind,
+            watermarks.c.consumer_owner ==
+            consumer_owner).with_for_update()).mappings().first()
+    if watermark is None:
+        return False
+    rows = session.execute(
+        sqlalchemy.select(demands).where(
+            demands.c.workspace == workspace,
+            demands.c.consumer_kind == consumer_kind,
+            demands.c.consumer_owner == consumer_owner,
+            demands.c.state.in_([
+                models.ImageDemandState.WARMING.value,
+                models.ImageDemandState.READY.value,
+                models.ImageDemandState.FAILED.value,
+            ])).order_by(demands.c.id).with_for_update()).mappings().all()
+    for row in rows:
+        _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+    return _mark_owner_deleted_in_session(session,
+                                          workspace=workspace,
+                                          consumer_kind=consumer_kind,
+                                          consumer_owner=consumer_owner,
+                                          now=now)
+
+
 def release_demand_authoritatively(demand_id: str,
                                    workspace: str,
                                    *,
@@ -766,7 +800,26 @@ def list_consumer_reconciliation_candidates(*,
 def defer_consumer_reconciliation(demand_id: str,
                                   *,
                                   now: int | None = None) -> bool:
-    """Rotates a still-live consumer behind other bounded candidates."""
+    """Invalidates partial terminal proof and rotates a live candidate."""
+    current = int(time.time()) if now is None else now
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(schema.demands.update().where(
+            schema.demands.c.id == demand_id,
+            schema.demands.c.state.in_([
+                models.ImageDemandState.WARMING.value,
+                models.ImageDemandState.READY.value,
+                models.ImageDemandState.FAILED.value,
+            ])).values(first_terminal_observed_at=None,
+                       last_terminal_observed_at=None,
+                       terminal_observation_count=0,
+                       updated_at=current)).rowcount
+    return changed == 1
+
+
+def defer_terminal_confirmation(demand_id: str,
+                                *,
+                                now: int | None = None) -> bool:
+    """Rotates a candidate without erasing its pending terminal proof."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         changed = session.execute(schema.demands.update().where(

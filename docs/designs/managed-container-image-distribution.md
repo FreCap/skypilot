@@ -588,15 +588,34 @@ mapping. Advancing to a different controller epoch is allowed only when the
 caller presents an authoritative lifecycle transition. For sequenced owners,
 the new sequence must be strictly greater, so a delayed recovery cannot take
 ownership back. That same transaction supersedes any older live demand before
-publishing the new owner epoch. A first-party named-cluster deletion releases
-its cluster demand and permanently retires that launch incarnation in the same
-PostgreSQL transaction that deletes the cluster row. Recreating the same named
-cluster receives a new request epoch and therefore a new stable owner. The
-two-observation delay applies only to reconciliation that infers a missing
-owner, never to an authoritative `sky down` transition. When reconciliation
-proves a cluster, managed-job task, or Serve version terminal, its final
-observation terminalizes the last demand and retires that owner in one
-watermark-then-demand transaction.
+publishing the new owner epoch. The cluster INIT transaction stores the exact
+validated consumer kind and owner beside the authoritative cluster row, rather
+than relying on a later handle decode. A first-party named-cluster deletion uses
+that binding to release every live demand and permanently retire the launch
+incarnation in the same PostgreSQL transaction that deletes the cluster row.
+Managed-job and Serve replica cluster rows carry their shared non-cluster
+binding and never retire it during replica teardown. Recreating the same named
+cluster receives a new request epoch and therefore a new stable owner.
+
+The two-observation reconciler compares both the reusable cluster name and its
+stored consumer binding. A same-name row with a different binding is proof that
+the old incarnation is absent; it cannot mask the old demand indefinitely.
+Rows and demands created before incarnation-scoped bindings retain the explicit
+legacy name-only compatibility path. A false `binding_known` scalar marks a
+pre-binding or indeterminate row and conservatively keeps every same-name demand
+live until a current writer backfills it or the row disappears. Current writers
+set that scalar true and leave both consumer fields `NULL` when the handle proves
+there is no managed consumer, so an unrelated direct-image recreation does not
+mask an old managed incarnation. A current binding, an authoritative
+nonterminal state, or an unknown lifecycle result clears any partial terminal
+confirmation. The
+separate confirmation-delay rotation preserves its first observation, so
+retirement requires two uninterrupted authoritative terminal observations at
+least one hour apart. The delay applies only to reconciliation that infers a
+missing owner, never to an authoritative `sky down` transition. When
+reconciliation proves a cluster, managed-job task, or Serve version terminal,
+its final observation terminalizes the last demand and retires that owner in
+one watermark-then-demand transaction.
 
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
@@ -614,10 +633,15 @@ managed-job recovery establish the same consumer context before both the normal
 optimizer and the under-lock planner, so either path reloads and restricts to
 the durable target. The resolved pull plan persists the controller epoch, owner
 epoch, demand ID, and demand generation in the cluster's INIT handle before
-provider provisioning. The per-controller SQLite-compatible state may retain
-the demand ID as a hint, but correctness does not depend on a second database
-commit. The dashboard and events say `IMAGE_WARMING`, not `resources
-unavailable`.
+provider provisioning. The same INIT transaction persists `binding_known` plus
+the nullable consumer kind and owner in three cluster-row scalar columns on both
+supported cluster-state dialects. A false bit is pre-feature or indeterminate;
+a true bit with both consumer fields `NULL` is a current, validated absence; and
+a true bit with both fields populated is an exact binding. Only the managed
+image catalog remains PostgreSQL-only. The per-controller SQLite-compatible
+state may retain the demand ID as a hint, but correctness does not depend on a
+second database commit. The dashboard and events say `IMAGE_WARMING`, not
+`resources unavailable`.
 
 If materialization fails terminally, the controller atomically supersedes that
 demand before permitting a new candidate and reports
@@ -1673,7 +1697,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   ceilings, and empty failed-reservation reclamation tests;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
   version-target, controller loss, supersede, generation watermark,
-  authoritative owner retirement, compaction, and unreachable consumer stores;
+  interrupted terminal confirmation, authoritative owner retirement,
+  compaction, and unreachable consumer stores;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
   nested index, artifact, nondistributable/foreign layer, external URL, config
   platform, raw-byte digest, and size-bound reject-before-write tests;
@@ -1841,3 +1866,20 @@ authoritative observation, and proves expired demand compaction through each
 production lifecycle. Since the permanent fence rejects every later creator,
 the obsolete credential-expiry gate and column are removed rather than
 inventing a provider-specific credential lifetime.
+
+Implementation review round 8 at
+`54d94afcc7e7b33f42cc37dc079627b2e719a136` returned Codex `RESHAPE` and
+Fable `PURSUE`. Codex proved that cluster reconciliation compared only the
+reusable name, so an orphaned incarnation A could remain live forever when
+incarnation B recreated the same name before A's second terminal observation.
+This revision persists the validated consumer kind and owner on the cluster row
+from INIT, compares that exact binding during reconciliation, and uses it for
+authoritative direct retirement. It also proves that a same-name replacement
+releases and compacts the old incarnation without affecting the replacement.
+Any intervening current or indeterminate lifecycle observation now clears stale
+terminal evidence, while the confirmation timer uses a distinct rotation that
+preserves it. The PostgreSQL proof covers missing A, reappearance of the exact A
+binding, replacement by B, and two fresh observations before A is retired.
+Rows with a false binding-known bit remain conservative during mixed rollout,
+while current direct-image rows record a known absence and cannot mask an old
+managed incarnation.

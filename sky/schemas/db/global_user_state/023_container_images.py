@@ -59,6 +59,28 @@ def _lock_migration() -> None:
         bindparams(name=_MIGRATION_LOCK))
 
 
+def _add_cluster_binding_columns() -> None:
+    db_utils.add_column_to_table_alembic('clusters',
+                                         'container_image_binding_known',
+                                         sqlalchemy.Integer(),
+                                         server_default='0')
+    db_utils.add_column_to_table_alembic('clusters',
+                                         'container_image_consumer_kind',
+                                         sqlalchemy.Text())
+    db_utils.add_column_to_table_alembic('clusters',
+                                         'container_image_consumer_owner',
+                                         sqlalchemy.Text())
+
+
+def _drop_cluster_binding_columns() -> None:
+    db_utils.drop_column_from_table_alembic('clusters',
+                                            'container_image_consumer_owner')
+    db_utils.drop_column_from_table_alembic('clusters',
+                                            'container_image_consumer_kind')
+    db_utils.drop_column_from_table_alembic('clusters',
+                                            'container_image_binding_known')
+
+
 def _create_tables() -> None:
     op.create_table(
         'container_image_catalog',
@@ -738,11 +760,15 @@ def _create_tables() -> None:
 
 
 def upgrade():
-    """Create the PostgreSQL-only image catalog and worker queues."""
+    """Bind cluster consumers and create PostgreSQL image-plane state."""
     bind = op.get_bind()
-    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+    is_postgres = (
+        bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+    if is_postgres:
+        _lock_migration()
+    _add_cluster_binding_columns()
+    if not is_postgres:
         return
-    _lock_migration()
     _create_tables()
     bind.execute(
         sqlalchemy.text(
@@ -756,9 +782,10 @@ def upgrade():
 
 
 def downgrade():
-    """Drop the unshipped schema only after a literal empty-state proof."""
+    """Drop unshipped image state after a literal empty-state proof."""
     bind = op.get_bind()
     if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        _drop_cluster_binding_columns()
         return
     _lock_migration()
     for table_name in _TABLE_NAMES[1:]:
@@ -781,3 +808,4 @@ def downgrade():
         {'id': _CATALOG_ROW_ID})
     for table_name in _DROP_TABLE_NAMES:
         op.drop_table(table_name)
+    _drop_cluster_binding_columns()

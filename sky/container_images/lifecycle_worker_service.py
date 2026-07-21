@@ -150,7 +150,7 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
                 job_identity = (parsed_job_id, task_id)
                 job_identities.append(job_identity)
                 demand_job_identity[demand.id] = job_identity
-    existing = global_user_state.get_cluster_status_fields(
+    cluster_consumers = global_user_state.get_cluster_image_consumers(
         sorted(cluster_names))
     try:
         service_states = serve_state.get_service_version_terminal_states(
@@ -171,7 +171,11 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue
-            if cluster_name in existing:
+            legacy_name_owner = ':incarnation:' not in demand.consumer_owner
+            active_consumer = cluster_consumers.get(cluster_name)
+            if (cluster_name in cluster_consumers and
+                (legacy_name_owner or active_consumer is None or active_consumer
+                 == (demand.consumer_kind, demand.consumer_owner))):
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue
@@ -205,7 +209,7 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
         if (demand.first_terminal_observed_at is not None and
                 current - demand.first_terminal_observed_at
                 < _TERMINAL_CONFIRMATION_SECONDS):
-            demand_state.defer_consumer_reconciliation(demand.id, now=current)
+            demand_state.defer_terminal_confirmation(demand.id, now=current)
             continue
         if demand_state.observe_consumer_terminal(
                 demand.id,

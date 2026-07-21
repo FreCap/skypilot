@@ -8,7 +8,6 @@ import hashlib
 import importlib
 import os
 from pathlib import Path
-import pickle
 import shutil
 import threading
 import time
@@ -725,6 +724,107 @@ def test_stale_authoritative_release_cannot_retire_a_live_generation(
     assert owner_deleted_at is None
 
 
+def test_cluster_init_persists_validated_consumer_binding(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='cluster-a:incarnation:launch-hash',
+                             consumer_kind='cluster',
+                             controller_epoch='cluster-request:launch-a',
+                             controller_sequence=None)
+    pull_plan = _pull_plan(active, regional)
+    demand = transactions.commit_ready_demand(
+        demand_id=demand.id,
+        consumer_generation=demand.consumer_generation,
+        pull_plan=pull_plan,
+        now=51)
+    assert publication_record.image_id is not None
+    resolved = models.ResolvedContainerImage(
+        image_id=publication_record.image_id,
+        reference=regional.target_ref,
+        target_id=str(pull_plan['target_id']),
+        digest=_DIGEST,
+        auth_strategy='ecr_runtime_identity',
+        location_id=regional.id,
+        distribution=profile.name,
+        profile_revision=active.revision,
+        policy_fingerprint='a' * 64,
+        profile_revision_id=active.id,
+        target_fingerprint=regional.target_fingerprint,
+        demand_id=demand.id,
+        demand_generation=demand.consumer_generation,
+        controller_epoch='cluster-request:launch-a',
+        owner_epoch=demand.owner_epoch,
+        credential_helper='ecr-login',
+        runtime_principal=pull_plan['runtime_principal'],
+        instance_profile=pull_plan['instance_profile'])
+    resources = types.SimpleNamespace(
+        container_image=models.ContainerImage(release='boltz-l4',
+                                              distribution=profile.name),
+        resolved_container_image=resolved,
+        container_image_from_legacy_image_id=False,
+        cloud=None,
+        region=None,
+        zone=None,
+        instance_type=None,
+        docker_login_config=None)
+    handle = types.SimpleNamespace(launched_resources=resources,
+                                   launched_nodes=1,
+                                   cached_cluster_info=None)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    global_user_state.cluster_history_table.create(image_database,
+                                                   checkfirst=True)
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+    monkeypatch.setattr(global_user_state.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+
+    global_user_state.add_or_update_cluster('cluster-a',
+                                            handle,
+                                            requested_resources=None,
+                                            ready=False)
+    partial_handle = types.SimpleNamespace(launched_resources=None,
+                                           launched_nodes=1,
+                                           cached_cluster_info=None)
+    global_user_state.add_or_update_cluster('cluster-a',
+                                            partial_handle,
+                                            requested_resources=None,
+                                            ready=True,
+                                            is_launch=False)
+
+    direct_resources = types.SimpleNamespace(
+        container_image=None,
+        resolved_container_image=None,
+        container_image_from_legacy_image_id=False,
+        cloud=None,
+        region=None,
+        zone=None,
+        instance_type=None,
+        docker_login_config=None)
+    direct_handle = types.SimpleNamespace(launched_resources=direct_resources,
+                                          launched_nodes=1,
+                                          cached_cluster_info=None)
+    global_user_state.add_or_update_cluster('cluster-direct',
+                                            direct_handle,
+                                            requested_resources=None,
+                                            ready=False)
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert().values(
+            name='cluster-legacy', status='UP', workspace='research'))
+
+    assert global_user_state.get_cluster_image_consumers(
+        ['cluster-a', 'cluster-direct', 'cluster-legacy']) == {
+            'cluster-a': ('cluster', demand.consumer_owner),
+            'cluster-direct': (None, None),
+            'cluster-legacy': None,
+        }
+
+
 def test_cluster_row_and_demand_release_commit_atomically(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -739,14 +839,15 @@ def test_cluster_row_and_demand_release_commit_atomically(
                              controller_epoch='cluster-request:launch-a',
                              controller_sequence=None)
     global_user_state.cluster_table.create(image_database, checkfirst=True)
-    handle = types.SimpleNamespace(launched_resources=types.SimpleNamespace(
-        resolved_container_image=types.SimpleNamespace(demand_id=demand.id)))
     with image_database.begin() as connection:
         connection.execute(global_user_state.cluster_table.insert().values(
             name='cluster-a',
-            handle=pickle.dumps(handle),
+            handle=b'unreadable-bound-cluster-handle',
             status='UP',
-            workspace='research'))
+            workspace='research',
+            container_image_binding_known=1,
+            container_image_consumer_kind='cluster',
+            container_image_consumer_owner=demand.consumer_owner))
     monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
                         lambda: image_database)
     monkeypatch.setattr(global_user_state.time, 'time', lambda: 100)
@@ -809,14 +910,15 @@ def test_replica_cluster_deletion_preserves_shared_job_owner(
         controller_epoch='managed-job:42:task:0:recovery:0',
         controller_sequence=0)
     global_user_state.cluster_table.create(image_database, checkfirst=True)
-    handle = types.SimpleNamespace(launched_resources=types.SimpleNamespace(
-        resolved_container_image=types.SimpleNamespace(demand_id=demand.id)))
     with image_database.begin() as connection:
         connection.execute(global_user_state.cluster_table.insert().values(
             name='managed-job-replica',
-            handle=pickle.dumps(handle),
+            handle=b'unreadable-bound-replica-handle',
             status='UP',
-            workspace='research'))
+            workspace='research',
+            container_image_binding_known=1,
+            container_image_consumer_kind='managed_job_task',
+            container_image_consumer_owner=demand.consumer_owner))
     monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
                         lambda: image_database)
 
@@ -837,6 +939,115 @@ def test_replica_cluster_deletion_preserves_shared_job_owner(
     preserved = demand_state.get_demand(demand.id, 'research')
     assert preserved is not None
     assert preserved.state == models.ImageDemandState.WARMING
+
+
+def test_same_name_recreation_cannot_mask_an_orphaned_cluster_incarnation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    first = _warming_demand(active,
+                            publication_record,
+                            regional,
+                            profile,
+                            owner='cluster-a:incarnation:first-launch-hash',
+                            consumer_kind='cluster',
+                            controller_epoch='cluster-request:first',
+                            controller_sequence=None,
+                            consumer_metadata={
+                                'workload_type': 'cluster',
+                                'workload_id': 'cluster-a',
+                            },
+                            now=50)
+    assert demand_state.attach_consumer(first.id, 'research', now=51)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(200) == 0
+    observed = demand_state.get_demand(first.id, 'research')
+    assert observed is not None
+    assert observed.first_terminal_observed_at == 200
+
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert().values(
+            name='cluster-a',
+            status='INIT',
+            workspace='research',
+            container_image_binding_known=1,
+            container_image_consumer_kind='cluster',
+            container_image_consumer_owner=first.consumer_owner))
+    assert lifecycle_worker_service._reconcile_terminal_consumers(300) == 0
+    current = demand_state.get_demand(first.id, 'research')
+    assert current is not None
+    assert current.first_terminal_observed_at is None
+    assert current.last_terminal_observed_at is None
+    assert current.terminal_observation_count == 0
+
+    replacement = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner='cluster-a:incarnation:replacement-launch-hash',
+        consumer_kind='cluster',
+        controller_epoch='cluster-request:replacement',
+        controller_sequence=None,
+        request_id='replacement-request',
+        consumer_metadata={
+            'workload_type': 'cluster',
+            'workload_id': 'cluster-a',
+        },
+        now=301)
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.update().where(
+            global_user_state.cluster_table.c.name == 'cluster-a').values(
+                container_image_consumer_owner=replacement.consumer_owner))
+
+    new_first_observation = 4000
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        new_first_observation) == 0
+    observed = demand_state.get_demand(first.id, 'research')
+    assert observed is not None
+    assert observed.state == models.ImageDemandState.WARMING
+    assert observed.first_terminal_observed_at == new_first_observation
+
+    final_observation = (
+        new_first_observation +
+        lifecycle_worker_service._TERMINAL_CONFIRMATION_SECONDS)
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        final_observation) == 1
+    released = demand_state.get_demand(first.id, 'research')
+    assert released is not None
+    assert released.state == models.ImageDemandState.RELEASED
+    still_live = demand_state.get_demand(replacement.id, 'research')
+    assert still_live is not None
+    assert still_live.state == models.ImageDemandState.WARMING
+    with image_database.connect() as connection:
+        deleted_at = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.owner_deleted_at).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    first.consumer_owner)).scalar_one()
+        replacement_deleted_at = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.owner_deleted_at).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    replacement.consumer_owner)).scalar_one()
+    assert deleted_at == final_observation
+    assert replacement_deleted_at is None
+    assert demand_state.compact_terminal_demands(
+        now=final_observation + demand_state._TERMINAL_RETENTION_SECONDS) == 1
+    assert demand_state.get_demand(first.id, 'research') is None
+    assert demand_state.get_demand(replacement.id, 'research') is not None
 
 
 def test_job_and_serve_reconciliation_retire_and_compact_owners(
@@ -883,7 +1094,7 @@ def test_job_and_serve_reconciliation_retire_and_compact_owners(
         service.id, 'research', authoritative=True, now=60)
     current = 60 + lifecycle_worker_service._TERMINAL_CONFIRMATION_SECONDS
     monkeypatch.setattr(lifecycle_worker_service.global_user_state,
-                        'get_cluster_status_fields', lambda _: {})
+                        'get_cluster_image_consumers', lambda _: {})
     monkeypatch.setattr(
         lifecycle_worker_service.managed_job_state,
         'get_job_task_terminal_states', lambda identities:
@@ -1914,11 +2125,31 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
     migration_023 = importlib.import_module(
         'sky.schemas.db.global_user_state.023_container_images')
     try:
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+            connection.exec_driver_sql(
+                "INSERT INTO clusters (name) VALUES ('legacy-cluster')")
         _migration_call(migration_engine, migration_023.upgrade)
         schema.metadata.create_all(runtime_engine)
         assert _schema_shape(migration_engine,
                              migration_schema) == _schema_shape(
                                  runtime_engine, runtime_schema)
+        cluster_columns = {
+            column['name'] for column in sqlalchemy.inspect(
+                migration_engine).get_columns('clusters')
+        }
+        assert cluster_columns == {
+            'name', 'container_image_binding_known',
+            'container_image_consumer_kind', 'container_image_consumer_owner'
+        }
+        with migration_engine.connect() as connection:
+            legacy_binding = connection.execute(
+                sqlalchemy.text('SELECT container_image_binding_known, '
+                                'container_image_consumer_kind, '
+                                'container_image_consumer_owner FROM clusters '
+                                "WHERE name = 'legacy-cluster'")).one()
+        assert tuple(legacy_binding) == (0, None, None)
 
         authority = str(uuid.uuid4())
         with migration_engine.begin() as connection:
@@ -1941,7 +2172,13 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
             connection.execute(
                 sqlalchemy.text('DELETE FROM container_image_operations'))
         _migration_call(migration_engine, migration_023.downgrade)
-        assert sqlalchemy.inspect(migration_engine).get_table_names() == []
+        assert sqlalchemy.inspect(migration_engine).get_table_names() == [
+            'clusters'
+        ]
+        assert {
+            column['name'] for column in sqlalchemy.inspect(
+                migration_engine).get_columns('clusters')
+        } == {'name'}
     finally:
         migration_engine.dispose()
         runtime_engine.dispose()
@@ -1950,6 +2187,45 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
                 f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
             connection.exec_driver_sql(
                 f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
+
+
+def test_migration_023_adds_only_cluster_binding_columns_to_sqlite() -> None:
+    engine = sqlalchemy.create_engine('sqlite://')
+    metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'clusters', metadata,
+        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO clusters (name) VALUES ('legacy-cluster')"))
+    migration_023 = importlib.import_module(
+        'sky.schemas.db.global_user_state.023_container_images')
+    try:
+        _migration_call(engine, migration_023.upgrade)
+        inspector = sqlalchemy.inspect(engine)
+        assert inspector.get_table_names() == ['clusters']
+        assert {column['name'] for column in inspector.get_columns('clusters')
+               } == {
+                   'name', 'container_image_binding_known',
+                   'container_image_consumer_kind',
+                   'container_image_consumer_owner'
+               }
+        with engine.connect() as connection:
+            legacy_binding = connection.execute(
+                sqlalchemy.text('SELECT container_image_binding_known, '
+                                'container_image_consumer_kind, '
+                                'container_image_consumer_owner FROM clusters '
+                                "WHERE name = 'legacy-cluster'")).one()
+        assert tuple(legacy_binding) == (0, None, None)
+        _migration_call(engine, migration_023.downgrade)
+        assert {
+            column['name']
+            for column in sqlalchemy.inspect(engine).get_columns('clusters')
+        } == {'name'}
+    finally:
+        engine.dispose()
 
 
 def _prototype_spec() -> builder_prototype.BuildSpec:
