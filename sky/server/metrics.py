@@ -163,7 +163,7 @@ async def multiproc_reaper_daemon(
                     f'pid(s).')
         except asyncio.CancelledError:
             logger.info('Prometheus multiproc reaper cancelled')
-            break
+            raise
         except Exception:  # pylint: disable=broad-except
             logger.warning('Error in prometheus multiproc reaper.',
                            exc_info=True)

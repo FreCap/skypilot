@@ -1,5 +1,6 @@
 """Unit tests for the metrics system."""
 
+import asyncio
 import base64
 import os
 import time
@@ -306,8 +307,7 @@ async def test_multiproc_reaper_daemon_returns_when_env_unset():
 
 @pytest.mark.asyncio
 async def test_multiproc_reaper_daemon_loops_and_cancels(tmp_path):
-    """Daemon ticks, calls reap, and exits cleanly on cancellation."""
-    import asyncio  # local to avoid touching module-level imports
+    """Daemon ticks, calls reap, and stops when cancelled."""
     call_count = {'n': 0}
 
     def fake_reap():
@@ -324,12 +324,35 @@ async def test_multiproc_reaper_daemon_loops_and_cancels(tmp_path):
         for _ in range(5):
             await asyncio.sleep(0)
         task.cancel()
-        try:
+        with pytest.raises(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
     assert call_count['n'] >= 1
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_multiproc_reaper_daemon_propagates_cancellation(tmp_path):
+    """Cancellation while reaping remains observable to the task owner."""
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def blocked_to_thread(*args, **kwargs):
+        del args, kwargs
+        started.set()
+        await blocked.wait()
+
+    with patch.dict(os.environ,
+                    {'PROMETHEUS_MULTIPROC_DIR': str(tmp_path)}), \
+         patch('sky.server.metrics.asyncio.to_thread',
+               new=blocked_to_thread):
+        task = asyncio.create_task(metrics.multiproc_reaper_daemon())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert task.cancelled()
 
 
 @pytest.mark.asyncio
