@@ -47,21 +47,41 @@ const history = {
       timestamp: 180,
       version: 1,
       readyCount: 1,
+      readyReservedCount: 0,
       provisioningCount: 0,
       notReadyCount: 0,
       erroredCount: 0,
       preemptedCount: 0,
       stoppingCount: 0,
+      totalCount: 1,
+      logicalReadyCount: 8,
+      logicalReadyReservedCount: 0,
+      logicalProvisioningCount: 0,
+      logicalNotReadyCount: 0,
+      logicalErroredCount: 0,
+      logicalPreemptedCount: 0,
+      logicalStoppingCount: 0,
+      logicalTotalCount: 8,
     },
     {
       timestamp: 24 * 60 * 60,
       version: 1,
       readyCount: 1,
+      readyReservedCount: 1,
       provisioningCount: 0,
       notReadyCount: 0,
       erroredCount: 0,
       preemptedCount: 0,
       stoppingCount: 0,
+      totalCount: 1,
+      logicalReadyCount: 8,
+      logicalReadyReservedCount: 8,
+      logicalProvisioningCount: 0,
+      logicalNotReadyCount: 0,
+      logicalErroredCount: 0,
+      logicalPreemptedCount: 0,
+      logicalStoppingCount: 0,
+      logicalTotalCount: 8,
     },
   ],
 };
@@ -85,6 +105,22 @@ describe('ServeHistorySection', () => {
     render(<ServeHistorySection history={history} />);
 
     expect(screen.getByText('Latest ready')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Logical' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(screen.getByRole('button', { name: 'Physical' })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Physical' }));
+    expect(screen.getByRole('button', { name: 'Physical' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(
+      screen.getByText('Status by physical backend in the selected range')
+    ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute(
       'aria-pressed',
       'true'

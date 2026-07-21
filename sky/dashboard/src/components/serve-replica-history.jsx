@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { CircularProgress } from '@mui/material';
 
 import { Card } from '@/components/ui/card';
@@ -11,10 +11,16 @@ import {
 
 const SERIES = [
   {
-    key: 'readyCount',
+    key: 'readyOrdinaryCount',
     label: 'Ready',
     borderColor: 'rgb(22, 163, 74)',
     backgroundColor: 'rgba(34, 197, 94, 0.42)',
+  },
+  {
+    key: 'readyReservedCount',
+    label: 'Ready free reserved',
+    borderColor: 'rgb(13, 148, 136)',
+    backgroundColor: 'rgba(20, 184, 166, 0.45)',
   },
   {
     key: 'provisioningCount',
@@ -48,14 +54,100 @@ const SERIES = [
   },
 ];
 
-function emptyCounts() {
-  return Object.fromEntries(SERIES.map(({ key }) => [key, 0]));
+const MODE_CONFIG = {
+  logical: {
+    label: 'Logical',
+    singular: 'logical slot',
+    plural: 'logical slots',
+    axisTitle: 'Logical slots',
+    fields: {
+      readyCount: 'logicalReadyCount',
+      readyReservedCount: 'logicalReadyReservedCount',
+      provisioningCount: 'logicalProvisioningCount',
+      notReadyCount: 'logicalNotReadyCount',
+      erroredCount: 'logicalErroredCount',
+      preemptedCount: 'logicalPreemptedCount',
+      stoppingCount: 'logicalStoppingCount',
+      totalCount: 'logicalTotalCount',
+    },
+  },
+  physical: {
+    label: 'Physical',
+    singular: 'physical backend',
+    plural: 'physical backends',
+    axisTitle: 'Physical backends',
+    fields: {
+      readyCount: 'readyCount',
+      readyReservedCount: 'readyReservedCount',
+      provisioningCount: 'provisioningCount',
+      notReadyCount: 'notReadyCount',
+      erroredCount: 'erroredCount',
+      preemptedCount: 'preemptedCount',
+      stoppingCount: 'stoppingCount',
+      totalCount: 'totalCount',
+    },
+  },
+};
+
+const COUNT_KEYS = [
+  'readyCount',
+  'provisioningCount',
+  'notReadyCount',
+  'erroredCount',
+  'preemptedCount',
+  'stoppingCount',
+  'totalCount',
+];
+
+function validCount(value) {
+  return Number.isInteger(value) && value >= 0;
 }
 
-export function buildReplicaHistoryView(history, range = null) {
+function sampleCounts(sample, mode) {
+  const fields = MODE_CONFIG[mode].fields;
+  const counts = {};
+  for (const key of COUNT_KEYS) {
+    const value = sample[fields[key]];
+    if (!validCount(value)) return null;
+    counts[key] = value;
+  }
+  const reserved = sample[fields.readyReservedCount];
+  counts.readyReservedCount = validCount(reserved) ? reserved : null;
+  return counts;
+}
+
+function aggregateRows(rows, mode) {
+  const selected = rows.map((row) => sampleCounts(row, mode));
+  if (selected.some((counts) => counts === null)) return null;
+
+  const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
+  selected.forEach((row) => {
+    COUNT_KEYS.forEach((key) => {
+      counts[key] += row[key];
+    });
+  });
+  const reservedKnown = selected.every(
+    (row) => row.readyReservedCount !== null
+  );
+  counts.readyReservedCount = reservedKnown
+    ? selected.reduce((sum, row) => sum + row.readyReservedCount, 0)
+    : null;
+  counts.readyOrdinaryCount =
+    counts.readyCount - (counts.readyReservedCount || 0);
+  return counts;
+}
+
+export function buildReplicaHistoryView(
+  history,
+  range = null,
+  mode = 'logical'
+) {
   const samples = history?.available ? history.samples || [] : [];
+  const config = MODE_CONFIG[mode] || MODE_CONFIG.logical;
   if (!samples.length || !range) {
     return {
+      mode,
+      config,
       timestamps: [],
       versionBreakdowns: [],
       datasets: SERIES.map((series) => ({ ...series, data: [] })),
@@ -64,16 +156,10 @@ export function buildReplicaHistoryView(history, range = null) {
   }
 
   const bucketSeconds = history.bucketSeconds || 60;
-  const aggregates = new Map();
   const versions = new Map();
   samples.forEach((sample) => {
     const timestamp = sample.timestamp;
     if (timestamp < range.start || timestamp > range.end) return;
-    const aggregate = aggregates.get(timestamp) || emptyCounts();
-    SERIES.forEach(({ key }) => {
-      aggregate[key] += sample[key] || 0;
-    });
-    aggregates.set(timestamp, aggregate);
     const versionRows = versions.get(timestamp) || [];
     versionRows.push(sample);
     versions.set(timestamp, versionRows);
@@ -88,19 +174,17 @@ export function buildReplicaHistoryView(history, range = null) {
     timestamp += bucketSeconds
   ) {
     timestamps.push(timestamp);
-    const aggregate = aggregates.get(timestamp) || null;
-    observed.push(aggregate);
-    versionBreakdowns.push(
-      (versions.get(timestamp) || []).sort(
-        (left, right) => left.version - right.version
-      )
+    const versionRows = (versions.get(timestamp) || []).sort(
+      (left, right) => left.version - right.version
     );
+    versionBreakdowns.push(versionRows);
+    observed.push(versionRows.length ? aggregateRows(versionRows, mode) : null);
   }
 
   const observedCounts = observed.filter(Boolean);
   const latest = observedCounts.at(-1);
   const readyValues = observedCounts.map((counts) => counts.readyCount);
-  const machineMinuteMultiplier = bucketSeconds / 60;
+  const minuteMultiplier = bucketSeconds / 60;
   const stats = latest
     ? {
         current: latest,
@@ -111,20 +195,27 @@ export function buildReplicaHistoryView(history, range = null) {
         peakErrored: Math.max(
           ...observedCounts.map((counts) => counts.erroredCount)
         ),
-        erroredMachineMinutes: observedCounts.reduce(
-          (sum, counts) => sum + counts.erroredCount * machineMinuteMultiplier,
+        erroredMinutes: observedCounts.reduce(
+          (sum, counts) => sum + counts.erroredCount * minuteMultiplier,
           0
         ),
-        stoppingMachineMinutes: observedCounts.reduce(
-          (sum, counts) => sum + counts.stoppingCount * machineMinuteMultiplier,
+        stoppingMinutes: observedCounts.reduce(
+          (sum, counts) => sum + counts.stoppingCount * minuteMultiplier,
           0
         ),
       }
     : null;
+  const visibleSeries = SERIES.filter(
+    ({ key }) =>
+      key !== 'readyReservedCount' ||
+      observedCounts.some((counts) => counts.readyReservedCount !== null)
+  );
   return {
+    mode,
+    config,
     timestamps,
     versionBreakdowns,
-    datasets: SERIES.map((series) => ({
+    datasets: visibleSeries.map((series) => ({
       ...series,
       data: observed.map((counts) => (counts ? counts[series.key] : null)),
       fill: true,
@@ -137,10 +228,41 @@ export function buildReplicaHistoryView(history, range = null) {
   };
 }
 
-function versionFooter(versionRows) {
-  return versionRows.map(
-    (row) =>
-      `v${row.version}: ${row.readyCount} ready, ${row.provisioningCount} provisioning, ${row.erroredCount} errored, ${row.stoppingCount} stopping`
+function versionFooter(versionRows, mode) {
+  return versionRows.map((row) => {
+    const counts = sampleCounts(row, mode);
+    if (!counts)
+      return `v${row.version}: ${MODE_CONFIG[mode].plural} unavailable`;
+    const reserved =
+      counts.readyReservedCount === null
+        ? ''
+        : ` (${counts.readyReservedCount} free reserved)`;
+    return `v${row.version}: ${counts.readyCount} ready${reserved}, ${counts.provisioningCount} provisioning, ${counts.erroredCount} errored, ${counts.stoppingCount} stopping`;
+  });
+}
+
+function ModeToggle({ mode, onChange }) {
+  return (
+    <div className="inline-flex rounded-md border border-gray-200 p-0.5">
+      {Object.entries(MODE_CONFIG).map(([key, config]) => {
+        const active = key === mode;
+        return (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onChange(key)}
+            aria-pressed={active}
+            className={`rounded px-2.5 py-1 text-xs font-medium ${
+              active
+                ? 'bg-sky-50 text-sky-700'
+                : 'text-gray-600 hover:bg-gray-50'
+            }`}
+          >
+            {config.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -150,9 +272,10 @@ export function ReplicaHistoryCard({
   onRangeSelect,
   loading = false,
 }) {
+  const [mode, setMode] = useState('logical');
   const view = useMemo(
-    () => buildReplicaHistoryView(history, range),
-    [history, range]
+    () => buildReplicaHistoryView(history, range, mode),
+    [history, range, mode]
   );
   if (!history) return null;
   if (history?.available === false) return null;
@@ -175,7 +298,7 @@ export function ReplicaHistoryCard({
       stacked: true,
       beginAtZero: true,
       ticks: { precision: 0 },
-      title: { display: true, text: 'Physical machines' },
+      title: { display: true, text: view.config.axisTitle },
     }),
     plugins: {
       legend: { position: 'bottom' },
@@ -184,7 +307,7 @@ export function ReplicaHistoryCard({
           footer: (items) => {
             const index = items?.[0]?.dataIndex;
             return Number.isInteger(index)
-              ? versionFooter(view.versionBreakdowns[index])
+              ? versionFooter(view.versionBreakdowns[index], mode)
               : [];
           },
         },
@@ -199,14 +322,17 @@ export function ReplicaHistoryCard({
 
   return (
     <div className="mb-6">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div>
-          <h3 className="text-lg font-semibold">Machine history</h3>
+          <h3 className="text-lg font-semibold">Replica history</h3>
           <div className="text-sm text-gray-500">
-            Physical replica status in the selected range
+            Status by {view.config.singular} in the selected range
           </div>
         </div>
-        {loading && <CircularProgress size={16} />}
+        <div className="flex items-center gap-2">
+          <ModeToggle mode={mode} onChange={setMode} />
+          {loading && <CircularProgress size={16} />}
+        </div>
       </div>
       <Card>
         {!view.timestamps.length ? (
@@ -216,11 +342,17 @@ export function ReplicaHistoryCard({
         ) : (
           <div className="p-4">
             {view.stats ? (
-              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 text-sm">
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4 text-sm">
                 <div>
                   <div className="text-gray-500">Latest ready</div>
                   <div className="font-semibold">
                     {view.stats.current.readyCount}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Latest free reserved</div>
+                  <div className="font-semibold">
+                    {view.stats.current.readyReservedCount ?? 'Unavailable'}
                   </div>
                 </div>
                 <div>
@@ -238,16 +370,17 @@ export function ReplicaHistoryCard({
                   <div className="font-semibold">{view.stats.peakErrored}</div>
                 </div>
                 <div>
-                  <div className="text-gray-500">Error / stopping minutes</div>
+                  <div className="text-gray-500">
+                    Error / stopping {view.config.singular}-minutes
+                  </div>
                   <div className="font-semibold">
-                    {view.stats.erroredMachineMinutes} /{' '}
-                    {view.stats.stoppingMachineMinutes}
+                    {view.stats.erroredMinutes} / {view.stats.stoppingMinutes}
                   </div>
                 </div>
               </div>
             ) : (
               <div className="mb-4 text-sm text-gray-500">
-                No machine samples in the selected range.
+                No {view.config.plural} samples in the selected range.
               </div>
             )}
             <SelectableHistoryLine
