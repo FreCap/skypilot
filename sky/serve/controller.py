@@ -2039,6 +2039,8 @@ class SkyServeController:
         total_by_accelerator: dict[str, int] = {}
         zero_cost_ready_by_accelerator: dict[str, int] = {}
         zero_cost_total_by_accelerator: dict[str, int] = {}
+        zero_cost_location_classifier = getattr(
+            autoscaler, 'is_replica_on_zero_cost_location', None)
         failed_statuses = serve_state.ReplicaStatus.failed_statuses()
         for info in replica_infos:
             status = info.status
@@ -2062,6 +2064,15 @@ class SkyServeController:
                 if isinstance(accelerators, dict) and accelerators:
                     accelerator = next(iter(accelerators))
             known_accelerator = accelerator != 'unknown'
+            is_zero_cost = bool(getattr(info, 'is_zero_cost', False))
+            if callable(zero_cost_location_classifier):
+                classified = zero_cost_location_classifier(info)
+                # Loose mocks used by callers may synthesize arbitrary
+                # attributes. Only the classifier's real boolean contract is
+                # accepted; persisted provenance remains a valid positive
+                # signal for builds/configurations without a location match.
+                if type(classified) is bool:
+                    is_zero_cost = is_zero_cost or classified
             if status == serve_state.ReplicaStatus.READY:
                 capacity_getter = getattr(autoscaler,
                                           'get_ready_replica_capacity', None)
@@ -2072,8 +2083,7 @@ class SkyServeController:
                 if known_accelerator:
                     ready_by_accelerator[accelerator] = (
                         ready_by_accelerator.get(accelerator, 0) + width)
-                if (known_accelerator and
-                        bool(getattr(info, 'is_zero_cost', False))):
+                if known_accelerator and is_zero_cost:
                     zero_cost_ready_by_accelerator[accelerator] = (
                         zero_cost_ready_by_accelerator.get(accelerator, 0) +
                         width)
@@ -2086,8 +2096,7 @@ class SkyServeController:
                 if known_accelerator:
                     total_by_accelerator[accelerator] = (
                         total_by_accelerator.get(accelerator, 0) + width)
-                if (known_accelerator and
-                        bool(getattr(info, 'is_zero_cost', False))):
+                if known_accelerator and is_zero_cost:
                     zero_cost_total_by_accelerator[accelerator] = (
                         zero_cost_total_by_accelerator.get(accelerator, 0) +
                         width)

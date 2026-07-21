@@ -521,6 +521,17 @@ class Autoscaler:
             self._fill_location_matches(location, zero_cost)
             for zero_cost in self._fill_zero_cost_locations)
 
+    def is_replica_on_zero_cost_location(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether a replica occupies a configured zero-cost location.
+
+        The controller uses this same classifier for exact-card history.  In
+        particular, legacy ReplicaInfo rows predate persisted is_zero_cost
+        provenance but still retain enough placement identity to match the
+        autoscaler's active reserved locations.
+        """
+        return self._replica_on_zero_cost_location(info)
+
     def _fill_capacity_units(self, info: 'replica_managers.ReplicaInfo') -> int:
         """Autoscaling units represented by one row for fill accounting."""
         del info
