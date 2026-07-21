@@ -21,6 +21,7 @@ from sky.container_images import demand_state
 from sky.container_images import models
 from sky.container_images import runtime
 from sky.container_images import topology_state
+from sky.container_images import transactions
 from sky.serve import constants as serve_constants
 from sky.serve import serve_utils
 from sky.server import versions
@@ -59,7 +60,7 @@ class _FakeResources:
         self.resolved_container_image = resolved
         self.docker_login_config = docker_login_config
 
-    def copy(self, **updates: Any) -> '_FakeResources':
+    def copy(self, **updates: Any) -> _FakeResources:
         return _FakeResources(
             updates.pop('container_image', self.container_image),
             legacy=updates.pop('_container_image_from_legacy_image_id',
@@ -297,6 +298,66 @@ def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
     commit.assert_called_once_with(demand_id=_DEMAND_ID,
                                    consumer_generation=1,
                                    pull_plan=mock.ANY)
+
+
+@pytest.mark.parametrize(
+    ('changed_state', 'error_code', 'expected_error'),
+    ((models.ImageLocationState.EVICTING, None,
+      runtime.ContainerImageWarmingError),
+     (models.ImageLocationState.FAILED, 'materialization_failed',
+      runtime.ContainerImagePreparationFailedError)))
+def test_ready_snapshot_state_change_remains_typed(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        changed_state: models.ImageLocationState, error_code: str | None,
+        expected_error: type[Exception]) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    location = _location(profile, models.ImageLocationState.READY)
+    demand = _demand(profile)
+    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        lambda **kwargs: location)
+    monkeypatch.setattr(runtime.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: _AUTHORITY_ID)
+    monkeypatch.setattr(runtime.transactions,
+                        'create_warming_demand_for_controller_epoch',
+                        lambda **kwargs: demand)
+    monkeypatch.setattr(
+        runtime.transactions, 'commit_ready_demand',
+        mock.Mock(side_effect=transactions.DemandLocationNotReadyError(
+            changed_state, error_code)))
+    fail = mock.Mock(return_value=True)
+    monkeypatch.setattr(runtime.demand_state, 'fail_and_supersede_demand', fail)
+
+    resources = _FakeResources(
+        models.ContainerImage(release='boltz-l4', distribution=profile.name))
+    with pytest.raises(expected_error) as exc_info:
+        runtime.resolve_for_placement(
+            resources,
+            models.Placement(provider='aws',
+                             region='us-west-2',
+                             backend='aws_vm',
+                             platform='linux/amd64'),
+            workspace='research',
+            consumer_kind='service_version',
+            consumer_owner='boltz:v7',
+            controller_epoch='service:service-hash:v7',
+            controller_sequence=7,
+            allow_epoch_advance=False)
+
+    assert getattr(exc_info.value, 'demand_id') == demand.id
+    if changed_state == models.ImageLocationState.FAILED:
+        fail.assert_called_once_with(demand.id, error_code)
+    else:
+        assert getattr(exc_info.value,
+                       'consumer_generation') == demand.consumer_generation
+        fail.assert_not_called()
 
 
 def test_metadata_filter_is_mutation_free_and_fails_closed_on_stale_binding(

@@ -2077,6 +2077,33 @@ def test_eviction_exact_absence_with_new_demand_requeues_without_release(
     assert shard_after.in_flight == 0
 
 
+def test_eviction_won_before_demand_commit_reports_typed_warming_state(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             now=101)
+
+    with pytest.raises(transactions.DemandLocationNotReadyError) as exc_info:
+        transactions.commit_ready_demand(
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan=_pull_plan(active, regional),
+            now=102)
+
+    assert exc_info.value.state == models.ImageLocationState.EVICTING
+    assert exc_info.value.error_code is None
+
+
 def test_ambiguous_eviction_remains_fenced_until_exact_verification(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

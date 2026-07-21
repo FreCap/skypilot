@@ -612,10 +612,21 @@ def resolve_for_placement(resources: resources_lib.Resources,
         'instance_profile': instance_profile,
         'kubernetes_node_selector': list(kubernetes_node_selector),
     }
-    demand = transactions.commit_ready_demand(
-        demand_id=demand.id,
-        consumer_generation=demand.consumer_generation,
-        pull_plan=pull_plan)
+    try:
+        demand = transactions.commit_ready_demand(
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan=pull_plan)
+    except transactions.DemandLocationNotReadyError as e:
+        # The metadata snapshot predates demand creation. An eviction can win
+        # the location lock in between; the durable demand then requeues that
+        # location, so this attempt remains warming rather than a generic
+        # resolution failure.
+        if e.state == models.ImageLocationState.FAILED:
+            demand_state.fail_and_supersede_demand(
+                demand.id, e.error_code or 'IMAGE_PREPARATION_FAILED')
+            raise ContainerImagePreparationFailedError(demand.id) from e
+        raise ContainerImageWarmingError(demand) from e
     resolved = models.ResolvedContainerImage(
         image_id=artifact.id,
         reference=location.target_ref,

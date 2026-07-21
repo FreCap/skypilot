@@ -28,6 +28,16 @@ _FAILED_RESERVATION_SECONDS = 30 * 24 * 60 * 60
 _FAILED_PUBLICATION_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
 
+class DemandLocationNotReadyError(ValueError):
+    """The demand's locked location left READY before plan commit."""
+
+    def __init__(self, state: models.ImageLocationState,
+                 error_code: str | None) -> None:
+        self.state = state
+        self.error_code = error_code
+        super().__init__('Demand location is not READY.')
+
+
 def _target_reference(shard: sqlalchemy.engine.RowMapping,
                       runtime_digest: str) -> str:
     return (f"{str(shard['registry']).rstrip('/')}/"
@@ -986,8 +996,11 @@ def commit_ready_demand(*,
             sqlalchemy.select(schema.locations).where(
                 schema.locations.c.id ==
                 optimistic['location_id']).with_for_update()).mappings().one()
-        if (str(location['state']) != models.ImageLocationState.READY.value or
-                location['lease_token'] is not None or
+        location_state = models.ImageLocationState(str(location['state']))
+        if location_state != models.ImageLocationState.READY:
+            raise DemandLocationNotReadyError(location_state,
+                                              location['error_code'])
+        if (location['lease_token'] is not None or
                 location['target_ref'] is None or
                 str(location['runtime_digest']) != str(
                     optimistic['runtime_digest']) or

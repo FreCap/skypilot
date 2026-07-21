@@ -677,7 +677,10 @@ then the consumer watermark and demand. It marks the demand itself as the
 durable eviction fence and stores the plan in one PostgreSQL transaction. It
 rechecks profile revision, target fingerprint, reference, digest, platform,
 auth strategy, credential-helper class, lease-free READY state, and consumer
-epoch. Central demand state is the durable source for normal launch, Serve, and
+epoch. If eviction changed a metadata snapshot from READY before demand
+creation, that locked recheck returns typed warming state; the new durable demand
+requeues the location, and the attempt never degrades to a generic resolution
+failure. Central demand state is the durable source for normal launch, Serve, and
 managed-job controllers, so their own SQLite-compatible state stores only the
 demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
