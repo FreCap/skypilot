@@ -21,6 +21,46 @@ function formatTimestamp(timestamp) {
   return new Date(timestamp * 1000).toLocaleString();
 }
 
+function reconcileAcknowledgedNotifications(snapshot, acknowledgedThrough) {
+  const lastSeenSequence = Math.max(
+    snapshot.last_seen_sequence || 0,
+    acknowledgedThrough
+  );
+  let notifications = snapshot.notifications || [];
+  let notificationsChanged = false;
+  let unreadCount = 0;
+
+  notifications.forEach((notification, index) => {
+    const shouldMarkRead =
+      notification.unread && notification.sequence <= lastSeenSequence;
+    if (shouldMarkRead) {
+      if (!notificationsChanged) {
+        notifications = [...notifications];
+        notificationsChanged = true;
+      }
+      notifications[index] = { ...notification, unread: false };
+    }
+    if (!shouldMarkRead && notification.unread) {
+      unreadCount += 1;
+    }
+  });
+
+  if (
+    !notificationsChanged &&
+    lastSeenSequence === (snapshot.last_seen_sequence || 0) &&
+    unreadCount === (snapshot.unread_count || 0)
+  ) {
+    return snapshot;
+  }
+
+  return {
+    ...snapshot,
+    notifications,
+    unread_count: unreadCount,
+    last_seen_sequence: lastSeenSequence,
+  };
+}
+
 export function OperatorNotificationBell({ role, compact = false }) {
   const [data, setData] = useState({
     notifications: [],
@@ -34,6 +74,7 @@ export function OperatorNotificationBell({ role, compact = false }) {
   const containerRef = useRef(null);
   const lifecycleVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
+  const acknowledgedThroughRef = useRef(0);
 
   const refresh = useCallback((lifecycleVersion) => {
     const inFlight = refreshInFlightRef.current;
@@ -42,8 +83,12 @@ export function OperatorNotificationBell({ role, compact = false }) {
     }
     const refreshPromise = (async () => {
       try {
-        const next = await getOperatorNotifications(7);
+        const next = reconcileAcknowledgedNotifications(
+          await getOperatorNotifications(7),
+          acknowledgedThroughRef.current
+        );
         if (lifecycleVersion !== lifecycleVersionRef.current) return;
+        acknowledgedThroughRef.current = next.last_seen_sequence || 0;
         setData(next);
         setError(null);
       } catch (fetchError) {
@@ -66,6 +111,7 @@ export function OperatorNotificationBell({ role, compact = false }) {
   useEffect(() => {
     const lifecycleVersion = lifecycleVersionRef.current + 1;
     lifecycleVersionRef.current = lifecycleVersion;
+    acknowledgedThroughRef.current = 0;
     const revokeLifecycle = () => {
       if (lifecycleVersionRef.current === lifecycleVersion) {
         lifecycleVersionRef.current += 1;
@@ -73,6 +119,7 @@ export function OperatorNotificationBell({ role, compact = false }) {
       if (refreshInFlightRef.current?.lifecycleVersion === lifecycleVersion) {
         refreshInFlightRef.current = null;
       }
+      acknowledgedThroughRef.current = 0;
     };
     if (role !== 'admin') {
       return revokeLifecycle;
@@ -116,22 +163,16 @@ export function OperatorNotificationBell({ role, compact = false }) {
     try {
       const result = await acknowledgeOperatorNotifications(throughSequence);
       if (lifecycleVersion !== lifecycleVersionRef.current) return;
-      setData((current) => {
-        const notifications = current.notifications.map((notification) =>
-          notification.sequence <= result.last_seen_sequence
-            ? { ...notification, unread: false }
-            : notification
-        );
-        return {
-          ...current,
-          notifications,
-          unread_count: notifications.filter((item) => item.unread).length,
-          last_seen_sequence: Math.max(
-            current.last_seen_sequence || 0,
-            result.last_seen_sequence
-          ),
-        };
-      });
+      acknowledgedThroughRef.current = Math.max(
+        acknowledgedThroughRef.current,
+        result.last_seen_sequence || 0
+      );
+      setData((current) =>
+        reconcileAcknowledgedNotifications(
+          current,
+          acknowledgedThroughRef.current
+        )
+      );
     } catch (acknowledgeError) {
       if (lifecycleVersion === lifecycleVersionRef.current) {
         setError(acknowledgeError.message);
@@ -146,7 +187,11 @@ export function OperatorNotificationBell({ role, compact = false }) {
 
     const unread = data.notifications.filter((item) => item.unread);
     setOpenNotifications(unread);
-    if (data.latest_sequence > data.last_seen_sequence) {
+    const lastSeenSequence = Math.max(
+      data.last_seen_sequence || 0,
+      acknowledgedThroughRef.current
+    );
+    if (data.latest_sequence > lastSeenSequence) {
       acknowledge(data.latest_sequence);
     }
   };
