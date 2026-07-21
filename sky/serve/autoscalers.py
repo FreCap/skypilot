@@ -4329,7 +4329,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         slots are authorized. The actuation path separately waits for those
         slots to become ready before retiring the old card.
         """
-        if wave_budget is None:
+        if wave_budget is None and sum(desired.values()) == target:
             return desired, 0
         cards = self._configured_cards_from_profiles()
         if sum(previous.values()) == previous_target:
@@ -4352,7 +4352,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 fallback = self._cold_paid_card_order(cards)[0]
                 current[fallback] += remaining
 
-        additions_left = max(0, wave_budget)
+        additions_left = (sum(
+            max(0,
+                desired.get(card, 0) - current.get(card, 0))
+            for card in cards) if wave_budget is None else max(0, wave_budget))
         added = 0
         for card in cards:
             increase = max(0, desired.get(card, 0) - current.get(card, 0))
@@ -4572,6 +4575,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         old_target_by_accelerator = dict(
             self.target_num_replicas_by_accelerator)
         logical_wave_budget = self._logical_scale_up_budget(replica_infos)
+        if (self.replica_unit == 'logical' and
+                candidate_target_by_accelerator is not None and
+                sum(old_target_by_accelerator.values())
+                != old_target_num_replicas):
+            # A rebuilt controller reconstructs the aggregate safety target
+            # from committed capacity, while its process-local exact-card map
+            # starts empty. Seed a map that explains that held aggregate
+            # before comparing card deltas. Otherwise the first non-empty
+            # candidate looks like a card increase on every tick: the
+            # scale-up branch repeatedly resets downscale hysteresis, but its
+            # lower aggregate cannot replace the held restart target, leaving
+            # exact-card actuation disabled indefinitely.
+            recovered_map, recovered_card_slots = (
+                self._limit_logical_card_transition(
+                    candidate_target_by_accelerator, old_target_by_accelerator,
+                    old_target_num_replicas, old_target_num_replicas,
+                    replica_infos, logical_wave_budget))
+            if sum(recovered_map.values()) == old_target_num_replicas:
+                self.target_num_replicas_by_accelerator = recovered_map
+                old_target_by_accelerator = dict(recovered_map)
+                if (recovered_card_slots > 0 and
+                        self.max_scale_up_rate_percentage is not None):
+                    self._last_scale_up_wave_at = time.time()
+                    assert logical_wave_budget is not None
+                    logical_wave_budget = max(
+                        0, logical_wave_budget - recovered_card_slots)
         target_map_changed = (candidate_target_by_accelerator is not None and
                               candidate_target_by_accelerator
                               != old_target_by_accelerator)
@@ -4638,13 +4667,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             adopted_map, attribution_complete = (
                 self._calculate_concurrency_target_by_accelerator(
                     replica_infos, target_ceiling=self.target_num_replicas))
-            if (attribution_complete and
-                    sum(adopted_map.values()) == self.target_num_replicas):
+            if attribution_complete and self.replica_unit == 'logical':
                 adopted_map, added_card_slots = (
                     self._limit_logical_card_transition(
                         adopted_map, old_target_by_accelerator,
                         old_target_num_replicas, self.target_num_replicas,
                         replica_infos, logical_wave_budget))
+            else:
+                added_card_slots = 0
+            if (attribution_complete and
+                    sum(adopted_map.values()) == self.target_num_replicas):
                 self.target_num_replicas_by_accelerator = adopted_map
                 if (added_card_slots > 0 and
                         self.max_scale_up_rate_percentage is not None):
