@@ -239,6 +239,26 @@ def test_cluster_terminal_confirmation_uses_locked_reconciliation(
     reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
 
 
+def test_lifecycle_policy_refresh_keeps_last_valid_cutoffs(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    previous = {'research': 123, 'retained': None}
+    reload_config = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.skypilot_config,
+                        'safe_reload_config', reload_config)
+    monkeypatch.setattr(
+        lifecycle_worker_service.config, 'list_workspace_policies',
+        mock.Mock(side_effect=ValueError('malformed workspace policy')))
+
+    refreshed = lifecycle_worker_service._refresh_workspace_eviction_cutoffs(
+        200, previous)
+    startup = lifecycle_worker_service._refresh_workspace_eviction_cutoffs(
+        200, None)
+
+    assert refreshed is previous
+    assert startup is None
+    assert reload_config.call_count == 2
+
+
 @pytest.mark.parametrize(
     ('message', 'expected'),
     [('AccessDenied: arn:aws:iam::123:role/secret', 'CANARY_FAILED'),

@@ -472,6 +472,11 @@ def reserve_regional_location(
                     models.ImageLocationState.FAILED.value,
                     models.ImageLocationState.MISSING.value,
                     models.ImageLocationState.EVICTED.value):
+                if str(shard['state']) not in (
+                        models.ImageShardState.READY.value,
+                        models.ImageShardState.FULL.value):
+                    raise topology_state.RegistryCapacityExhaustedError(
+                        'REGISTRY_SHARD_UNAVAILABLE')
                 location_values: dict[str, Any] = {
                     'state': models.ImageLocationState.PENDING.value,
                     'next_retry_at': None,
@@ -790,6 +795,7 @@ def retry_publication(
         if optimistic is None:
             raise ValueError('IMAGE_PUBLICATION_NOT_FOUND')
         location = None
+        shard = None
         if optimistic['canonical_location_id'] is not None:
             location_snapshot = session.execute(
                 sqlalchemy.select(locations.c.shard_id).where(
@@ -797,10 +803,10 @@ def retry_publication(
                     optimistic['canonical_location_id'])).first()
             if location_snapshot is None:
                 raise ValueError('Canonical location is unavailable.')
-            session.execute(
-                sqlalchemy.select(schema.registry_shards.c.id).where(
+            shard = session.execute(
+                sqlalchemy.select(schema.registry_shards).where(
                     schema.registry_shards.c.id ==
-                    location_snapshot[0]).with_for_update()).one()
+                    location_snapshot[0]).with_for_update()).mappings().one()
             location = session.execute(
                 sqlalchemy.select(locations).where(
                     locations.c.id == optimistic['canonical_location_id']).
@@ -815,8 +821,13 @@ def retry_publication(
             raise ValueError('Only a retained FAILED publication can retry.')
         if location is not None and str(
                 location['state']) in (models.ImageLocationState.FAILED.value,
-                                       models.ImageLocationState.MISSING.value,
-                                       models.ImageLocationState.EVICTED.value):
+                                       models.ImageLocationState.MISSING.value):
+            if shard is None:
+                raise RuntimeError('Canonical location shard is unavailable.')
+            if str(shard['state']) not in (models.ImageShardState.READY.value,
+                                           models.ImageShardState.FULL.value):
+                raise topology_state.RegistryCapacityExhaustedError(
+                    'REGISTRY_SHARD_UNAVAILABLE')
             session.execute(locations.update().where(
                 locations.c.id == location['id']).values(
                     state=models.ImageLocationState.PENDING.value,

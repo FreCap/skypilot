@@ -1182,15 +1182,27 @@ def claim_next_location(*,
             models.ImageLocationState.VERIFYING.value,
         ]), locations.c.lease_expires_at <= current)
     eligible_location = sqlalchemy.or_(fresh, expired)
+    accepts_reserved_work = shards.c.state.in_([
+        models.ImageShardState.READY.value,
+        models.ImageShardState.FULL.value,
+    ])
+    recovers_expired_work = shards.c.state.in_([
+        models.ImageShardState.READY.value,
+        models.ImageShardState.FULL.value,
+        models.ImageShardState.DRIFTED.value,
+        models.ImageShardState.DISABLED.value,
+    ])
     shard_statement = sqlalchemy.select(shards).where(
-        shards.c.state == models.ImageShardState.READY.value,
         sqlalchemy.or_(
             sqlalchemy.and_(
-                shards.c.in_flight < shards.c.max_in_flight,
+                accepts_reserved_work, shards.c.in_flight
+                < shards.c.max_in_flight,
                 sqlalchemy.exists().where(locations.c.shard_id == shards.c.id,
                                           fresh)),
-            sqlalchemy.exists().where(locations.c.shard_id == shards.c.id,
-                                      expired)))
+            sqlalchemy.and_(
+                recovers_expired_work,
+                sqlalchemy.exists().where(locations.c.shard_id == shards.c.id,
+                                          expired))))
     if workspace is not None:
         shard_statement = shard_statement.where(shards.c.workspace == workspace)
     shard_statement = shard_statement.order_by(
@@ -1214,9 +1226,13 @@ def claim_next_location(*,
         reclaimed = str(location_row['state']) in (
             models.ImageLocationState.COPYING.value,
             models.ImageLocationState.VERIFYING.value)
-        if (not reclaimed and
-                int(shard_row['in_flight']) >= int(shard_row['max_in_flight'])):
-            return None
+        if not reclaimed:
+            if str(shard_row['state']) not in (
+                    models.ImageShardState.READY.value,
+                    models.ImageShardState.FULL.value):
+                return None
+            if int(shard_row['in_flight']) >= int(shard_row['max_in_flight']):
+                return None
         row = session.execute(locations.update().where(
             locations.c.id == location_row['id']).values(
                 state=(models.ImageLocationState.VERIFYING.value if reclaimed
@@ -1385,6 +1401,9 @@ def retry_location(location_id: str,
         if str(row['state']) not in (models.ImageLocationState.FAILED.value,
                                      models.ImageLocationState.MISSING.value,
                                      models.ImageLocationState.EVICTED.value):
+            return None
+        if str(shard['state']) not in (models.ImageShardState.READY.value,
+                                       models.ImageShardState.FULL.value):
             return None
         values: dict[str, Any] = {
             'state': models.ImageLocationState.PENDING.value,

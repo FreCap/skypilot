@@ -1524,8 +1524,24 @@ Location dispatch is two-level and no-starvation: select an eligible physical
 shard by oldest `last_dispatch_at` under its target in-flight ceiling, then claim
 its oldest eligible location. Source-inspection claims rotate by
 profile/workspace. If another target has eligible work, one target cannot consume
-every consecutive claim. Lease reconciliation repairs in-flight counters after a
-worker expires.
+every consecutive claim. `FULL` is an admission state, not a dispatch stop:
+already-reserved `PENDING` work remains claimable on `READY` and `FULL` shards.
+An expired `COPYING` or `VERIFYING` lease remains reclaimable even if the shard
+later becomes `DRIFTED` or `DISABLED`; recovery performs an exact destination
+read and repairs the in-flight counter, but fresh writes remain blocked outside
+`READY|FULL`. Re-admitting a `FAILED`, `MISSING`, or `EVICTED` location is new
+write admission and therefore also requires `READY|FULL`, including canonical
+publication retry. The dispatcher rechecks this state from its locked shard row
+after selecting a location, so an expired-lease heartbeat cannot make a
+`DRIFTED` shard fall through to fresh work. Lease reconciliation repairs
+in-flight counters after a worker expires.
+
+The lifecycle worker reloads workspace retention policy behind a failure
+boundary. A malformed or temporarily unreadable configuration keeps the last
+valid cutoff map and logs a bounded warning instead of terminating eviction,
+lease reconciliation, or compaction. Before the first valid map has loaded,
+retention eviction is disabled for every workspace while the worker continues
+non-destructive reconciliation and retries configuration refresh.
 
 Worker budgets do not pretend to control calls made by remote container
 runtimes. Node pulls use per-node credential reuse plus bounded exponential
@@ -2050,3 +2066,12 @@ budgets create-only during qualification, rechecks live quota and inventory
 epoch under locks, and applies capacity, dispatch, budget, eviction, and revision
 changes atomically during activation. It also aligns profile-row lock order and
 enforces the fresh-EVICT-only no-I/O restore rule in the database transaction.
+
+Implementation review round 16 at
+`da540abf24efa2770eb6550e3436437971028793` returned Codex `PURSUE` and Fable
+`RESHAPE`. Fable proved that a shard becoming `FULL` after its final reservation
+could permanently strand that already-admitted `PENDING` location and every
+expired copy lease on the shard. The next revision separates admission from
+dispatch, reclaims expired leases across later admission-state changes, fences
+re-admission to `READY|FULL`, and preserves the last valid workspace-retention
+policy when configuration refresh fails.

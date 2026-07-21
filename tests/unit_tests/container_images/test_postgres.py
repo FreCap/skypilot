@@ -690,6 +690,262 @@ def _complete_location(location: topology_state.LocationRecord, *,
                                            now=now + 2)
 
 
+def test_full_shard_dispatches_already_reserved_retry(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    publication_record, location = _publish_and_bind(profile)
+    shard = topology_state.get_shard(location.shard_id)
+    assert shard is not None and shard.reserved_manifests > 0
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                max_manifests=shard.reserved_manifests,
+                state=models.ImageShardState.FULL.value))
+
+    first = topology_state.claim_next_location(worker_id='copy-1',
+                                               lease_seconds=60,
+                                               workspace='research',
+                                               now=30)
+    assert first is not None and first.id == location.id
+    assert first.lease_token is not None
+    retried = transactions.converge_canonical(
+        location_id=first.id,
+        lease_token=first.lease_token,
+        ready=False,
+        error_code=(models.ImageLocationErrorCode.MATERIALIZATION_FAILED.value),
+        retry_at=40,
+        terminal=False,
+        now=31)
+    assert retried.state == models.ImageLocationState.PENDING
+    assert topology_state.claim_next_location(worker_id='copy-2',
+                                              lease_seconds=60,
+                                              workspace='research',
+                                              now=39) is None
+
+    second = topology_state.claim_next_location(worker_id='copy-2',
+                                                lease_seconds=60,
+                                                workspace='research',
+                                                now=40)
+    assert second is not None and second.id == location.id
+    assert second.state == models.ImageLocationState.COPYING
+    final_shard = topology_state.get_shard(shard.id)
+    assert final_shard is not None
+    assert final_shard.state == models.ImageShardState.FULL
+    assert final_shard.in_flight == 1
+    assert second.lease_token is not None
+    assert topology_state.transition_location_to_verifying(second.id,
+                                                           second.lease_token,
+                                                           now=41)
+    ready = transactions.converge_canonical(location_id=second.id,
+                                            lease_token=second.lease_token,
+                                            ready=True,
+                                            now=42)
+    assert ready.state == models.ImageLocationState.READY
+    ready_publication = catalog_state.get_publication(publication_record.id,
+                                                      'research')
+    completed_shard = topology_state.get_shard(shard.id)
+    assert ready_publication is not None
+    assert ready_publication.state == models.ImagePublicationState.READY
+    assert completed_shard is not None
+    assert completed_shard.state == models.ImageShardState.FULL
+    assert completed_shard.in_flight == 0
+
+
+@pytest.mark.parametrize(
+    ('shard_state', 'allowed'),
+    [(models.ImageShardState.FULL, True),
+     (models.ImageShardState.DRIFTED, False),
+     (models.ImageShardState.DISABLED, False)],
+)
+def test_canonical_publication_retry_obeys_shard_admission_state(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile,
+        shard_state: models.ImageShardState, allowed: bool) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    publication_record, location = _publish_and_bind(profile)
+    claim = topology_state.claim_next_location(worker_id='copy-1',
+                                               lease_seconds=60,
+                                               workspace='research',
+                                               now=30)
+    assert claim is not None and claim.id == location.id
+    assert claim.lease_token is not None
+    failed = transactions.converge_canonical(
+        location_id=claim.id,
+        lease_token=claim.lease_token,
+        ready=False,
+        error_code=(
+            models.ImageLocationErrorCode.DESTINATION_DIGEST_MISMATCH.value),
+        terminal=True,
+        now=31)
+    assert failed.state == models.ImageLocationState.FAILED
+    shard = topology_state.get_shard(location.shard_id)
+    assert shard is not None
+    values: dict[str, Any] = {'state': shard_state.value}
+    if shard_state == models.ImageShardState.FULL:
+        values['max_manifests'] = shard.reserved_manifests
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(**values))
+
+    def retry() -> publication.PublicationMutation:
+        return publication.retry(
+            publication_id=publication_record.id,
+            workspace='research',
+            actor_hash='2' * 64,
+            idempotency_key=(
+                f'canonical-retry-{shard_state.value.lower()}-0001'))
+
+    if allowed:
+        mutation = retry()
+        assert mutation.publication.state == models.ImagePublicationState.PENDING
+        pending = topology_state.get_location(location.id)
+        assert pending is not None
+        assert pending.state == models.ImageLocationState.PENDING
+        reclaimed = topology_state.claim_next_location(worker_id='copy-2',
+                                                       lease_seconds=60,
+                                                       workspace='research',
+                                                       now=40)
+        assert reclaimed is not None and reclaimed.id == location.id
+    else:
+        with pytest.raises(topology_state.RegistryCapacityExhaustedError,
+                           match='REGISTRY_SHARD_UNAVAILABLE'):
+            retry()
+        retained = topology_state.get_location(location.id)
+        failed_publication = catalog_state.get_publication(
+            publication_record.id, 'research')
+        assert retained is not None
+        assert retained.state == models.ImageLocationState.FAILED
+        assert failed_publication is not None
+        assert failed_publication.state == models.ImagePublicationState.FAILED
+
+
+def test_expired_copy_lease_repairs_drifted_shard_in_flight(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, location = _publish_and_bind(profile)
+    first = topology_state.claim_next_location(worker_id='copy-1',
+                                               lease_seconds=10,
+                                               workspace='research',
+                                               now=30)
+    assert first is not None and first.id == location.id
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == location.shard_id).values(
+                state=models.ImageShardState.DRIFTED.value))
+
+    reclaimed = topology_state.claim_next_location(worker_id='copy-2',
+                                                   lease_seconds=10,
+                                                   workspace='research',
+                                                   now=41)
+    assert reclaimed is not None and reclaimed.id == location.id
+    assert reclaimed.state == models.ImageLocationState.VERIFYING
+    assert reclaimed.lease_kind == 'VERIFY'
+    assert reclaimed.lease_token is not None
+    during = topology_state.get_shard(location.shard_id)
+    assert during is not None and during.in_flight == 1
+    pending = transactions.converge_canonical(
+        location_id=reclaimed.id,
+        lease_token=reclaimed.lease_token,
+        ready=False,
+        error_code=models.ImageLocationErrorCode.MANIFEST_MISSING.value,
+        retry_at=50,
+        terminal=False,
+        now=42)
+    assert pending.state == models.ImageLocationState.PENDING
+    repaired = topology_state.get_shard(location.shard_id)
+    assert repaired is not None
+    assert repaired.state == models.ImageShardState.DRIFTED
+    assert repaired.in_flight == 0
+    assert topology_state.claim_next_location(worker_id='copy-3',
+                                              lease_seconds=10,
+                                              workspace='research',
+                                              now=50) is None
+
+
+def test_drifted_shard_heartbeat_race_never_dispatches_fresh_write(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, location = _publish_and_bind(profile)
+    claimed = topology_state.claim_next_location(worker_id='copy-1',
+                                                 lease_seconds=10,
+                                                 workspace='research',
+                                                 now=30)
+    assert claimed is not None and claimed.id == location.id
+    shard = topology_state.get_shard(location.shard_id)
+    assert shard is not None
+    fresh_image_id = str(uuid.uuid4())
+    fresh_location_id = str(uuid.uuid4())
+    with image_database.begin() as connection:
+        connection.execute(schema.images.insert().values(
+            id=fresh_image_id,
+            workspace='research',
+            runtime_digest=_OTHER_DIGEST,
+            platform='linux/amd64',
+            config_digest=_CONFIG_DIGEST,
+            manifest_media_type=_MANIFEST_MEDIA_TYPE,
+            manifest_size_bytes=1,
+            declared_size_bytes=1,
+            creator_user_hash='3' * 64,
+            producer_kind='external_oci',
+            created_at=35,
+            updated_at=35))
+        connection.execute(schema.locations.insert().values(
+            id=fresh_location_id,
+            workspace='research',
+            image_id=fresh_image_id,
+            shard_id=shard.id,
+            target_fingerprint=shard.target_fingerprint,
+            physical_fingerprint=shard.physical_fingerprint,
+            runtime_digest=_OTHER_DIGEST,
+            canonical=True,
+            canonical_location_id=None,
+            target_ref=(f'{shard.registry}/{shard.repository_name}@'
+                        f'{_OTHER_DIGEST}'),
+            state=models.ImageLocationState.PENDING.value,
+            attempt_count=0,
+            reserved_declared_bytes=1,
+            created_at=35,
+            updated_at=35))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                reserved_manifests=(
+                    schema.registry_shards.c.reserved_manifests + 1),
+                reserved_declared_bytes=(
+                    schema.registry_shards.c.reserved_declared_bytes + 1),
+                state=models.ImageShardState.DRIFTED.value))
+
+    with image_database.connect() as blocker:
+        transaction = blocker.begin()
+        try:
+            blocker.execute(schema.locations.update().where(
+                schema.locations.c.id == location.id).values(
+                    lease_expires_at=100))
+            assert topology_state.claim_next_location(worker_id='copy-2',
+                                                      lease_seconds=10,
+                                                      workspace='research',
+                                                      now=41) is None
+        finally:
+            transaction.commit()
+
+    fresh = topology_state.get_location(fresh_location_id)
+    assert fresh is not None
+    assert fresh.state == models.ImageLocationState.PENDING
+    assert fresh.lease_token is None
+    recovered = topology_state.claim_next_location(worker_id='copy-3',
+                                                   lease_seconds=10,
+                                                   workspace='research',
+                                                   now=101)
+    assert recovered is not None and recovered.id == location.id
+    assert recovered.state == models.ImageLocationState.VERIFYING
+
+
 def _ready_regional(
     engine: sqlalchemy.engine.Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -713,6 +969,46 @@ def _ready_regional(
         now=40)
     regional = _complete_location(regional, now=41)
     return active, publication_record, canonical, regional
+
+
+def test_drifted_shard_rejects_location_readmission(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, canonical, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    before = topology_state.get_shard(regional.shard_id)
+    assert before is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == regional.shard_id).values(
+                state=models.ImageShardState.DRIFTED.value))
+        connection.execute(schema.locations.update().where(
+            schema.locations.c.id == regional.id).values(
+                state=models.ImageLocationState.MISSING.value,
+                error_code=(
+                    models.ImageLocationErrorCode.MANIFEST_MISSING.value)))
+
+    assert topology_state.retry_location(regional.id, 'research',
+                                         now=50) is None
+    assert publication_record.image_id is not None
+    with pytest.raises(topology_state.RegistryCapacityExhaustedError,
+                       match='REGISTRY_SHARD_UNAVAILABLE'):
+        transactions.reserve_regional_location(
+            image_id=publication_record.image_id,
+            workspace='research',
+            profile_revision_id=active.id,
+            target_id=profile.targets[0].name,
+            canonical_location_id=canonical.id,
+            max_regional_locations=16,
+            now=50)
+    retained = topology_state.get_location(regional.id)
+    after = topology_state.get_shard(regional.shard_id)
+    assert retained is not None
+    assert retained.state == models.ImageLocationState.MISSING
+    assert after is not None
+    assert after.state == models.ImageShardState.DRIFTED
+    assert after.reserved_manifests == before.reserved_manifests
+    assert after.reserved_declared_bytes == before.reserved_declared_bytes
 
 
 def _runtime_resolution(

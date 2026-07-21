@@ -13,6 +13,8 @@ import uuid
 from sqlalchemy import orm
 
 from sky import global_user_state
+from sky import sky_logging
+from sky import skypilot_config
 from sky.container_images import aws
 from sky.container_images import budgets
 from sky.container_images import catalog_state
@@ -30,6 +32,8 @@ _DEFAULT_LEASE_SECONDS = 15 * 60
 _CONSUMER_RECONCILIATION_SECONDS = 60
 _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
 _UNATTACHED_REQUEST_RETENTION_SECONDS = 24 * 60 * 60
+
+logger = sky_logging.init_logger(__name__)
 
 
 def _ecr_hooks(
@@ -89,6 +93,19 @@ def _workspace_eviction_cutoffs(now: int) -> dict[str, int | None]:
             policy.regional_cache_retention_weeks * seconds_per_week
         ) for workspace, policy in config.list_workspace_policies().items()
     }
+
+
+def _refresh_workspace_eviction_cutoffs(
+    now: int,
+    previous: dict[str, int | None] | None,
+) -> dict[str, int | None] | None:
+    """Reloads retention policy without killing the lifecycle claim loop."""
+    try:
+        skypilot_config.safe_reload_config()
+        return _workspace_eviction_cutoffs(now)
+    except (OSError, TypeError, ValueError):
+        logger.warning('Image lifecycle policy refresh failed.')
+        return previous
 
 
 def evict_location(location: topology_state.LocationRecord,
@@ -481,7 +498,7 @@ class LifecycleWorkerService:
         last_qualification_reconciliation = 0
         last_canonical_reconciliation = 0
         last_policy_refresh = 0
-        workspace_cutoffs: dict[str, int | None] = {}
+        workspace_cutoffs: dict[str, int | None] | None = None
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_in_flight,
                 thread_name_prefix='image-lifecycle') as executor:
@@ -533,8 +550,12 @@ class LifecycleWorkerService:
                     futures.add(canonical_future)
                     last_canonical_reconciliation = current
                 if current - last_policy_refresh >= 60:
-                    workspace_cutoffs = _workspace_eviction_cutoffs(current)
+                    workspace_cutoffs = _refresh_workspace_eviction_cutoffs(
+                        current, workspace_cutoffs)
                     last_policy_refresh = current
+                if workspace_cutoffs is None:
+                    self._stop.wait(1 if futures else 5)
+                    continue
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = topology_state.claim_next_eviction(
