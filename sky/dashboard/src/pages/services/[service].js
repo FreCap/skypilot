@@ -132,6 +132,7 @@ export function useServiceDetails({ serviceName }) {
   const [replicasLoading, setReplicasLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
@@ -198,7 +199,13 @@ export function useServiceDetails({ serviceName }) {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+    return () => {
+      requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.serviceName === serviceName) {
+        refreshInFlightRef.current = null;
+      }
+    };
+  }, [fetchData, serviceName]);
 
   useEffect(() => {
     if (!serviceName) return undefined;
@@ -243,11 +250,24 @@ export function useServiceDetails({ serviceName }) {
     };
   }, [serviceName]);
 
-  const refreshData = useCallback(async () => {
-    // Drop every args-keyed getServices variant (summary and full).
-    dashboardCache.invalidateFunction(getServices);
-    await fetchData();
-  }, [fetchData]);
+  const refreshData = useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.serviceName === serviceName) {
+      return inFlight.promise;
+    }
+
+    const refreshPromise = (async () => {
+      // Drop every args-keyed getServices variant (summary and full).
+      dashboardCache.invalidateFunction(getServices);
+      await fetchData();
+    })().finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = { serviceName, promise: refreshPromise };
+    return refreshPromise;
+  }, [fetchData, serviceName]);
 
   return {
     serviceData,
