@@ -70,12 +70,11 @@ async def test_scheduled_launch_records_backoff_and_releases_slot():
     starting_lock = asyncio.Lock()
     starting_signal = asyncio.Condition(starting_lock)
 
-    with mock.patch.object(scheduler.state,
-                           'get_pool_from_job_id',
-                           return_value=None), mock.patch.object(
-                               scheduler.state,
-                               'get_execution_from_job_id',
-                               return_value=None), mock.patch.object(
+    with mock.patch.object(
+            scheduler.state,
+            'get_pool_and_execution_from_job_id_async',
+            new_callable=mock.AsyncMock,
+            return_value=(None, None)), mock.patch.object(
                                    scheduler.state,
                                    'scheduler_set_launching_async',
                                    new_callable=mock.AsyncMock) as set_launching, \
@@ -126,12 +125,11 @@ async def test_scheduled_launch_capacity_check_and_claim_are_atomic():
                 max_concurrent = max(max_concurrent, len(starting))
             await asyncio.sleep(0)
 
-    with mock.patch.object(scheduler.state,
-                           'get_pool_from_job_id',
-                           return_value=None), \
-            mock.patch.object(scheduler.state,
-                              'get_execution_from_job_id',
-                              return_value=None), \
+    with mock.patch.object(
+            scheduler.state,
+            'get_pool_and_execution_from_job_id_async',
+            new_callable=mock.AsyncMock,
+            return_value=(None, None)), \
             mock.patch.object(scheduler.state,
                               'scheduler_set_launching_async',
                               new_callable=mock.AsyncMock), \
@@ -152,12 +150,11 @@ async def test_scheduled_launch_releases_slot_when_set_launching_fails():
     starting_lock = asyncio.Lock()
     starting_signal = asyncio.Condition(starting_lock)
 
-    with mock.patch.object(scheduler.state,
-                           'get_pool_from_job_id',
-                           return_value=None), \
-            mock.patch.object(scheduler.state,
-                              'get_execution_from_job_id',
-                              return_value=None), \
+    with mock.patch.object(
+            scheduler.state,
+            'get_pool_and_execution_from_job_id_async',
+            new_callable=mock.AsyncMock,
+            return_value=(None, None)), \
             mock.patch.object(scheduler.state,
                               'scheduler_set_launching_async',
                               new_callable=mock.AsyncMock,
