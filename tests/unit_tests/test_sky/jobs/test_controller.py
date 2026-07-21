@@ -751,6 +751,45 @@ class TestJobGroupRecovery:
         assert cancelled == {'first', 'second'}
 
     @pytest.mark.asyncio
+    async def test_job_group_launch_propagates_child_cancellation(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:1]
+        mock_dag.primary_tasks = []
+        executor = MagicMock()
+        executor.launch = AsyncMock(side_effect=asyncio.CancelledError())
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            return_value=('cluster-0', executor))
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        job_controller._cleanup_job_group_clusters = AsyncMock()
+        statuses = AsyncMock(return_value=[])
+        set_started = AsyncMock()
+        barrier_snapshot = MagicMock(return_value={})
+
+        with patch.object(controller_lib.managed_job_runtime,
+                          'is_registered',
+                          return_value=False), patch.object(
+                              controller_lib.managed_job_state,
+                              'get_all_task_ids_statuses_async',
+                              statuses), patch.object(
+                                  controller_lib.managed_job_state,
+                                  'set_started_async',
+                                  set_started), patch.object(
+                                      controller_lib.global_user_state,
+                                      'get_handles_from_cluster_names',
+                                      barrier_snapshot), patch.object(
+                                          controller_lib.job_group_networking,
+                                          'dns_addresses_for_task',
+                                          return_value=None), pytest.raises(
+                                              asyncio.CancelledError):
+            await job_controller._run_job_group()
+
+        executor.launch.assert_awaited_once_with()
+        barrier_snapshot.assert_not_called()
+        set_started.assert_not_awaited()
+        job_controller._monitor_job_group_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_group_barrier_reads_one_ordered_handle_snapshot(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)

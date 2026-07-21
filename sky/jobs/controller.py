@@ -1530,7 +1530,7 @@ class JobController:
                     results = await asyncio.gather(*launch_coros,
                                                    return_exceptions=True)
                     for result in results:
-                        if isinstance(result, Exception):
+                        if isinstance(result, BaseException):
                             raise result
                     logger.info(f'Clusters launched in '
                                 f'{time.time()-launch_start:.2f}s')
