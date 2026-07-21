@@ -310,10 +310,10 @@ def stage_profile_revision(*,
     table = schema.profile_revisions
     with orm.Session(catalog_state.engine()) as session, session.begin():
         existing_rows = session.execute(
-            sqlalchemy.select(table).where(table.c.workspace == workspace,
-                                           table.c.profile == profile).order_by(
-                                               table.c.desired_generation).
-            with_for_update()).mappings().all()
+            sqlalchemy.select(table).where(
+                table.c.workspace == workspace,
+                table.c.profile == profile).order_by(
+                    table.c.id).with_for_update()).mappings().all()
         for row in existing_rows:
             if (int(row['revision']) == revision and
                     str(row['config_hash']) == config_hash and
@@ -604,7 +604,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
                            repository_arn: str, max_manifests: int,
                            max_declared_bytes: int, max_in_flight: int,
                            now: int) -> ShardRecord:
-    """Creates one Terraform-provisioned shard or verifies its immutable facts."""
+    """Creates one bootstrap shard or validates an operational physical slot."""
     table = schema.registry_shards
     identity = (table.c.workspace == workspace, table.c.profile == profile,
                 table.c.target_id == target_id,
@@ -650,28 +650,54 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
         'repository_arn': repository_arn,
     }
     if any(str(row[key]) != str(value) for key, value in immutable.items()):
-        session.execute(table.update().where(table.c.id == row['id']).values(
-            state=models.ImageShardState.DRIFTED.value, updated_at=now))
         raise ValueError('Qualified registry shard physical identity drifted.')
     if (max_manifests < int(row['reserved_manifests']) or
-            max_declared_bytes < int(row['reserved_declared_bytes'])):
+            max_declared_bytes < int(row['reserved_declared_bytes']) or
+            max_in_flight < int(row['in_flight'])):
         raise ValueError(
             'Registry shard ceilings cannot fall below reservations.')
+    # Once activation owns a physical slot, a later Terraform handoff is only
+    # candidate evidence. Its operational ceilings and inventory epoch change
+    # in the fenced activation transaction, never during qualification.
+    if row['profile_revision_id'] is not None:
+        return _shard(row)
+    capacities_changed = (int(row['max_manifests']) != max_manifests or int(
+        row['max_declared_bytes']) != max_declared_bytes or
+                          int(row['max_in_flight']) != max_in_flight)
+    if not capacities_changed:
+        return _shard(row)
+    if row['inventory_lease_token'] is not None:
+        raise ValueError(
+            'Bootstrap shard inventory must finish before limits change.')
     values: dict[str, Any] = {
         'max_manifests': max_manifests,
         'max_declared_bytes': max_declared_bytes,
         'max_in_flight': max_in_flight,
         'updated_at': now,
+        'inventory_cursor': None,
+        'inventory_started_at': None,
+        'inventory_completed_at': None,
+        'observed_manifests': 0,
     }
-    if row['inventory_lease_token'] is None:
-        values.update(inventory_cursor=None,
-                      inventory_started_at=None,
-                      inventory_completed_at=None,
-                      observed_manifests=0)
+    if str(row['state']) in (models.ImageShardState.READY.value,
+                             models.ImageShardState.FULL.value):
+        values.update(state=models.ImageShardState.PENDING.value,
+                      qualified_at=None)
     updated = session.execute(
         table.update().where(table.c.id == row['id']).values(
             **values).returning(table)).mappings().one()
     return _shard(updated)
+
+
+def lock_profile_shards(session: orm.Session, *, workspace: str,
+                        profile: str) -> None:
+    """Locks an existing physical ring in the global shard-ID order."""
+    table = schema.registry_shards
+    session.execute(
+        sqlalchemy.select(
+            table.c.id).where(table.c.workspace == workspace,
+                              table.c.profile == profile).order_by(
+                                  table.c.id).with_for_update()).all()
 
 
 def list_shards(workspace: str,
@@ -1594,6 +1620,8 @@ def complete_eviction(location_id: str,
                 row['lease_expires_at'] is None or
                 int(row['lease_expires_at']) <= current):
             return None
+        if provider_not_called and row['lease_kind'] != 'EVICT':
+            return None
         live_demand = session.execute(
             sqlalchemy.select(schema.demands.c.id).where(
                 schema.demands.c.location_id == location_id,
@@ -1781,23 +1809,15 @@ def get_worker(worker_id: str) -> WorkerRecord | None:
     return _worker(row) if row is not None else None
 
 
-def upsert_provider_budget(*,
-                           provider: str,
-                           partition: str,
-                           account: str,
-                           region: str,
-                           api_family: str,
-                           applied_rate_per_second: int,
-                           burst: int,
-                           now: int | None = None) -> ProviderBudgetRecord:
-    """Installs one qualification-backed, account-region API budget."""
-    current = int(time.time()) if now is None else now
+def _provider_budget_values(*, provider: str, partition: str, account: str,
+                            region: str, api_family: str,
+                            applied_rate_per_second: int,
+                            burst: int) -> tuple[str, dict[str, Any], int, int]:
     if (applied_rate_per_second <= 0 or burst <= 0 or
             applied_rate_per_second > 1_000_000 or burst > 1_000_000):
         raise ValueError('Provider budget limits are invalid.')
     rate_milli = applied_rate_per_second * 1000
     burst_milli = burst * 1000
-    table = schema.provider_budgets
     values = {
         'provider': provider,
         'partition': partition,
@@ -1809,6 +1829,65 @@ def upsert_provider_budget(*,
         uuid.uuid5(
             uuid.NAMESPACE_URL, 'skypilot-image-budget:' + ':'.join(
                 (provider, partition, account, region, api_family))))
+    return budget_id, values, rate_milli, burst_milli
+
+
+def upsert_provider_budget_in_session(session: orm.Session, *, provider: str,
+                                      partition: str, account: str, region: str,
+                                      api_family: str,
+                                      applied_rate_per_second: int, burst: int,
+                                      now: int) -> ProviderBudgetRecord:
+    """Applies one qualified budget inside its profile activation transaction."""
+    budget_id, values, rate_milli, burst_milli = _provider_budget_values(
+        provider=provider,
+        partition=partition,
+        account=account,
+        region=region,
+        api_family=api_family,
+        applied_rate_per_second=applied_rate_per_second,
+        burst=burst)
+    table = schema.provider_budgets
+    row = session.execute(
+        postgresql.insert(table).values(
+            id=budget_id,
+            **values,
+            applied_rate_milli=rate_milli,
+            burst_milli=burst_milli,
+            tokens_milli=burst_milli,
+            refilled_at=now,
+            updated_at=now).on_conflict_do_update(
+                constraint='uq_container_image_provider_budget',
+                set_={
+                    'applied_rate_milli': rate_milli,
+                    'burst_milli': burst_milli,
+                    'tokens_milli': sqlalchemy.func.least(
+                        table.c.tokens_milli, burst_milli),
+                    'refilled_at': now,
+                    'updated_at': now,
+                }).returning(table)).mappings().one()
+    return _provider_budget(row)
+
+
+def ensure_provider_budget(*,
+                           provider: str,
+                           partition: str,
+                           account: str,
+                           region: str,
+                           api_family: str,
+                           applied_rate_per_second: int,
+                           burst: int,
+                           now: int | None = None) -> ProviderBudgetRecord:
+    """Creates a missing qualification budget without changing a live one."""
+    current = int(time.time()) if now is None else now
+    budget_id, values, rate_milli, burst_milli = _provider_budget_values(
+        provider=provider,
+        partition=partition,
+        account=account,
+        region=region,
+        api_family=api_family,
+        applied_rate_per_second=applied_rate_per_second,
+        burst=burst)
+    table = schema.provider_budgets
     with orm.Session(catalog_state.engine()) as session, session.begin():
         row = session.execute(
             postgresql.insert(table).values(
@@ -1818,17 +1897,38 @@ def upsert_provider_budget(*,
                 burst_milli=burst_milli,
                 tokens_milli=burst_milli,
                 refilled_at=current,
-                updated_at=current).on_conflict_do_update(
-                    constraint='uq_container_image_provider_budget',
-                    set_={
-                        'applied_rate_milli': rate_milli,
-                        'burst_milli': burst_milli,
-                        'tokens_milli': sqlalchemy.func.least(
-                            table.c.tokens_milli, burst_milli),
-                        'refilled_at': current,
-                        'updated_at': current,
-                    }).returning(table)).mappings().one()
+                updated_at=current).on_conflict_do_nothing(
+                    constraint='uq_container_image_provider_budget').returning(
+                        table)).mappings().first()
+        if row is None:
+            row = session.execute(
+                sqlalchemy.select(table).where(table.c.id == budget_id).
+                with_for_update()).mappings().one()
     return _provider_budget(row)
+
+
+def upsert_provider_budget(*,
+                           provider: str,
+                           partition: str,
+                           account: str,
+                           region: str,
+                           api_family: str,
+                           applied_rate_per_second: int,
+                           burst: int,
+                           now: int | None = None) -> ProviderBudgetRecord:
+    """Installs one qualification-backed, account-region API budget."""
+    current = int(time.time()) if now is None else now
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        return upsert_provider_budget_in_session(
+            session,
+            provider=provider,
+            partition=partition,
+            account=account,
+            region=region,
+            api_family=api_family,
+            applied_rate_per_second=applied_rate_per_second,
+            burst=burst,
+            now=current)
 
 
 def get_provider_budget(*, provider: str, partition: str, account: str,

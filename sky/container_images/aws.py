@@ -430,7 +430,12 @@ def ingest_terraform_qualification(
         max_daily_canary_microusd=(
             profile.qualification.max_daily_canary_microusd),
         now=current)
+    if desired.terraform_hash not in (None, manifest.manifest_hash):
+        raise ValueError('Terraform qualification hash is immutable.')
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        topology_state.lock_profile_shards(session,
+                                           workspace=manifest.workspace,
+                                           profile=profile.name)
         for shard in sorted(manifest.shards,
                             key=lambda item: (item.target, item.shard_index)):
             target = profile.target(shard.target)
@@ -455,7 +460,10 @@ def ingest_terraform_qualification(
                 max_in_flight=shard.max_in_flight,
                 now=current)
     for partition, account, region, rate, burst in provider_budgets:
-        topology_state.upsert_provider_budget(provider='aws',
+        # A missing budget is required to run first-time qualification. An
+        # existing operational budget remains unchanged until this revision
+        # atomically activates.
+        topology_state.ensure_provider_budget(provider='aws',
                                               partition=partition,
                                               account=account,
                                               region=region,
@@ -478,6 +486,7 @@ def ingest_terraform_qualification(
         terraform_hash=manifest.manifest_hash,
         now=current)
     for shard in manifest.shards:
+        target = profile.target(shard.target)
         applied_quota, reserved_headroom = regional_quotas[shard.region]
         live_key = models.profile_attestation_key('infrastructure_shard',
                                                   shard.physical_fingerprint)
@@ -489,6 +498,7 @@ def ingest_terraform_qualification(
                 'status': 'READY',
                 'observed_at': current,
                 'physical_fingerprint': shard.physical_fingerprint,
+                'target_fingerprint': target.target_fingerprint,
                 'target': shard.target,
                 'repository_arn': shard.repository_arn,
                 'repository_uri': f'{shard.registry}/{shard.repository_name}',
@@ -499,9 +509,31 @@ def ingest_terraform_qualification(
                 'policy_hash': shard.policy_hash,
                 'ownership_tags_hash': shard.ownership_tags_hash,
                 'max_manifests': shard.max_manifests,
+                'max_declared_bytes': shard.max_declared_bytes,
+                'max_in_flight': shard.max_in_flight,
                 'terraform_applied_quota': applied_quota,
                 'reserved_headroom': reserved_headroom,
                 'live_attestation_key': live_key,
+            },
+            expected_generation=desired.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=current)
+    for partition, account, region, rate, burst in provider_budgets:
+        desired = topology_state.record_profile_attestation(
+            profile_revision_id=desired.id,
+            kind=models.profile_attestation_key('terraform_budget', 'aws',
+                                                partition, account, region,
+                                                'ecr'),
+            evidence={
+                'status': 'READY',
+                'observed_at': current,
+                'provider': 'aws',
+                'partition': partition,
+                'account': account,
+                'region': region,
+                'api_family': 'ecr',
+                'applied_rate_per_second': rate,
+                'burst': burst,
             },
             expected_generation=desired.desired_generation,
             expected_config_hash=profile.config_hash,

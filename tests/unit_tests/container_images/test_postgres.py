@@ -153,6 +153,9 @@ def _activate_profile(
             schema.registry_shards.c.profile == profile.name).values(
                 state=models.ImageShardState.READY.value,
                 qualified_at=11,
+                inventory_epoch=1,
+                inventory_started_at=10,
+                inventory_completed_at=11,
                 updated_at=11))
         assert not any(
             session.execute(
@@ -169,6 +172,68 @@ def _activate_profile(
         expected_config_hash=profile.config_hash,
         terraform_hash='f' * 64,
         now=12)
+    assert attested.attestations_hash is not None
+    for target in (profile.canonical,) + profile.targets:
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=models.profile_attestation_key('terraform_budget', 'aws',
+                                                profile.partition,
+                                                profile.registry_account,
+                                                target.region, 'ecr'),
+            evidence={
+                'status': 'READY',
+                'observed_at': 12,
+                'provider': 'aws',
+                'partition': profile.partition,
+                'account': profile.registry_account,
+                'region': target.region,
+                'api_family': 'ecr',
+                'applied_rate_per_second': 20,
+                'burst': 10,
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=12)
+    for shard in topology_state.list_shards('research', profile.name):
+        target = profile.target(shard.target_id)
+        live_key = models.profile_attestation_key('infrastructure_shard',
+                                                  shard.physical_fingerprint)
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=models.profile_attestation_key('terraform_shard',
+                                                shard.physical_fingerprint),
+            evidence={
+                'status': 'READY',
+                'observed_at': 12,
+                'physical_fingerprint': shard.physical_fingerprint,
+                'target_fingerprint': shard.target_fingerprint,
+                'target': shard.target_id,
+                'max_manifests': shard.max_manifests,
+                'max_declared_bytes': shard.max_declared_bytes,
+                'max_in_flight': shard.max_in_flight,
+                'terraform_applied_quota': shard.max_manifests + 10,
+                'reserved_headroom': 10,
+                'live_attestation_key': live_key,
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=12)
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=live_key,
+            evidence={
+                'status': 'READY',
+                'observed_at': 12,
+                'physical_fingerprint': shard.physical_fingerprint,
+                'target_fingerprint': shard.target_fingerprint,
+                'applied_images_per_repository_quota': shard.max_manifests + 10,
+                'reserved_headroom': 10,
+                'inventory_epoch': shard.inventory_epoch,
+                'inventory_completed_at': shard.inventory_completed_at,
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=12)
     assert attested.attestations_hash is not None
     active = transactions.activate_profile(
         profile_revision_id=revision.id,
@@ -299,6 +364,239 @@ def test_candidate_attestation_requires_unchanged_operational_inventory(
     assert unchanged is not None
     assert unchanged.profile_revision_id == active.id
     assert unchanged.state == models.ImageShardState.READY
+
+
+def test_candidate_handoff_is_nonmutating_and_activation_applies_atomically(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    for target in (profile.canonical,) + profile.targets:
+        topology_state.upsert_provider_budget(provider='aws',
+                                              partition=profile.partition,
+                                              account=profile.registry_account,
+                                              region=target.region,
+                                              api_family='ecr',
+                                              applied_rate_per_second=30,
+                                              burst=15,
+                                              now=14)
+    before_shards = topology_state.list_shards('research', profile.name)
+    before_budgets = {
+        target.region: topology_state.get_provider_budget(
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            api_family='ecr')
+        for target in (profile.canonical,) + profile.targets
+    }
+    assert all(item is not None for item in before_budgets.values())
+
+    candidate_profile = _policy_profile(profile)
+    candidate = _stage_candidate_profile(candidate_profile, now=20)
+    with orm.Session(image_database) as session, session.begin():
+        for shard in before_shards:
+            topology_state.upsert_qualified_shard(
+                session,
+                workspace=shard.workspace,
+                profile=shard.profile,
+                target_id=shard.target_id,
+                provider=shard.provider,
+                partition=shard.partition,
+                account=shard.account,
+                region=shard.region,
+                shard_generation=shard.shard_generation,
+                shard_index=shard.shard_index,
+                target_fingerprint=shard.target_fingerprint,
+                physical_fingerprint=shard.physical_fingerprint,
+                registry=shard.registry,
+                repository_name=shard.repository_name,
+                repository_arn=shard.repository_arn,
+                max_manifests=80,
+                max_declared_bytes=800_000,
+                max_in_flight=3,
+                now=21)
+    for target in (profile.canonical,) + profile.targets:
+        topology_state.ensure_provider_budget(provider='aws',
+                                              partition=profile.partition,
+                                              account=profile.registry_account,
+                                              region=target.region,
+                                              api_family='ecr',
+                                              applied_rate_per_second=7,
+                                              burst=3,
+                                              now=21)
+    assert topology_state.list_shards('research', profile.name) == before_shards
+    assert {
+        target.region: topology_state.get_provider_budget(
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            api_family='ecr')
+        for target in (profile.canonical,) + profile.targets
+    } == before_budgets
+
+    attested = topology_state.record_profile_attestation(
+        profile_revision_id=candidate.id,
+        kind='terraform',
+        evidence={
+            'status': 'READY',
+            'observed_at': 22,
+        },
+        expected_generation=candidate.desired_generation,
+        expected_config_hash=candidate.config_hash,
+        terraform_hash='e' * 64,
+        now=22)
+    for target in (candidate_profile.canonical,) + candidate_profile.targets:
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=candidate.id,
+            kind=models.profile_attestation_key(
+                'terraform_budget', 'aws', candidate_profile.partition,
+                candidate_profile.registry_account, target.region, 'ecr'),
+            evidence={
+                'status': 'READY',
+                'observed_at': 22,
+                'provider': 'aws',
+                'partition': candidate_profile.partition,
+                'account': candidate_profile.registry_account,
+                'region': target.region,
+                'api_family': 'ecr',
+                'applied_rate_per_second': 7,
+                'burst': 3,
+            },
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            now=22)
+    for shard in before_shards:
+        target = candidate_profile.target(shard.target_id)
+        live_key = models.profile_attestation_key('infrastructure_shard',
+                                                  shard.physical_fingerprint)
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=candidate.id,
+            kind=models.profile_attestation_key('terraform_shard',
+                                                shard.physical_fingerprint),
+            evidence={
+                'status': 'READY',
+                'observed_at': 22,
+                'physical_fingerprint': shard.physical_fingerprint,
+                'target_fingerprint': shard.target_fingerprint,
+                'target': shard.target_id,
+                'max_manifests': 80,
+                'max_declared_bytes': 800_000,
+                'max_in_flight': 3,
+                'terraform_applied_quota': 100,
+                'reserved_headroom': 10,
+                'live_attestation_key': live_key,
+            },
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            now=22)
+        recorded = topology_state.record_candidate_shard_attestation(
+            profile_revision_id=candidate.id,
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            shard_id=shard.id,
+            expected_operational_revision_id=active.id,
+            expected_target_fingerprint=shard.target_fingerprint,
+            expected_physical_fingerprint=shard.physical_fingerprint,
+            expected_inventory_epoch=shard.inventory_epoch,
+            expected_inventory_completed_at=shard.inventory_completed_at,
+            kind=live_key,
+            evidence={
+                'status': 'READY',
+                'observed_at': 22,
+                'physical_fingerprint': shard.physical_fingerprint,
+                'target_fingerprint': shard.target_fingerprint,
+                'applied_images_per_repository_quota': 100,
+                'reserved_headroom': 10,
+                'inventory_epoch': shard.inventory_epoch,
+                'inventory_completed_at': shard.inventory_completed_at,
+            },
+            now=22)
+        assert recorded is not None
+        attested = recorded
+
+    stale_shard = before_shards[-1]
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == stale_shard.id).values(
+                inventory_epoch=stale_shard.inventory_epoch + 1,
+                inventory_started_at=23,
+                inventory_completed_at=23,
+                updated_at=23))
+    assert attested.attestations_hash is not None
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        transactions.activate_profile(
+            profile_revision_id=candidate.id,
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            expected_terraform_hash='e' * 64,
+            expected_attestations_hash=attested.attestations_hash,
+            required_attestations={'terraform': None},
+            now=24)
+    assert topology_state.get_active_profile('research', profile.name) == active
+    assert {
+        target.region: topology_state.get_provider_budget(
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            api_family='ecr')
+        for target in (profile.canonical,) + profile.targets
+    } == before_budgets
+    assert all(
+        shard.profile_revision_id == active.id and shard.max_manifests == 100
+        and shard.max_declared_bytes == 1_000_000 and shard.max_in_flight == 4
+        for shard in topology_state.list_shards('research', profile.name))
+
+    current = topology_state.get_shard(stale_shard.id)
+    assert current is not None and current.inventory_completed_at is not None
+    refreshed = topology_state.record_candidate_shard_attestation(
+        profile_revision_id=candidate.id,
+        expected_generation=candidate.desired_generation,
+        expected_config_hash=candidate.config_hash,
+        shard_id=current.id,
+        expected_operational_revision_id=active.id,
+        expected_target_fingerprint=current.target_fingerprint,
+        expected_physical_fingerprint=current.physical_fingerprint,
+        expected_inventory_epoch=current.inventory_epoch,
+        expected_inventory_completed_at=current.inventory_completed_at,
+        kind=models.profile_attestation_key('infrastructure_shard',
+                                            current.physical_fingerprint),
+        evidence={
+            'status': 'READY',
+            'observed_at': 25,
+            'physical_fingerprint': current.physical_fingerprint,
+            'target_fingerprint': current.target_fingerprint,
+            'applied_images_per_repository_quota': 100,
+            'reserved_headroom': 10,
+            'inventory_epoch': current.inventory_epoch,
+            'inventory_completed_at': current.inventory_completed_at,
+        },
+        now=25)
+    assert refreshed is not None and refreshed.attestations_hash is not None
+    activated = transactions.activate_profile(
+        profile_revision_id=candidate.id,
+        expected_generation=candidate.desired_generation,
+        expected_config_hash=candidate.config_hash,
+        expected_terraform_hash='e' * 64,
+        expected_attestations_hash=refreshed.attestations_hash,
+        required_attestations={'terraform': None},
+        now=26)
+
+    assert activated.id == candidate.id
+    assert all(
+        shard.profile_revision_id == candidate.id and shard.max_manifests == 80
+        and shard.max_declared_bytes == 800_000 and shard.max_in_flight == 3
+        for shard in topology_state.list_shards('research', profile.name))
+    for target in (profile.canonical,) + profile.targets:
+        budget = topology_state.get_provider_budget(
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            api_family='ecr')
+        assert budget is not None
+        assert budget.applied_rate_milli == 7_000
+        assert budget.burst_milli == 3_000
 
 
 def test_qualifying_successor_does_not_block_publish_or_prepare(
@@ -2354,6 +2652,32 @@ def test_copy_completion_cannot_finish_an_eviction_lease(
     assert retained.state == models.ImageLocationState.EVICTING
     assert retained.lease_token == eviction.lease_token
     assert after is not None and after.in_flight == 1
+
+
+def test_no_io_restore_requires_a_fresh_eviction_lease(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.locations.update().where(
+            schema.locations.c.id == eviction.id).values(lease_kind='VERIFY'))
+
+    assert topology_state.complete_eviction(eviction.id,
+                                            eviction.lease_token,
+                                            present=None,
+                                            provider_not_called=True,
+                                            now=101) is None
+    retained = topology_state.get_location(eviction.id)
+    assert retained is not None
+    assert retained.state == models.ImageLocationState.EVICTING
+    assert retained.lease_kind == 'VERIFY'
+    assert retained.lease_token == eviction.lease_token
 
 
 def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(

@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import threading
+import types
 from typing import Any
 from unittest import mock
 import uuid
@@ -13,6 +14,7 @@ import uuid
 import pytest
 
 from sky.container_images import aws
+from sky.container_images import models
 from sky.container_images import oci
 
 _MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json'
@@ -233,6 +235,151 @@ def test_terraform_manifest_parser_is_closed_typed_and_fingerprinted() -> None:
     with pytest.raises(ValueError, match='duplicate shards'):
         aws.TerraformQualificationManifest.from_json(
             _terraform_manifest([shard, shard]))
+
+
+def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    authority = '11111111-1111-4111-8111-111111111111'
+    shards: list[aws.QualifiedShard] = []
+    roles: dict[str, str] = {}
+    quotas: dict[str, int] = {}
+    for target in (profile.canonical,) + profile.targets:
+        for index in range(target.shard_count):
+            repository_name = (
+                f'{target.repository_prefix}/rtest/wtest/g00/s{index:02x}')
+            values = {
+                'workspace': 'research',
+                'target': target.name,
+                'partition': profile.partition,
+                'account': profile.registry_account,
+                'region': target.region,
+                'shard_generation': 0,
+                'shard_index': index,
+                'registry': target.registry,
+                'repository_name': repository_name,
+                'repository_arn':
+                    (f'arn:{profile.partition}:ecr:{target.region}:'
+                     f'{profile.registry_account}:repository/{repository_name}'
+                    ),
+                'encryption_type': 'AES256',
+                'kms_key_arn': None,
+                'tag_immutability': 'IMMUTABLE',
+                'scanning_mode': 'SCAN_ON_PUSH',
+                'policy_hash': '1' * 64,
+                'ownership_tags_hash': '2' * 64,
+                'max_manifests': 80,
+                'max_declared_bytes': 800_000,
+                'max_in_flight': 3,
+                'physical_fingerprint': '0' * 64,
+            }
+            provisional = aws.QualifiedShard(**values)
+            values['physical_fingerprint'] = provisional.calculated_fingerprint(
+            )
+            shards.append(aws.QualifiedShard(**values))
+        copy = profile.bindings[target.write_authority]
+        lifecycle = profile.bindings[target.qualification_delete_authority]
+        qualification_name = (
+            f'{target.repository_prefix}/rtest/qualification/{target.region}')
+        roles.update({
+            f'{target.region}:copy_role_arn': copy.authority,
+            f'{target.region}:copy_policy_hash': '3' * 64,
+            f'{target.region}:lifecycle_role_arn': lifecycle.authority,
+            f'{target.region}:lifecycle_policy_hash': '4' * 64,
+            f'{target.region}:copy_boundary_policy_hash': '5' * 64,
+            f'{target.region}:lifecycle_boundary_policy_hash': '6' * 64,
+            f'{target.region}:qualification_repo_arn':
+                (f'arn:{profile.partition}:ecr:{target.region}:'
+                 f'{profile.registry_account}:repository/{qualification_name}'),
+        })
+        quotas.update({
+            f'{target.region}:ecr_api_rate_per_second': 7,
+            f'{target.region}:ecr_api_burst': 3,
+            f'{target.region}:images_per_repository': 100,
+            f'{target.region}:reserved_headroom': 10,
+        })
+    payload = _raw({
+        'schema_version': 1,
+        'catalog_authority': authority,
+        'workspace': 'research',
+        'profile': profile.name,
+        'profile_revision': profile.revision,
+        'config_hash': profile.config_hash,
+        'physical_manifest_hash': profile.physical_manifest_hash,
+        'generated_at': 100,
+        'shards': [dataclasses.asdict(shard) for shard in shards],
+        'role_fingerprints': roles,
+        'quota_facts': quotas,
+    })
+    desired = types.SimpleNamespace(id='candidate',
+                                    desired_generation=2,
+                                    config_hash=profile.config_hash,
+                                    terraform_hash=None)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    monkeypatch.setattr(aws.catalog_state, 'get_catalog_authority_id',
+                        lambda **_kwargs: authority)
+    monkeypatch.setattr(aws.catalog_state, 'engine',
+                        mock.Mock(return_value=object()))
+    monkeypatch.setattr(aws.image_config, 'resolve_profile', lambda *_args:
+                        (profile, policy))
+    monkeypatch.setattr(aws.topology_state, 'stage_profile_revision',
+                        lambda **_kwargs: desired)
+    mutation_order: list[str] = []
+    lock_shards = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: mutation_order.append('lock'))
+    monkeypatch.setattr(aws.topology_state, 'lock_profile_shards', lock_shards)
+    upsert_shard = mock.Mock()
+    upsert_shard.side_effect = lambda *_args, **_kwargs: mutation_order.append(
+        'upsert')
+    monkeypatch.setattr(aws.topology_state, 'upsert_qualified_shard',
+                        upsert_shard)
+    ensure_budget = mock.Mock()
+    monkeypatch.setattr(aws.topology_state, 'ensure_provider_budget',
+                        ensure_budget)
+    monkeypatch.setattr(
+        aws.topology_state, 'upsert_provider_budget',
+        mock.Mock(side_effect=AssertionError('candidate mutated live budget')))
+    attest = mock.Mock(return_value=desired)
+    monkeypatch.setattr(aws.topology_state, 'record_profile_attestation',
+                        attest)
+    session = mock.MagicMock()
+    session_context = mock.MagicMock()
+    session_context.__enter__.return_value = session
+    monkeypatch.setattr(aws.orm, 'Session', lambda _engine: session_context)
+
+    result = aws.ingest_terraform_qualification(payload, now=100)
+
+    assert result is desired
+    lock_shards.assert_called_once_with(session,
+                                        workspace='research',
+                                        profile=profile.name)
+    assert mutation_order == ['lock'] + ['upsert'] * len(shards)
+    assert upsert_shard.call_count == len(shards)
+    assert ensure_budget.call_count == len((profile.canonical,) +
+                                           profile.targets)
+    shard_evidence = [
+        call.kwargs['evidence']
+        for call in attest.call_args_list
+        if call.kwargs['kind'].startswith('terraform_shard:')
+    ]
+    budget_evidence = [
+        call.kwargs['evidence']
+        for call in attest.call_args_list
+        if call.kwargs['kind'].startswith('terraform_budget:')
+    ]
+    assert len(shard_evidence) == len(shards)
+    assert all(
+        evidence['max_manifests'] == 80 and evidence['max_declared_bytes'] ==
+        800_000 and evidence['max_in_flight'] == 3
+        for evidence in shard_evidence)
+    assert len(budget_evidence) == len((profile.canonical,) + profile.targets)
+    assert all(
+        evidence['applied_rate_per_second'] == 7 and evidence['burst'] == 3
+        for evidence in budget_evidence)
 
 
 class _EcrClient:

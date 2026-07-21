@@ -718,7 +718,9 @@ demand exists, exact absence changes the location to `EVICTED`, decrements the
 reservation exactly once, and zeros the location's charged bytes. Re-admission
 or explicit retry atomically restores count and bytes before changing an
 EVICTED location to `PENDING`. A provider operation known not to have started may
-restore READY; after provider I/O, only exact presence may do so. Ambiguous
+restore READY only for its fresh `EVICT` lease; the completion transaction
+rejects that shortcut for `VERIFY` and `RECLAIM`. After provider I/O, only exact
+presence may restore READY. Ambiguous
 readback remains fenced in `EVICTING` for another worker. An expired EVICTING
 lease is always reclaimable and first performs an exact presence read. If no
 demand exists, exact presence may proceed to a newly authorized delete; if
@@ -906,16 +908,21 @@ bounded by the fixed shard ring rather than sorting a million-location cache.
 Every command that locks more than one participating row uses this order:
 
 1. a central durable consumer row, when normal cluster state participates;
-2. profile revision, provider budget, physical shard, and worker rows, ordered by
-   class and ID;
+2. all revisions for one profile ordered by ID, provider budgets ordered by
+   provider scope, physical shards ordered by ID, and worker rows;
 3. artifact and source rows, ordered by ID;
 4. canonical location before regional location, then location ID;
 5. publication and operation rows, ordered by ID; and
 6. consumer watermark and demand rows, ordered by ID.
 
 Initial insert races rely on unique constraints and restart the transaction.
-No repository function acquires an earlier class after a later one. Canonical
-completion and publication retry both lock location before publication.
+No ordinary repository function acquires an earlier class after a later one.
+Canonical completion and publication retry both lock location before
+publication. The PROFILE_CANARY queue is the one explicit class-order
+exception: claim and
+completion both lock their operation row before the referenced profile revision.
+No profile-locking transaction acquires a canary operation, so this consistent
+one-way edge cannot close a cycle.
 Inspection completion reads its publication optimistically, locks profile/shard,
 artifact/source, and location rows first, then locks and rechecks the publication
 token; an invalid token rolls the entire transaction back. Demand READY commit
@@ -1223,8 +1230,16 @@ Terraform reads the applied ECR images-per-repository quota, reserves explicit
 headroom, and emits `max_manifests_per_shard`. AWS documents a default adjustable
 limit of 100,000 images per repository in its
 [ECR service quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html).
-A Terraform handoff creates or updates shard rows as `PENDING`; desired Terraform
-output is never live qualification. The copy worker assumes only the regional
+A Terraform handoff creates a previously unseen bootstrap shard as `PENDING`;
+desired Terraform output is never live qualification. Reingesting unchanged
+bootstrap facts does not reset a completed epoch. Changing limits on an unowned
+bootstrap row waits for any inventory lease, resets it to `PENDING`, and requires
+a new complete scan. Before validation, handoff ingestion locks every existing
+physical shard for the profile in ID order. Once a shard has an operational
+revision pointer, a later handoff validates immutable identity and reservation
+floors but does not update its limits, inventory cursor, timestamps, state,
+dispatch ceiling, or revision pointer. Those candidate limits remain in the
+candidate revision's Terraform attestation. The copy worker assumes only the regional
 copy/verify role and reads every physical shard's live ARN, URI, tag immutability,
 encryption/KMS setting, scanning setting, repository policy, ownership tags, and
 applied images-per-repository service quota. It canonicalizes the policy and
@@ -1232,6 +1247,14 @@ tags and compares them to the handoff fingerprints. The first complete inventory
 must be empty. Only that live proof may promote the shard to READY and write the
 profile's per-shard attestation. Reingesting a handoff cannot turn a DRIFTED shard
 READY.
+
+Provider API budgets follow the same boundary. Qualification may create a
+missing account-region budget so first activation can make bounded probes, but
+it never rewrites an existing live budget. The candidate's applied rate and
+burst remain revision-scoped Terraform facts. Activation locks provider scopes
+in deterministic order and applies those facts in its transaction while
+preserving the persisted throttle backoff and clamping existing tokens to a
+smaller burst.
 
 The shard row also stores the target fingerprint. Its operational profile-
 revision pointer and automatic-eviction bit remain on the current active values
@@ -1258,6 +1281,16 @@ and blocks only candidate activation. Each maintenance pass probes at most 16
 missing shards per target through the persisted provider budget; the current
 ACTIVE revision remains available while larger rings converge in the
 background.
+
+Activation locks every revision for the profile in ID order, then every shared
+provider budget in provider-scope order, then every physical shard in ID order.
+For each shard it rechecks the candidate Terraform limits, exact target and
+physical fingerprints, a fresh live proof for the shard's current inventory
+epoch, the absence of an inventory lease, and either an unowned bootstrap slot
+or the still-ACTIVE operational pointer. It then applies candidate capacity,
+dispatch, eviction, and revision values, retires the old revision, and promotes
+the candidate in the same transaction. Any stale epoch, failed reservation
+floor, mismatched ring, or invalid budget rolls back every operational update.
 
 A managed target first activates only when every workspace shard and the cleaned
 qualification repository are empty, fingerprints match, and hard ceilings are no
@@ -1976,3 +2009,44 @@ uncommitted INIT and preserves the live fence. It also requires durable terminal
 request evidence before the 24-hour unattached-demand fallback, makes corrupt
 legacy handles fall back to conservative reconciliation, and removes the unused
 persisted-plan bypass scaffolding identified by Fable.
+
+Implementation review rounds 10 and 11 independently repeated the exact
+immutable `1c88a6f9b5a0bacdc645d0cfb6eb558633d1e7cf` tree and both returned paired
+Codex `PURSUE` and Fable `PURSUE`. Round 10 established the first acceptance in
+that streak, and round 11 deliberately retraced the cluster-incarnation and
+owner-retirement schedules without finding another blocker.
+
+Implementation review round 12 at
+`c53a1d4b527927ef32d6aaf2032baf6d4fb0b0b0` returned Codex `PURSUE` and Fable
+`RESHAPE`, resetting the streak. Fable found that an expired eviction with a
+new live demand could remain unreclaimable, and that a new authorized demand
+could find an EVICTED or MISSING row without re-admitting it. The next revision
+made expired work exact-read reclaimable and routed new and replayed demand
+through the fenced re-admission transaction.
+
+Implementation review round 13 at
+`2df8f2d7e935b2cf02d82c83ec96dfe3855d6e03` returned paired Codex `RESHAPE` and
+Fable `RESHAPE`. The union identified lifecycle authority selected from a newer
+revision, global eviction starvation behind one locked shard, immediate eviction
+of never-used prepared bytes, an inert per-workspace retention opt-out, and a
+false no-I/O restore after an earlier provider attempt. The next revision pinned
+lifecycle to the shard's operational revision, made dispatch shard-first with
+`SKIP LOCKED`, used the verified/created retention anchor, honored workspace
+opt-out, and separated fresh EVICT, VERIFY, and RECLAIM completion semantics.
+
+Implementation review round 14 at
+`ecd3d1f1c16f2d306afa971f64f2021715ed5da2` returned Codex `RESHAPE` and Fable
+`PURSUE`. Codex proved that inventory could borrow a same-ring QUALIFYING
+revision's authority and mark the ACTIVE shard DRIFTED. The next revision bound
+operational inventory to the shard's exact ACTIVE or RETIRED pointer and added
+the read-only, epoch-fenced candidate probe described above.
+
+Implementation review round 15 at
+`afde6539019587b7512488be9a08a67b3cb359d4` returned Codex `RESHAPE` and Fable
+`PURSUE`. Codex proved that Terraform handoff ingestion still rewrote ACTIVE
+shard limits, inventory timestamps, and shared provider budgets before candidate
+activation. This revision keeps those facts revision-scoped, makes existing
+budgets create-only during qualification, rechecks live quota and inventory
+epoch under locks, and applies capacity, dispatch, budget, eviction, and revision
+changes atomically during activation. It also aligns profile-row lock order and
+enforces the fresh-EVICT-only no-I/O restore rule in the database transaction.

@@ -50,6 +50,10 @@ def _attestation_requirements(
 ) -> dict[str, int | None]:
     required: dict[str, int | None] = {'terraform': None}
     for target in (profile.canonical,) + profile.targets:
+        required[models.profile_attestation_key('terraform_budget', 'aws',
+                                                profile.partition,
+                                                profile.registry_account,
+                                                target.region, 'ecr')] = None
         required[models.profile_attestation_key('terraform_target',
                                                 target.name)] = None
         required[models.profile_attestation_key(

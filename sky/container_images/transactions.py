@@ -1054,6 +1054,96 @@ def commit_ready_demand(*,
             updated)
 
 
+def _activation_budget_facts(
+    profile: models.ManagedRegistryProfile,
+    attestations: dict[str, Any],
+    *,
+    now: int,
+) -> list[dict[str, Any]]:
+    """Returns exact candidate budget facts in a global lock order."""
+    facts: list[dict[str, Any]] = []
+    expected_shape = {
+        'status', 'observed_at', 'provider', 'partition', 'account', 'region',
+        'api_family', 'applied_rate_per_second', 'burst'
+    }
+    for target in (profile.canonical,) + profile.targets:
+        key = models.profile_attestation_key('terraform_budget', 'aws',
+                                             profile.partition,
+                                             profile.registry_account,
+                                             target.region, 'ecr')
+        evidence = attestations.get(key)
+        if (not isinstance(evidence, dict) or set(evidence) != expected_shape or
+                evidence.get('status') != 'READY' or
+                type(evidence.get('observed_at')) is not int or
+                not 0 <= now - evidence['observed_at'] or
+                evidence.get('provider') != 'aws' or
+                evidence.get('partition') != profile.partition or
+                evidence.get('account') != profile.registry_account or
+                evidence.get('region') != target.region or
+                evidence.get('api_family') != 'ecr' or
+                type(evidence.get('applied_rate_per_second')) is not int or
+                evidence['applied_rate_per_second'] <= 0 or
+                type(evidence.get('burst')) is not int or
+                not 1 <= evidence['burst'] <= 64):
+            raise ValueError('QUALIFICATION_FAILED')
+        facts.append(evidence)
+    return sorted(facts,
+                  key=lambda item: (item['provider'], item['partition'], item[
+                      'account'], item['region'], item['api_family']))
+
+
+def _activation_shard_capacities(
+        shard: sqlalchemy.engine.RowMapping,
+        target: models.ManagedRegistryTarget,
+        attestations: dict[str, Any]) -> tuple[int, int, int]:
+    """Validates revision-scoped limits and live proof for one locked shard."""
+    physical_fingerprint = str(shard['physical_fingerprint'])
+    terraform_key = models.profile_attestation_key('terraform_shard',
+                                                   physical_fingerprint)
+    live_key = models.profile_attestation_key('infrastructure_shard',
+                                              physical_fingerprint)
+    expected = attestations.get(terraform_key)
+    live = attestations.get(live_key)
+    if (not isinstance(expected, dict) or expected.get('status') != 'READY' or
+            expected.get('physical_fingerprint') != physical_fingerprint or
+            expected.get('target_fingerprint') != target.target_fingerprint or
+            expected.get('target') != target.name or
+            expected.get('live_attestation_key') != live_key or
+            not isinstance(live, dict) or live.get('status') != 'READY' or
+            type(live.get('observed_at')) is not int or
+            live.get('physical_fingerprint') != physical_fingerprint or
+            live.get('target_fingerprint') != target.target_fingerprint or
+            type(live.get('inventory_epoch')) is not int or
+            live['inventory_epoch'] != int(shard['inventory_epoch']) or
+            type(live.get('inventory_completed_at')) is not int or
+            live['inventory_completed_at'] != shard['inventory_completed_at'] or
+            shard['inventory_lease_token'] is not None):
+        raise ValueError('QUALIFICATION_FAILED')
+    max_manifests = expected.get('max_manifests')
+    max_declared_bytes = expected.get('max_declared_bytes')
+    max_in_flight = expected.get('max_in_flight')
+    terraform_quota = expected.get('terraform_applied_quota')
+    reserved_headroom = expected.get('reserved_headroom')
+    applied_quota = live.get('applied_images_per_repository_quota')
+    live_headroom = live.get('reserved_headroom')
+    if (type(max_manifests) is not int or max_manifests <= 0 or
+            max_manifests > target.max_manifests_per_shard or
+            type(max_declared_bytes) is not int or max_declared_bytes <= 0 or
+            max_declared_bytes > target.max_declared_bytes_per_shard or
+            type(max_in_flight) is not int or max_in_flight <= 0 or
+            max_in_flight > target.max_in_flight or
+            type(terraform_quota) is not int or terraform_quota <= 0 or
+            type(reserved_headroom) is not int or reserved_headroom < 0 or
+            type(applied_quota) is not int or applied_quota < terraform_quota or
+            live_headroom != reserved_headroom or
+            max_manifests + reserved_headroom > applied_quota or
+            max_manifests < int(shard['reserved_manifests']) or
+            max_declared_bytes < int(shard['reserved_declared_bytes']) or
+            max_in_flight < int(shard['in_flight'])):
+        raise ValueError('QUALIFICATION_FAILED')
+    return max_manifests, max_declared_bytes, max_in_flight
+
+
 def activate_profile(
         *,
         profile_revision_id: str,
@@ -1067,9 +1157,22 @@ def activate_profile(
     current = int(time.time()) if now is None else now
     table = schema.profile_revisions
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        desired = session.execute(
-            sqlalchemy.select(table).where(table.c.id == profile_revision_id).
-            with_for_update()).mappings().one()
+        optimistic = session.execute(
+            sqlalchemy.select(table.c.workspace, table.c.profile).where(
+                table.c.id == profile_revision_id)).first()
+        if optimistic is None:
+            raise topology_state.StaleProfileRevisionError(
+                'Qualification result no longer exists.')
+        profile_rows = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.workspace == optimistic.workspace,
+                table.c.profile == optimistic.profile).order_by(
+                    table.c.id).with_for_update()).mappings().all()
+        desired = next((row for row in profile_rows
+                        if str(row['id']) == profile_revision_id), None)
+        if desired is None:
+            raise topology_state.StaleProfileRevisionError(
+                'Qualification result no longer exists.')
         if (str(desired['state']) != models.ImageProfileState.QUALIFYING.value
                 or int(desired['desired_generation']) != expected_generation or
                 str(desired['config_hash']) != expected_config_hash or
@@ -1088,43 +1191,66 @@ def activate_profile(
                 (max_age_seconds is not None and
                  current - evidence['observed_at'] > max_age_seconds)):
                 raise ValueError('QUALIFICATION_FAILED')
-        shard_failure = session.execute(
-            sqlalchemy.select(schema.registry_shards.c.id).where(
-                schema.registry_shards.c.workspace == desired['workspace'],
-                schema.registry_shards.c.profile == desired['profile'],
-                schema.registry_shards.c.state.not_in([
-                    models.ImageShardState.READY.value,
-                    models.ImageShardState.FULL.value,
-                ])).limit(1)).first()
-        if shard_failure is not None:
-            raise ValueError('QUALIFICATION_FAILED')
         configured = models.ManagedRegistryProfile.from_snapshot(
             json.loads(str(desired['config_json'])))
+        budget_facts = _activation_budget_facts(configured,
+                                                attestations,
+                                                now=current)
+        for fact in budget_facts:
+            topology_state.upsert_provider_budget_in_session(
+                session,
+                provider=fact['provider'],
+                partition=fact['partition'],
+                account=fact['account'],
+                region=fact['region'],
+                api_family=fact['api_family'],
+                applied_rate_per_second=fact['applied_rate_per_second'],
+                burst=fact['burst'],
+                now=current)
         shards = schema.registry_shards
         targets = (configured.canonical,) + configured.targets
-        shard_count = session.execute(
-            sqlalchemy.select(
-                sqlalchemy.func.count()  # pylint: disable=not-callable
-            ).select_from(shards).where(
+        target_by_name = {target.name: target for target in targets}
+        shard_rows = session.execute(
+            sqlalchemy.select(shards).where(
                 shards.c.workspace == desired['workspace'],
-                shards.c.profile == desired['profile'])).scalar_one()
-        if shard_count != sum(target.shard_count for target in targets):
+                shards.c.profile == desired['profile']).order_by(
+                    shards.c.id).with_for_update()).mappings().all()
+        if len(shard_rows) != sum(target.shard_count for target in targets):
             raise ValueError('QUALIFICATION_FAILED')
-        session.execute(shards.update().where(
-            shards.c.workspace == desired['workspace'],
-            shards.c.profile == desired['profile']).values(
-                eviction_enabled=False, updated_at=current))
-        for target in targets:
-            changed = session.execute(shards.update().where(
-                shards.c.workspace == desired['workspace'],
-                shards.c.profile == desired['profile'],
-                shards.c.target_id == target.name, shards.c.target_fingerprint
-                == target.target_fingerprint).values(
+        target_counts = {target.name: 0 for target in targets}
+        active_ids = {
+            str(row['id'])
+            for row in profile_rows
+            if str(row['state']) == models.ImageProfileState.ACTIVE.value
+        }
+        for shard in shard_rows:
+            target = target_by_name.get(str(shard['target_id']))
+            if (target is None or
+                    shard['target_fingerprint'] != target.target_fingerprint or
+                    str(shard['state'])
+                    not in (models.ImageShardState.READY.value,
+                            models.ImageShardState.FULL.value) or
+                (shard['profile_revision_id'] is not None and
+                 str(shard['profile_revision_id']) not in active_ids)):
+                raise ValueError('QUALIFICATION_FAILED')
+            target_counts[target.name] += 1
+            max_manifests, max_declared_bytes, max_in_flight = (
+                _activation_shard_capacities(shard, target, attestations))
+            full = (int(shard['reserved_manifests']) >= max_manifests or
+                    int(shard['reserved_declared_bytes']) >= max_declared_bytes)
+            session.execute(
+                shards.update().where(shards.c.id == shard['id']).values(
                     profile_revision_id=profile_revision_id,
                     eviction_enabled=(target.delete_authority is not None),
-                    updated_at=current)).rowcount
-            if changed != target.shard_count:
-                raise ValueError('QUALIFICATION_FAILED')
+                    max_manifests=max_manifests,
+                    max_declared_bytes=max_declared_bytes,
+                    max_in_flight=max_in_flight,
+                    state=(models.ImageShardState.FULL.value
+                           if full else models.ImageShardState.READY.value),
+                    updated_at=current))
+        if any(target_counts[target.name] != target.shard_count
+               for target in targets):
+            raise ValueError('QUALIFICATION_FAILED')
         session.execute(table.update().where(
             table.c.workspace == desired['workspace'],
             table.c.profile == desired['profile'],
