@@ -814,7 +814,7 @@ def add_or_update_cluster(cluster_name: str,
                           existing_cluster_hash: str | None = None,
                           workload_type: str | None = None,
                           workload_id: str | None = None,
-                          workload_task_id: int | None = None):
+                          workload_task_id: int | None = None) -> str:
     """Adds or updates cluster_name -> cluster_handle mapping.
 
     Args:
@@ -836,6 +836,9 @@ def add_or_update_cluster(cluster_name: str,
         workload_type: Best-effort cost attribution type.
         workload_id: Best-effort cost attribution identifier.
         workload_task_id: Managed-job task ID, when available.
+
+    Returns:
+        The stable hash identifying the inserted or updated cluster generation.
     """
     engine = _db_manager.get_engine()
 
@@ -891,8 +894,9 @@ def add_or_update_cluster(cluster_name: str,
     # when the cluster failover through multiple regions (one entry per region).
     # It can be more inaccurate for the multi-node cluster
     # as the failover can have the nodes partially UP.
-    cluster_hash = _get_hash_for_existing_cluster(cluster_name) or str(
-        uuid.uuid4())
+    cluster_hash = (existing_cluster_hash or
+                    _get_hash_for_existing_cluster(cluster_name) or
+                    str(uuid.uuid4()))
     usage_intervals = _get_cluster_usage_intervals(cluster_hash)
     usage_intervals_changed = False
 
@@ -1140,6 +1144,7 @@ def add_or_update_cluster(cluster_name: str,
         session.execute(do_update_stmt)
 
         session.commit()
+    return cluster_hash
 
 
 @db_retries.retry
@@ -1151,7 +1156,8 @@ def add_cluster_event(cluster_name: str,
                       nop_if_duplicate: bool = False,
                       duplicate_regex: str | None = None,
                       expose_duplicate_error: bool = False,
-                      transitioned_at: int | None = None) -> None:
+                      transitioned_at: int | None = None,
+                      existing_cluster_hash: str | None = None) -> None:
     """Add a cluster event.
 
     Args:
@@ -1165,6 +1171,8 @@ def add_cluster_event(cluster_name: str,
         expose_duplicate_error: If True, raise an error if the event is a
             duplicate. Only used if nop_if_duplicate is True.
         transitioned_at: If provided, use this timestamp for the event.
+        existing_cluster_hash: If provided, add the event only when the current
+            row has this cluster-generation hash.
     """
     engine = _db_manager.get_engine()
     if transitioned_at is None:
@@ -1182,9 +1190,12 @@ def add_cluster_event(cluster_name: str,
         # Read hash and status in a single query so they come from the same
         # row snapshot (a separate hash pre-fetch could pair a stale hash
         # with a newer status under concurrent removal/re-creation).
-        cluster_row = session.query(
+        query = session.query(
             cluster_table.c.cluster_hash,
-            cluster_table.c.status).filter_by(name=cluster_name).first()
+            cluster_table.c.status).filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        cluster_row = query.first()
         if cluster_row is None or cluster_row.cluster_hash is None:
             logger.debug(f'Hash for cluster {cluster_name} not found. '
                          'Skipping event.')
@@ -1610,7 +1621,8 @@ def _get_user_hash_or_current_user(user_hash: str | None) -> str:
 
 @metrics_lib.time_me
 def update_cluster_handle(cluster_name: str,
-                          cluster_handle: 'backends.ResourceHandle'):
+                          cluster_handle: 'backends.ResourceHandle',
+                          existing_cluster_hash: str | None = None) -> None:
     engine = _db_manager.get_engine()
     handle = pickle.dumps(cluster_handle)
 
@@ -1624,17 +1636,27 @@ def update_cluster_handle(cluster_name: str,
     update_dict: dict[Any, Any] = {cluster_table.c.handle: handle}
 
     with orm.Session(engine) as session:
+        query = session.query(cluster_table).filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
         if current_names is not None:
-            row = session.query(cluster_table.c.node_names).filter_by(
-                name=cluster_name).with_for_update().first()
+            node_names_query = session.query(
+                cluster_table.c.node_names).filter_by(name=cluster_name)
+            if existing_cluster_hash is not None:
+                node_names_query = node_names_query.filter_by(
+                    cluster_hash=existing_cluster_hash)
+            row = node_names_query.with_for_update().first()
             existing_json = row.node_names if row else None
             node_names = common_utils.merge_node_names_lineage(
                 existing_json, current_names)
             update_dict[cluster_table.c.node_names] = node_names
 
-        session.query(cluster_table).filter_by(
-            name=cluster_name).update(update_dict)
+        count = query.update(update_dict)
         session.commit()
+    assert count <= 1, count
+    if count == 0 and existing_cluster_hash is not None:
+        raise ValueError(f'Cluster {cluster_name} with hash '
+                         f'{existing_cluster_hash} not found.')
 
 
 @metrics_lib.time_me
@@ -1705,12 +1727,17 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
 @db_retries.retry
 @metrics_lib.time_me
 def get_handle_from_cluster_name(
-        cluster_name: str) -> Optional['backends.ResourceHandle']:
+    cluster_name: str,
+    existing_cluster_hash: str | None = None
+) -> Optional['backends.ResourceHandle']:
     engine = _db_manager.get_engine()
     assert cluster_name is not None, 'cluster_name cannot be None'
     with orm.Session(engine) as session:
-        row = (session.query(
-            cluster_table.c.handle).filter_by(name=cluster_name).first())
+        query = session.query(
+            cluster_table.c.handle).filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        row = query.first()
     if row is None:
         return None
     return pickle.loads(row.handle)
@@ -2085,20 +2112,25 @@ def _set_cluster_usage_intervals(
 
 
 @metrics_lib.time_me
-def set_owner_identity_for_cluster(cluster_name: str,
-                                   owner_identity: list[str] | None) -> None:
+def set_owner_identity_for_cluster(
+        cluster_name: str,
+        owner_identity: list[str] | None,
+        existing_cluster_hash: str | None = None) -> None:
     engine = _db_manager.get_engine()
     if owner_identity is None:
         return
     owner_identity_str = json.dumps(owner_identity)
     with orm.Session(engine) as session:
-        count = session.query(cluster_table).filter_by(
-            name=cluster_name).update(
-                {cluster_table.c.owner: owner_identity_str})
+        query = session.query(cluster_table).filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        count = query.update({cluster_table.c.owner: owner_identity_str})
         session.commit()
     assert count <= 1, count
     if count == 0:
-        raise ValueError(f'Cluster {cluster_name} not found.')
+        suffix = (f' with hash {existing_cluster_hash}'
+                  if existing_cluster_hash is not None else '')
+        raise ValueError(f'Cluster {cluster_name}{suffix} not found.')
 
 
 @metrics_lib.time_me

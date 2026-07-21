@@ -6,10 +6,14 @@ polling every second, and directly-reachable targets must be verified with
 a proxy-less handshake (which authorizes the SSM bypass in ssm_direct).
 Quota-free transports keep the tight 1s cadence.
 """
+from unittest import mock
+
 import pytest
 
+from sky import exceptions
 from sky.provision import common as provision_common
 from sky.provision import provisioner
+from sky.utils import resources_utils
 from sky.utils import ssm_direct
 
 # Matches ssm_direct.is_skypilot_ssm_proxy (bypass-eligible).
@@ -18,6 +22,30 @@ FULL_SSM_PROXY = (
     'aws ssm start-session --target "$(aws ec2 describe-instances)" '
     '--region us-east-1 --document-name AWS-StartSSHSession '
     '--parameters portNumber=%p')
+
+
+def test_post_provision_setup_reports_removed_cluster(monkeypatch):
+    launched_resources = mock.Mock()
+    launched_resources.cloud = mock.Mock()
+    cluster_info = mock.Mock()
+    provision_record = mock.Mock(region='us-east-1')
+    monkeypatch.setattr(provisioner.global_user_state, 'get_cluster_yaml_dict',
+                        lambda _: {})
+    monkeypatch.setattr(provisioner.provision, 'get_cluster_info',
+                        lambda *args, **kwargs: cluster_info)
+    monkeypatch.setattr(provisioner.global_user_state,
+                        'get_handle_from_cluster_name',
+                        lambda *args, **kwargs: None)
+
+    with pytest.raises(exceptions.ClusterDoesNotExist,
+                       match='removed or replaced'):
+        provisioner._post_provision_setup(  # pylint: disable=protected-access
+            launched_resources,
+            resources_utils.ClusterName('race', 'race-on-cloud'),
+            '/tmp/cluster.yaml',
+            provision_record,
+            custom_resource=None,
+            existing_cluster_hash='stale-hash')
 
 
 def test_provisioner_facade_owns_ssh_wait_callables():

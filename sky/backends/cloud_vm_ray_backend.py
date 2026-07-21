@@ -1158,6 +1158,7 @@ class RetryingVmProvisioner:
             prev_handle: Optional['CloudVmRayResourceHandle'],
             prev_cluster_ever_up: bool,
             prev_config_hash: str | None,
+            prev_cluster_hash: str | None = None,
         ) -> None:
             assert cluster_name is not None, 'cluster_name must be specified.'
             self.cluster_name = cluster_name
@@ -1167,6 +1168,7 @@ class RetryingVmProvisioner:
             self.prev_handle = prev_handle
             self.prev_cluster_ever_up = prev_cluster_ever_up
             self.prev_config_hash = prev_config_hash
+            self.prev_cluster_hash = prev_cluster_hash
 
     def __init__(self,
                  log_dir: str,
@@ -1197,6 +1199,7 @@ class RetryingVmProvisioner:
         self._extra_launch_context: dict[str, Any] = extra_launch_context
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
+        self._active_cluster_hash: str | None = None
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
@@ -1236,7 +1239,12 @@ class RetryingVmProvisioner:
                 # prev_resources.zone field may not be set before the previous
                 # cluster is launched.
                 handle = global_user_state.get_handle_from_cluster_name(
-                    cluster_name)
+                    cluster_name,
+                    existing_cluster_hash=self._active_cluster_hash)
+                if handle is None:
+                    raise exceptions.ClusterDoesNotExist(
+                        f'Cluster {cluster_name!r} was removed or replaced '
+                        'while provisioning was in progress.')
                 assert isinstance(handle, CloudVmRayResourceHandle), (
                     'handle should be CloudVmRayResourceHandle (found: '
                     f'{type(handle)}) {cluster_name!r}')
@@ -1576,6 +1584,7 @@ class RetryingVmProvisioner:
                         'Skipping provisioning of cluster with matching '
                         'config hash.')
                     config_dict['provisioning_skipped'] = True
+                    config_dict['cluster_hash'] = self._active_cluster_hash
                     return config_dict
                 config_dict['provisioning_skipped'] = False
 
@@ -1624,27 +1633,34 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
-                global_user_state.add_or_update_cluster(
-                    cluster_name,
-                    cluster_handle=handle,
-                    requested_resources=requested_resources,
-                    ready=False,
-                    is_managed=self._is_managed,
-                    provision_log_path=log_abs_path,
-                    workload_type=self._workload_type,
-                    workload_id=workload_id,
-                    workload_task_id=workload_task_id,
-                )
+                self._active_cluster_hash = (
+                    global_user_state.add_or_update_cluster(
+                        cluster_name,
+                        cluster_handle=handle,
+                        requested_resources=requested_resources,
+                        ready=False,
+                        is_managed=self._is_managed,
+                        provision_log_path=log_abs_path,
+                        workload_type=self._workload_type,
+                        workload_id=workload_id,
+                        workload_task_id=workload_task_id,
+                        existing_cluster_hash=self._active_cluster_hash,
+                    ))
+                config_dict['cluster_hash'] = self._active_cluster_hash
 
                 # Add cluster event for actual provisioning start.
                 global_user_state.add_cluster_event(
-                    cluster_name, status_lib.ClusterStatus.INIT,
+                    cluster_name,
+                    status_lib.ClusterStatus.INIT,
                     f'Provisioning on {to_provision.cloud.display_name()} ' +
                     f'in {to_provision.region}',
-                    global_user_state.ClusterEventType.STATUS_CHANGE)
+                    global_user_state.ClusterEventType.STATUS_CHANGE,
+                    existing_cluster_hash=self._active_cluster_hash)
 
                 global_user_state.set_owner_identity_for_cluster(
-                    cluster_name, cloud_user_identity)
+                    cluster_name,
+                    cloud_user_identity,
+                    existing_cluster_hash=self._active_cluster_hash)
 
                 if (to_provision.cloud.PROVISIONER_VERSION ==
                         clouds.ProvisionerVersion.SKYPILOT):
@@ -2295,6 +2311,7 @@ class RetryingVmProvisioner:
         prev_cluster_status = to_provision_config.prev_cluster_status
         prev_handle = to_provision_config.prev_handle
         prev_cluster_ever_up = to_provision_config.prev_cluster_ever_up
+        self._active_cluster_hash = to_provision_config.prev_cluster_hash
         launchable_retries_disabled = (self._dag is None or
                                        self._optimize_target is None)
         skip_if_config_hash_matches = (to_provision_config.prev_config_hash if
@@ -4145,12 +4162,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # ('handle', 'provision_record', 'resources_vars')
                 # We need to return the handle - but it should be the existing
                 # handle for the cluster.
+                cluster_hash = config_dict.get('cluster_hash')
                 handle = global_user_state.get_handle_from_cluster_name(
-                    cluster_name)
-                assert handle is not None, (cluster_name, handle)
+                    cluster_name, existing_cluster_hash=cluster_hash)
+                if handle is None:
+                    raise exceptions.ClusterDoesNotExist(
+                        f'Cluster {cluster_name!r} was removed or replaced '
+                        'while provisioning was in progress.')
                 return handle, True
 
             config_hash = config_dict.get('config_hash')
+            cluster_hash = config_dict['cluster_hash']
             if 'provision_record' in config_dict:
                 # New provisioner is used here.
                 handle = config_dict['handle']
@@ -4182,9 +4204,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
                     # Add cluster event for runtime setup start
                     global_user_state.add_cluster_event(
-                        handle.cluster_name, status_lib.ClusterStatus.INIT,
+                        handle.cluster_name,
+                        status_lib.ClusterStatus.INIT,
                         'Setting up SkyPilot runtime on cluster',
-                        global_user_state.ClusterEventType.STATUS_CHANGE)
+                        global_user_state.ClusterEventType.STATUS_CHANGE,
+                        existing_cluster_hash=cluster_hash)
 
                     cluster_info = provisioner.post_provision_runtime_setup(
                         handle.launched_resources,
@@ -4193,7 +4217,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         handle.cluster_yaml,
                         provision_record=provision_record,
                         custom_resource=resources_vars.get('custom_resources'),
-                        log_dir=self.log_dir)
+                        log_dir=self.log_dir,
+                        existing_cluster_hash=cluster_hash)
                 # We use the IPs from the cluster_info to update_cluster_ips,
                 # when the provisioning is done, to make sure the cluster IPs
                 # are up-to-date.
@@ -4213,7 +4238,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
                 self._update_after_cluster_provisioned(
                     handle, to_provision_config.prev_handle, task,
-                    prev_cluster_status, config_hash)
+                    prev_cluster_status, config_hash, cluster_hash)
                 return handle, False
 
             cluster_config_file = config_dict['ray']
@@ -4278,7 +4303,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
             self._update_after_cluster_provisioned(
                 handle, to_provision_config.prev_handle, task,
-                prev_cluster_status, config_hash)
+                prev_cluster_status, config_hash, cluster_hash)
             return handle, False
 
     def _open_ports(self, handle: CloudVmRayResourceHandle) -> None:
@@ -4300,7 +4325,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self, handle: CloudVmRayResourceHandle,
             prev_handle: CloudVmRayResourceHandle | None, task: task_lib.Task,
             prev_cluster_status: status_lib.ClusterStatus | None,
-            config_hash: str | None) -> None:
+            config_hash: str | None, cluster_hash: str) -> None:
         usage_lib.messages.usage.update_cluster_resources(
             handle.launched_nodes, handle.launched_resources)
         usage_lib.messages.usage.update_final_cluster_status(
@@ -4395,14 +4420,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ready=True,
                 config_hash=config_hash,
                 task_config=user_specified_task_config,
+                existing_cluster_hash=cluster_hash,
             )
 
             # Add cluster event for successful provisioning.
             global_user_state.add_cluster_event(
-                handle.cluster_name, status_lib.ClusterStatus.UP,
+                handle.cluster_name,
+                status_lib.ClusterStatus.UP,
                 'Cluster successfully provisioned with ' +
                 f'{handle.launched_nodes} nodes',
-                global_user_state.ClusterEventType.STATUS_CHANGE)
+                global_user_state.ClusterEventType.STATUS_CHANGE,
+                existing_cluster_hash=cluster_hash)
 
             usage_lib.messages.usage.update_final_cluster_status(
                 status_lib.ClusterStatus.UP)
@@ -6523,6 +6551,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # cluster is terminated (through console or auto-down), the record will
         # become None and the cluster_ever_up should be considered as False.
         cluster_ever_up = record is not None and record['cluster_ever_up']
+        prev_cluster_hash = (record['cluster_hash']
+                             if record is not None else None)
         prev_config_hash = record['config_hash'] if record is not None else None
         logger.debug(f'cluster_ever_up: {cluster_ever_up}')
         logger.debug(f'record: {record}')
@@ -6735,7 +6765,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 prev_cluster_status=prev_cluster_status,
                 prev_handle=handle,
                 prev_cluster_ever_up=cluster_ever_up,
-                prev_config_hash=prev_config_hash)
+                prev_config_hash=prev_config_hash,
+                prev_cluster_hash=prev_cluster_hash)
         usage_lib.messages.usage.set_new_cluster()
         # Use the task_cloud, because the cloud in `to_provision` can be changed
         # later during the retry.
@@ -6785,7 +6816,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             prev_cluster_status=None,
             prev_handle=None,
             prev_cluster_ever_up=False,
-            prev_config_hash=prev_config_hash)
+            prev_config_hash=prev_config_hash,
+            prev_cluster_hash=None)
 
     def _execute_storage_mounts(
             self, handle: CloudVmRayResourceHandle,
