@@ -1,11 +1,50 @@
 """Tests for the Kubernetes autodown event breadcrumb reader."""
 import datetime
-from typing import Optional
+import inspect
+import pickle
+from typing import Any, get_type_hints, Optional
 from unittest import mock
 
+from sky.provision.kubernetes import autostop_events
 from sky.provision.kubernetes import instance as k8s_instance
 
 _PROVIDER_CONFIG = {'namespace': 'sky-ns', 'context': 'my-ctx'}
+
+
+def test_autostop_event_instance_surface_is_stable():
+    expected_parameters = {
+        'emit_autostop_event_best_effort':
+            ('provider_config', 'cluster_name_on_cloud'),
+        'get_cluster_autostop_event':
+            ('provider_config', 'cluster_name_on_cloud', 'since'),
+    }
+    expected_type_hints = {
+        'emit_autostop_event_best_effort': {
+            'provider_config': dict[str, Any],
+            'cluster_name_on_cloud': str,
+            'return': type(None),
+        },
+        'get_cluster_autostop_event': {
+            'provider_config': dict[str, Any],
+            'cluster_name_on_cloud': str,
+            'since': float | None,
+            'return': dict[str, Any] | None,
+        },
+    }
+
+    assert k8s_instance.AUTOSTOP_EVENT_REASON == 'SkyPilotAutodown'
+    for name, parameter_names in expected_parameters.items():
+        symbol = getattr(k8s_instance, name)
+        signature = inspect.signature(symbol)
+        assert tuple(signature.parameters) == parameter_names
+        assert get_type_hints(symbol) == expected_type_hints[name]
+        assert symbol.__module__ == k8s_instance.__name__
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
+        assert symbol is getattr(autostop_events, name)
+
+    get_event_signature = inspect.signature(
+        k8s_instance.get_cluster_autostop_event)
+    assert get_event_signature.parameters['since'].default is None
 
 
 def _make_event(name: str,
@@ -36,9 +75,53 @@ def _patch_core_api(monkeypatch, events=None, raises=None):
     return core_api_mock
 
 
+def test_emit_autostop_event_preserves_gateway_contract(monkeypatch):
+    core_api_mock = _patch_core_api(monkeypatch)
+    k8s_client = mock.MagicMock()
+    monkeypatch.setattr(k8s_instance.kubernetes.kubernetes, 'client',
+                        k8s_client)
+
+    k8s_instance.emit_autostop_event_best_effort(_PROVIDER_CONFIG,
+                                                 'my-cluster-abc')
+
+    k8s_client.V1ObjectMeta.assert_called_once()
+    metadata_kwargs = k8s_client.V1ObjectMeta.call_args.kwargs
+    assert metadata_kwargs['namespace'] == 'sky-ns'
+    assert metadata_kwargs['name'].startswith(
+        'my-cluster-abc-head.skyautodown.')
+    k8s_client.V1ObjectReference.assert_called_once_with(
+        kind='Pod', name='my-cluster-abc-head', namespace='sky-ns')
+    k8s_client.V1EventSource.assert_called_once_with(
+        component='skypilot-skylet')
+    event_kwargs = k8s_client.CoreV1Event.call_args.kwargs
+    assert event_kwargs['reason'] == 'SkyPilotAutodown'
+    assert event_kwargs['message'] == (
+        'Cluster is autodowning after reaching its idle timeout.')
+    assert event_kwargs['type'] == 'Normal'
+    assert event_kwargs['first_timestamp'] == event_kwargs['last_timestamp']
+    assert event_kwargs['first_timestamp'].tzinfo == datetime.timezone.utc
+    core_api_mock.create_namespaced_event.assert_called_once_with(
+        'sky-ns',
+        k8s_client.CoreV1Event.return_value,
+        _request_timeout=k8s_instance.kubernetes.API_TIMEOUT)
+
+
+def test_emit_autostop_event_never_raises(monkeypatch):
+    core_api_mock = _patch_core_api(monkeypatch)
+    k8s_client = mock.MagicMock()
+    k8s_client.CoreV1Event.side_effect = RuntimeError('bad event payload')
+    monkeypatch.setattr(k8s_instance.kubernetes.kubernetes, 'client',
+                        k8s_client)
+
+    k8s_instance.emit_autostop_event_best_effort(_PROVIDER_CONFIG,
+                                                 'my-cluster-abc')
+
+    core_api_mock.create_namespaced_event.assert_not_called()
+
+
 def test_autostop_event_matches_head_pod(monkeypatch):
     ts = datetime.datetime(2026, 6, 5, tzinfo=datetime.timezone.utc)
-    _patch_core_api(
+    core_api_mock = _patch_core_api(
         monkeypatch,
         events=[_make_event('my-cluster-abc-head', last_timestamp=ts)])
 
@@ -48,6 +131,10 @@ def test_autostop_event_matches_head_pod(monkeypatch):
     assert result is not None
     assert result['reason'] == k8s_instance.AUTOSTOP_EVENT_REASON
     assert result['transitioned_at'] == int(ts.timestamp())
+    core_api_mock.list_namespaced_event.assert_called_once_with(
+        'sky-ns',
+        field_selector='reason=SkyPilotAutodown',
+        _request_timeout=k8s_instance.kubernetes.API_TIMEOUT)
 
 
 def test_autostop_event_ignores_other_clusters(monkeypatch):
