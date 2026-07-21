@@ -82,6 +82,18 @@ const HISTORY_COUNT_FIELDS = [
   ['total_count', 'totalCount'],
 ];
 
+const OPTIONAL_HISTORY_COUNT_FIELDS = [
+  ['ready_reserved_count', 'readyReservedCount'],
+  ['logical_ready_count', 'logicalReadyCount'],
+  ['logical_ready_reserved_count', 'logicalReadyReservedCount'],
+  ['logical_provisioning_count', 'logicalProvisioningCount'],
+  ['logical_not_ready_count', 'logicalNotReadyCount'],
+  ['logical_errored_count', 'logicalErroredCount'],
+  ['logical_preempted_count', 'logicalPreemptedCount'],
+  ['logical_stopping_count', 'logicalStoppingCount'],
+  ['logical_total_count', 'logicalTotalCount'],
+];
+
 const ACCELERATOR_HISTORY_FIELDS = [
   ['min_replicas', 'minReplicas'],
   ['demand_target', 'demandTarget'],
@@ -140,6 +152,17 @@ export function normalizeReplicaHistory(history) {
             const value = Number(sample[source]);
             normalized[target] =
               Number.isInteger(value) && value >= 0 ? value : 0;
+          });
+          OPTIONAL_HISTORY_COUNT_FIELDS.forEach(([source, target]) => {
+            const rawValue = sample[source];
+            const value = Number(rawValue);
+            normalized[target] =
+              rawValue !== null &&
+              rawValue !== undefined &&
+              Number.isInteger(value) &&
+              value >= 0
+                ? value
+                : null;
           });
           return normalized;
         })

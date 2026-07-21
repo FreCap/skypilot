@@ -21,7 +21,8 @@ class InfraInfo:
                  cloud: str | None = None,
                  region: str | None = None,
                  zone: str | None = None):
-        assert cloud not in ['none', 'None', 'NONE'], 'cloud must be specified'
+        if cloud in ['none', 'None', 'NONE']:
+            raise ValueError('cloud must be specified')
         if not cloud or cloud == '*':
             cloud = None
         if not region or region == '*':

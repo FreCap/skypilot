@@ -22,6 +22,15 @@ The priority rule deliberately means that a flexible priority-50 request remains
 ## Baseline and scope
 
 - SkyPilot merge baseline: `boltz-bio/skypilot` `origin/improvements` at `33074d9e0995028104e711119a5e4d152762a769`.
+- The implementation was synchronized again on 2026-07-21 with
+  `origin/improvements` at `ddb6df245c62e474c117ec25b27631e4d7e616b6`.
+  This includes the production-calibrated simulation runbook from PR #740,
+  the bounded consecutive downscale-veto fix from PR #744, and logical versus
+  reserved-fill history from PR #748.
+- PR #748 owns Serve database revision `020`. Exact-accelerator autoscaler
+  history therefore uses revision `021`, with `020` as its predecessor. This
+  preserves a linear PostgreSQL upgrade path for installations that already
+  ran the capacity-mode migration.
 - The aggregate one-minute PostgreSQL contract in
   `docs/designs/serve-autoscaler-history.md` remains authoritative. This
   design extends each aggregate sample with exact-card maps; it does not add
@@ -30,6 +39,55 @@ The priority rule deliberately means that a flexible priority-50 request remains
 - Existing SkyServe request priority, process-local admission queue, instance-aware least-load policy, exact `replica_info.gpu_type`, targeted resource override support, and reserved-capacity broker are extended rather than replaced.
 - Existing HA behavior remains: one active load-balancer authority owns queue/admission state; clients retry across an authority change. Queue durability across an LB failover is not introduced by this project.
 - This plan covers SkyServe and the boltz-platform request path. It does not add preemption, priority aging, a persistent distributed queue, or per-card maximums.
+
+### Production operating point
+
+The initial `boltz-l4-fleet` configuration remains:
+
+```yaml
+request_queue:
+  size_per_replica: 10
+  max_size: 10000
+  timeout_seconds: 20
+  timeout_seconds_by_priority:
+    - min_priority: 0
+      timeout_seconds: 600
+    - min_priority: 50
+      timeout_seconds: 60
+replica_policy:
+  target_concurrency_per_replica: 1
+  target_utilization_percentage: 90
+  expected_request_duration_seconds: 30
+  max_scale_up_rate_percentage: 20
+  scale_up_rate_min_replicas: 10
+  scale_up_rate_period_seconds: 60
+  adaptive_scale_up:
+    max_scale_up_rate_percentage: 100
+    scale_up_rate_min_replicas: 50
+    pressure_observations: 2
+    hold_seconds: 120
+  downscale_delay_seconds: 300
+  max_scale_down_rate_percentage: 50
+```
+
+A post-version-36 production window contained 23,022 SkyServe attempts, one
+SkyServe rejection, and no platform spill from SkyPilot. During the final
+burst, the adopted target rose to 256 and then drained to 128 while raw demand
+was 15, with the next bounded step continuing toward ready reserved capacity.
+The temporary high target was the expected two-veto, five-minute hysteresis
+tail, not an indefinitely pinned fleet.
+
+Gauge replay rejects increasing `expected_request_duration_seconds` to 60 or
+90 because it materially increases paid target pressure without an observed
+service-quality deficit. A minute-level replay cannot reproduce sub-minute
+pressure latches, priority buckets, request compatibility, or provider
+placement, so its candidate cost rows are advisory under
+`serve-autoscaling-simulation.md`. No queue, duration, utilization, or
+downscale configuration change is justified until the exact implementation is
+deployed and a held-out trace includes priority and compatibility dimensions.
+The 30-second duration remains a pressure-conversion horizon; it is not an
+estimate of end-to-end request runtime because live in-flight work is measured
+directly.
 
 ## Behavioral contract
 

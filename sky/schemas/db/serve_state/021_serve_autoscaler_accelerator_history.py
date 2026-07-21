@@ -1,7 +1,7 @@
 """Add exact-accelerator maps to PostgreSQL SkyServe history.
 
-Revision ID: 020
-Revises: 019
+Revision ID: 021
+Revises: 020
 Create Date: 2026-07-20
 
 """
@@ -14,8 +14,8 @@ from sqlalchemy.dialects import postgresql
 
 from sky.utils.db import db_utils
 
-revision: str = '020'
-down_revision: str | Sequence[str] | None = '019'
+revision: str = '021'
+down_revision: str | Sequence[str] | None = '020'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

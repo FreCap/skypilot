@@ -44,10 +44,13 @@ def test_controller_cleanup_isolates_file_failure(monkeypatch, tmp_path,
 
     # The selected batch is full even though one row failed. Keep the normal
     # continuation signal so the caller can discover more rows immediately;
-    # the next short batch then ends the round without a persistent busy loop.
-    assert not log_gc._clean_controller_logs_with_retention(60, batch_size=3)
+    # the failed row is recorded so later rounds page past it.
+    failed: set = set()
+    assert not log_gc._clean_controller_logs_with_retention(
+        60, batch_size=3, failed_job_ids=failed)
 
-    get_logs.assert_called_once_with(60, batch_size=3)
+    get_logs.assert_called_once_with(60, batch_size=3, exclude_job_ids=failed)
+    assert failed == {2}
     set_cleaned.assert_called_once()
     assert set_cleaned.call_args.kwargs['job_ids'] == [1, 3]
     assert 'Failed to clean controller logs for job 2' in caplog.text
@@ -109,9 +112,13 @@ def test_task_cleanup_isolates_unlink_failure(monkeypatch, tmp_path, caplog):
 
     monkeypatch.setattr(pathlib.Path, 'unlink', _unlink)
 
-    assert log_gc._clean_task_logs_with_retention(60, batch_size=10)
+    failed: set = set()
+    assert log_gc._clean_task_logs_with_retention(60,
+                                                  batch_size=10,
+                                                  failed_tasks=failed)
 
-    get_logs.assert_called_once_with(60, batch_size=10)
+    get_logs.assert_called_once_with(60, batch_size=10, exclude_tasks=failed)
+    assert failed == {(2, 0)}
     set_cleaned.assert_called_once()
     assert set_cleaned.call_args.kwargs['tasks'] == [(1, 0), (3, 0)]
     assert 'Failed to clean task logs for job 2, task 0' in caplog.text
@@ -163,7 +170,7 @@ def test_task_cleanup_observes_directory_failure_and_missing_is_success(
     assert not (succeeded.parent / 'tasks').exists()
 
 
-def test_controller_cleanup_all_failed_full_batch_ends_round(
+def test_controller_cleanup_all_failed_full_batch_pages_past_failures(
         monkeypatch, tmp_path):
     paths = {job_id: tmp_path / f'{job_id}.log' for job_id in (1, 2)}
     for path in paths.values():
@@ -186,13 +193,25 @@ def test_controller_cleanup_all_failed_full_batch_ends_round(
 
     monkeypatch.setattr(builtins, 'open', _open)
 
-    # A full batch with zero progress would be re-selected verbatim; the
-    # round must complete so the caller sleeps until the next interval.
-    assert log_gc._clean_controller_logs_with_retention(60, batch_size=2)
+    # A full batch where every row failed continues the pass, but the failed
+    # rows are recorded so the next round selects past them instead of
+    # re-attempting the same rows in a sleepless loop.
+    failed: set = set()
+    assert not log_gc._clean_controller_logs_with_retention(
+        60, batch_size=2, failed_job_ids=failed)
     assert set_cleaned.call_args.kwargs['job_ids'] == []
+    assert failed == set(paths)
+
+    # The next round excludes the failed rows; a short batch ends the pass.
+    get_logs.return_value = []
+    assert log_gc._clean_controller_logs_with_retention(60,
+                                                        batch_size=2,
+                                                        failed_job_ids=failed)
+    assert get_logs.call_args.kwargs['exclude_job_ids'] == failed
 
 
-def test_task_cleanup_all_failed_full_batch_ends_round(monkeypatch, tmp_path):
+def test_task_cleanup_all_failed_full_batch_pages_past_failures(
+        monkeypatch, tmp_path):
     log_files = [tmp_path / f'{job_id}' / 'run.log' for job_id in (1, 2)]
     for log_file in log_files:
         log_file.parent.mkdir()
@@ -209,5 +228,65 @@ def test_task_cleanup_all_failed_full_batch_ends_round(monkeypatch, tmp_path):
         pathlib.Path, 'unlink',
         mock.Mock(side_effect=PermissionError('operation not permitted')))
 
-    assert log_gc._clean_task_logs_with_retention(60, batch_size=2)
+    failed: set = set()
+    assert not log_gc._clean_task_logs_with_retention(
+        60, batch_size=2, failed_tasks=failed)
     assert set_cleaned.call_args.kwargs['tasks'] == []
+    assert failed == {(1, 0), (2, 0)}
+
+    get_tasks.return_value = []
+    assert log_gc._clean_task_logs_with_retention(60,
+                                                  batch_size=2,
+                                                  failed_tasks=failed)
+    assert get_tasks.call_args.kwargs['exclude_tasks'] == failed
+
+
+def test_controller_cleanup_stuck_row_attempted_once_per_pass(
+        monkeypatch, tmp_path):
+    """A persistently failing row is attempted once and then paged past,
+    so it cannot starve rows behind it in the same pass."""
+    paths = {job_id: tmp_path / f'{job_id}.log' for job_id in (1, 2, 3)}
+    for path in paths.values():
+        path.write_text('old log', encoding='utf-8')
+
+    # Round 1 selects a full batch (stuck row 1 + row 2); round 2 must be
+    # called with row 1 excluded and serves row 3 as a short batch.
+    def _get_logs(_retention, batch_size, exclude_job_ids):
+        del batch_size
+        if not exclude_job_ids:
+            return [{'job_id': 1}, {'job_id': 2}]
+        assert exclude_job_ids == {1}
+        return [{'job_id': 3}]
+
+    set_cleaned = mock.Mock()
+    monkeypatch.setattr(log_gc.managed_job_state,
+                        'get_controller_logs_to_clean', _get_logs)
+    monkeypatch.setattr(log_gc.managed_job_state, 'set_controller_logs_cleaned',
+                        set_cleaned)
+    monkeypatch.setattr(log_gc.managed_job_utils, 'controller_log_file_for_job',
+                        lambda job_id: str(paths[job_id]))
+
+    original_open = builtins.open
+    attempts = []
+
+    def _open(path, *args, **kwargs):
+        if pathlib.Path(path) == paths[1]:
+            attempts.append(path)
+            raise OSError('read-only filesystem')
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', _open)
+
+    failed: set = set()
+    assert not log_gc._clean_controller_logs_with_retention(
+        60, batch_size=2, failed_job_ids=failed)
+    assert log_gc._clean_controller_logs_with_retention(60,
+                                                        batch_size=2,
+                                                        failed_job_ids=failed)
+
+    assert len(attempts) == 1
+    assert failed == {1}
+    assert [c.kwargs['job_ids'] for c in set_cleaned.call_args_list] == [[2],
+                                                                         [3]]
+    assert 'Controller log has been cleaned' in paths[3].read_text(
+        encoding='utf-8')

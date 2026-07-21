@@ -374,6 +374,21 @@ class TestMigrationChainPG:
                 assert request_columns['rejected_count']['default'] is not None
                 assert request_columns['rejection_count_available'][
                     'default'] is not None
+                status_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'serve_replica_status_history')
+                }
+                assert {
+                    'ready_reserved_count',
+                    'logical_ready_count',
+                    'logical_ready_reserved_count',
+                    'logical_provisioning_count',
+                    'logical_not_ready_count',
+                    'logical_errored_count',
+                    'logical_preempted_count',
+                    'logical_stopping_count',
+                    'logical_total_count',
+                }.issubset(status_columns)
         finally:
             engine.dispose()
 
@@ -611,7 +626,7 @@ class TestServeStatusHistoryPG:
         assert history['samples'][0]['total_count'] == 0
         assert history['samples'][0]['errored_count'] == 0
 
-    def test_snapshot_groups_physical_rows_and_zero_capacity(
+    def test_snapshot_groups_capacity_modes_reserved_ready_and_zero_capacity(
             self, history_engine):
         services = serve_state.services_table
         replicas = serve_state.replicas_table
@@ -637,38 +652,60 @@ class TestServeStatusHistoryPG:
                 'replica_id': 1,
                 'status': 'READY',
                 'version': 1,
+                'replica_state': {
+                    'planned_capacity': 8,
+                    'reserved_fill': True,
+                },
             }, {
                 'service_name': 'svc',
                 'replica_id': 2,
                 'status': 'FAILED_PROBING',
                 'version': 1,
+                'replica_state': {
+                    'planned_capacity': 4,
+                    'reserved_fill': True,
+                },
             }, {
                 'service_name': 'svc',
                 'replica_id': 3,
                 'status': 'PROVISIONING',
                 'version': 2,
+                'replica_state': {
+                    'planned_capacity': 2,
+                    'reserved_fill': False,
+                },
             }, {
                 'service_name': 'pool',
                 'replica_id': 1,
                 'status': 'READY',
                 'version': 1,
+                'replica_state': {
+                    'planned_capacity': 16,
+                    'reserved_fill': True,
+                },
             }])
 
         timestamp = 1784207110.0
         assert serve_history.record_status_snapshot(timestamp) == 3
         history = serve_history.get_status_history('svc',
                                                    timestamp=timestamp + 1)
-        assert [(row['version'], row['ready_count'], row['provisioning_count'],
-                 row['errored_count'], row['total_count'])
-                for row in history['samples']] == [
-                    (1, 1, 0, 1, 2),
-                    (2, 0, 1, 0, 1),
-                ]
+        assert [
+            (row['version'], row['ready_count'], row['ready_reserved_count'],
+             row['provisioning_count'], row['errored_count'],
+             row['total_count'], row['logical_ready_count'],
+             row['logical_ready_reserved_count'],
+             row['logical_provisioning_count'], row['logical_errored_count'],
+             row['logical_total_count']) for row in history['samples']
+        ] == [
+            (1, 1, 1, 0, 1, 2, 8, 8, 0, 4, 12),
+            (2, 0, 0, 1, 0, 1, 0, 0, 2, 0, 2),
+        ]
         empty = serve_history.get_status_history('empty',
                                                  timestamp=timestamp + 1)
         assert len(empty['samples']) == 1
         assert empty['samples'][0]['version'] == 7
         assert empty['samples'][0]['total_count'] == 0
+        assert empty['samples'][0]['logical_total_count'] == 0
 
     def test_same_minute_upsert_and_incarnation_filter(self, history_engine):
         services = serve_state.services_table

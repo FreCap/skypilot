@@ -51,13 +51,25 @@ jobs:
           ruff check sky/provision/__init__.py --select B905
           # GCS source and lifecycle validation must survive `python -O`.
           ruff check sky/data/storage_gcs.py --select S101
+          # Kubernetes volume validation must survive `python -O`.
+          ruff check sky/provision/kubernetes/volume.py --select S101
+          # ZIP extraction security checks must survive `python -O`.
+          ruff check sky/server/file_mount_uploads.py --select S101
           # EFA setup has a nested network-card loop inside the subnet retry
           # loop. Shadowing its attempt index can silently skip failover.
           ruff check sky/provision/aws/instance_requests.py --select PLW2901
           # API payload validation must survive `python -O`.
           ruff check sky/server/requests/payloads.py --select S101
+          # Stream response identity checks must survive `python -O`.
+          ruff check sky/client/sdk.py --select S101
           # Parallel cluster metadata must not silently truncate nodes.
           ruff check sky/backends/cloud_vm_ray_backend.py --select B905
+          # Batch worker validation errors must reach the coordinator result.
+          ruff check sky/batch/coordinator.py --select S110
+          # SQLite database-name validation must survive `python -O`.
+          ruff check sky/utils/db/db_utils.py --select S101
+          # Infrastructure sentinel validation must survive `python -O`.
+          ruff check sky/utils/infra_utils.py --select S101
           # A mutable class default bypasses threading.local's per-thread
           # attribute storage and is shared by every thread. RUF012 is noisy
           # for intentional class constants, so scope it to local subclasses.

@@ -1,11 +1,36 @@
 # Priority-aware queue patience and stable SkyServe scaling
 
+## Status
+
+Implemented and deployed on 2026-07-20. Exact feature commit
+`332a3ed64266708c51bf87378a632755f93ff13d` received a Fable `PURSUE` verdict,
+then merged as commit `ac0ade92d558fb5ee1fe421665318785c9b1ed1c` and was
+released as SkyPilot `1.1.575`. The production `boltz-l4-fleet` policy was
+applied as service version 36 with the 600/60-second priority thresholds,
+normal and adaptive scale-up waves, five-minute downscale delay, and
+independent 50 percent downscale limits described below.
+
+A follow-up observation found the adopted target pinned at 144 while raw
+demand was 3 to 8 because the magnitude-blind pressure latch could re-arm and
+restart downscale delay indefinitely under trickle traffic. Commit
+`1269e3b57230414a9d96562c219e3ea7409ae94d` bounded consecutive vetoes to two
+per downscale episode, merged as
+`9a78ea0c13ddcab3cb74ded646273487666a2d6a`, and was released as SkyPilot
+`1.1.583`. At the time of this documentation update, the release was not yet
+deployed to the production control plane.
+
+The numerical production policy is an initial operating point, not a permanent
+default recommendation for every service. Future tuning must follow the
+[SkyServe autoscaling simulation runbook](serve-autoscaling-simulation.md) and
+compare a candidate against the exact live baseline on held-out traffic and
+supply traces.
+
 ## Problem
 
 SkyServe already supports strict request priority, concurrency-native logical
 autoscaling, deduplicated rejected-job pressure, bounded scale-up waves, a
 wall-clock downscale delay, and a configurable whole-fleet scale-down limit.
-Those controls still leave three gaps for bursty one-request-per-GPU services:
+Those controls still leave four gaps for bursty one-request-per-GPU services:
 
 1. One queue timeout applies to every priority. A short timeout spills all
    traffic before slow GPU capacity can start, while a long timeout makes every
@@ -16,6 +41,8 @@ Those controls still leave three gaps for bursty one-request-per-GPU services:
 3. A 50 percent whole-fleet downscale can cancel almost the complete
    provisioning cohort when ready capacity is already more than half the
    fleet. A burst one minute later must then relaunch the same capacity.
+4. A magnitude-blind pressure delta can repeatedly restart downscale delay
+   under harmless trickle traffic, leaving adopted demand far above raw demand.
 
 The production incident on 2026-07-20 demonstrated the third gap. The service
 had 124 ready logical slots and 109 provisioning slots. Its adopted target fell
@@ -34,6 +61,7 @@ limit was respected, but more than 90 percent of pending capacity was lost.
 - Use deduplicated offered arrivals as a raise-only load floor.
 - Accelerate scale-up under sustained pressure while retaining time pacing.
 - Prevent fresh demand from racing a downscale decision.
+- Bound pressure vetoes so the protection cannot starve downscale forever.
 - Apply the configured downscale percentage independently to committed capacity
   and to the provisioning cohort.
 - Preserve scalar-only specs and mixed old/new controller and load-balancer
@@ -246,6 +274,17 @@ It records a bounded reason string for status. A stable or shrinking queue and
 a stable nonzero rejection population do not veto forever. Each delta can
 restart the delay once; unchanged gauges cannot generate another veto.
 
+Consecutive vetoes are additionally capped at 2 per downscale episode (a run
+of recomputes whose raw target stays below the adopted target). The latch is
+magnitude-blind, so under trickle traffic a tiny positive delta re-arms it
+nearly every quiet window and an unbounded veto would restart the delay
+forever, starving downscale indefinitely. After the cap the elapsed delay
+accepts the lower target. Genuine rising pressure raises the raw target and
+takes the upscale branch, which ends the episode and refreshes the veto
+budget; an accepted downscale, an equal target, a stale tick, and a version
+update also reset the streak. Worst case the cap adds two full delay windows
+of extra hold, preserving the protection at the moment pressure begins.
+
 The pressure baseline is the latest complete, non-floored report current when
 the downscale delay starts or the previous veto is consumed. Reports may arrive
 faster than decision ticks, so any positive delta is latched until the next
@@ -323,13 +362,38 @@ Autoscaler status exposes:
 - 60-second and 300-second offered-arrival counts and arrival floor;
 - raw and adopted targets plus committed and provisioning capacity;
 - pressure streak, adaptive-active state, and adaptive hold remaining;
-- downscale elapsed time, veto reason, whole-fleet allowance, provisioning
-  allowance, frozen provisioning-retention floor, and pending slots spent in
-  the current episode.
+- downscale elapsed time, veto reason, consecutive-veto streak and budget,
+  whole-fleet allowance, provisioning allowance, frozen
+  provisioning-retention floor, and pending slots spent in the current
+  episode.
 
 These values flow through the existing Serve status surface. Minute history
 keeps its existing aggregate schema in this change. Persisting priority maps
 would create high-cardinality product policy and is deliberately deferred.
+
+## Data-driven tuning requirement
+
+A dashboard screenshot or one burst is evidence for an investigation, not a
+sufficient basis for changing a policy. Any later change to queue patience,
+utilization, expected duration, minimum capacity, scale-up waves, downscale
+hysteresis, or downscale limits must use the simulation runbook linked above.
+
+The comparison must include the currently deployed policy unchanged, use the
+same request and capacity traces for every candidate, model launch delay and
+failure, and report results by priority. When request priority, duration, or
+historical cluster supply is unavailable, the report must label the missing
+input and sweep a bounded range instead of substituting one silent guess.
+
+The simulator is not a proof of production behavior. Before a policy is
+adopted, its baseline replay must be calibrated against observed targets,
+ready and provisioning capacity, queue depth, and rejections. A candidate that
+only wins under an uncalibrated or optimistic model is not eligible for
+rollout.
+
+Every report must name raw demand, adopted demand after hysteresis, and the
+effective capacity target after reserved fill separately. Utilization used for
+cost tuning must also separate ordinary capacity from free reserved capacity;
+free capacity cannot make an incrementally paid fleet appear underutilized.
 
 ## Alternatives considered
 
