@@ -34,6 +34,7 @@ from sky.jobs import constants as managed_job_constants
 from sky.jobs import runner as managed_job_runner
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
+from sky.jobs.server import cancellation as managed_job_cancellation
 from sky.jobs.server import job_events as managed_job_events
 from sky.jobs.server import kubernetes_queue as managed_job_kubernetes_queue
 from sky.metrics import utils as metrics_lib
@@ -74,6 +75,9 @@ _MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES = (
     managed_job_kubernetes_queue.MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES)
 queue_from_kubernetes_pod = (
     managed_job_kubernetes_queue.queue_from_kubernetes_pod)
+cancel = managed_job_cancellation.cancel
+# Preserve module and pickle identity for the historical facade import.
+cancel.__module__ = __name__
 
 
 def _warn_file_mounts_rolling_update(dag: 'sky.Dag') -> None:
@@ -1370,105 +1374,6 @@ def queue_v2(
             statuses=statuses,
         )
     return filtered_jobs, total, status_counts, total_no_filter
-
-
-@usage_lib.entrypoint
-# pylint: disable=redefined-builtin
-def cancel(name: str | None = None,
-           job_ids: list[int] | None = None,
-           all: bool = False,
-           all_users: bool = False,
-           pool: str | None = None,
-           graceful: bool = False,
-           graceful_timeout: int | None = None) -> None:
-    # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
-    """Cancels managed jobs.
-
-    Please refer to sky.cli.job_cancel for documentation.
-
-    Raises:
-        sky.exceptions.ClusterNotUpError: the jobs controller is not up.
-        RuntimeError: failed to cancel the job.
-    """
-    with rich_utils.safe_status(
-            ux_utils.spinner_message('Cancelling managed jobs')):
-        job_ids = [] if job_ids is None else job_ids
-        handle = backend_utils.is_controller_accessible(
-            controller=controller_utils.Controllers.JOBS_CONTROLLER,
-            stopped_message='All managed jobs should have finished.')
-
-        job_id_str = ','.join(map(str, job_ids))
-        if sum([
-                bool(job_ids), name is not None, pool is not None, all or
-                all_users
-        ]) != 1:
-            arguments = []
-            arguments += [f'job_ids={job_id_str}'] if job_ids else []
-            arguments += [f'name={name}'] if name is not None else []
-            arguments += [f'pool={pool}'] if pool is not None else []
-            arguments += ['all'] if all else []
-            arguments += ['all_users'] if all_users else []
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(
-                    'Can only specify one of JOB_IDS, name, pool, or all/'
-                    f'all_users. Provided {" ".join(arguments)!r}.')
-
-        job_ids = None if (all_users or all) else job_ids
-
-        backend = backend_utils.get_backend_from_handle(handle)
-        assert isinstance(backend, backends.CloudVmRayBackend)
-
-        use_legacy = not handle.is_grpc_enabled_with_flag
-        stdout = None
-
-        if not use_legacy:
-            current_workspace = skypilot_config.get_active_workspace()
-            try:
-                request = managed_jobsv1_pb2.CancelJobsRequest(
-                    current_workspace=current_workspace,
-                    graceful=graceful,
-                    graceful_timeout=graceful_timeout)
-
-                if all_users or all or job_ids:
-                    request.all_users = all_users
-                    if all:
-                        request.user_hash = common_utils.get_user_hash()
-                    if job_ids is not None:
-                        request.job_ids.CopyFrom(
-                            managed_jobsv1_pb2.JobIds(ids=job_ids))
-                elif name is not None:
-                    request.job_name = name
-                else:
-                    assert pool is not None, (job_ids, name, pool, all)
-                    request.pool_name = pool
-
-                response = backend_utils.invoke_skylet_with_retries(
-                    lambda: cloud_vm_ray_backend.SkyletClient(
-                        handle.get_grpc_channel()).cancel_managed_jobs(request))
-                stdout = response.message
-            except exceptions.SkyletMethodNotImplementedError:
-                use_legacy = True
-
-        if use_legacy:
-            stdout = managed_job_runner.current().cancel_managed_jobs(
-                handle=handle,
-                backend=backend,
-                all_users=all_users,
-                all=all,
-                job_ids=job_ids,
-                name=name,
-                pool=pool,
-                graceful=graceful,
-                graceful_timeout=graceful_timeout,
-            )
-
-        if stdout is None:
-            raise RuntimeError('Managed job cancellation produced no output.')
-        logger.info(stdout)
-        if 'Multiple jobs found with name' in stdout:
-            with ux_utils.print_exception_no_traceback():
-                raise RuntimeError(
-                    'Please specify the job ID instead of the job name.')
 
 
 @usage_lib.entrypoint
