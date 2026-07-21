@@ -253,7 +253,7 @@ async def job_event_retention_daemon():
                 DEFAULT_JOB_EVENT_RETENTION_HOURS)
         except asyncio.CancelledError:
             logger.info('Job event retention daemon cancelled')
-            break
+            raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error running job event retention daemon: {e}')
 
