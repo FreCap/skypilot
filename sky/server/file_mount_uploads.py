@@ -385,19 +385,18 @@ async def unzip_file(zip_file_path: pathlib.Path,
 
     def _do_unzip() -> None:
         try:
+            extract_root = client_file_mounts_dir.resolve()
             with zipfile.ZipFile(zip_file_path, 'r') as zipf:
                 for member in zipf.infolist():
                     # Determine the new path
                     original_path = os.path.normpath(member.filename)
-                    new_path = client_file_mounts_dir / original_path.lstrip(
-                        '/')
+                    new_path = extract_root / original_path.lstrip('/')
 
                     # Security check: ensure extracted path stays within target
                     # directory to prevent Zip Slip attacks (path traversal via
                     # malicious "../" sequences in archive member names).
                     resolved_path = new_path.resolve()
-                    if not is_relative_to(resolved_path,
-                                          client_file_mounts_dir):
+                    if not is_relative_to(resolved_path, extract_root):
                         raise ValueError(
                             f'Zip member {member.filename!r} would extract '
                             'outside target directory. Aborted.')
@@ -406,12 +405,14 @@ async def unzip_file(zip_file_path: pathlib.Path,
                         # Symlink. Read the target path and create a symlink.
                         new_path.parent.mkdir(parents=True, exist_ok=True)
                         target = zipf.read(member).decode()
-                        assert not os.path.isabs(target), target
+                        if os.path.isabs(target):
+                            raise ValueError(
+                                f'Symlink target {target!r} must be relative. '
+                                'Aborted.')
                         # Since target is a relative path, we need to check that
-                        # it is under `client_file_mounts_dir` for security.
+                        # it is under `extract_root` for security.
                         full_target_path = (new_path.parent / target).resolve()
-                        if not is_relative_to(full_target_path,
-                                              client_file_mounts_dir):
+                        if not is_relative_to(full_target_path, extract_root):
                             raise ValueError(
                                 f'Symlink target {target} leads to a '
                                 'file not in userspace. Aborted.')

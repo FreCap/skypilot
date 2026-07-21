@@ -1587,7 +1587,7 @@ class TestGetPVCSpec:
             config={},  # No access_mode
         )
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError, match='access_mode is required'):
             k8s_volume._get_pvc_spec('my-namespace', config)
 
 

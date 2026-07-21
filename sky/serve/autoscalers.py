@@ -28,6 +28,14 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
+# Maximum consecutive downscale pressure vetoes per downscale episode.
+# Genuine rising pressure raises the raw target and takes the upscale
+# branch, which ends the episode on its own; the veto only needs to
+# protect against downscaling at the exact moment pressure begins.
+# Bounding it at 2 consecutive full hysteresis windows (worst case
+# ~2x downscale_delay_seconds extra hold) preserves that protection
+# while restoring downscale liveness under trickle traffic.
+_MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
 
 
 class AutoscalerDecisionOperator(enum.Enum):
@@ -2329,6 +2337,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._pressure_streak: int = 0
         self._adaptive_until: float | None = None
         self._downscale_veto_reason: str | None = None
+        # Consecutive pressure vetoes within the current downscale episode
+        # (a run of recomputes whose raw target stays below the adopted
+        # target). Bounded by _MAX_CONSECUTIVE_DOWNSCALE_VETOES: under
+        # trickle traffic a tiny positive delta re-latches pressure nearly
+        # every quiet window, and an unbounded veto would restart the
+        # hysteresis timer forever, starving downscale indefinitely.
+        self._downscale_veto_streak: int = 0
         self._pending_retention_floor: int | None = None
         self._pending_capacity_at_adoption: int = 0
         self._pending_budget_spent: int = 0
@@ -2983,7 +2998,21 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def _consume_downscale_pressure_veto(self) -> bool:
         if not self._pressure_latched:
             self._downscale_veto_reason = None
+            self._downscale_veto_streak = 0
             return False
+        if self._downscale_veto_streak >= _MAX_CONSECUTIVE_DOWNSCALE_VETOES:
+            # The latch is magnitude-blind: under trickle traffic a tiny
+            # positive delta re-arms it nearly every quiet window, and an
+            # unbounded veto would restart the hysteresis timer forever.
+            # After the cap, let the downscale proceed; a genuine burst
+            # raises the raw target and exits the downscale episode via
+            # the upscale branch anyway.
+            self._downscale_veto_reason = None
+            self._pressure_latched = False
+            self._pressure_reasons = ()
+            self._downscale_veto_streak = 0
+            return False
+        self._downscale_veto_streak += 1
         self._downscale_veto_reason = ','.join(self._pressure_reasons)[:128]
         self._pressure_latched = False
         self._pressure_reasons = ()
@@ -3075,6 +3104,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self._pressure_latched = False
                 self._pressure_reasons = ()
                 self._pressure_streak = 0
+                self._downscale_veto_streak = 0
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
             # ride every sync). Raise-only floor, applied without
             # hysteresis -- while blind we must not delay growth, and we
@@ -3157,6 +3187,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
             if target_num_replicas >= self.target_num_replicas:
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
             else:
@@ -3168,10 +3199,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
             self._adopt_scale_up_target(target_num_replicas, replica_infos)
         elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
             self._reset_downscale_hysteresis()
+            # A rising raw target ends the downscale episode: the next
+            # episode gets a fresh veto budget.
+            self._downscale_veto_streak = 0
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
@@ -3185,6 +3220,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         else:
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
 
         self._upscale_pending = (target_num_replicas > self.target_num_replicas)
 
@@ -3323,6 +3359,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         super().update_version(version, spec, update_mode)
         self._reset_downscale_hysteresis()
+        self._downscale_veto_streak = 0
         self._pending_retention_floor = None
         self._pending_capacity_at_adoption = 0
         self._pending_budget_spent = 0
@@ -3763,6 +3800,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'downscale_elapsed_seconds': self._downscale_elapsed_seconds(),
             'downscale_delay_seconds': self.downscale_delay_seconds,
             'downscale_veto_reason': self._downscale_veto_reason,
+            'downscale_veto_streak': self._downscale_veto_streak,
             'scale_down_allowance': self._last_scale_down_allowance,
             'pending_scale_down_allowance': self._last_pending_allowance,
             'pending_retention_floor': self._pending_retention_floor,
@@ -3799,6 +3837,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'pressure_latched': self._pressure_latched,
             'pressure_reasons': self._pressure_reasons,
             'pressure_streak': self._pressure_streak,
+            'downscale_veto_streak': self._downscale_veto_streak,
             'adaptive_until': self._adaptive_until,
             'unknown_in_flight_replica_ids': sorted(
                 self._unknown_in_flight_replica_ids),
@@ -3838,7 +3877,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                       'headerless_arrivals_60s', 'headerless_arrivals_300s',
                       'offered_arrival_tracking_saturated', 'pressure_baseline',
                       'pressure_latched', 'pressure_reasons', 'pressure_streak',
-                      'adaptive_until'):
+                      'downscale_veto_streak', 'adaptive_until'):
             key = field
             if key in dynamic_states:
                 setattr(self, f'_{field}', dynamic_states.pop(key))

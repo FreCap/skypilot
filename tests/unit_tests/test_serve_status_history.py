@@ -32,7 +32,7 @@ def test_status_bucket_mapping_is_exhaustive():
         assert serve_history._status_bucket(status.value) == bucket
 
 
-def test_build_history_rows_groups_versions_and_preserves_zero_capacity():
+def test_build_history_rows_groups_capacity_modes_and_reserved_ready():
     observed_at = datetime.datetime(2026,
                                     7,
                                     16,
@@ -42,10 +42,10 @@ def test_build_history_rows_groups_versions_and_preserves_zero_capacity():
                                     tzinfo=datetime.timezone.utc)
     bucket_start = observed_at.replace(second=0)
     rows = [
-        ('svc', 'hash', 1, 'READY', 3),
-        ('svc', 'hash', 1, 'FAILED_PROBING', 2),
-        ('svc', 'hash', 2, 'PROVISIONING', 4),
-        ('empty', 'empty-hash', 7, None, 0),
+        ('svc', 'hash', 1, 'READY', 3, 12, 2, 8),
+        ('svc', 'hash', 1, 'FAILED_PROBING', 2, 5, 1, 3),
+        ('svc', 'hash', 2, 'PROVISIONING', 4, 16, 0, 0),
+        ('empty', 'empty-hash', 7, None, 0, 0, 0, 0),
     ]
 
     result = serve_history._build_history_rows(rows, observed_at, bucket_start)
@@ -54,13 +54,21 @@ def test_build_history_rows_groups_versions_and_preserves_zero_capacity():
     assert by_key[('svc', 1)]['ready_count'] == 3
     assert by_key[('svc', 1)]['errored_count'] == 2
     assert by_key[('svc', 1)]['total_count'] == 5
+    assert by_key[('svc', 1)]['ready_reserved_count'] == 2
+    assert by_key[('svc', 1)]['logical_ready_count'] == 12
+    assert by_key[('svc', 1)]['logical_ready_reserved_count'] == 8
+    assert by_key[('svc', 1)]['logical_errored_count'] == 5
+    assert by_key[('svc', 1)]['logical_total_count'] == 17
     assert by_key[('svc', 2)]['provisioning_count'] == 4
     assert by_key[('svc', 2)]['total_count'] == 4
+    assert by_key[('svc', 2)]['logical_provisioning_count'] == 16
+    assert by_key[('svc', 2)]['logical_total_count'] == 16
     assert by_key[('empty', 7)]['total_count'] == 0
+    assert by_key[('empty', 7)]['logical_total_count'] == 0
     assert by_key[('empty', 7)]['bucket_start'] == bucket_start
 
 
-def test_snapshot_query_uses_normalized_columns_only():
+def test_snapshot_query_uses_normalized_columns_and_durable_capacity_state():
     sql = str(serve_history._snapshot_query().compile(
         dialect=postgresql.dialect(),
         compile_kwargs={'literal_binds': True})).lower()
@@ -68,7 +76,9 @@ def test_snapshot_query_uses_normalized_columns_only():
     assert 'replicas.version' in sql
     assert 'replicas.sky_down_status is distinct from' in sql
     assert "'succeeded'" in sql
-    assert 'replica_state' not in sql
+    assert 'replica_state' in sql
+    assert 'planned_capacity' in sql
+    assert 'reserved_fill' in sql
     assert 'replica_info' not in sql
 
 

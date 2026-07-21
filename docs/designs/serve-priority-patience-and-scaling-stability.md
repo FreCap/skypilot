@@ -262,6 +262,17 @@ It records a bounded reason string for status. A stable or shrinking queue and
 a stable nonzero rejection population do not veto forever. Each delta can
 restart the delay once; unchanged gauges cannot generate another veto.
 
+Consecutive vetoes are additionally capped at 2 per downscale episode (a run
+of recomputes whose raw target stays below the adopted target). The latch is
+magnitude-blind, so under trickle traffic a tiny positive delta re-arms it
+nearly every quiet window and an unbounded veto would restart the delay
+forever, starving downscale indefinitely. After the cap the elapsed delay
+accepts the lower target. Genuine rising pressure raises the raw target and
+takes the upscale branch, which ends the episode and refreshes the veto
+budget; an accepted downscale, an equal target, a stale tick, and a version
+update also reset the streak. Worst case the cap adds two full delay windows
+of extra hold, preserving the protection at the moment pressure begins.
+
 The pressure baseline is the latest complete, non-floored report current when
 the downscale delay starts or the previous veto is consumed. Reports may arrive
 faster than decision ticks, so any positive delta is latched until the next

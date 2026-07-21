@@ -491,6 +491,40 @@ def _scale_down_manager(spec_drain, is_pool=False, spec_error=None):
     return rm
 
 
+class TestResolveDrainCapInfoReuse:
+    """Passing an in-hand ReplicaInfo must skip the redundant DB read."""
+
+    def test_in_hand_info_skips_db_read(self):
+        rm = _scale_down_manager(spec_drain=600)
+        info = mock.Mock()
+        info.version = 3
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id') as db_read:
+            cap = rm._resolve_drain_cap_seconds(7, info)
+        db_read.assert_not_called()
+        assert cap == 600
+        rm._get_version_spec.assert_called_once_with(3)
+
+    def test_no_info_still_reads_db(self):
+        rm = _scale_down_manager(spec_drain=600)
+        info = mock.Mock()
+        info.version = 3
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info) as db_read:
+            cap = rm._resolve_drain_cap_seconds(7)
+        db_read.assert_called_once_with('svc', 7)
+        assert cap == 600
+
+    def test_spec_failure_with_in_hand_info_falls_back(self):
+        rm = _scale_down_manager(spec_drain=None,
+                                 spec_error=ValueError('version gone'))
+        info = mock.Mock()
+        info.version = 3
+        cap = rm._resolve_drain_cap_seconds(7, info)
+        assert cap == replica_managers._DEFAULT_DRAIN_SECONDS
+
+
 class TestScaleDownWiring:
 
     def _run(self, rm):

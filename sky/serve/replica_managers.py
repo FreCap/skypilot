@@ -2553,7 +2553,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         None)
                     if drain_cap is None:
                         drain_cap = self._resolve_drain_cap_seconds(
-                            replica_info.replica_id)
+                            replica_info.replica_id, replica_info)
                 # Failure teardowns stay in the record
                 # (left_in_record=True), and _terminate_replica asserts
                 # such rows sync logs down for debuggability -- re-driving
@@ -3959,7 +3959,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     not status_property.preempted):
                 drain_cap = getattr(status_property, 'drain_cap_seconds', None)
                 if drain_cap is None:
-                    drain_cap = self._resolve_drain_cap_seconds(replica_id)
+                    drain_cap = self._resolve_drain_cap_seconds(
+                        replica_id, info)
             # Once an attempt is admitted, its durable SCHEDULED/RUNNING state
             # prevents duplicate reconciliation.  Remove the old deadline;
             # a failure records the next one in _handle_sky_down_finish.
@@ -3978,16 +3979,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'{common_utils.format_exception(e)}')
                 self._schedule_failed_cleanup_retry(replica_id)
 
-    def _resolve_drain_cap_seconds(self, replica_id: int) -> int:
+    def _resolve_drain_cap_seconds(self,
+                                   replica_id: int,
+                                   info: 'ReplicaInfo | None' = None) -> int:
         """Drain cap for retiring this replica, per its own version spec.
 
         An outdated replica retired by a rolling update drains per the
         spec it was serving under. Spec lookup failures fall back to the
         default cap -- a drain regression must never block a teardown.
+
+        Callers that already hold the replica's ``ReplicaInfo`` pass it in
+        to skip a redundant full-row read (and unpickle) of the same row.
         """
         try:
-            info = serve_state.get_replica_info_from_id(self._service_name,
-                                                        replica_id)
+            if info is None:
+                info = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
             if info is not None:
                 spec_drain = self._get_version_spec(
                     info.version).graceful_drain_seconds
@@ -4028,7 +4035,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         drain_cap = getattr(info.status_property, 'drain_cap_seconds', None)
         needs_persist = False
         if drain_cap is None:
-            drain_cap = self._resolve_drain_cap_seconds(info.replica_id)
+            drain_cap = self._resolve_drain_cap_seconds(info.replica_id, info)
             info.status_property.drain_cap_seconds = drain_cap
             needs_persist = True
         prior_started_at = getattr(info.status_property, 'drain_started_at',
@@ -4087,7 +4094,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
         info.status_property.drain_cap_seconds = (
-            self._resolve_drain_cap_seconds(replica_id))
+            self._resolve_drain_cap_seconds(replica_id, info))
         _ensure_drain_started_at(info.status_property,
                                  info.status_property.drain_cap_seconds)
         info.status_property.wait_for_idle_before_termination = True
@@ -4906,7 +4913,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 drain_cap = getattr(info.status_property, 'drain_cap_seconds',
                                     None)
                 if drain_cap is None:
-                    drain_cap = self._resolve_drain_cap_seconds(replica_id)
+                    drain_cap = self._resolve_drain_cap_seconds(
+                        replica_id, info)
                 logger.warning(
                     f'Strict idle wait for replica {replica_id} reached its '
                     f'{drain_cap}s deadline without fresh zero-occupancy '
