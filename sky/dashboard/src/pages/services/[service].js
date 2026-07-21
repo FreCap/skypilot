@@ -133,6 +133,7 @@ export function useServiceDetails({ serviceName }) {
   const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
+  const historyRefreshInFlightRef = useRef(null);
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
@@ -153,7 +154,8 @@ export function useServiceDetails({ serviceName }) {
     // fresh summary must still replace whatever an earlier invocation
     // left behind.
     let fullLanded = false;
-    const summaryPromise = dashboardCache
+    let summaryPromise;
+    summaryPromise = dashboardCache
       .get(getServices, [
         {
           serviceNames: [serviceName],
@@ -173,11 +175,18 @@ export function useServiceDetails({ serviceName }) {
         console.error('Failed to fetch service summary:', error);
       })
       .finally(() => {
+        if (historyRefreshInFlightRef.current?.promise === summaryPromise) {
+          historyRefreshInFlightRef.current = null;
+        }
         if (isCurrentRequest()) {
           setLoading(false);
           setHistoryLoading(false);
         }
       });
+    historyRefreshInFlightRef.current = {
+      serviceName,
+      promise: summaryPromise,
+    };
     const fullPromise = dashboardCache
       .get(getServices, [{ serviceNames: [serviceName] }])
       .then(({ services }) => {
@@ -204,13 +213,15 @@ export function useServiceDetails({ serviceName }) {
       if (refreshInFlightRef.current?.serviceName === serviceName) {
         refreshInFlightRef.current = null;
       }
+      if (historyRefreshInFlightRef.current?.serviceName === serviceName) {
+        historyRefreshInFlightRef.current = null;
+      }
     };
   }, [fetchData, serviceName]);
 
   useEffect(() => {
     if (!serviceName) return undefined;
     let active = true;
-    let refreshInFlight = false;
     const historyArgs = [
       {
         serviceNames: [serviceName],
@@ -220,28 +231,43 @@ export function useServiceDetails({ serviceName }) {
       },
     ];
     const refreshHistory = async () => {
-      if (refreshInFlight) return;
-      refreshInFlight = true;
+      const inFlight = historyRefreshInFlightRef.current;
+      if (inFlight?.serviceName === serviceName) {
+        return inFlight.promise;
+      }
       const requestVersion = requestVersionRef.current;
       const isCurrentRequest = () =>
         active && requestVersionRef.current === requestVersion;
-      setHistoryLoading(true);
-      dashboardCache.invalidate(getServices, historyArgs);
-      try {
-        const { services } = await dashboardCache.get(getServices, historyArgs);
-        if (!isCurrentRequest()) return;
-        const found = (services || []).find((s) => s.name === serviceName);
-        setReplicaHistory(found?.replicaHistory || null);
-      } catch (error) {
-        if (isCurrentRequest()) {
-          console.error('Failed to refresh service history:', error);
+      let historyPromise;
+      historyPromise = (async () => {
+        setHistoryLoading(true);
+        dashboardCache.invalidate(getServices, historyArgs);
+        try {
+          const { services } = await dashboardCache.get(
+            getServices,
+            historyArgs
+          );
+          if (!isCurrentRequest()) return;
+          const found = (services || []).find((s) => s.name === serviceName);
+          setReplicaHistory(found?.replicaHistory || null);
+        } catch (error) {
+          if (isCurrentRequest()) {
+            console.error('Failed to refresh service history:', error);
+          }
+        } finally {
+          if (historyRefreshInFlightRef.current?.promise === historyPromise) {
+            historyRefreshInFlightRef.current = null;
+          }
+          if (isCurrentRequest()) {
+            setHistoryLoading(false);
+          }
         }
-      } finally {
-        refreshInFlight = false;
-        if (isCurrentRequest()) {
-          setHistoryLoading(false);
-        }
-      }
+      })();
+      historyRefreshInFlightRef.current = {
+        serviceName,
+        promise: historyPromise,
+      };
+      return historyPromise;
     };
     const interval = setInterval(refreshHistory, 60 * 1000);
     return () => {
