@@ -147,6 +147,7 @@ export function useClustersPageData({
   const [preloadingComplete, setPreloadingComplete] = useState(false);
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   const runPreload = useCallback(
     async ({ force = false, refreshTable = false } = {}) => {
@@ -182,14 +183,27 @@ export function useClustersPageData({
     runPreload();
     return () => {
       requestVersionRef.current += 1;
+      refreshInFlightRef.current = null;
     };
   }, [runPreload]);
 
   const handleRefresh = useCallback(() => {
+    if (refreshInFlightRef.current !== null) {
+      return refreshInFlightRef.current;
+    }
     if (showHistory) {
       dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
     }
-    return runPreload({ force: true, refreshTable: true });
+    const refreshPromise = runPreload({
+      force: true,
+      refreshTable: true,
+    }).finally(() => {
+      if (refreshInFlightRef.current === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = refreshPromise;
+    return refreshPromise;
   }, [historyDays, runPreload, showHistory]);
 
   return { preloadingComplete, lastFetchedTime, handleRefresh };

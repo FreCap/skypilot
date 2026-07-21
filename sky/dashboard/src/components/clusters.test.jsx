@@ -211,6 +211,40 @@ describe('Clusters preload lifecycle', () => {
     expect(screen.getByText(/Updated just now/)).toBeInTheDocument();
   });
 
+  it('coalesces overlapping manual refreshes into one forced preload', async () => {
+    const initialPreload = deferred();
+    const refreshPreload = deferred();
+    cachePreloader.preloadForPage
+      .mockReturnValueOnce(initialPreload.promise)
+      .mockReturnValueOnce(refreshPreload.promise);
+    render(<Clusters />);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      2,
+      'clusters',
+      { force: true }
+    );
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      initialPreload.resolve();
+      await initialPreload.promise;
+    });
+    expect(refreshClusters).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+    });
+
+    await waitFor(() => expect(refreshClusters).toHaveBeenCalledTimes(1));
+  });
+
   it('invalidates the visible history cache key', async () => {
     router.query = { history: 'true', historyDays: '5' };
     render(<Clusters />);
