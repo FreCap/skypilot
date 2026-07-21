@@ -1,11 +1,20 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 import {
   acknowledgeOperatorNotifications,
   getOperatorNotifications,
 } from '@/data/connectors/operator-notifications';
-import { OperatorNotificationBell } from './operator-notification-bell';
+import {
+  OPERATOR_NOTIFICATION_POLL_MS,
+  OperatorNotificationBell,
+} from './operator-notification-bell';
 
 jest.mock('@/data/connectors/operator-notifications', () => ({
   getOperatorNotifications: jest.fn(),
@@ -29,6 +38,23 @@ const unread = {
   last_seen_sequence: 0,
 };
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+const empty = {
+  notifications: [],
+  unread_count: 0,
+  latest_sequence: 0,
+  last_seen_sequence: 0,
+};
+
 describe('OperatorNotificationBell', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -36,6 +62,10 @@ describe('OperatorNotificationBell', () => {
     acknowledgeOperatorNotifications.mockResolvedValue({
       last_seen_sequence: 7,
     });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('shows and acknowledges the unread subset when opened', async () => {
@@ -100,5 +130,89 @@ describe('OperatorNotificationBell', () => {
       screen.queryByRole('button', { name: /Operator notifications/ })
     ).not.toBeInTheDocument();
     expect(getOperatorNotifications).not.toHaveBeenCalled();
+  });
+
+  it('coalesces overdue polls and retries after the owner fails', async () => {
+    jest.useFakeTimers();
+    const first = deferred();
+    getOperatorNotifications
+      .mockReset()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(unread);
+
+    render(<OperatorNotificationBell role="admin" />);
+    expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS * 3);
+    });
+    expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      first.reject(new Error('poll unavailable'));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS);
+      await Promise.resolve();
+    });
+    expect(getOperatorNotifications).toHaveBeenCalledTimes(2);
+    await screen.findByRole('button', {
+      name: 'Operator notifications: 1 unread',
+    });
+  });
+
+  it('fences a poll from an earlier admin role lifecycle', async () => {
+    const stale = deferred();
+    getOperatorNotifications
+      .mockReset()
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(unread);
+    const { rerender } = render(<OperatorNotificationBell role="admin" />);
+
+    rerender(<OperatorNotificationBell role="user" />);
+    rerender(<OperatorNotificationBell role="admin" />);
+    await screen.findByRole('button', {
+      name: 'Operator notifications: 1 unread',
+    });
+
+    await act(async () => {
+      stale.resolve(empty);
+      await stale.promise;
+    });
+    expect(
+      screen.getByRole('button', {
+        name: 'Operator notifications: 1 unread',
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('fences an acknowledgement from an earlier admin lifecycle', async () => {
+    const staleAcknowledgement = deferred();
+    acknowledgeOperatorNotifications.mockReturnValueOnce(
+      staleAcknowledgement.promise
+    );
+    const { rerender } = render(<OperatorNotificationBell role="admin" />);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'Operator notifications: 1 unread',
+      })
+    );
+
+    rerender(<OperatorNotificationBell role="user" />);
+    rerender(<OperatorNotificationBell role="admin" />);
+    await waitFor(() =>
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(2)
+    );
+    await act(async () => {
+      staleAcknowledgement.resolve({ last_seen_sequence: 7 });
+      await staleAcknowledgement.promise;
+    });
+
+    expect(
+      screen.getByRole('button', {
+        name: 'Operator notifications: 1 unread',
+      })
+    ).toBeInTheDocument();
   });
 });

@@ -32,31 +32,58 @@ export function OperatorNotificationBell({ role, compact = false }) {
   const [openNotifications, setOpenNotifications] = useState([]);
   const [error, setError] = useState(null);
   const containerRef = useRef(null);
-  const mountedRef = useRef(false);
+  const lifecycleVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const next = await getOperatorNotifications(7);
-      if (mountedRef.current) {
+  const refresh = useCallback((lifecycleVersion) => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.lifecycleVersion === lifecycleVersion) {
+      return inFlight.promise;
+    }
+    const refreshPromise = (async () => {
+      try {
+        const next = await getOperatorNotifications(7);
+        if (lifecycleVersion !== lifecycleVersionRef.current) return;
         setData(next);
         setError(null);
+      } catch (fetchError) {
+        if (lifecycleVersion === lifecycleVersionRef.current) {
+          setError(fetchError.message);
+        }
       }
-    } catch (fetchError) {
-      if (mountedRef.current) setError(fetchError.message);
-    }
+    })().finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = {
+      lifecycleVersion,
+      promise: refreshPromise,
+    };
+    return refreshPromise;
   }, []);
 
   useEffect(() => {
-    mountedRef.current = true;
+    const lifecycleVersion = lifecycleVersionRef.current + 1;
+    lifecycleVersionRef.current = lifecycleVersion;
+    const revokeLifecycle = () => {
+      if (lifecycleVersionRef.current === lifecycleVersion) {
+        lifecycleVersionRef.current += 1;
+      }
+      if (refreshInFlightRef.current?.lifecycleVersion === lifecycleVersion) {
+        refreshInFlightRef.current = null;
+      }
+    };
     if (role !== 'admin') {
-      return () => {
-        mountedRef.current = false;
-      };
+      return revokeLifecycle;
     }
-    refresh();
-    const interval = window.setInterval(refresh, OPERATOR_NOTIFICATION_POLL_MS);
+    void refresh(lifecycleVersion);
+    const interval = window.setInterval(
+      () => void refresh(lifecycleVersion),
+      OPERATOR_NOTIFICATION_POLL_MS
+    );
     return () => {
-      mountedRef.current = false;
+      revokeLifecycle();
       window.clearInterval(interval);
     };
   }, [refresh, role]);
@@ -85,9 +112,10 @@ export function OperatorNotificationBell({ role, compact = false }) {
   const badge = unreadCount > 9 ? '9+' : String(unreadCount);
 
   const acknowledge = async (throughSequence) => {
+    const lifecycleVersion = lifecycleVersionRef.current;
     try {
       const result = await acknowledgeOperatorNotifications(throughSequence);
-      if (!mountedRef.current) return;
+      if (lifecycleVersion !== lifecycleVersionRef.current) return;
       setData((current) => {
         const notifications = current.notifications.map((notification) =>
           notification.sequence <= result.last_seen_sequence
@@ -105,7 +133,9 @@ export function OperatorNotificationBell({ role, compact = false }) {
         };
       });
     } catch (acknowledgeError) {
-      if (mountedRef.current) setError(acknowledgeError.message);
+      if (lifecycleVersion === lifecycleVersionRef.current) {
+        setError(acknowledgeError.message);
+      }
     }
   };
 
