@@ -504,7 +504,12 @@ def _execute_dag(
     elif controller is not None:
         workload_type = 'controller'
     if workload_type == 'cluster':
-        _extra_launch_context = dict(_extra_launch_context)
+        previous_resources = getattr(handle, 'launched_resources', None)
+        previous_resolution = getattr(previous_resources,
+                                      'resolved_container_image', None)
+        _extra_launch_context = (
+            container_image_consumers.reuse_persisted_cluster_epoch(
+                _extra_launch_context, previous_resolution))
         _extra_launch_context.setdefault(
             container_image_consumers.CLUSTER_CONTROLLER_EPOCH_KEY,
             f'cluster-request:{common_utils.get_current_request_id()}')

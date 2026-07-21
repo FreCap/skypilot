@@ -610,7 +610,6 @@ consumer_watermarks = sqlalchemy.Table(
                       nullable=False,
                       server_default='-1'),
     sqlalchemy.Column('owner_deleted_at', sqlalchemy.BigInteger),
-    sqlalchemy.Column('credential_expires_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.CheckConstraint(
@@ -622,8 +621,10 @@ consumer_watermarks = sqlalchemy.Table(
     sqlalchemy.CheckConstraint(
         'length(controller_epoch) BETWEEN 1 AND 1024',
         name='ck_container_image_consumer_controller_epoch'),
-    sqlalchemy.Index('ix_container_image_consumer_watermarks_compaction',
-                     'owner_deleted_at', 'credential_expires_at'),
+    sqlalchemy.Index(
+        'ix_container_image_consumer_watermarks_compaction',
+        'owner_deleted_at',
+        postgresql_where=sqlalchemy.text('owner_deleted_at IS NOT NULL')),
 )
 
 workers = sqlalchemy.Table(

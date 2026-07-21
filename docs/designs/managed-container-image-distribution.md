@@ -4,7 +4,7 @@ Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
-Last updated: 2026-07-20
+Last updated: 2026-07-21
 
 ## Decision
 
@@ -563,8 +563,9 @@ warming. When a selected managed target has no READY route, resolution first
 persists one server-owned demand for that logical deployment target. Identity
 is a stable owner plus an explicit controller epoch:
 
-- a named-cluster owner uses the durable API request ID for a fresh cluster
-  lifecycle and reloads that epoch from its persisted pull plan on replay;
+- a named-cluster owner combines the reusable cluster name with a digest of the
+  durable API request epoch for one launch incarnation and reloads that epoch
+  from its persisted pull plan on replay;
 - a managed-job owner uses stable job and task IDs plus the recovery generation
   derived atomically from the authoritative job status and recovery count; and
 - a Serve owner uses the service incarnation and version plus a normalized
@@ -588,9 +589,14 @@ caller presents an authoritative lifecycle transition. For sequenced owners,
 the new sequence must be strictly greater, so a delayed recovery cannot take
 ownership back. That same transaction supersedes any older live demand before
 publishing the new owner epoch. A first-party named-cluster deletion releases
-its cluster demand in the same PostgreSQL transaction that deletes the cluster
-row. The two-observation delay applies only to reconciliation that infers a
-missing owner, never to an authoritative `sky down` transition.
+its cluster demand and permanently retires that launch incarnation in the same
+PostgreSQL transaction that deletes the cluster row. Recreating the same named
+cluster receives a new request epoch and therefore a new stable owner. The
+two-observation delay applies only to reconciliation that infers a missing
+owner, never to an authoritative `sky down` transition. When reconciliation
+proves a cluster, managed-job task, or Serve version terminal, its final
+observation terminalizes the last demand and retires that owner in one
+watermark-then-demand transaction.
 
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
@@ -691,29 +697,31 @@ rank across every resource alternative for the task before the cost optimizer
 runs. A cheap cross-region or warming option therefore cannot defeat a READY
 regional image merely because it originated from another `any_of` resource.
 
-Terminal demand rows compact after 30 days only when the consumer credential is
-revoked or provably expired and the owner watermark prevents resurrection. The
-watermark is the durable nonresurrection fence and never compacts automatically.
-Authoritative owner deletion locks that fence, succeeds only when the owner has
-no live demand, and records one immutable credential-expiry proof. Deleting the
-fence would let a controller transaction that had already passed authorization
-lose the row while waiting on its unique key and recreate the owner on retry.
-If owner-deletion or credential-expiry proof is unavailable, the newest
-tombstone also remains for administrator review. This retains at most one
-high-watermark row per stable consumer owner rather than every historical
-generation. At million-owner scale these narrow rows remain ordinary indexed
-PostgreSQL state; any future archival scheme must preserve an equivalent
-non-deletable owner fence.
+Terminal demand rows compact after 30 days only when the authoritative consumer
+lifecycle has permanently retired their incarnation and the owner watermark
+prevents resurrection. The watermark is the durable nonresurrection fence and
+never compacts automatically. Because demand creation always rechecks that
+permanent deleted-owner marker under row lock, controller credential expiry is
+not a safety precondition for deleting the retained demand payload.
+Authoritative owner retirement locks the fence and succeeds only when the owner
+has no live demand. Deleting the fence would let a controller transaction that
+had already passed authorization lose the row while waiting on its unique key
+and recreate the owner on retry. If authoritative retirement proof is
+unavailable, the newest tombstone also remains for administrator review. This
+retains at most one high-watermark row per stable consumer owner rather than
+every historical generation. At million-owner scale these narrow rows remain
+ordinary indexed PostgreSQL state; any future archival scheme must preserve an
+equivalent non-deletable owner fence.
 
 Compaction discovers a bounded page of terminal candidate keys without taking
 row locks, groups those keys by owner, and processes owners in deterministic key
 order. For each owner it locks the consumer watermark first, rechecks deletion,
-credential-expiry, and terminal-generation proof, then locks and rechecks only
-that page's eligible demand rows before deletion. It retains the watermark after
-the last demand is removed. It never locks a demand before its watermark, so
-concurrent replay, supersession, authoritative release, or demand creation
-cannot form an inverse-lock cycle with lifecycle maintenance or erase the
-nonresurrection fence.
+and terminal-generation proof, then locks and rechecks only that page's eligible
+demand rows before deletion. It retains the watermark after the last demand is
+removed. It never locks a demand before its watermark, so concurrent replay,
+supersession, authoritative release, or demand creation cannot form an
+inverse-lock cycle with lifecycle maintenance or erase the nonresurrection
+fence.
 
 The image plane gates only whether a new SkyServe replica is eligible to become
 READY. Registry READY, node pull complete, and replica healthy remain three
@@ -1664,8 +1672,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   batched token grants, hot/cold target no-starvation, throttling, count/byte
   ceilings, and empty failed-reservation reclamation tests;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
-  version-target, controller loss, supersede, generation watermark, credential
-  expiry/revocation, compaction, and unreachable consumer stores;
+  version-target, controller loss, supersede, generation watermark,
+  authoritative owner retirement, compaction, and unreachable consumer stores;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
   nested index, artifact, nondistributable/foreign layer, external URL, config
   platform, raw-byte digest, and size-bound reject-before-write tests;
@@ -1820,3 +1828,16 @@ could then recreate a fresh watermark without the terminal fence. This revision
 keeps one permanent watermark per stable owner, rejects creation after
 authoritative deletion under that row lock, removes orphan-watermark discovery,
 and proves both the blocked creator and its retry cannot resurrect the owner.
+
+Implementation review round 7 at
+`8ed518c0a8a8f4940017c087555258e7a02604e0` returned Codex `RESHAPE` and
+Fable `PURSUE`. Both found that `mark_owner_deleted()` had no production caller,
+so the safe compactor was inert and terminal demand payloads grew without
+bound. Wiring reusable cluster names directly to irreversible deletion would
+also prevent same-name recreation. This revision makes cluster owners
+launch-incarnation-safe, retires named clusters atomically with cluster-row
+deletion, retires inferred cluster, managed-job, and Serve owners on their final
+authoritative observation, and proves expired demand compaction through each
+production lifecycle. Since the permanent fence rejects every later creator,
+the obsolete credential-expiry gate and column are removed rather than
+inventing a provider-specific credential lifetime.

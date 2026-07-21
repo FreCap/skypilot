@@ -1555,14 +1555,9 @@ class RetryingVmProvisioner:
         if self._workload_type == 'cluster' and prev_handle is not None:
             previous_resources = prev_handle.launched_resources
             previous_resolution = previous_resources.resolved_container_image
-            if (previous_resolution is not None and
-                    previous_resolution.controller_epoch is not None):
-                launch_context = dict(launch_context or {})
-                launch_context[
-                    container_image_consumers.CLUSTER_CONTROLLER_EPOCH_KEY] = (
-                        previous_resolution.controller_epoch)
-                launch_context[container_image_consumers.
-                               CLUSTER_ALLOW_EPOCH_ADVANCE_KEY] = (False)
+            launch_context = (
+                container_image_consumers.reuse_persisted_cluster_epoch(
+                    launch_context, previous_resolution))
         image_demand = _get_image_demand_attribution(task, cluster_name,
                                                      self._workload_type,
                                                      launch_context)

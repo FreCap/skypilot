@@ -41,7 +41,7 @@ def _cluster_demand(
         authority_id='00000000-0000-4000-8000-000000000006',
         workspace='research',
         consumer_kind='cluster',
-        consumer_owner='orphan-cluster',
+        consumer_owner='orphan-cluster:incarnation:owner-hash',
         request_id='request-id',
         consumer_generation=0,
         target_key='artifact:target',
@@ -52,9 +52,12 @@ def _cluster_demand(
         profile_revision_id=_REVISION_ID,
         target_fingerprint='f' * 64,
         location_id=_LOCATION_ID,
-        placement={'consumer': {
-            'request_id': 'request-id'
-        }},
+        placement={
+            'consumer': {
+                'workload_id': 'orphan-cluster',
+                'request_id': 'request-id',
+            }
+        },
         pull_plan=None,
         state=models.ImageDemandState.WARMING,
         error_code=None,

@@ -27,6 +27,7 @@ from sky.container_images import builder_prototype
 from sky.container_images import catalog_state
 from sky.container_images import config
 from sky.container_images import demand_state
+from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
 from sky.container_images import publication
 from sky.container_images import schema
@@ -271,6 +272,7 @@ def _warming_demand(
     controller_sequence: int | None = 7,
     allow_epoch_advance: bool = False,
     request_id: str = 'request-1',
+    consumer_metadata: dict[str, Any] | None = None,
     backend: str = 'aws_vm',
     placement_region: str | None = None,
     now: int = 50,
@@ -280,6 +282,9 @@ def _warming_demand(
     assert authority is not None
     target = next(target for target in (profile.canonical,) + profile.targets
                   if target.target_fingerprint == location.target_fingerprint)
+    consumer = {'request_id': request_id}
+    if consumer_metadata is not None:
+        consumer.update(consumer_metadata)
     return transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
         workspace='research',
@@ -300,9 +305,7 @@ def _warming_demand(
             'region': placement_region or target.region,
             'backend': backend,
             'platform': 'linux/amd64',
-            'consumer': {
-                'request_id': request_id,
-            },
+            'consumer': consumer,
         },
         now=now)
 
@@ -664,7 +667,7 @@ def test_authoritative_cluster_deletion_releases_demand_immediately(
                              publication_record,
                              regional,
                              profile,
-                             owner='cluster-a',
+                             owner='cluster-a:incarnation:launch-hash',
                              consumer_kind='cluster',
                              controller_epoch='cluster-request:launch-a',
                              controller_sequence=None)
@@ -677,6 +680,51 @@ def test_authoritative_cluster_deletion_releases_demand_immediately(
     assert released.state == models.ImageDemandState.RELEASED
 
 
+def test_stale_authoritative_release_cannot_retire_a_live_generation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    owner = '42:task:0'
+    stale = _warming_demand(active,
+                            publication_record,
+                            regional,
+                            profile,
+                            owner=owner,
+                            consumer_kind='managed_job_task',
+                            controller_epoch='managed-job:42:task:0:recovery:0',
+                            controller_sequence=0)
+    assert demand_state.supersede_demand(stale.id, 'research', now=51)
+    current = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner=owner,
+        consumer_kind='managed_job_task',
+        controller_epoch='managed-job:42:task:0:recovery:1',
+        controller_sequence=1,
+        allow_epoch_advance=True,
+        request_id='request-2',
+        now=52)
+
+    assert not demand_state.release_demand_authoritatively(
+        stale.id, 'research', now=53)
+    preserved = demand_state.get_demand(current.id, 'research')
+    assert preserved is not None
+    assert preserved.state == models.ImageDemandState.WARMING
+    with image_database.connect() as connection:
+        owner_deleted_at = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.owner_deleted_at).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind ==
+                    'managed_job_task',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    owner)).scalar_one()
+    assert owner_deleted_at is None
+
+
 def test_cluster_row_and_demand_release_commit_atomically(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -686,7 +734,7 @@ def test_cluster_row_and_demand_release_commit_atomically(
                              publication_record,
                              regional,
                              profile,
-                             owner='cluster-a',
+                             owner='cluster-a:incarnation:launch-hash',
                              consumer_kind='cluster',
                              controller_epoch='cluster-request:launch-a',
                              controller_sequence=None)
@@ -701,6 +749,7 @@ def test_cluster_row_and_demand_release_commit_atomically(
             workspace='research'))
     monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
                         lambda: image_database)
+    monkeypatch.setattr(global_user_state.time, 'time', lambda: 100)
 
     global_user_state.remove_cluster('cluster-a', terminate=True)
 
@@ -712,6 +761,164 @@ def test_cluster_row_and_demand_release_commit_atomically(
     released = demand_state.get_demand(demand.id, 'research')
     assert released is not None
     assert released.state == models.ImageDemandState.RELEASED
+    with image_database.connect() as connection:
+        watermark = connection.execute(
+            sqlalchemy.select(schema.consumer_watermarks).where(
+                schema.consumer_watermarks.c.workspace == 'research',
+                schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                schema.consumer_watermarks.c.consumer_owner ==
+                demand.consumer_owner)).mappings().one()
+    assert watermark['owner_deleted_at'] == 100
+    assert demand_state.compact_terminal_demands(
+        now=100 + demand_state._TERMINAL_RETENTION_SECONDS) == 1
+    assert demand_state.get_demand(demand.id, 'research') is None
+    with image_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.consumer_owner).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                    schema.consumer_watermarks.c.consumer_owner == demand.
+                    consumer_owner)).scalar_one() == demand.consumer_owner
+    recreated = _warming_demand(active,
+                                publication_record,
+                                regional,
+                                profile,
+                                owner='cluster-a:incarnation:new-launch-hash',
+                                consumer_kind='cluster',
+                                controller_epoch='cluster-request:launch-b',
+                                controller_sequence=None,
+                                request_id='launch-b',
+                                now=101)
+    assert recreated.state == models.ImageDemandState.WARMING
+    assert recreated.consumer_owner != demand.consumer_owner
+
+
+def test_replica_cluster_deletion_preserves_shared_job_owner(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner='42:task:0',
+        consumer_kind='managed_job_task',
+        controller_epoch='managed-job:42:task:0:recovery:0',
+        controller_sequence=0)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    handle = types.SimpleNamespace(launched_resources=types.SimpleNamespace(
+        resolved_container_image=types.SimpleNamespace(demand_id=demand.id)))
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert().values(
+            name='managed-job-replica',
+            handle=pickle.dumps(handle),
+            status='UP',
+            workspace='research'))
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+
+    global_user_state.remove_cluster('managed-job-replica', terminate=True)
+
+    with image_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(global_user_state.cluster_table.c.name).where(
+                global_user_state.cluster_table.c.name ==
+                'managed-job-replica')).first() is None
+        watermark = connection.execute(
+            sqlalchemy.select(schema.consumer_watermarks).where(
+                schema.consumer_watermarks.c.workspace == 'research',
+                schema.consumer_watermarks.c.consumer_kind ==
+                'managed_job_task', schema.consumer_watermarks.c.consumer_owner
+                == demand.consumer_owner)).mappings().one()
+    assert watermark['owner_deleted_at'] is None
+    preserved = demand_state.get_demand(demand.id, 'research')
+    assert preserved is not None
+    assert preserved.state == models.ImageDemandState.WARMING
+
+
+def test_job_and_serve_reconciliation_retire_and_compact_owners(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    job_identity = (42, 0)
+    service_identity = ('boltz-l4', 1, 'service-hash')
+    job = _warming_demand(active,
+                          publication_record,
+                          regional,
+                          profile,
+                          owner='42:task:0',
+                          consumer_kind='managed_job_task',
+                          controller_epoch='managed-job:42:task:0:recovery:0',
+                          controller_sequence=0,
+                          consumer_metadata={
+                              'workload_type': 'managed_job',
+                              'workload_id': '42',
+                              'workload_task_id': 0,
+                              'recovery_generation': 0,
+                          })
+    service = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        owner='boltz-l4:incarnation:service-hash:v1:target:scope',
+        consumer_kind='service_version',
+        controller_epoch='service:service-hash:v1',
+        controller_sequence=1,
+        request_id='request-2',
+        consumer_metadata={
+            'workload_type': 'service',
+            'workload_id': 'boltz-l4',
+            'workload_task_id': 1,
+            'service_hash': 'service-hash',
+        },
+        now=51)
+    assert not demand_state.observe_consumer_terminal(
+        job.id, 'research', authoritative=True, now=60)
+    assert not demand_state.observe_consumer_terminal(
+        service.id, 'research', authoritative=True, now=60)
+    current = 60 + lifecycle_worker_service._TERMINAL_CONFIRMATION_SECONDS
+    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
+                        'get_cluster_status_fields', lambda _: {})
+    monkeypatch.setattr(
+        lifecycle_worker_service.managed_job_state,
+        'get_job_task_terminal_states', lambda identities:
+        {identity: identity == job_identity for identity in identities})
+    monkeypatch.setattr(
+        lifecycle_worker_service.serve_state,
+        'get_service_version_terminal_states', lambda identities:
+        {identity: identity == service_identity for identity in identities})
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 2
+    for demand in (job, service):
+        terminal = demand_state.get_demand(demand.id, 'research')
+        assert terminal is not None
+        assert terminal.state == models.ImageDemandState.RELEASED
+        with image_database.connect() as connection:
+            watermark = connection.execute(
+                sqlalchemy.select(schema.consumer_watermarks).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind ==
+                    demand.consumer_kind,
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    demand.consumer_owner)).mappings().one()
+        assert watermark['owner_deleted_at'] == current
+
+    assert demand_state.compact_terminal_demands(
+        now=current + demand_state._TERMINAL_RETENTION_SECONDS) == 2
+    assert demand_state.get_demand(job.id, 'research') is None
+    assert demand_state.get_demand(service.id, 'research') is None
+    with image_database.connect() as connection:
+        retained_fences = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.consumer_owner).where(
+                    schema.consumer_watermarks.c.consumer_owner.in_(
+                        [job.consumer_owner, service.consumer_owner]))).all()
+    assert len(retained_fences) == 2
 
 
 def test_retired_profile_allows_exact_demand_replay_but_no_new_owner(
@@ -1055,12 +1262,7 @@ def test_terminal_compaction_and_release_follow_watermark_lock_order(
         now=52)
     assert demand_state.release_demand_authoritatively(retained.id,
                                                        'research',
-                                                       now=53)
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind='managed_job_task',
-                                           consumer_owner=owner,
-                                           credential_expires_at=54,
-                                           now=54)
+                                                       now=54)
     with image_database.begin() as connection:
         connection.execute(schema.demands.update().where(
             schema.demands.c.id == expired.id).values(expires_at=100))
@@ -1146,11 +1348,9 @@ def test_terminal_compaction_cannot_resurrect_deleted_owner(
         controller_epoch='managed-job:42:task:0:recovery:0',
         controller_sequence=0)
     assert demand_state.supersede_demand(expired.id, 'research', now=51)
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind='managed_job_task',
-                                           consumer_owner=owner,
-                                           credential_expires_at=54,
-                                           now=54)
+    assert demand_state.release_demand_authoritatively(expired.id,
+                                                       'research',
+                                                       now=54)
     with image_database.begin() as connection:
         connection.execute(schema.demands.update().where(
             schema.demands.c.id == expired.id).values(expires_at=100))
@@ -1244,7 +1444,6 @@ def test_terminal_compaction_cannot_resurrect_deleted_owner(
                         models.ImageDemandState.FAILED.value,
                     ]))).all()
         assert watermark['owner_deleted_at'] == 54
-        assert watermark['credential_expires_at'] == 54
         assert not live_demands
     finally:
         allow_compaction_to_continue.set()
@@ -1270,13 +1469,17 @@ def test_terminal_compaction_requires_proof_and_retains_owner_fence(
     assert demand_state.compact_terminal_demands(now=1000) == 0
     assert demand_state.get_demand(demand.id, 'research') is not None
 
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind=demand.consumer_kind,
-                                           consumer_owner=demand.consumer_owner,
-                                           credential_expires_at=900,
-                                           now=900)
+    assert demand_state.release_demand_authoritatively(demand.id,
+                                                       'research',
+                                                       now=900)
     assert demand_state.compact_terminal_demands(now=1000) == 1
     assert demand_state.get_demand(demand.id, 'research') is None
+    with pytest.raises(demand_state.StaleConsumerGenerationError,
+                       match='no longer exists'):
+        transactions.commit_ready_demand(
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan={})
     with image_database.connect() as connection:
         watermark = connection.execute(
             sqlalchemy.select(
@@ -1329,11 +1532,9 @@ def test_deleted_owner_rejects_legacy_generation_creation(
         placement=placement,
         now=50)
     assert demand_state.supersede_demand(demand.id, 'research', now=51)
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind='cluster',
-                                           consumer_owner=owner,
-                                           credential_expires_at=52,
-                                           now=52)
+    assert demand_state.release_demand_authoritatively(demand.id,
+                                                       'research',
+                                                       now=52)
 
     with pytest.raises(demand_state.StaleConsumerGenerationError,
                        match='authoritatively deleted'):
@@ -1353,48 +1554,6 @@ def test_deleted_owner_rejects_legacy_generation_creation(
             location_id=regional.id,
             placement=placement,
             now=53)
-
-
-def test_owner_deletion_requires_no_live_demand_and_is_immutable(
-        image_database, monkeypatch: pytest.MonkeyPatch,
-        profile: models.ManagedRegistryProfile) -> None:
-    active, publication_record, _, regional = _ready_regional(
-        image_database, monkeypatch, profile)
-    demand = _warming_demand(active, publication_record, regional, profile)
-
-    assert not demand_state.mark_owner_deleted(
-        workspace='research',
-        consumer_kind=demand.consumer_kind,
-        consumer_owner=demand.consumer_owner,
-        credential_expires_at=100,
-        now=51)
-    assert demand_state.supersede_demand(demand.id, 'research', now=52)
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind=demand.consumer_kind,
-                                           consumer_owner=demand.consumer_owner,
-                                           credential_expires_at=100,
-                                           now=53)
-    assert demand_state.mark_owner_deleted(workspace='research',
-                                           consumer_kind=demand.consumer_kind,
-                                           consumer_owner=demand.consumer_owner,
-                                           credential_expires_at=100,
-                                           now=54)
-    with pytest.raises(ValueError, match='immutable'):
-        demand_state.mark_owner_deleted(workspace='research',
-                                        consumer_kind=demand.consumer_kind,
-                                        consumer_owner=demand.consumer_owner,
-                                        credential_expires_at=101,
-                                        now=55)
-    with pytest.raises(ValueError, match='expiry'):
-        demand_state.mark_owner_deleted(workspace='research',
-                                        consumer_kind=demand.consumer_kind,
-                                        consumer_owner=demand.consumer_owner,
-                                        credential_expires_at=-1)
-    with pytest.raises(ValueError, match='expiry'):
-        demand_state.mark_owner_deleted(workspace='research',
-                                        consumer_kind=demand.consumer_kind,
-                                        consumer_owner=demand.consumer_owner,
-                                        credential_expires_at=True)
 
 
 def test_shard_admission_retries_after_locked_home_fills(

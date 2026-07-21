@@ -72,6 +72,13 @@ def _workload_attribution(
     return workload_id, workload_task_id
 
 
+def _validate_cluster_controller_epoch(value: Any) -> str:
+    if (not isinstance(value, str) or not value or len(value) > 1024 or
+            any(character.isspace() for character in value)):
+        raise ValueError('Cluster image controller epoch is invalid.')
+    return value
+
+
 def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
            launch_context: dict[str, Any] | None) -> ImageConsumerContext:
     """Derives an identity that survives request and controller restarts."""
@@ -126,13 +133,13 @@ def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
     controller_epoch = (launch_context or {}).get(CLUSTER_CONTROLLER_EPOCH_KEY)
     if controller_epoch is None:
         controller_epoch = f'cluster-request:{request_id}'
-    if (not isinstance(controller_epoch, str) or not controller_epoch or
-            len(controller_epoch) > 1024):
-        raise ValueError('Cluster image controller epoch is invalid.')
+    controller_epoch = _validate_cluster_controller_epoch(controller_epoch)
     allow_epoch_advance = bool((launch_context or
                                 {}).get(CLUSTER_ALLOW_EPOCH_ADVANCE_KEY, False))
+    incarnation = hashlib.sha256(controller_epoch.encode()).hexdigest()
     return ImageConsumerContext(consumer_kind='cluster',
-                                consumer_owner=stable_cluster_name,
+                                consumer_owner=(f'{stable_cluster_name}:'
+                                                f'incarnation:{incarnation}'),
                                 controller_epoch=controller_epoch,
                                 controller_sequence=None,
                                 allow_epoch_advance=allow_epoch_advance,
@@ -141,6 +148,19 @@ def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
                                     'workload_id': stable_cluster_name,
                                     'request_id': request_id,
                                 })
+
+
+def reuse_persisted_cluster_epoch(launch_context: dict[str, Any] | None,
+                                  resolved_image: Any | None) -> dict[str, Any]:
+    """Reloads one persisted cluster incarnation before planning and launch."""
+    context = dict(launch_context or {})
+    controller_epoch = getattr(resolved_image, 'controller_epoch', None)
+    if controller_epoch is None:
+        return context
+    context[CLUSTER_CONTROLLER_EPOCH_KEY] = _validate_cluster_controller_epoch(
+        controller_epoch)
+    context[CLUSTER_ALLOW_EPOCH_ADVANCE_KEY] = False
+    return context
 
 
 def scope_for_placement(context: ImageConsumerContext,

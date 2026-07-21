@@ -497,6 +497,37 @@ def test_one_thousand_service_replicas_share_one_version_target_owner(
     assert recreated.controller_epoch == 'service:new-hash:v7'
 
 
+def test_named_cluster_owner_is_scoped_to_durable_launch_incarnation() -> None:
+    task = sky.Task()
+    first_context = {
+        consumers.CLUSTER_CONTROLLER_EPOCH_KEY: 'cluster-request:first',
+        consumers.CLUSTER_ALLOW_EPOCH_ADVANCE_KEY: True,
+    }
+    first = consumers.derive(task, 'research-cluster', 'cluster', first_context)
+    replay = consumers.derive(task, 'research-cluster', 'cluster',
+                              first_context)
+    recreated = consumers.derive(
+        task, 'research-cluster', 'cluster', {
+            consumers.CLUSTER_CONTROLLER_EPOCH_KEY: 'cluster-request:second',
+            consumers.CLUSTER_ALLOW_EPOCH_ADVANCE_KEY: True,
+        })
+    persisted_context = consumers.reuse_persisted_cluster_epoch(
+        {
+            consumers.CLUSTER_CONTROLLER_EPOCH_KEY: 'cluster-request:second',
+            consumers.CLUSTER_ALLOW_EPOCH_ADVANCE_KEY: True,
+        }, mock.Mock(controller_epoch='cluster-request:first'))
+    persisted = consumers.derive(task, 'research-cluster', 'cluster',
+                                 persisted_context)
+
+    assert first.consumer_owner == replay.consumer_owner
+    assert persisted.consumer_owner == first.consumer_owner
+    assert not persisted.allow_epoch_advance
+    assert first.consumer_owner.startswith('research-cluster:incarnation:')
+    assert recreated.consumer_owner != first.consumer_owner
+    assert recreated.controller_epoch == 'cluster-request:second'
+    assert recreated.metadata['workload_id'] == 'research-cluster'
+
+
 def test_legacy_docker_image_survives_copy_pickle_and_yaml_round_trip() -> None:
     resources = sky.Resources(image_id='docker:ubuntu:22.04')
     copied = pickle.loads(pickle.dumps(resources))

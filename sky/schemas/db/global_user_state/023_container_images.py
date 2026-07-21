@@ -682,7 +682,6 @@ def _create_tables() -> None:
                           nullable=False,
                           server_default='-1'),
         sqlalchemy.Column('owner_deleted_at', sqlalchemy.BigInteger),
-        sqlalchemy.Column('credential_expires_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.CheckConstraint(
@@ -695,9 +694,10 @@ def _create_tables() -> None:
             'length(controller_epoch) BETWEEN 1 AND 1024',
             name='ck_container_image_consumer_controller_epoch'),
     )
-    op.create_index('ix_container_image_consumer_watermarks_compaction',
-                    'container_image_consumer_watermarks',
-                    ['owner_deleted_at', 'credential_expires_at'])
+    op.create_index(
+        'ix_container_image_consumer_watermarks_compaction',
+        'container_image_consumer_watermarks', ['owner_deleted_at'],
+        postgresql_where=sqlalchemy.text('owner_deleted_at IS NOT NULL'))
 
     op.create_table(
         'container_image_workers',

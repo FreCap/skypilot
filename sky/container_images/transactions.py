@@ -967,7 +967,10 @@ def commit_ready_demand(*,
     with orm.Session(catalog_state.engine()) as session, session.begin():
         optimistic = session.execute(
             sqlalchemy.select(schema.demands).where(
-                schema.demands.c.id == demand_id)).mappings().one()
+                schema.demands.c.id == demand_id)).mappings().first()
+        if optimistic is None:
+            raise demand_state.StaleConsumerGenerationError(
+                'Demand no longer exists.')
         profile_row = session.execute(
             sqlalchemy.select(schema.profile_revisions).where(
                 schema.profile_revisions.c.id ==

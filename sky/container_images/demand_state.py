@@ -68,7 +68,6 @@ class ConsumerWatermark:
     max_seen_generation: int
     max_terminal_generation: int
     owner_deleted_at: int | None
-    credential_expires_at: int | None
     created_at: int
     updated_at: int
 
@@ -158,7 +157,6 @@ def _watermark(row: sqlalchemy.engine.RowMapping) -> ConsumerWatermark:
         max_seen_generation=int(row['max_seen_generation']),
         max_terminal_generation=int(row['max_terminal_generation']),
         owner_deleted_at=row['owner_deleted_at'],
-        credential_expires_at=row['credential_expires_at'],
         created_at=int(row['created_at']),
         updated_at=int(row['updated_at']),
     )
@@ -664,7 +662,7 @@ def release_demand_authoritatively_in_session(session: orm.Session,
                                               expected_consumer_kind: str |
                                               None = None,
                                               now: int) -> bool:
-    """Releases a fence inside the first-party owner's deletion transaction."""
+    """Releases and retires an owner inside its deletion transaction."""
     optimistic = session.execute(
         sqlalchemy.select(schema.demands).where(
             schema.demands.c.id == demand_id,
@@ -674,28 +672,34 @@ def release_demand_authoritatively_in_session(session: orm.Session,
     if (expected_consumer_kind is not None and
             str(optimistic['consumer_kind']) != expected_consumer_kind):
         return False
+    owner_workspace = str(optimistic['workspace'])
+    owner_kind = str(optimistic['consumer_kind'])
+    owner = str(optimistic['consumer_owner'])
     _lock_existing_watermark(session,
-                             workspace=str(optimistic['workspace']),
-                             consumer_kind=str(optimistic['consumer_kind']),
-                             consumer_owner=str(optimistic['consumer_owner']))
+                             workspace=owner_workspace,
+                             consumer_kind=owner_kind,
+                             consumer_owner=owner)
     row = session.execute(
         sqlalchemy.select(schema.demands).where(
             schema.demands.c.id == demand_id, schema.demands.c.workspace ==
             workspace).with_for_update()).mappings().first()
     if row is None:
         return False
-    if str(row['state']) in (models.ImageDemandState.RELEASED.value,
-                             models.ImageDemandState.SUPERSEDED.value):
-        return True
-    _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
-    return True
+    if str(row['state']) not in (models.ImageDemandState.RELEASED.value,
+                                 models.ImageDemandState.SUPERSEDED.value):
+        _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+    return _mark_owner_deleted_in_session(session,
+                                          workspace=owner_workspace,
+                                          consumer_kind=owner_kind,
+                                          consumer_owner=owner,
+                                          now=now)
 
 
 def release_demand_authoritatively(demand_id: str,
                                    workspace: str,
                                    *,
                                    now: int | None = None) -> bool:
-    """Releases a fence after first-party proof of owner deletion."""
+    """Releases and retires an owner after first-party deletion proof."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         return release_demand_authoritatively_in_session(session,
@@ -795,6 +799,41 @@ def _terminalize(session: orm.Session, row: sqlalchemy.engine.RowMapping,
             updated_at=now))
 
 
+def _mark_owner_deleted_in_session(session: orm.Session, *, workspace: str,
+                                   consumer_kind: str, consumer_owner: str,
+                                   now: int) -> bool:
+    watermarks = schema.consumer_watermarks
+    demands = schema.demands
+    watermark = session.execute(
+        sqlalchemy.select(watermarks).where(
+            watermarks.c.workspace == workspace,
+            watermarks.c.consumer_kind == consumer_kind,
+            watermarks.c.consumer_owner ==
+            consumer_owner).with_for_update()).mappings().first()
+    if watermark is None:
+        return False
+    if watermark['owner_deleted_at'] is not None:
+        return True
+    live_demand = session.execute(
+        sqlalchemy.select(demands.c.id).where(
+            demands.c.workspace == workspace,
+            demands.c.consumer_kind == consumer_kind,
+            demands.c.consumer_owner == consumer_owner,
+            demands.c.state.in_([
+                models.ImageDemandState.WARMING.value,
+                models.ImageDemandState.READY.value,
+                models.ImageDemandState.FAILED.value,
+            ])).limit(1)).first()
+    if live_demand is not None:
+        return False
+    session.execute(watermarks.update().where(
+        watermarks.c.workspace == workspace,
+        watermarks.c.consumer_kind == consumer_kind,
+        watermarks.c.consumer_owner == consumer_owner).values(
+            owner_deleted_at=now, updated_at=now))
+    return True
+
+
 def observe_consumer_terminal(demand_id: str,
                               workspace: str,
                               *,
@@ -812,21 +851,26 @@ def observe_consumer_terminal(demand_id: str,
                 demands.c.workspace == workspace)).mappings().first()
         if optimistic is None:
             return False
+        owner_workspace = str(optimistic['workspace'])
+        owner_kind = str(optimistic['consumer_kind'])
+        owner = str(optimistic['consumer_owner'])
         _lock_existing_watermark(session,
-                                 workspace=str(optimistic['workspace']),
-                                 consumer_kind=str(optimistic['consumer_kind']),
-                                 consumer_owner=str(
-                                     optimistic['consumer_owner']))
+                                 workspace=owner_workspace,
+                                 consumer_kind=owner_kind,
+                                 consumer_owner=owner)
         row = session.execute(
             sqlalchemy.select(demands).where(
                 demands.c.id == demand_id, demands.c.workspace ==
                 workspace).with_for_update()).mappings().first()
         if row is None:
             return False
-        if str(row['state']) == models.ImageDemandState.RELEASED.value:
-            return True
-        if str(row['state']) == models.ImageDemandState.SUPERSEDED.value:
-            return True
+        if str(row['state']) in (models.ImageDemandState.RELEASED.value,
+                                 models.ImageDemandState.SUPERSEDED.value):
+            return _mark_owner_deleted_in_session(session,
+                                                  workspace=owner_workspace,
+                                                  consumer_kind=owner_kind,
+                                                  consumer_owner=owner,
+                                                  now=current)
         first = row['first_terminal_observed_at']
         count = int(row['terminal_observation_count'])
         if first is None:
@@ -852,56 +896,11 @@ def observe_consumer_terminal(demand_id: str,
                      row,
                      models.ImageDemandState.RELEASED,
                      now=current)
-        return True
-
-
-def mark_owner_deleted(*,
-                       workspace: str,
-                       consumer_kind: str,
-                       consumer_owner: str,
-                       credential_expires_at: int,
-                       now: int | None = None) -> bool:
-    if (type(credential_expires_at) is not int or  # pylint: disable=unidiomatic-typecheck
-            not 0 <= credential_expires_at <= _MAX_POSTGRES_BIGINT):
-        raise ValueError('Consumer credential expiry is invalid.')
-    current = int(time.time()) if now is None else now
-    watermarks = schema.consumer_watermarks
-    demands = schema.demands
-    with orm.Session(catalog_state.engine()) as session, session.begin():
-        watermark = session.execute(
-            sqlalchemy.select(watermarks).where(
-                watermarks.c.workspace == workspace,
-                watermarks.c.consumer_kind == consumer_kind,
-                watermarks.c.consumer_owner ==
-                consumer_owner).with_for_update()).mappings().first()
-        if watermark is None:
-            return False
-        if watermark['owner_deleted_at'] is not None:
-            existing_expiry = watermark['credential_expires_at']
-            if (existing_expiry is None or
-                    int(existing_expiry) != credential_expires_at):
-                raise ValueError('Consumer owner deletion proof is immutable.')
-            return True
-        live_demand = session.execute(
-            sqlalchemy.select(demands.c.id).where(
-                demands.c.workspace == workspace,
-                demands.c.consumer_kind == consumer_kind,
-                demands.c.consumer_owner == consumer_owner,
-                demands.c.state.in_([
-                    models.ImageDemandState.WARMING.value,
-                    models.ImageDemandState.READY.value,
-                    models.ImageDemandState.FAILED.value,
-                ])).limit(1)).first()
-        if live_demand is not None:
-            return False
-        session.execute(watermarks.update().where(
-            watermarks.c.workspace == workspace,
-            watermarks.c.consumer_kind == consumer_kind,
-            watermarks.c.consumer_owner == consumer_owner).values(
-                owner_deleted_at=current,
-                credential_expires_at=credential_expires_at,
-                updated_at=current))
-        return True
+        return _mark_owner_deleted_in_session(session,
+                                              workspace=owner_workspace,
+                                              consumer_kind=owner_kind,
+                                              consumer_owner=owner,
+                                              now=current)
 
 
 def compact_terminal_demands(*,
@@ -929,10 +928,8 @@ def compact_terminal_demands(*,
                             demands.c.state.in_([
                                 models.ImageDemandState.SUPERSEDED.value,
                                 models.ImageDemandState.RELEASED.value,
-                            ]),
-                            demands.c.expires_at <= current,
+                            ]), demands.c.expires_at <= current,
                             watermarks.c.owner_deleted_at.is_not(None),
-                            watermarks.c.credential_expires_at <= current,
                             demands.c.consumer_generation
                             <= watermarks.c.max_terminal_generation).order_by(
                                 demands.c.expires_at,
@@ -955,11 +952,7 @@ def compact_terminal_demands(*,
                 with_for_update(skip_locked=True)).mappings().first()
             if watermark is None:
                 continue
-            credential_expiry = watermark['credential_expires_at']
-            owner_deletion_proved = (watermark['owner_deleted_at'] is not None
-                                     and credential_expiry is not None and
-                                     int(credential_expiry) <= current)
-            if not owner_deletion_proved:
+            if watermark['owner_deleted_at'] is None:
                 continue
             candidate_ids = candidate_ids_by_owner.get(
                 (workspace, consumer_kind, consumer_owner), [])

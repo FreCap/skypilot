@@ -107,21 +107,27 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
     """Releases fences only from each consumer's authoritative lifecycle."""
     candidates = demand_state.list_consumer_reconciliation_candidates(
         older_than=current - _CONSUMER_RECONCILIATION_SECONDS, limit=limit)
-    cluster_names = sorted({
-        demand.consumer_owner
-        for demand in candidates
-        if demand.consumer_kind == 'cluster'
-    })
-    existing = global_user_state.get_cluster_status_fields(cluster_names)
+    cluster_names: set[str] = set()
     service_identities: list[tuple[str, int, str]] = []
     job_identities: list[tuple[int, int]] = []
+    demand_cluster_identity: dict[str, str] = {}
     demand_service_identity: dict[str, tuple[str, int, str]] = {}
     demand_job_identity: dict[str, tuple[int, int]] = {}
     for demand in candidates:
         consumer = demand.placement.get('consumer')
         if not isinstance(consumer, dict):
             continue
-        if demand.consumer_kind == 'service_version':
+        if demand.consumer_kind == 'cluster':
+            workload_id = consumer.get('workload_id')
+            if isinstance(workload_id, str) and workload_id:
+                cluster_names.add(workload_id)
+                demand_cluster_identity[demand.id] = workload_id
+            elif ':incarnation:' not in demand.consumer_owner:
+                # Compatibility for demands created before cluster owners were
+                # scoped by their durable launch incarnation.
+                cluster_names.add(demand.consumer_owner)
+                demand_cluster_identity[demand.id] = demand.consumer_owner
+        elif demand.consumer_kind == 'service_version':
             name = consumer.get('workload_id')
             version = consumer.get('workload_task_id')
             service_hash = consumer.get('service_hash')
@@ -144,6 +150,8 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
                 job_identity = (parsed_job_id, task_id)
                 job_identities.append(job_identity)
                 demand_job_identity[demand.id] = job_identity
+    existing = global_user_state.get_cluster_status_fields(
+        sorted(cluster_names))
     try:
         service_states = serve_state.get_service_version_terminal_states(
             list(set(service_identities)))
@@ -158,7 +166,12 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
     for demand in candidates:
         authoritative_terminal = False
         if demand.consumer_kind == 'cluster':
-            if demand.consumer_owner in existing:
+            cluster_name = demand_cluster_identity.get(demand.id)
+            if cluster_name is None:
+                demand_state.defer_consumer_reconciliation(demand.id,
+                                                           now=current)
+                continue
+            if cluster_name in existing:
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue

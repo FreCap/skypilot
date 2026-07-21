@@ -1902,6 +1902,9 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
                 from sky.container_images import demand_state
 
                 # pylint: enable=import-outside-toplevel
+                # Managed-job and Serve replica clusters point to shared
+                # non-cluster consumers. The kind guard intentionally leaves
+                # those owners to their authoritative lifecycle reconciler.
                 demand_state.release_demand_authoritatively_in_session(
                     session,
                     terminal_demand_id,
