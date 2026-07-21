@@ -122,7 +122,7 @@ class QualifiedShard:
                        separators=(',', ':')).encode()).hexdigest()
 
     @classmethod
-    def from_dict(cls, value: Any) -> 'QualifiedShard':
+    def from_dict(cls, value: Any) -> QualifiedShard:
         """Parses one closed Terraform shard fact without trusting JSON types."""
         fields = {field.name for field in dataclasses.fields(cls)}
         if not isinstance(value, dict) or set(value) != fields:
@@ -220,7 +220,7 @@ class TerraformQualificationManifest:
     quota_facts: dict[str, int]
 
     @classmethod
-    def from_json(cls, payload: bytes) -> 'TerraformQualificationManifest':
+    def from_json(cls, payload: bytes) -> TerraformQualificationManifest:
         if len(payload) > 4 * 1024 * 1024:
             raise ValueError('Qualification manifest exceeds 4 MiB.')
         try:
@@ -553,7 +553,7 @@ def applied_ecr_images_per_repository_quota(binding: AwsRoleBinding,
     }
     try:
         response = client.get_service_quota(**kwargs)
-    except BaseException as error:  # pylint: disable=broad-except
+    except Exception as error:  # pylint: disable=broad-except
         if _error_code(error) != 'NoSuchResourceException':
             raise
         response = client.get_aws_default_service_quota(**kwargs)
@@ -599,7 +599,7 @@ class _HookedEcrClient:
             self.started_calls += 1
             try:
                 return value(*args, **kwargs)
-            except BaseException as error:  # pylint: disable=broad-except
+            except Exception as error:  # pylint: disable=broad-except
                 if _error_code(error) in _THROTTLE_ERROR_CODES:
                     self._hooks.on_throttle()
                 _classify(error)
@@ -684,7 +684,7 @@ class EcrRepository:
                   region: str,
                   repository_name: str,
                   *,
-                  hooks: EcrCallHooks | None = None) -> 'EcrRepository':
+                  hooks: EcrCallHooks | None = None) -> EcrRepository:
         client = _assumed_ecr_client(binding, region)
         if hooks is not None:
             client = _HookedEcrClient(client, hooks)
@@ -883,7 +883,7 @@ class EcrRepository:
         try:
             initiated = self._client.initiate_layer_upload(
                 repositoryName=self.repository_name)
-        except BaseException as error:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             _classify(error)
             raise AssertionError('unreachable') from error
         upload_id = initiated['uploadId']
@@ -901,7 +901,7 @@ class EcrRepository:
                     partFirstByte=offset,
                     partLastByte=offset + len(payload) - 1,
                     layerPartBlob=payload)
-            except BaseException as error:  # pylint: disable=broad-except
+            except Exception as error:  # pylint: disable=broad-except
                 try:
                     _classify(error)
                 except AmbiguousProviderOutcomeError:
@@ -924,7 +924,7 @@ class EcrRepository:
                 repositoryName=self.repository_name,
                 uploadId=upload_id,
                 layerDigests=[descriptor.digest])
-        except BaseException as error:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             if self._layers_present([descriptor.digest])[descriptor.digest]:
                 return
             _classify(error)
@@ -954,7 +954,7 @@ class EcrRepository:
                 imageManifestMediaType=graph.runtime_media_type,
                 imageDigest=graph.runtime_digest)
             return CopyOutcome.WRITTEN
-        except BaseException as error:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             code = _error_code(error)
             if code == 'ImageAlreadyExistsException':
                 if self.verify_graph(graph):
@@ -977,14 +977,14 @@ class EcrRepository:
                                             imageIds=[{
                                                 'imageDigest': digest
                                             }])
-        except BaseException:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             calls_after = getattr(self._client, 'started_calls', None)
             if (calls_before is not None and calls_after == calls_before):
                 return DeleteOutcome.NOT_STARTED
         try:
             return (DeleteOutcome.ABSENT if self._batch_get_manifest(digest)
                     is None else DeleteOutcome.PRESENT)
-        except BaseException:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             calls_after = getattr(self._client, 'started_calls', None)
             if (calls_before is not None and calls_after == calls_before):
                 return DeleteOutcome.NOT_STARTED

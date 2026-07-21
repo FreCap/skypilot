@@ -526,6 +526,11 @@
                         "type": "object"
                     }
                 },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
                 "image": {
                     "type": [
                         "string",
@@ -543,11 +548,6 @@
                         "string",
                         "null"
                     ]
-                },
-                "healthPort": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 65535
                 },
                 "livenessDeadlineSeconds": {
                     "type": "integer",
@@ -610,6 +610,11 @@
                         "type": "object"
                     }
                 },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
                 "image": {
                     "type": [
                         "string",
@@ -621,11 +626,6 @@
                         "string",
                         "null"
                     ]
-                },
-                "healthPort": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 65535
                 },
                 "livenessDeadlineSeconds": {
                     "type": "integer",
@@ -651,27 +651,6 @@
                 "resources": {
                     "type": "object"
                 },
-                "sourceCredentialSecrets": {
-                    "type": "array",
-                    "maxItems": 64,
-                    "items": {
-                        "type": "object",
-                        "required": ["namespace", "name"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "namespace": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 253
-                            },
-                            "name": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 253
-                            }
-                        }
-                    }
-                },
                 "serviceAccount": {
                     "type": "object",
                     "properties": {
@@ -689,6 +668,25 @@
                                 "string",
                                 "null"
                             ]
+                        }
+                    }
+                },
+                "sourceCredentialSecrets": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "maxLength": 253,
+                                "minLength": 1
+                            },
+                            "namespace": {
+                                "type": "string",
+                                "maxLength": 253,
+                                "minLength": 1
+                            }
                         }
                     }
                 },
@@ -715,6 +713,11 @@
                         "type": "object"
                     }
                 },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
                 "image": {
                     "type": [
                         "string",
@@ -726,11 +729,6 @@
                         "string",
                         "null"
                     ]
-                },
-                "healthPort": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 65535
                 },
                 "livenessDeadlineSeconds": {
                     "type": "integer",

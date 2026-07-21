@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import dataclasses
 import hashlib
 import math
 import time
-from typing import Any, Callable, NoReturn, TypeVar
+from typing import Any, NoReturn, TypeVar
 import uuid
 
 import fastapi

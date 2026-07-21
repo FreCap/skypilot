@@ -78,7 +78,7 @@ class BuildSpec:
     source_auth: str | None
 
     @classmethod
-    def from_dict(cls, value: Any) -> 'BuildSpec':
+    def from_dict(cls, value: Any) -> BuildSpec:
         """Parses one closed, bounded prototype build document."""
         if not isinstance(value, dict):
             raise ValueError('Builder prototype spec must be an object.')
@@ -449,7 +449,7 @@ class S3CompatibleContextStore:
     def _head_matches(self, key: str, entry: ContextEntry) -> bool:
         try:
             response = self._client.head_object(Bucket=self._bucket, Key=key)
-        except BaseException as error:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             response = getattr(error, 'response', {})
             code = (response.get('Error', {}).get('Code') if isinstance(
                 response, dict) else None)

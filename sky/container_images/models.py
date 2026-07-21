@@ -1427,6 +1427,8 @@ class ResolvedContainerImage:
     target_fingerprint: str | None = None
     demand_id: str | None = None
     demand_generation: int | None = None
+    controller_epoch: str | None = None
+    owner_epoch: int | None = None
     credential_helper: str | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
@@ -1510,12 +1512,15 @@ class ResolvedContainerImage:
             if self.auth_strategy == 'source_config':
                 raise ValueError('A managed resolved container image cannot '
                                  'use source_config runtime pull authority.')
-        demand_values = (self.demand_id, self.demand_generation)
+        demand_values = (self.demand_id, self.demand_generation,
+                         self.controller_epoch, self.owner_epoch)
         if any(value is not None for value in demand_values):
             if any(value is None for value in demand_values):
                 raise ValueError('Resolved image demand fields are atomic.')
             assert self.demand_id is not None
             assert self.demand_generation is not None
+            assert self.controller_epoch is not None
+            assert self.owner_epoch is not None
             object.__setattr__(
                 self, 'demand_id',
                 validate_catalog_id(self.demand_id, 'Resolved image demand ID'))
@@ -1523,6 +1528,15 @@ class ResolvedContainerImage:
                     isinstance(self.demand_generation, bool) or
                     self.demand_generation < 0):
                 raise ValueError('Resolved image demand generation is invalid.')
+            if (not isinstance(self.controller_epoch, str) or
+                    not self.controller_epoch or
+                    len(self.controller_epoch) > 1024 or
+                    any(character.isspace()
+                        for character in self.controller_epoch)):
+                raise ValueError('Resolved image controller epoch is invalid.')
+            if (not isinstance(self.owner_epoch, int) or
+                    isinstance(self.owner_epoch, bool) or self.owner_epoch < 0):
+                raise ValueError('Resolved image owner epoch is invalid.')
         if self.credential_helper not in (None, 'ecr-login'):
             raise ValueError('Resolved image credential helper is invalid.')
         for value, subject in ((self.runtime_principal,
@@ -1583,9 +1597,9 @@ class ResolvedContainerImage:
         optional = {
             'location_id', 'distribution', 'profile_revision',
             'policy_fingerprint', 'profile_revision_id', 'target_fingerprint',
-            'demand_id', 'demand_generation', 'credential_helper',
-            'runtime_principal', 'instance_profile', 'kubernetes_node_selector',
-            'status', 'fallback_reason'
+            'demand_id', 'demand_generation', 'controller_epoch', 'owner_epoch',
+            'credential_helper', 'runtime_principal', 'instance_profile',
+            'kubernetes_node_selector', 'status', 'fallback_reason'
         }
         unknown = set(value) - required - optional
         missing = required - set(value)
@@ -1601,7 +1615,7 @@ class ResolvedContainerImage:
         string_optional = {
             'location_id', 'distribution', 'policy_fingerprint', 'status',
             'fallback_reason', 'profile_revision_id', 'target_fingerprint',
-            'demand_id', 'credential_helper'
+            'demand_id', 'controller_epoch', 'credential_helper'
         }
         for key in string_optional:
             if key in value and value[key] is not None and not isinstance(
@@ -1620,6 +1634,11 @@ class ResolvedContainerImage:
              isinstance(demand_generation, bool))):
             raise ValueError('_resolved_container_image.demand_generation '
                              'must be an integer or null.')
+        owner_epoch = value.get('owner_epoch')
+        if (owner_epoch is not None and (not isinstance(owner_epoch, int) or
+                                         isinstance(owner_epoch, bool))):
+            raise ValueError('_resolved_container_image.owner_epoch must be an '
+                             'integer or null.')
         node_selector = value.get('kubernetes_node_selector', ())
         if (not isinstance(node_selector, (list, tuple)) or
                 any(not isinstance(item, (list, tuple)) or len(item) != 2

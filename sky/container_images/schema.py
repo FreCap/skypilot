@@ -599,6 +599,9 @@ consumer_watermarks = sqlalchemy.Table(
     sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('consumer_kind', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('consumer_owner', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('controller_epoch', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('controller_sequence', sqlalchemy.BigInteger),
+    sqlalchemy.Column('owner_epoch', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('max_seen_generation',
                       sqlalchemy.BigInteger,
                       nullable=False),
@@ -611,9 +614,14 @@ consumer_watermarks = sqlalchemy.Table(
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.CheckConstraint(
-        'max_seen_generation >= 0 AND max_terminal_generation >= -1 AND '
+        '(controller_sequence IS NULL OR controller_sequence >= 0) AND '
+        'owner_epoch >= 0 AND max_seen_generation >= 0 AND '
+        'max_terminal_generation >= -1 AND '
         'max_terminal_generation <= max_seen_generation',
         name='ck_container_image_consumer_watermark_generation'),
+    sqlalchemy.CheckConstraint(
+        'length(controller_epoch) BETWEEN 1 AND 1024',
+        name='ck_container_image_consumer_controller_epoch'),
     sqlalchemy.Index('ix_container_image_consumer_watermarks_compaction',
                      'owner_deleted_at', 'credential_expires_at'),
 )

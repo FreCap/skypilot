@@ -8,8 +8,11 @@ import hashlib
 import importlib
 import os
 from pathlib import Path
+import pickle
 import shutil
 import threading
+import time
+import types
 from typing import Any
 import uuid
 
@@ -19,6 +22,7 @@ import pytest
 import sqlalchemy
 from sqlalchemy import orm
 
+from sky import global_user_state
 from sky.container_images import builder_prototype
 from sky.container_images import catalog_state
 from sky.container_images import config
@@ -263,22 +267,28 @@ def _warming_demand(
     *,
     owner: str = 'boltz-l4:v7',
     consumer_kind: str = 'service_version',
-    owner_epoch: int = 123,
+    controller_epoch: str = 'service:boltz-l4:v7',
+    controller_sequence: int | None = 7,
+    allow_epoch_advance: bool = False,
     request_id: str = 'request-1',
+    backend: str = 'aws_vm',
+    placement_region: str | None = None,
     now: int = 50,
 ) -> demand_state.DemandRecord:
     assert publication_record.image_id is not None
     authority = catalog_state.get_catalog_authority_id(create=False)
     assert authority is not None
     west = profile.targets[0]
-    return transactions.create_warming_demand_for_owner_epoch(
+    return transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
         workspace='research',
         consumer_kind=consumer_kind,
         consumer_owner=owner,
+        controller_epoch=controller_epoch,
+        controller_sequence=controller_sequence,
+        allow_epoch_advance=allow_epoch_advance,
         target_key=(f'{publication_record.image_id}:'
                     f'{west.target_fingerprint}'),
-        owner_epoch=owner_epoch,
         image_id=publication_record.image_id,
         runtime_digest=_DIGEST,
         profile_revision_id=active.id,
@@ -286,12 +296,41 @@ def _warming_demand(
         location_id=regional.id,
         placement={
             'provider': 'aws',
-            'region': west.region,
+            'region': placement_region or west.region,
+            'backend': backend,
+            'platform': 'linux/amd64',
             'consumer': {
                 'request_id': request_id,
             },
         },
         now=now)
+
+
+def _pull_plan(active: topology_state.ProfileRevisionRecord,
+               regional: topology_state.LocationRecord) -> dict[str, Any]:
+    configured = models.ManagedRegistryProfile.from_snapshot(
+        active.config_snapshot)
+    target = next(target for target in (configured.canonical,) +
+                  configured.targets
+                  if target.target_fingerprint == regional.target_fingerprint)
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = configured.bindings[binding_id]
+    return {
+        'version': 1,
+        'reference': regional.target_ref,
+        'runtime_digest': _DIGEST,
+        'platform': 'linux/amd64',
+        'distribution': configured.name,
+        'profile_revision_id': active.id,
+        'target_id': target.name,
+        'target_fingerprint': regional.target_fingerprint,
+        'auth_strategy': 'ecr_runtime_identity',
+        'credential_helper': 'ecr-login',
+        'runtime_principal': binding.principals[0],
+        'instance_profile': binding.instance_profile,
+        'kubernetes_node_selector': [],
+    }
 
 
 def test_publication_is_invisible_until_canonical_ready_and_replay_converges(
@@ -372,13 +411,15 @@ def test_demand_fences_eviction_until_two_terminal_observations(
     demand = _warming_demand(active, publication_record, regional, profile)
     authority = catalog_state.get_catalog_authority_id(create=False)
     assert authority is not None and publication_record.image_id is not None
-    replay = transactions.create_warming_demand_for_owner_epoch(
+    replay = transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
         workspace='research',
         consumer_kind='service_version',
         consumer_owner='boltz-l4:v7',
+        controller_epoch='service:boltz-l4:v7',
+        controller_sequence=7,
+        allow_epoch_advance=False,
         target_key=f'{publication_record.image_id}:{west.target_fingerprint}',
-        owner_epoch=123,
         image_id=publication_record.image_id,
         runtime_digest=_DIGEST,
         profile_revision_id=active.id,
@@ -386,17 +427,19 @@ def test_demand_fences_eviction_until_two_terminal_observations(
         location_id=regional.id,
         placement={
             'provider': 'aws',
-            'region': west.region
+            'region': west.region,
+            'backend': 'aws_vm',
+            'platform': 'linux/amd64',
+            'consumer': {
+                'request_id': 'request-1',
+            },
         },
         now=51)
     assert replay.id == demand.id and replay.consumer_generation == 0
     demand = transactions.commit_ready_demand(
         demand_id=demand.id,
         consumer_generation=demand.consumer_generation,
-        pull_plan={
-            'reference': regional.target_ref,
-            'runtime_digest': _DIGEST,
-        },
+        pull_plan=_pull_plan(active, regional),
         now=52)
     assert demand.state == models.ImageDemandState.READY
     assert topology_state.claim_next_eviction(worker_id='lifecycle-1',
@@ -526,19 +569,148 @@ def test_restart_stable_owner_epoch_reuses_one_target_fence(
                              publication_record,
                              regional,
                              profile,
-                             request_id='request-after-restart',
+                             request_id='request-before-restart',
                              now=51)
 
     assert replay.id == first.id
     assert replay.consumer_generation == 0
     assert replay.placement['consumer'][
         'request_id'] == 'request-before-restart'
-    current = demand_state.get_current_demand_for_owner_epoch(
+    current = demand_state.get_current_demand_for_controller_epoch(
         workspace='research',
         consumer_kind=first.consumer_kind,
         consumer_owner=first.consumer_owner,
-        owner_epoch=first.owner_epoch)
+        controller_epoch='service:boltz-l4:v7')
     assert current is not None and current.id == first.id
+
+
+def test_authorized_controller_epoch_advance_is_atomic_and_monotonic(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    first = _warming_demand(active,
+                            publication_record,
+                            regional,
+                            profile,
+                            controller_epoch='managed-job:42:task:0:recovery:0',
+                            controller_sequence=0)
+
+    with pytest.raises(demand_state.StaleConsumerGenerationError):
+        _warming_demand(active,
+                        publication_record,
+                        regional,
+                        profile,
+                        controller_epoch='managed-job:42:task:0:recovery:1',
+                        controller_sequence=1,
+                        allow_epoch_advance=False,
+                        now=51)
+
+    successor = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        controller_epoch='managed-job:42:task:0:recovery:1',
+        controller_sequence=1,
+        allow_epoch_advance=True,
+        now=52)
+    assert successor.id != first.id
+    assert successor.owner_epoch == first.owner_epoch + 1
+    assert successor.consumer_generation == first.consumer_generation + 1
+    superseded = demand_state.get_demand(first.id, 'research')
+    assert superseded is not None
+    assert superseded.state == models.ImageDemandState.SUPERSEDED
+    assert demand_state.get_current_demand_for_controller_epoch(
+        workspace='research',
+        consumer_kind=first.consumer_kind,
+        consumer_owner=first.consumer_owner,
+        controller_epoch='managed-job:42:task:0:recovery:0') is None
+    replay = _warming_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        controller_epoch='managed-job:42:task:0:recovery:1',
+        controller_sequence=1,
+        allow_epoch_advance=True,
+        now=53)
+    assert replay.id == successor.id
+    with pytest.raises(demand_state.StaleConsumerGenerationError,
+                       match='cannot move backward'):
+        _warming_demand(active,
+                        publication_record,
+                        regional,
+                        profile,
+                        controller_epoch='managed-job:42:task:0:recovery:0',
+                        controller_sequence=0,
+                        allow_epoch_advance=True,
+                        now=54)
+    with pytest.raises(demand_state.StaleConsumerGenerationError):
+        transactions.commit_ready_demand(
+            demand_id=first.id,
+            consumer_generation=first.consumer_generation,
+            pull_plan=_pull_plan(active, regional),
+            now=55)
+
+
+def test_authoritative_cluster_deletion_releases_demand_immediately(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='cluster-a',
+                             consumer_kind='cluster',
+                             controller_epoch='cluster-request:launch-a',
+                             controller_sequence=None)
+
+    assert demand_state.release_demand_authoritatively(demand.id,
+                                                       'research',
+                                                       now=51)
+    released = demand_state.get_demand(demand.id, 'research')
+    assert released is not None
+    assert released.state == models.ImageDemandState.RELEASED
+
+
+def test_cluster_row_and_demand_release_commit_atomically(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='cluster-a',
+                             consumer_kind='cluster',
+                             controller_epoch='cluster-request:launch-a',
+                             controller_sequence=None)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    handle = types.SimpleNamespace(launched_resources=types.SimpleNamespace(
+        resolved_container_image=types.SimpleNamespace(demand_id=demand.id)))
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert().values(
+            name='cluster-a',
+            handle=pickle.dumps(handle),
+            status='UP',
+            workspace='research'))
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+
+    global_user_state.remove_cluster('cluster-a', terminate=True)
+
+    with image_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(global_user_state.cluster_table.c.name).where(
+                global_user_state.cluster_table.c.name ==
+                'cluster-a')).first() is None
+    released = demand_state.get_demand(demand.id, 'research')
+    assert released is not None
+    assert released.state == models.ImageDemandState.RELEASED
 
 
 def test_retired_profile_allows_exact_demand_replay_but_no_new_owner(
@@ -556,7 +728,7 @@ def test_retired_profile_allows_exact_demand_replay_but_no_new_owner(
                              publication_record,
                              regional,
                              profile,
-                             request_id='after-profile-rollout',
+                             request_id='request-1',
                              now=52)
     assert replay.id == first.id
     with pytest.raises(demand_state.StaleConsumerGenerationError):
@@ -565,7 +737,7 @@ def test_retired_profile_allows_exact_demand_replay_but_no_new_owner(
                         regional,
                         profile,
                         owner='new-service:v1',
-                        owner_epoch=456,
+                        controller_epoch='service:new-service:v1',
                         now=53)
 
 
@@ -585,10 +757,7 @@ def test_superseded_generation_cannot_commit_ready_after_restart(
                                 request_id='retry-request',
                                 now=52)
     assert successor.consumer_generation == first.consumer_generation + 1
-    pull_plan = {
-        'reference': regional.target_ref,
-        'runtime_digest': _DIGEST,
-    }
+    pull_plan = _pull_plan(active, regional)
     with pytest.raises(demand_state.StaleConsumerGenerationError):
         transactions.commit_ready_demand(
             demand_id=first.id,
@@ -601,6 +770,112 @@ def test_superseded_generation_cannot_commit_ready_after_restart(
         pull_plan=pull_plan,
         now=54)
     assert ready.state == models.ImageDemandState.READY
+
+
+def test_ready_commit_rejects_any_non_authoritative_pull_plan_field(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active, publication_record, regional, profile)
+    expected = _pull_plan(active, regional)
+
+    for field, forged in (
+        ('target_id', 'forged-target'),
+        ('runtime_principal', 'arn:aws:iam::000000000000:role/Forged'),
+        ('instance_profile', 'ForgedProfile'),
+        ('credential_helper', None),
+        ('kubernetes_node_selector', [('forged', 'selector')]),
+    ):
+        pull_plan = dict(expected)
+        pull_plan[field] = forged
+        with pytest.raises(ValueError, match='does not match its demand'):
+            transactions.commit_ready_demand(
+                demand_id=demand.id,
+                consumer_generation=demand.consumer_generation,
+                pull_plan=pull_plan,
+                now=53)
+
+    with_extra = dict(expected)
+    with_extra['inline_credential'] = 'must-not-persist'
+    with pytest.raises(ValueError, match='does not match its demand'):
+        transactions.commit_ready_demand(
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan=with_extra,
+            now=54)
+
+
+def test_ready_commit_accepts_only_profile_qualified_eks_pull_plan(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='boltz-eks:v7',
+                             controller_epoch='service:boltz-eks:v7',
+                             backend='aws_eks',
+                             placement_region='boltz-west')
+    target = profile.targets[0]
+    binding_id = target.runtime_binding('aws_eks')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    qualified = next(cluster for cluster in binding.qualified_clusters
+                     if cluster.context == 'boltz-west')
+    pull_plan = {
+        'version': 1,
+        'reference': regional.target_ref,
+        'runtime_digest': _DIGEST,
+        'platform': 'linux/amd64',
+        'distribution': profile.name,
+        'profile_revision_id': active.id,
+        'target_id': target.name,
+        'target_fingerprint': regional.target_fingerprint,
+        'auth_strategy': 'ecr_runtime_identity',
+        'credential_helper': None,
+        'runtime_principal': None,
+        'instance_profile': None,
+        'kubernetes_node_selector': list(qualified.node_selector),
+    }
+
+    ready = transactions.commit_ready_demand(
+        demand_id=demand.id,
+        consumer_generation=demand.consumer_generation,
+        pull_plan=pull_plan,
+        now=53)
+
+    assert ready.state == models.ImageDemandState.READY
+    assert ready.pull_plan is not None
+    assert ready.pull_plan['kubernetes_node_selector'] == [
+        list(item) for item in qualified.node_selector
+    ]
+
+
+def test_controller_replay_cannot_change_immutable_placement(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    _warming_demand(active, publication_record, regional, profile)
+
+    with pytest.raises(ValueError, match='cannot change image target'):
+        _warming_demand(active,
+                        publication_record,
+                        regional,
+                        profile,
+                        backend='aws_eks',
+                        placement_region='boltz-west',
+                        now=51)
+    with pytest.raises(ValueError, match='cannot change image target'):
+        _warming_demand(active,
+                        publication_record,
+                        regional,
+                        profile,
+                        request_id='different-request',
+                        now=52)
 
 
 def test_concurrent_regional_admission_converges_without_false_capacity(
@@ -635,6 +910,99 @@ def test_concurrent_regional_admission_converges_without_false_capacity(
     assert shard is not None
     assert shard.reserved_manifests == 1
     assert shard.reserved_declared_bytes == location.reserved_declared_bytes
+
+
+def test_shard_admission_retries_after_locked_home_fills(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    with orm.Session(image_database) as session, session.begin():
+        fingerprint = hashlib.sha256(
+            f'{target.target_fingerprint}:1'.encode()).hexdigest()
+        topology_state.upsert_qualified_shard(
+            session,
+            workspace='research',
+            profile=profile.name,
+            target_id=target.name,
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            shard_generation=0,
+            shard_index=1,
+            physical_fingerprint=fingerprint,
+            registry=target.registry,
+            repository_name=f'{target.repository_prefix}/test/s01',
+            repository_arn=(f'arn:{profile.partition}:ecr:{target.region}:'
+                            f'{profile.registry_account}:repository/'
+                            f'{target.repository_prefix}/test/s01'),
+            max_manifests=100,
+            max_declared_bytes=1_000_000,
+            max_in_flight=4,
+            now=12)
+        session.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.workspace == 'research',
+            schema.registry_shards.c.profile == profile.name,
+            schema.registry_shards.c.target_id == target.name).values(
+                state=models.ImageShardState.READY.value,
+                qualified_at=12,
+                updated_at=12))
+
+    with image_database.connect() as connection:
+        ordered_ids = connection.execute(
+            sqlalchemy.select(schema.registry_shards.c.id).where(
+                schema.registry_shards.c.workspace == 'research',
+                schema.registry_shards.c.profile == profile.name,
+                schema.registry_shards.c.target_id == target.name).order_by(
+                    sqlalchemy.func.md5(schema.registry_shards.c.id + _DIGEST),
+                    schema.registry_shards.c.id)).scalars().all()
+    assert len(ordered_ids) == 2
+    home_id, fallback_id = ordered_ids
+    waiter_started = threading.Event()
+    waiter: dict[str, int] = {}
+
+    def select_shard() -> str:
+        with orm.Session(image_database) as session, session.begin():
+            waiter['pid'] = int(
+                session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.pg_backend_pid())).scalar_one())
+            waiter_started.set()
+            row = transactions._select_and_lock_shard(session,
+                                                      workspace='research',
+                                                      profile=profile.name,
+                                                      target_id=target.name,
+                                                      runtime_digest=_DIGEST,
+                                                      declared_size_bytes=4096)
+            return str(row['id'])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with orm.Session(image_database) as blocker, blocker.begin():
+            blocker.execute(
+                sqlalchemy.select(schema.registry_shards).where(
+                    schema.registry_shards.c.id ==
+                    home_id).with_for_update()).mappings().one()
+            result = executor.submit(select_shard)
+            assert waiter_started.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            blocked = False
+            while time.monotonic() < deadline:
+                with image_database.connect() as observer:
+                    blocked = bool(
+                        observer.execute(
+                            sqlalchemy.text(
+                                'SELECT wait_event_type = \'Lock\' '
+                                'FROM pg_stat_activity WHERE pid = :pid'), {
+                                    'pid': waiter['pid']
+                                }).scalar())
+                if blocked:
+                    break
+                time.sleep(0.01)
+            assert blocked
+            blocker.execute(schema.registry_shards.update().where(
+                schema.registry_shards.c.id == home_id).values(
+                    reserved_manifests=schema.registry_shards.c.max_manifests))
+        assert result.result(timeout=5) == fallback_id
 
 
 def test_eviction_exact_absence_with_new_demand_requeues_without_release(

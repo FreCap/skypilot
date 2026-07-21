@@ -12,6 +12,11 @@
 {{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
 {{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
 {{- end -}}
+{{- range .Values.imageCopyWorker.sourceCredentialSecrets -}}
+{{- if or (not .namespace) (not .name) -}}
+{{- fail "Every imageCopyWorker.sourceCredentialSecrets entry requires namespace and name" -}}
+{{- end -}}
+{{- end -}}
 
 {{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
 apiVersion: v1

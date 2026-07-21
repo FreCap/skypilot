@@ -2073,13 +2073,6 @@ class TestRequestBodyAllowlistCoverage:
         # Recipe content: YAML content similar to tasks
         'sky.recipes.create',
         'sky.recipes.update',
-        # Image identities can disclose private registry and repository
-        # topology. Keep their request bodies out of debug dumps.
-        'sky.image.publish',
-        'sky.image.register',
-        'sky.image.status',
-        'sky.image.prepare',
-        'sky.image.retry',
     }
 
     def test_all_request_names_covered(self):

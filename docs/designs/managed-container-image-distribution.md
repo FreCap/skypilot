@@ -561,11 +561,30 @@ profile revision, target fingerprint, digest, and platform. A request or
 controller restart therefore cannot select a second target while the first is
 warming. When a selected managed target has no READY route, resolution first
 persists one server-owned demand for that logical deployment target. Identity
-is:
+is a stable owner plus an explicit controller epoch:
 
-- stable named-cluster owner plus its monotonic relaunch generation;
-- stable managed-job ID and task ID plus its monotonic recovery generation; or
-- Serve service version plus target.
+- a named-cluster owner uses the durable API request ID for a fresh cluster
+  lifecycle and reloads that epoch from its persisted pull plan on replay;
+- a managed-job owner uses stable job and task IDs plus the recovery generation
+  derived atomically from the authoritative job status and recovery count; and
+- a Serve owner uses the service incarnation and version plus a normalized
+  provider, region, backend, and platform target scope.
+
+The controller epoch is not hashed into an arbitrary generation. The consumer
+watermark stores the bounded controller epoch and maps it, under row lock, to a
+monotonically increasing owner epoch. It also stores an optional monotonic
+controller sequence. Serve uses its durable version, managed jobs use their
+durable recovery generation, and clusters deliberately use no sequence because
+only the named-cluster lifecycle lock may authorize a new request epoch.
+Replaying the same controller epoch requires the same sequence and reuses the
+mapping. Advancing to a different controller epoch is allowed only when the
+caller presents an authoritative lifecycle transition. For sequenced owners,
+the new sequence must be strictly greater, so a delayed recovery cannot take
+ownership back. That same transaction supersedes any older live demand before
+publishing the new owner epoch. A first-party named-cluster deletion releases
+its cluster demand in the same PostgreSQL transaction that deletes the cluster
+row. The two-observation delay applies only to reconciliation that infers a
+missing owner, never to an authoritative `sky down` transition.
 
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
@@ -581,8 +600,10 @@ Only after that commit does the resolver raise the typed
 the authoritative image-placement state. Normal launch, SkyServe, and
 managed-job recovery establish the same consumer context before both the normal
 optimizer and the under-lock planner, so either path reloads and restricts to
-the durable target. The per-controller SQLite-compatible state may retain the
-demand ID as a hint, but correctness does not depend on a second database
+the durable target. The resolved pull plan persists the controller epoch, owner
+epoch, demand ID, and demand generation in the cluster's INIT handle before
+provider provisioning. The per-controller SQLite-compatible state may retain
+the demand ID as a hint, but correctness does not depend on a second database
 commit. The dashboard and events say `IMAGE_WARMING`, not `resources
 unavailable`.
 
@@ -602,11 +623,11 @@ source fallback.
 The runtime commits a secret-free pull plan only after a READY route is selected.
 `transactions.commit_ready_demand()` locks the location, then the demand,
 marks the demand itself as the durable eviction fence, and stores the plan in one
-PostgreSQL transaction. It rechecks profile revision, target fingerprint, digest,
-platform, auth strategy, lease-free READY state, and consumer epoch. Central
-demand state is the durable source for normal launch, Serve, and managed-job
-controllers, so their own SQLite-compatible state stores only the demand ID and
-generation.
+PostgreSQL transaction. It rechecks profile revision, target fingerprint,
+reference, digest, platform, auth strategy, credential-helper class, lease-free
+READY state, and consumer epoch. Central demand state is the durable source for
+normal launch, Serve, and managed-job controllers, so their own
+SQLite-compatible state stores only the demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
 An owner epoch with a live demand reloads that demand's exact immutable profile
@@ -629,11 +650,11 @@ restore READY; after provider I/O, only exact presence may do so. Ambiguous
 readback remains fenced in `EVICTING` for another worker.
 
 Consumer terminal or supersede handling writes a tombstone and advances one
-stable-owner generation watermark in the same
-transaction. Demand creation locks that watermark and rejects a generation below
-maximum seen or at/below maximum terminal; a replay of the exact live
-maximum-seen generation converges the existing demand. A WARMING request demand
-may expire
+stable-owner generation watermark in the same transaction. Demand creation
+locks that watermark, validates the explicit controller epoch, and rejects a
+generation below maximum seen or at/below maximum terminal; a replay of the
+exact live maximum-seen generation converges the existing demand. A WARMING
+request demand may expire
 only when its request is terminal, no durable consumer attached, and it is at
 least 24 hours old. For clusters, jobs, and services, reconciliation requires two
 authoritative terminal observations separated by an hour before advancing a
@@ -642,6 +663,18 @@ fence.
 All demand creation, supersession, failure, and authoritative terminal paths use
 the same watermark-then-demand lock order. This prevents inverse-lock deadlocks
 under concurrent controller replay and lifecycle reconciliation.
+
+Task request errors are classified by typed image-plane exceptions at the
+runtime boundary, never by inspecting whether the request body happens to
+contain an image field. Bounded code-valued errors such as `IMAGE_WARMING`,
+`IMAGE_NOT_PUBLISHED`, and `IMAGE_PREPARATION_FAILED` cross the API unchanged.
+An unexpected exception caught inside the image boundary becomes one generic
+typed image error selected from a static value-free message table. Request
+failure persistence receives the original exception only long enough to locate
+that typed marker through bounded cause and failover wrappers, then stores a
+fresh built-in error with no inherited traceback. Errors from legacy `image_id`,
+ordinary provisioning, quotas, setup, or user code are not rewritten by the
+image feature.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -1103,8 +1136,11 @@ configuration alone never creates capacity.
 On first location creation, the transaction starts from a stable digest-derived
 shard index and probes the fixed ring. Admission uses an ordinary PostgreSQL row
 lock rather than `SKIP LOCKED`: brief contention waits and rechecks the same
-capacity predicate instead of being misreported as exhaustion. It locks one
-physical shard row, rechecks
+capacity predicate instead of being misreported as exhaustion. If PostgreSQL
+READ COMMITTED EvalPlanQual drops a candidate that filled while the selector
+waited behind `LIMIT 1`, admission executes a fresh statement snapshot so the
+next eligible ring member can be selected. It locks one physical shard row,
+rechecks
 whether the location already exists, and reserves one slot only when
 `reserved_count < max_manifests_per_shard` and conservative declared bytes fit.
 The chosen shard is stored on the location forever. A full ring fails closed with
@@ -1690,3 +1726,29 @@ makes terminal request lookup index-bounded, applies locality ranking globally
 across task alternatives, replays retired immutable profile snapshots, splits
 copy and lifecycle IAM boundaries, discovers applied ECR quota during planning,
 and makes PostgreSQL concurrency and scale tests mandatory in CI.
+
+Implementation review round 2 at
+`7c1caac00649b9afc82d9e722482fec5ea0b8059` returned paired Codex `RESHAPE`
+and Fable `RESHAPE`. Both found the exact-head acceptance run invalid while
+mandatory CI was red and required controller-owned deployment epochs rather
+than stable strings hashed into database integers. Fable additionally found
+that request-body-based sanitization erased legacy and code-valued errors, that
+authoritative cluster deletion waited on the missing-owner reconciliation
+delay, and that shard admission retained one PostgreSQL fill-during-wait race.
+This revision replaces the hashed token with a locked controller-epoch mapping
+and optional monotonic controller sequence, scopes Serve ownership by version
+target, and derives managed-job recovery epochs from durable job state. It makes
+first-party cluster teardown atomic with demand release, uses typed
+image-boundary errors without rewriting legacy or provisioning failures,
+revalidates the exact profile-derived READY pull plan, and retries shard
+selection from fresh READ COMMITTED snapshots until a separate snapshot proves
+capacity exhaustion after EvalPlanQual drops filled candidates. Runtime
+placement is a complete immutable demand field, including backend and platform;
+EC2 and EKS plans reject every unqualified helper, principal, instance profile,
+node selector, or extra field. Error-marker traversal is bounded and cycle-safe,
+multi-row request termination locks deterministically, and both copy and
+lifecycle workers can resume bounded publication fanout. It also reconciles the
+Serve migration chain at revision 021, regenerates the Helm schema, restores
+immutable YAML fixtures, removes the duplicate test-module basename, and
+updates Python 3.14 static-analysis contracts. Activation remains disabled until
+the resulting exact head passes every operational gate.

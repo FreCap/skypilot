@@ -874,7 +874,7 @@ def _request_execution_wrapper(request_id: str,
     except (Exception, SystemExit) as e:  # pylint: disable=broad-except
         safe_failure_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
-        api_requests.set_request_failed(request_id, safe_failure_error)
+        api_requests.set_request_failed(request_id, e)
         # Manually reset the original stdout and stderr file descriptors early
         # so that the "Request xxxx failed due to ..." log message will be
         # written to the original stdout and stderr file descriptors.
@@ -1045,8 +1045,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         ctx.redirect_log(original_output)
         safe_submission_error = api_requests.sanitize_request_error(
             request.name, e, request_body)
-        await api_requests.set_request_failed_async(request.request_id,
-                                                    safe_submission_error)
+        await api_requests.set_request_failed_async(request.request_id, e)
         logger.error(f'Failed to run request {request.request_id} due to '
                      f'{common_utils.format_exception(safe_submission_error)}')
         return
@@ -1073,8 +1072,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
                 ctx.redirect_log(original_output)
                 safe_future_error = api_requests.sanitize_request_error(
                     request.name, e, request_body)
-                await api_requests.set_request_failed_async(
-                    request_id, safe_future_error)
+                await api_requests.set_request_failed_async(request_id, e)
                 logger.error(
                     f'Request {request_id} failed due to '
                     f'{common_utils.format_exception(safe_future_error)}')
@@ -1098,8 +1096,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         ctx.redirect_log(original_output)
         safe_unhandled_error = api_requests.sanitize_request_error(
             request.name, e, request_body)
-        await api_requests.set_request_failed_async(request.request_id,
-                                                    safe_unhandled_error)
+        await api_requests.set_request_failed_async(request.request_id, e)
         logger.error(f'Request {request.request_id} interrupted due to '
                      'unhandled exception: '
                      f'{common_utils.format_exception(safe_unhandled_error)}')

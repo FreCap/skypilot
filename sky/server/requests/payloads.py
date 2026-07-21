@@ -310,10 +310,7 @@ def _resource_config_targets_kubernetes(
     cloud_name = _resource_config_cloud_constraint(resource_config)
     if cloud_name is None:
         return False
-    cloud = registry.CLOUD_REGISTRY.from_str(cloud_name)
-    kubernetes = registry.CLOUD_REGISTRY.from_str('kubernetes')
-    assert cloud is not None and kubernetes is not None
-    return isinstance(cloud, type(kubernetes))
+    return _cloud_constraint_targets_kubernetes(cloud_name)
 
 
 def _resource_config_may_target_kubernetes(
@@ -322,9 +319,15 @@ def _resource_config_may_target_kubernetes(
     cloud_name = _resource_config_cloud_constraint(resource_config)
     if cloud_name is None:
         return True
+    return _cloud_constraint_targets_kubernetes(cloud_name)
+
+
+def _cloud_constraint_targets_kubernetes(cloud_name: str) -> bool:
+    """Resolves a validated cloud constraint without optimization-only guards."""
     cloud = registry.CLOUD_REGISTRY.from_str(cloud_name)
     kubernetes = registry.CLOUD_REGISTRY.from_str('kubernetes')
-    assert cloud is not None and kubernetes is not None
+    if cloud is None or kubernetes is None:
+        raise ValueError
     return isinstance(cloud, type(kubernetes))
 
 

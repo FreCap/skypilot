@@ -27,6 +27,7 @@ from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
+from sky.container_images import errors as container_image_errors
 from sky.metrics import utils as metrics_lib
 from sky.server import common as server_common
 from sky.server import constants as server_constants
@@ -153,9 +154,6 @@ RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
                             request_names.RequestName.CLUSTER_LAUNCH.value,)
 
-_CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE = (
-    'Managed container image task failed validation or execution.')
-
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
 # [ ] Move logs to persistent place.
@@ -239,35 +237,18 @@ def _build_error_dict(error: BaseException) -> dict[str, Any]:
     }
 
 
-def _request_body_uses_container_image(
-        request_body: payloads.RequestBody | None) -> bool:
-    """Returns whether a persisted task or DAG uses managed images."""
-    if request_body is None:
-        return False
-    return any(
-        isinstance(value, str) and
-        payloads.serialized_task_uses_container_image(value)
-        for value in (getattr(request_body, 'task', None),
-                      getattr(request_body, 'dag', None)))
-
-
-def request_error_requires_sanitization(
-    name: str | None,
-    request_body: payloads.RequestBody | None = None,
-) -> bool:
-    """Returns whether errors for this request cross an image boundary."""
-    del name
-    return _request_body_uses_container_image(request_body)
-
-
 def sanitize_request_error(
     name: str | None,
     error: _ErrorT,
     request_body: payloads.RequestBody | None = None,
 ) -> _ErrorT | ValueError:
-    """Removes provider and caller values from image terminal errors."""
-    if request_error_requires_sanitization(name, request_body):
-        return ValueError(_CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE)
+    """Strips values only from failures marked by the image boundary."""
+    del name, request_body
+    safe_error = container_image_errors.find_safe_error(error)
+    if safe_error is not None:
+        # Return a fresh built-in exception. It carries neither the wrapper's
+        # provider values nor typed-error attributes such as a demand ID.
+        return ValueError(str(safe_error))
     return error
 
 
@@ -364,7 +345,7 @@ class Request:
         """Set the error."""
         sanitized_error = sanitize_request_error(self.name, error,
                                                  self.request_body)
-        if request_error_requires_sanitization(self.name, self.request_body):
+        if sanitized_error is not error:
             _set_value_free_exception_stacktrace(sanitized_error)
         self.error = _build_error_dict(sanitized_error)
 
@@ -1700,10 +1681,10 @@ def _mark_container_image_request_terminal(request_id: str) -> None:
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     request = get_request(request_id, fields=['name', 'request_body'])
-    sanitize = (request is not None and request_error_requires_sanitization(
-        request.name, request.request_body))
-    if sanitize:
-        e = sanitize_request_error(request.name, e, request.request_body)
+    sanitized_error = (sanitize_request_error(
+        request.name, e, request.request_body) if request is not None else e)
+    if sanitized_error is not e:
+        e = sanitized_error
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
@@ -1718,10 +1699,10 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     request = await get_request_async(request_id,
                                       fields=['name', 'request_body'])
-    sanitize = (request is not None and request_error_requires_sanitization(
-        request.name, request.request_body))
-    if sanitize:
-        e = sanitize_request_error(request.name, e, request.request_body)
+    sanitized_error = (sanitize_request_error(
+        request.name, e, request.request_body) if request is not None else e)
+    if sanitized_error is not e:
+        e = sanitized_error
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)

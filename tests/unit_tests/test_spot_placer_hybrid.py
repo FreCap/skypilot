@@ -330,14 +330,17 @@ class TestHeterogeneousLocations:
                                         use_spot=base.use_spot,
                                         container_image=image)
 
-        by_ref = with_image(container_image_models.ContainerImage(ref='same'))
+        source_ref = ('registry.example/model@sha256:' + 'a' * 64)
+        by_ref = with_image(
+            container_image_models.ContainerImage(ref=source_ref))
         by_release = with_image(
             container_image_models.ContainerImage(release='same'))
         by_artifact = with_image(
             container_image_models.ContainerImage(
                 artifact_id='11111111-1111-4111-8111-111111111111'))
         by_ref_and_release = with_image(
-            container_image_models.ContainerImage(ref='same', release='same'))
+            container_image_models.ContainerImage(ref=source_ref,
+                                                  release='same'))
 
         assert len({by_ref, by_release, by_artifact, by_ref_and_release}) == 4
         assert by_ref != by_release
@@ -816,10 +819,10 @@ run: echo hi
                 'zone': None,
                 'container_image': {
                     'ref': 'registry.example/model@sha256:' + 'a' * 64,
-                    'profile': 'managed',
+                    'distribution': 'managed',
                 },
             })
             assert with_image.container_image is not None
-            assert with_image.container_image.profile == 'managed'
+            assert with_image.container_image.distribution == 'managed'
             assert (spot_placer.Location.from_pickleable(
                 with_image.to_pickleable()) == with_image)

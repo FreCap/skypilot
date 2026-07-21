@@ -22,6 +22,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.backends import backend_utils
 from sky.client import sdk
+from sky.container_images import consumers as container_image_consumers
 from sky.jobs import file_content_utils
 from sky.jobs import runtime as managed_job_runtime
 from sky.jobs import scheduler
@@ -647,7 +648,14 @@ class StrategyExecutor:
 
                             request_id = None
                             try:
-                                extra_ctx = self.extra_launch_context()
+                                extra_ctx = dict(self.extra_launch_context())
+                                recovery_generation = await (
+                                    state.get_image_recovery_generation_async(
+                                        self.job_id, self.task_id))
+                                extra_ctx[
+                                    container_image_consumers.
+                                    MANAGED_JOB_RECOVERY_GENERATION_KEY] = (
+                                        recovery_generation)
                                 request_id = await asyncio.to_thread(
                                     self._launch_in_workspace,
                                     self.dag,

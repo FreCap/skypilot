@@ -118,8 +118,9 @@ class _Handler(server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format_string: str, *args: Any) -> None:
-        del format_string, args
+    def log_message(  # pylint: disable=redefined-builtin
+            self, format: str, *args: Any) -> None:
+        del format, args
 
 
 class HealthServer:

@@ -94,7 +94,7 @@ class _LeaseHeartbeat:
                                         name='image-worker-lease-heartbeat',
                                         daemon=True)
 
-    def __enter__(self) -> '_LeaseHeartbeat':
+    def __enter__(self) -> _LeaseHeartbeat:
         if not self._heartbeat():
             raise RuntimeError('Container image work lease was lost.')
         self._thread.start()
@@ -648,6 +648,7 @@ def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
 
 
 def _qualification_maintenance(limiter: budgets.ProviderBudgetLimiter) -> bool:
+    transactions.reconcile_pending_canonical_publications()
     reconcile_qualification_profiles(limiter)
     qualification.schedule_automatic_canaries()
     return True

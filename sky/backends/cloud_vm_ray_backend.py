@@ -49,6 +49,7 @@ from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
 from sky.container_images import consumers as container_image_consumers
+from sky.container_images import errors as container_image_errors
 from sky.container_images import models as container_image_models
 from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
@@ -153,7 +154,9 @@ def _resolve_container_image_for_placement(
     *,
     consumer_kind: str,
     consumer_owner: str,
-    owner_epoch_token: str,
+    controller_epoch: str,
+    controller_sequence: int | None,
+    allow_epoch_advance: bool,
     consumer_metadata: dict[str, Any],
     ensure: bool = True,
 ) -> resources_lib.Resources:
@@ -200,22 +203,27 @@ def _resolve_container_image_for_placement(
             workspace=workspace,
             consumer_kind=consumer_kind,
             consumer_owner=consumer_owner,
-            owner_epoch_token=owner_epoch_token,
+            controller_epoch=controller_epoch,
+            controller_sequence=controller_sequence,
+            allow_epoch_advance=allow_epoch_advance,
             consumer_metadata=consumer_metadata,
             ensure=ensure)
     except container_image_runtime.ContainerImageWarmingError as e:
-        raise exceptions.ResourcesUnavailableError(str(e),
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
                                                    no_failover=True) from e
     except container_image_runtime.ContainerImagePreparationFailedError as e:
-        raise exceptions.ResourcesUnavailableError(str(e),
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
                                                    no_failover=False) from e
-    except ValueError as e:
+    except Exception as e:  # pylint: disable=broad-except
         # Catalog, profile, and policy errors are not capacity failures. A
         # different placement cannot repair them, so fail without cycling the
-        # fleet through every candidate.
-        raise exceptions.ResourcesUnavailableError(
-            f'Cannot resolve managed container image: {e}',
-            no_failover=True) from e
+        # fleet through every candidate. Convert at this boundary so provider,
+        # registry, and credential values never enter request state or logs.
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
+                                                   no_failover=True) from e
 
 
 # Timeout (seconds) for provision progress: if in this duration no new nodes
@@ -1543,16 +1551,30 @@ class RetryingVmProvisioner:
         # Quota has passed and the region is now a real launch attempt. This
         # is the first point where ensure-on-use may create materialization
         # intents. Dry runs remain read-only.
+        launch_context = self._extra_launch_context
+        if self._workload_type == 'cluster' and prev_handle is not None:
+            previous_resources = prev_handle.launched_resources
+            previous_resolution = previous_resources.resolved_container_image
+            if (previous_resolution is not None and
+                    previous_resolution.controller_epoch is not None):
+                launch_context = dict(launch_context or {})
+                launch_context[
+                    container_image_consumers.CLUSTER_CONTROLLER_EPOCH_KEY] = (
+                        previous_resolution.controller_epoch)
+                launch_context[container_image_consumers.
+                               CLUSTER_ALLOW_EPOCH_ADVANCE_KEY] = (False)
         image_demand = _get_image_demand_attribution(task, cluster_name,
                                                      self._workload_type,
-                                                     self._extra_launch_context)
+                                                     launch_context)
         to_provision = typing.cast(
             resources_lib.LaunchableResources,
             _resolve_container_image_for_placement(
                 to_provision,
                 consumer_kind=image_demand.consumer_kind,
                 consumer_owner=image_demand.consumer_owner,
-                owner_epoch_token=image_demand.owner_epoch_token,
+                controller_epoch=image_demand.controller_epoch,
+                controller_sequence=image_demand.controller_sequence,
+                allow_epoch_advance=image_demand.allow_epoch_advance,
                 consumer_metadata=image_demand.metadata,
                 ensure=not dryrun))
 

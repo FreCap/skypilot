@@ -294,7 +294,7 @@ imageCopyWorker:
   qualificationManifestConfigMapName: null
   # Exact source dockerconfig Secrets this process may read. The chart grants
   # resourceNames-scoped RBAC only for chart-created service accounts.
-  # @schema type: [array]; item: object; maxItems: 64
+  # @schema type: [array]; item: object; maxItems: 64; itemProperties: {"namespace": {"type": "string", "minLength": 1, "maxLength": 253}, "name": {"type": "string", "minLength": 1, "maxLength": 253}}
   sourceCredentialSecrets: []
   serviceAccount:
     # Create the worker service account. Set false with name to use an existing

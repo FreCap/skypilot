@@ -131,6 +131,33 @@ def _get_api_access_token_rows(engine):
     return [(row.job_id, row.token_id) for row in rows]
 
 
+@pytest.mark.asyncio
+async def test_image_recovery_generation_tracks_durable_recovery_epoch(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 42, 0, status=ManagedJobStatus.RUNNING)
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.update().where(
+            state.spot_table.c.spot_job_id == 42,
+            state.spot_table.c.task_id == 0).values(recovery_count=2))
+
+    assert await state.get_image_recovery_generation_async(42, 0) == 2
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.update().where(
+            state.spot_table.c.spot_job_id == 42,
+            state.spot_table.c.task_id == 0).values(
+                status=ManagedJobStatus.RECOVERING.value))
+    assert await state.get_image_recovery_generation_async(42, 0) == 3
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.update().where(
+            state.spot_table.c.spot_job_id == 42,
+            state.spot_table.c.task_id == 0).values(
+                status=ManagedJobStatus.RUNNING.value, recovery_count=3))
+    assert await state.get_image_recovery_generation_async(42, 0) == 3
+    with pytest.raises(ValueError, match='does not exist'):
+        await state.get_image_recovery_generation_async(404, 0)
+
+
 def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
 

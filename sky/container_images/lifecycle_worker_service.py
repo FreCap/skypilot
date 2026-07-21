@@ -10,9 +10,6 @@ import threading
 import time
 import uuid
 
-import sqlalchemy
-from sqlalchemy import orm
-
 from sky import global_user_state
 from sky.container_images import aws
 from sky.container_images import budgets
@@ -20,7 +17,6 @@ from sky.container_images import catalog_state
 from sky.container_images import demand_state
 from sky.container_images import models
 from sky.container_images import qualification
-from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
@@ -104,26 +100,7 @@ def evict_location(location: topology_state.LocationRecord,
 
 
 def _reconcile_publication_fanout(limit: int = 100) -> int:
-    locations = schema.locations
-    publications = schema.publications
-    with orm.Session(catalog_state.engine()) as session:
-        location_ids = session.execute(
-            sqlalchemy.select(locations.c.id).where(
-                locations.c.canonical.is_(True),
-                locations.c.state.in_([
-                    models.ImageLocationState.READY.value,
-                    models.ImageLocationState.FAILED.value,
-                ]),
-                sqlalchemy.exists().where(
-                    publications.c.canonical_location_id == locations.c.id,
-                    publications.c.state ==
-                    models.ImagePublicationState.PENDING.value)).order_by(
-                        locations.c.updated_at,
-                        locations.c.id).limit(limit)).scalars().all()
-    reconciled = 0
-    for location_id in location_ids:
-        reconciled += transactions.reconcile_canonical_publications(location_id)
-    return reconciled
+    return transactions.reconcile_pending_canonical_publications(limit)
 
 
 def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:

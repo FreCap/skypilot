@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import time
 from typing import Any
@@ -63,6 +62,9 @@ class ConsumerWatermark:
     workspace: str
     consumer_kind: str
     consumer_owner: str
+    controller_epoch: str
+    controller_sequence: int | None
+    owner_epoch: int
     max_seen_generation: int
     max_terminal_generation: int
     owner_deleted_at: int | None
@@ -71,12 +73,45 @@ class ConsumerWatermark:
     updated_at: int
 
 
-def owner_epoch_from_token(token: str) -> int:
-    """Maps a stable request/controller token to a non-secret bigint fence."""
-    if not isinstance(token, str) or not token or len(token) > 1024:
-        raise ValueError('Demand owner epoch token is invalid.')
-    digest = hashlib.sha256(token.encode()).digest()
-    return int.from_bytes(digest[:8], byteorder='big') & _MAX_POSTGRES_BIGINT
+def validate_controller_epoch(value: str) -> str:
+    """Validates one durable, non-secret controller incarnation ID."""
+    if (not isinstance(value, str) or not value or len(value) > 1024 or
+            any(character.isspace() for character in value)):
+        raise ValueError('Demand controller epoch is invalid.')
+    return value
+
+
+def validate_controller_sequence(value: int | None) -> int | None:
+    """Validates an optional monotonic sequence owned by the controller."""
+    if value is not None and (not isinstance(value, int) or isinstance(
+            value, bool) or value < 0 or value > _MAX_POSTGRES_BIGINT):
+        raise ValueError('Demand controller sequence is invalid.')
+    return value
+
+
+def _encode_placement(placement: dict[str, Any]) -> str:
+    """Validates and encodes the immutable v0 runtime placement fence."""
+    required = {'provider', 'region', 'backend', 'platform'}
+    allowed = required | {'consumer'}
+    if (not isinstance(placement, dict) or
+            not required <= set(placement) <= allowed or
+            placement['provider'] != 'aws' or
+            placement['backend'] not in ('aws_vm', 'aws_eks')):
+        raise ValueError('Demand placement constraints are invalid.')
+    models.validate_control_plane_identifier(placement['region'],
+                                             'Demand placement region')
+    models.validate_oci_platform(placement['platform'],
+                                 'Demand placement platform')
+    consumer = placement.get('consumer')
+    if consumer is not None and not isinstance(consumer, dict):
+        raise ValueError('Demand consumer metadata must be an object.')
+    try:
+        encoded = json.dumps(placement, sort_keys=True, separators=(',', ':'))
+    except (TypeError, ValueError) as error:
+        raise ValueError('Demand placement constraints are invalid.') from error
+    if len(encoded.encode()) > 8192:
+        raise ValueError('Demand placement constraints exceed 8 KiB.')
+    return encoded
 
 
 def _demand(row: sqlalchemy.engine.RowMapping) -> DemandRecord:
@@ -117,6 +152,9 @@ def _watermark(row: sqlalchemy.engine.RowMapping) -> ConsumerWatermark:
         workspace=str(row['workspace']),
         consumer_kind=str(row['consumer_kind']),
         consumer_owner=str(row['consumer_owner']),
+        controller_epoch=str(row['controller_epoch']),
+        controller_sequence=row['controller_sequence'],
+        owner_epoch=int(row['owner_epoch']),
         max_seen_generation=int(row['max_seen_generation']),
         max_terminal_generation=int(row['max_terminal_generation']),
         owner_deleted_at=row['owner_deleted_at'],
@@ -127,40 +165,81 @@ def _watermark(row: sqlalchemy.engine.RowMapping) -> ConsumerWatermark:
 
 
 def _lock_watermark(session: orm.Session, *, workspace: str, consumer_kind: str,
-                    consumer_owner: str, generation: int,
-                    now: int) -> sqlalchemy.engine.RowMapping:
+                    consumer_owner: str, controller_epoch: str,
+                    controller_sequence: int | None, owner_epoch: int,
+                    generation: int, now: int) -> sqlalchemy.engine.RowMapping:
+    controller_epoch = validate_controller_epoch(controller_epoch)
+    controller_sequence = validate_controller_sequence(controller_sequence)
     table = schema.consumer_watermarks
     session.execute(
         postgresql.insert(table).values(
             workspace=workspace,
             consumer_kind=consumer_kind,
             consumer_owner=consumer_owner,
+            controller_epoch=controller_epoch,
+            controller_sequence=controller_sequence,
+            owner_epoch=owner_epoch,
             max_seen_generation=generation,
             max_terminal_generation=-1,
             created_at=now,
             updated_at=now).on_conflict_do_nothing(index_elements=[
                 table.c.workspace, table.c.consumer_kind, table.c.consumer_owner
             ]))
-    return session.execute(
+    row = session.execute(
         sqlalchemy.select(table).where(
             table.c.workspace == workspace,
             table.c.consumer_kind == consumer_kind, table.c.consumer_owner ==
             consumer_owner).with_for_update()).mappings().one()
+    if (str(row['controller_epoch']) != controller_epoch or
+            row['controller_sequence'] != controller_sequence or
+            int(row['owner_epoch']) != owner_epoch):
+        raise StaleConsumerGenerationError(
+            'Controller epoch no longer owns this consumer watermark.')
+    return row
 
 
-def create_demand_in_session(session: orm.Session, *, authority_id: str,
-                             workspace: str, consumer_kind: str,
-                             consumer_owner: str, consumer_generation: int,
-                             target_key: str, owner_epoch: int, image_id: str,
-                             runtime_digest: str, profile_revision_id: str,
-                             target_fingerprint: str, location_id: str,
-                             placement: dict[str,
-                                             Any], now: int) -> DemandRecord:
+def _lock_existing_watermark(
+        session: orm.Session, *, workspace: str, consumer_kind: str,
+        consumer_owner: str) -> sqlalchemy.engine.RowMapping:
+    return session.execute(
+        sqlalchemy.select(schema.consumer_watermarks).where(
+            schema.consumer_watermarks.c.workspace == workspace,
+            schema.consumer_watermarks.c.consumer_kind == consumer_kind,
+            schema.consumer_watermarks.c.consumer_owner ==
+            consumer_owner).with_for_update()).mappings().one()
+
+
+def create_demand_in_session(
+        session: orm.Session,
+        *,
+        authority_id: str,
+        workspace: str,
+        consumer_kind: str,
+        consumer_owner: str,
+        consumer_generation: int,
+        target_key: str,
+        owner_epoch: int,
+        image_id: str,
+        runtime_digest: str,
+        profile_revision_id: str,
+        target_fingerprint: str,
+        location_id: str,
+        placement: dict[str, Any],
+        now: int,
+        controller_epoch: str | None = None,
+        controller_sequence: int | None = None) -> DemandRecord:
     """Creates one WARMING demand while enforcing the owner high watermark."""
+    if controller_epoch is None:
+        controller_epoch = f'legacy-owner-epoch:{owner_epoch}'
+        controller_sequence = owner_epoch
+    placement_json = _encode_placement(placement)
     watermark = _lock_watermark(session,
                                 workspace=workspace,
                                 consumer_kind=consumer_kind,
                                 consumer_owner=consumer_owner,
+                                controller_epoch=controller_epoch,
+                                controller_sequence=controller_sequence,
+                                owner_epoch=owner_epoch,
                                 generation=consumer_generation,
                                 now=now)
     max_seen = int(watermark['max_seen_generation'])
@@ -186,6 +265,7 @@ def create_demand_in_session(session: orm.Session, *, authority_id: str,
             'profile_revision_id': profile_revision_id,
             'target_fingerprint': target_fingerprint,
             'location_id': location_id,
+            'placement_json': placement_json,
         }
         if any(
                 str(existing[key]) != str(value)
@@ -200,11 +280,6 @@ def create_demand_in_session(session: orm.Session, *, authority_id: str,
             schema.consumer_watermarks.c.consumer_owner ==
             consumer_owner).values(max_seen_generation=consumer_generation,
                                    updated_at=now))
-    placement_json = json.dumps(placement,
-                                sort_keys=True,
-                                separators=(',', ':'))
-    if len(placement_json.encode()) > 8192:
-        raise ValueError('Demand placement constraints exceed 8 KiB.')
     request_id = None
     consumer_metadata = placement.get('consumer')
     if consumer_kind == 'cluster' and isinstance(consumer_metadata, dict):
@@ -245,15 +320,17 @@ def create_demand(**kwargs: Any) -> DemandRecord:
         return create_demand_in_session(session, now=current, **kwargs)
 
 
-def create_demand_for_owner_epoch_in_session(
+def create_demand_for_controller_epoch_in_session(
         session: orm.Session,
         *,
         authority_id: str,
         workspace: str,
         consumer_kind: str,
         consumer_owner: str,
+        controller_epoch: str,
+        controller_sequence: int | None,
+        allow_epoch_advance: bool,
         target_key: str,
-        owner_epoch: int,
         image_id: str,
         runtime_digest: str,
         profile_revision_id: str,
@@ -262,13 +339,19 @@ def create_demand_for_owner_epoch_in_session(
         placement: dict[str, Any],
         now: int,
         require_existing: bool = False) -> DemandRecord:
-    """Converges request replay or allocates the next durable generation."""
+    """Maps a controller epoch and converges its durable target fence."""
+    controller_epoch = validate_controller_epoch(controller_epoch)
+    controller_sequence = validate_controller_sequence(controller_sequence)
+    placement_json = _encode_placement(placement)
     watermarks = schema.consumer_watermarks
     inserted = session.execute(
         postgresql.insert(watermarks).values(
             workspace=workspace,
             consumer_kind=consumer_kind,
             consumer_owner=consumer_owner,
+            controller_epoch=controller_epoch,
+            controller_sequence=controller_sequence,
+            owner_epoch=0,
             max_seen_generation=0,
             max_terminal_generation=-1,
             created_at=now,
@@ -282,6 +365,55 @@ def create_demand_for_owner_epoch_in_session(
             watermarks.c.consumer_kind == consumer_kind,
             watermarks.c.consumer_owner ==
             consumer_owner).with_for_update()).mappings().one()
+    current_controller_epoch = str(watermark['controller_epoch'])
+    current_controller_sequence = watermark['controller_sequence']
+    owner_epoch = int(watermark['owner_epoch'])
+    if current_controller_epoch == controller_epoch:
+        if current_controller_sequence != controller_sequence:
+            raise StaleConsumerGenerationError(
+                'A controller epoch cannot change its sequence.')
+    if current_controller_epoch != controller_epoch:
+        if require_existing:
+            raise StaleConsumerGenerationError(
+                'A retired profile revision accepts only an exact live replay.')
+        if not allow_epoch_advance:
+            raise StaleConsumerGenerationError(
+                'A different controller epoch already owns this consumer.')
+        if (current_controller_sequence is not None and
+            (controller_sequence is None or
+             controller_sequence <= int(current_controller_sequence))):
+            raise StaleConsumerGenerationError(
+                'Controller sequence cannot move backward.')
+        previous = session.execute(
+            sqlalchemy.select(schema.demands).where(
+                schema.demands.c.workspace == workspace,
+                schema.demands.c.consumer_kind == consumer_kind,
+                schema.demands.c.consumer_owner == consumer_owner,
+                schema.demands.c.owner_epoch == owner_epoch,
+                schema.demands.c.state.in_([
+                    models.ImageDemandState.WARMING.value,
+                    models.ImageDemandState.READY.value,
+                    models.ImageDemandState.FAILED.value,
+                ])).order_by(
+                    schema.demands.c.id).with_for_update()).mappings().all()
+        for row in previous:
+            _terminalize(session,
+                         row,
+                         models.ImageDemandState.SUPERSEDED,
+                         now=now)
+        if owner_epoch >= _MAX_POSTGRES_BIGINT:
+            raise ValueError('Demand owner epoch is exhausted.')
+        owner_epoch += 1
+        watermark = session.execute(watermarks.update().where(
+            watermarks.c.workspace == workspace,
+            watermarks.c.consumer_kind == consumer_kind,
+            watermarks.c.consumer_owner == consumer_owner).values(
+                controller_epoch=controller_epoch,
+                controller_sequence=controller_sequence,
+                owner_epoch=owner_epoch,
+                owner_deleted_at=None,
+                credential_expires_at=None,
+                updated_at=now).returning(watermarks)).mappings().one()
     existing_rows = session.execute(
         sqlalchemy.select(schema.demands).where(
             schema.demands.c.workspace == workspace,
@@ -306,6 +438,7 @@ def create_demand_for_owner_epoch_in_session(
             'profile_revision_id': profile_revision_id,
             'target_fingerprint': target_fingerprint,
             'location_id': location_id,
+            'placement_json': placement_json,
         }
         if any(
                 str(existing[key]) != str(value)
@@ -333,6 +466,8 @@ def create_demand_for_owner_epoch_in_session(
                                     target_fingerprint=target_fingerprint,
                                     location_id=location_id,
                                     placement=placement,
+                                    controller_epoch=controller_epoch,
+                                    controller_sequence=controller_sequence,
                                     now=now)
 
 
@@ -364,17 +499,27 @@ def get_live_demand(*, workspace: str, consumer_kind: str, consumer_owner: str,
     return _demand(row) if row is not None else None
 
 
-def get_current_demand_for_owner_epoch(*, workspace: str, consumer_kind: str,
-                                       consumer_owner: str,
-                                       owner_epoch: int) -> DemandRecord | None:
-    """Returns the sole live target fence for a restart-stable owner epoch."""
+def get_current_demand_for_controller_epoch(
+        *, workspace: str, consumer_kind: str, consumer_owner: str,
+        controller_epoch: str) -> DemandRecord | None:
+    """Returns the live fence only for the authoritative controller epoch."""
+    controller_epoch = validate_controller_epoch(controller_epoch)
     with orm.Session(catalog_state.engine()) as session:
+        watermark = session.execute(
+            sqlalchemy.select(schema.consumer_watermarks.c.owner_epoch).where(
+                schema.consumer_watermarks.c.workspace == workspace,
+                schema.consumer_watermarks.c.consumer_kind == consumer_kind,
+                schema.consumer_watermarks.c.consumer_owner == consumer_owner,
+                schema.consumer_watermarks.c.controller_epoch ==
+                controller_epoch)).first()
+        if watermark is None:
+            return None
         rows = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.workspace == workspace,
                 schema.demands.c.consumer_kind == consumer_kind,
                 schema.demands.c.consumer_owner == consumer_owner,
-                schema.demands.c.owner_epoch == owner_epoch,
+                schema.demands.c.owner_epoch == int(watermark[0]),
                 schema.demands.c.state.in_([
                     models.ImageDemandState.WARMING.value,
                     models.ImageDemandState.READY.value,
@@ -382,7 +527,8 @@ def get_current_demand_for_owner_epoch(*, workspace: str, consumer_kind: str,
                 ])).order_by(schema.demands.c.consumer_generation.desc()).limit(
                     2)).mappings().all()
     if len(rows) > 1:
-        raise RuntimeError('A consumer epoch has multiple live image demands.')
+        raise RuntimeError(
+            'A controller epoch has multiple live image demands.')
     return _demand(rows[0]) if rows else None
 
 
@@ -455,7 +601,7 @@ def mark_cluster_request_terminal(request_id: str,
                     models.ImageDemandState.WARMING.value,
                     models.ImageDemandState.READY.value,
                     models.ImageDemandState.FAILED.value,
-                ])).with_for_update()).mappings().all()
+                ])).order_by(demands.c.id).with_for_update()).mappings().all()
         changed = 0
         for row in rows:
             values: dict[str, Any] = {
@@ -484,12 +630,11 @@ def supersede_demand(demand_id: str,
                 schema.demands.c.workspace == workspace)).mappings().first()
         if optimistic is None:
             return False
-        _lock_watermark(session,
-                        workspace=str(optimistic['workspace']),
-                        consumer_kind=str(optimistic['consumer_kind']),
-                        consumer_owner=str(optimistic['consumer_owner']),
-                        generation=int(optimistic['consumer_generation']),
-                        now=current)
+        _lock_existing_watermark(session,
+                                 workspace=str(optimistic['workspace']),
+                                 consumer_kind=str(optimistic['consumer_kind']),
+                                 consumer_owner=str(
+                                     optimistic['consumer_owner']))
         row = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.id == demand_id, schema.demands.c.workspace ==
@@ -506,6 +651,53 @@ def supersede_demand(demand_id: str,
         return True
 
 
+def release_demand_authoritatively_in_session(session: orm.Session,
+                                              demand_id: str,
+                                              workspace: str,
+                                              *,
+                                              expected_consumer_kind: str |
+                                              None = None,
+                                              now: int) -> bool:
+    """Releases a fence inside the first-party owner's deletion transaction."""
+    optimistic = session.execute(
+        sqlalchemy.select(schema.demands).where(
+            schema.demands.c.id == demand_id,
+            schema.demands.c.workspace == workspace)).mappings().first()
+    if optimistic is None:
+        return False
+    if (expected_consumer_kind is not None and
+            str(optimistic['consumer_kind']) != expected_consumer_kind):
+        return False
+    _lock_existing_watermark(session,
+                             workspace=str(optimistic['workspace']),
+                             consumer_kind=str(optimistic['consumer_kind']),
+                             consumer_owner=str(optimistic['consumer_owner']))
+    row = session.execute(
+        sqlalchemy.select(schema.demands).where(
+            schema.demands.c.id == demand_id, schema.demands.c.workspace ==
+            workspace).with_for_update()).mappings().first()
+    if row is None:
+        return False
+    if str(row['state']) in (models.ImageDemandState.RELEASED.value,
+                             models.ImageDemandState.SUPERSEDED.value):
+        return True
+    _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+    return True
+
+
+def release_demand_authoritatively(demand_id: str,
+                                   workspace: str,
+                                   *,
+                                   now: int | None = None) -> bool:
+    """Releases a fence after first-party proof of owner deletion."""
+    current = int(time.time()) if now is None else now
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        return release_demand_authoritatively_in_session(session,
+                                                         demand_id,
+                                                         workspace,
+                                                         now=current)
+
+
 def fail_and_supersede_demand(demand_id: str,
                               error_code: str,
                               *,
@@ -518,12 +710,11 @@ def fail_and_supersede_demand(demand_id: str,
                 schema.demands.c.id == demand_id)).mappings().first()
         if optimistic is None:
             return False
-        _lock_watermark(session,
-                        workspace=str(optimistic['workspace']),
-                        consumer_kind=str(optimistic['consumer_kind']),
-                        consumer_owner=str(optimistic['consumer_owner']),
-                        generation=int(optimistic['consumer_generation']),
-                        now=current)
+        _lock_existing_watermark(session,
+                                 workspace=str(optimistic['workspace']),
+                                 consumer_kind=str(optimistic['consumer_kind']),
+                                 consumer_owner=str(
+                                     optimistic['consumer_owner']))
         row = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.id ==
@@ -615,12 +806,11 @@ def observe_consumer_terminal(demand_id: str,
                 demands.c.workspace == workspace)).mappings().first()
         if optimistic is None:
             return False
-        _lock_watermark(session,
-                        workspace=str(optimistic['workspace']),
-                        consumer_kind=str(optimistic['consumer_kind']),
-                        consumer_owner=str(optimistic['consumer_owner']),
-                        generation=int(optimistic['consumer_generation']),
-                        now=current)
+        _lock_existing_watermark(session,
+                                 workspace=str(optimistic['workspace']),
+                                 consumer_kind=str(optimistic['consumer_kind']),
+                                 consumer_owner=str(
+                                     optimistic['consumer_owner']))
         row = session.execute(
             sqlalchemy.select(demands).where(
                 demands.c.id == demand_id, demands.c.workspace ==

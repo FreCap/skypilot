@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import time
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 import uuid
 
 from sky.container_images import api_models

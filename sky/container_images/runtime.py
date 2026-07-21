@@ -12,6 +12,7 @@ from sky.container_images import catalog_state
 from sky.container_images import config
 from sky.container_images import consumers
 from sky.container_images import demand_state
+from sky.container_images import errors
 from sky.container_images import models
 from sky.container_images import topology_state
 from sky.container_images import transactions
@@ -21,18 +22,16 @@ if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
 
 
-class ContainerImageWarmingError(ValueError):
+class ContainerImageWarmingError(errors.ContainerImageError):
     """The selected placement is fenced while its exact digest materializes."""
 
     def __init__(self, demand: demand_state.DemandRecord) -> None:
         self.demand_id = demand.id
         self.consumer_generation = demand.consumer_generation
-        super().__init__(
-            'IMAGE_WARMING: registry preparation is still running for '
-            f'demand {demand.id}.')
+        super().__init__('IMAGE_WARMING')
 
 
-class ContainerImagePreparationFailedError(ValueError):
+class ContainerImagePreparationFailedError(errors.ContainerImageError):
     """The selected target reached a closed terminal preparation failure."""
 
     def __init__(self, demand_id: str) -> None:
@@ -43,7 +42,7 @@ class ContainerImagePreparationFailedError(ValueError):
 @dataclasses.dataclass(frozen=True)
 class _MetadataResolution:
     """Provider-free eligibility result cached during optimization."""
-    resources: 'resources_lib.Resources'
+    resources: resources_lib.Resources
     direct: bool
     profile: models.ManagedRegistryProfile | None = None
     policy: models.WorkspaceImagePolicy | None = None
@@ -200,9 +199,9 @@ def _runtime_binding(
             kubernetes_node_selector)
 
 
-def _pin_host_image(resources: 'resources_lib.Resources',
+def _pin_host_image(resources: resources_lib.Resources,
                     placement: models.Placement,
-                    expected: str | None) -> 'resources_lib.Resources':
+                    expected: str | None) -> resources_lib.Resources:
     if expected is None:
         return resources
     configured = dict(resources.image_id or {})
@@ -222,21 +221,21 @@ def _direct_fallback_allowed(policy: models.WorkspaceImagePolicy,
 
 def _current_consumer_demand(
     workspace: str,
+    placement: models.Placement,
     cache: dict[tuple[typing.Any, ...], typing.Any],
 ) -> demand_state.DemandRecord | None:
     consumer = consumers.current()
     if consumer is None:
         return None
-    owner_epoch = demand_state.owner_epoch_from_token(
-        consumer.owner_epoch_token)
+    consumer = consumers.scope_for_placement(consumer, placement)
     key = ('consumer_demand', workspace, consumer.consumer_kind,
-           consumer.consumer_owner, owner_epoch)
+           consumer.consumer_owner, consumer.controller_epoch)
     if key not in cache:
-        cache[key] = demand_state.get_current_demand_for_owner_epoch(
+        cache[key] = demand_state.get_current_demand_for_controller_epoch(
             workspace=workspace,
             consumer_kind=consumer.consumer_kind,
             consumer_owner=consumer.consumer_owner,
-            owner_epoch=owner_epoch)
+            controller_epoch=consumer.controller_epoch)
     return cache[key]
 
 
@@ -303,7 +302,7 @@ def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
 
 
 def _resolve_metadata(
-    resources: 'resources_lib.Resources',
+    resources: resources_lib.Resources,
     placement: models.Placement,
     workspace: str,
     cache: dict[tuple[typing.Any, ...], typing.Any] | None = None
@@ -314,7 +313,7 @@ def _resolve_metadata(
     if (image is None or resources.container_image_from_legacy_image_id or
             resources.resolved_container_image is not None):
         return _MetadataResolution(resources=resources, direct=True)
-    current_demand = _current_consumer_demand(workspace, cache)
+    current_demand = _current_consumer_demand(workspace, placement, cache)
     if current_demand is not None:
         policy_key = ('workspace_policy', workspace)
         if policy_key not in cache:
@@ -456,11 +455,11 @@ def _resolve_metadata(
 
 
 def prepare_metadata_only(
-    resources: 'resources_lib.Resources',
+    resources: resources_lib.Resources,
     placement: models.Placement,
     workspace: str,
     cache: dict[tuple[typing.Any, ...], typing.Any] | None = None
-) -> 'resources_lib.Resources | None':
+) -> resources_lib.Resources | None:
     """Filters and pins one candidate without provider calls or mutations."""
     try:
         return _resolve_metadata(resources, placement, workspace,
@@ -470,11 +469,11 @@ def prepare_metadata_only(
 
 
 def prepare_metadata_only_with_rank(
-    resources: 'resources_lib.Resources',
+    resources: resources_lib.Resources,
     placement: models.Placement,
     workspace: str,
     cache: dict[tuple[typing.Any, ...], typing.Any] | None = None,
-) -> tuple['resources_lib.Resources', int] | None:
+) -> tuple[resources_lib.Resources, int] | None:
     """Returns one eligible candidate and its locality preference class."""
     try:
         resolution = _resolve_metadata(resources, placement, workspace, cache)
@@ -494,23 +493,28 @@ def _managed_login(
                                           credential_helper='ecr-login')
 
 
-def resolve_for_placement(resources: 'resources_lib.Resources',
+def resolve_for_placement(resources: resources_lib.Resources,
                           placement: models.Placement,
                           *,
                           workspace: str,
                           consumer_kind: str,
                           consumer_owner: str,
-                          owner_epoch_token: str,
+                          controller_epoch: str,
+                          controller_sequence: int | None,
+                          allow_epoch_advance: bool,
                           consumer_metadata: dict[str, typing.Any] |
                           None = None,
-                          ensure: bool = True) -> 'resources_lib.Resources':
+                          ensure: bool = True) -> resources_lib.Resources:
     """Pins one qualified AWS target or preserves the exact direct path."""
     image = resources.container_image
     consumer = consumers.ImageConsumerContext(
         consumer_kind=consumer_kind,
         consumer_owner=consumer_owner,
-        owner_epoch_token=owner_epoch_token,
+        controller_epoch=controller_epoch,
+        controller_sequence=controller_sequence,
+        allow_epoch_advance=allow_epoch_advance,
         metadata=consumer_metadata or {})
+    consumer = consumers.scope_for_placement(consumer, placement)
     with consumers.use(consumer):
         metadata = _resolve_metadata(resources, placement, workspace)
     resources = metadata.resources
@@ -561,22 +565,23 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
     authority_id = catalog_state.get_catalog_authority_id(create=False)
     if authority_id is None:
         raise ValueError('CATALOG_AUTHORITY_UNAVAILABLE')
-    owner_epoch = demand_state.owner_epoch_from_token(owner_epoch_token)
     placement_payload: dict[str, typing.Any] = {
         'provider': placement.provider,
         'region': placement.region,
         'backend': placement.backend,
         'platform': platform,
     }
-    if consumer_metadata:
-        placement_payload['consumer'] = consumer_metadata
-    demand = transactions.create_warming_demand_for_owner_epoch(
+    if consumer.metadata:
+        placement_payload['consumer'] = consumer.metadata
+    demand = transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority_id,
         workspace=workspace,
-        consumer_kind=consumer_kind,
-        consumer_owner=consumer_owner,
+        consumer_kind=consumer.consumer_kind,
+        consumer_owner=consumer.consumer_owner,
+        controller_epoch=consumer.controller_epoch,
+        controller_sequence=consumer.controller_sequence,
+        allow_epoch_advance=consumer.allow_epoch_advance,
         target_key=f'{artifact.id}:{target.target_fingerprint}',
-        owner_epoch=owner_epoch,
         image_id=artifact.id,
         runtime_digest=artifact.runtime_digest,
         profile_revision_id=active.id,
@@ -625,6 +630,8 @@ def resolve_for_placement(resources: 'resources_lib.Resources',
         target_fingerprint=target.target_fingerprint,
         demand_id=demand.id,
         demand_generation=demand.consumer_generation,
+        controller_epoch=consumer.controller_epoch,
+        owner_epoch=demand.owner_epoch,
         credential_helper=('ecr-login'
                            if placement.backend == 'aws_vm' else None),
         runtime_principal=runtime_principal,

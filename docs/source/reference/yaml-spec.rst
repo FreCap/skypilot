@@ -748,12 +748,12 @@ OR
 
 OCI container image to use as the task runtime (optional, advanced).
 
-Use the scalar form for an OCI source reference:
+Use the scalar form for a digest-pinned OCI source reference:
 
 .. code-block:: yaml
 
   resources:
-    container_image: ghcr.io/my-org/model:2026-07-18
+    container_image: ghcr.io/my-org/model@sha256:<64-hex-digest>
 
 Use the object form to bind a human-readable release or select a registry
 distribution profile:
@@ -762,15 +762,15 @@ distribution profile:
 
   resources:
     container_image:
-      ref: ghcr.io/my-org/model:2026-07-18
+      ref: ghcr.io/my-org/model@sha256:<64-hex-digest>
       release: model-production-2026-07-18
       distribution: production
 
 The supported fields are:
 
-- ``ref``: an OCI image reference. When a managed distribution is selected,
-  SkyPilot resolves mutable tags to an immutable digest before persisting the
-  workload.
+- ``ref``: an OCI image reference pinned by a SHA-256 digest. To start from a
+  mutable tag, first run ``sky image publish <tag> --release <name>`` and use
+  the returned release or artifact identity in the workload.
 - ``release``: a workspace-scoped, human-readable immutable alias. Combine it
   with ``ref`` to bind the alias on first use, or use it alone after the image
   has been published.

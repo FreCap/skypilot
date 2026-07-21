@@ -355,7 +355,7 @@ class _OwnedHeartbeat(contextlib.AbstractContextManager['_OwnedHeartbeat']):
     def __init__(self, *_: object) -> None:
         pass
 
-    def __enter__(self) -> '_OwnedHeartbeat':
+    def __enter__(self) -> _OwnedHeartbeat:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -453,6 +453,27 @@ def test_lost_copy_lease_cannot_mark_location_ready(
     destination.verify_graph.assert_not_called()
     assert all(
         call.kwargs.get('ready') is False for call in converge.call_args_list)
+
+
+def test_copy_maintenance_also_recovers_pending_publication_fanout(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    reconcile_fanout = mock.Mock(return_value=3)
+    reconcile_profiles = mock.Mock()
+    schedule_canaries = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.transactions,
+                        'reconcile_pending_canonical_publications',
+                        reconcile_fanout)
+    monkeypatch.setattr(copy_worker_service, 'reconcile_qualification_profiles',
+                        reconcile_profiles)
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'schedule_automatic_canaries', schedule_canaries)
+    limiter = mock.Mock()
+
+    assert copy_worker_service._qualification_maintenance(limiter)
+
+    reconcile_fanout.assert_called_once_with()
+    reconcile_profiles.assert_called_once_with(limiter)
+    schedule_canaries.assert_called_once_with()
 
 
 def _dockerconfig_binding() -> models.RegistryAccessBinding:

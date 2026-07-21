@@ -64,20 +64,87 @@ def _select_and_lock_shard(
     table = schema.registry_shards
     # PostgreSQL md5 gives a stable ring without first locking rejected shards.
     score = sqlalchemy.func.md5(table.c.id + runtime_digest)
-    row = session.execute(
-        sqlalchemy.select(table).where(
-            table.c.workspace == workspace, table.c.profile == profile,
-            table.c.target_id == target_id,
-            table.c.state == models.ImageShardState.READY.value,
-            table.c.reserved_manifests < table.c.max_manifests,
-            table.c.reserved_declared_bytes + declared_size_bytes
-            <= table.c.max_declared_bytes).order_by(
-                score,
-                table.c.id).limit(1).with_for_update()).mappings().first()
-    if row is None:
-        raise topology_state.RegistryCapacityExhaustedError(
-            'REGISTRY_CAPACITY_EXHAUSTED')
-    return row
+    eligible = (table.c.workspace == workspace, table.c.profile == profile,
+                table.c.target_id == target_id,
+                table.c.state == models.ImageShardState.READY.value,
+                table.c.reserved_manifests < table.c.max_manifests,
+                table.c.reserved_declared_bytes + declared_size_bytes
+                <= table.c.max_declared_bytes)
+    statement = sqlalchemy.select(table).where(*eligible).order_by(
+        score, table.c.id).limit(1).with_for_update()
+    # Under READ COMMITTED, a candidate can fill while this SELECT waits for
+    # its row lock. PostgreSQL's EvalPlanQual then removes that row without
+    # continuing past LIMIT 1. Retry from a fresh statement snapshot until an
+    # unlocked candidate wins or a separate fresh snapshot proves that no
+    # eligible candidate remains. Reservations only increase within this path,
+    # so the loop converges even under a train of concurrent fills.
+    while True:
+        row = session.execute(statement).mappings().first()
+        if row is not None:
+            return row
+        candidate_exists = session.execute(
+            sqlalchemy.select(table.c.id).where(*eligible).limit(1)).first()
+        if candidate_exists is None:
+            raise topology_state.RegistryCapacityExhaustedError(
+                'REGISTRY_CAPACITY_EXHAUSTED')
+
+
+def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,
+                        location: sqlalchemy.engine.RowMapping,
+                        artifact: sqlalchemy.engine.RowMapping,
+                        demand: sqlalchemy.engine.RowMapping) -> dict[str, Any]:
+    """Reconstructs the only runtime plan allowed by durable catalog state."""
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        json.loads(str(profile_row['config_json'])))
+    if (profile.name != str(profile_row['profile']) or
+            profile.revision != int(profile_row['revision']) or
+            profile.config_hash != str(profile_row['config_hash'])):
+        raise ValueError('Runtime pull plan profile snapshot is inconsistent.')
+    matching_targets = [
+        target for target in (profile.canonical,) + profile.targets
+        if target.target_fingerprint == str(demand['target_fingerprint'])
+    ]
+    if len(matching_targets) != 1:
+        raise ValueError('Runtime pull plan target is not uniquely configured.')
+    target = matching_targets[0]
+    placement = json.loads(str(demand['placement_json']))
+    backend = placement.get('backend')
+    region = placement.get('region')
+    binding_id = target.runtime_binding(backend)
+    if binding_id is None:
+        raise ValueError('Runtime pull plan binding is not configured.')
+    binding = profile.bindings[binding_id]
+    runtime_principal: str | None = None
+    instance_profile: str | None = None
+    node_selector: list[tuple[str, str]] = []
+    credential_helper: str | None = None
+    if backend == 'aws_vm':
+        runtime_principal = binding.principals[0]
+        instance_profile = binding.instance_profile
+        credential_helper = 'ecr-login'
+    elif backend == 'aws_eks':
+        qualified = next((cluster for cluster in binding.qualified_clusters
+                          if cluster.context == region), None)
+        if qualified is None:
+            raise ValueError('Runtime pull plan EKS target is not qualified.')
+        node_selector = list(qualified.node_selector)
+    else:
+        raise ValueError('Runtime pull plan backend is invalid.')
+    return {
+        'version': 1,
+        'reference': str(location['target_ref']),
+        'runtime_digest': str(demand['runtime_digest']),
+        'platform': str(artifact['platform']),
+        'distribution': profile.name,
+        'profile_revision_id': str(demand['profile_revision_id']),
+        'target_id': target.name,
+        'target_fingerprint': str(demand['target_fingerprint']),
+        'auth_strategy': 'ecr_runtime_identity',
+        'credential_helper': credential_helper,
+        'runtime_principal': runtime_principal,
+        'instance_profile': instance_profile,
+        'kubernetes_node_selector': node_selector,
+    }
 
 
 def _converge_artifact(session: orm.Session, *, workspace: str,
@@ -669,6 +736,31 @@ def reconcile_canonical_publications(location_id: str,
             now=current)
 
 
+def reconcile_pending_canonical_publications(limit: int = 100) -> int:
+    """Reconciles a bounded fanout batch from either operational worker."""
+    if not 1 <= limit <= 1000:
+        raise ValueError('Publication fanout reconciliation limit is invalid.')
+    locations = schema.locations
+    publications = schema.publications
+    with orm.Session(catalog_state.engine()) as session:
+        location_ids = session.execute(
+            sqlalchemy.select(locations.c.id).where(
+                locations.c.canonical.is_(True),
+                locations.c.state.in_([
+                    models.ImageLocationState.READY.value,
+                    models.ImageLocationState.FAILED.value,
+                ]),
+                sqlalchemy.exists().where(
+                    publications.c.canonical_location_id == locations.c.id,
+                    publications.c.state ==
+                    models.ImagePublicationState.PENDING.value)).order_by(
+                        locations.c.updated_at,
+                        locations.c.id).limit(limit)).scalars().all()
+    return sum(
+        reconcile_canonical_publications(location_id)
+        for location_id in location_ids)
+
+
 def retry_publication(
         *,
         publication_id: str,
@@ -806,14 +898,16 @@ def create_warming_demand(*,
             now=current)
 
 
-def create_warming_demand_for_owner_epoch(
+def create_warming_demand_for_controller_epoch(
         *,
         authority_id: str,
         workspace: str,
         consumer_kind: str,
         consumer_owner: str,
+        controller_epoch: str,
+        controller_sequence: int | None,
+        allow_epoch_advance: bool,
         target_key: str,
-        owner_epoch: int,
         image_id: str,
         runtime_digest: str,
         profile_revision_id: str,
@@ -821,7 +915,7 @@ def create_warming_demand_for_owner_epoch(
         location_id: str,
         placement: dict[str, Any],
         now: int | None = None) -> demand_state.DemandRecord:
-    """Allocates one monotonic generation and converges request replay."""
+    """Maps one controller epoch and converges its monotonic demand."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         profile_row = _lock_profile(session,
@@ -838,14 +932,16 @@ def create_warming_demand_for_owner_epoch(
         if str(location['target_fingerprint']) != target_fingerprint:
             raise ValueError(
                 'Demand target fingerprint does not match location.')
-        return demand_state.create_demand_for_owner_epoch_in_session(
+        return demand_state.create_demand_for_controller_epoch_in_session(
             session,
             authority_id=authority_id,
             workspace=workspace,
             consumer_kind=consumer_kind,
             consumer_owner=consumer_owner,
+            controller_epoch=controller_epoch,
+            controller_sequence=controller_sequence,
+            allow_epoch_advance=allow_epoch_advance,
             target_key=target_key,
-            owner_epoch=owner_epoch,
             image_id=image_id,
             runtime_digest=runtime_digest,
             profile_revision_id=profile_revision_id,
@@ -872,18 +968,36 @@ def commit_ready_demand(*,
         optimistic = session.execute(
             sqlalchemy.select(schema.demands).where(
                 schema.demands.c.id == demand_id)).mappings().one()
+        profile_row = session.execute(
+            sqlalchemy.select(schema.profile_revisions).where(
+                schema.profile_revisions.c.id ==
+                optimistic['profile_revision_id'],
+                schema.profile_revisions.c.workspace ==
+                optimistic['workspace'])).mappings().one()
         location = session.execute(
             sqlalchemy.select(schema.locations).where(
                 schema.locations.c.id ==
                 optimistic['location_id']).with_for_update()).mappings().one()
+        artifact = session.execute(
+            sqlalchemy.select(schema.images).where(
+                schema.images.c.id == optimistic['image_id'],
+                schema.images.c.workspace ==
+                optimistic['workspace']).with_for_update()).mappings().one()
         if (str(location['state']) != models.ImageLocationState.READY.value or
                 location['lease_token'] is not None or
+                location['target_ref'] is None or
                 str(location['runtime_digest']) != str(
                     optimistic['runtime_digest']) or
                 str(location['target_fingerprint']) != str(
                     optimistic['target_fingerprint'])):
             raise ValueError(
                 'Location is not a lease-free READY demand target.')
+        expected_plan = _expected_pull_plan(profile_row=profile_row,
+                                            location=location,
+                                            artifact=artifact,
+                                            demand=optimistic)
+        if pull_plan != expected_plan:
+            raise ValueError('Runtime pull plan does not match its demand.')
         watermark = session.execute(
             sqlalchemy.select(schema.consumer_watermarks).where(
                 schema.consumer_watermarks.c.workspace ==

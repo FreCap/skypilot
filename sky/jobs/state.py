@@ -2150,6 +2150,24 @@ async def get_job_status_with_task_id_async(
         return ManagedJobStatus(status[0]) if status else None
 
 
+@db_retries.retry_async
+async def get_image_recovery_generation_async(job_id: int, task_id: int) -> int:
+    """Returns the durable launch generation for managed image ownership."""
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        row = (await session.execute(
+            sqlalchemy.select(spot_table.c.status,
+                              spot_table.c.recovery_count).where(
+                                  spot_table.c.spot_job_id == job_id,
+                                  spot_table.c.task_id == task_id))).first()
+    if row is None:
+        raise ValueError('Managed job task does not exist.')
+    generation = int(row.recovery_count or 0)
+    if ManagedJobStatus(row.status) == ManagedJobStatus.RECOVERING:
+        generation += 1
+    return generation
+
+
 async def set_recovering_async(
     job_id: int,
     task_id: int,

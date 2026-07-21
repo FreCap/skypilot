@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
+import json
 import re
-from typing import Any, Iterator
+from typing import Any
 
 from sky import task as task_lib
+from sky.container_images import models
 from sky.serve import constants as serve_constants
 from sky.skylet import constants
 from sky.utils import common_utils
@@ -20,9 +24,16 @@ class ImageConsumerContext:
 
     consumer_kind: str
     consumer_owner: str
-    owner_epoch_token: str
+    controller_epoch: str
+    controller_sequence: int | None
+    allow_epoch_advance: bool
     metadata: dict[str, Any]
 
+
+CLUSTER_CONTROLLER_EPOCH_KEY = 'container_image_cluster_controller_epoch'
+CLUSTER_ALLOW_EPOCH_ADVANCE_KEY = 'container_image_cluster_allow_epoch_advance'
+MANAGED_JOB_RECOVERY_GENERATION_KEY = (
+    'container_image_managed_job_recovery_generation')
 
 _CURRENT: contextvars.ContextVar[ImageConsumerContext |
                                  None] = (contextvars.ContextVar(
@@ -76,8 +87,10 @@ def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
             return ImageConsumerContext(
                 consumer_kind='service_version',
                 consumer_owner=f'{workload_id}:v{workload_task_id}',
-                owner_epoch_token=(
+                controller_epoch=(
                     f'service:{service_hash}:v{workload_task_id}'),
+                controller_sequence=workload_task_id,
+                allow_epoch_advance=False,
                 metadata={
                     'workload_type': workload_type,
                     'workload_id': workload_id,
@@ -88,25 +101,70 @@ def derive(task: task_lib.Task, cluster_name: str | None, workload_type: str,
         managed_job_id = (task.envs or {}).get(constants.MANAGED_JOB_ID_ENV_VAR)
         if managed_job_id is not None:
             owner = f'{managed_job_id}:task:{workload_task_id}'
+            recovery_generation = (launch_context or
+                                   {}).get(MANAGED_JOB_RECOVERY_GENERATION_KEY,
+                                           0)
+            if (type(recovery_generation) is not int or
+                    recovery_generation < 0):
+                raise ValueError(
+                    'Managed image recovery generation must be nonnegative.')
             return ImageConsumerContext(
                 consumer_kind='managed_job_task',
                 consumer_owner=owner,
-                owner_epoch_token=f'managed-job:{owner}',
+                controller_epoch=(
+                    f'managed-job:{owner}:recovery:{recovery_generation}'),
+                controller_sequence=recovery_generation,
+                allow_epoch_advance=recovery_generation > 0,
                 metadata={
                     'workload_type': workload_type,
                     'workload_id': str(managed_job_id),
                     'workload_task_id': workload_task_id,
+                    'recovery_generation': recovery_generation,
                     'request_id': request_id,
                 })
+    controller_epoch = (launch_context or {}).get(CLUSTER_CONTROLLER_EPOCH_KEY)
+    if controller_epoch is None:
+        controller_epoch = f'cluster-request:{request_id}'
+    if (not isinstance(controller_epoch, str) or not controller_epoch or
+            len(controller_epoch) > 1024):
+        raise ValueError('Cluster image controller epoch is invalid.')
+    allow_epoch_advance = bool((launch_context or
+                                {}).get(CLUSTER_ALLOW_EPOCH_ADVANCE_KEY, False))
+    return ImageConsumerContext(consumer_kind='cluster',
+                                consumer_owner=stable_cluster_name,
+                                controller_epoch=controller_epoch,
+                                controller_sequence=None,
+                                allow_epoch_advance=allow_epoch_advance,
+                                metadata={
+                                    'workload_type': 'cluster',
+                                    'workload_id': stable_cluster_name,
+                                    'request_id': request_id,
+                                })
+
+
+def scope_for_placement(context: ImageConsumerContext,
+                        placement: models.Placement) -> ImageConsumerContext:
+    """Scopes one Serve version to a target without multiplying by replica."""
+    if (context.consumer_kind != 'service_version' or
+            'target_scope' in context.metadata):
+        return context
+    target = {
+        'provider': placement.provider.lower(),
+        'region': placement.region,
+        'backend': placement.backend,
+        'platform': placement.platform or 'linux/amd64',
+    }
+    encoded = json.dumps(target, sort_keys=True, separators=(',', ':'))
+    target_scope = hashlib.sha256(encoded.encode()).hexdigest()
+    metadata = dict(context.metadata)
+    metadata['target_scope'] = target
     return ImageConsumerContext(
-        consumer_kind='cluster',
-        consumer_owner=stable_cluster_name,
-        owner_epoch_token=f'cluster:{stable_cluster_name}',
-        metadata={
-            'workload_type': 'cluster',
-            'workload_id': stable_cluster_name,
-            'request_id': request_id,
-        })
+        consumer_kind=context.consumer_kind,
+        consumer_owner=f'{context.consumer_owner}:target:{target_scope}',
+        controller_epoch=context.controller_epoch,
+        controller_sequence=context.controller_sequence,
+        allow_epoch_advance=False,
+        metadata=metadata)
 
 
 def current() -> ImageConsumerContext | None:

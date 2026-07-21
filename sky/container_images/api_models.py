@@ -28,7 +28,7 @@ class PublicationCreate(_ApiModel):
     source_auth: str | None = None
 
     @pydantic.model_validator(mode='after')
-    def validate_publication(self) -> 'PublicationCreate':
+    def validate_publication(self) -> PublicationCreate:
         self.source_ref = models.validate_oci_reference(self.source_ref,
                                                         'Publication source')
         if models.split_digest(self.source_ref)[1] is None:
@@ -54,7 +54,7 @@ class ArtifactPrepare(_ApiModel):
     workspace: str | None = None
 
     @pydantic.model_validator(mode='after')
-    def validate_prepare(self) -> 'ArtifactPrepare':
+    def validate_prepare(self) -> ArtifactPrepare:
         self.distribution = models.validate_control_plane_identifier(
             self.distribution, 'Preparation distribution')
         self.target = models.validate_control_plane_identifier(
@@ -88,7 +88,7 @@ class CanaryCreate(_ApiModel):
     confirm_cost: bool
 
     @pydantic.model_validator(mode='after')
-    def validate_canary(self) -> 'CanaryCreate':
+    def validate_canary(self) -> CanaryCreate:
         self.workspace = models.validate_workspace_name(self.workspace,
                                                         'Canary workspace')
         self.target = models.validate_control_plane_identifier(
@@ -114,7 +114,7 @@ class OperationView(_ApiModel):
 
     @classmethod
     def from_record(cls,
-                    record: catalog_state.OperationRecord) -> 'OperationView':
+                    record: catalog_state.OperationRecord) -> OperationView:
         result = record.result
         if isinstance(result, dict) and 'nonce' in result:
             result = dict(result)
@@ -149,8 +149,7 @@ class ArtifactView(_ApiModel):
     updated_at: int
 
     @classmethod
-    def from_record(cls,
-                    record: catalog_state.ArtifactRecord) -> 'ArtifactView':
+    def from_record(cls, record: catalog_state.ArtifactRecord) -> ArtifactView:
         return cls(id=record.id,
                    workspace=record.workspace,
                    runtime_digest=record.runtime_digest,
@@ -178,7 +177,7 @@ class CatalogArtifactView(ArtifactView):
         cls,
         record: catalog_state.ArtifactRecord,
         summary: dict[str, Any],
-    ) -> 'CatalogArtifactView':
+    ) -> CatalogArtifactView:
         return cls(**ArtifactView.from_record(record).model_dump(), **summary)
 
 
@@ -195,7 +194,7 @@ class SourceView(_ApiModel):
     created_at: int
 
     @classmethod
-    def from_record(cls, record: catalog_state.SourceRecord) -> 'SourceView':
+    def from_record(cls, record: catalog_state.SourceRecord) -> SourceView:
         value = record.__dict__.copy()
         value.pop('workspace')
         return cls(**value)
@@ -224,8 +223,8 @@ class PublicationView(_ApiModel):
     updated_at: int
 
     @classmethod
-    def from_record(
-            cls, record: catalog_state.PublicationRecord) -> 'PublicationView':
+    def from_record(cls,
+                    record: catalog_state.PublicationRecord) -> PublicationView:
         return cls(id=record.id,
                    operation_id=record.operation_id,
                    profile_revision_id=record.profile_revision_id,
@@ -257,7 +256,7 @@ class ReleaseView(_ApiModel):
 
     @classmethod
     def from_record(cls,
-                    record: catalog_state.PublicationRecord) -> 'ReleaseView':
+                    record: catalog_state.PublicationRecord) -> ReleaseView:
         if record.published_release is None or record.image_id is None:
             raise ValueError('Only READY publications are releases.')
         return cls(publication_id=record.id,
@@ -291,7 +290,7 @@ class LocationView(_ApiModel):
 
     @classmethod
     def from_record(cls, record: topology_state.LocationRecord, target_id: str,
-                    distribution: str) -> 'LocationView':
+                    distribution: str) -> LocationView:
         return cls(id=record.id,
                    image_id=record.image_id,
                    shard_id=record.shard_id,
@@ -335,7 +334,7 @@ class DemandView(_ApiModel):
     updated_at: int
 
     @classmethod
-    def from_record(cls, record: demand_state.DemandRecord) -> 'DemandView':
+    def from_record(cls, record: demand_state.DemandRecord) -> DemandView:
         return cls(id=record.id,
                    consumer_kind=record.consumer_kind,
                    consumer_owner=record.consumer_owner,
@@ -374,7 +373,7 @@ class ProfileView(_ApiModel):
 
     @classmethod
     def from_record(
-            cls, record: topology_state.ProfileRevisionRecord) -> 'ProfileView':
+            cls, record: topology_state.ProfileRevisionRecord) -> ProfileView:
         return cls(id=record.id,
                    profile=record.profile,
                    revision=record.revision,
@@ -402,7 +401,7 @@ class WorkerView(_ApiModel):
     max_in_flight: int
 
     @classmethod
-    def from_record(cls, record: topology_state.WorkerRecord) -> 'WorkerView':
+    def from_record(cls, record: topology_state.WorkerRecord) -> WorkerView:
         return cls(id=record.id,
                    kind=record.kind.value,
                    version=record.version,
@@ -430,7 +429,7 @@ class ProviderBudgetView(_ApiModel):
     def from_record(
         cls,
         record: topology_state.ProviderBudgetRecord,
-    ) -> 'ProviderBudgetView':
+    ) -> ProviderBudgetView:
         return cls(provider=record.provider,
                    partition=record.partition,
                    account=record.account,

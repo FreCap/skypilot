@@ -503,6 +503,14 @@ def _execute_dag(
                          task.service.pool else 'service')
     elif controller is not None:
         workload_type = 'controller'
+    if workload_type == 'cluster':
+        _extra_launch_context = dict(_extra_launch_context)
+        _extra_launch_context.setdefault(
+            container_image_consumers.CLUSTER_CONTROLLER_EPOCH_KEY,
+            f'cluster-request:{common_utils.get_current_request_id()}')
+        _extra_launch_context.setdefault(
+            container_image_consumers.CLUSTER_ALLOW_EPOCH_ADVANCE_KEY,
+            not cluster_exists)
     image_consumer = container_image_consumers.derive(task, cluster_name,
                                                       workload_type,
                                                       _extra_launch_context)

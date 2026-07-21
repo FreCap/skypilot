@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 import pickle
 from typing import Any
@@ -15,6 +16,7 @@ from sky import exceptions
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.container_images import catalog_state
+from sky.container_images import consumers
 from sky.container_images import demand_state
 from sky.container_images import models
 from sky.container_images import runtime
@@ -238,7 +240,7 @@ def _wire_metadata(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(runtime.topology_state, 'get_profile_revision',
                         lambda revision_id: active)
     monkeypatch.setattr(runtime.demand_state,
-                        'get_current_demand_for_owner_epoch',
+                        'get_current_demand_for_controller_epoch',
                         lambda **kwargs: None)
 
 
@@ -267,7 +269,7 @@ def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
                         'get_catalog_authority_id',
                         lambda create=False: _AUTHORITY_ID)
     monkeypatch.setattr(runtime.transactions,
-                        'create_warming_demand_for_owner_epoch', create)
+                        'create_warming_demand_for_controller_epoch', create)
     monkeypatch.setattr(runtime.transactions, 'commit_ready_demand', commit)
 
     resources = _FakeResources(
@@ -281,7 +283,9 @@ def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
         workspace='research',
         consumer_kind='service_version',
         consumer_owner='boltz:v7',
-        owner_epoch_token='service-hash:v7')
+        controller_epoch='service:service-hash:v7',
+        controller_sequence=7,
+        allow_epoch_advance=False)
 
     assert resolved.image_id == {'us-west-2': 'ami-0fedcba9876543210'}
     assert resolved.resolved_container_image is not None
@@ -343,7 +347,9 @@ def test_managed_preferred_stale_route_preserves_direct_digest_path(
                                            workspace='research',
                                            consumer_kind='cluster',
                                            consumer_owner='cluster',
-                                           owner_epoch_token='request')
+                                           controller_epoch='cluster:request',
+                                           controller_sequence=None,
+                                           allow_epoch_advance=False)
     assert result is resources
     assert result.resolved_container_image is None
 
@@ -373,7 +379,7 @@ def test_live_demand_replays_its_retired_immutable_profile_snapshot(
     monkeypatch.setattr(runtime.config, 'get_workspace_policy',
                         lambda workspace: policy)
     monkeypatch.setattr(runtime.demand_state,
-                        'get_current_demand_for_owner_epoch',
+                        'get_current_demand_for_controller_epoch',
                         lambda **kwargs: pinned)
     monkeypatch.setattr(runtime.topology_state, 'get_profile_revision',
                         lambda revision_id: revision)
@@ -390,7 +396,7 @@ def test_live_demand_replays_its_retired_immutable_profile_snapshot(
                         lambda create=False: _AUTHORITY_ID)
     create = mock.Mock(return_value=pinned)
     monkeypatch.setattr(runtime.transactions,
-                        'create_warming_demand_for_owner_epoch', create)
+                        'create_warming_demand_for_controller_epoch', create)
     monkeypatch.setattr(
         runtime.transactions, 'commit_ready_demand', lambda **kwargs:
         dataclasses.replace(pinned,
@@ -409,7 +415,9 @@ def test_live_demand_replays_its_retired_immutable_profile_snapshot(
         workspace='research',
         consumer_kind=pinned.consumer_kind,
         consumer_owner=pinned.consumer_owner,
-        owner_epoch_token='service:stable:v7')
+        controller_epoch='service:stable:v7',
+        controller_sequence=7,
+        allow_epoch_advance=False)
 
     assert resolved.resolved_container_image is not None
     assert resolved.resolved_container_image.profile_revision_id == revision.id
@@ -428,7 +436,7 @@ def test_exact_host_image_mismatch_is_rejected_before_demand_mutation(
     _wire_metadata(monkeypatch, profile, policy, active)
     mutate = mock.Mock(side_effect=AssertionError('unexpected demand'))
     monkeypatch.setattr(runtime.transactions,
-                        'create_warming_demand_for_owner_epoch', mutate)
+                        'create_warming_demand_for_controller_epoch', mutate)
     monkeypatch.setattr(runtime.time, 'time', lambda: 101)
     resources = _FakeResources(models.ContainerImage(release='boltz-l4',
                                                      distribution=profile.name),
@@ -453,15 +461,28 @@ def test_one_thousand_service_replicas_share_one_version_target_owner(
         serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'service-hash',
         serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 7,
     }
+    placement = models.Placement(provider='aws',
+                                 region='us-west-2',
+                                 backend='aws_vm',
+                                 platform='linux/amd64')
     owners = set()
     for replica in range(1000):
         attribution = cloud_vm_ray_backend._get_image_demand_attribution(
             task, f'boltz-l4-fleet-{replica}', 'service', context)
+        attribution = consumers.scope_for_placement(attribution, placement)
         owners.add((attribution.consumer_kind, attribution.consumer_owner,
-                    attribution.owner_epoch_token))
+                    attribution.controller_epoch))
     assert len(owners) == 1
-    assert owners == {('service_version', 'boltz-l4-fleet:v7',
-                       'service:service-hash:v7')}
+    kind, owner, epoch = owners.pop()
+    assert kind == 'service_version'
+    assert owner.startswith('boltz-l4-fleet:v7:target:')
+    assert epoch == 'service:service-hash:v7'
+
+    other = consumers.scope_for_placement(
+        cloud_vm_ray_backend._get_image_demand_attribution(
+            task, 'boltz-l4-fleet-1000', 'service', context),
+        dataclasses.replace(placement, region='us-east-1'))
+    assert other.consumer_owner != owner
 
 
 def test_legacy_docker_image_survives_copy_pickle_and_yaml_round_trip() -> None:
@@ -532,3 +553,17 @@ def test_nested_alternatives_are_validated_and_private_pull_plans_rejected(
     with pytest.raises(ValueError,
                        match='Invalid managed container image task'):
         payloads.LaunchBody(task=forged, cluster_name='cluster')
+
+
+@pytest.mark.parametrize('resolver', [
+    payloads._resource_config_targets_kubernetes,
+    payloads._resource_config_may_target_kubernetes,
+])
+def test_payload_cloud_resolution_fails_closed_without_registry(
+        monkeypatch: pytest.MonkeyPatch, resolver: Callable[[dict[str, Any]],
+                                                            bool]) -> None:
+    monkeypatch.setattr(payloads.registry.CLOUD_REGISTRY, 'from_str',
+                        lambda _: None)
+
+    with pytest.raises(ValueError):
+        resolver({'cloud': 'kubernetes'})

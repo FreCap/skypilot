@@ -428,7 +428,7 @@ class TestMigrationChainPG:
             engine.dispose()
 
     @pytest.mark.parametrize('preview_workspace_016', [False, True])
-    def test_revision_020_reconciles_conflicting_revision_016_layouts(
+    def test_revision_021_reconciles_conflicting_revision_016_layouts(
             self, pg_server, preview_workspace_016):
         """Both pre-merge revision 016 schemas converge on PostgreSQL."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
@@ -473,6 +473,56 @@ class TestMigrationChainPG:
             sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
             sqlalchemy.Column('created_at', sqlalchemy.Float),
             sqlalchemy.Column('created_by', sqlalchemy.Text))
+        sqlalchemy.Table(
+            'serve_replica_status_history', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+            sqlalchemy.Column('bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('ready_count', sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('provisioning_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('not_ready_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('errored_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('preempted_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('stopping_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('total_count', sqlalchemy.Integer,
+                              nullable=False))
+        sqlalchemy.Table(
+            'serve_request_activity_history', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('reporter_session_id',
+                              sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('request_count',
+                              sqlalchemy.Integer,
+                              nullable=False))
         metadata.create_all(engine)
         try:
             with engine.begin() as connection:
@@ -523,7 +573,7 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
-    def test_revision_020_repairs_preview_revision_018_collision(
+    def test_revision_021_repairs_preview_revision_018_collision(
             self, pg_server):
         """A preview DB stamped 018 gains the current 018 placement table."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
@@ -540,9 +590,8 @@ class TestMigrationChainPG:
                 # faithfully models the historical collision: workspace is
                 # present while the placement-events table is absent.
                 connection.execute(
-                    sqlalchemy.text(
-                        'UPDATE alembic_version_serve_state_db '
-                        "SET version_num = '018'"))
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '018'"))
 
             assert 'serve_placement_events' not in set(
                 sqlalchemy.inspect(engine).get_table_names())

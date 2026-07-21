@@ -219,6 +219,8 @@ def _validate_container_image_resolution(
         if (resolved_image.location_id is None or
                 resolved_image.demand_id is None or
                 resolved_image.demand_generation is None or
+                resolved_image.controller_epoch is None or
+                resolved_image.owner_epoch is None or
                 resolved_image.profile_revision_id is None or
                 resolved_image.target_fingerprint is None):
             raise ValueError('Managed container image pull plan is incomplete.')
@@ -226,6 +228,7 @@ def _validate_container_image_resolution(
         location = container_image_schema.locations
         profile = container_image_schema.profile_revisions
         artifact = container_image_schema.images
+        watermark = container_image_schema.consumer_watermarks
         row = session.execute(
             sqlalchemy.select(
                 demand.c.id,
@@ -243,6 +246,14 @@ def _validate_container_image_resolution(
                 == resolved_image.profile_revision_id,
                 demand.c.target_fingerprint
                 == resolved_image.target_fingerprint,
+                demand.c.owner_epoch == resolved_image.owner_epoch,
+                sqlalchemy.exists().where(
+                    watermark.c.workspace == demand.c.workspace,
+                    watermark.c.consumer_kind == demand.c.consumer_kind,
+                    watermark.c.consumer_owner == demand.c.consumer_owner,
+                    watermark.c.controller_epoch ==
+                    resolved_image.controller_epoch,
+                    watermark.c.owner_epoch == resolved_image.owner_epoch),
                 location.c.id == resolved_image.location_id,
                 location.c.target_ref == resolved_image.reference,
                 location.c.state ==
@@ -1844,10 +1855,11 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
     with orm.Session(engine) as session:
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
-        row = session.query(
-            cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
-            cluster_table.c.handle,
-            cluster_table.c.workspace).filter_by(name=cluster_name).first()
+        row = session.query(cluster_table.c.cluster_hash,
+                            cluster_table.c.provision_log_path,
+                            cluster_table.c.handle,
+                            cluster_table.c.workspace).filter_by(
+                                name=cluster_name).with_for_update().first()
         cluster_hash = row.cluster_hash if row is not None else None
         provision_log_path = (row.provision_log_path
                               if row is not None else None)
@@ -1882,6 +1894,20 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
             })
 
         if terminate:
+            if (terminal_demand_id is not None and
+                    terminal_workspace is not None):
+                # Import locally to avoid global_user_state -> demand_state ->
+                # catalog_state -> global_user_state initialization recursion.
+                # pylint: disable=import-outside-toplevel
+                from sky.container_images import demand_state
+
+                # pylint: enable=import-outside-toplevel
+                demand_state.release_demand_authoritatively_in_session(
+                    session,
+                    terminal_demand_id,
+                    terminal_workspace,
+                    expected_consumer_kind='cluster',
+                    now=int(time.time()))
             session.query(cluster_table).filter_by(name=cluster_name).delete()
         else:
             if row is None or row.handle is None:
@@ -1900,23 +1926,6 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
                 cluster_table.c.status_updated_at: current_time
             })
         session.commit()
-
-    if terminal_demand_id is not None and terminal_workspace is not None:
-        # Import locally to avoid global_user_state -> demand_state ->
-        # catalog_state -> global_user_state initialization recursion.
-        # pylint: disable=import-outside-toplevel
-        from sky.container_images import demand_state as image_demand_state
-
-        # pylint: enable=import-outside-toplevel
-        demand = image_demand_state.get_demand(terminal_demand_id,
-                                               terminal_workspace)
-        # Logical service-version and managed-job demands are shared by more
-        # than one physical launch. Their owning controller state, not one
-        # cluster deletion, is the terminal authority.
-        if demand is not None and demand.consumer_kind == 'cluster':
-            image_demand_state.observe_consumer_terminal(terminal_demand_id,
-                                                         terminal_workspace,
-                                                         authoritative=True)
 
 
 @db_retries.retry
