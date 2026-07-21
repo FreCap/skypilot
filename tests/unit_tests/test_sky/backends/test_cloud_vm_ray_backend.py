@@ -61,6 +61,9 @@ class TestCloudVmRayResourceHandleCardinality:
             # starting a nested pytest session. Nested pytest competes with
             # the already parallel unit suite for shared fixtures and has
             # repeatedly exceeded this otherwise generous process timeout.
+            # The direct child still imports SkyPilot, and a passing probe has
+            # exceeded 30 seconds under the 16-way Python 3.14 CI suite. Keep
+            # the probe bounded while allowing for that observed contention.
             script = ('import runpy; '
                       f'module = runpy.run_path({__file__!r}); '
                       "module['TestCloudVmRayResourceHandleCardinality']()."
@@ -69,7 +72,7 @@ class TestCloudVmRayResourceHandleCardinality:
                                     check=False,
                                     capture_output=True,
                                     text=True,
-                                    timeout=30)
+                                    timeout=120)
             assert result.returncode == 0, result.stdout + result.stderr
             return
 
