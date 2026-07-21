@@ -531,9 +531,11 @@ class Autoscaler:
         replicas are opportunistic supply, and the platform's spill
         logic must not read them as demand.
 
-        - Surplus scale-ups beyond max(current, demand target) carry the
-          sentinel override so the launch path pins them to zero-cost
-          ACTIVE locations only (and skips entirely when none is).
+        - Every spendable free slot that fits below the hard aggregate
+          max_replicas ceiling carries the sentinel override so the launch
+          path pins it to zero-cost ACTIVE locations only (and skips entirely
+          when none is). Demand and rolling-update launches reserve their
+          planned ceiling headroom first, but do not otherwise suppress fill.
         - Scale-downs covered by the fill surplus are suppressed, taking
           the shelter quota from the TAIL of the zero-cost victims: the
           subclass ordered its victims most-preferred-first (initializing
@@ -549,13 +551,12 @@ class Autoscaler:
         if not self.reserved_capacity_fill:
             return decisions
         # Zero-cost accounting is version-asymmetric by design; the
-        # three roles use different version scopes:
-        # - LAUNCH BASELINE: latest-version only. The baseline below is
-        #   max(num_latest_nonterminal, demand_target), which is
-        #   latest-only, so old-version zero-cost replicas (a rolling
-        #   update draining its previous fleet) would inflate the launch
-        #   target by replicas the baseline never sees -- compounding
-        #   fill launches every tick.
+        # four roles use different version scopes:
+        # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
+        #   zero-cost replicas (a rolling update draining its previous fleet)
+        #   would otherwise inflate the target and compound fill launches.
+        #   The HARD CEILING below is deliberately all-version: old rows still
+        #   occupy physical capacity and must reduce aggregate headroom.
         # - OCCUPANCY DEBIT: all versions. ANY nonterminal zero-cost row
         #   whose pod may be unbound (not READY, or created after the
         #   snapshot) holds a claim on a slot the snapshot counted free
@@ -583,11 +584,13 @@ class Autoscaler:
         zero_cost_occupying = 0
         zero_cost_demand_placed = 0
         zero_cost_demand_placed_latest = 0
+        num_nonterminal = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
                 continue
             capacity_units = self._fill_capacity_units(info)
+            num_nonterminal += capacity_units
             is_latest = info.version == self.latest_version
             if is_latest:
                 num_latest_nonterminal += capacity_units
@@ -655,38 +658,42 @@ class Autoscaler:
         self._fill_target = fill_target
         demand_target = self.get_final_target_num_replicas()
         surplus_covered = fill_target - demand_target
-        if surplus_covered <= 0:
-            return decisions
-        # Victim-aware suppression: shelter ONLY scale-downs whose victim
-        # replica sits on a zero-cost location, up to the fill surplus.
-        # Downs targeting paid replicas always pass through -- fill
-        # surplus must never keep a PAID replica alive (the subclass
-        # orders victims newest-first, so a victim-blind prefix keep
-        # could shelter a paid replica indefinitely while repeatedly
-        # killing and relaunching zero-cost ones).
-        id_to_info = {info.replica_id: info for info in replica_infos}
-        # Take the shelter quota from the TAIL of the zero-cost victims:
-        # the subclass emits victims most-preferred-first, so a partial
-        # surplus must shelter the LEAST-preferred ones (e.g. keep the
-        # READY replica serving traffic, not the PROVISIONING one ahead
-        # of it in the list). Two passes so output order is preserved.
-        zero_cost_decision_ids = []
-        for idx, decision in enumerate(decisions):
-            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
-                assert isinstance(decision.target,
-                                  (int, LogicalScaleDownTarget))
-                victim = id_to_info.get(_scale_down_replica_id(decision.target))
-                if (victim is not None and
-                        self._replica_on_zero_cost_location(victim)):
-                    zero_cost_decision_ids.append(idx)
-        suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
-        result: list[AutoscalerDecision] = [
-            decision for idx, decision in enumerate(decisions)
-            if idx not in suppressed_ids
-        ]
+        # Keep this overlay side-effect free for callers that retain the
+        # ordinary decision list for later policy checks.
+        result = list(decisions)
+        if surplus_covered > 0:
+            # Victim-aware suppression: shelter ONLY scale-downs whose victim
+            # replica sits on a zero-cost location, up to the fill surplus.
+            # Downs targeting paid replicas always pass through -- fill
+            # surplus must never keep a PAID replica alive (the subclass
+            # orders victims newest-first, so a victim-blind prefix keep
+            # could shelter a paid replica indefinitely while repeatedly
+            # killing and relaunching zero-cost ones).
+            id_to_info = {info.replica_id: info for info in replica_infos}
+            # Take the shelter quota from the TAIL of the zero-cost victims:
+            # the subclass emits victims most-preferred-first, so a partial
+            # surplus must shelter the LEAST-preferred ones (e.g. keep the
+            # READY replica serving traffic, not the PROVISIONING one ahead
+            # of it in the list). Two passes so output order is preserved.
+            zero_cost_decision_ids = []
+            for idx, decision in enumerate(decisions):
+                if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
+                    assert isinstance(decision.target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info.get(
+                        _scale_down_replica_id(decision.target))
+                    if (victim is not None and
+                            self._replica_on_zero_cost_location(victim)):
+                        zero_cost_decision_ids.append(idx)
+            suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
+            result = [
+                decision for idx, decision in enumerate(decisions)
+                if idx not in suppressed_ids
+            ]
         # Launch target: latest-version zero-cost replicas only (see the
-        # version-asymmetry note above), against the latest-only
-        # baseline.
+        # version-asymmetry note above). Fill intent is independent of demand;
+        # the hard aggregate headroom calculation below separately reserves
+        # latest demand and counts every old-version nonterminal row.
         fill_target_launch = min(zero_cost_latest + spendable_free_slots,
                                  self.max_replicas)
         if fill_ceiling_launch is not None:
@@ -697,14 +704,20 @@ class Autoscaler:
             # old-version demand rows must not inflate launches during a
             # rolling update.
             fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
-        num_fill_up = (fill_target_launch -
-                       max(num_latest_nonterminal, demand_target))
+        desired_fill_up = max(0, fill_target_launch - zero_cost_latest)
+        num_old_nonterminal = num_nonterminal - num_latest_nonterminal
+        planned_total = (num_old_nonterminal +
+                         max(num_latest_nonterminal, demand_target))
+        hard_ceiling_headroom = max(0, self.max_replicas - planned_total)
+        num_fill_up = min(desired_fill_up, hard_ceiling_headroom)
         if num_fill_up > 0:
             logger.info(f'Reserved-capacity fill: launch target '
                         f'{fill_target_launch} (latest zero-cost replicas '
                         f'{zero_cost_latest} + spendable free slots '
                         f'{spendable_free_slots}), demand target '
-                        f'{demand_target}; scaling up {num_fill_up} '
+                        f'{demand_target}, planned total {planned_total}, '
+                        f'hard-ceiling headroom {hard_ceiling_headroom}; '
+                        f'scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
             fill_override: dict[str, Any] = {
                 constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
