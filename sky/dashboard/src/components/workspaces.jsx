@@ -225,6 +225,8 @@ export function Workspaces() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const isInitialLoadRef = useRef(true);
   const requestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
+  const manualRefreshOwnerRef = useRef(null);
 
   // Modal states
   const [isAllWorkspacesModalOpen, setIsAllWorkspacesModalOpen] =
@@ -416,8 +418,11 @@ export function Workspaces() {
   );
 
   const fetchData = useCallback(
-    async (options = { showLoadingIndicators: true }) => {
-      const { showLoadingIndicators = true } = options;
+    async (options = {}) => {
+      const { showLoadingIndicators = true, supersede = false } = options;
+      if (!supersede && activeRequestRef.current) {
+        return activeRequestRef.current;
+      }
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const isCurrentRequest = () => {
@@ -425,90 +430,100 @@ export function Workspaces() {
       };
       const wasInitialLoad = isInitialLoadRef.current;
 
-      if (showLoadingIndicators) {
-        setClustersLoading(true);
-        setJobsLoading(true);
-      }
-
-      try {
-        // First, get the list of workspaces the user has access to
-        const fetchedWorkspacesConfig = await dashboardCache.get(getWorkspaces);
-        if (!isCurrentRequest()) return false;
-        setRawWorkspacesData(fetchedWorkspacesConfig);
-        const configuredWorkspaceNames = Object.keys(fetchedWorkspacesConfig);
-
-        // Fetch enabledClouds for all workspaces in a single batch request
-        let enabledCloudsMap = {};
-        try {
-          enabledCloudsMap = await dashboardCache.get(getEnabledCloudsBatch, [
-            configuredWorkspaceNames,
-          ]);
-        } catch (error) {
-          if (isCurrentRequest()) {
-            console.error('Error fetching enabled clouds batch:', error);
-          }
-        }
-        if (!isCurrentRequest()) return false;
-
-        // Initialize workspace details with zeros - UI will show spinners for counts
-        const initialWorkspaceDetails = configuredWorkspaceNames
-          .map((wsName) => ({
-            name: wsName,
-            totalClusterCount: 0,
-            runningClusterCount: 0,
-            managedJobsCount: 0,
-            clouds: Array.isArray(enabledCloudsMap[wsName])
-              ? enabledCloudsMap[wsName]
-              : [],
-          }))
-          .sort((a, b) => a.name.localeCompare(b.name));
-
-        setWorkspaceDetails(initialWorkspaceDetails);
-
-        // Mark initial loading as complete so the table renders
-        if (wasInitialLoad && showLoadingIndicators) {
-          isInitialLoadRef.current = false;
-          setIsInitialLoad(false);
-        }
-
-        // Launch clusters and jobs fetches in parallel
-        // Each function updates its data immediately when done and sets its loading state to false
-        const clustersPromise = fetchClustersData(
-          configuredWorkspaceNames,
-          isCurrentRequest
-        );
-        const jobsPromise = fetchJobsData(
-          configuredWorkspaceNames,
-          isCurrentRequest
-        );
-
-        // Wait for both to complete (errors are handled inside each function)
-        await Promise.all([clustersPromise, jobsPromise]);
-        if (!isCurrentRequest()) return false;
-        setLastFetchedTime(new Date());
-        return true;
-      } catch (error) {
-        if (!isCurrentRequest()) return false;
-        console.error('Error fetching workspace data:', error);
-        // Don't clear data on error during refresh - keep showing stale data
-        if (wasInitialLoad) {
-          setWorkspaceDetails([]);
-          setGlobalStats({
-            runningClusters: 0,
-            totalClusters: 0,
-            managedJobs: 0,
-          });
-        }
+      const request = (async () => {
         if (showLoadingIndicators) {
-          setClustersLoading(false);
-          setJobsLoading(false);
+          setClustersLoading(true);
+          setJobsLoading(true);
         }
-        if (wasInitialLoad && showLoadingIndicators) {
-          isInitialLoadRef.current = false;
-          setIsInitialLoad(false);
+
+        try {
+          // First, get the list of workspaces the user has access to
+          const fetchedWorkspacesConfig =
+            await dashboardCache.get(getWorkspaces);
+          if (!isCurrentRequest()) return false;
+          setRawWorkspacesData(fetchedWorkspacesConfig);
+          const configuredWorkspaceNames = Object.keys(fetchedWorkspacesConfig);
+
+          // Fetch enabledClouds for all workspaces in a single batch request
+          let enabledCloudsMap = {};
+          try {
+            enabledCloudsMap = await dashboardCache.get(getEnabledCloudsBatch, [
+              configuredWorkspaceNames,
+            ]);
+          } catch (error) {
+            if (isCurrentRequest()) {
+              console.error('Error fetching enabled clouds batch:', error);
+            }
+          }
+
+          if (!isCurrentRequest()) return false;
+
+          // Initialize workspace details with zeros, UI will show spinners for counts.
+          const initialWorkspaceDetails = configuredWorkspaceNames
+            .map((wsName) => ({
+              name: wsName,
+              totalClusterCount: 0,
+              runningClusterCount: 0,
+              managedJobsCount: 0,
+              clouds: Array.isArray(enabledCloudsMap[wsName])
+                ? enabledCloudsMap[wsName]
+                : [],
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+          setWorkspaceDetails(initialWorkspaceDetails);
+
+          // Mark initial loading as complete so the table renders.
+          if (wasInitialLoad && showLoadingIndicators) {
+            isInitialLoadRef.current = false;
+            setIsInitialLoad(false);
+          }
+
+          // Launch clusters and jobs fetches in parallel.
+          const clustersPromise = fetchClustersData(
+            configuredWorkspaceNames,
+            isCurrentRequest
+          );
+          const jobsPromise = fetchJobsData(
+            configuredWorkspaceNames,
+            isCurrentRequest
+          );
+
+          // Wait for both to complete (errors are handled inside each function).
+          await Promise.all([clustersPromise, jobsPromise]);
+          if (!isCurrentRequest()) return false;
+          setLastFetchedTime(new Date());
+          return true;
+        } catch (error) {
+          if (!isCurrentRequest()) return false;
+          console.error('Error fetching workspace data:', error);
+          // Don't clear data on error during refresh, keep showing stale data.
+          if (wasInitialLoad) {
+            setWorkspaceDetails([]);
+            setGlobalStats({
+              runningClusters: 0,
+              totalClusters: 0,
+              managedJobs: 0,
+            });
+          }
+          if (showLoadingIndicators) {
+            setClustersLoading(false);
+            setJobsLoading(false);
+          }
+          if (wasInitialLoad && showLoadingIndicators) {
+            isInitialLoadRef.current = false;
+            setIsInitialLoad(false);
+          }
+          return false;
         }
-        return false;
-      }
+      })();
+
+      activeRequestRef.current = request;
+      return request.finally(() => {
+        if (activeRequestRef.current === request) {
+          activeRequestRef.current = null;
+        }
+      });
     },
     [fetchClustersData, fetchJobsData]
   );
@@ -527,20 +542,28 @@ export function Workspaces() {
 
     // Set up refresh interval
     const interval = setInterval(() => {
-      if (isCurrent && window.document.visibilityState === 'visible') {
-        fetchData({ showLoadingIndicators: false });
+      if (
+        isCurrent &&
+        manualRefreshOwnerRef.current === null &&
+        window.document.visibilityState === 'visible'
+      ) {
+        void fetchData({ showLoadingIndicators: false });
       }
     }, REFRESH_INTERVALS.REFRESH_INTERVAL);
 
     return () => {
       isCurrent = false;
       requestVersionRef.current += 1;
+      activeRequestRef.current = null;
+      manualRefreshOwnerRef.current = null;
       clearInterval(interval);
     };
   }, [fetchData]);
 
   const handleRefresh = useCallback(async () => {
     trackWorkspaceAction('refresh');
+    const refreshOwner = {};
+    manualRefreshOwnerRef.current = refreshOwner;
     const refreshVersion = requestVersionRef.current + 1;
     requestVersionRef.current = refreshVersion;
     const isCurrentRefresh = () => {
@@ -561,12 +584,19 @@ export function Workspaces() {
     try {
       await apiClient.fetch('/check', {}, 'POST');
       if (!isCurrentRefresh()) return;
-      await fetchData({ showLoadingIndicators: true });
+      await fetchData({
+        showLoadingIndicators: true,
+        supersede: true,
+      });
     } catch (error) {
       if (isCurrentRefresh()) {
         console.error('Error during sky check refresh:', error);
         setClustersLoading(false);
         setJobsLoading(false);
+      }
+    } finally {
+      if (manualRefreshOwnerRef.current === refreshOwner) {
+        manualRefreshOwnerRef.current = null;
       }
     }
   }, [fetchData]);
