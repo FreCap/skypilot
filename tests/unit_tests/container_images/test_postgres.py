@@ -28,7 +28,9 @@ from sky.container_images import config
 from sky.container_images import demand_state
 from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
+from sky.container_images import preparation
 from sky.container_images import publication
+from sky.container_images import runtime
 from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
@@ -257,6 +259,44 @@ def _ready_regional(
         now=40)
     regional = _complete_location(regional, now=41)
     return active, publication_record, canonical, regional
+
+
+def _runtime_resolution(
+    resources: Any,
+    profile: models.ManagedRegistryProfile,
+    active: topology_state.ProfileRevisionRecord,
+    publication_record: catalog_state.PublicationRecord,
+    location: topology_state.LocationRecord,
+    *,
+    current_demand: demand_state.DemandRecord | None = None,
+) -> runtime._MetadataResolution:
+    assert publication_record.image_id is not None
+    artifact = catalog_state.get_artifact(publication_record.image_id,
+                                          'research')
+    assert artifact is not None
+    target = next(target for target in (profile.canonical,) + profile.targets
+                  if target.target_fingerprint == location.target_fingerprint)
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,))
+    return runtime._MetadataResolution(
+        resources=resources,
+        direct=False,
+        profile=profile,
+        policy=policy,
+        active=active,
+        artifact=artifact,
+        publication=publication_record,
+        location=location,
+        target=target,
+        binding=binding,
+        runtime_principal=binding.principals[0],
+        instance_profile=binding.instance_profile,
+        current_demand=current_demand)
 
 
 def _warming_demand(
@@ -1601,6 +1641,98 @@ def test_ready_commit_and_regional_admission_follow_global_lock_order(
         admission_executor.shutdown(wait=True)
 
 
+def test_ready_commit_and_evicted_readmission_follow_global_lock_order(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.lease_token is not None
+    evicted = topology_state.complete_eviction(eviction.id,
+                                               eviction.lease_token,
+                                               present=False,
+                                               now=101)
+    assert evicted is not None
+    assert evicted.state == models.ImageLocationState.EVICTED
+    demand = _warming_demand(active,
+                             publication_record,
+                             evicted,
+                             profile,
+                             now=102)
+    ready_holds_artifact = threading.Event()
+    allow_ready_location_lock = threading.Event()
+    readmission_attempted_artifact = threading.Event()
+
+    def _is_artifact_lock(statement: str) -> bool:
+        normalized = ' '.join(statement.split()).upper()
+        return (' FROM CONTAINER_IMAGES ' in normalized and
+                ' FOR UPDATE' in normalized)
+
+    def _pause_ready_after_artifact(_connection, _cursor, statement,
+                                    _parameters, _context,
+                                    _executemany) -> None:
+        if (threading.current_thread().name.startswith('ready-commit') and
+                _is_artifact_lock(statement)):
+            ready_holds_artifact.set()
+            if not allow_ready_location_lock.wait(timeout=10):
+                raise TimeoutError('READY readmission lock test timed out.')
+
+    def _observe_readmission_artifact(_connection, _cursor, statement,
+                                      _parameters, _context,
+                                      _executemany) -> None:
+        if (threading.current_thread().name.startswith('readmission') and
+                _is_artifact_lock(statement)):
+            readmission_attempted_artifact.set()
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                            _pause_ready_after_artifact)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _observe_readmission_artifact)
+    ready_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='ready-commit')
+    readmission_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='readmission')
+    try:
+        ready_future = ready_executor.submit(
+            transactions.commit_ready_demand,
+            demand_id=demand.id,
+            consumer_generation=demand.consumer_generation,
+            pull_plan=_pull_plan(active, regional),
+            now=103)
+        assert ready_holds_artifact.wait(timeout=5)
+        readmission_future = readmission_executor.submit(
+            topology_state.retry_location, regional.id, 'research', now=104)
+        assert readmission_attempted_artifact.wait(timeout=5)
+
+        # Readmission has locked its shard and is waiting for the artifact. It
+        # must not hold the location, or artifact -> location READY commit can
+        # deadlock against location -> artifact retry.
+        with orm.Session(image_database) as observer, observer.begin():
+            location_id = observer.execute(
+                sqlalchemy.select(schema.locations.c.id).where(
+                    schema.locations.c.id == regional.id).with_for_update(
+                        nowait=True)).scalar_one()
+            assert location_id == regional.id
+
+        allow_ready_location_lock.set()
+        with pytest.raises(transactions.DemandLocationNotReadyError):
+            ready_future.result(timeout=5)
+        readmitted = readmission_future.result(timeout=5)
+        assert readmitted is not None
+        assert readmitted.state == models.ImageLocationState.PENDING
+    finally:
+        allow_ready_location_lock.set()
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                _pause_ready_after_artifact)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _observe_readmission_artifact)
+        ready_executor.shutdown(wait=True)
+        readmission_executor.shutdown(wait=True)
+
+
 def _locked_table(statement: str) -> str | None:
     normalized = ' '.join(statement.split()).upper()
     if ' FOR UPDATE' not in normalized:
@@ -2102,6 +2234,185 @@ def test_eviction_won_before_demand_commit_reports_typed_warming_state(
 
     assert exc_info.value.state == models.ImageLocationState.EVICTING
     assert exc_info.value.error_code is None
+
+
+def test_expired_eviction_with_live_demand_reclaims_for_exact_read(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    first = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                               unused_before=1000,
+                                               lease_seconds=60,
+                                               now=100)
+    assert first is not None and first.lease_token is not None
+    _warming_demand(active, publication_record, regional, profile, now=101)
+
+    reclaimed = topology_state.claim_next_eviction(worker_id='lifecycle-2',
+                                                   unused_before=1000,
+                                                   lease_seconds=60,
+                                                   now=161)
+
+    assert reclaimed is not None and reclaimed.id == regional.id
+    assert reclaimed.lease_token is not None
+    assert reclaimed.lease_token != first.lease_token
+    assert reclaimed.lease_kind == 'VERIFY'
+    completed = topology_state.complete_eviction(reclaimed.id,
+                                                 reclaimed.lease_token,
+                                                 present=False,
+                                                 now=162)
+    assert completed is not None
+    assert completed.state == models.ImageLocationState.PENDING
+    assert (
+        completed.reserved_declared_bytes == regional.reserved_declared_bytes)
+    shard = topology_state.get_shard(regional.shard_id)
+    assert shard is not None and shard.in_flight == 0
+
+
+def test_new_runtime_demand_readmits_evicted_location(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.lease_token is not None
+    evicted = topology_state.complete_eviction(eviction.id,
+                                               eviction.lease_token,
+                                               present=False,
+                                               now=101)
+    assert evicted is not None
+    assert evicted.state == models.ImageLocationState.EVICTED
+    assert evicted.reserved_declared_bytes == 0
+    target = profile.targets[0]
+    resources = types.SimpleNamespace(container_image=models.ContainerImage(
+        release='boltz-l4', distribution=profile.name))
+    metadata = _runtime_resolution(resources, profile, active,
+                                   publication_record, evicted)
+    monkeypatch.setattr(runtime, '_resolve_metadata',
+                        lambda *_args, **_kwargs: metadata)
+
+    with pytest.raises(runtime.ContainerImageWarmingError) as exc_info:
+        runtime.resolve_for_placement(
+            resources,
+            models.Placement(provider='aws',
+                             region=target.region,
+                             backend='aws_vm',
+                             platform='linux/amd64'),
+            workspace='research',
+            consumer_kind='service_version',
+            consumer_owner='boltz-l4:incarnation:hash:v8',
+            controller_epoch='service:hash:v8',
+            controller_sequence=8,
+            allow_epoch_advance=False)
+
+    readmitted = topology_state.get_location(regional.id)
+    assert readmitted is not None
+    assert readmitted.state == models.ImageLocationState.PENDING
+    assert (
+        readmitted.reserved_declared_bytes == regional.reserved_declared_bytes)
+    demand = demand_state.get_demand(exc_info.value.demand_id, 'research')
+    assert demand is not None
+    assert demand.state == models.ImageDemandState.WARMING
+    assert demand.location_id == regional.id
+
+
+def test_explicit_prepare_readmits_existing_evicted_location(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.lease_token is not None
+    evicted = topology_state.complete_eviction(eviction.id,
+                                               eviction.lease_token,
+                                               present=False,
+                                               now=101)
+    assert evicted is not None
+    assert evicted.state == models.ImageLocationState.EVICTED
+    assert publication_record.image_id is not None
+
+    mutation = preparation.prepare(image_id=publication_record.image_id,
+                                   distribution=profile.name,
+                                   target_id=profile.targets[0].name,
+                                   workspace='research',
+                                   actor_hash='2' * 64,
+                                   idempotency_key='prepare-readmit-evicted')
+
+    assert mutation.location.id == regional.id
+    assert mutation.location.state == models.ImageLocationState.PENDING
+    assert (mutation.location.reserved_declared_bytes ==
+            regional.reserved_declared_bytes)
+    assert mutation.operation.state == models.ImageOperationState.PENDING
+
+
+def test_retired_live_demand_readmits_inventory_missing_location(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    owner = 'cluster:incarnation:stable'
+    epoch = 'cluster-request:stable'
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner=owner,
+                             consumer_kind='cluster',
+                             controller_epoch=epoch,
+                             controller_sequence=None,
+                             now=50)
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == active.id).values(
+                state=models.ImageProfileState.RETIRED.value, updated_at=51))
+        connection.execute(schema.locations.update().where(
+            schema.locations.c.id == regional.id).values(
+                state=models.ImageLocationState.MISSING.value,
+                error_code=(
+                    models.ImageLocationErrorCode.MANIFEST_MISSING.value),
+                updated_at=51))
+    retired = topology_state.get_profile_revision(active.id)
+    missing = topology_state.get_location(regional.id)
+    assert retired is not None
+    assert retired.state == models.ImageProfileState.RETIRED
+    assert missing is not None
+    assert missing.state == models.ImageLocationState.MISSING
+    resources = types.SimpleNamespace(container_image=models.ContainerImage(
+        release='boltz-l4', distribution=profile.name))
+    metadata = _runtime_resolution(resources,
+                                   profile,
+                                   retired,
+                                   publication_record,
+                                   missing,
+                                   current_demand=demand)
+    monkeypatch.setattr(runtime, '_resolve_metadata',
+                        lambda *_args, **_kwargs: metadata)
+
+    with pytest.raises(runtime.ContainerImageWarmingError) as exc_info:
+        runtime.resolve_for_placement(
+            resources,
+            models.Placement(provider='aws',
+                             region=profile.targets[0].region,
+                             backend='aws_vm',
+                             platform='linux/amd64'),
+            workspace='research',
+            consumer_kind='cluster',
+            consumer_owner=owner,
+            controller_epoch=epoch,
+            controller_sequence=None,
+            allow_epoch_advance=False,
+            consumer_metadata={'request_id': 'request-1'})
+
+    assert exc_info.value.demand_id == demand.id
+    readmitted = topology_state.get_location(regional.id)
+    assert readmitted is not None
+    assert readmitted.state == models.ImageLocationState.PENDING
 
 
 def test_ambiguous_eviction_remains_fenced_until_exact_verification(

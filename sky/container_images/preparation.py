@@ -96,6 +96,16 @@ def prepare(*, image_id: str, distribution: str, target_id: str, workspace: str,
             canonical_location_id=publication.canonical_location_id,
             max_regional_locations=(
                 profile.limits.max_regional_locations_per_artifact))
+    elif location.state in (models.ImageLocationState.FAILED,
+                            models.ImageLocationState.MISSING,
+                            models.ImageLocationState.EVICTED):
+        readmitted = topology_state.retry_location(location.id, workspace)
+        if readmitted is not None:
+            location = readmitted
+        else:
+            location = topology_state.get_location(location.id)
+            if location is None or location.workspace != workspace:
+                raise ValueError('ARTIFACT_NOT_READY')
     terminal_state, error_code = _terminal(location)
     operation = catalog_state.bind_operation_result(
         operation.id,

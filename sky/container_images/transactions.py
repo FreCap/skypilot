@@ -469,6 +469,7 @@ def reserve_regional_location(
                     locations.c.id ==
                     existing['id']).with_for_update()).mappings().one()
             if str(winner['state']) in (
+                    models.ImageLocationState.FAILED.value,
                     models.ImageLocationState.MISSING.value,
                     models.ImageLocationState.EVICTED.value):
                 location_values: dict[str, Any] = {

@@ -360,6 +360,34 @@ def test_ready_snapshot_state_change_remains_typed(
         fail.assert_not_called()
 
 
+@pytest.mark.parametrize(('state', 'retry_failed', 'readmitted'),
+                         ((models.ImageLocationState.MISSING, False, True),
+                          (models.ImageLocationState.EVICTED, False, True),
+                          (models.ImageLocationState.FAILED, True, True),
+                          (models.ImageLocationState.FAILED, False, False),
+                          (models.ImageLocationState.READY, True, False)))
+def test_terminal_location_readmission_matches_demand_lifecycle(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        state: models.ImageLocationState, retry_failed: bool,
+        readmitted: bool) -> None:
+    location = _location(profile, state)
+    pending = dataclasses.replace(location,
+                                  state=models.ImageLocationState.PENDING)
+    retry = mock.Mock(return_value=pending)
+    monkeypatch.setattr(runtime.topology_state, 'retry_location', retry)
+
+    result = runtime._readmit_location_for_demand(location,
+                                                  'research',
+                                                  retry_failed=retry_failed)
+
+    if readmitted:
+        assert result is pending
+        retry.assert_called_once_with(location.id, 'research')
+    else:
+        assert result is location
+        retry.assert_not_called()
+
+
 def test_metadata_filter_is_mutation_free_and_fails_closed_on_stale_binding(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

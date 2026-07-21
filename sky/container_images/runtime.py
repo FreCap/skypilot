@@ -493,6 +493,31 @@ def _managed_login(
                                           credential_helper='ecr-login')
 
 
+def _readmit_location_for_demand(
+    location: topology_state.LocationRecord,
+    workspace: str,
+    *,
+    retry_failed: bool,
+) -> topology_state.LocationRecord:
+    states = {
+        models.ImageLocationState.MISSING,
+        models.ImageLocationState.EVICTED,
+    }
+    if retry_failed:
+        states.add(models.ImageLocationState.FAILED)
+    if location.state not in states:
+        return location
+    readmitted = topology_state.retry_location(location.id, workspace)
+    if readmitted is not None:
+        return readmitted
+    # A concurrent retry may have moved the row before our locked mutation.
+    # Reload only on that uncommon path so READY uses the current pull plan.
+    refreshed = topology_state.get_location(location.id)
+    if refreshed is None or refreshed.workspace != workspace:
+        raise ValueError('ARTIFACT_NOT_READY')
+    return refreshed
+
+
 def resolve_for_placement(resources: resources_lib.Resources,
                           placement: models.Placement,
                           *,
@@ -557,6 +582,10 @@ def resolve_for_placement(resources: resources_lib.Resources,
                 profile.limits.max_regional_locations_per_artifact))
     if not ensure:
         return resources
+    is_new_demand = metadata.current_demand is None
+    location = _readmit_location_for_demand(location,
+                                            workspace,
+                                            retry_failed=is_new_demand)
     if (policy.mode == models.WorkspaceImageMode.MANAGED_PREFERRED and
             policy.locality == models.Locality.PREFER and
             image.ref is not None and metadata.current_demand is None and

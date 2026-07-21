@@ -88,6 +88,13 @@ def evict_location(location: topology_state.LocationRecord,
         hooks=aws.EcrCallHooks(
             before_call=lambda: limiter.before_call(shard),
             on_throttle=lambda: limiter.record_throttle(shard)))
+    if location.lease_kind == 'VERIFY':
+        manifest_present = repository.exact_manifest_exists(
+            location.runtime_digest)
+        topology_state.complete_eviction(location.id,
+                                         token,
+                                         present=manifest_present)
+        return not manifest_present
     outcome = repository.delete_outcome(location.runtime_digest)
     if outcome == aws.DeleteOutcome.NOT_STARTED:
         topology_state.complete_eviction(location.id,

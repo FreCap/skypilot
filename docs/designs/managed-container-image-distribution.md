@@ -441,7 +441,7 @@ Location transitions are:
 | VERIFYING | FAILED | Exact mismatch or closed permanent error |
 | READY | MISSING | Completed inventory plus exact digest absence |
 | READY | EVICTING | Regional, past retention, and no live demand |
-| FAILED, MISSING, EVICTED | PENDING | Explicit retry or new authorized demand |
+| FAILED, MISSING, EVICTED | PENDING | Explicit prepare/retry or new authorized demand |
 | EVICTING | EVICTED | Exact digest absence after delete |
 | EVICTING | READY | Exact digest remains after terminal delete denial |
 | EVICTING | EVICTING | Ambiguous/retryable delete; reclaim after lease expiry |
@@ -679,8 +679,12 @@ rechecks profile revision, target fingerprint, reference, digest, platform,
 auth strategy, credential-helper class, lease-free READY state, and consumer
 epoch. If eviction changed a metadata snapshot from READY before demand
 creation, that locked recheck returns typed warming state; the new durable demand
-requeues the location, and the attempt never degrades to a generic resolution
-failure. Central demand state is the durable source for normal launch, Serve, and
+keeps the location fenced, an expired eviction is reclaimed, and the attempt
+never degrades to a generic resolution failure. A new authorized demand
+re-admits FAILED, MISSING, or EVICTED state before creating its fence. A replaying
+live demand re-admits MISSING or EVICTED state, including from its exact retired
+profile snapshot, while a FAILED live demand is superseded and reported as
+terminal. Central demand state is the durable source for normal launch, Serve, and
 managed-job controllers, so their own SQLite-compatible state stores only the
 demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
@@ -702,7 +706,10 @@ reservation exactly once, and zeros the location's charged bytes. Re-admission
 or explicit retry atomically restores count and bytes before changing an
 EVICTED location to `PENDING`. A provider operation known not to have started may
 restore READY; after provider I/O, only exact presence may do so. Ambiguous
-readback remains fenced in `EVICTING` for another worker.
+readback remains fenced in `EVICTING` for another worker. An expired EVICTING
+lease is always reclaimable. If a live demand appeared during the expired
+attempt, the reclaimer performs only an exact presence read: presence restores
+READY and absence requeues PENDING, without deleting bytes the demand now wants.
 
 Consumer terminal or supersede handling writes a tombstone and advances one
 stable-owner generation watermark in the same transaction. Demand creation
@@ -893,9 +900,11 @@ artifact/source, and location rows first, then locks and rechecks the publicatio
 token; an invalid token rolls the entire transaction back. Demand READY commit
 locks artifact before location and then watermark/demand. Lifecycle eviction
 locks shard and location before checking demands and does not acquire an
-artifact row. Authoritative cluster deletion already owns the central consumer
-row before it locks the image watermark and demand. This is the executable
-ownership contract for the component split.
+artifact row. Location re-admission and explicit retry lock shard, artifact,
+then location, so a stale READY commit cannot form a reverse edge. Authoritative
+cluster deletion already owns the central consumer row before it locks the image
+watermark and demand. This is the executable ownership contract for the
+component split.
 
 Migration 023 is run under a PostgreSQL migration-scoped advisory lock, not a
 runtime control-plane lock. The downgrade itself can inspect only database state.

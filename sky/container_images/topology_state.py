@@ -1255,7 +1255,7 @@ def retry_location(location_id: str,
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
         optimistic = session.execute(
-            sqlalchemy.select(locations.c.shard_id).where(
+            sqlalchemy.select(locations.c.shard_id, locations.c.image_id).where(
                 locations.c.id == location_id,
                 locations.c.workspace == workspace)).first()
         if optimistic is None:
@@ -1263,6 +1263,10 @@ def retry_location(location_id: str,
         shard = session.execute(
             sqlalchemy.select(shards).where(shards.c.id == optimistic[0]).
             with_for_update()).mappings().one()
+        artifact = session.execute(
+            sqlalchemy.select(schema.images).where(
+                schema.images.c.id == optimistic[1], schema.images.c.workspace
+                == workspace).with_for_update()).mappings().one()
         row = session.execute(
             sqlalchemy.select(locations).where(
                 locations.c.id == location_id, locations.c.workspace ==
@@ -1281,9 +1285,7 @@ def retry_location(location_id: str,
             if int(row['reserved_declared_bytes']) != 0:
                 raise RuntimeError(
                     'Evicted location retained a capacity charge.')
-            charge = session.execute(
-                sqlalchemy.select(schema.images.c.declared_size_bytes).where(
-                    schema.images.c.id == row['image_id'])).scalar_one()
+            charge = int(artifact['declared_size_bytes'])
             changed = session.execute(shards.update().where(
                 shards.c.id == shard['id'], shards.c.reserved_manifests
                 < shards.c.max_manifests,
@@ -1423,12 +1425,15 @@ def claim_next_eviction(*,
                     models.ImageDemandState.WARMING.value,
                     models.ImageDemandState.READY.value,
                 ])).limit(1)).first()
-        if live_demand is not None:
+        if live_demand is not None and not reclaimed:
             return None
+        # An expired eviction with a new demand must determine the prior
+        # provider outcome without deleting wanted bytes again.
+        verify_only = reclaimed and live_demand is not None
         updated = session.execute(
             locations.update().where(locations.c.id == row['id']).values(
                 state=models.ImageLocationState.EVICTING.value,
-                lease_kind='EVICT',
+                lease_kind='VERIFY' if verify_only else 'EVICT',
                 lease_token=token,
                 lease_expires_at=current + lease_seconds,
                 attempt_count=locations.c.attempt_count + 1,

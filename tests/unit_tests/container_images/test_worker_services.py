@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import json
 import socket
 from types import SimpleNamespace
@@ -587,6 +588,37 @@ def test_copy_maintenance_also_recovers_pending_publication_fanout(
     reconcile_fanout.assert_called_once_with()
     reconcile_profiles.assert_called_once_with(limiter)
     schedule_canaries.assert_called_once_with()
+
+
+def test_reclaimed_eviction_with_demand_verifies_without_deleting(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    location = dataclasses.replace(_copying_location(profile),
+                                   state=models.ImageLocationState.EVICTING,
+                                   lease_kind='VERIFY')
+    repository = mock.Mock()
+    repository.exact_manifest_exists.return_value = False
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _: _shard(profile))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_profile_revisions',
+                        lambda _: [_revision(profile)])
+    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: repository)
+    complete = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'complete_eviction', complete)
+
+    assert lifecycle_worker_service.evict_location(location, mock.Mock())
+
+    repository.exact_manifest_exists.assert_called_once_with(
+        location.runtime_digest)
+    repository.delete_outcome.assert_not_called()
+    complete.assert_called_once_with(location.id,
+                                     location.lease_token,
+                                     present=False)
 
 
 def _dockerconfig_binding() -> models.RegistryAccessBinding:
