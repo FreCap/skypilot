@@ -217,6 +217,230 @@ async def test_kubernetes_proxy_records_one_terminal_close(
 
 
 @pytest.mark.asyncio
+async def test_kubernetes_proxy_reaps_failed_port_forward_startup():
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(side_effect=ProcessLookupError),
+        wait=mock.Mock(return_value=1),
+        kill=mock.Mock(),
+    )
+    stdout_reader = SimpleNamespace(
+        readline=mock.AsyncMock(return_value=b''),
+        read=mock.AsyncMock(return_value=b''),
+    )
+    event_loop = SimpleNamespace(
+        run_in_executor=mock.AsyncMock(side_effect=[proc, 1]),
+        connect_read_pipe=mock.AsyncMock(),
+    )
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(asyncio, 'get_running_loop',
+                           return_value=event_loop), \
+         mock.patch.object(asyncio, 'StreamReader',
+                           return_value=stdout_reader), \
+         mock.patch.object(asyncio, 'StreamReaderProtocol'), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        await server.kubernetes_pod_ssh_proxy(websocket, 'cluster')
+
+    websocket.close.assert_awaited_once_with()
+    proc.terminate.assert_called_once_with()
+    proc.kill.assert_not_called()
+    assert event_loop.run_in_executor.await_count == 2
+    connection_metric.labels.assert_not_called()
+    connection_gauge.inc.assert_not_called()
+    connection_gauge.dec.assert_not_called()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason='KubectlPortForwardExit')
+    close_counter.inc.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_proxy_reaps_child_when_pipe_registration_fails():
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(side_effect=ProcessLookupError),
+        wait=mock.Mock(return_value=1),
+        kill=mock.Mock(),
+    )
+    stdout_reader = SimpleNamespace(read=mock.AsyncMock())
+    event_loop = SimpleNamespace(
+        run_in_executor=mock.AsyncMock(side_effect=[proc, 1]),
+        connect_read_pipe=mock.AsyncMock(
+            side_effect=RuntimeError('pipe registration failed')),
+    )
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(asyncio, 'get_running_loop',
+                           return_value=event_loop), \
+         mock.patch.object(asyncio, 'StreamReader',
+                           return_value=stdout_reader), \
+         mock.patch.object(asyncio, 'StreamReaderProtocol'), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric), \
+         pytest.raises(RuntimeError, match='pipe registration failed'):
+        await server.kubernetes_pod_ssh_proxy(websocket, 'cluster')
+
+    proc.terminate.assert_called_once_with()
+    proc.kill.assert_not_called()
+    stdout_reader.read.assert_not_awaited()
+    assert event_loop.run_in_executor.await_count == 2
+    connection_gauge.inc.assert_not_called()
+    connection_gauge.dec.assert_not_called()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason='KubectlPortForwardExit')
+    close_counter.inc.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_proxy_reaps_child_on_parent_cancellation():
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(),
+        wait=mock.Mock(return_value=0),
+        kill=mock.Mock(),
+    )
+    readline_started = asyncio.Event()
+
+    async def wait_for_stdout():
+        readline_started.set()
+        await asyncio.Future()
+
+    stdout_reader = SimpleNamespace(
+        readline=mock.AsyncMock(side_effect=wait_for_stdout),
+        read=mock.AsyncMock(return_value=b''),
+    )
+    event_loop = SimpleNamespace(
+        run_in_executor=mock.AsyncMock(side_effect=[proc, 0]),
+        connect_read_pipe=mock.AsyncMock(),
+    )
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(asyncio, 'get_running_loop',
+                           return_value=event_loop), \
+         mock.patch.object(asyncio, 'StreamReader',
+                           return_value=stdout_reader), \
+         mock.patch.object(asyncio, 'StreamReaderProtocol'), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        proxy_task = asyncio.create_task(
+            server.kubernetes_pod_ssh_proxy(websocket, 'cluster'))
+        await readline_started.wait()
+        proxy_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy_task
+
+    proc.terminate.assert_called_once_with()
+    proc.kill.assert_not_called()
+    event_loop.run_in_executor.assert_any_await(None, proc.wait)
+    connection_gauge.inc.assert_not_called()
+    connection_gauge.dec.assert_not_called()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason='KubectlPortForwardExit')
+    close_counter.inc.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_proxy_tolerates_exit_racing_with_kill():
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(),
+        wait=mock.Mock(return_value=0),
+        kill=mock.Mock(side_effect=ProcessLookupError),
+    )
+    stdout_reader = SimpleNamespace(
+        readline=mock.AsyncMock(return_value=b''),
+        read=mock.AsyncMock(return_value=b''),
+    )
+    event_loop = SimpleNamespace(
+        run_in_executor=mock.AsyncMock(side_effect=[proc, 0]),
+        connect_read_pipe=mock.AsyncMock(),
+    )
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(asyncio, 'get_running_loop',
+                           return_value=event_loop), \
+         mock.patch.object(asyncio, 'StreamReader',
+                           return_value=stdout_reader), \
+         mock.patch.object(asyncio, 'StreamReaderProtocol'), \
+         mock.patch.object(asyncio, 'wait_for',
+                           new=mock.AsyncMock(
+                               side_effect=asyncio.TimeoutError)), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        await server.kubernetes_pod_ssh_proxy(websocket, 'cluster')
+
+    proc.terminate.assert_called_once_with()
+    proc.kill.assert_called_once_with()
+    event_loop.run_in_executor.assert_any_await(None, proc.wait)
+    connection_gauge.inc.assert_not_called()
+    connection_gauge.dec.assert_not_called()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason='KubectlPortForwardExit')
+    close_counter.inc.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('process_exited', 'ssh_failed', 'expected_reason'),
     [

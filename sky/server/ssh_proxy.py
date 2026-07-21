@@ -159,31 +159,39 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
     # rest of this handler can stay async.
     assert proc.stdout is not None
     stdout_reader = asyncio.StreamReader(loop=loop)
-    await loop.connect_read_pipe(
-        lambda: asyncio.StreamReaderProtocol(stdout_reader, loop=loop),
-        proc.stdout)
-
-    # Wait for port-forward to be ready and get the local port
-    local_port = None
-    while True:
-        stdout_line = await stdout_reader.readline()
-        if stdout_line:
-            decoded_line = stdout_line.decode()
-            logger.info(f'kubectl port-forward stdout: {decoded_line}')
-            if 'Forwarding from 127.0.0.1' in decoded_line:
-                port_str = decoded_line.split(':')[-1]
-                local_port = int(port_str.replace(' -> ', ':').split(':')[0])
-                break
-        else:
-            await websocket.close()
-            return
-
-    logger.info(f'Starting port-forward to local port: {local_port}')
-    conn_gauge = metrics_utils.SKY_APISERVER_WEBSOCKET_CONNECTIONS.labels(
-        pid=os.getpid())
+    conn_gauge = None
+    connection_counted = False
+    stdout_pipe_connected = False
     ssh_failed = False
+    reason = 'KubectlPortForwardExit'
     try:
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(stdout_reader, loop=loop),
+            proc.stdout)
+        stdout_pipe_connected = True
+
+        # Wait for port-forward to be ready and get the local port.
+        local_port = None
+        while True:
+            stdout_line = await stdout_reader.readline()
+            if stdout_line:
+                decoded_line = stdout_line.decode()
+                logger.info(f'kubectl port-forward stdout: {decoded_line}')
+                if 'Forwarding from 127.0.0.1' in decoded_line:
+                    port_str = decoded_line.split(':')[-1]
+                    local_port = int(
+                        port_str.replace(' -> ', ':').split(':')[0])
+                    break
+            else:
+                await websocket.close()
+                return
+
+        logger.info(f'Starting port-forward to local port: {local_port}')
+        conn_gauge = metrics_utils.SKY_APISERVER_WEBSOCKET_CONNECTIONS.labels(
+            pid=os.getpid())
         conn_gauge.inc()
+        connection_counted = True
+        reason = 'ClientClosed'
         # Connect to the local port
         reader, writer = await asyncio.open_connection('127.0.0.1', local_port)
 
@@ -201,36 +209,38 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
             close_backend=close_writer,
             timestamps_supported=timestamps_supported,
         )
+        if ssh_failed:
+            reason = 'SSHToPodDisconnected'
     finally:
-        conn_gauge.dec()
-        reason = ''
+        if connection_counted and conn_gauge is not None:
+            conn_gauge.dec()
         try:
             logger.info('Terminating kubectl port-forward process')
             proc.terminate()
         except ProcessLookupError:
-            stdout = await stdout_reader.read()
+            stdout = (await stdout_reader.read()
+                      if stdout_pipe_connected else b'')
             logger.error('kubectl port-forward was terminated before the '
                          'ssh websocket connection was closed. Remaining '
                          f'output: {str(stdout)}')
             reason = 'KubectlPortForwardExit'
-        else:
-            if ssh_failed:
-                reason = 'SSHToPodDisconnected'
-            else:
-                reason = 'ClientClosed'
         metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
             pid=os.getpid(), reason=reason).inc()
         # Reap the kubectl child. `asyncio.create_subprocess_exec` had this
         # handled by asyncio's child watcher; `subprocess.Popen` is outside
         # that watcher so we must wait() ourselves or leave a zombie.
+        wait_task = asyncio.ensure_future(loop.run_in_executor(None, proc.wait))
         try:
-            await asyncio.wait_for(loop.run_in_executor(None, proc.wait),
-                                   timeout=5)
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
         except asyncio.TimeoutError:
             logger.warning(
                 'kubectl did not exit 5s after SIGTERM; sending SIGKILL.')
-            proc.kill()
-            await loop.run_in_executor(None, proc.wait)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                # The child exited after the timeout but before SIGKILL.
+                pass
+            await wait_task
 
 
 @router.websocket('/slurm-job-ssh-proxy')
