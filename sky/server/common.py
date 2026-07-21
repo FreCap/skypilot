@@ -364,7 +364,8 @@ def make_authenticated_request(method: str,
     if retry:
         return rest.request(method, url, **kwargs)
     else:
-        assert method == 'GET', 'Only GET requests can be done without retry'
+        if method != 'GET':
+            raise AssertionError('Only GET requests can be done without retry')
         return rest.request_without_retry(method, url, **kwargs)
 
 
@@ -426,7 +427,8 @@ async def make_authenticated_request_async(
     if retry:
         return await rest.request_async(session, method, url, **kwargs)
     else:
-        assert method == 'GET', 'Only GET requests can be done without retry'
+        if method != 'GET':
+            raise AssertionError('Only GET requests can be done without retry')
         return await rest.request_without_retry_async(session, method, url,
                                                       **kwargs)
 
@@ -652,8 +654,8 @@ def _start_api_server(deploy: bool = False,
                       enable_basic_auth: bool = False):
     """Starts a SkyPilot API server locally."""
     server_url = get_server_url(host)
-    assert server_url in AVAILABLE_LOCAL_API_SERVER_URLS, (
-        f'server url {server_url} is not a local url')
+    if server_url not in AVAILABLE_LOCAL_API_SERVER_URLS:
+        raise AssertionError(f'server url {server_url} is not a local url')
 
     with rich_utils.client_status('Starting SkyPilot API server, '
                                   f'view logs at {constants.API_SERVER_LOGS}'):
@@ -881,8 +883,8 @@ def check_server_healthy(
 def get_skypilot_version_on_disk() -> str:
     """Get the canonical SkyPilot version from the code on disk."""
     current_file_path = pathlib.Path(__file__)
-    assert str(current_file_path).endswith(
-        'server/common.py'), current_file_path
+    if not str(current_file_path).endswith('server/common.py'):
+        raise AssertionError(current_file_path)
     sky_root = current_file_path.parent.parent
     with open(sky_root / '__init__.py', encoding='utf-8') as fp:
         content = fp.read()

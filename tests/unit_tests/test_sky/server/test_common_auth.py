@@ -2,6 +2,8 @@
 
 import unittest.mock as mock
 
+import pytest
+
 from sky.server import common
 
 
@@ -113,7 +115,7 @@ class TestServerCommonAuth:
     @mock.patch('sky.server.common.get_api_cookie_jar')
     @mock.patch('sky.server.common.rest.request')
     def test_make_authenticated_request_with_custom_headers(
-            self, mock_request, mock_get_cookie_jar, mock_get_headers,
+            self, mock_request, unused_mock_get_cookie_jar, mock_get_headers,
             mock_get_server_url):
         """Test authenticated request with custom headers merged."""
         # Mock server URL
@@ -180,6 +182,33 @@ class TestServerCommonAuth:
                                              cookies=mock_cookies)
         assert result == mock_response
 
+    @mock.patch('sky.server.common._prepare_authenticated_request_params',
+                return_value=('https://api.example.test/delete', {}))
+    @mock.patch('sky.server.common.rest.request_without_retry')
+    def test_make_authenticated_request_without_retry_rejects_post(
+            self, mock_request, _mock_prepare):
+        with pytest.raises(AssertionError,
+                           match='Only GET requests can be done without retry'):
+            common.make_authenticated_request('POST', '/delete', retry=False)
+
+        mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @mock.patch('sky.server.common._prepare_authenticated_request_params',
+                return_value=('https://api.example.test/delete', {}))
+    @mock.patch('sky.server.common.rest.request_without_retry_async',
+                new_callable=mock.AsyncMock)
+    async def test_make_authenticated_request_async_without_retry_rejects_post(
+            self, mock_request, _mock_prepare):
+        with pytest.raises(AssertionError,
+                           match='Only GET requests can be done without retry'):
+            await common.make_authenticated_request_async(mock.Mock(),
+                                                          'POST',
+                                                          '/delete',
+                                                          retry=False)
+
+        mock_request.assert_not_awaited()
+
     @mock.patch('sky.client.service_account_auth.get_service_account_headers')
     @mock.patch('sky.server.common.get_api_cookie_jar')
     @mock.patch('sky.server.common.rest.request')
@@ -215,7 +244,7 @@ class TestServerCommonAuth:
     @mock.patch('sky.server.common.get_api_cookie_jar')
     @mock.patch('sky.server.common.rest.request')
     def test_make_authenticated_request_custom_server_url(
-            self, mock_request, mock_get_cookie_jar, mock_get_headers):
+            self, mock_request, unused_mock_get_cookie_jar, mock_get_headers):
         """Test authenticated request with custom server URL."""
         # Mock service account authentication
         mock_get_headers.return_value = {
