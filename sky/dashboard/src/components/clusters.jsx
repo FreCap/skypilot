@@ -33,12 +33,7 @@ import {
   TableBody,
   TableCell,
 } from '@/components/ui/table';
-import {
-  getClusters,
-  getClusterHistory,
-  useClusterData,
-} from '@/data/connectors/clusters';
-import { getWorkspaces } from '@/data/connectors/workspaces';
+import { getClusterHistory, useClusterData } from '@/data/connectors/clusters';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, Brackets } from 'lucide-react';
 import { relativeTime } from '@/components/utils';
@@ -191,8 +186,6 @@ export function useClustersPageData({
   }, [runPreload]);
 
   const handleRefresh = useCallback(() => {
-    dashboardCache.invalidate(getClusters);
-    dashboardCache.invalidate(getWorkspaces);
     if (showHistory) {
       dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
     }
