@@ -124,14 +124,12 @@ describe('useVolumeDetails request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('lets the newest manual refresh own data and loading state', async () => {
+  it('coalesces duplicate manual refreshes and releases ownership after success', async () => {
     const initial = deferred();
-    const olderRefresh = deferred();
-    const newerRefresh = deferred();
+    const refresh = deferred();
     dashboardCache.get
       .mockImplementationOnce(() => initial.promise)
-      .mockImplementationOnce(() => olderRefresh.promise)
-      .mockImplementationOnce(() => newerRefresh.promise);
+      .mockImplementationOnce(() => refresh.promise);
 
     const { result } = renderHook(() =>
       useVolumeDetails({ volumeName: 'volume-a' })
@@ -142,35 +140,160 @@ describe('useVolumeDetails request ownership', () => {
       await initial.promise;
     });
 
-    let olderRefreshPromise;
+    let firstRefreshPromise;
+    let duplicateRefreshPromise;
     act(() => {
-      olderRefreshPromise = result.current.refreshData();
+      firstRefreshPromise = result.current.refreshData();
+      duplicateRefreshPromise = result.current.refreshData();
     });
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
 
-    let newerRefreshPromise;
+    expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refresh.resolve([{ name: 'volume-a', status: 'NEW' }]);
+      await Promise.all([firstRefreshPromise, duplicateRefreshPromise]);
+    });
+    expect(result.current.volumeData.status).toBe('NEW');
+    expect(result.current.loading).toBe(false);
+
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-a', status: 'NEWER' },
+    ]);
+    let laterRefreshPromise;
     act(() => {
-      newerRefreshPromise = result.current.refreshData();
+      laterRefreshPromise = result.current.refreshData();
     });
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
-
     await act(async () => {
-      newerRefresh.resolve([{ name: 'volume-a', status: 'NEW' }]);
-      await newerRefreshPromise;
-    });
-    expect(result.current.volumeData.status).toBe('NEW');
-    expect(result.current.loading).toBe(false);
-
-    await act(async () => {
-      olderRefresh.resolve([{ name: 'volume-a', status: 'OLD' }]);
-      await olderRefreshPromise;
+      await laterRefreshPromise;
     });
 
-    expect(result.current.volumeData.status).toBe('NEW');
+    expect(result.current.volumeData.status).toBe('NEWER');
     expect(result.current.loading).toBe(false);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(getVolumes);
-    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-a' },
+    ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('releases refresh ownership after a failed refresh', async () => {
+    const failedRefresh = deferred();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'volume-a', status: 'INITIAL' }])
+      .mockImplementationOnce(() => failedRefresh.promise);
+
+    const { result } = renderHook(() =>
+      useVolumeDetails({ volumeName: 'volume-a' })
+    );
+    await waitFor(() =>
+      expect(result.current.volumeData?.status).toBe('INITIAL')
+    );
+
+    let firstRefreshPromise;
+    let duplicateRefreshPromise;
+    act(() => {
+      firstRefreshPromise = result.current.refreshData();
+      duplicateRefreshPromise = result.current.refreshData();
+    });
+
+    expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      failedRefresh.reject(new Error('refresh failed'));
+      await Promise.all([firstRefreshPromise, duplicateRefreshPromise]);
+    });
+
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-a', status: 'RECOVERED' },
+    ]);
+    let recoveredRefreshPromise;
+    act(() => {
+      recoveredRefreshPromise = result.current.refreshData();
+    });
+
+    expect(recoveredRefreshPromise).not.toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await recoveredRefreshPromise;
+    });
+
+    expect(result.current.volumeData.status).toBe('RECOVERED');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not reuse an old refresh owner after leaving and returning to a volume', async () => {
+    const oldRefresh = deferred();
+    const newRefresh = deferred();
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-a', status: 'volume-a-initial' },
+    ]);
+
+    const { result, rerender } = renderHook(
+      ({ volumeName }) => useVolumeDetails({ volumeName }),
+      { initialProps: { volumeName: 'volume-a' } }
+    );
+    await waitFor(() =>
+      expect(result.current.volumeData?.status).toBe('volume-a-initial')
+    );
+
+    dashboardCache.get.mockImplementationOnce(() => oldRefresh.promise);
+    let oldRefreshPromise;
+    act(() => {
+      oldRefreshPromise = result.current.refreshData();
+    });
+
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-b', status: 'volume-b-full' },
+    ]);
+    rerender({ volumeName: 'volume-b' });
+    await waitFor(() =>
+      expect(result.current.volumeData?.status).toBe('volume-b-full')
+    );
+
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-a', status: 'volume-a-return' },
+    ]);
+    rerender({ volumeName: 'volume-a' });
+    await waitFor(() =>
+      expect(result.current.volumeData?.status).toBe('volume-a-return')
+    );
+
+    dashboardCache.get.mockImplementationOnce(() => newRefresh.promise);
+    let newRefreshPromise;
+    act(() => {
+      newRefreshPromise = result.current.refreshData();
+    });
+
+    expect(newRefreshPromise).not.toBe(oldRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(1, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+
+    await act(async () => {
+      newRefresh.resolve([{ name: 'volume-a', status: 'volume-a-new' }]);
+      await newRefreshPromise;
+    });
+    expect(result.current.volumeData.status).toBe('volume-a-new');
+
+    await act(async () => {
+      oldRefresh.resolve([{ name: 'volume-a', status: 'volume-a-old' }]);
+      await oldRefreshPromise;
+    });
+
+    expect(result.current.volumeData.status).toBe('volume-a-new');
   });
 });
