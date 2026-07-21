@@ -39,6 +39,7 @@ _DEFAULT_LEASE_SECONDS = 15 * 60
 _CONFIG_REFRESH_SECONDS = 60
 _QUALIFICATION_MANIFEST_LIMIT = 256
 _INVENTORY_CONFIRMATION_LIMIT = 100
+_CANDIDATE_SHARD_PROBE_LIMIT = 16
 _QUALIFICATION_ACTOR_HASH = hashlib.sha256(
     b'skypilot-image-qualification-manifest-ingestor').hexdigest()
 
@@ -521,16 +522,24 @@ def copy_location(location: topology_state.LocationRecord,
 def _profile_for_shard(
     shard: topology_state.ShardRecord,
 ) -> tuple[topology_state.ProfileRevisionRecord, models.ManagedRegistryProfile]:
-    revisions = topology_state.list_profile_revisions(shard.workspace,
-                                                      profile=shard.profile,
-                                                      limit=1001)
+    allowed_states: tuple[models.ImageProfileState, ...]
+    if shard.profile_revision_id is not None:
+        operational = topology_state.get_profile_revision(
+            shard.profile_revision_id)
+        revisions = [] if operational is None else [operational]
+        allowed_states = (models.ImageProfileState.ACTIVE,
+                          models.ImageProfileState.RETIRED)
+    else:
+        revisions = topology_state.list_profile_revisions(shard.workspace,
+                                                          profile=shard.profile,
+                                                          limit=1001)
+        allowed_states = (models.ImageProfileState.QUALIFYING,)
     attestation_key = models.profile_attestation_key('terraform_shard',
                                                      shard.physical_fingerprint)
     for revision in revisions:
-        if revision.profile != shard.profile or revision.state not in (
-                models.ImageProfileState.QUALIFYING,
-                models.ImageProfileState.ACTIVE,
-                models.ImageProfileState.RETIRED):
+        if (revision.workspace != shard.workspace or
+                revision.profile != shard.profile or
+                revision.state not in allowed_states):
             continue
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
@@ -560,6 +569,118 @@ def _expected_shard_attestation(
             or not isinstance(expected.get('live_attestation_key'), str)):
         raise LookupError('Terraform shard attestation is not committed yet.')
     return str(expected['live_attestation_key']), expected
+
+
+def _matching_shard_metadata(
+    repository: aws.EcrRepository,
+    role: aws.AwsRoleBinding,
+    shard: topology_state.ShardRecord,
+    expected: dict[str, Any],
+) -> tuple[dict[str, Any], int, int] | None:
+    """Returns exact live facts only when Terraform and quota still agree."""
+    metadata = repository.repository_metadata()
+    applied_quota = aws.applied_ecr_images_per_repository_quota(
+        role, shard.region)
+    expected_values = {
+        'repository_arn': expected.get('repository_arn'),
+        'repository_uri': expected.get('repository_uri'),
+        'tag_mutability': expected.get('tag_mutability'),
+        'encryption_type': expected.get('encryption_type'),
+        'kms_key': expected.get('kms_key'),
+        'scanning_mode': expected.get('scanning_mode'),
+        'policy_hash': expected.get('policy_hash'),
+        'ownership_tags_hash': expected.get('ownership_tags_hash'),
+    }
+    headroom = expected.get('reserved_headroom')
+    terraform_quota = expected.get('terraform_applied_quota')
+    max_manifests = expected.get('max_manifests')
+    if (metadata != expected_values or type(headroom) is not int or
+            type(terraform_quota) is not int or
+            type(max_manifests) is not int or applied_quota < terraform_quota or
+            max_manifests + headroom > applied_quota):
+        return None
+    return metadata, applied_quota, headroom
+
+
+def _reconcile_candidate_shard_attestation(
+    revision: topology_state.ProfileRevisionRecord,
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+    *,
+    limiter: budgets.ProviderBudgetLimiter,
+    now: int,
+) -> bool:
+    """Probes one candidate authority without mutating operational inventory."""
+    if revision.state != models.ImageProfileState.QUALIFYING:
+        return True
+    shards = topology_state.list_target_shards(revision.workspace, profile.name,
+                                               target.name)
+    if (len(shards) != target.shard_count or
+            any(shard.target_fingerprint != target.target_fingerprint
+                for shard in shards)):
+        return False
+    probed = 0
+    for shard in shards:
+        live_key, expected = _expected_shard_attestation(revision, shard)
+        evidence = revision.attestations.get(live_key)
+        if (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
+                isinstance(evidence.get('observed_at'), int) and 0 <=
+                now - evidence['observed_at'] <= _CONFIG_REFRESH_SECONDS * 10):
+            continue
+        if probed >= _CANDIDATE_SHARD_PROBE_LIMIT:
+            return False
+        # Before first activation, resumable inventory owns both the physical
+        # scan and candidate attestation. A later revision may reuse only a
+        # fresh operational epoch and cannot mutate the shared shard.
+        if (shard.profile_revision_id is None or
+                shard.state not in (models.ImageShardState.READY,
+                                    models.ImageShardState.FULL) or
+                shard.inventory_completed_at is None or
+                not 0 <= now - shard.inventory_completed_at <=
+                _CONFIG_REFRESH_SECONDS * 10):
+            return False
+        operational = topology_state.get_profile_revision(
+            shard.profile_revision_id)
+        if (operational is None or
+                operational.state != models.ImageProfileState.ACTIVE):
+            return False
+        binding = profile.bindings[target.write_authority]
+        role = _aws_role(binding, profile, 'verify')
+        repository = aws.EcrRepository.from_role(role,
+                                                 shard.region,
+                                                 shard.repository_name,
+                                                 hooks=_ecr_hooks(
+                                                     limiter, shard))
+        verified = _matching_shard_metadata(repository, role, shard, expected)
+        if verified is None:
+            return False
+        metadata, applied_quota, headroom = verified
+        recorded = topology_state.record_candidate_shard_attestation(
+            profile_revision_id=revision.id,
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            shard_id=shard.id,
+            expected_operational_revision_id=shard.profile_revision_id,
+            expected_target_fingerprint=shard.target_fingerprint,
+            expected_physical_fingerprint=shard.physical_fingerprint,
+            expected_inventory_epoch=shard.inventory_epoch,
+            expected_inventory_completed_at=shard.inventory_completed_at,
+            kind=live_key,
+            evidence={
+                'status': 'READY',
+                'observed_at': now,
+                'physical_fingerprint': shard.physical_fingerprint,
+                **metadata,
+                'applied_images_per_repository_quota': applied_quota,
+                'reserved_headroom': headroom,
+                'inventory_epoch': shard.inventory_epoch,
+                'inventory_completed_at': shard.inventory_completed_at,
+            },
+            now=now)
+        if recorded is None:
+            return False
+        probed += 1
+    return True
 
 
 def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
@@ -642,6 +763,11 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=current)
+    _reconcile_candidate_shard_attestation(revision,
+                                           profile,
+                                           target,
+                                           limiter=limiter,
+                                           now=current)
     if not _qualification_copy_needed(revision, profile, target, current):
         return True
     reader = providers.RegistryV2Source(profile.qualification.canary_ref,
@@ -725,29 +851,11 @@ def reconcile_inventory(
                                                  hooks=_ecr_hooks(
                                                      limiter, shard))
         live_key, expected = _expected_shard_attestation(revision, shard)
-        metadata = repository.repository_metadata()
-        applied_quota = aws.applied_ecr_images_per_repository_quota(
-            role, shard.region)
-        expected_values = {
-            'repository_arn': expected.get('repository_arn'),
-            'repository_uri': expected.get('repository_uri'),
-            'tag_mutability': expected.get('tag_mutability'),
-            'encryption_type': expected.get('encryption_type'),
-            'kms_key': expected.get('kms_key'),
-            'scanning_mode': expected.get('scanning_mode'),
-            'policy_hash': expected.get('policy_hash'),
-            'ownership_tags_hash': expected.get('ownership_tags_hash'),
-        }
-        headroom = expected.get('reserved_headroom')
-        terraform_quota = expected.get('terraform_applied_quota')
-        max_manifests = expected.get('max_manifests')
-        if (metadata != expected_values or type(headroom) is not int or
-                type(terraform_quota) is not int or
-                type(max_manifests) is not int or
-                applied_quota < terraform_quota or
-                max_manifests + headroom > applied_quota):
+        verified = _matching_shard_metadata(repository, role, shard, expected)
+        if verified is None:
             topology_state.mark_shard_drifted(shard.id, token)
             return False
+        metadata, applied_quota, headroom = verified
         digests, cursor = repository.inventory_page(
             next_token=shard.inventory_cursor)
         completed = topology_state.record_inventory_page(

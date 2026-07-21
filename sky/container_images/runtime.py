@@ -339,18 +339,21 @@ def _resolve_metadata(
         if profile_key not in cache:
             cache[profile_key] = config.resolve_profile(image.distribution,
                                                         workspace)
-        profile, policy = cache[profile_key]
-        if profile is None:
+        configured_profile, policy = cache[profile_key]
+        if configured_profile is None:
             return _MetadataResolution(resources=resources,
                                        direct=True,
                                        policy=policy)
-        active_key = ('active', workspace, profile.name)
+        active_key = ('active', workspace, configured_profile.name)
         if active_key not in cache:
             cache[active_key] = topology_state.get_active_profile(
-                workspace, profile.name)
+                workspace, configured_profile.name)
         active = cache[active_key]
-        if (active is None or active.revision != profile.revision or
-                active.config_hash != profile.config_hash):
+        if active is None:
+            raise ValueError('PROFILE_NOT_ACTIVE')
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            active.config_snapshot)
+        if profile.name != configured_profile.name:
             raise ValueError('PROFILE_NOT_ACTIVE')
     platform = placement.platform or 'linux/amd64'
     identity_key = ('identity', workspace, image.ref, image.release,

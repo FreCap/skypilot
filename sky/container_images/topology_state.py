@@ -513,6 +513,61 @@ def record_profile_attestation_in_session(session: orm.Session,
     return _profile(updated)
 
 
+def record_candidate_shard_attestation(
+        *, profile_revision_id: str, expected_generation: int,
+        expected_config_hash: str, shard_id: str,
+        expected_operational_revision_id: str, expected_target_fingerprint: str,
+        expected_physical_fingerprint: str, expected_inventory_epoch: int,
+        expected_inventory_completed_at: int, kind: str,
+        evidence: dict[str, Any], now: int) -> ProfileRevisionRecord | None:
+    """Records candidate proof only against one unchanged operational epoch."""
+    profiles = schema.profile_revisions
+    shards = schema.registry_shards
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        candidate = session.execute(
+            sqlalchemy.select(profiles).where(
+                profiles.c.id ==
+                profile_revision_id).with_for_update()).mappings().one()
+        if (str(candidate['state']) != models.ImageProfileState.QUALIFYING.value
+                or
+                int(candidate['desired_generation']) != expected_generation or
+                str(candidate['config_hash']) != expected_config_hash):
+            raise StaleProfileRevisionError(
+                'Attestation no longer matches the desired profile revision.')
+        shard = session.execute(
+            sqlalchemy.select(shards).where(
+                shards.c.id == shard_id).with_for_update()).mappings().first()
+        if (shard is None or shard['workspace'] != candidate['workspace'] or
+                shard['profile'] != candidate['profile'] or
+                shard['profile_revision_id'] != expected_operational_revision_id
+                or shard['target_fingerprint'] != expected_target_fingerprint or
+                shard['physical_fingerprint'] != expected_physical_fingerprint
+                or str(shard['state'])
+                not in (models.ImageShardState.READY.value,
+                        models.ImageShardState.FULL.value) or
+                int(shard['inventory_epoch']) != expected_inventory_epoch or
+                shard['inventory_completed_at']
+                != expected_inventory_completed_at or
+                shard['inventory_lease_token'] is not None):
+            return None
+        operational_state = session.execute(
+            sqlalchemy.select(profiles.c.state).where(
+                profiles.c.id == expected_operational_revision_id)).scalar()
+        if operational_state != models.ImageProfileState.ACTIVE.value:
+            return None
+        # The candidate row is already locked. The shared helper's repeated
+        # SELECT FOR UPDATE is reentrant and preserves profile-before-shard
+        # ordering for every competing transaction.
+        return record_profile_attestation_in_session(
+            session,
+            profile_revision_id=profile_revision_id,
+            kind=kind,
+            evidence=evidence,
+            expected_generation=expected_generation,
+            expected_config_hash=expected_config_hash,
+            now=now)
+
+
 def reserve_canary_cost(session: orm.Session, *, profile_revision_id: str,
                         expected_generation: int, utc_day: str,
                         worst_case_microusd: int,
@@ -652,6 +707,23 @@ def get_target_shard(workspace: str, profile: str,
                     schema.registry_shards.c.shard_index).limit(
                         1)).mappings().first()
     return _shard(row) if row is not None else None
+
+
+def list_target_shards(workspace: str, profile: str,
+                       target_id: str) -> list[ShardRecord]:
+    """Returns one bounded physical target ring in deterministic order."""
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(schema.registry_shards).where(
+                schema.registry_shards.c.workspace == workspace,
+                schema.registry_shards.c.profile == profile,
+                schema.registry_shards.c.target_id == target_id).order_by(
+                    schema.registry_shards.c.shard_generation,
+                    schema.registry_shards.c.shard_index).limit(
+                        257)).mappings().all()
+    if len(rows) > 256:
+        raise ValueError('Registry target contains too many physical shards.')
+    return [_shard(row) for row in rows]
 
 
 def claim_inventory_shard(*,
@@ -1201,8 +1273,7 @@ def _finish_location(session: orm.Session, *, location_id: str,
             row['lease_expires_at'] is None or
             int(row['lease_expires_at']) <= now or str(row['state'])
             not in (models.ImageLocationState.COPYING.value,
-                    models.ImageLocationState.VERIFYING.value,
-                    models.ImageLocationState.EVICTING.value)):
+                    models.ImageLocationState.VERIFYING.value)):
         return None
     updated = session.execute(
         locations.update().where(locations.c.id == location_id).values(

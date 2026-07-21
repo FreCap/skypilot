@@ -467,21 +467,18 @@ def _revision(
         updated_at=11)
 
 
-def _moved_profile(
+def _policy_profile(
     profile: models.ManagedRegistryProfile,) -> models.ManagedRegistryProfile:
     target = profile.target('aws-us-west-2')
-    moved_target = dataclasses.replace(
-        target, repository_prefix=f'{target.repository_prefix}/next')
     bindings = tuple(
         dataclasses.replace(binding,
                             authority=(
                                 f'arn:aws:iam::{profile.registry_account}:'
-                                'role/SkyPilotImageLifecycleV2')) if binding.
-        id == target.delete_authority else binding
+                                'role/SkyPilotImageCopyV2')) if binding.id ==
+        target.write_authority else binding
         for binding in profile.access_bindings)
     return dataclasses.replace(profile,
                                revision=profile.revision + 1,
-                               targets=(moved_target,),
                                access_bindings=bindings)
 
 
@@ -724,6 +721,34 @@ def test_expired_eviction_without_delete_authority_reads_before_restore(
                                      present=True)
 
 
+@pytest.mark.parametrize('lease_kind', ['EVICT', 'VERIFY', 'RECLAIM'])
+def test_eviction_resolution_failure_preserves_prior_outcome(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        lease_kind: str) -> None:
+    location = dataclasses.replace(_copying_location(profile),
+                                   state=models.ImageLocationState.EVICTING,
+                                   lease_kind=lease_kind)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _: _shard(profile))
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_profile_target_for_location', lambda *_args: None)
+    complete = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'complete_eviction', complete)
+
+    assert not lifecycle_worker_service.evict_location(location, mock.Mock())
+
+    if lease_kind == 'EVICT':
+        complete.assert_called_once_with(location.id,
+                                         location.lease_token,
+                                         present=None,
+                                         provider_not_called=True)
+    else:
+        complete.assert_called_once_with(location.id,
+                                         location.lease_token,
+                                         present=None)
+
+
 def test_eviction_uses_shard_activated_revision(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -758,31 +783,41 @@ def test_eviction_uses_shard_activated_revision(
     assert roles[0].role_arn == profile.bindings[delete_authority].authority
 
 
-def test_copy_and_inventory_resolve_matching_physical_revision(
+def test_copy_and_inventory_use_operational_revision_not_newer_candidate(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
-    moved = _moved_profile(profile)
+    candidate_profile = _policy_profile(profile)
     shard = _shard(profile)
     canonical = _canonical_location(profile)
     old_key = models.profile_attestation_key('terraform_shard',
                                              shard.physical_fingerprint)
     old_revision = dataclasses.replace(
         _revision(profile),
-        state=models.ImageProfileState.RETIRED,
         attestations={
             old_key: {
                 'status': 'READY',
                 'physical_fingerprint': shard.physical_fingerprint,
             }
         })
-    new_revision = dataclasses.replace(_revision(moved),
-                                       id='new-revision',
-                                       desired_generation=2)
+    candidate_revision = dataclasses.replace(
+        _revision(candidate_profile),
+        id='new-revision',
+        desired_generation=2,
+        state=models.ImageProfileState.QUALIFYING,
+        attestations={
+            old_key: {
+                'status': 'READY',
+                'physical_fingerprint': shard.physical_fingerprint,
+            }
+        })
     monkeypatch.setattr(
         copy_worker_service.topology_state, 'list_profile_revisions',
-        lambda _workspace, **_kwargs: [new_revision, old_revision])
-    monkeypatch.setattr(copy_worker_service.topology_state,
-                        'get_profile_revision', lambda _: old_revision)
+        mock.Mock(
+            side_effect=AssertionError('operational lookup must be exact')))
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'get_profile_revision',
+        lambda revision_id: old_revision
+        if revision_id == old_revision.id else candidate_revision)
     monkeypatch.setattr(copy_worker_service.topology_state, 'get_location',
                         lambda _: canonical)
     monkeypatch.setattr(
@@ -797,6 +832,115 @@ def test_copy_and_inventory_resolve_matching_physical_revision(
     assert resolved == profile
     assert revision.id == old_revision.id
     assert inventory_profile == profile
+
+
+def test_bootstrap_inventory_uses_exact_qualifying_physical_revision(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    shard = dataclasses.replace(_shard(profile),
+                                profile_revision_id=None,
+                                state=models.ImageShardState.PENDING)
+    key = models.profile_attestation_key('terraform_shard',
+                                         shard.physical_fingerprint)
+    candidate = dataclasses.replace(
+        _revision(profile),
+        state=models.ImageProfileState.QUALIFYING,
+        attestations={
+            key: {
+                'status': 'READY',
+                'physical_fingerprint': shard.physical_fingerprint,
+            }
+        })
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_profile_revisions',
+                        lambda *_args, **_kwargs: [candidate])
+
+    revision, inventory_profile = copy_worker_service._profile_for_shard(shard)
+
+    assert revision.id == candidate.id
+    assert inventory_profile == profile
+
+
+@pytest.mark.parametrize('metadata_matches', [True, False])
+def test_candidate_shard_probe_never_mutates_operational_state(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        metadata_matches: bool) -> None:
+    candidate_profile = _policy_profile(profile)
+    target = candidate_profile.targets[0]
+    base_shard = dataclasses.replace(_shard(profile),
+                                     inventory_epoch=3,
+                                     inventory_started_at=80,
+                                     inventory_completed_at=90)
+    shards = [
+        dataclasses.replace(base_shard,
+                            id=f'shard-{index}',
+                            shard_index=index,
+                            physical_fingerprint=f'{index:064x}')
+        for index in range(target.shard_count)
+    ]
+    shard = shards[0]
+    expected_metadata = {
+        'repository_arn': shard.repository_arn,
+        'repository_uri': f'{shard.registry}/{shard.repository_name}',
+        'tag_mutability': 'IMMUTABLE',
+        'encryption_type': 'AES256',
+        'kms_key': None,
+        'scanning_mode': 'SCAN_ON_PUSH',
+        'policy_hash': 'a' * 64,
+        'ownership_tags_hash': 'b' * 64,
+    }
+    attestations = {
+        models.profile_attestation_key('terraform_shard', item.physical_fingerprint):
+            {
+                'status': 'READY',
+                'physical_fingerprint': item.physical_fingerprint,
+                'live_attestation_key': models.profile_attestation_key(
+                    'infrastructure_shard', item.physical_fingerprint),
+                **expected_metadata,
+                'terraform_applied_quota': 100,
+                'max_manifests': 90,
+                'reserved_headroom': 10,
+            } for item in shards
+    }
+    candidate = dataclasses.replace(_revision(candidate_profile),
+                                    id='candidate-revision',
+                                    desired_generation=2,
+                                    state=models.ImageProfileState.QUALIFYING,
+                                    attestations=attestations)
+    repository = mock.Mock()
+    repository.repository_metadata.return_value = (expected_metadata
+                                                   if metadata_matches else {
+                                                       **expected_metadata,
+                                                       'policy_hash': 'c' * 64,
+                                                   })
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_target_shards', lambda *_args: shards)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'get_profile_revision', lambda _: _revision(profile))
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(copy_worker_service.aws,
+                        'applied_ecr_images_per_repository_quota',
+                        lambda *_args: 100)
+    record = mock.Mock(return_value=candidate)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'record_candidate_shard_attestation', record)
+    drift = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'mark_shard_drifted', drift)
+
+    reconciled = copy_worker_service._reconcile_candidate_shard_attestation(
+        candidate, candidate_profile, target, limiter=mock.Mock(), now=100)
+
+    assert reconciled is metadata_matches
+    assert record.call_count == (target.shard_count if metadata_matches else 0)
+    drift.assert_not_called()
+    if metadata_matches:
+        assert record.call_args.kwargs['profile_revision_id'] == candidate.id
+        assert record.call_args.kwargs[
+            'expected_operational_revision_id'] == _REVISION_ID
 
 
 def _dockerconfig_binding() -> models.RegistryAccessBinding:

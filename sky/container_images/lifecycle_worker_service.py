@@ -101,6 +101,15 @@ def evict_location(location: topology_state.LocationRecord,
         return False
     resolved = _profile_target_for_location(location, shard)
     if resolved is None:
+        if location.lease_kind == 'EVICT':
+            topology_state.complete_eviction(location.id,
+                                             token,
+                                             present=None,
+                                             provider_not_called=True)
+        else:
+            # VERIFY and RECLAIM may represent provider I/O from an expired
+            # owner. Preserve ambiguity until an exact authority is available.
+            topology_state.complete_eviction(location.id, token, present=None)
         return False
     profile, target = resolved
     verify_only = location.lease_kind == 'VERIFY'

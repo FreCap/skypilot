@@ -46,12 +46,16 @@ def publish(*,
         distribution, 'Publication distribution')
     if distribution == config.DIRECT_PROFILE:
         raise ValueError('Publication requires a managed distribution.')
-    profile, _ = config.resolve_profile(distribution, workspace)
-    if profile is None:
+    configured_profile, _ = config.resolve_profile(distribution, workspace)
+    if configured_profile is None:
         raise ValueError('PROFILE_NOT_ACTIVE')
-    active = topology_state.get_active_profile(workspace, profile.name)
-    if (active is None or active.revision != profile.revision or
-            active.config_hash != profile.config_hash):
+    active = topology_state.get_active_profile(workspace,
+                                               configured_profile.name)
+    if active is None:
+        raise ValueError('PROFILE_NOT_ACTIVE')
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        active.config_snapshot)
+    if profile.name != configured_profile.name:
         raise ValueError('PROFILE_NOT_ACTIVE')
     source_binding = config.get_source_binding(source_auth_binding_id)
     source_fingerprint = (source_binding.fingerprint

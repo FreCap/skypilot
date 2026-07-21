@@ -40,12 +40,16 @@ def prepare(*, image_id: str, distribution: str, target_id: str, workspace: str,
     artifact = catalog_state.get_published_artifact(image_id, workspace)
     if artifact is None:
         raise ValueError('IMAGE_NOT_PUBLISHED')
-    profile, _ = config.resolve_profile(distribution, workspace)
-    if profile is None:
+    configured_profile, _ = config.resolve_profile(distribution, workspace)
+    if configured_profile is None:
         raise ValueError('PROFILE_NOT_ACTIVE')
-    active = topology_state.get_active_profile(workspace, profile.name)
-    if (active is None or active.revision != profile.revision or
-            active.config_hash != profile.config_hash):
+    active = topology_state.get_active_profile(workspace,
+                                               configured_profile.name)
+    if active is None:
+        raise ValueError('PROFILE_NOT_ACTIVE')
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        active.config_snapshot)
+    if profile.name != configured_profile.name:
         raise ValueError('PROFILE_NOT_ACTIVE')
     target = profile.target(target_id)
     publication = catalog_state.get_ready_publication_for_artifact(

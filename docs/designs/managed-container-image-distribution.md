@@ -1149,7 +1149,11 @@ current desired row and promotes it only after rechecking desired generation,
 config and Terraform hashes, target fingerprints, and fresh required
 attestations. A late older qualifier becomes SUPERSEDED and cannot activate. The
 previous active revision remains selectable until the new one commits ACTIVE;
-existing plans retain their exact old revision until their demands drain.
+existing plans retain their exact old revision until their demands drain. New
+runtime resolution, publication, and prepare requests likewise use that ACTIVE
+revision's immutable snapshot while the configured successor is QUALIFYING.
+Current workspace allowlists and authorization still apply, but a desired config
+reload cannot create a deployment outage before its provider proofs converge.
 
 Profile revision is routing and authority metadata, not physical image identity.
 If a new active revision names the same qualified physical shard fingerprint, it
@@ -1239,6 +1243,21 @@ physical shard and location. Inventory qualification remains separately scoped
 to the candidate revision and requires its exact per-shard Terraform
 attestation. A newer same-named target cannot lend credentials or policy to
 bytes in a different repository ring.
+
+Inventory has three explicit authority modes. Before first activation, a
+QUALIFYING revision may inventory an unowned PENDING shard and promote it after
+the complete physical scan. Once a shard has an operational revision pointer,
+resumable inventory resolves only that exact ACTIVE or RETIRED snapshot and is
+the only path that can change shared shard or location state. A later
+QUALIFYING policy revision instead performs a read-only per-shard probe with its
+own verify authority and exact Terraform expectations. It may record candidate
+evidence only while the shard still points to the same ACTIVE revision and its
+READY/FULL operational inventory epoch remains fresh and unchanged. Candidate
+credential, policy, or quota mismatch leaves the operational shard untouched
+and blocks only candidate activation. Each maintenance pass probes at most 16
+missing shards per target through the persisted provider budget; the current
+ACTIVE revision remains available while larger rings converge in the
+background.
 
 A managed target first activates only when every workspace shard and the cleaned
 qualification repository are empty, fingerprints match, and hard ceilings are no

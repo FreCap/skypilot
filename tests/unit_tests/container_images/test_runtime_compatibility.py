@@ -245,6 +245,43 @@ def _wire_metadata(monkeypatch: pytest.MonkeyPatch,
                         lambda **kwargs: None)
 
 
+def test_qualifying_config_keeps_active_runtime_snapshot(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    write_authority = profile.targets[0].write_authority
+    bindings = tuple(
+        dataclasses.replace(binding, external_id='candidate-external-id'
+                           ) if binding.id == write_authority else binding
+        for binding in profile.access_bindings)
+    configured = dataclasses.replace(profile,
+                                     revision=profile.revision + 1,
+                                     access_bindings=bindings)
+    active = _active_revision(profile, observed_at=1000)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, configured, policy, active)
+    monkeypatch.setattr(runtime.time, 'time', lambda: 1001)
+    monkeypatch.setattr(
+        runtime.topology_state, 'get_location_for_target',
+        lambda **_kwargs: _location(profile, models.ImageLocationState.READY))
+    resources = _FakeResources(
+        models.ContainerImage(release='boltz-l4', distribution=profile.name))
+
+    resolution = runtime._resolve_metadata(
+        resources,
+        models.Placement(provider='aws',
+                         region='us-west-2',
+                         backend='aws_vm',
+                         platform='linux/amd64'), 'research')
+
+    assert resolution.active == active
+    assert resolution.profile == profile
+    assert resolution.profile != configured
+
+
 def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import hashlib
 import importlib
 import os
@@ -198,6 +199,142 @@ def _configure_profile(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(config, 'resolve_profile',
                         lambda distribution, workspace: (profile, policy))
     monkeypatch.setattr(config, 'get_source_binding', lambda _: None)
+
+
+def _policy_profile(
+    profile: models.ManagedRegistryProfile,) -> models.ManagedRegistryProfile:
+    write_authority = profile.targets[0].write_authority
+    bindings = tuple(
+        dataclasses.replace(binding, external_id='candidate-external-id'
+                           ) if binding.id == write_authority else binding
+        for binding in profile.access_bindings)
+    return dataclasses.replace(profile,
+                               revision=profile.revision + 1,
+                               access_bindings=bindings)
+
+
+def _stage_candidate_profile(
+    profile: models.ManagedRegistryProfile,
+    *,
+    now: int,
+) -> topology_state.ProfileRevisionRecord:
+    return topology_state.stage_profile_revision(
+        workspace='research',
+        profile=profile.name,
+        revision=profile.revision,
+        config_hash=profile.config_hash,
+        config_snapshot=profile.to_snapshot(),
+        physical_manifest_hash=profile.physical_manifest_hash,
+        max_daily_canary_microusd=(
+            profile.qualification.max_daily_canary_microusd),
+        now=now)
+
+
+def test_candidate_attestation_requires_unchanged_operational_inventory(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    candidate = _stage_candidate_profile(_policy_profile(profile), now=20)
+    shard = topology_state.list_target_shards('research', profile.name,
+                                              profile.targets[0].name)[0]
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                inventory_epoch=7,
+                inventory_started_at=21,
+                inventory_completed_at=22,
+                updated_at=22))
+    snapshot = topology_state.get_shard(shard.id)
+    assert snapshot is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                inventory_epoch=8,
+                inventory_started_at=23,
+                inventory_completed_at=24,
+                updated_at=24))
+    key = models.profile_attestation_key('infrastructure_shard',
+                                         shard.physical_fingerprint)
+    stale = topology_state.record_candidate_shard_attestation(
+        profile_revision_id=candidate.id,
+        expected_generation=candidate.desired_generation,
+        expected_config_hash=candidate.config_hash,
+        shard_id=snapshot.id,
+        expected_operational_revision_id=active.id,
+        expected_target_fingerprint=snapshot.target_fingerprint,
+        expected_physical_fingerprint=snapshot.physical_fingerprint,
+        expected_inventory_epoch=snapshot.inventory_epoch,
+        expected_inventory_completed_at=snapshot.inventory_completed_at,
+        kind=key,
+        evidence={
+            'status': 'READY',
+            'observed_at': 25,
+        },
+        now=25)
+    assert stale is None
+    unchanged_candidate = topology_state.get_profile_revision(candidate.id)
+    assert unchanged_candidate is not None
+    assert key not in unchanged_candidate.attestations
+
+    current = topology_state.get_shard(shard.id)
+    assert current is not None and current.inventory_completed_at is not None
+    recorded = topology_state.record_candidate_shard_attestation(
+        profile_revision_id=candidate.id,
+        expected_generation=candidate.desired_generation,
+        expected_config_hash=candidate.config_hash,
+        shard_id=current.id,
+        expected_operational_revision_id=active.id,
+        expected_target_fingerprint=current.target_fingerprint,
+        expected_physical_fingerprint=current.physical_fingerprint,
+        expected_inventory_epoch=current.inventory_epoch,
+        expected_inventory_completed_at=current.inventory_completed_at,
+        kind=key,
+        evidence={
+            'status': 'READY',
+            'observed_at': 26,
+        },
+        now=26)
+    assert recorded is not None
+    assert recorded.attestations[key]['status'] == 'READY'
+    unchanged = topology_state.get_shard(shard.id)
+    assert unchanged is not None
+    assert unchanged.profile_revision_id == active.id
+    assert unchanged.state == models.ImageShardState.READY
+
+
+def test_qualifying_successor_does_not_block_publish_or_prepare(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    publication_record, canonical = _publish_and_bind(profile)
+    _complete_location(canonical, now=30)
+    assert publication_record.image_id is not None
+
+    candidate_profile = _policy_profile(profile)
+    candidate = _stage_candidate_profile(candidate_profile, now=40)
+    _configure_profile(monkeypatch, candidate_profile)
+
+    during_rollout = publication.publish(
+        source_ref=_OTHER_SOURCE,
+        release='during-profile-rollout',
+        distribution=profile.name,
+        workspace='research',
+        actor_hash='2' * 64,
+        idempotency_key='publication-during-profile-rollout')
+    prepared = preparation.prepare(
+        image_id=publication_record.image_id,
+        distribution=profile.name,
+        target_id=profile.targets[0].name,
+        workspace='research',
+        actor_hash='2' * 64,
+        idempotency_key='prepare-during-profile-rollout')
+
+    assert candidate.state == models.ImageProfileState.QUALIFYING
+    assert during_rollout.publication.profile_revision_id == active.id
+    assert prepared.location.target_fingerprint == (
+        profile.targets[0].target_fingerprint)
+    still_active = topology_state.get_active_profile('research', profile.name)
+    assert still_active is not None and still_active.id == active.id
 
 
 def _publish_and_bind(
@@ -2192,6 +2329,31 @@ def test_prepared_location_retention_uses_verified_time_and_workspace_policy(
         lease_seconds=60,
         now=100)
     assert claimed is not None and claimed.id == regional.id
+
+
+def test_copy_completion_cannot_finish_an_eviction_lease(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    before = topology_state.get_shard(eviction.shard_id)
+    assert before is not None and before.in_flight == 1
+
+    assert topology_state.complete_location_ready(eviction.id,
+                                                  eviction.lease_token,
+                                                  now=101) is None
+
+    retained = topology_state.get_location(eviction.id)
+    after = topology_state.get_shard(eviction.shard_id)
+    assert retained is not None
+    assert retained.state == models.ImageLocationState.EVICTING
+    assert retained.lease_token == eviction.lease_token
+    assert after is not None and after.in_flight == 1
 
 
 def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(
