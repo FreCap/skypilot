@@ -488,8 +488,17 @@ An ECR destination claim executes this fenced algorithm:
    Reject
    foreign or nondistributable media types, external layer URLs, excessive
    manifest/config size, excessive layer count, or the artifact byte limit before
-   acquiring destination authority.
-3. Call destination `BatchGetImage` for the exact child digest. If the returned
+   acquiring destination authority. The lease heartbeat is active before source
+   credential acquisition or network reads. Generic OCI inspection remains
+   read-only and streamed blob transfer observes cancellation; destination
+   authority cannot be acquired after that source work loses its lease. Managed
+   regional-source ECR credential acquisition and SDK calls are synchronously
+   fenced by the exact lease.
+3. Re-prove the exact lease immediately before destination credential
+   acquisition and again after it returns. Every destination ECR SDK hook
+   re-proves ownership before and after any provider-budget wait, leaving no
+   unbounded interval in which an expired worker can begin a later call. Then
+   call destination `BatchGetImage` for the exact child digest. If the returned
    raw bytes, media type, config, platform, and referenced layers verify, skip all
    writes and converge through VERIFYING to READY.
 4. Use `BatchCheckLayerAvailability` and transfer only missing blobs. Each source
@@ -503,10 +512,11 @@ An ECR destination claim executes this fenced algorithm:
    presence commits READY. Confirmed absence returns to PENDING with backoff.
    Digest/media/config mismatch is terminal and never overwrites the destination.
 7. SQL completion locks the location and validates the token and database clock.
-   A worker that lost its lease cannot complete state even if its same-digest ECR
-   call finished. The next claimant's exact reads make that harmless write
-   converge. Canonical READY then fans out dependent publications in bounded
-   batches without repeating provider I/O.
+   A worker that lost its lease cannot begin another credential or ECR call and
+   cannot complete state even if an already-started same-digest call finished.
+   The next claimant's exact reads make that harmless immutable write converge.
+   Canonical READY then fans out dependent publications in bounded batches
+   without repeating provider I/O.
 
 Inventory is advisory. A completed list epoch may nominate a READY location as
 absent, but only an exact digest read under a reconciliation lease can move it to
@@ -1600,10 +1610,13 @@ noncanonical, managed locations past retention, plus provably
 empty failed canonical reservations for counter reclamation. They inspect the
 exact digest after ambiguous deletion and never delete a repository or a READY
 canonical manifest. Copy and lifecycle use one shared lease-heartbeat primitive.
-Copy observes cancellation while transferring immutable content and still relies
-on token-checked state convergence. Lifecycle additionally makes exact lease
-ownership and durable `DELETE` intent synchronous preconditions of every
-destructive provider call.
+Copy synchronously proves ownership around managed source/destination ECR
+credential acquisition and around every provider-budget wait, observes
+cancellation while transferring immutable content, and still relies on
+token-checked state convergence for a call already in flight. External source
+inspection is read-only, and destination authority remains fenced after it.
+Lifecycle additionally makes durable `DELETE` intent a synchronous precondition
+of every destructive provider call.
 
 Shutdown stops new claims, cancels work that has not started provider I/O, and
 lets leases expire after ambiguous I/O. Restart recovery verifies actual
@@ -2184,3 +2197,14 @@ existing quarantine path without readback. It also restricts no-I/O restoration
 to pre-delete `EVICT` leases, fixes the race test's logical heartbeat clock,
 binds typed retry conflicts to terminal idempotent operations, and projects
 bounded quarantine-retained capacity in the readiness UI.
+
+Final acceptance round 1 at
+`6f73ba70cb073d8cdd2e2ae75b19f057f598fcee` returned Codex `RESHAPE` and
+Fable `PURSUE`, resetting the streak. Codex proved that a copy worker could wait
+inside the shared provider budget, lose its location lease, and then begin a
+destination ECR call because its hook did not re-prove ownership after the wait.
+Destination STS acquisition also preceded heartbeat ownership. This revision
+therefore starts the heartbeat before source or destination credentials, moves
+destination authority acquisition after source validation, fences credential
+acquisition on both sides, and binds synchronous lease checks before and after
+every copy ECR provider-budget wait.

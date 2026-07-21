@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import json
 import socket
+import threading
 from types import SimpleNamespace
 from unittest import mock
 import urllib.error
@@ -662,6 +663,154 @@ def test_lost_copy_lease_cannot_mark_location_ready(
     destination.verify_graph.assert_not_called()
     assert all(
         call.kwargs.get('ready') is False for call in converge.call_args_list)
+
+
+def test_copy_lease_loss_during_budget_wait_blocks_provider_call(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    location = _copying_location(profile)
+    graph = SimpleNamespace(runtime_digest=_DIGEST,
+                            config=SimpleNamespace(digest=_CONFIG_DIGEST),
+                            platform='linux/amd64')
+    events: list[str] = []
+    lost = False
+
+    class FencedHeartbeat:
+        """Deterministic heartbeat that loses ownership during a wait."""
+
+        def __init__(self, *_args: object) -> None:
+            self.cancel_event = threading.Event()
+
+        def __enter__(self):
+            self.assert_owned()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def assert_owned(self) -> None:
+            events.append('lease')
+            if lost:
+                self.cancel_event.set()
+                raise worker_lease.LeaseLostError(
+                    'Container image work lease was lost.')
+
+    class Destination:
+        """Invokes the production hook immediately before fake provider I/O."""
+
+        def __init__(self, hooks: aws.EcrCallHooks) -> None:
+            self._hooks = hooks
+            self.verify_graph = mock.Mock()
+
+        def copy_graph(self, *_args: object) -> aws.CopyOutcome:
+            self._hooks.before_call()
+            events.append('provider')
+            return aws.CopyOutcome.WRITTEN
+
+    def repository_from_role(*_args: object, **kwargs: object) -> Destination:
+        events.append('sts')
+        return Destination(kwargs['hooks'])
+
+    def lose_lease_during_budget(_shard: object) -> None:
+        nonlocal lost
+        events.append('budget')
+        lost = True
+
+    limiter = SimpleNamespace(before_call=lose_lease_during_budget,
+                              record_throttle=lambda _shard: None)
+    monkeypatch.setattr(copy_worker_service.catalog_state, 'get_artifact',
+                        lambda *_args: _artifact())
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_shard',
+                        lambda _shard_id: _shard(profile))
+    monkeypatch.setattr(copy_worker_service, '_profile_for_location',
+                        lambda *_args: profile)
+    monkeypatch.setattr(
+        copy_worker_service, '_graph_for_location',
+        lambda *_args: events.append('source') or
+        (graph, mock.sentinel.read_blob))
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    monkeypatch.setattr(copy_worker_service, '_LeaseHeartbeat', FencedHeartbeat)
+    transition = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'transition_location_to_verifying', transition)
+    converge = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.transactions, 'converge_canonical',
+                        converge)
+
+    assert not copy_worker_service.copy_location(
+        location, limiter=limiter, lease_seconds=30)
+
+    assert events == [
+        'lease',
+        'source',
+        'lease',
+        'sts',
+        'lease',
+        'lease',
+        'budget',
+        'lease',
+    ]
+    assert 'provider' not in events
+    transition.assert_not_called()
+    converge.assert_called_once()
+    assert converge.call_args.kwargs['ready'] is False
+
+
+def test_regional_source_credentials_and_ecr_reads_are_lease_fenced(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    location = _copying_location(profile)
+    canonical = _canonical_location(profile)
+    source_shard = _shard(profile, profile.canonical.name, canonical.shard_id)
+    graph = mock.sentinel.graph
+    events: list[str] = []
+    heartbeat = SimpleNamespace(assert_owned=lambda: events.append('lease'))
+    limiter = SimpleNamespace(
+        before_call=lambda _shard: events.append('budget'),
+        record_throttle=lambda _shard: None)
+
+    def repository_from_role(*_args: object,
+                             **kwargs: object) -> SimpleNamespace:
+        events.append('sts')
+        hooks = kwargs['hooks']
+
+        def read_manifest(_digest: str) -> bytes:
+            hooks.before_call()
+            events.append('source-read')
+            return b'{}'
+
+        return SimpleNamespace(read_manifest=read_manifest,
+                               read_blob=mock.sentinel.read_blob,
+                               read_blob_bytes=mock.Mock())
+
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_location',
+                        lambda _location_id: canonical)
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_shard',
+                        lambda _shard_id: source_shard)
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    monkeypatch.setattr(copy_worker_service.oci, 'build_content_graph',
+                        lambda **_kwargs: graph)
+
+    resolved, read_blob = copy_worker_service._graph_for_location(
+        location, _artifact(), profile, limiter, heartbeat)
+
+    assert resolved is graph
+    assert read_blob is mock.sentinel.read_blob
+    assert events == [
+        'lease',
+        'sts',
+        'lease',
+        'lease',
+        'budget',
+        'lease',
+        'source-read',
+    ]
 
 
 def test_copy_maintenance_also_recovers_pending_publication_fanout(

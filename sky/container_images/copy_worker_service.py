@@ -309,8 +309,17 @@ def _aws_role(binding: models.RegistryAccessBinding,
 def _ecr_hooks(
     limiter: budgets.ProviderBudgetLimiter,
     shard: topology_state.ShardRecord,
+    heartbeat: worker_lease.LeaseHeartbeat | None = None,
 ) -> aws.EcrCallHooks:
-    return aws.EcrCallHooks(before_call=lambda: limiter.before_call(shard),
+
+    def before_call() -> None:
+        if heartbeat is not None:
+            heartbeat.assert_owned()
+        limiter.before_call(shard)
+        if heartbeat is not None:
+            heartbeat.assert_owned()
+
+    return aws.EcrCallHooks(before_call=before_call,
                             on_throttle=lambda: limiter.record_throttle(shard))
 
 
@@ -319,6 +328,7 @@ def _graph_for_location(
     artifact: catalog_state.ArtifactRecord,
     profile: models.ManagedRegistryProfile,
     limiter: budgets.ProviderBudgetLimiter,
+    heartbeat: worker_lease.LeaseHeartbeat,
 ) -> tuple[oci.OciContentGraph, Callable[[oci.OciDescriptor], Any]]:
     if location.canonical:
         source = catalog_state.source_for_canonical_location(location.id)
@@ -338,11 +348,14 @@ def _graph_for_location(
         raise ValueError('Canonical registry shard is missing.')
     source_target = profile.target(source_shard.target_id)
     source_binding = profile.bindings[source_target.write_authority]
+    source_role = _aws_role(source_binding, profile, 'source_read')
+    heartbeat.assert_owned()
     source_repository = aws.EcrRepository.from_role(
-        _aws_role(source_binding, profile, 'source_read'),
+        source_role,
         source_shard.region,
         source_shard.repository_name,
-        hooks=_ecr_hooks(limiter, source_shard))
+        hooks=_ecr_hooks(limiter, source_shard, heartbeat))
+    heartbeat.assert_owned()
     limits = oci.OciInspectionLimits(
         max_artifact_bytes=profile.limits.max_artifact_bytes)
     raw = source_repository.read_manifest(artifact.runtime_digest)
@@ -418,23 +431,28 @@ def copy_location(location: topology_state.LocationRecord,
             raise ValueError('PROFILE_NOT_ACTIVE')
         target = profile.target(shard.target_id)
         write_binding = profile.bindings[target.write_authority]
-        destination = aws.EcrRepository.from_role(
-            _aws_role(write_binding, profile, 'destination_write'),
-            shard.region,
-            shard.repository_name,
-            hooks=_ecr_hooks(limiter, shard))
         heartbeat = _LeaseHeartbeat(
             lambda: topology_state.heartbeat_location(location.id, token,
                                                       lease_seconds),
             max(1.0, lease_seconds / 3))
         with heartbeat:
             graph, read_blob = _graph_for_location(location, artifact, profile,
-                                                   limiter)
+                                                   limiter, heartbeat)
             if (graph.runtime_digest != artifact.runtime_digest or
                     graph.config.digest != artifact.config_digest or
                     graph.platform != artifact.platform):
                 raise aws.DestinationContentMismatchError(
                     'Source evidence no longer matches catalog artifact.')
+            destination_role = _aws_role(write_binding, profile,
+                                         'destination_write')
+            heartbeat.assert_owned()
+            destination = aws.EcrRepository.from_role(destination_role,
+                                                      shard.region,
+                                                      shard.repository_name,
+                                                      hooks=_ecr_hooks(
+                                                          limiter, shard,
+                                                          heartbeat))
+            heartbeat.assert_owned()
             if location.state == models.ImageLocationState.COPYING:
                 outcome = destination.copy_graph(graph, read_blob,
                                                  heartbeat.cancel_event)
