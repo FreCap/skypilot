@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 import json
+import time
 from typing import Any
 from unittest import mock
 
@@ -79,6 +80,47 @@ def test_queue_config_round_trip_and_defaults():
         spec.to_yaml_config())
     assert restored.lb_request_queue == queue
     assert spec.copy().lb_request_queue == queue
+
+
+def test_per_accelerator_floor_round_trip_and_validation():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=4,
+                      min_replicas_by_accelerator={
+                          'A100': 1,
+                          'A100-80GB': 1,
+                      },
+                      target_qps_per_replica={
+                          'A100': 1,
+                          'A100-80GB': 2,
+                      },
+                      load_balancing_policy='instance_aware_least_load')
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(
+        spec.to_yaml_config())
+    assert restored.min_replicas_by_accelerator == {
+        'A100': 1,
+        'A100-80GB': 1,
+    }
+    assert spec.copy().min_replicas_by_accelerator == (
+        spec.min_replicas_by_accelerator)
+    concurrency_spec = _make_spec(
+        min_replicas=0,
+        max_replicas=4,
+        min_replicas_by_accelerator={'A100': 2},
+        target_concurrency_per_replica=1,
+        load_balancing_policy='instance_aware_least_load')
+    assert concurrency_spec.min_replicas_by_accelerator == {'A100': 2}
+    with pytest.raises(ValueError, match='must not exceed max_replicas'):
+        _make_spec(min_replicas=0,
+                   max_replicas=1,
+                   min_replicas_by_accelerator={
+                       'A100': 1,
+                       'A100-80GB': 1,
+                   })
+    with pytest.raises(ValueError, match='requires either dict type'):
+        _make_spec(min_replicas=0,
+                   max_replicas=2,
+                   min_replicas_by_accelerator={'A100': 1},
+                   load_balancing_policy='instance_aware_least_load')
 
 
 def test_priority_timeout_thresholds_round_trip_and_select_highest_match():
@@ -806,6 +848,498 @@ def test_request_priority_header_is_consumed_before_proxying():
             ])
 
 
+def test_request_accelerator_header_parsing_and_default():
+    lb = _make_lb()
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100', 'A100-80GB'],
+    })
+    omitted = _request_with_headers([])
+    assert lb._parse_request_accelerators(omitted) == ('L4', 'A100',
+                                                       'A100-80GB')
+    explicit = _request_with_headers([
+        (b'x-skyserve-compatible-accelerators', b'l4, A100-80GB'),
+    ])
+    assert lb._parse_request_accelerators(explicit) == ('L4', 'A100-80GB')
+
+
+@pytest.mark.parametrize('value', [b'', b'L4,', b'L4,l4', b'A100-40GB'])
+def test_invalid_request_accelerator_header_returns_400(value):
+    lb = _make_lb()
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100', 'A100-80GB'],
+    })
+    request = _request_with_headers([
+        (b'x-skyserve-compatible-accelerators', value),
+    ])
+    with pytest.raises(fastapi.HTTPException) as exc:
+        lb._parse_request_accelerators(request)
+    assert exc.value.status_code == 400
+
+
+def test_explicit_accelerators_fail_closed_before_capability_sync():
+    lb = _make_lb()
+    request = _request_with_headers([
+        (b'x-skyserve-compatible-accelerators', b'L4,A100'),
+    ])
+    with pytest.raises(fastapi.HTTPException) as exc:
+        lb._parse_request_accelerators(request)
+    assert exc.value.status_code == 503
+
+
+def test_accelerator_header_is_consumed_before_proxying():
+    request = _request_with_headers([
+        (b'x-keep', b'value'),
+        (b'x-skyserve-compatible-accelerators', b'L4,A100'),
+        (b'x-skyserve-priority', b'50'),
+    ])
+    assert (load_balancer.SkyServeLoadBalancer.
+            _headers_without_request_priority(request) == [(b'x-keep', b'value')
+                                                          ])
+
+
+def test_equal_priority_queue_preserves_scarce_card_matching():
+    lb = _make_lb(max_concurrency=2)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=2),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100', 'H100'],
+    })
+    lb._replica_info_by_url = {
+        'a100': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+        'h100': {
+            'gpu_type': 'H100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(['a100', 'h100'])
+    loop = asyncio.new_event_loop()
+    try:
+        flexible = _request()
+        setattr(flexible, '_skyserve_compatible_accelerators', ('L4', 'A100'))
+        larger = _request()
+        setattr(larger, '_skyserve_compatible_accelerators', ('A100', 'H100'))
+        first = load_balancer._RequestQueueWaiter(flexible, 50, 0,
+                                                  loop.create_future())
+        second = load_balancer._RequestQueueWaiter(larger, 50, 1,
+                                                   loop.create_future())
+        lb._request_queue_waiters = {50: {0: first, 1: second}}
+        lb._waiting_request_count = 2
+        lb._dispatch_request_queue_locked()
+        assert getattr(flexible, '_skyserve_granted_accelerator') == 'A100'
+        assert getattr(larger, '_skyserve_granted_accelerator') == 'H100'
+    finally:
+        loop.close()
+
+
+def test_late_a100_only_request_gets_next_a100_after_1000_flexible_waiters():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1, max_size=10000),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._replica_info_by_url = {
+        'a100': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(['a100'])
+    loop = asyncio.new_event_loop()
+    try:
+        bucket = {}
+        flexible_waiters = []
+        for sequence in range(1000):
+            request = _request()
+            setattr(request, '_skyserve_compatible_accelerators',
+                    ('L4', 'A100'))
+            waiter = load_balancer._RequestQueueWaiter(request, 50, sequence,
+                                                       loop.create_future())
+            bucket[sequence] = waiter
+            flexible_waiters.append(waiter)
+        a100_request = _request()
+        setattr(a100_request, '_skyserve_compatible_accelerators', ('A100',))
+        constrained = load_balancer._RequestQueueWaiter(a100_request, 50, 1000,
+                                                        loop.create_future())
+        bucket[constrained.sequence] = constrained
+        lb._request_queue_waiters = {50: bucket}
+        lb._waiting_request_count = len(bucket)
+
+        lb._dispatch_request_queue_locked()
+
+        assert constrained.granted
+        assert getattr(a100_request, '_skyserve_granted_accelerator') == 'A100'
+        assert not any(waiter.granted for waiter in flexible_waiters)
+        assert lb._waiting_request_count == 1000
+    finally:
+        loop.close()
+
+
+def test_queue_prefers_ready_reserved_compatible_card():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._replica_info_by_url = {
+        'l4': {
+            'gpu_type': 'L4',
+            'is_zero_cost': 'false',
+        },
+        'a100': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'true',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(['l4', 'a100'])
+    loop = asyncio.new_event_loop()
+    try:
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', ('L4', 'A100'))
+        waiter = load_balancer._RequestQueueWaiter(request, 50, 0,
+                                                   loop.create_future())
+        lb._request_queue_waiters = {50: {0: waiter}}
+        lb._waiting_request_count = 1
+        lb._dispatch_request_queue_locked()
+        assert getattr(request, '_skyserve_granted_accelerator') == 'A100'
+    finally:
+        loop.close()
+
+
+def test_queue_consumes_reserved_card_preference_once_per_ready_slot():
+    lb = _make_lb(max_concurrency=2)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=2),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._replica_info_by_url = {
+        'l4-paid': {
+            'gpu_type': 'L4',
+            'is_zero_cost': 'false',
+        },
+        'a100-reserved': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'true',
+        },
+        'a100-paid': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(
+        ['l4-paid', 'a100-reserved', 'a100-paid'])
+    loop = asyncio.new_event_loop()
+    try:
+        requests = [_request(), _request()]
+        waiters = {}
+        for sequence, request in enumerate(requests):
+            setattr(request, '_skyserve_compatible_accelerators',
+                    ('L4', 'A100'))
+            waiters[sequence] = load_balancer._RequestQueueWaiter(
+                request, 50, sequence, loop.create_future())
+        lb._request_queue_waiters = {50: waiters}
+        lb._waiting_request_count = 2
+
+        lb._dispatch_request_queue_locked()
+
+        assert getattr(requests[0], '_skyserve_granted_accelerator') == 'A100'
+        assert getattr(requests[1], '_skyserve_granted_accelerator') == 'L4'
+    finally:
+        loop.close()
+
+
+def test_zero_dispatch_capacity_skips_compatibility_matching():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    loop = asyncio.new_event_loop()
+    try:
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', ('A100',))
+        waiter = load_balancer._RequestQueueWaiter(request, 50, 0,
+                                                   loop.create_future())
+        lb._request_queue_waiters = {50: {0: waiter}}
+        lb._waiting_request_count = 1
+        lb._active_request_count = 1
+
+        with mock.patch.object(
+                lb,
+                '_build_request_queue_grant_plan_locked',
+                side_effect=AssertionError('matching should be skipped')):
+            lb._dispatch_request_queue_locked()
+
+        assert not waiter.granted
+        assert lb._waiting_request_count == 1
+    finally:
+        loop.close()
+
+
+def test_dense_compatibility_matching_is_bounded_by_profiles_and_slots():
+    cards = tuple(f'GPU-{index}' for index in range(8))
+    lb = _make_lb(max_concurrency=128, max_size=1000)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=128, max_size=1000),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': list(cards),
+    })
+    loop = asyncio.new_event_loop()
+    try:
+        waiters = {}
+        for sequence in range(500):
+            request = _request()
+            mask = 1 + sequence % 255
+            compatible = tuple(
+                card for index, card in enumerate(cards) if mask & (1 << index))
+            setattr(request, '_skyserve_compatible_accelerators', compatible)
+            waiters[sequence] = load_balancer._RequestQueueWaiter(
+                request, 50, sequence, loop.create_future())
+        lb._request_queue_waiters = {50: waiters}
+        lb._waiting_request_count = len(waiters)
+
+        started = time.monotonic()
+        plan = lb._build_request_queue_grant_plan_locked(
+            {card: 16 for card in cards}, {card: 0 for card in cards}, 128)
+        elapsed = time.monotonic() - started
+
+        assert len(plan) == 128
+        assert elapsed < 2
+    finally:
+        loop.close()
+
+
+def test_queue_uses_fallback_quality_not_raw_compatibility_count():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100', 'H100'],
+    })
+    lb._replica_info_by_url = {
+        'a100': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(['a100'])
+    loop = asyncio.new_event_loop()
+    try:
+        cheaper_fallback = _request()
+        setattr(cheaper_fallback, '_skyserve_compatible_accelerators',
+                ('L4', 'A100'))
+        worse_fallback = _request()
+        setattr(worse_fallback, '_skyserve_compatible_accelerators',
+                ('A100', 'H100'))
+        older = load_balancer._RequestQueueWaiter(cheaper_fallback, 50, 0,
+                                                  loop.create_future())
+        newer = load_balancer._RequestQueueWaiter(worse_fallback, 50, 1,
+                                                  loop.create_future())
+        lb._request_queue_waiters = {50: {0: older, 1: newer}}
+        lb._waiting_request_count = 2
+
+        lb._dispatch_request_queue_locked()
+
+        assert not older.granted
+        assert newer.granted
+        assert getattr(worse_fallback,
+                       '_skyserve_granted_accelerator') == 'A100'
+    finally:
+        loop.close()
+
+
+def test_numeric_priority_dominates_accelerator_scarcity():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._replica_info_by_url = {
+        'a100': {
+            'gpu_type': 'A100',
+            'is_zero_cost': 'false',
+        },
+    }
+    lb._load_balancing_policy.set_ready_replicas(['a100'])
+    loop = asyncio.new_event_loop()
+    try:
+        high_flexible = _request()
+        setattr(high_flexible, '_skyserve_compatible_accelerators',
+                ('L4', 'A100'))
+        low_constrained = _request()
+        setattr(low_constrained, '_skyserve_compatible_accelerators', ('A100',))
+        high = load_balancer._RequestQueueWaiter(high_flexible, 50, 1,
+                                                 loop.create_future())
+        low = load_balancer._RequestQueueWaiter(low_constrained, 20, 0,
+                                                loop.create_future())
+        lb._request_queue_waiters = {20: {0: low}, 50: {1: high}}
+        lb._waiting_request_count = 2
+
+        lb._dispatch_request_queue_locked()
+
+        assert high.granted
+        assert not low.granted
+    finally:
+        loop.close()
+
+
+def test_aggregate_free_slot_does_not_admit_incompatible_request():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4', 'A100'],
+        })
+        lb._replica_info_by_url = {
+            'l4': {
+                'gpu_type': 'L4',
+                'is_zero_cost': 'false',
+            },
+        }
+        lb._load_balancing_policy.set_ready_replicas(['l4'])
+        request = _request()
+        setattr(request, '_skyserve_compatible_accelerators', ('A100',))
+        acquire = asyncio.create_task(lb._acquire_request_slot(request, 50))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        assert not acquire.done()
+        assert lb._active_request_count == 0
+        acquire.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquire
+        while lb._waiting_request_count:
+            await asyncio.sleep(0)
+
+    asyncio.run(_run())
+
+
+def test_capable_controller_with_missing_replica_identity_fails_closed():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100'],
+    })
+    lb._load_balancing_policy.set_ready_replicas(['identity-not-synced'])
+    request = _request()
+    setattr(request, '_skyserve_compatible_accelerators', ('L4',))
+    assert lb._request_queue_accelerator_slots_locked() == ({
+        'L4': 0,
+        'A100': 0,
+    }, {
+        'L4': 0,
+        'A100': 0,
+    })
+    assert not lb._reserve_immediate_accelerator_locked(request)
+
+
+def test_empty_fleet_records_compatibility_demand_before_admission():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._queued_compatibility_demand_supported = True
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4', 'A100'],
+        })
+        request = _request_with_headers([
+            (b'x-skyserve-compatible-accelerators', b'A100'),
+            (b'x-skyserve-priority', b'50'),
+        ])
+        request.body = mock.AsyncMock(return_value=b'')
+        proxy = asyncio.create_task(lb._proxy_with_retries(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        assert lb._request_aggregator.request_history_snapshot() is None
+        assert lb._request_queue_profiles() == [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }]
+        proxy.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy
+        assert lb._request_queue_profiles() == []
+
+    asyncio.run(_run())
+
+
+def test_service_update_intersects_or_rejects_queued_compatibility():
+    lb = _make_lb(max_concurrency=1)
+    lb._apply_routing_spec({
+        'request_queue': _queue_config(max_concurrency=1),
+        'request_accelerator_compatibility_version': 1,
+        'configured_accelerators': ['L4', 'A100', 'H100'],
+    })
+    loop = asyncio.new_event_loop()
+    try:
+        surviving_request = _request()
+        setattr(surviving_request, '_skyserve_compatible_accelerators',
+                ('L4', 'A100'))
+        rejected_request = _request()
+        setattr(rejected_request, '_skyserve_compatible_accelerators',
+                ('H100',))
+        surviving = load_balancer._RequestQueueWaiter(surviving_request, 50, 0,
+                                                      loop.create_future())
+        rejected = load_balancer._RequestQueueWaiter(rejected_request, 50, 1,
+                                                     loop.create_future())
+        lb._request_queue_waiters = {50: {0: surviving, 1: rejected}}
+        lb._waiting_request_count = 2
+
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['A100'],
+        })
+
+        assert getattr(surviving_request,
+                       '_skyserve_compatible_accelerators') == ('A100',)
+        assert surviving.sequence in lb._request_queue_waiters[50]
+        assert rejected.terminal_error is not None
+        assert rejected.terminal_error.status_code == 503
+        assert rejected.future.done()
+        assert lb._waiting_request_count == 1
+    finally:
+        loop.close()
+
+
+def test_instance_aware_policy_prefers_reserved_only_on_load_tie():
+    policy = load_balancing_policies.InstanceAwareLeastLoadPolicy()
+    policy.set_ready_replicas(['paid-l4', 'reserved-a100'])
+    policy.set_target_qps_per_accelerator({'L4': 1, 'A100': 1})
+    policy.set_replica_info({
+        'paid-l4': {
+            'gpu_type': 'L4',
+            'gpu_count': '1',
+            'is_zero_cost': 'false',
+        },
+        'reserved-a100': {
+            'gpu_type': 'A100',
+            'gpu_count': '1',
+            'is_zero_cost': 'true',
+        },
+    })
+    assert policy.select_replica(_request()) == 'reserved-a100'
+    policy.load_map['reserved-a100'] = 1
+    assert policy.select_replica(_request()) == 'paid-l4'
+
+
 def test_queue_disabled_still_validates_request_priority():
 
     async def _run():
@@ -1025,6 +1559,41 @@ def test_waiter_wakes_when_dispatch_slot_released():
     asyncio.run(_run())
 
 
+def test_controller_capability_rollback_backfills_waiting_demand_once():
+
+    async def _run():
+        lb = _make_lb(max_concurrency=1, timeout_seconds=5)
+        lb._queued_compatibility_demand_supported = True
+        lb._apply_routing_spec({
+            'request_queue': _queue_config(max_concurrency=1,
+                                           timeout_seconds=5),
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['L4', 'A100'],
+        })
+        request = _request_with_headers([
+            (b'x-skyserve-compatible-accelerators', b'A100'),
+            (b'x-skyserve-priority', b'50'),
+        ])
+        request.body = mock.AsyncMock(return_value=b'')
+        proxy = asyncio.create_task(lb._proxy_with_retries(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        assert lb._request_aggregator.request_history_snapshot() is None
+
+        lb._set_queued_compatibility_demand_support(False)
+        first = lb._request_aggregator.request_history_snapshot()
+        assert first is not None
+        assert first['buckets'][0]['request_count'] == 1
+        lb._set_queued_compatibility_demand_support(False)
+        assert lb._request_aggregator.request_history_snapshot() == first
+
+        proxy.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy
+
+    asyncio.run(_run())
+
+
 def test_occupancy_probe_wakes_waiter():
 
     async def _run():
@@ -1066,6 +1635,9 @@ def test_timeout_and_cancellation_remove_waiters():
             await lb._acquire_request_slot(request)
         assert exc.value.status_code == 503
         assert lb._waiting_request_count == 0
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
 
         lb._request_queue_config = {
             **(lb._request_queue_config or {}),
@@ -1078,6 +1650,7 @@ def test_timeout_and_cancellation_remove_waiters():
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert lb._waiting_request_count == 0
+        assert lb._request_aggregator.request_history_snapshot() == history
 
     asyncio.run(_run())
 

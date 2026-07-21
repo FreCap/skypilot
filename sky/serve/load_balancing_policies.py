@@ -513,6 +513,18 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
                 replica for replica, load in replica_loads
                 if load - min_load <= 1e-9
             ]
+            # Priority and compatibility are enforced before policy selection.
+            # Within the resulting equally safe, equally loaded set, consume
+            # ready reserved capacity first so an equivalent paid replica can
+            # become idle and scale down. Never accept extra load merely for
+            # cost: this filter applies only to the normalized-load tie.
+            zero_cost = [
+                replica for replica in tie_break if str(
+                    self.replica_info.get(replica, {}).get(
+                        'is_zero_cost', '')).lower() == 'true'
+            ]
+            if zero_cost:
+                tie_break = zero_cost
             selected_replica = random.choice(tie_break)
             logger.debug('Available replicas and loads: %s', replica_loads)
             logger.debug('Selected replica: %s', selected_replica)

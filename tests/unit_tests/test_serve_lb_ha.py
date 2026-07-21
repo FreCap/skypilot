@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import threading
 from unittest import mock
 
 from sky.serve import controller
@@ -266,6 +267,156 @@ def test_demand_handoff_unions_old_and_new_in_flight_evidence():
     assert floored['unknown_in_flight_urls'] == ['unknown-new', 'unknown-old']
 
 
+def test_demand_handoff_preserves_compatibility_arrivals_and_queue_floors():
+    old_request = {
+        'routing_version': 1,
+        'request_aggregator': {
+            'timestamps': [10],
+            'compatibility_profiles': [{
+                'timestamp': 10,
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 2,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 3,
+        }],
+        'rejected_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 5,
+            'recent_count': 2,
+        }],
+    }
+    current_request = {
+        'routing_version': 1,
+        'request_aggregator': {
+            'timestamps': [20],
+            'compatibility_profiles': [{
+                'timestamp': 20,
+                'priority': 20,
+                'compatible_accelerators': ['L4', 'A100'],
+                'count': 1,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }, {
+            'priority': 20,
+            'compatible_accelerators': ['L4', 'A100'],
+            'count': 4,
+        }],
+        'rejected_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 3,
+            'recent_count': 3,
+        }],
+    }
+    snapshot = lb_ha.DemandSnapshot.from_request(old_request)
+    assert lb_ha.DemandSnapshot.from_dict(snapshot.to_dict()) == snapshot
+
+    handoff = lb_ha.DemandHandoff(60)
+    handoff.begin(8, snapshot)
+    floored = handoff.apply(8, current_request, True, now=1)
+
+    assert floored['request_aggregator']['timestamps'] == [10, 20]
+    assert floored['request_aggregator']['compatibility_profiles'] == [
+        old_request['request_aggregator']['compatibility_profiles'][0],
+        current_request['request_aggregator']['compatibility_profiles'][0],
+    ]
+    assert floored['queued_requests_by_compatibility'] == [{
+        'priority': 50,
+        'compatible_accelerators': ['A100'],
+        'count': 3,
+    }, {
+        'priority': 20,
+        'compatible_accelerators': ['L4', 'A100'],
+        'count': 4,
+    }]
+    assert floored['rejected_requests_by_compatibility'] == [{
+        'priority': 50,
+        'compatible_accelerators': ['A100'],
+        'count': 5,
+        'recent_count': 3,
+    }]
+
+    next_request = {
+        **current_request,
+        'request_aggregator': {
+            'timestamps': [],
+            'compatibility_profiles': [],
+        },
+    }
+    repeated = handoff.apply(8, next_request, True, now=21)
+    assert repeated['request_aggregator'] == next_request['request_aggregator']
+    assert repeated['queued_requests_by_compatibility'] == floored[
+        'queued_requests_by_compatibility']
+    assert repeated['rejected_requests_by_compatibility'] == floored[
+        'rejected_requests_by_compatibility']
+
+
+def test_demand_handoff_drops_exact_profiles_from_an_old_routing_version():
+    snapshot = lb_ha.DemandSnapshot.from_request({
+        'routing_version': 1,
+        'request_aggregator': {
+            'timestamps': [10],
+            'compatibility_profiles': [{
+                'timestamp': 10,
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 2,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 3,
+        }],
+        'rejected_requests_by_compatibility': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 4,
+        }],
+    })
+    current = {
+        'routing_version': 2,
+        'request_aggregator': {
+            'timestamps': [20],
+            'compatibility_profiles': [{
+                'timestamp': 20,
+                'priority': 20,
+                'compatible_accelerators': ['H100'],
+                'count': 1,
+            }],
+        },
+        'queued_requests_by_compatibility': [{
+            'priority': 20,
+            'compatible_accelerators': ['H100'],
+            'count': 1,
+        }],
+        'rejected_requests_by_compatibility': [],
+    }
+
+    floored = snapshot.floor(current)
+
+    # Aggregate safety evidence still crosses the handoff, but card-specific
+    # evidence from the old catalog does not.
+    assert floored['request_aggregator']['timestamps'] == [10, 20]
+    assert floored['request_aggregator']['compatibility_profiles'] == [
+        current['request_aggregator']['compatibility_profiles'][0]
+    ]
+    assert floored['queued_requests_by_compatibility'] == (
+        current['queued_requests_by_compatibility'])
+    assert not floored['rejected_requests_by_compatibility']
+    assert floored['routing_version'] == 2
+
+
 def test_complete_demand_report_does_not_require_all_occupancy_samples():
     report = {
         'in_flight': {
@@ -275,6 +426,8 @@ def test_complete_demand_report_does_not_require_all_occupancy_samples():
         'rejected_in_window': 3,
         'rejected_in_recent_window': 1,
         'unknown_in_flight_urls': ['http://unsampled'],
+        'queued_requests_by_compatibility': [],
+        'rejected_requests_by_compatibility': [],
         'occupancy_sampled_urls': ['http://replica'],
     }
 
@@ -293,6 +446,8 @@ def test_empty_complete_report_starts_window_but_preserves_floor():
         'rejected_in_recent_window': 0,
         'unknown_in_flight_urls': [],
         'occupancy_sampled_urls': [],
+        'queued_requests_by_compatibility': [],
+        'rejected_requests_by_compatibility': [],
     }
     assert controller.SkyServeController._lb_demand_report_is_complete(
         empty_report)
@@ -334,12 +489,23 @@ def test_incomplete_demand_report_preserves_handoff_floor():
         'rejected_in_window': 0,
         'rejected_in_recent_window': 0,
         'unknown_in_flight_urls': [],
+        'queued_requests_by_compatibility': [],
+        'rejected_requests_by_compatibility': [],
     }
     for field in complete:
         report = dict(complete)
         report[field] = None
         assert not controller.SkyServeController._lb_demand_report_is_complete(
             report)
+
+    malformed_queue_report = dict(complete)
+    malformed_queue_report['queued_requests_by_compatibility'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['A100'],
+        'count': -1,
+    }]
+    assert not controller.SkyServeController._lb_demand_report_is_complete(
+        malformed_queue_report)
 
 
 def test_demand_snapshot_preserves_real_load_balancer_timestamps():
@@ -406,6 +572,7 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._lb_demand_handoff = lb_ha.DemandHandoff(5)
     ctrl._lb_drain_timeout_seconds = 60
     ctrl._applied_version = 1
+    ctrl._routing_state_lock = threading.RLock()
     ctrl._owns_current_service = mock.Mock(return_value=True)
     ctrl._lb_cutover_fence = mock.Mock(return_value=('incarnation',
                                                      (123, '10.0.0.1'), 7))

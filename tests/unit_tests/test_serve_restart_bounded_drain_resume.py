@@ -164,3 +164,46 @@ def test_probe3_shortfall_reactivation_still_works():
         mgr._reconcile_recovering_logical_retirements()
     assert not info.status_property.is_scale_down
     assert not mgr._recovering_logical_retirement_ids
+
+
+def test_same_total_exact_card_shift_reactivates_required_card():
+    """Aggregate coverage cannot retire the only backend of a target card."""
+    retiring_l4 = _bounded_precommit_info()
+    retiring_l4.resources_override = {'accelerators': {'L4': 1}}
+    ready_a100 = replica_managers.ReplicaInfo(
+        replica_id=2,
+        cluster_name='svc-2',
+        replica_port='8080',
+        is_spot=True,
+        location=None,
+        version=2,
+        resources_override={'accelerators': {
+            'A100': 1
+        }},
+        planned_capacity=1)
+    ready_status = ready_a100.status_property
+    ready_status.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    ready_status.service_ready_now = True
+    ready_status.first_ready_time = 1
+
+    mgr = _restart_manager(retiring_l4)
+    mgr._logical_reconcile_snapshot = (
+        replica_managers.LogicalReconcileSnapshot(
+            version=2,
+            generation=5,
+            observed_slots_by_replica_id={2: 1},
+            in_flight_by_replica_id={
+                1: 0,
+                2: 0
+            },
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic()))
+    mgr._logical_target = (2, 5, 1, (('L4', 1),), (('L4', 1), ('A100', 1)))
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[retiring_l4, ready_a100]):
+        mgr._reconcile_recovering_logical_retirements()
+
+    assert not retiring_l4.status_property.is_scale_down
+    assert not mgr._recovering_logical_retirement_ids

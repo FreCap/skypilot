@@ -117,6 +117,11 @@ def test_drain_during_admission_rejects_before_recording_request():
 
     async def _scenario():
         lb = _make_lb()
+        lb._queued_compatibility_demand_supported = True
+        lb._apply_routing_spec({
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['A100'],
+        })
         request = mock.MagicMock()
 
         async def _admit(_request):
@@ -134,6 +139,60 @@ def test_drain_during_admission_rejects_before_recording_request():
                 await lb._proxy_with_retries(request)
         assert exc_info.value.status_code == 503
         assert lb._request_aggregator.request_history_snapshot() is None
+
+    asyncio.run(_scenario())
+
+
+def test_old_controller_mode_records_before_admission_for_safe_rollout():
+
+    async def _scenario():
+        lb = _make_lb()
+        request = mock.MagicMock()
+
+        async def _admit(_request):
+            lb._begin_draining()
+            return True
+
+        with mock.patch.object(lb,
+                               '_acquire_request_slot',
+                               side_effect=_admit), \
+             mock.patch.object(
+                 lb,
+                 '_release_request_slot',
+                 new=mock.AsyncMock()):
+            with pytest.raises(fastapi.HTTPException) as exc_info:
+                await lb._proxy_with_retries(request)
+        assert exc_info.value.status_code == 503
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
+
+    asyncio.run(_scenario())
+
+
+def test_queue_gauge_capability_keeps_aggregate_service_arrivals():
+
+    async def _scenario():
+        lb = _make_lb()
+        lb._queued_compatibility_demand_supported = True
+        request = mock.MagicMock()
+
+        async def _admit(_request):
+            lb._begin_draining()
+            return True
+
+        with mock.patch.object(lb,
+                               '_acquire_request_slot',
+                               side_effect=_admit), \
+             mock.patch.object(
+                 lb,
+                 '_release_request_slot',
+                 new=mock.AsyncMock()):
+            with pytest.raises(fastapi.HTTPException):
+                await lb._proxy_with_retries(request)
+        history = lb._request_aggregator.request_history_snapshot()
+        assert history is not None
+        assert history['buckets'][0]['request_count'] == 1
 
     asyncio.run(_scenario())
 

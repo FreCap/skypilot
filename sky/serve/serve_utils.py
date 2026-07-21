@@ -496,6 +496,8 @@ class RequestTimestamp(RequestsAggregator):
         # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
         self.timestamps: collections.deque[float] = collections.deque(
             maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
+        self.compatibility_profiles: collections.deque[dict[str, Any]] = (
+            collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
         # Exact arrival counters are reported independently from the lossy,
         # bounded raw timestamp batch used by autoscaling. Counts remain in
         # memory through the current hour so another request in an already
@@ -510,9 +512,19 @@ class RequestTimestamp(RequestsAggregator):
 
     def add(self, request: 'fastapi.Request') -> None:
         """Add a request to the request aggregator."""
-        del request  # unused
         timestamp = time.time()
         self.timestamps.append(timestamp)
+        compatible = getattr(request, '_skyserve_compatible_accelerators', None)
+        self.compatibility_profiles.append({
+            'timestamp': timestamp,
+            'priority': int(
+                getattr(request, '_skyserve_request_priority',
+                        constants.LB_REQUEST_PRIORITY_MIN)),
+            # None distinguishes a legacy omitted-catalog request from an
+            # explicit canonical set; an empty list is never valid.
+            'compatible_accelerators':
+                (list(compatible) if compatible is not None else None),
+        })
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
         self._request_history[bucket_start] = (
@@ -533,6 +545,7 @@ class RequestTimestamp(RequestsAggregator):
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
@@ -625,6 +638,7 @@ class RequestTimestamp(RequestsAggregator):
         """Take the current timestamps, leaving later arrivals untouched."""
         batch = self.to_dict()
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         return batch
 
     def restore(self, batch: dict[str, Any]) -> None:
@@ -635,16 +649,49 @@ class RequestTimestamp(RequestsAggregator):
         retained.
         """
         drained = batch.get('timestamps', [])
-        if not drained:
+        drained_profiles = batch.get('compatibility_profiles', [])
+        if not drained and not drained_profiles:
             return
         current = list(self.timestamps)
+        current_profiles = list(self.compatibility_profiles)
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         self.timestamps.extend(drained)
         self.timestamps.extend(current)
+        self.compatibility_profiles.extend(drained_profiles)
+        self.compatibility_profiles.extend(current_profiles)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the aggregator to a dict."""
-        return {'timestamps': list(self.timestamps)}
+        grouped_profiles: dict[tuple[int, frozenset[str]], dict[str, Any]] = {}
+        for profile in self.compatibility_profiles:
+            accelerators = profile.get('compatible_accelerators')
+            priority = profile.get('priority')
+            timestamp = profile.get('timestamp')
+            count = profile.get('count', 1)
+            if (not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(priority, int) or
+                    not isinstance(timestamp, (int, float)) or
+                    not isinstance(count, int) or count < 1):
+                # Legacy omitted-catalog samples remain visible to aggregate
+                # timestamp scaling but cannot be safely assigned to a card.
+                continue
+            key = (priority, frozenset(accelerators))
+            grouped = grouped_profiles.get(key)
+            if grouped is None:
+                grouped_profiles[key] = {
+                    'timestamp': timestamp,
+                    'priority': priority,
+                    'compatible_accelerators': list(accelerators),
+                    'count': count,
+                }
+            else:
+                grouped['timestamp'] = max(grouped['timestamp'], timestamp)
+                grouped['count'] += count
+        return {
+            'timestamps': list(self.timestamps),
+            'compatibility_profiles': list(grouped_profiles.values()),
+        }
 
     def __repr__(self) -> str:
         return f'RequestTimestamp(timestamps={list(self.timestamps)})'
@@ -1966,6 +2013,17 @@ def _get_service_status(
             record['target_num_replicas'] = autoscaler_info[
                 'target_num_replicas']
             request_field_map = {
+                'min_replicas_by_accelerator': 'min_replicas_by_accelerator',
+                'target_num_replicas_by_accelerator': 'target_num_replicas_by_accelerator',
+                'demand_target_by_accelerator': 'demand_target_by_accelerator',
+                'ready_replicas_by_accelerator': 'ready_replicas_by_accelerator',
+                'provisioning_replicas_by_accelerator': 'provisioning_replicas_by_accelerator',
+                'total_replicas_by_accelerator': 'total_replicas_by_accelerator',
+                'zero_cost_ready_replicas_by_accelerator': 'zero_cost_ready_replicas_by_accelerator',
+                'fill_target_by_accelerator': 'fill_target_by_accelerator',
+                'free_reserved_slots_by_accelerator': 'free_reserved_slots_by_accelerator',
+                'fill_target': 'fill_target',
+                'fill_free_slots': 'fill_free_slots',
                 'recent_request_count': 'recent_request_count',
                 'request_window_seconds': 'request_window_seconds',
                 'requests_per_second': 'requests_per_second',

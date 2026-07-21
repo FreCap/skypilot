@@ -204,6 +204,33 @@ def test_recent_reject_window_tracks_spikes_separately_from_retention():
     assert lb._rejected_in_recent_window() == 1
 
 
+def test_reject_window_reports_exact_profile_and_recent_count():
+    lb = _make_lb()
+    lb._configured_accelerators = ('L4', 'A100')
+    recent = _request(job_id='recent')
+    recent._skyserve_request_priority = 50
+    recent._skyserve_compatible_accelerators = ('A100',)
+    retained = _request(job_id='retained')
+    retained._skyserve_request_priority = 20
+    retained._skyserve_compatible_accelerators = None
+    lb._record_rejection(recent)
+    lb._record_rejection(retained)
+    lb._reject_last_seen['retained'] = (
+        time.monotonic() - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS - 1)
+
+    assert lb._rejected_compatibility_profiles() == [{
+        'priority': 50,
+        'compatible_accelerators': ['A100'],
+        'count': 1,
+        'recent_count': 1,
+    }, {
+        'priority': 20,
+        'compatible_accelerators': ['L4', 'A100'],
+        'count': 1,
+        'recent_count': 0,
+    }]
+
+
 def test_terminal_503_records_rejection():
     lb = _make_lb()  # empty ready set -> "no ready replicas" exit
     with pytest.raises(fastapi.HTTPException):
@@ -666,16 +693,19 @@ def test_sync_loop_sleeps_after_unexpected_failure_and_recovers():
 
 def test_sync_payload_carries_demand_gauges():
     lb = _make_lb()
+    lb._routing_version = 7
     lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
     lb._load_balancing_policy.load_map['http://a:8080'] = 2
     lb._queue_depth = 3
     lb._record_rejection(_request(job_id='job-1'))
     captured = _run_sync(lb, {'replica_info': {}})
     body = captured['json']
+    assert body['routing_version'] == 7
     assert body['in_flight'] == {'http://a:8080': 2}
     assert body['queue_depth'] == 3
     assert body['rejected_in_window'] == 1
     assert body['rejected_in_recent_window'] == 1
+    assert body['rejected_requests_by_compatibility'] == []
     assert 'timestamps' in body['request_aggregator']
     # Gauges are NOT cleared by a successful sync (only the timestamp
     # aggregator keeps clear-on-report semantics).

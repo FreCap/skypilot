@@ -5,6 +5,7 @@ import collections
 import contextlib
 import dataclasses
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -57,6 +58,9 @@ _OCCUPANCY_ADMISSION_ATTR = '_sky_occupancy_admission_unassigned'
 _BOUNDED_REQUEST_BODY_ATTR = '_skyserve_bounded_body'
 _WAITING_REQUEST_BODY_BYTES_ATTR = '_skyserve_waiting_body_bytes'
 _REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
+_REQUEST_ACCELERATORS_ATTR = '_skyserve_compatible_accelerators'
+_REQUEST_GRANTED_ACCELERATOR_ATTR = '_skyserve_granted_accelerator'
+_REQUEST_DEMAND_RECORDED_ATTR = '_skyserve_request_demand_recorded'
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
 # transport failure cannot create a second logical operation. POST/PATCH are
@@ -170,11 +174,22 @@ class SkyServeLoadBalancer:
     _request_queue_sequence: int = 0
     _draining: bool = False
     _reject_last_seen: dict[str, tuple[float, int]] | None = None
+    _reject_compatibility_by_key: dict[str, tuple[int,
+                                                  tuple[str,
+                                                        ...]]] | None = None
     _reject_fallback_seq: int = 0
     _offered_arrivals_by_job: dict[str, float] | None = None
     _headerless_offered_arrivals: collections.deque[float] | None = None
     _offered_arrival_saturated_until: float | None = None
     _capacity_hint: dict[str, Any] | None = None
+    _configured_accelerators: tuple[str, ...] | None = None
+    _request_accelerator_compatibility_version: int | None = None
+    # Fail open for mixed-version availability: until a controller explicitly
+    # acknowledges the replaceable queue gauge, publish the legacy arrival
+    # event before admission so an old controller can cold-start an empty
+    # fleet. A successful old-controller response also downgrades this flag.
+    _queued_compatibility_demand_supported: bool = False
+    _replica_info_by_url: dict[str, dict[str, Any]] | None = None
     _draining_clients: dict[str, list[httpx.AsyncClient]] | None = None
     _occupancy_capable: set[str] | None = None
     # Subset explicitly declared by the per-version service contract. Unlike
@@ -318,6 +333,13 @@ class SkyServeLoadBalancer:
         self._waiting_request_body_bytes = 0
         self._request_queue_waiters = {}
         self._request_queue_sequence = 0
+        self._reject_last_seen = {}
+        self._reject_compatibility_by_key = {}
+        self._reject_fallback_seq = 0
+        self._configured_accelerators = None
+        self._request_accelerator_compatibility_version = None
+        self._queued_compatibility_demand_supported = False
+        self._replica_info_by_url = {}
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -566,6 +588,66 @@ class SkyServeLoadBalancer:
         request_queue = routing_spec.get('request_queue')
         self._request_queue_config = (dict(request_queue) if isinstance(
             request_queue, dict) else None)
+        previous_configured_accelerators = self._configured_accelerators
+        compatibility_version = routing_spec.get(
+            'request_accelerator_compatibility_version')
+        configured_accelerators = routing_spec.get('configured_accelerators')
+        if (compatibility_version == constants.LB_REQUEST_ACCELERATORS_VERSION
+                and isinstance(configured_accelerators, list) and
+                0 < len(configured_accelerators) <=
+                constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS and all(
+                    isinstance(item, str) and item
+                    for item in configured_accelerators) and
+                len({item.casefold() for item in configured_accelerators
+                    }) == len(configured_accelerators)):
+            self._configured_accelerators = tuple(configured_accelerators)
+            self._request_accelerator_compatibility_version = (
+                compatibility_version)
+        else:
+            # Never retain a stale catalog across a malformed or downgraded
+            # routing spec. Explicit request constraints must fail closed.
+            self._configured_accelerators = None
+            self._request_accelerator_compatibility_version = None
+        self._reconcile_queued_request_accelerators(
+            previous_configured_accelerators, self._configured_accelerators)
+
+    def _reconcile_queued_request_accelerators(
+        self,
+        previous: tuple[str, ...] | None,
+        current: tuple[str, ...] | None,
+    ) -> None:
+        """Re-index queued requests against a changed exact-card catalog.
+
+        Controller sync and request admission run on the same asyncio event
+        loop.  This method contains no await, so mutating the waiter registry
+        here is atomic with respect to queue admission even though routing
+        specs are applied under the separate client-pool lock.
+        """
+        if previous == current:
+            return
+        waiters = self._request_queue_waiters_for_instance()
+        current_by_name = ({
+            card.casefold(): card for card in current
+        } if current is not None else {})
+        for bucket in list(waiters.values()):
+            for waiter in list(bucket.values()):
+                requested = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
+                                    None)
+                if requested is None:
+                    requested = previous
+                surviving = tuple(current_by_name[card.casefold()]
+                                  for card in (requested or ())
+                                  if card.casefold() in current_by_name)
+                if surviving:
+                    setattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
+                            surviving)
+                    continue
+                self._remove_request_queue_waiter_locked(waiter)
+                waiter.terminal_error = self._accelerator_header_error(
+                    'has no exact card still configured after a service '
+                    'update; retry against the active version.',
+                    status_code=503)
+                self._resolve_request_queue_waiter_locked(waiter)
 
     def _queue_uses_async_occupancy(self) -> bool:
         config = self._request_queue_config
@@ -880,16 +962,119 @@ class SkyServeLoadBalancer:
         return priority
 
     @staticmethod
+    def _accelerator_header_error(detail: str,
+                                  status_code: int = 400
+                                 ) -> fastapi.HTTPException:
+        headers = ({
+            'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+        } if status_code == 503 else None)
+        return fastapi.HTTPException(
+            status_code=status_code,
+            detail=(f'{constants.LB_REQUEST_ACCELERATORS_HEADER} {detail}'),
+            headers=headers)
+
+    def _parse_request_accelerators(
+            self, request: fastapi.Request) -> tuple[str, ...] | None:
+        """Parse and canonicalize the optional ordered exact-card set.
+
+        None is returned only for a legacy controller/LB pair and an omitted
+        header. An explicit header never widens when the catalog is unknown.
+        """
+        headers = request.headers
+        raw_headers = getattr(headers, 'raw', None)
+        values: list[bytes | str] = []
+        if isinstance(raw_headers, (list, tuple)):
+            for name, value in raw_headers:
+                normalized_name = (name.lower() if isinstance(name, bytes) else
+                                   str(name).lower().encode('ascii'))
+                if (normalized_name ==
+                        constants.LB_REQUEST_ACCELERATORS_HEADER_BYTES):
+                    values.append(value)
+        else:
+            for name, value in headers.items():
+                if str(name).lower() == (
+                        constants.LB_REQUEST_ACCELERATORS_HEADER.lower()):
+                    values.append(value)
+
+        configured = self._configured_accelerators
+        if not values:
+            return configured
+        if len(values) != 1:
+            raise self._accelerator_header_error('must appear at most once.')
+        if (self._request_accelerator_compatibility_version
+                != constants.LB_REQUEST_ACCELERATORS_VERSION or
+                configured is None):
+            raise self._accelerator_header_error(
+                'cannot be honored until the controller publishes the exact '
+                'accelerator catalog; retry after synchronization.',
+                status_code=503)
+        value = values[0]
+        if isinstance(value, bytes):
+            if len(value) > constants.LB_REQUEST_ACCELERATORS_MAX_BYTES:
+                raise self._accelerator_header_error('is too large.')
+            try:
+                text = value.decode('ascii')
+            except UnicodeDecodeError:
+                raise self._accelerator_header_error(
+                    'must contain ASCII exact accelerator identifiers.'
+                ) from None
+        else:
+            text = str(value)
+            if len(text.encode('utf-8')) > (
+                    constants.LB_REQUEST_ACCELERATORS_MAX_BYTES):
+                raise self._accelerator_header_error('is too large.')
+            if not text.isascii():
+                raise self._accelerator_header_error(
+                    'must contain ASCII exact accelerator identifiers.')
+        raw_items = text.split(',')
+        if (not raw_items or
+                len(raw_items) > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS):
+            raise self._accelerator_header_error(
+                f'must contain 1-{constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS} '
+                'exact accelerator identifiers.')
+        configured_by_name = {
+            accelerator.casefold(): accelerator for accelerator in configured
+        }
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw_item in raw_items:
+            item = raw_item.strip(' \t')
+            normalized = item.casefold()
+            if not item:
+                raise self._accelerator_header_error(
+                    'must not contain empty accelerator identifiers.')
+            if normalized in seen:
+                raise self._accelerator_header_error(
+                    f'contains duplicate accelerator {item!r}.')
+            seen.add(normalized)
+            canonical = configured_by_name.get(normalized)
+            if canonical is None:
+                raise self._accelerator_header_error(
+                    f'contains unknown exact accelerator {item!r}.')
+            result.append(canonical)
+        return tuple(result)
+
+    @staticmethod
     def _headers_without_request_priority(request: fastapi.Request) -> Any:
         """Return upstream headers with every scheduling header removed."""
         headers = request.headers
         raw_headers = getattr(headers, 'raw', None)
         if isinstance(raw_headers, (list, tuple)):
-            return [(name, value) for name, value in raw_headers if (
-                name.lower() if isinstance(name, bytes) else str(name).lower().
-                encode('ascii')) != constants.LB_REQUEST_PRIORITY_HEADER_BYTES]
-        return [(name, value) for name, value in headers.items() if str(
-            name).lower() != constants.LB_REQUEST_PRIORITY_HEADER.lower()]
+            scheduling_headers = {
+                constants.LB_REQUEST_PRIORITY_HEADER_BYTES,
+                constants.LB_REQUEST_ACCELERATORS_HEADER_BYTES,
+            }
+            return [(name, value)
+                    for name, value in raw_headers
+                    if (name.lower() if isinstance(name, bytes) else str(name).
+                        lower().encode('ascii')) not in scheduling_headers]
+        scheduling_headers_text = {
+            constants.LB_REQUEST_PRIORITY_HEADER.lower(),
+            constants.LB_REQUEST_ACCELERATORS_HEADER.lower(),
+        }
+        return [(name, value)
+                for name, value in headers.items()
+                if str(name).lower() not in scheduling_headers_text]
 
     def _request_queue_waiters_for_instance(
             self) -> dict[int, dict[int, _RequestQueueWaiter]]:
@@ -910,20 +1095,369 @@ class SkyServeLoadBalancer:
         self._waiting_request_count = max(0, self._waiting_request_count - 1)
         return True
 
-    def _pop_request_queue_waiter_locked(self) -> _RequestQueueWaiter | None:
+    def _pop_request_queue_waiter_locked(
+        self,
+        accelerator_slots: dict[str, int] | None = None,
+        zero_cost_slots: dict[str, int] | None = None,
+    ) -> _RequestQueueWaiter | None:
         waiters = self._request_queue_waiters_for_instance()
         while waiters:
-            priority = max(waiters)
-            bucket = waiters[priority]
-            sequence = next(iter(bucket))
-            waiter = bucket[sequence]
+            selected: _RequestQueueWaiter | None = None
+            selected_accelerator: str | None = None
+            for priority in sorted(waiters, reverse=True):
+                bucket = waiters[priority]
+                if accelerator_slots is None:
+                    selected = bucket[next(iter(bucket))]
+                    break
+                candidates: list[tuple[int, int, _RequestQueueWaiter,
+                                       list[str]]] = []
+                for waiter in bucket.values():
+                    if waiter.abandoned:
+                        candidates.append((0, waiter.sequence, waiter, []))
+                        continue
+                    compatible = getattr(waiter.request,
+                                         _REQUEST_ACCELERATORS_ATTR, None)
+                    ordered_cards = (compatible if compatible is not None else
+                                     tuple(accelerator_slots))
+                    available_cards = [
+                        card for card in ordered_cards
+                        if accelerator_slots.get(card, 0) > 0
+                    ]
+                    if available_cards:
+                        candidates.append(
+                            (len(available_cards), waiter.sequence, waiter,
+                             available_cards))
+                if not candidates:
+                    continue
+                # Most constrained request first within equal numeric
+                # priority; FIFO remains the tie-break. Abandoned entries are
+                # removed eagerly and never consume capacity.
+                _, _, selected, available_cards = min(candidates,
+                                                      key=lambda item: item[:2])
+                if available_cards:
+                    reserved_cards = [
+                        card for card in available_cards
+                        if (zero_cost_slots or {}).get(card, 0) > 0
+                    ]
+                    selected_accelerator = (reserved_cards[0] if reserved_cards
+                                            else available_cards[0])
+                break
+            if selected is None:
+                return None
+            waiter = selected
             self._remove_request_queue_waiter_locked(waiter)
             if waiter.abandoned:
                 if not waiter.future.done():
                     waiter.future.set_result(None)
                 continue
+            if selected_accelerator is not None:
+                assert accelerator_slots is not None
+                setattr(waiter.request, _REQUEST_GRANTED_ACCELERATOR_ATTR,
+                        selected_accelerator)
+                accelerator_slots[selected_accelerator] -= 1
+                if (zero_cost_slots is not None and
+                        zero_cost_slots.get(selected_accelerator, 0) > 0):
+                    zero_cost_slots[selected_accelerator] -= 1
             return waiter
         return None
+
+    def _request_queue_fallback_rank_locked(
+        self,
+        compatible: tuple[str, ...],
+        accelerator_slots: dict[str, int],
+    ) -> int:
+        """Rank the best non-ready fallback; larger means more urgent."""
+        hint = self._capacity_hint or {}
+        provisioning = hint.get('provisioning_replicas_by_accelerator', {})
+        free_reserved = hint.get('free_reserved_slots_by_accelerator', {})
+        configured = self._configured_accelerators or compatible
+        cost_order = {card: index for index, card in enumerate(configured)}
+        ranks: list[int] = []
+        for card in compatible:
+            if accelerator_slots.get(card, 0) > 0:
+                continue
+            if int(provisioning.get(card, 0) or 0) > 0:
+                ranks.append(10 + cost_order.get(card, len(cost_order)))
+            elif int(free_reserved.get(card, 0) or 0) > 0:
+                ranks.append(20 + cost_order.get(card, len(cost_order)))
+            elif card in cost_order:
+                # A later configured card is a more expensive cold fallback.
+                ranks.append(30 + cost_order[card])
+        # No alternative is worse than every realizable fallback.
+        return min(ranks) if ranks else 1000
+
+    # Loop-local closures execute synchronously and never escape their tier.
+    # pylint: disable=cell-var-from-loop
+    def _build_request_queue_grant_plan_locked(
+        self,
+        accelerator_slots: dict[str, int],
+        zero_cost_slots: dict[str, int],
+        max_grants: int,
+    ) -> list[tuple[_RequestQueueWaiter, str]]:
+        """Build a maximum-cardinality strict-priority matching plan.
+
+        The loop-local closures execute synchronously and never escape their
+        tier iteration. Each priority tier is grouped by its bounded exact-card
+        compatibility profile and matched against the remaining slots. Within
+        a tier, profiles with fewer actual ready slots and worse non-ready
+        fallback are processed first; FIFO merges profiles that truly tie. The
+        augmenting-path matcher can move an earlier request to another
+        compatible card, but never drops it to admit a later peer.
+        """
+        if max_grants <= 0:
+            return []
+        waiters = self._request_queue_waiters_for_instance()
+        remaining = dict(accelerator_slots)
+        plan: list[tuple[_RequestQueueWaiter, str]] = []
+        configured = self._configured_accelerators or tuple(remaining)
+        card_order = {card: index for index, card in enumerate(configured)}
+
+        for priority in sorted(waiters, reverse=True):
+            tier = [
+                waiter for waiter in waiters[priority].values()
+                if not waiter.abandoned
+            ]
+            tier_grant_limit = min(max_grants - len(plan),
+                                   sum(remaining.values()))
+            if tier_grant_limit <= 0:
+                break
+
+            def compatible_cards(
+                    waiter: _RequestQueueWaiter) -> tuple[str, ...]:
+                compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
+                                     None)
+                if compatible is None:
+                    return tuple(configured)
+                allowed = set(compatible)
+                return tuple(card for card in configured if card in allowed)
+
+            # All waiters in a profile have identical matching edges. Keep
+            # FIFO only within the bounded profile set and stop retrying a
+            # profile after one waiter cannot augment the current matching.
+            # This avoids traversing an arbitrarily large backlog after every
+            # ready slot is already assigned.
+            profile_waiters: dict[tuple[str, ...],
+                                  list[_RequestQueueWaiter]] = {}
+            for waiter in tier:
+                profile_waiters.setdefault(compatible_cards(waiter),
+                                           []).append(waiter)
+            profile_heap: list[tuple[int, int, int, tuple[str, ...], int]] = []
+            for compatible, queued in profile_waiters.items():
+                first = queued[0]
+                heapq.heappush(
+                    profile_heap,
+                    (sum(remaining.get(card, 0) for card in compatible),
+                     -self._request_queue_fallback_rank_locked(
+                         compatible, remaining), first.sequence, compatible, 0))
+            assignments: dict[int, str] = {}
+            assigned_by_card: dict[str, list[_RequestQueueWaiter]] = {
+                card: [] for card in remaining
+            }
+
+            def card_preferences(
+                waiter: _RequestQueueWaiter,
+                assigned_by_card: dict[str, list[_RequestQueueWaiter]],
+            ) -> list[str]:
+                cards = [
+                    card for card in compatible_cards(waiter)
+                    if remaining.get(card, 0) > 0
+                ]
+                return sorted(cards,
+                              key=lambda card: (
+                                  0 if len(assigned_by_card[card]) <
+                                  zero_cost_slots.get(card, 0) else 1,
+                                  card_order.get(card, len(card_order)),
+                              ))
+
+            def assign(
+                waiter: _RequestQueueWaiter,
+                seen_cards: set[str],
+                seen_waiters: set[int],
+                assigned_by_card: dict[str, list[_RequestQueueWaiter]],
+                assignments: dict[int, str],
+            ) -> bool:
+                if waiter.sequence in seen_waiters:
+                    return False
+                seen_waiters.add(waiter.sequence)
+                for card in card_preferences(waiter, assigned_by_card):
+                    if card in seen_cards:
+                        continue
+                    seen_cards.add(card)
+                    occupants = assigned_by_card[card]
+                    if len(occupants) < remaining[card]:
+                        occupants.append(waiter)
+                        assignments[waiter.sequence] = card
+                        return True
+                    # Move an already-admitted peer to another compatible
+                    # card to preserve maximum immediate admissions.
+                    for occupant in list(reversed(occupants)):
+                        if assign(occupant, seen_cards, seen_waiters,
+                                  assigned_by_card, assignments):
+                            occupants.remove(occupant)
+                            occupants.append(waiter)
+                            assignments[waiter.sequence] = card
+                            return True
+                return False
+
+            accepted: list[_RequestQueueWaiter] = []
+            while profile_heap and len(accepted) < tier_grant_limit:
+                _, fallback_rank, _, compatible, index = heapq.heappop(
+                    profile_heap)
+                queued = profile_waiters[compatible]
+                waiter = queued[index]
+                if not assign(waiter, set(), set(), assigned_by_card,
+                              assignments):
+                    # A later waiter from this exact profile has the same
+                    # edges and cannot augment an unchanged matching either.
+                    continue
+                accepted.append(waiter)
+                next_index = index + 1
+                if next_index < len(queued):
+                    heapq.heappush(
+                        profile_heap,
+                        (sum(remaining.get(card, 0) for card in compatible),
+                         fallback_rank, queued[next_index].sequence, compatible,
+                         next_index))
+            for waiter in accepted:
+                card = assignments[waiter.sequence]
+                plan.append((waiter, card))
+                remaining[card] -= 1
+                if zero_cost_slots.get(card, 0) > 0:
+                    zero_cost_slots[card] -= 1
+        return plan
+
+    # pylint: enable=cell-var-from-loop
+
+    def _request_queue_accelerator_slots_locked(
+            self) -> tuple[dict[str, int], dict[str, int]] | None:
+        """Return currently dispatchable slots by exact card and cost tier."""
+        configured = self._configured_accelerators
+        if configured is None:
+            return None
+        # Once the controller advertises the exact-card capability, missing
+        # identity is zero compatible capacity, never permission to fall back
+        # to aggregate admission. This fails closed during partial syncs.
+        replica_info = self._replica_info_by_url or {}
+        with self._client_pool_lock:
+            ready_urls = set(self._load_balancing_policy.ready_replicas)
+            if self._queue_uses_async_occupancy():
+                free_by_url = self._effective_replica_free_slots_locked()
+            else:
+                in_flight = self._load_balancing_policy.snapshot_in_flight()
+                per_replica_limit = max(
+                    1,
+                    int((self._request_queue_config or
+                         {}).get('max_concurrency_per_replica', 1)))
+                free_by_url = {
+                    url: max(0, per_replica_limit -
+                             (in_flight or {}).get(url, 0)) for url in ready_urls
+                }
+            slots = {accelerator: 0 for accelerator in configured}
+            zero_cost_slots = {accelerator: 0 for accelerator in configured}
+            for url in ready_urls:
+                info = replica_info.get(url, {})
+                accelerator = info.get('gpu_type')
+                free = max(0, int(free_by_url.get(url, 0)))
+                if accelerator not in slots or free <= 0:
+                    continue
+                slots[accelerator] += free
+                if str(info.get('is_zero_cost', '')).lower() == 'true':
+                    zero_cost_slots[accelerator] += free
+        return slots, zero_cost_slots
+
+    def _reserve_immediate_accelerator_locked(self,
+                                              request: fastapi.Request) -> bool:
+        """Reserve one compatible ready-card slot for direct admission."""
+        snapshot = self._request_queue_accelerator_slots_locked()
+        if snapshot is None:
+            # A legacy controller/LB pair has no exact-card catalog. Preserve
+            # its aggregate admission behavior instead of guessing identity.
+            return True
+        accelerator_slots, zero_cost_slots = snapshot
+        compatible = getattr(request, _REQUEST_ACCELERATORS_ATTR, None)
+        configured = self._configured_accelerators or tuple(accelerator_slots)
+        allowed = set(compatible if compatible is not None else configured)
+        available = [
+            card for card in configured
+            if card in allowed and accelerator_slots.get(card, 0) > 0
+        ]
+        if not available:
+            return False
+        selected = next(
+            (card for card in available if zero_cost_slots.get(card, 0) > 0),
+            available[0])
+        setattr(request, _REQUEST_GRANTED_ACCELERATOR_ATTR, selected)
+        return True
+
+    def _request_queue_profiles(self) -> list[dict[str, Any]]:
+        """Return bounded queue counts by priority and compatibility set."""
+        configured = self._configured_accelerators
+        if configured is None:
+            return []
+        order = {card: index for index, card in enumerate(configured)}
+        grouped: dict[tuple[int, frozenset[str]], int] = {}
+        for priority, bucket in self._request_queue_waiters_for_instance(
+        ).items():
+            for waiter in bucket.values():
+                if waiter.abandoned:
+                    continue
+                compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
+                                     None)
+                cards = frozenset(
+                    compatible if compatible is not None else configured)
+                grouped[(priority, cards)] = grouped.get(
+                    (priority, cards), 0) + 1
+        return [{
+            'priority': priority,
+            'compatible_accelerators': sorted(
+                cards, key=lambda card: order.get(card, len(order))),
+            'count': count,
+        } for (priority, cards), count in sorted(
+            grouped.items(),
+            key=lambda item:
+            (-item[0][0],
+             tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
+               ]
+
+    def _record_request_demand_once(self, request: fastapi.Request) -> None:
+        """Commit one legacy/accepted demand event for this LB request."""
+        if vars(request).get(_REQUEST_DEMAND_RECORDED_ATTR, False):
+            return
+        self._request_aggregator.add(request)
+        setattr(request, _REQUEST_DEMAND_RECORDED_ATTR, True)
+
+    def _set_queued_compatibility_demand_support(self, supported: bool) -> None:
+        """Apply controller queue-gauge capability and rollback fallback."""
+        previous = getattr(self, '_queued_compatibility_demand_supported',
+                           False)
+        self._queued_compatibility_demand_supported = supported
+        if not previous or supported:
+            return
+        # A controller rollback can happen while requests are already waiting.
+        # Backfill each waiter once into the legacy arrival feed so the old
+        # controller can still cold-start compatible capacity. Request-local
+        # idempotence prevents a later admission/timeout from counting twice.
+        for bucket in self._request_queue_waiters_for_instance().values():
+            for waiter in bucket.values():
+                if not waiter.abandoned:
+                    self._record_request_demand_once(waiter.request)
+
+    def _in_flight_by_accelerator_locked(self) -> dict[str, int]:
+        """Attribute work to exact cards while holding client-pool lock."""
+        if self._queue_uses_async_occupancy():
+            in_flight_by_url = self._effective_occupancy_locked()
+        else:
+            in_flight_by_url = (
+                self._load_balancing_policy.snapshot_in_flight() or {})
+        result: dict[str, int] = {}
+        for url, count in in_flight_by_url.items():
+            card = (self._replica_info_by_url or {}).get(url,
+                                                         {}).get('gpu_type')
+            if (not isinstance(card, str) or
+                    card not in (self._configured_accelerators or ())):
+                continue
+            result[card] = result.get(card, 0) + max(0, int(count))
+        return result
 
     @staticmethod
     def _resolve_request_queue_waiter_locked(
@@ -955,15 +1489,23 @@ class SkyServeLoadBalancer:
         """Grant available slots by strict priority and FIFO within a tie."""
         if self._waiting_request_count <= 0:
             return
+        for bucket in list(self._request_queue_waiters_for_instance().values()):
+            for waiter in list(bucket.values()):
+                if not waiter.abandoned:
+                    continue
+                self._remove_request_queue_waiter_locked(waiter)
+                self._resolve_request_queue_waiter_locked(waiter)
+        if self._waiting_request_count <= 0:
+            return
         if self._draining or not self._accepts_new_requests():
             while True:
-                waiter = self._pop_request_queue_waiter_locked()
-                if waiter is None:
+                queued_waiter = self._pop_request_queue_waiter_locked()
+                if queued_waiter is None:
                     return
-                waiter.terminal_error = (self._draining_request_error()
-                                         if self._draining else
-                                         self._inactive_role_request_error())
-                self._resolve_request_queue_waiter_locked(waiter)
+                queued_waiter.terminal_error = (
+                    self._draining_request_error()
+                    if self._draining else self._inactive_role_request_error())
+                self._resolve_request_queue_waiter_locked(queued_waiter)
 
         if self._request_queue_config is None:
             # A live update disabled queueing. Preserve the existing unbounded
@@ -972,11 +1514,28 @@ class SkyServeLoadBalancer:
         else:
             dispatch_limit, _ = self._request_queue_limits()
             available = max(0, dispatch_limit - self._current_dispatch_load())
+        if available <= 0:
+            return
+        slot_snapshot = (self._request_queue_accelerator_slots_locked()
+                         if self._request_queue_config is not None else None)
+        accelerator_slots, zero_cost_slots = (slot_snapshot if slot_snapshot
+                                              is not None else (None, None))
+        if accelerator_slots is not None and zero_cost_slots is not None:
+            grant_plan = self._build_request_queue_grant_plan_locked(
+                accelerator_slots, dict(zero_cost_slots), available)
+            for waiter, accelerator in grant_plan:
+                if not self._remove_request_queue_waiter_locked(waiter):
+                    continue
+                setattr(waiter.request, _REQUEST_GRANTED_ACCELERATOR_ATTR,
+                        accelerator)
+                self._grant_request_queue_waiter_locked(waiter)
+            return
         for _ in range(available):
-            waiter = self._pop_request_queue_waiter_locked()
-            if waiter is None:
+            queued_waiter = self._pop_request_queue_waiter_locked(
+                accelerator_slots, zero_cost_slots)
+            if queued_waiter is None:
                 break
-            self._grant_request_queue_waiter_locked(waiter)
+            self._grant_request_queue_waiter_locked(queued_waiter)
 
     async def _notify_request_queue(self) -> None:
         condition = self._request_queue_condition
@@ -1072,12 +1631,18 @@ class SkyServeLoadBalancer:
                     return True
                 dispatch_limit, queue_size = self._request_queue_limits()
                 if (self._waiting_request_count == 0 and
-                        self._current_dispatch_load() < dispatch_limit):
+                        self._current_dispatch_load() < dispatch_limit and
+                        self._reserve_immediate_accelerator_locked(request)):
                     self._active_request_count += 1
                     if self._queue_uses_async_occupancy():
                         self._record_unassigned_occupancy_admission(request)
                     return True
                 if self._waiting_request_count >= queue_size:
+                    # Capacity rejections are real demand even though they
+                    # never enter the queue. Unlike HA drain/inactive
+                    # rejections, recording them helps the controller grow the
+                    # exact compatible fleet instead of hiding overload.
+                    self._record_request_demand_once(request)
                     self._record_rejection(request)
                     raise fastapi.HTTPException(
                         status_code=503,
@@ -1136,6 +1701,7 @@ class SkyServeLoadBalancer:
                     if time.monotonic() >= deadline:
                         self._remove_request_queue_waiter_locked(waiter)
                         self._resolve_request_queue_waiter_locked(waiter)
+                        self._record_request_demand_once(request)
                         self._record_rejection(request)
                         self._dispatch_request_queue_locked()
                         raise self._queue_timeout_error()
@@ -1468,6 +2034,13 @@ class SkyServeLoadBalancer:
                 if seen > cutoff:
                     pruned[key] = (seen, priority)
         self._reject_last_seen = pruned
+        profiles = self._reject_compatibility_by_key
+        if profiles is not None:
+            self._reject_compatibility_by_key = {
+                key: profile
+                for key, profile in profiles.items()
+                if key in pruned
+            }
         return pruned
 
     def _record_rejection(self, request: fastapi.Request) -> None:
@@ -1485,7 +2058,24 @@ class SkyServeLoadBalancer:
             key = f'_headerless_{self._reject_fallback_seq}'
         priority = getattr(request, _REQUEST_PRIORITY_ATTR,
                            constants.LB_REQUEST_PRIORITY_MIN)
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            priority = constants.LB_REQUEST_PRIORITY_MIN
         self._prune_reject_window()[key] = (time.monotonic(), priority)
+        configured = self._configured_accelerators
+        compatible = getattr(request, _REQUEST_ACCELERATORS_ATTR, None)
+        if compatible is None:
+            compatible = configured
+        if (not isinstance(compatible, (list, tuple)) or not compatible or
+                not all(isinstance(card, str) and card for card in compatible)):
+            compatible = None
+        profiles = self._reject_compatibility_by_key
+        if profiles is None:
+            profiles = {}
+            self._reject_compatibility_by_key = profiles
+        if compatible:
+            profiles[key] = (priority, tuple(compatible))
+        else:
+            profiles.pop(key, None)
         request_aggregator = getattr(self, '_request_aggregator', None)
         if request_aggregator is not None:
             request_aggregator.add_rejection()
@@ -1495,6 +2085,31 @@ class SkyServeLoadBalancer:
         key = request.headers.get(constants.LB_JOB_ID_HEADER)
         if key is not None:
             self._prune_reject_window().pop(key, None)
+            profiles = self._reject_compatibility_by_key
+            if profiles is not None:
+                profiles.pop(key, None)
+
+    def _rejected_compatibility_profiles(self) -> list[dict[str, Any]]:
+        """Return the replaceable recent-rejection gauge by exact profile."""
+        retained = self._prune_reject_window()
+        profiles = self._reject_compatibility_by_key or {}
+        cutoff = (time.monotonic() -
+                  constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+        grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
+        for key, (last_seen, _) in retained.items():
+            profile = profiles.get(key)
+            if profile is None:
+                continue
+            count, recent_count = grouped.get(profile, (0, 0))
+            grouped[profile] = (count + 1,
+                                recent_count + int(last_seen > cutoff))
+        return [{
+            'priority': priority,
+            'compatible_accelerators': list(compatible),
+            'count': count,
+            'recent_count': recent_count,
+        } for (priority, compatible), (count, recent_count) in sorted(
+            grouped.items(), key=lambda item: (-item[0][0], item[0][1]))]
 
     async def _request_uses_async_occupancy(self,
                                             request: fastapi.Request) -> bool:
@@ -1777,8 +2392,9 @@ class SkyServeLoadBalancer:
           ready_replicas / in_flight and the occupancy aggregates remain
           admission-facing and observation-gated in logical mode. With
           reserved-capacity fill enabled, idle reserved (zero-cost) machines
-          surface here exclusively by joining the ready set — the platform is
-          intentionally never told about unmaterialized reserved capacity.
+          become admission capacity only by joining the ready set. Fresh free
+          reserved slots may be reported separately as control-plane telemetry,
+          but are never included in materialized_slots or direct admission.
         - target_replicas is the DEMAND-side autoscaler target, not a
           capacity statement: under fill, ready_replicas legitimately
           exceeds it (opportunistic zero-cost supply). Admission must
@@ -2013,6 +2629,10 @@ class SkyServeLoadBalancer:
             # endpoint and contain neither request identifiers nor payloads.
             'local_in_flight': self._active_request_count,
             'request_queue_depth': self._waiting_request_count,
+            'queued_requests_by_compatibility': self._request_queue_profiles(),
+            'rejected_requests_by_compatibility':
+                self._rejected_compatibility_profiles(),
+            'in_flight_by_accelerator': self._in_flight_by_accelerator_locked(),
             'waiting_request_body_bytes': self._waiting_request_body_bytes,
             'request_queue_capacity': request_queue_capacity,
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
@@ -2025,8 +2645,31 @@ class SkyServeLoadBalancer:
             **self._offered_arrival_counts(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
+            'min_replicas_by_accelerator': hint.get(
+                'min_replicas_by_accelerator', {}),
+            'target_replicas_by_accelerator': hint.get(
+                'target_num_replicas_by_accelerator', {}),
+            'demand_target_by_accelerator': hint.get(
+                'demand_target_by_accelerator',
+                hint.get('target_num_replicas_by_accelerator', {})),
+            'ready_replicas_by_accelerator': hint.get(
+                'ready_replicas_by_accelerator', {}),
+            'provisioning_replicas_by_accelerator': hint.get(
+                'provisioning_replicas_by_accelerator', {}),
+            'total_replicas_by_accelerator': hint.get(
+                'total_replicas_by_accelerator', {}),
+            'zero_cost_ready_replicas_by_accelerator': hint.get(
+                'zero_cost_ready_replicas_by_accelerator', {}),
+            'fill_target_by_accelerator': hint.get('fill_target_by_accelerator',
+                                                   {}),
+            'free_reserved_slots_by_accelerator': hint.get(
+                'free_reserved_slots_by_accelerator', {}),
             'max_replicas': max_replicas,
             'configured_max_replicas': configured_max_replicas,
+            'request_accelerator_compatibility_version':
+                (self._request_accelerator_compatibility_version),
+            'configured_accelerators': list(self._configured_accelerators or
+                                            ()),
             'current_capacity': current_capacity,
             'max_capacity': max_capacity,
             'in_flight_capacity': in_flight_capacity,
@@ -2515,6 +3158,10 @@ class SkyServeLoadBalancer:
                 self._request_aggregator.request_history_snapshot())
             request_batch_accepted = False
             sync_payload = {
+                # Catalog/version fence for compatibility gauges. This is the
+                # version of the routing spec already applied by this LB, not
+                # the version the controller may return from this request.
+                'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
                 'request_history_session_id': self._request_history_session_id,
@@ -2531,6 +3178,10 @@ class SkyServeLoadBalancer:
                 'draining_urls': list(self._draining_clients or {}),
                 'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,
+                'queued_requests_by_compatibility':
+                    self._request_queue_profiles(),
+                'rejected_requests_by_compatibility':
+                    self._rejected_compatibility_profiles(),
                 'queue_depth_by_priority':
                     self._queue_depth_priority_snapshot(),
                 'rejected_in_window': self._rejected_in_window(),
@@ -2576,6 +3227,10 @@ class SkyServeLoadBalancer:
                         # conservatively over-counting.
                         request_batch_accepted = True
                         response_json = await response.json()
+                        self._set_queued_compatibility_demand_support(
+                            response_json.get(
+                                'queued_compatibility_demand_supported') is
+                            True)
                         if response_json.get(
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
@@ -2621,7 +3276,6 @@ class SkyServeLoadBalancer:
                         'Controller sync omitted the routing spec; retaining '
                         'the last applied routes and readiness state.')
                     return
-                self._routing_version = service_version
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):
                     # Spurious empty sync: the controller still has READY
@@ -2700,6 +3354,7 @@ class SkyServeLoadBalancer:
                         url for url in ready_replica_urls
                         if url not in quarantined
                     ]
+                    self._replica_info_by_url = dict(replica_info)
                     self._load_balancing_policy.set_ready_replicas(routable)
                     # A re-added url voids any off-ready occupancy sample:
                     # work accepted after the re-add would be invisible in
@@ -2761,6 +3416,11 @@ class SkyServeLoadBalancer:
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
+                # Echo a version only after applying that same response's
+                # routing spec and route/catalog snapshot.  In particular, a
+                # spurious-empty response retains the previous coherent state
+                # and must not advance this fence.
+                self._routing_version = service_version
                 # Cache the controller's capacity hint for /_lb/capacity.
                 # Absence (older controller) resets to None rather than
                 # keeping a stale previous value: readers must see
@@ -3325,6 +3985,8 @@ class SkyServeLoadBalancer:
             raise self._inactive_role_request_error()
         priority = self._parse_request_priority(request)
         setattr(request, _REQUEST_PRIORITY_ATTR, priority)
+        compatible_accelerators = self._parse_request_accelerators(request)
+        setattr(request, _REQUEST_ACCELERATORS_ATTR, compatible_accelerators)
         self._record_offered_arrival(request)
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
@@ -3353,6 +4015,17 @@ class SkyServeLoadBalancer:
             # work without occupying a queue slot.
             if self._request_queue_config is not None:
                 await self._request_body(request)
+            legacy_demand = (not getattr(
+                self, '_queued_compatibility_demand_supported', False) or
+                             self._configured_accelerators is None)
+            if legacy_demand:
+                # Until capability negotiation succeeds, retain the old
+                # pre-admission signal. This is required for a new LB rolled
+                # out before (or rolled back onto) an old controller: the old
+                # controller ignores the replaceable queue gauge. Services
+                # without an exact-card catalog also retain aggregate arrival
+                # scaling because their queue cannot publish card profiles.
+                self._record_request_demand_once(request)
             acquired_slot = await self._acquire_request_slot(request)
             had_admission_slot = acquired_slot
             if acquired_slot:
@@ -3366,6 +4039,11 @@ class SkyServeLoadBalancer:
                 raise self._draining_request_error()
             if not self._accepts_new_requests():
                 raise self._inactive_role_request_error()
+            # Commit arrival/history only after admission and its final role
+            # fence. Waiting work is reported separately as a live queue gauge,
+            # so an empty compatible fleet can still launch without leaving a
+            # phantom arrival behind when this LB drains during admission.
+            self._record_request_demand_once(request)
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
@@ -3416,7 +4094,6 @@ class SkyServeLoadBalancer:
         """Retry loop body, bracketed by the queue-depth gauge above."""
         priority = getattr(request, _REQUEST_PRIORITY_ATTR,
                            constants.LB_REQUEST_PRIORITY_MIN)
-        self._request_aggregator.add(request)
         # TODO(tian): Finetune backoff parameters.
         backoff = common_utils.Backoff(
             initial_backoff=self._retry_initial_backoff_seconds)
@@ -3473,6 +4150,33 @@ class SkyServeLoadBalancer:
                         self._effective_replica_free_slots_locked().items()
                         if url in ready_urls and slots > 0
                     }
+                compatible_accelerators = getattr(request,
+                                                  _REQUEST_ACCELERATORS_ATTR,
+                                                  None)
+                if compatible_accelerators is not None:
+                    ready_urls = set(self._load_balancing_policy.ready_replicas)
+                    granted_accelerator = getattr(
+                        request, _REQUEST_GRANTED_ACCELERATOR_ATTR, None)
+                    requested_cards = ({granted_accelerator}
+                                       if granted_accelerator is not None else
+                                       set(compatible_accelerators))
+                    compatible_urls = {
+                        url for url in ready_urls
+                        if (self._replica_info_by_url or {}
+                           ).get(url, {}).get('gpu_type') in requested_cards
+                    }
+                    # A queue grant is a best-effort reservation against one
+                    # current card. If that exact ready set changed before
+                    # selection, retain the request's full compatibility set
+                    # rather than returning a false 503.
+                    if granted_accelerator is not None and not compatible_urls:
+                        compatible_urls = {
+                            url for url in ready_urls
+                            if (self._replica_info_by_url or {}).get(url, {}).
+                            get('gpu_type') in set(compatible_accelerators)
+                        }
+                    eligible_urls = (compatible_urls if eligible_urls is None
+                                     else eligible_urls & compatible_urls)
                 if eligible_urls is None:
                     ready_replica_url = (
                         self._load_balancing_policy.select_replica(
@@ -3483,6 +4187,11 @@ class SkyServeLoadBalancer:
                             request,
                             exclude=failed_urls,
                             eligible=eligible_urls))
+                # Only the first attempt consumes the queue's card
+                # reservation. Retries may use any compatible exact card.
+                if getattr(request, _REQUEST_GRANTED_ACCELERATOR_ATTR,
+                           None) is not None:
+                    setattr(request, _REQUEST_GRANTED_ACCELERATOR_ATTR, None)
                 if ready_replica_url is not None:
                     occupancy_declared = ready_replica_url in set(
                         self._occupancy_declared_urls or ())

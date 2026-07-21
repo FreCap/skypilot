@@ -39,6 +39,18 @@ const history = {
       capacityTarget: 1,
       readyCapacity: 1,
       provisioningCapacity: 0,
+      replicaUnit: 'logical_slot',
+      acceleratorBreakdown: {
+        configuredAccelerators: ['L4'],
+        minReplicas: { L4: 0 },
+        demandTarget: { L4: 1 },
+        readyCapacity: { L4: 1 },
+        provisioningCapacity: { L4: 0 },
+        totalCapacity: { L4: 1 },
+        zeroCostReadyCapacity: { L4: 1 },
+        fillTarget: { L4: 1 },
+        freeReservedSlots: { L4: 0 },
+      },
       version: 1,
     },
   ],
@@ -90,6 +102,7 @@ function chartRanges() {
   return [
     'Request history chart',
     'Demand pressure chart',
+    'L4 accelerator history chart',
     'Machine history chart',
   ].map((label) => {
     const chart = screen.getByRole('button', { name: label });
@@ -129,10 +142,12 @@ describe('ServeHistorySection', () => {
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
+      { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
     ]);
 
     fireEvent.click(screen.getByRole('button', { name: '12h' }));
     expect(chartRanges()).toEqual([
+      { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
@@ -145,6 +160,7 @@ describe('ServeHistorySection', () => {
       { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },
+      { start: 120, end: 300 },
     ]);
 
     fireEvent.click(screen.getByRole('button', { name: '1h' }));
@@ -152,6 +168,7 @@ describe('ServeHistorySection', () => {
       screen.getByRole('button', { name: 'Machine history chart' })
     );
     expect(chartRanges()).toEqual([
+      { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },
