@@ -1,3 +1,4 @@
+# pyright: reportOptionalMemberAccess=error
 """Utilities for streaming logs from response."""
 
 import asyncio
@@ -457,6 +458,10 @@ async def _tail_log_file(
                 last_status_check_time = current_time
                 req_status = await requests_lib.get_request_status_async(
                     request_id)
+                if req_status is None:
+                    # Retention can delete an old terminal request while an
+                    # already-open stream drains its final log bytes.
+                    break
                 if req_status.status > requests_lib.RequestStatus.RUNNING:
                     # Status can become terminal after our EOF read but before
                     # the producer's final write becomes visible. Drain once
@@ -478,6 +483,11 @@ async def _tail_log_file(
                                 requests_lib.RequestStatus.CANCELLED):
                             request_task = await requests_lib.get_request_async(
                                 request_id, fields=['name', 'should_retry'])
+                            if request_task is None:
+                                # The row can be reclaimed between the status
+                                # and full-row reads. Do not invent retry or
+                                # display-name metadata after it is gone.
+                                break
                             if request_task.should_retry:
                                 buffer.append(
                                     message_utils.encode_payload(
