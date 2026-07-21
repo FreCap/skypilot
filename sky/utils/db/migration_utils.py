@@ -29,7 +29,7 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 _alembic_thread_lock = threading.Lock()
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '022'  # operator notifications
+GLOBAL_USER_STATE_VERSION = '023'  # shared auth sessions
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
