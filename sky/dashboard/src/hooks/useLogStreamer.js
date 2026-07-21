@@ -81,21 +81,25 @@ export function useLogStreamer({
       }, flushIntervalMs);
     };
 
-    const appendProgressLine = (line) => {
-      const processMatch = line.match(/^\(([^)]+)\)/);
-      if (processMatch) {
-        progressMapRef.current.set(processMatch[1], line);
-        setProgressTick((tick) => tick + 1);
-        return;
-      }
-      // Some progress bars (e.g. data processing) do not include a process
-      // prefix; fall back to treating them as regular log lines so they render.
+    const appendBufferedLine = (line) => {
       bufferRef.current.push(line);
       if (bufferRef.current.length > maxRenderLines * 2) {
         bufferRef.current = bufferRef.current.slice(
           bufferRef.current.length - maxRenderLines
         );
       }
+    };
+
+    const appendProgressLine = (line) => {
+      const processMatch = line.match(/^\(([^)]+)\)/);
+      if (processMatch) {
+        progressMapRef.current.set(processMatch[1], line);
+        return true;
+      }
+      // Some progress bars (e.g. data processing) do not include a process
+      // prefix; fall back to treating them as regular log lines so they render.
+      appendBufferedLine(line);
+      return false;
     };
 
     const processChunk = (chunk) => {
@@ -110,6 +114,8 @@ export function useLogStreamer({
         setHasReceivedFirstChunk(true);
       }
 
+      let bufferedLineAdded = false;
+      let progressChanged = false;
       for (const line of newLines) {
         let cleanLine = stripAnsiCodes(line);
         if (shouldDropLogLine(cleanLine)) {
@@ -121,17 +127,25 @@ export function useLogStreamer({
 
         const isProgressBar = /\d+%\s*\|/.test(cleanLine);
         if (isProgressBar) {
-          appendProgressLine(cleanLine);
+          const keyedProgress = appendProgressLine(cleanLine);
+          progressChanged = progressChanged || keyedProgress;
+          bufferedLineAdded = bufferedLineAdded || !keyedProgress;
         } else {
-          bufferRef.current.push(cleanLine);
-          if (bufferRef.current.length > maxRenderLines * 2) {
-            bufferRef.current = bufferRef.current.slice(
-              bufferRef.current.length - maxRenderLines
-            );
-          }
+          appendBufferedLine(cleanLine);
+          bufferedLineAdded = true;
         }
       }
-      scheduleFlush();
+      if (progressChanged) {
+        const progressLineLimit = Math.max(0, maxRenderLines);
+        while (progressMapRef.current.size > progressLineLimit) {
+          const oldestProcess = progressMapRef.current.keys().next().value;
+          progressMapRef.current.delete(oldestProcess);
+        }
+        setProgressTick((tick) => tick + 1);
+      }
+      if (bufferedLineAdded) {
+        scheduleFlush();
+      }
     };
 
     setIsLoading(true);
