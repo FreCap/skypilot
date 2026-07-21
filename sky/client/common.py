@@ -120,7 +120,11 @@ def download_logs_from_api_server(
         json=json.loads(body.model_dump_json()),
         stream=True,
         timeout=(API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None))
-    if response.status_code == 200:
+    try:
+        if response.status_code != 200:
+            raise Exception(f'Failed to download logs: '
+                            f'{response.status_code} {response.text}')
+
         remote_home_path = response.headers.get('X-Home-Path')
         if remote_home_path is None:
             raise RuntimeError('/download response missing X-Home-Path header')
@@ -159,9 +163,8 @@ def download_logs_from_api_server(
                             new_path.write_bytes(member_file.read())
 
         return remote2local_path_dict
-    else:
-        raise Exception(
-            f'Failed to download logs: {response.status_code} {response.text}')
+    finally:
+        response.close()
 
 
 # === Upload files to API server ===
