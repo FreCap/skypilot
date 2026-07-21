@@ -4500,6 +4500,72 @@ def test_readiness_projection_is_capped_and_index_headed_at_scale(
     assert 'Limit' in str(plan)
 
 
+def test_profile_history_is_keyset_paginated_and_indexed_at_scale(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_profile_revisions (
+                    id, workspace, profile, revision, desired_generation,
+                    state, config_hash, config_json, physical_manifest_hash,
+                    created_at, updated_at
+                )
+                SELECT md5('scale-profile-' || series::text), 'research',
+                       'history-' || series::text, 1, series, 'SUPERSEDED',
+                       md5('scale-profile-config-' || series::text), '{}',
+                       md5('scale-profile-physical-' || series::text),
+                       series, series
+                FROM generate_series(1, 20000) AS series
+            """))
+        connection.execute(
+            sqlalchemy.text('ANALYZE container_image_profile_revisions'))
+
+    first = topology_state.list_profile_revision_history('research', limit=51)
+    assert len(first) == 51
+    assert first[0].created_at == 20_000
+    after = (first[-1].created_at, first[-1].id)
+    second = topology_state.list_profile_revision_history('research',
+                                                          limit=51,
+                                                          after=after)
+    assert len(second) == 51
+    assert all((record.created_at, record.id) < after for record in second)
+
+    assert topology_state.list_active_profile_revisions(
+        'research', (profile.name, 'not-configured')) == [active]
+    with pytest.raises(ValueError, match='Active profile lookup is invalid'):
+        topology_state.list_active_profile_revisions(
+            'research', tuple(f'profile-{index}' for index in range(129)))
+
+    with image_database.connect() as connection:
+        plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_profile_revisions
+                WHERE workspace = 'research'
+                  AND (created_at, id) < (:created_at, :id)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 51
+            """), {
+                'created_at': after[0],
+                'id': after[1],
+            }).scalars().all()
+        active_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_profile_revisions
+                WHERE workspace = 'research'
+                  AND profile IN (:profile, 'not-configured')
+                  AND state = 'ACTIVE'
+                ORDER BY profile, id
+                LIMIT 2
+            """), {
+                'profile': profile.name,
+            }).scalars().all()
+    assert 'ix_container_image_profile_history' in str(plan)
+    assert 'uq_container_image_profile_active' in str(active_plan)
+
+
 def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

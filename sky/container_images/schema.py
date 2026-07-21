@@ -100,6 +100,8 @@ profile_revisions = sqlalchemy.Table(
                      postgresql_where=sqlalchemy.text("state = 'ACTIVE'")),
     sqlalchemy.Index('ix_container_image_profile_state', 'state', 'updated_at',
                      'id'),
+    sqlalchemy.Index('ix_container_image_profile_history', 'workspace',
+                     'created_at', 'id'),
 )
 
 operations = sqlalchemy.Table(

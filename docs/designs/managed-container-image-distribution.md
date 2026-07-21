@@ -1836,7 +1836,7 @@ GET /images/artifacts/{id}/publications?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/locations?workspace=W&limit=50&cursor=C
 GET /images/artifacts/{id}/demands?workspace=W&limit=50&cursor=C
 GET /images/operations/{id}?workspace=W
-GET /images/profiles?workspace=W
+GET /images/profiles?workspace=W&limit=50&cursor=C
 GET /images/workers?workspace=W&limit=50&cursor=C
 GET /images/readiness?workspace=W
 ```
@@ -1845,9 +1845,13 @@ Reads use opaque versioned keyset cursors bound to workspace and filters. Limit
 is 1 through 100. A cursor from another workspace, filter, profile revision, or
 server version fails closed. Responses bound associations; detail collections
 remain paginated. Profile validation permits at most 128 profiles and 256 targets
-per profile. Readiness counts scan at most 10,001 indexed queue rows per target
-and report `at_least: 10000` above that cap; oldest-age lookup is index-bounded.
-No dashboard read creates a generic request row.
+per profile. Profile-history reads use an indexed, newest-first keyset page and
+never materialize the durable revision history. Capabilities first derive the
+at-most-128 configured and allowed profile names, then query only their ACTIVE
+rows through the partial unique index; it does not scan historical revisions.
+Readiness counts scan at most 10,001 indexed queue rows per target and report
+`at_least: 10000` above that cap; oldest-age lookup is index-bounded. No
+dashboard read creates a generic request row.
 
 The workspace publication feed is required for recovery, not a duplicate
 catalog. A publication that fails while inspecting its source has no artifact
@@ -1981,6 +1985,9 @@ drained and every image table is empty; it is never part of Helm rollback.
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, and inventory claims use their exact partial
   due-time indexes with large terminal or idle populations present;
+- profile-history pagination beyond one page plus PostgreSQL plan evidence that
+  the newest-first workspace query uses its exact keyset index, and capability
+  tests proving it requests only the bounded configured ACTIVE profile set;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
   version-target, controller loss, supersede, generation watermark,
   interrupted terminal confirmation, one-shot request-terminal proof preserved
@@ -2356,3 +2363,14 @@ identity-only private copy marker, and corrects the public YAML examples so
 workload selection cannot be mistaken for publication. Subsequent gates must
 treat this document's V0 and explicit post-v0 sections as the authoritative
 release boundary.
+
+Valid full-feature round 1 at
+`209eb83c2974901e4e90f56dffe67c59c2e4adc1` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the acceptance streak. Codex proved that both capabilities
+and the profile-history endpoint materialized every durable profile revision,
+so repeated qualification could make ordinary Images reads consume memory and
+latency linearly with retained history. This revision separates the two read
+models: capabilities query only the bounded configured ACTIVE set, while the
+operator history endpoint uses an indexed, opaque-cursor keyset page with a
+1-through-100 public limit. The response remains additively compatible through
+the existing version, items, and optional next-cursor envelope.

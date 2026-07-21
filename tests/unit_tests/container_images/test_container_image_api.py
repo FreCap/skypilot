@@ -267,8 +267,9 @@ def test_capabilities_are_metadata_only_and_show_exact_runtime_ids(
         (profile.name, mock.sentinel.policy))
     monkeypatch.setattr(server.config, 'access_bindings',
                         lambda: profile.bindings)
-    monkeypatch.setattr(server.topology_state, 'list_profile_revisions',
-                        lambda _: [_profile_record(profile)])
+    active_lookup = mock.Mock(return_value=[_profile_record(profile)])
+    monkeypatch.setattr(server.topology_state, 'list_active_profile_revisions',
+                        active_lookup)
     view = server.capabilities(_request(), workspace='research')
     assert view.admin and view.publish and view.use
     assert view.default_distribution == profile.name
@@ -277,6 +278,48 @@ def test_capabilities_are_metadata_only_and_show_exact_runtime_ids(
                 if item.name == 'aws-us-west-2')
     assert west.runtime_ids['aws_vm'] == ['us-west-2']
     assert west.runtime_ids['aws_eks'] == ['boltz-west']
+    active_lookup.assert_called_once_with('research', (profile.name,))
+
+
+def test_profile_history_api_is_keyset_paginated_and_query_bounded(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    authority = str(uuid.uuid4())
+    monkeypatch.setattr(pagination.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: authority)
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda request, requested: 'research')
+    records = [
+        dataclasses.replace(_profile_record(profile),
+                            id=str(uuid.uuid4()),
+                            created_at=created_at)
+        for created_at in (30, 20, 10)
+    ]
+    history = mock.Mock(return_value=records)
+    monkeypatch.setattr(server.topology_state, 'list_profile_revision_history',
+                        history)
+
+    page = server.list_profiles(_request(), workspace='research', limit=2)
+
+    assert len(page.items) == 2
+    assert page.next_cursor is not None
+    history.assert_called_once_with('research', limit=3, after=None)
+    after = pagination.decode(page.next_cursor,
+                              scope='profiles',
+                              workspace='research',
+                              filters={})
+    assert after == (records[1].created_at, records[1].id)
+
+    history.reset_mock()
+    history.return_value = []
+    empty = server.list_profiles(_request(),
+                                 workspace='research',
+                                 limit=2,
+                                 cursor=page.next_cursor)
+    assert empty.items == []
+    assert empty.next_cursor is None
+    history.assert_called_once_with('research', limit=3, after=after)
 
 
 def test_catalog_page_is_bounded_and_cursor_is_last_returned_item(

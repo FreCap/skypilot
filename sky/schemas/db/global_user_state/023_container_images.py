@@ -159,6 +159,9 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_profile_state',
                     'container_image_profile_revisions',
                     ['state', 'updated_at', 'id'])
+    op.create_index('ix_container_image_profile_history',
+                    'container_image_profile_revisions',
+                    ['workspace', 'created_at', 'id'])
 
     op.create_table(
         'container_image_operations',

@@ -428,6 +428,29 @@ def get_desired_profile(workspace: str,
     return _profile(row) if row is not None else None
 
 
+def list_active_profile_revisions(
+    workspace: str,
+    profile_names: tuple[str, ...],
+) -> list[ProfileRevisionRecord]:
+    """Returns ACTIVE revisions for one bounded configured profile set."""
+    if (len(profile_names) > 128 or any(
+            not isinstance(name, str) or not name for name in profile_names) or
+            len(set(profile_names)) != len(profile_names)):
+        raise ValueError('Active profile lookup is invalid.')
+    if not profile_names:
+        return []
+    table = schema.profile_revisions
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.workspace == workspace,
+                table.c.profile.in_(profile_names), table.c.state ==
+                models.ImageProfileState.ACTIVE.value).order_by(
+                    table.c.profile,
+                    table.c.id).limit(len(profile_names))).mappings().all()
+    return [_profile(row) for row in rows]
+
+
 def list_qualifying_profiles(*,
                              include_active: bool = False,
                              limit: int = 100) -> list[ProfileRevisionRecord]:
@@ -463,6 +486,27 @@ def list_profile_revisions(
         if not 1 <= limit <= 1001:
             raise ValueError('Profile revision page size is invalid.')
         statement = statement.limit(limit)
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(statement).mappings().all()
+    return [_profile(row) for row in rows]
+
+
+def list_profile_revision_history(
+    workspace: str,
+    *,
+    limit: int = 50,
+    after: tuple[int, str] | None = None,
+) -> list[ProfileRevisionRecord]:
+    """Returns one newest-first keyset page of durable profile history."""
+    if not 1 <= limit <= 101:
+        raise ValueError('Internal profile history page size is invalid.')
+    table = schema.profile_revisions
+    statement = sqlalchemy.select(table).where(table.c.workspace == workspace)
+    if after is not None:
+        statement = statement.where(
+            sqlalchemy.tuple_(table.c.created_at, table.c.id) < after)
+    statement = statement.order_by(table.c.created_at.desc(),
+                                   table.c.id.desc()).limit(limit)
     with orm.Session(catalog_state.engine()) as session:
         rows = session.execute(statement).mappings().all()
     return [_profile(row) for row in rows]

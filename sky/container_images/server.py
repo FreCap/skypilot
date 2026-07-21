@@ -375,16 +375,16 @@ def capabilities(request: fastapi.Request,
     publish = _can_publish(request, resolved)
     try:
         policy = config.get_workspace_policy(resolved)
-        active = {
-            revision.profile: revision
-            for revision in topology_state.list_profile_revisions(resolved)
-            if revision.state == models.ImageProfileState.ACTIVE
-        }
         profiles = [
             profile for profile in config.configured_profiles()
             if not policy.allowed_profiles or
             profile.name in policy.allowed_profiles
         ]
+        active = {
+            revision.profile: revision
+            for revision in topology_state.list_active_profile_revisions(
+                resolved, tuple(profile.name for profile in profiles))
+        }
         selected, _ = config.resolve_profile_name(None, resolved)
         bindings = (sorted(
             name for name, binding in config.access_bindings().items()
@@ -695,20 +695,31 @@ def get_operation(operation_id: str,
     return api_models.OperationView.from_record(operation)
 
 
-@router.get('/profiles')
+@router.get('/profiles', response_model=api_models.Page)
 def list_profiles(request: fastapi.Request,
-                  workspace: str | None = None) -> dict[str, Any]:
+                  workspace: str | None = None,
+                  limit: int = 50,
+                  cursor: str | None = None) -> api_models.Page:
     resolved = _resolve_workspace(request, workspace)
+    limit = _limit(limit)
+    filters: dict[str, Any] = {}
+    after = _after(cursor,
+                   scope='profiles',
+                   workspace=resolved,
+                   filters=filters)
     try:
-        records = topology_state.list_profile_revisions(resolved)
+        records = topology_state.list_profile_revision_history(resolved,
+                                                               limit=limit + 1,
+                                                               after=after)
     except RuntimeError as error:
         _api_error(error)
-    return {
-        'version': 1,
-        'items': [
-            api_models.ProfileView.from_record(record) for record in records
-        ],
-    }
+    return _page(records,
+                 limit=limit,
+                 scope='profiles',
+                 workspace=resolved,
+                 filters=filters,
+                 key=lambda item: (item.created_at, item.id),
+                 view=api_models.ProfileView.from_record)
 
 
 @router.get('/workers', response_model=api_models.Page)
