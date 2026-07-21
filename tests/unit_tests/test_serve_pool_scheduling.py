@@ -71,6 +71,27 @@ def test_get_free_worker_resources_uses_grouped_pool_resource_lookup():
     assert free_resources['replica-b'].is_empty()
 
 
+def test_get_free_worker_resources_reuses_provided_cluster_snapshot():
+    replica = _mock_pool_replica(1,
+                                 'replica-a',
+                                 launched_resources=Resources(cpus='8'))
+    cluster_records = {'replica-a': {'handle': object()}}
+    with mock.patch.object(
+            serve_utils.global_user_state,
+            'get_clusters_from_names',
+            side_effect=AssertionError(
+                'duplicate batched cluster read used')), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={'replica-a': Resources(cpus='2')}):
+        free_resources = serve_utils.get_free_worker_resources(
+            'pool-a', replicas=[replica], cluster_records=cluster_records)
+
+    assert free_resources is not None
+    assert float(free_resources['replica-a'].cpus) == pytest.approx(6.0)
+
+
 def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
     busy = _mock_pool_replica(1, 'replica-busy')
     idle = _mock_pool_replica(2, 'replica-idle')
@@ -171,6 +192,10 @@ def test_get_next_cluster_name_skips_resource_scan_without_constraints(
 def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
     constrained = _mock_pool_replica(1, 'replica-constrained')
     roomy = _mock_pool_replica(2, 'replica-roomy')
+    cluster_records = {
+        'replica-constrained': None,
+        'replica-roomy': None,
+    }
     with mock.patch.object(serve_utils,
                            '_get_service_status',
                            return_value={
@@ -186,6 +211,9 @@ def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
          mock.patch.object(serve_state,
                            'get_replica_infos',
                            return_value=[constrained, roomy]), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=cluster_records), \
          mock.patch.object(
              serve_utils,
              'get_free_worker_resources',
@@ -206,9 +234,110 @@ def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
             'pool-a', job_id=23, task_resources=Resources(cpus='2'))
 
     free_resources.assert_called_once_with('pool-a',
-                                           replicas=[constrained, roomy])
+                                           replicas=[constrained, roomy],
+                                           cluster_records=cluster_records)
     assert selected == 'replica-roomy'
     set_cluster.assert_called_once_with(23, 'replica-roomy')
+    set_infra.assert_not_called()
+
+
+def test_get_next_cluster_name_reuses_resource_scan_cluster_snapshot_for_infra(
+):
+    worker = _mock_pool_replica(1,
+                                'replica-a',
+                                launched_resources=Resources(cpus='8'))
+    cluster_record = {'handle': worker.handle.return_value}
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[worker]), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             return_value={
+                 'replica-a': cluster_record
+             }) as get_clusters, \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_handle_from_cluster_name',
+             side_effect=AssertionError(
+                 'post-selection handle reread used')), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={}), \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra') as set_infra:
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=29, task_resources=Resources(cpus='2'))
+
+    assert selected == 'replica-a'
+    get_clusters.assert_called_once_with(['replica-a'])
+    assert worker.handle.call_args_list == [
+        mock.call(cluster_record),
+        mock.call(cluster_record),
+    ]
+    set_cluster.assert_called_once_with(29, 'replica-a')
+    set_infra.assert_called_once_with(29, cloud=None, region=None, zone=None)
+
+
+def test_get_next_cluster_name_does_not_reread_missing_snapshot_for_infra():
+    worker = _mock_pool_replica(1,
+                                'replica-a',
+                                launched_resources=Resources(cpus='8'))
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[worker]), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_clusters_from_names',
+             return_value={
+                 'replica-a': None
+             }) as get_clusters, \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_pool_worker_used_resources_by_cluster',
+             return_value={}), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_nonterminal_job_counts_by_pool',
+             return_value={}), \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra') as set_infra:
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=30, task_resources=Resources(cpus='2'))
+
+    assert selected == 'replica-a'
+    get_clusters.assert_called_once_with(['replica-a'])
+    worker.handle.assert_not_called()
+    set_cluster.assert_called_once_with(30, 'replica-a')
     set_infra.assert_not_called()
 
 
