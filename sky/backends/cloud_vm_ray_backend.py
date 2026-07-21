@@ -1201,6 +1201,11 @@ class RetryingVmProvisioner:
         self._workload_type = workload_type
         self._active_cluster_hash: str | None = None
 
+    @property
+    def active_cluster_hash(self) -> str | None:
+        """Returns the cluster generation owned by this provisioning run."""
+        return self._active_cluster_hash
+
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
             cluster_name: str,
@@ -4072,6 +4077,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # may still have not succeeded. This while loop will then kick
                 # in if retry_until_up is set, which will kick off new "rounds"
                 # of optimization infinitely.
+                retry_provisioner: RetryingVmProvisioner | None = None
                 try:
                     retry_provisioner = RetryingVmProvisioner(
                         self.log_dir,
@@ -4096,6 +4102,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         skip_unnecessary_provisioning)
                     break
                 except exceptions.ResourcesUnavailableError as e:
+                    failed_cluster_hash = (retry_provisioner.active_cluster_hash
+                                           if retry_provisioner is not None else
+                                           None)
                     log_path = os.path.join(self.log_dir, 'provision.log')
 
                     error_message = (
@@ -4116,11 +4125,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                             f'{ux_utils.provision_hint(cluster_name)}'
                             f'{colorama.Style.RESET_ALL}')
 
-                        # Add cluster event for retry.
-                        global_user_state.add_cluster_event(
-                            cluster_name, status_lib.ClusterStatus.INIT,
-                            f'Retrying provisioning after {gap_seconds:.0f}s',
-                            global_user_state.ClusterEventType.STATUS_CHANGE)
+                        # Add cluster event for retry only if this run owns a
+                        # cluster generation.
+                        if failed_cluster_hash is not None:
+                            global_user_state.add_cluster_event(
+                                cluster_name,
+                                status_lib.ClusterStatus.INIT,
+                                f'Retrying provisioning after '
+                                f'{gap_seconds:.0f}s',
+                                global_user_state.ClusterEventType.
+                                STATUS_CHANGE,
+                                existing_cluster_hash=failed_cluster_hash)
 
                         raise exceptions.ExecutionRetryableError(
                             error_message,
@@ -4130,14 +4145,19 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     # Do not remove the stopped cluster from the global state
                     # if failed to start.
                     if not e.no_failover:
-                        global_user_state.add_cluster_event(
-                            cluster_name,
-                            None,
-                            'Provision failed: ' + str(e),
-                            global_user_state.ClusterEventType.STATUS_CHANGE,
-                            nop_if_duplicate=True)
-                        global_user_state.remove_cluster(cluster_name,
-                                                         terminate=True)
+                        if failed_cluster_hash is not None:
+                            global_user_state.add_cluster_event(
+                                cluster_name,
+                                None,
+                                'Provision failed: ' + str(e),
+                                global_user_state.ClusterEventType.
+                                STATUS_CHANGE,
+                                nop_if_duplicate=True,
+                                existing_cluster_hash=failed_cluster_hash)
+                            global_user_state.remove_cluster(
+                                cluster_name,
+                                terminate=True,
+                                existing_cluster_hash=failed_cluster_hash)
                         usage_lib.messages.usage.update_final_cluster_status(
                             None)
                     logger.error(
