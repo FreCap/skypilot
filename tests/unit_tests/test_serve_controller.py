@@ -3125,6 +3125,42 @@ class TestGetCapacityHint:
         assert counts['total_replicas'] == 9
         assert counts['physical_ready_replicas'] == 2
 
+    def test_zero_cost_exact_cards_include_legacy_location_match(self):
+        ctrl = _make_controller()
+        autoscaler = _FakeAutoscaler(target=3,
+                                     recomputed=True,
+                                     latest_version=2)
+        autoscaler.is_replica_on_zero_cost_location = (
+            lambda info: info.replica_id == 1)
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        legacy = _FakeReplicaInfo(1, serve_state.ReplicaStatus.READY, version=2)
+        legacy.is_zero_cost = False
+        persisted = _FakeReplicaInfo(2,
+                                     serve_state.ReplicaStatus.READY,
+                                     version=2)
+        persisted.is_zero_cost = True
+        unknown = _FakeReplicaInfo(3,
+                                   serve_state.ReplicaStatus.READY,
+                                   version=2)
+        unknown.is_zero_cost = False
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://legacy', 'A100-80GB', 1),
+            2: ('http://persisted', 'A100', 1),
+            3: ('http://unknown', 'H100', 1),
+        }
+
+        counts = ctrl._get_replica_counts(  # pylint: disable=protected-access
+            [legacy, persisted, unknown])
+
+        assert counts['zero_cost_ready_replicas_by_accelerator'] == {
+            'A100-80GB': 1,
+            'A100': 1,
+        }
+        assert counts['zero_cost_total_replicas_by_accelerator'] == {
+            'A100-80GB': 1,
+            'A100': 1,
+        }
+
 
 class TestReservedCapacityPollerStart:
     """Poller lifecycle: seeded, idempotent, inert without a placer."""

@@ -512,6 +512,14 @@ Persist the same exact-card values in the existing one-minute
 - hard floor, reserved-fill target, zero-cost ready capacity, and free
   reserved slots by exact accelerator.
 
+Classify zero-cost capacity with the same active reserved-location matcher
+used by the autoscaler's fill overlay. The persisted `is_zero_cost` field
+remains a valid positive provenance signal, but it cannot be the sole source:
+replicas written before that field existed deserialize as false even when
+their concrete placement is still an active zero-cost location. Location
+matching may add that legacy capacity to the exact-card observation, but a
+missing or unknown location must remain unattributed rather than being guessed.
+
 Each object has at most `MAX_COMPATIBILITY_ACCELERATORS` entries. Keys must be
 non-empty exact configured identifiers and values must be nonnegative integers.
 Within a minute, the newest controller observation replaces every map together
@@ -564,6 +572,10 @@ Tests:
 - Add PostgreSQL migration/upsert/serialization tests proving last-observation
   map semantics, empty-map mixed-version compatibility, incarnation fencing,
   retention, and exact `A100` versus `A100-80GB` keys.
+- Add controller coverage proving a legacy replica without persisted
+  `is_zero_cost` provenance is attributed from the autoscaler's exact active
+  reserved-location matcher, while an unknown placement remains
+  unattributed.
 
 Acceptance gate:
 
