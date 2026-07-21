@@ -3,6 +3,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
+import contextlib
 import copy
 import dataclasses
 import enum
@@ -4033,7 +4034,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
     ) -> tuple[CloudVmRayResourceHandle | None, bool]:
-        with lock_events.DistributedLockEvent(lock_id, _CLUSTER_LOCK_TIMEOUT):
+        with contextlib.ExitStack() as lock_stack:
+            lock_stack.enter_context(
+                lock_events.DistributedLockEvent(lock_id,
+                                                 _CLUSTER_LOCK_TIMEOUT))
+            if not dryrun:
+                resource_lock_id = (
+                    backend_utils.cluster_resource_operation_lock_id(
+                        cluster_name))
+                lock_stack.enter_context(
+                    lock_events.DistributedLockEvent(resource_lock_id,
+                                                     _CLUSTER_LOCK_TIMEOUT))
             # Reset spinner message to remove any mention of being blocked
             # by other requests.
             rich_utils.force_update_status(
@@ -5143,6 +5154,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 raise
         lock_id = backend_utils.cluster_status_lock_id(cluster_name)
         lock = locks.get_lock(lock_id, timeout=1)
+        resource_lock_id = backend_utils.cluster_resource_operation_lock_id(
+            cluster_name)
+        resource_lock = locks.get_lock(resource_lock_id, timeout=1)
         # Retry in case new cluster operation comes in and holds the lock
         # right after the lock is removed.
         n_attempts = 2
@@ -5170,17 +5184,19 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             lock.force_unlock()
             try:
                 with lock:
-                    self.teardown_no_lock(
-                        handle,
-                        terminate,
-                        purge,
-                        # When --purge is set and we already see an ID mismatch
-                        # error, we skip the refresh codepath. This is because
-                        # refresh checks current user identity can throw
-                        # ClusterOwnerIdentityMismatchError. The argument/flag
-                        # `purge` should bypass such ID mismatch errors.
-                        refresh_cluster_status=(
-                            not is_identity_mismatch_and_purge))
+                    with resource_lock:
+                        self.teardown_no_lock(
+                            handle,
+                            terminate,
+                            purge,
+                            # When --purge is set and we already see an ID
+                            # mismatch error, we skip the refresh codepath. This
+                            # is because refresh checks current user identity
+                            # can throw ClusterOwnerIdentityMismatchError. The
+                            # argument/flag `purge` should bypass such ID
+                            # mismatch errors.
+                            refresh_cluster_status=(
+                                not is_identity_mismatch_and_purge))
                 if terminate:
                     lock.force_unlock()
                 break
@@ -5189,8 +5205,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                              f'retrying...')
                 if n_attempts <= 0:
                     raise RuntimeError(
-                        f'Cluster {cluster_name!r} is locked by {lock_id}. '
-                        'Check to see if it is still being launched') from e
+                        f'Cluster {cluster_name!r} is locked by {lock_id} or '
+                        f'{resource_lock_id}. Check to see if it is still '
+                        'being launched or torn down') from e
 
     # --- CloudVMRayBackend Specific APIs ---
 
@@ -5883,6 +5900,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         # _LAUNCH_DOUBLE_CHECK_WINDOW in backend_utils.py.
                         force_refresh_statuses={status_lib.ClusterStatus.INIT},
                         cluster_lock_already_held=True,
+                        cluster_resource_lock_already_held=True,
                         retry_if_missing=False))
                 if refreshed_handle is not None:
                     # Use the latest handle from status refresh to avoid acting
@@ -6521,6 +6539,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     # --- Utilities ---
 
+    @context_utils.cancellation_guard
     @timeline.event
     def _check_existing_cluster(
             self,
@@ -6558,6 +6577,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 cluster_name,
                 force_refresh_statuses={status_lib.ClusterStatus.INIT},
                 cluster_lock_already_held=True,
+                cluster_resource_lock_already_held=True,
                 include_user_info=False,
                 summary_response=True,
             )
