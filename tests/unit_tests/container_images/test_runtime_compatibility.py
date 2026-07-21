@@ -13,6 +13,7 @@ import pytest
 
 import sky
 from sky import exceptions
+from sky import resources as resources_lib
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.container_images import catalog_state
@@ -664,6 +665,61 @@ def test_legacy_docker_image_survives_copy_pickle_and_yaml_round_trip() -> None:
     assert copied.container_image_from_legacy_image_id
     assert copied.container_image.ref == 'ubuntu:22.04'
     assert copied.to_yaml_config()['image_id'] == {'docker': 'ubuntu:22.04'}
+
+
+@pytest.mark.parametrize(
+    ('legacy_ref', 'normalized_ref'),
+    [
+        ('MyRegistry.example.com/team/img:tag',
+         'myregistry.example.com/team/img:tag'),
+        ('reg.example.com:443/team/img:tag', 'reg.example.com/team/img:tag'),
+    ],
+)
+def test_pre_v35_legacy_docker_state_normalizes_runtime_reference(
+        legacy_ref: str, normalized_ref: str) -> None:
+    state = sky.Resources().__getstate__()
+    state.update({
+        '_version': 34,
+        '_docker_image': legacy_ref,
+        '_image_id': None,
+    })
+    state.pop('_container_image', None)
+    state.pop('_resolved_container_image', None)
+    state.pop('_container_image_from_legacy_image_id', None)
+
+    restored = sky.Resources.__new__(sky.Resources)
+    restored.__setstate__(state)
+
+    assert restored.container_image is not None
+    assert restored.container_image.ref == normalized_ref
+    assert restored.extract_docker_image() == normalized_ref
+
+
+def test_legacy_docker_copy_does_not_repeat_deprecation_warning(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    warning = mock.Mock()
+    monkeypatch.setattr(resources_lib.logger, 'warning', warning)
+
+    original = sky.Resources(image_id='docker:ubuntu:22.04')
+    copied = original.copy()
+    copied.copy()
+
+    warning.assert_called_once_with(
+        'Using image_id for a Docker image is deprecated. Use '
+        'container_image instead.')
+
+
+def test_legacy_docker_provenance_flag_cannot_suppress_first_warning(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    warning = mock.Mock()
+    monkeypatch.setattr(resources_lib.logger, 'warning', warning)
+
+    sky.Resources(image_id='docker:ubuntu:22.04',
+                  _container_image_from_legacy_image_id=True)
+
+    warning.assert_called_once_with(
+        'Using image_id for a Docker image is deprecated. Use '
+        'container_image instead.')
 
 
 def test_api_61_rejects_only_new_container_image_syntax(

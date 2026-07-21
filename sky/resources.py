@@ -41,6 +41,7 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 DEFAULT_DISK_SIZE_GB = 256
+_LEGACY_CONTAINER_IMAGE_COPY_TOKEN = object()
 
 RESOURCE_CONFIG_ALIASES = {
     'gpus': 'accelerators',
@@ -201,6 +202,7 @@ class Resources:
         _resolved_container_image: (container_images_lib.ResolvedContainerImage
                                     | dict[str, Any] | None) = None,
         _container_image_from_legacy_image_id: bool = False,
+        _legacy_container_image_copy_token: object | None = None,
     ):
         """Initialize a Resources object.
 
@@ -278,10 +280,8 @@ class Resources:
           container_image: the OCI container image to run. A string specifies
             the image source directly. A dict selects immutable content with
             ``ref``, ``release``, or ``artifact_id`` and may choose an allowed
-            registry ``distribution``. The compatibility names ``profile``
-            and ``version`` remain accepted. The legacy
-            ``image_id: docker:...`` form is accepted with a deprecation
-            warning.
+            registry ``distribution``. The legacy ``image_id: docker:...`` form
+            is accepted with a deprecation warning.
 
           disk_size: the size of the OS disk in GiB.
           disk_tier: the disk performance tier to use. If None, defaults to
@@ -474,9 +474,11 @@ class Resources:
             # value-free because image references are an untrusted boundary.
             self._container_image = (container_images_lib.ContainerImage.
                                      from_legacy_ref(legacy_docker_image))
-            logger.warning(
-                'Using image_id for a Docker image is deprecated. Use '
-                'container_image instead.')
+            if (_legacy_container_image_copy_token
+                    is not _LEGACY_CONTAINER_IMAGE_COPY_TOKEN):
+                logger.warning(
+                    'Using image_id for a Docker image is deprecated. Use '
+                    'container_image instead.')
         else:
             self._container_image = None
 
@@ -2491,6 +2493,9 @@ class Resources:
                 '_container_image_from_legacy_image_id',
                 self._container_image_from_legacy_image_id and
                 not container_image_overridden and not image_id_overridden),
+            _legacy_container_image_copy_token=(
+                _LEGACY_CONTAINER_IMAGE_COPY_TOKEN
+                if preserve_legacy_container else None),
             _docker_username_for_runpod=override.pop(
                 '_docker_username_for_runpod',
                 self._docker_username_for_runpod),
@@ -3245,7 +3250,9 @@ class Resources:
                 container_images_lib.ContainerImage.from_legacy_ref(
                     docker_image) if docker_image is not None else None)
             state['_resolved_container_image'] = None
-            state['_docker_image'] = docker_image
+            state['_docker_image'] = (state['_container_image'].ref
+                                      if state['_container_image'] is not None
+                                      else None)
         else:
             container_image = state.get('_container_image')
             if container_image is not None:

@@ -2341,3 +2341,18 @@ forever. This revision adds the exact generated and persisted queue projections
 described above, closes inspection to unbound publications, and preserves
 terminal request evidence while only the age gate is pending. The acceptance
 streak remains reset until both reviewers accept the complete repaired feature.
+
+The first full-feature probe at
+`d230a3ef183639910ce4cfa1dcf18342f87cd9c2` used a contradictory review brief
+that promoted the explicit post-v0 builder and non-AWS managed-registry seams
+into v0 requirements. Codex therefore returned `RESHAPE` for their intentional
+absence, while Fable reviewed the canonical v0 boundary and returned `PURSUE`.
+That probe does not count toward the acceptance streak. Fable also reproduced a
+real legacy-upgrade edge: pre-v35 Docker references whose registry authority is
+canonicalized during unpickle left the raw runtime string inconsistent with the
+new selector. This revision stores the canonical reference on migration, avoids
+repeating the legacy deprecation warning during internal copies through an
+identity-only private copy marker, and corrects the public YAML examples so
+workload selection cannot be mistaken for publication. Subsequent gates must
+treat this document's V0 and explicit post-v0 sections as the authoritative
+release boundary.

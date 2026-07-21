@@ -44,7 +44,7 @@ Below is the configuration syntax and some example values.  See details under ea
     :ref:`max_hourly_cost <yaml-spec-resources-max-hourly-cost>`: 10.0
 
     # Config.
-    :ref:`container_image <yaml-spec-resources-container-image>`: ghcr.io/my-org/model:2026-07-18
+    :ref:`container_image <yaml-spec-resources-container-image>`: ghcr.io/my-org/model@sha256:<64-hex-digest>
     :ref:`image_id <yaml-spec-resources-image-id>`: ami-0868a20f5a3bf9702
     :ref:`ports <yaml-spec-resources-ports>`: 8081
     :ref:`labels <yaml-spec-resources-labels>`:
@@ -772,8 +772,8 @@ The supported fields are:
   mutable tag, first run ``sky image publish <tag> --release <name>`` and use
   the returned release or artifact identity in the workload.
 - ``release``: a workspace-scoped, human-readable immutable alias. Combine it
-  with ``ref`` to bind the alias on first use, or use it alone after the image
-  has been published.
+  with ``ref`` to prove that an existing publication resolves to the same
+  digest, or use it alone after the image has been published.
 - ``artifact_id``: the SkyPilot-generated UUID for an exact catalog artifact.
   It cannot be combined with ``ref`` or ``release``.
 - ``distribution``: an administrator-configured registry profile. Use
