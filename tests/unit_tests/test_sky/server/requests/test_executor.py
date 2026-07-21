@@ -156,9 +156,13 @@ def slow_entrypoint():
     return 'success'
 
 
+async def _wait_for_threading_event(event: threading.Event) -> None:
+    while not event.is_set():
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
-async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
-        isolated_database):
+async def test_execute_request_coroutine_ctx_cancelled_on_cancellation():
     """Test that context is always cancelled when execute_request_coroutine
     is cancelled."""
     _SLOW_ENTRYPOINT_STARTED.clear()
@@ -175,24 +179,38 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         entrypoint=slow_entrypoint,
         request_body=payloads.RequestBody(),
     )
-    await requests_lib.create_if_not_exists_async(request)
 
     # Mock the context and its methods
     mock_ctx = mock.Mock()
     mock_ctx.vars = {}
     mock_ctx.is_canceled.return_value = False
     mock_ctx.cancel.side_effect = _SLOW_ENTRYPOINT_RELEASE.set
+    mock_set_cancelled = mock.AsyncMock()
 
     with mock.patch('sky.utils.context.initialize'), \
-         mock.patch('sky.utils.context.get', return_value=mock_ctx):
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(requests_lib, 'update_status_async',
+                           new_callable=mock.AsyncMock), \
+         mock.patch.object(requests_lib, 'get_request_log_storage_usage',
+                           return_value=mock.Mock(hard_free_bytes=1024)), \
+         mock.patch.object(requests_lib, 'get_request_status_async',
+                           new_callable=mock.AsyncMock,
+                           return_value=requests_lib.StatusWithMsg(
+                               requests_lib.RequestStatus.RUNNING)), \
+         mock.patch.object(requests_lib, 'set_request_cancelled_async',
+                           mock_set_cancelled):
 
         task = executor.execute_request_in_coroutine(request)
 
-        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_STARTED.wait, 1)
+        await asyncio.wait_for(
+            _wait_for_threading_event(_SLOW_ENTRYPOINT_STARTED), timeout=1)
         await task.cancel()
-        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_FINISHED.wait, 1)
+        await asyncio.wait_for(
+            _wait_for_threading_event(_SLOW_ENTRYPOINT_FINISHED), timeout=1)
         # Verify the context is actually cancelled
         mock_ctx.cancel.assert_called()
+        mock_set_cancelled.assert_awaited_once_with(request.request_id)
+        assert task.task.cancelled()
 
 
 @pytest.mark.asyncio
