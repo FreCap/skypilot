@@ -1,3 +1,5 @@
+import io
+import logging
 import unittest
 from unittest import mock
 
@@ -8,6 +10,51 @@ from sky.utils import rich_utils
 
 
 class RichUtilsTest(unittest.TestCase):
+
+    def test_stream_handler_suppresses_closed_capture_stream(self):
+
+        class ClosedCaptureStream:
+            closed = True
+
+            def write(self, message):
+                del message
+                raise ValueError('I/O operation on closed file.')
+
+            def flush(self):
+                pass
+
+        handler = rich_utils.RichSafeStreamHandler(ClosedCaptureStream())
+        logger = logging.Logger('test.closed_stream', level=logging.DEBUG)
+        logger.addHandler(handler)
+        stderr = io.StringIO()
+
+        with mock.patch.object(logging, 'raiseExceptions', True), \
+             mock.patch('sys.stderr', stderr):
+            logger.debug('captured after pytest closed the stream')
+
+        self.assertEqual('', stderr.getvalue())
+
+    def test_stream_handler_reports_other_write_failures(self):
+
+        class FailingStream:
+
+            def write(self, message):
+                del message
+                raise ValueError('different write failure')
+
+            def flush(self):
+                pass
+
+        handler = rich_utils.RichSafeStreamHandler(FailingStream())
+        logger = logging.Logger('test.failing_stream', level=logging.DEBUG)
+        logger.addHandler(handler)
+        stderr = io.StringIO()
+
+        with mock.patch.object(logging, 'raiseExceptions', True), \
+             mock.patch('sys.stderr', stderr):
+            logger.debug('preserve diagnostics')
+
+        self.assertIn('different write failure', stderr.getvalue())
 
     def test_decode_rich_status_with_split_utf8(self):
         """Test that decode_rich_status handles UTF-8 characters split across chunks."""
