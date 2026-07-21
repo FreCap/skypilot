@@ -1187,6 +1187,39 @@ def get_task_name(job_id: int, task_id: int) -> str:
         return task_name[0]
 
 
+@db_retries.retry
+def get_log_stream_context(
+    job_id: int,
+    task_id: int,
+) -> tuple[str | None, str | None, int | None, str | None]:
+    """Return the launch target fields needed to stream one task's logs.
+
+    Pool membership, the current pool cluster, the job ID on that cluster,
+    and the task name must describe one database snapshot. Reading them in
+    separate sessions can mix recovery epochs while a log follower is choosing
+    its target.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        context = session.execute(
+            sqlalchemy.select(
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name,
+                job_info_table.c.job_id_on_pool_cluster,
+                spot_table.c.task_name,
+            ).select_from(
+                spot_table.outerjoin(
+                    job_info_table, job_info_table.c.spot_job_id ==
+                    spot_table.c.spot_job_id)).where(
+                        sqlalchemy.and_(
+                            spot_table.c.spot_job_id == job_id,
+                            spot_table.c.task_id == task_id,
+                        ))).fetchone()
+    if context is None:
+        return None, None, None, None
+    return context[0], context[1], context[2], context[3]
+
+
 def get_latest_job_id() -> int | None:
     """Get the latest job id."""
     engine = _db_manager.get_engine()
