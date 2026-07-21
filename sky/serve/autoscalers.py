@@ -537,6 +537,71 @@ class Autoscaler:
         del info
         return 1
 
+    def _exact_card_fill_shelter(
+        self,
+        zero_cost_infos: list['replica_managers.ReplicaInfo'],
+        fill_target: int,
+    ) -> tuple[dict[str, int], dict[int, str]] | None:
+        """Return per-card scale-down shelter and replica attribution.
+
+        The aggregate fill target overlaps only demand assigned to the same
+        exact reserved card. Existing zero-cost holdings receive the target
+        first, in configured card order, so a demand-only downscale cannot
+        drain one reserved card and immediately refill another. Autoscalers
+        without a complete exact-card view retain the legacy aggregate path.
+        """
+        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        if (not isinstance(demand_target, dict) or
+                not isinstance(configured_shapes, dict) or
+                not configured_shapes):
+            return None
+
+        canonical_by_name = {
+            str(card).casefold(): str(card) for card in configured_shapes
+        }
+        demand_by_card: dict[str, int] = {}
+        for raw_card, raw_target in demand_target.items():
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                return None
+            demand_by_card[card] = max(0, int(raw_target))
+
+        current_by_card: dict[str, int] = {}
+        replica_cards: dict[int, str] = {}
+        for info in zero_cost_infos:
+            location = info.get_spot_location()
+            accelerators = (location.accelerators
+                            if location is not None else None)
+            if not accelerators or len(accelerators) != 1:
+                return None
+            raw_card = next(iter(accelerators))
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                # Old-version or partially launched rows may not have a
+                # trustworthy exact shape. Aggregate shelter is conservative
+                # and avoids inventing an accelerator identity for them.
+                return None
+            replica_cards[info.replica_id] = card
+            current_by_card[card] = (current_by_card.get(card, 0) +
+                                     self._fill_capacity_units(info))
+
+        remaining = max(0, fill_target)
+        fill_by_card: dict[str, int] = {}
+        for card in configured_shapes:
+            canonical = canonical_by_name[str(card).casefold()]
+            allocated = min(remaining, current_by_card.get(canonical, 0))
+            if allocated > 0:
+                fill_by_card[canonical] = allocated
+                remaining -= allocated
+            if remaining <= 0:
+                break
+        shelter = {
+            card: max(0, fill - demand_by_card.get(card, 0))
+            for card, fill in fill_by_card.items()
+        }
+        return shelter, replica_cards
+
     def _apply_reserved_capacity_fill(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -608,6 +673,7 @@ class Autoscaler:
         zero_cost_demand_placed_latest = 0
         num_nonterminal = 0
         num_latest_nonterminal = 0
+        zero_cost_infos: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.is_terminal:
                 continue
@@ -617,6 +683,7 @@ class Autoscaler:
             if is_latest:
                 num_latest_nonterminal += capacity_units
             if self._replica_on_zero_cost_location(info):
+                zero_cost_infos.append(info)
                 zero_cost_count += capacity_units
                 if is_latest:
                     zero_cost_latest += capacity_units
@@ -683,7 +750,9 @@ class Autoscaler:
         # Keep this overlay side-effect free for callers that retain the
         # ordinary decision list for later policy checks.
         result = list(decisions)
-        if surplus_covered > 0:
+        exact_shelter = self._exact_card_fill_shelter(zero_cost_infos,
+                                                      fill_target)
+        if surplus_covered > 0 or exact_shelter is not None:
             # Victim-aware suppression: shelter ONLY scale-downs whose victim
             # replica sits on a zero-cost location, up to the fill surplus.
             # Downs targeting paid replicas always pass through -- fill
@@ -697,7 +766,7 @@ class Autoscaler:
             # surplus must shelter the LEAST-preferred ones (e.g. keep the
             # READY replica serving traffic, not the PROVISIONING one ahead
             # of it in the list). Two passes so output order is preserved.
-            zero_cost_decision_ids = []
+            zero_cost_decisions = []
             for idx, decision in enumerate(decisions):
                 if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
                     assert isinstance(decision.target,
@@ -706,8 +775,23 @@ class Autoscaler:
                         _scale_down_replica_id(decision.target))
                     if (victim is not None and
                             self._replica_on_zero_cost_location(victim)):
-                        zero_cost_decision_ids.append(idx)
-            suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
+                        zero_cost_decisions.append((idx, victim))
+            suppressed_ids: set[int] = set()
+            if exact_shelter is not None:
+                shelter_by_card, replica_cards = exact_shelter
+                remaining_by_card = dict(shelter_by_card)
+                for idx, victim in reversed(zero_cost_decisions):
+                    card = replica_cards[victim.replica_id]
+                    if remaining_by_card.get(card, 0) <= 0:
+                        continue
+                    suppressed_ids.add(idx)
+                    remaining_by_card[card] = max(
+                        0, remaining_by_card[card] -
+                        self._fill_capacity_units(victim))
+            else:
+                suppressed_ids = {
+                    idx for idx, _ in zero_cost_decisions[-surplus_covered:]
+                }
             result = [
                 decision for idx, decision in enumerate(decisions)
                 if idx not in suppressed_ids
