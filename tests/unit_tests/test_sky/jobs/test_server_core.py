@@ -1,5 +1,7 @@
 """Tests for sky.jobs.server.core."""
+# pylint: disable=redefined-outer-name
 from contextlib import ExitStack
+import pickle
 from types import SimpleNamespace
 from unittest import mock
 
@@ -8,6 +10,7 @@ import pytest
 from sky import backends
 from sky import exceptions
 from sky.jobs import runner as managed_job_runner
+from sky.jobs.server import cancellation as jobs_cancellation
 from sky.jobs.server import core as jobs_core
 from sky.utils import controller_utils
 
@@ -67,8 +70,7 @@ def cancellation_gateway():
         )
 
 
-def test_cancel_grpc_projects_job_ids_and_graceful_fields(
-        cancellation_gateway):
+def test_cancel_grpc_projects_job_ids_and_graceful_fields(cancellation_gateway):
     gateway = cancellation_gateway
 
     jobs_core.cancel(job_ids=[7, 9], graceful=True, graceful_timeout=23)
@@ -88,14 +90,20 @@ def test_cancel_grpc_projects_job_ids_and_graceful_fields(
     gateway.current_runner.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ('kwargs', 'field', 'expected'),
-    [
-        ({'name': 'train'}, 'job_name', 'train'),
-        ({'pool': 'workers'}, 'pool_name', 'workers'),
-        ({'all': True}, 'user_hash', 'user-hash-a'),
-        ({'all_users': True}, 'all_users', True),
-    ])
+@pytest.mark.parametrize(('kwargs', 'field', 'expected'), [
+    ({
+        'name': 'train'
+    }, 'job_name', 'train'),
+    ({
+        'pool': 'workers'
+    }, 'pool_name', 'workers'),
+    ({
+        'all': True
+    }, 'user_hash', 'user-hash-a'),
+    ({
+        'all_users': True
+    }, 'all_users', True),
+])
 def test_cancel_grpc_projects_selector(cancellation_gateway, kwargs, field,
                                        expected):
     gateway = cancellation_gateway
@@ -135,12 +143,10 @@ def test_cancel_rejects_missing_selector(cancellation_gateway):
     cancellation_gateway.invoke.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ('output', 'message'),
-    [
-        (None, 'produced no output'),
-        ('Multiple jobs found with name train', 'specify the job ID'),
-    ])
+@pytest.mark.parametrize(('output', 'message'), [
+    (None, 'produced no output'),
+    ('Multiple jobs found with name train', 'specify the job ID'),
+])
 def test_cancel_rejects_invalid_legacy_output(cancellation_gateway, output,
                                               message):
     gateway = cancellation_gateway
@@ -149,6 +155,12 @@ def test_cancel_rejects_invalid_legacy_output(cancellation_gateway, output,
 
     with pytest.raises(RuntimeError, match=message):
         jobs_core.cancel(name='train')
+
+
+def test_cancel_facade_preserves_callable_and_pickle_identity():
+    assert jobs_core.cancel is jobs_cancellation.cancel
+    assert jobs_core.cancel.__module__ == jobs_core.__name__
+    assert pickle.loads(pickle.dumps(jobs_core.cancel)) is jobs_core.cancel
 
 
 def _forwarded_tail(tail):
