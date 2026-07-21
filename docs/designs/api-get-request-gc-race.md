@@ -32,6 +32,10 @@ Enable BasedPyright's `reportOptionalMemberAccess` diagnostic for
 part of this change because the repository still has many unrelated findings,
 primarily from optional dependency adaptors.
 
+Update the line-number-only async-lifecycle baseline for the two unchanged
+`server.py` findings shifted by this guard. The finding codes and messages must
+remain identical.
+
 ## Alternatives
 
 1. Fetch and hold the full row on every poll. This widens each polling query,
@@ -47,7 +51,8 @@ primarily from optional dependency adaptors.
 1. Add a regression test that returns a terminal status and then simulates the
    full request row being deleted.
 2. Add the missing-row guard and the scoped BasedPyright diagnostic.
-3. Run the focused server tests, BasedPyright, Ruff, and repository formatting.
+3. Run the focused server tests, BasedPyright, Ruff, async-lifecycle baseline,
+   and repository formatting.
 
 ## Rollout
 
@@ -61,3 +66,4 @@ server release.
 - Verify the existing successful serialization test remains green.
 - Run the focused server unit-test module.
 - Run BasedPyright against the existing baseline and run Ruff on `sky`.
+- Verify the async-lifecycle output exactly matches its reviewed baseline.
