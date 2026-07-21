@@ -18,7 +18,7 @@ PROFILE_STATES = ('QUALIFYING', 'ACTIVE', 'FAILED', 'SUPERSEDED', 'RETIRED')
 SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
-LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'RECONCILE')
+LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'RECLAIM', 'RECONCILE')
 
 
 def _one_of(column: str, values: tuple[str, ...],
@@ -260,6 +260,9 @@ registry_shards = sqlalchemy.Table(
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('profile', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column(
+        'profile_revision_id', sqlalchemy.Text,
+        sqlalchemy.ForeignKey('container_image_profile_revisions.id')),
     sqlalchemy.Column('target_id', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('provider', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('partition', sqlalchemy.Text, nullable=False),
@@ -267,7 +270,9 @@ registry_shards = sqlalchemy.Table(
     sqlalchemy.Column('region', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('shard_generation', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('shard_index', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('target_fingerprint', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('physical_fingerprint', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('eviction_enabled', sqlalchemy.Boolean, nullable=False),
     sqlalchemy.Column('registry', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('repository_name', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('repository_arn', sqlalchemy.Text, nullable=False),
@@ -393,7 +398,8 @@ locations = sqlalchemy.Table(
         "NULL)",
         name='ck_container_image_location_lease'),
     sqlalchemy.CheckConstraint(
-        "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT')",
+        "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
+        "'RECLAIM')",
         name='ck_container_image_location_lease_kind'),
     sqlalchemy.CheckConstraint(
         "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED')",
@@ -407,6 +413,13 @@ locations = sqlalchemy.Table(
                      'state', 'next_retry_at', 'updated_at', 'id'),
     sqlalchemy.Index('ix_container_image_locations_shard_readiness', 'shard_id',
                      'state', 'updated_at', 'id'),
+    sqlalchemy.Index(
+        'ix_container_image_locations_eviction',
+        'shard_id',
+        'state',
+        sqlalchemy.text('COALESCE(last_used_at, last_verified_at, created_at)'),
+        'id',
+        postgresql_where=sqlalchemy.text('canonical IS FALSE')),
     sqlalchemy.Index('ix_container_image_locations_canonical',
                      'canonical_location_id', 'state', 'id'),
     sqlalchemy.Index('ix_container_image_locations_artifact', 'image_id',

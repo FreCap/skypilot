@@ -440,7 +440,7 @@ Location transitions are:
 | VERIFYING | PENDING | Exact manifest is absent or read is retryable |
 | VERIFYING | FAILED | Exact mismatch or closed permanent error |
 | READY | MISSING | Completed inventory plus exact digest absence |
-| READY | EVICTING | Regional, past retention, and no live demand |
+| READY | EVICTING | Regional, automatic eviction enabled, past the workspace retention anchor, and no live demand |
 | FAILED, MISSING, EVICTED | PENDING | Explicit prepare/retry or new authorized demand |
 | EVICTING | EVICTED | Exact digest absence after delete |
 | EVICTING | READY | Exact digest remains after terminal delete denial |
@@ -697,8 +697,21 @@ so a profile rollout cannot strand an in-flight deployment or reopen old
 capacity.
 
 Eviction treats every WARMING or READY demand as the fence and locks its shard,
-location, and demand state in the canonical order. If demand appears after the
-provider deletion began and exact readback proves absence, completion changes
+location, and demand state in the canonical order. Retention is evaluated per
+workspace from `last_used_at`, or from `last_verified_at`/`created_at` for a
+location that has never been consumed. Thus explicit prepare retains newly
+materialized bytes for the full configured interval. `last_used_at` records
+registry admission, when the READY pull plan is committed, rather than consumer
+termination. A live demand remains an independent hard fence, but once a
+long-lived consumer terminates its location is immediately eligible when the
+interval since its last registry admission has already elapsed. A null
+`regional_cache_retention_weeks` disables new automatic eviction claims for that
+workspace. Each qualified shard persists its physical target fingerprint, exact
+activated profile revision, and current `eviction_enabled` policy, so the global
+SQL queue can exclude disabled targets without scanning locations or searching
+profile history. If demand
+appears after the provider deletion began and exact readback proves absence,
+completion changes
 the location to `PENDING`, preserves its existing capacity reservation, and lets
 the copy queue rematerialize it. It never records READY for absent bytes. If no
 demand exists, exact absence changes the location to `EVICTED`, decrements the
@@ -707,9 +720,11 @@ or explicit retry atomically restores count and bytes before changing an
 EVICTED location to `PENDING`. A provider operation known not to have started may
 restore READY; after provider I/O, only exact presence may do so. Ambiguous
 readback remains fenced in `EVICTING` for another worker. An expired EVICTING
-lease is always reclaimable. If a live demand appeared during the expired
-attempt, the reclaimer performs only an exact presence read: presence restores
-READY and absence requeues PENDING, without deleting bytes the demand now wants.
+lease is always reclaimable and first performs an exact presence read. If no
+demand exists, exact presence may proceed to a newly authorized delete; if
+deletion is now disabled it restores READY. If a live demand appeared during the
+expired attempt, the reclaimer is strictly verify-only: presence restores READY
+and absence requeues PENDING, without deleting bytes the demand now wants.
 
 Consumer terminal or supersede handling writes a tombstone and advances one
 stable-owner generation watermark in the same transaction. Demand creation
@@ -881,6 +896,12 @@ All queue discovery is bounded and indexed by state, retry time, inspection or
 location lease expiry, and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O
 occurs outside the claim transaction. Completion validates the applicable random
 lease token after acquiring the row lock and reading the current clock.
+Global eviction discovery orders the oldest eligible location per shard, then
+locks the shard itself with `SKIP LOCKED` before selecting its location. A busy
+oldest shard therefore cannot stop independent shards, while the shard-before-
+location lock order remains intact. A partial PostgreSQL index over shard,
+state, the effective retention timestamp, and location ID keeps this discovery
+bounded by the fixed shard ring rather than sorting a million-location cache.
 
 Every command that locks more than one participating row uses this order:
 
@@ -1207,6 +1228,17 @@ tags and compares them to the handoff fingerprints. The first complete inventory
 must be empty. Only that live proof may promote the shard to READY and write the
 profile's per-shard attestation. Reingesting a handoff cannot turn a DRIFTED shard
 READY.
+
+The shard row also stores the target fingerprint. Its operational profile-
+revision pointer and automatic-eviction bit remain on the current active values
+(or unset/false before first activation) while another revision is merely
+desired or QUALIFYING. They change only in the same transaction that activates
+the fully attested revision. Copy and lifecycle workers resolve that
+exact ACTIVE or RETIRED snapshot and recheck its target fingerprint against the
+physical shard and location. Inventory qualification remains separately scoped
+to the candidate revision and requires its exact per-shard Terraform
+attestation. A newer same-named target cannot lend credentials or policy to
+bytes in a different repository ring.
 
 A managed target first activates only when every workspace shard and the cleaned
 qualification repository are empty, fingerprints match, and hard ceilings are no

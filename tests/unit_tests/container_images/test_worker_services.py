@@ -367,12 +367,16 @@ def _artifact() -> catalog_state.ArtifactRecord:
 
 
 def _shard(
-        profile: models.ManagedRegistryProfile) -> topology_state.ShardRecord:
-    target = profile.target('aws-us-west-2')
+    profile: models.ManagedRegistryProfile,
+    target_name: str = 'aws-us-west-2',
+    shard_id: str = _SHARD_ID,
+) -> topology_state.ShardRecord:
+    target = profile.target(target_name)
     return topology_state.ShardRecord(
-        id=_SHARD_ID,
+        id=shard_id,
         workspace='research',
         profile=profile.name,
+        profile_revision_id=_REVISION_ID,
         target_id=target.name,
         provider='aws',
         partition='aws',
@@ -380,7 +384,9 @@ def _shard(
         region=target.region,
         shard_generation=0,
         shard_index=0,
+        target_fingerprint=target.target_fingerprint,
         physical_fingerprint='e' * 64,
+        eviction_enabled=(target.delete_authority is not None),
         registry=target.registry,
         repository_name='skypilot/images/west/test/s00',
         repository_arn=(
@@ -402,6 +408,36 @@ def _shard(
         inventory_completed_at=None,
         inventory_lease_token=None,
         inventory_lease_expires_at=None,
+        created_at=10,
+        updated_at=11)
+
+
+def _canonical_location(
+    profile: models.ManagedRegistryProfile,) -> topology_state.LocationRecord:
+    target = profile.canonical
+    digest_ref = f'{target.registry}/skypilot/images/canonical/test/s00@{_DIGEST}'
+    return topology_state.LocationRecord(
+        id='00000000-0000-4000-8000-000000000007',
+        workspace='research',
+        image_id=_ARTIFACT_ID,
+        shard_id='00000000-0000-4000-8000-000000000008',
+        target_fingerprint=target.target_fingerprint,
+        physical_fingerprint='f' * 64,
+        runtime_digest=_DIGEST,
+        canonical=True,
+        canonical_location_id=None,
+        target_ref=digest_ref,
+        state=models.ImageLocationState.READY,
+        lease_kind=None,
+        lease_token=None,
+        lease_expires_at=None,
+        attempt_count=1,
+        next_retry_at=None,
+        error_code=None,
+        last_verified_at=10,
+        last_used_at=None,
+        inventory_epoch_seen=None,
+        reserved_declared_bytes=1000,
         created_at=10,
         updated_at=11)
 
@@ -429,6 +465,24 @@ def _revision(
         max_daily_canary_microusd=5_000_000,
         created_at=10,
         updated_at=11)
+
+
+def _moved_profile(
+    profile: models.ManagedRegistryProfile,) -> models.ManagedRegistryProfile:
+    target = profile.target('aws-us-west-2')
+    moved_target = dataclasses.replace(
+        target, repository_prefix=f'{target.repository_prefix}/next')
+    bindings = tuple(
+        dataclasses.replace(binding,
+                            authority=(
+                                f'arn:aws:iam::{profile.registry_account}:'
+                                'role/SkyPilotImageLifecycleV2')) if binding.
+        id == target.delete_authority else binding
+        for binding in profile.access_bindings)
+    return dataclasses.replace(profile,
+                               revision=profile.revision + 1,
+                               targets=(moved_target,),
+                               access_bindings=bindings)
 
 
 def _copying_location(
@@ -489,15 +543,20 @@ def test_ambiguous_copy_is_verified_before_ready(
     graph = SimpleNamespace(runtime_digest=_DIGEST,
                             config=SimpleNamespace(digest=_CONFIG_DIGEST),
                             platform='linux/amd64')
+    canonical = _canonical_location(profile)
     monkeypatch.setattr(copy_worker_service.catalog_state, 'get_artifact',
                         lambda *_: _artifact())
     monkeypatch.setattr(copy_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
-    monkeypatch.setattr(copy_worker_service.topology_state, 'get_shard',
-                        lambda _: _shard(profile))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_location',
+                        lambda _: canonical)
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'get_shard',
+        lambda shard_id: _shard(profile)
+        if shard_id == location.shard_id else _shard(profile, profile.canonical.
+                                                     name, canonical.shard_id))
     monkeypatch.setattr(copy_worker_service.topology_state,
-                        'list_profile_revisions',
-                        lambda _: [_revision(profile)])
+                        'get_profile_revision', lambda _: _revision(profile))
     transition = mock.Mock(return_value=True)
     monkeypatch.setattr(copy_worker_service.topology_state,
                         'transition_location_to_verifying', transition)
@@ -541,15 +600,20 @@ def test_lost_copy_lease_cannot_mark_location_ready(
     graph = SimpleNamespace(runtime_digest=_DIGEST,
                             config=SimpleNamespace(digest=_CONFIG_DIGEST),
                             platform='linux/amd64')
+    canonical = _canonical_location(profile)
     monkeypatch.setattr(copy_worker_service.catalog_state, 'get_artifact',
                         lambda *_: _artifact())
     monkeypatch.setattr(copy_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
-    monkeypatch.setattr(copy_worker_service.topology_state, 'get_shard',
-                        lambda _: _shard(profile))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_location',
+                        lambda _: canonical)
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'get_shard',
+        lambda shard_id: _shard(profile)
+        if shard_id == location.shard_id else _shard(profile, profile.canonical.
+                                                     name, canonical.shard_id))
     monkeypatch.setattr(copy_worker_service.topology_state,
-                        'list_profile_revisions',
-                        lambda _: [_revision(profile)])
+                        'get_profile_revision', lambda _: _revision(profile))
     monkeypatch.setattr(copy_worker_service.topology_state,
                         'transition_location_to_verifying',
                         mock.Mock(return_value=False))
@@ -590,9 +654,15 @@ def test_copy_maintenance_also_recovers_pending_publication_fanout(
     schedule_canaries.assert_called_once_with()
 
 
+@pytest.mark.parametrize('delete_enabled', [True, False])
 def test_reclaimed_eviction_with_demand_verifies_without_deleting(
-        monkeypatch: pytest.MonkeyPatch,
-        profile: models.ManagedRegistryProfile) -> None:
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        delete_enabled: bool) -> None:
+    if not delete_enabled:
+        profile = dataclasses.replace(profile,
+                                      targets=(dataclasses.replace(
+                                          profile.targets[0],
+                                          delete_authority=None),))
     location = dataclasses.replace(_copying_location(profile),
                                    state=models.ImageLocationState.EVICTING,
                                    lease_kind='VERIFY')
@@ -601,8 +671,7 @@ def test_reclaimed_eviction_with_demand_verifies_without_deleting(
     monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
                         lambda _: _shard(profile))
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
-                        'list_profile_revisions',
-                        lambda _: [_revision(profile)])
+                        'get_profile_revision', lambda _: _revision(profile))
     monkeypatch.setattr(lifecycle_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
     monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
@@ -619,6 +688,115 @@ def test_reclaimed_eviction_with_demand_verifies_without_deleting(
     complete.assert_called_once_with(location.id,
                                      location.lease_token,
                                      present=False)
+
+
+def test_expired_eviction_without_delete_authority_reads_before_restore(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    profile = dataclasses.replace(
+        profile,
+        targets=(dataclasses.replace(profile.targets[0],
+                                     delete_authority=None),))
+    location = dataclasses.replace(_copying_location(profile),
+                                   state=models.ImageLocationState.EVICTING,
+                                   lease_kind='RECLAIM')
+    repository = mock.Mock()
+    repository.exact_manifest_exists.return_value = True
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _: _shard(profile))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_profile_revision', lambda _: _revision(profile))
+    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: repository)
+    complete = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'complete_eviction', complete)
+
+    assert not lifecycle_worker_service.evict_location(location, mock.Mock())
+
+    repository.exact_manifest_exists.assert_called_once_with(
+        location.runtime_digest)
+    repository.delete_outcome.assert_not_called()
+    complete.assert_called_once_with(location.id,
+                                     location.lease_token,
+                                     present=True)
+
+
+def test_eviction_uses_shard_activated_revision(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    old_revision = dataclasses.replace(_revision(profile),
+                                       state=models.ImageProfileState.RETIRED)
+    location = dataclasses.replace(_copying_location(profile),
+                                   state=models.ImageLocationState.EVICTING,
+                                   lease_kind='EVICT')
+    repository = mock.Mock()
+    repository.delete_outcome.return_value = aws.DeleteOutcome.ABSENT
+    roles: list[aws.AwsRoleBinding] = []
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _: _shard(profile))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_profile_revision', lambda _: old_revision)
+    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+
+    def repository_from_role(role: aws.AwsRoleBinding, *_args: object,
+                             **_kwargs: object) -> mock.Mock:
+        roles.append(role)
+        return repository
+
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'complete_eviction', mock.Mock())
+
+    assert lifecycle_worker_service.evict_location(location, mock.Mock())
+    delete_authority = profile.targets[0].delete_authority
+    assert delete_authority is not None
+    assert roles[0].role_arn == profile.bindings[delete_authority].authority
+
+
+def test_copy_and_inventory_resolve_matching_physical_revision(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    moved = _moved_profile(profile)
+    shard = _shard(profile)
+    canonical = _canonical_location(profile)
+    old_key = models.profile_attestation_key('terraform_shard',
+                                             shard.physical_fingerprint)
+    old_revision = dataclasses.replace(
+        _revision(profile),
+        state=models.ImageProfileState.RETIRED,
+        attestations={
+            old_key: {
+                'status': 'READY',
+                'physical_fingerprint': shard.physical_fingerprint,
+            }
+        })
+    new_revision = dataclasses.replace(_revision(moved),
+                                       id='new-revision',
+                                       desired_generation=2)
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'list_profile_revisions',
+        lambda _workspace, **_kwargs: [new_revision, old_revision])
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'get_profile_revision', lambda _: old_revision)
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_location',
+                        lambda _: canonical)
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'get_shard',
+        lambda shard_id: shard if shard_id == _SHARD_ID else _shard(
+            profile, profile.canonical.name, canonical.shard_id))
+
+    resolved = copy_worker_service._profile_for_location(
+        _copying_location(profile), shard)
+    revision, inventory_profile = copy_worker_service._profile_for_shard(shard)
+
+    assert resolved == profile
+    assert revision.id == old_revision.id
+    assert inventory_profile == profile
 
 
 def _dockerconfig_binding() -> models.RegistryAccessBinding:

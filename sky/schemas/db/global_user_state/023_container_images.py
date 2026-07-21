@@ -323,6 +323,9 @@ def _create_tables() -> None:
         sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
         sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('profile', sqlalchemy.Text, nullable=False),
+        sqlalchemy.Column(
+            'profile_revision_id', sqlalchemy.Text,
+            sqlalchemy.ForeignKey('container_image_profile_revisions.id')),
         sqlalchemy.Column('target_id', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('provider', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('partition', sqlalchemy.Text, nullable=False),
@@ -332,8 +335,13 @@ def _create_tables() -> None:
                           sqlalchemy.Integer,
                           nullable=False),
         sqlalchemy.Column('shard_index', sqlalchemy.Integer, nullable=False),
+        sqlalchemy.Column('target_fingerprint', sqlalchemy.Text,
+                          nullable=False),
         sqlalchemy.Column('physical_fingerprint',
                           sqlalchemy.Text,
+                          nullable=False),
+        sqlalchemy.Column('eviction_enabled',
+                          sqlalchemy.Boolean,
                           nullable=False),
         sqlalchemy.Column('registry', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('repository_name', sqlalchemy.Text, nullable=False),
@@ -478,7 +486,8 @@ def _create_tables() -> None:
             "IS NULL)",
             name='ck_container_image_location_lease'),
         sqlalchemy.CheckConstraint(
-            "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT')",
+            "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
+            "'RECLAIM')",
             name='ck_container_image_location_lease_kind'),
         sqlalchemy.CheckConstraint(
             "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED')",
@@ -496,6 +505,14 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_locations_shard_readiness',
                     'container_image_locations',
                     ['shard_id', 'state', 'updated_at', 'id'])
+    op.create_index(
+        'ix_container_image_locations_eviction',
+        'container_image_locations', [
+            'shard_id', 'state',
+            sqlalchemy.text(
+                'COALESCE(last_used_at, last_verified_at, created_at)'), 'id'
+        ],
+        postgresql_where=sqlalchemy.text('canonical IS FALSE'))
     op.create_index('ix_container_image_locations_canonical',
                     'container_image_locations',
                     ['canonical_location_id', 'state', 'id'])

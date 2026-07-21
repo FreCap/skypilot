@@ -54,6 +54,22 @@ def get_workspace_policy(
     return parse_workspace_policy(_workspace_policy_config(workspace))
 
 
+def list_workspace_policies() -> dict[str, models.WorkspaceImagePolicy]:
+    """Returns every explicitly configured workspace image policy."""
+    workspaces = skypilot_config.get_nested(
+        ('workspaces',), default_value={}) or {}
+    if not isinstance(workspaces, dict):
+        raise ValueError('SkyPilot workspaces configuration must be an object.')
+    policies: dict[str, models.WorkspaceImagePolicy] = {}
+    for workspace, workspace_config in workspaces.items():
+        if not isinstance(workspace, str) or not isinstance(
+                workspace_config, dict):
+            raise ValueError('SkyPilot workspace configuration is invalid.')
+        policies[workspace] = parse_workspace_policy(
+            workspace_config.get('container_images'))
+    return policies
+
+
 def _binding_from_config(name: str,
                          value: dict[str, Any]) -> models.RegistryAccessBinding:
     if not isinstance(value, dict):

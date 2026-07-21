@@ -445,6 +445,7 @@ def ingest_terraform_qualification(
                 region=shard.region,
                 shard_generation=shard.shard_generation,
                 shard_index=shard.shard_index,
+                target_fingerprint=target.target_fingerprint,
                 physical_fingerprint=shard.physical_fingerprint,
                 registry=shard.registry,
                 repository_name=shard.repository_name,

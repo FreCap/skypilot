@@ -385,6 +385,49 @@ def _graph_for_location(
     return graph, source_repository.read_blob
 
 
+def _profile_for_location(
+    location: topology_state.LocationRecord,
+    shard: topology_state.ShardRecord,
+) -> models.ManagedRegistryProfile | None:
+    """Finds a qualified snapshot matching every physical copy endpoint."""
+    if (shard.target_fingerprint != location.target_fingerprint or
+            shard.profile_revision_id is None):
+        return None
+    canonical = None
+    canonical_shard = None
+    if not location.canonical:
+        if location.canonical_location_id is None:
+            return None
+        canonical = topology_state.get_location(location.canonical_location_id)
+        if canonical is None:
+            return None
+        canonical_shard = topology_state.get_shard(canonical.shard_id)
+        if (canonical_shard is None or canonical_shard.profile_revision_id
+                != shard.profile_revision_id):
+            return None
+    revision = topology_state.get_profile_revision(shard.profile_revision_id)
+    if (revision is None or revision.workspace != location.workspace or
+            revision.profile != shard.profile or
+            revision.state not in (models.ImageProfileState.ACTIVE,
+                                   models.ImageProfileState.RETIRED)):
+        return None
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        revision.config_snapshot)
+    try:
+        target = profile.target(shard.target_id)
+        if target.target_fingerprint != location.target_fingerprint:
+            return None
+        if canonical is not None and canonical_shard is not None:
+            source = profile.target(canonical_shard.target_id)
+            if (source.target_fingerprint != canonical.target_fingerprint or
+                    canonical_shard.target_fingerprint
+                    != canonical.target_fingerprint):
+                return None
+    except ValueError:
+        return None
+    return profile
+
+
 def copy_location(location: topology_state.LocationRecord,
                   *,
                   limiter: budgets.ProviderBudgetLimiter,
@@ -398,15 +441,9 @@ def copy_location(location: topology_state.LocationRecord,
         shard = topology_state.get_shard(location.shard_id)
         if artifact is None or shard is None:
             raise ValueError('Location artifact or shard is missing.')
-        revisions = topology_state.list_profile_revisions(location.workspace)
-        revision = next((item for item in revisions
-                         if item.profile == shard.profile and item.state in
-                         (models.ImageProfileState.ACTIVE,
-                          models.ImageProfileState.RETIRED)), None)
-        if revision is None:
+        profile = _profile_for_location(location, shard)
+        if profile is None:
             raise ValueError('PROFILE_NOT_ACTIVE')
-        profile = models.ManagedRegistryProfile.from_snapshot(
-            revision.config_snapshot)
         target = profile.target(shard.target_id)
         write_binding = profile.bindings[target.write_authority]
         destination = aws.EcrRepository.from_role(
@@ -484,17 +521,31 @@ def copy_location(location: topology_state.LocationRecord,
 def _profile_for_shard(
     shard: topology_state.ShardRecord,
 ) -> tuple[topology_state.ProfileRevisionRecord, models.ManagedRegistryProfile]:
-    revisions = topology_state.list_profile_revisions(shard.workspace)
-    revision = next((item for item in revisions
-                     if item.profile == shard.profile and item.state in (
-                         models.ImageProfileState.QUALIFYING,
-                         models.ImageProfileState.ACTIVE,
-                         models.ImageProfileState.RETIRED,
-                     )), None)
-    if revision is None:
-        raise ValueError('Registry shard has no usable profile revision.')
-    return revision, models.ManagedRegistryProfile.from_snapshot(
-        revision.config_snapshot)
+    revisions = topology_state.list_profile_revisions(shard.workspace,
+                                                      profile=shard.profile,
+                                                      limit=1001)
+    attestation_key = models.profile_attestation_key('terraform_shard',
+                                                     shard.physical_fingerprint)
+    for revision in revisions:
+        if revision.profile != shard.profile or revision.state not in (
+                models.ImageProfileState.QUALIFYING,
+                models.ImageProfileState.ACTIVE,
+                models.ImageProfileState.RETIRED):
+            continue
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            revision.config_snapshot)
+        try:
+            target = profile.target(shard.target_id)
+        except ValueError:
+            continue
+        expected = revision.attestations.get(attestation_key)
+        if (target.target_fingerprint == shard.target_fingerprint and
+                isinstance(expected, dict) and
+                expected.get('status') == 'READY' and
+                expected.get('physical_fingerprint')
+                == shard.physical_fingerprint):
+            return revision, profile
+    raise ValueError('Registry shard has no matching usable profile revision.')
 
 
 def _expected_shard_attestation(

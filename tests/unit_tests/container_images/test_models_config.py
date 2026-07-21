@@ -151,6 +151,23 @@ def test_workspace_policy_selection_and_allowlist(
         config.resolve_profile_name('unapproved-profile', 'research')
 
 
+def test_list_workspace_policies_preserves_retention_opt_out(
+        monkeypatch: pytest.MonkeyPatch, config_reader) -> None:
+
+    def reader(keys: tuple[str, ...], default_value=None, **kwargs):
+        value = config_reader(keys, default_value, **kwargs)
+        if keys == ('workspaces',):
+            value['research']['container_images'][
+                'regional_cache_retention_weeks'] = None
+        return value
+
+    monkeypatch.setattr(config.skypilot_config, 'get_nested', reader)
+
+    policies = config.list_workspace_policies()
+
+    assert policies['research'].regional_cache_retention_weeks is None
+
+
 def test_managed_preferred_allows_explicit_direct_escape(
         monkeypatch: pytest.MonkeyPatch, config_reader) -> None:
     original = config_reader

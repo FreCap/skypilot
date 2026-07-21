@@ -16,6 +16,7 @@ from sky import global_user_state
 from sky.container_images import aws
 from sky.container_images import budgets
 from sky.container_images import catalog_state
+from sky.container_images import config
 from sky.container_images import demand_state
 from sky.container_images import models
 from sky.container_images import qualification
@@ -55,6 +56,41 @@ def _lifecycle_role(
         profile_tag=profile.name)
 
 
+def _profile_target_for_location(
+    location: topology_state.LocationRecord,
+    shard: topology_state.ShardRecord,
+) -> tuple[models.ManagedRegistryProfile, models.ManagedRegistryTarget] | None:
+    """Resolves a worker snapshot only for the location's physical target."""
+    if (shard.target_fingerprint != location.target_fingerprint or
+            shard.profile_revision_id is None):
+        return None
+    revision = topology_state.get_profile_revision(shard.profile_revision_id)
+    if (revision is None or revision.workspace != location.workspace or
+            revision.profile != shard.profile or
+            revision.state not in (models.ImageProfileState.ACTIVE,
+                                   models.ImageProfileState.RETIRED)):
+        return None
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        revision.config_snapshot)
+    try:
+        target = profile.target(shard.target_id)
+    except ValueError:
+        return None
+    if target.target_fingerprint != location.target_fingerprint:
+        return None
+    return profile, target
+
+
+def _workspace_eviction_cutoffs(now: int) -> dict[str, int | None]:
+    seconds_per_week = 7 * 24 * 60 * 60
+    return {
+        workspace: (
+            None if policy.regional_cache_retention_weeks is None else now -
+            policy.regional_cache_retention_weeks * seconds_per_week
+        ) for workspace, policy in config.list_workspace_policies().items()
+    }
+
+
 def evict_location(location: topology_state.LocationRecord,
                    limiter: budgets.ProviderBudgetLimiter) -> bool:
     token = location.lease_token
@@ -63,24 +99,21 @@ def evict_location(location: topology_state.LocationRecord,
     shard = topology_state.get_shard(location.shard_id)
     if shard is None:
         return False
-    revisions = topology_state.list_profile_revisions(location.workspace)
-    revision = next(
-        (item for item in revisions
-         if item.profile == shard.profile and item.state in
-         (models.ImageProfileState.ACTIVE, models.ImageProfileState.RETIRED)),
-        None)
-    if revision is None:
+    resolved = _profile_target_for_location(location, shard)
+    if resolved is None:
         return False
-    profile = models.ManagedRegistryProfile.from_snapshot(
-        revision.config_snapshot)
-    target = profile.target(shard.target_id)
-    if target.delete_authority is None:
+    profile, target = resolved
+    verify_only = location.lease_kind == 'VERIFY'
+    reclaimed = location.lease_kind == 'RECLAIM'
+    if not verify_only and not reclaimed and target.delete_authority is None:
         topology_state.complete_eviction(location.id,
                                          token,
                                          present=None,
                                          provider_not_called=True)
         return False
-    binding = profile.bindings[target.delete_authority]
+    authority = (target.delete_authority or
+                 target.qualification_delete_authority)
+    binding = profile.bindings[authority]
     repository = aws.EcrRepository.from_role(
         _lifecycle_role(binding, profile),
         shard.region,
@@ -88,9 +121,22 @@ def evict_location(location: topology_state.LocationRecord,
         hooks=aws.EcrCallHooks(
             before_call=lambda: limiter.before_call(shard),
             on_throttle=lambda: limiter.record_throttle(shard)))
-    if location.lease_kind == 'VERIFY':
+    if verify_only or reclaimed:
         manifest_present = repository.exact_manifest_exists(
             location.runtime_digest)
+        if reclaimed and manifest_present and target.delete_authority is not None:
+            outcome = repository.delete_outcome(location.runtime_digest)
+            if outcome == aws.DeleteOutcome.NOT_STARTED:
+                topology_state.complete_eviction(location.id,
+                                                 token,
+                                                 present=True)
+                return False
+            present = (True if outcome == aws.DeleteOutcome.PRESENT else
+                       False if outcome == aws.DeleteOutcome.ABSENT else None)
+            topology_state.complete_eviction(location.id,
+                                             token,
+                                             present=present)
+            return outcome == aws.DeleteOutcome.ABSENT
         topology_state.complete_eviction(location.id,
                                          token,
                                          present=manifest_present)
@@ -357,26 +403,13 @@ def reconcile_failed_canonical_reservations(limiter: budgets.
     for location in topology_state.list_failed_canonical_reap_candidates(
             limit=limit):
         shard = topology_state.get_shard(location.shard_id)
-        if shard is None:
+        if (shard is None or
+                shard.target_fingerprint != location.target_fingerprint):
             continue
-        profile = None
-        target = None
-        for revision in topology_state.list_profile_revisions(
-                location.workspace, limit=1001):
-            if (revision.profile != shard.profile or
-                    revision.state not in (models.ImageProfileState.ACTIVE,
-                                           models.ImageProfileState.RETIRED)):
-                continue
-            candidate_profile = models.ManagedRegistryProfile.from_snapshot(
-                revision.config_snapshot)
-            candidate_target = candidate_profile.target(shard.target_id)
-            if (candidate_target.target_fingerprint ==
-                    location.target_fingerprint):
-                profile = candidate_profile
-                target = candidate_target
-                break
-        if profile is None or target is None:
+        resolved = _profile_target_for_location(location, shard)
+        if resolved is None:
             continue
+        profile, target = resolved
         binding = profile.bindings[target.qualification_delete_authority]
         repository = aws.EcrRepository.from_role(
             _lifecycle_role(binding, profile),
@@ -438,6 +471,8 @@ class LifecycleWorkerService:
         last_consumer_reconciliation = 0
         last_qualification_reconciliation = 0
         last_canonical_reconciliation = 0
+        last_policy_refresh = 0
+        workspace_cutoffs: dict[str, int | None] = {}
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_in_flight,
                 thread_name_prefix='image-lifecycle') as executor:
@@ -488,11 +523,15 @@ class LifecycleWorkerService:
                         self._budget_limiter)
                     futures.add(canonical_future)
                     last_canonical_reconciliation = current
+                if current - last_policy_refresh >= 60:
+                    workspace_cutoffs = _workspace_eviction_cutoffs(current)
+                    last_policy_refresh = current
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = topology_state.claim_next_eviction(
                         worker_id=self.worker_id,
                         unused_before=current - self.retention_seconds,
+                        workspace_unused_before=workspace_cutoffs,
                         lease_seconds=self.lease_seconds,
                         now=current)
                     if claim is None:

@@ -63,6 +63,7 @@ class ShardRecord:
     id: str
     workspace: str
     profile: str
+    profile_revision_id: str | None
     target_id: str
     provider: str
     partition: str
@@ -70,7 +71,9 @@ class ShardRecord:
     region: str
     shard_generation: int
     shard_index: int
+    target_fingerprint: str
     physical_fingerprint: str
+    eviction_enabled: bool
     registry: str
     repository_name: str
     repository_arn: str
@@ -189,6 +192,7 @@ def _shard(row: sqlalchemy.engine.RowMapping) -> ShardRecord:
         id=str(row['id']),
         workspace=str(row['workspace']),
         profile=str(row['profile']),
+        profile_revision_id=row['profile_revision_id'],
         target_id=str(row['target_id']),
         provider=str(row['provider']),
         partition=str(row['partition']),
@@ -196,7 +200,9 @@ def _shard(row: sqlalchemy.engine.RowMapping) -> ShardRecord:
         region=str(row['region']),
         shard_generation=int(row['shard_generation']),
         shard_index=int(row['shard_index']),
+        target_fingerprint=str(row['target_fingerprint']),
         physical_fingerprint=str(row['physical_fingerprint']),
+        eviction_enabled=bool(row['eviction_enabled']),
         registry=str(row['registry']),
         repository_name=str(row['repository_name']),
         repository_arn=str(row['repository_arn']),
@@ -419,11 +425,15 @@ def list_qualifying_profiles(*,
 def list_profile_revisions(
         workspace: str,
         *,
+        profile: str | None = None,
         limit: int | None = None) -> list[ProfileRevisionRecord]:
     statement = sqlalchemy.select(schema.profile_revisions).where(
         schema.profile_revisions.c.workspace == workspace).order_by(
             schema.profile_revisions.c.profile,
             schema.profile_revisions.c.desired_generation.desc())
+    if profile is not None:
+        statement = statement.where(
+            schema.profile_revisions.c.profile == profile)
     if limit is not None:
         if not 1 <= limit <= 1001:
             raise ValueError('Profile revision page size is invalid.')
@@ -534,10 +544,11 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
                            profile: str, target_id: str, provider: str,
                            partition: str, account: str, region: str,
                            shard_generation: int, shard_index: int,
-                           physical_fingerprint: str, registry: str,
-                           repository_name: str, repository_arn: str,
-                           max_manifests: int, max_declared_bytes: int,
-                           max_in_flight: int, now: int) -> ShardRecord:
+                           target_fingerprint: str, physical_fingerprint: str,
+                           registry: str, repository_name: str,
+                           repository_arn: str, max_manifests: int,
+                           max_declared_bytes: int, max_in_flight: int,
+                           now: int) -> ShardRecord:
     """Creates one Terraform-provisioned shard or verifies its immutable facts."""
     table = schema.registry_shards
     identity = (table.c.workspace == workspace, table.c.profile == profile,
@@ -559,7 +570,9 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
             region=region,
             shard_generation=shard_generation,
             shard_index=shard_index,
+            target_fingerprint=target_fingerprint,
             physical_fingerprint=physical_fingerprint,
+            eviction_enabled=False,
             registry=registry,
             repository_name=repository_name,
             repository_arn=repository_arn,
@@ -575,6 +588,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
         'partition': partition,
         'account': account,
         'region': region,
+        'target_fingerprint': target_fingerprint,
         'physical_fingerprint': physical_fingerprint,
         'registry': registry,
         'repository_name': repository_name,
@@ -1363,53 +1377,82 @@ def heartbeat_worker(worker_id: str,
 def claim_next_eviction(*,
                         worker_id: str,
                         unused_before: int,
+                        workspace_unused_before: dict[str, int | None] |
+                        None = None,
                         lease_seconds: int,
                         now: int | None = None) -> LocationRecord | None:
     """Claims one demand-free regional digest after its retention window."""
     current = int(time.time()) if now is None else now
     locations = schema.locations
     demands = schema.demands
-    eligible = sqlalchemy.or_(
-        sqlalchemy.and_(
-            locations.c.state == models.ImageLocationState.READY.value,
-            locations.c.canonical.is_(False),
-            sqlalchemy.or_(locations.c.last_used_at.is_(None),
-                           locations.c.last_used_at < unused_before),
-            ~sqlalchemy.exists().where(
-                demands.c.location_id == locations.c.id,
-                demands.c.state.in_([
-                    models.ImageDemandState.WARMING.value,
-                    models.ImageDemandState.READY.value,
-                ]))),
-        sqlalchemy.and_(
-            locations.c.state == models.ImageLocationState.EVICTING.value,
-            locations.c.lease_expires_at <= current),
-    )
+    age_anchor = sqlalchemy.func.coalesce(locations.c.last_used_at,
+                                          locations.c.last_verified_at,
+                                          locations.c.created_at)
+    workspace_cutoffs = workspace_unused_before or {}
+    for workspace, cutoff in workspace_cutoffs.items():
+        if (not isinstance(workspace, str) or not workspace or
+            (cutoff is not None and
+             (not isinstance(cutoff, int) or isinstance(cutoff, bool)))):
+            raise ValueError('Workspace eviction cutoff is invalid.')
+    if workspace_cutoffs:
+        configured = tuple(workspace_cutoffs)
+        due_conditions = [
+            sqlalchemy.and_(locations.c.workspace == workspace, age_anchor
+                            < cutoff)
+            for workspace, cutoff in workspace_cutoffs.items()
+            if cutoff is not None
+        ]
+        retention_due = sqlalchemy.or_(
+            sqlalchemy.and_(locations.c.workspace.not_in(configured), age_anchor
+                            < unused_before), *due_conditions)
+    else:
+        retention_due = age_anchor < unused_before
+    ready_due = sqlalchemy.and_(
+        locations.c.state == models.ImageLocationState.READY.value,
+        locations.c.canonical.is_(False), retention_due,
+        ~sqlalchemy.exists().where(
+            demands.c.location_id == locations.c.id,
+            demands.c.state.in_([
+                models.ImageDemandState.WARMING.value,
+                models.ImageDemandState.READY.value,
+            ])))
+    expired = sqlalchemy.and_(
+        locations.c.state == models.ImageLocationState.EVICTING.value,
+        locations.c.lease_expires_at <= current)
     token = f'{worker_id}:{uuid.uuid4()}'
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        candidate = session.execute(
-            sqlalchemy.select(locations.c.id, locations.c.shard_id).join(
-                shards, shards.c.id == locations.c.shard_id).where(
-                    eligible,
-                    sqlalchemy.or_(
-                        locations.c.state ==
-                        models.ImageLocationState.EVICTING.value,
-                        shards.c.in_flight < shards.c.max_in_flight)).order_by(
-                            locations.c.last_used_at.asc().nullsfirst(),
-                            locations.c.id).limit(1)).mappings().first()
-        if candidate is None:
-            return None
+        claimable_for_shard = sqlalchemy.or_(
+            sqlalchemy.and_(ready_due, shards.c.eviction_enabled.is_(True),
+                            shards.c.in_flight < shards.c.max_in_flight),
+            expired)
+        shard_locations = sqlalchemy.and_(locations.c.shard_id == shards.c.id,
+                                          claimable_for_shard)
+        oldest_anchor = sqlalchemy.select(age_anchor).where(
+            shard_locations).order_by(
+                age_anchor,
+                locations.c.id).limit(1).correlate(shards).scalar_subquery()
+        oldest_id = sqlalchemy.select(
+            locations.c.id).where(shard_locations).order_by(
+                age_anchor,
+                locations.c.id).limit(1).correlate(shards).scalar_subquery()
         shard = session.execute(
             sqlalchemy.select(shards).where(
-                shards.c.id == candidate['shard_id']).with_for_update(
-                    skip_locked=True)).mappings().first()
+                sqlalchemy.exists().where(shard_locations)).order_by(
+                    oldest_anchor, oldest_id,
+                    shards.c.id).limit(1).with_for_update(
+                        of=shards, skip_locked=True)).mappings().first()
         if shard is None:
             return None
+        ready_claimable = sqlalchemy.and_(
+            ready_due, bool(shard['eviction_enabled']),
+            int(shard['in_flight']) < int(shard['max_in_flight']))
         row = session.execute(
             sqlalchemy.select(locations).where(
-                locations.c.id == candidate['id'],
-                eligible).with_for_update(skip_locked=True)).mappings().first()
+                locations.c.shard_id == shard['id'],
+                sqlalchemy.or_(ready_claimable, expired)).order_by(
+                    age_anchor, locations.c.id).limit(1).with_for_update(
+                        skip_locked=True)).mappings().first()
         if row is None:
             return None
         reclaimed = (str(
@@ -1427,13 +1470,15 @@ def claim_next_eviction(*,
                 ])).limit(1)).first()
         if live_demand is not None and not reclaimed:
             return None
-        # An expired eviction with a new demand must determine the prior
-        # provider outcome without deleting wanted bytes again.
+        # Every expired eviction determines the prior provider outcome first.
+        # A new demand makes that read strictly verify-only.
         verify_only = reclaimed and live_demand is not None
+        lease_kind = ('VERIFY'
+                      if verify_only else 'RECLAIM' if reclaimed else 'EVICT')
         updated = session.execute(
             locations.update().where(locations.c.id == row['id']).values(
                 state=models.ImageLocationState.EVICTING.value,
-                lease_kind='VERIFY' if verify_only else 'EVICT',
+                lease_kind=lease_kind,
                 lease_token=token,
                 lease_expires_at=current + lease_seconds,
                 attempt_count=locations.c.attempt_count + 1,
@@ -1443,6 +1488,7 @@ def claim_next_eviction(*,
             shards.update().where(shards.c.id == row['shard_id']).values(
                 in_flight=(shards.c.in_flight
                            if reclaimed else shards.c.in_flight + 1),
+                last_dispatch_at=current,
                 updated_at=current))
         return _location(updated)
 

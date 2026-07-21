@@ -1098,6 +1098,33 @@ def activate_profile(
                 ])).limit(1)).first()
         if shard_failure is not None:
             raise ValueError('QUALIFICATION_FAILED')
+        configured = models.ManagedRegistryProfile.from_snapshot(
+            json.loads(str(desired['config_json'])))
+        shards = schema.registry_shards
+        targets = (configured.canonical,) + configured.targets
+        shard_count = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(shards).where(
+                shards.c.workspace == desired['workspace'],
+                shards.c.profile == desired['profile'])).scalar_one()
+        if shard_count != sum(target.shard_count for target in targets):
+            raise ValueError('QUALIFICATION_FAILED')
+        session.execute(shards.update().where(
+            shards.c.workspace == desired['workspace'],
+            shards.c.profile == desired['profile']).values(
+                eviction_enabled=False, updated_at=current))
+        for target in targets:
+            changed = session.execute(shards.update().where(
+                shards.c.workspace == desired['workspace'],
+                shards.c.profile == desired['profile'],
+                shards.c.target_id == target.name, shards.c.target_fingerprint
+                == target.target_fingerprint).values(
+                    profile_revision_id=profile_revision_id,
+                    eviction_enabled=(target.delete_authority is not None),
+                    updated_at=current)).rowcount
+            if changed != target.shard_count:
+                raise ValueError('QUALIFICATION_FAILED')
         session.execute(table.update().where(
             table.c.workspace == desired['workspace'],
             table.c.profile == desired['profile'],

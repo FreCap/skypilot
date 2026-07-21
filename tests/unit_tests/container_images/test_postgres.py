@@ -118,35 +118,45 @@ def _activate_profile(
         now=10)
     with orm.Session(engine) as session, session.begin():
         for target in (profile.canonical,) + profile.targets:
-            fingerprint = hashlib.sha256(
-                f'{target.target_fingerprint}:0'.encode()).hexdigest()
-            topology_state.upsert_qualified_shard(
-                session,
-                workspace='research',
-                profile=profile.name,
-                target_id=target.name,
-                provider='aws',
-                partition=profile.partition,
-                account=profile.registry_account,
-                region=target.region,
-                shard_generation=0,
-                shard_index=0,
-                physical_fingerprint=fingerprint,
-                registry=target.registry,
-                repository_name=f'{target.repository_prefix}/test/s00',
-                repository_arn=(f'arn:{profile.partition}:ecr:{target.region}:'
-                                f'{profile.registry_account}:repository/'
-                                f'{target.repository_prefix}/test/s00'),
-                max_manifests=100,
-                max_declared_bytes=1_000_000,
-                max_in_flight=4,
-                now=11)
+            for shard_index in range(target.shard_count):
+                fingerprint = hashlib.sha256(
+                    f'{target.target_fingerprint}:{shard_index}'.encode(
+                    )).hexdigest()
+                repository_name = (
+                    f'{target.repository_prefix}/test/s{shard_index:02x}')
+                topology_state.upsert_qualified_shard(
+                    session,
+                    workspace='research',
+                    profile=profile.name,
+                    target_id=target.name,
+                    provider='aws',
+                    partition=profile.partition,
+                    account=profile.registry_account,
+                    region=target.region,
+                    shard_generation=0,
+                    shard_index=shard_index,
+                    target_fingerprint=target.target_fingerprint,
+                    physical_fingerprint=fingerprint,
+                    registry=target.registry,
+                    repository_name=repository_name,
+                    repository_arn=(
+                        f'arn:{profile.partition}:ecr:{target.region}:'
+                        f'{profile.registry_account}:repository/'
+                        f'{repository_name}'),
+                    max_manifests=100,
+                    max_declared_bytes=1_000_000,
+                    max_in_flight=4,
+                    now=11)
         session.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.workspace == 'research',
             schema.registry_shards.c.profile == profile.name).values(
                 state=models.ImageShardState.READY.value,
                 qualified_at=11,
                 updated_at=11))
+        assert not any(
+            session.execute(
+                sqlalchemy.select(
+                    schema.registry_shards.c.eviction_enabled)).scalars())
     attested = topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind='terraform',
@@ -159,7 +169,7 @@ def _activate_profile(
         terraform_hash='f' * 64,
         now=12)
     assert attested.attestations_hash is not None
-    return transactions.activate_profile(
+    active = transactions.activate_profile(
         profile_revision_id=revision.id,
         expected_generation=revision.desired_generation,
         expected_config_hash=profile.config_hash,
@@ -167,6 +177,15 @@ def _activate_profile(
         expected_attestations_hash=attested.attestations_hash,
         required_attestations={'terraform': None},
         now=13)
+    shards = topology_state.list_shards('research', profile.name)
+    expected_eviction = {
+        target.name: target.delete_authority is not None
+        for target in (profile.canonical,) + profile.targets
+    }
+    assert all(shard.profile_revision_id == active.id and
+               shard.eviction_enabled == expected_eviction[shard.target_id]
+               for shard in shards)
+    return active
 
 
 def _configure_profile(monkeypatch: pytest.MonkeyPatch,
@@ -2089,38 +2108,6 @@ def test_shard_admission_retries_after_locked_home_fills(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     _activate_profile(image_database, profile)
     target = profile.targets[0]
-    with orm.Session(image_database) as session, session.begin():
-        fingerprint = hashlib.sha256(
-            f'{target.target_fingerprint}:1'.encode()).hexdigest()
-        topology_state.upsert_qualified_shard(
-            session,
-            workspace='research',
-            profile=profile.name,
-            target_id=target.name,
-            provider='aws',
-            partition=profile.partition,
-            account=profile.registry_account,
-            region=target.region,
-            shard_generation=0,
-            shard_index=1,
-            physical_fingerprint=fingerprint,
-            registry=target.registry,
-            repository_name=f'{target.repository_prefix}/test/s01',
-            repository_arn=(f'arn:{profile.partition}:ecr:{target.region}:'
-                            f'{profile.registry_account}:repository/'
-                            f'{target.repository_prefix}/test/s01'),
-            max_manifests=100,
-            max_declared_bytes=1_000_000,
-            max_in_flight=4,
-            now=12)
-        session.execute(schema.registry_shards.update().where(
-            schema.registry_shards.c.workspace == 'research',
-            schema.registry_shards.c.profile == profile.name,
-            schema.registry_shards.c.target_id == target.name).values(
-                state=models.ImageShardState.READY.value,
-                qualified_at=12,
-                updated_at=12))
-
     with image_database.connect() as connection:
         ordered_ids = connection.execute(
             sqlalchemy.select(schema.registry_shards.c.id).where(
@@ -2129,8 +2116,8 @@ def test_shard_admission_retries_after_locked_home_fills(
                 schema.registry_shards.c.target_id == target.name).order_by(
                     sqlalchemy.func.md5(schema.registry_shards.c.id + _DIGEST),
                     schema.registry_shards.c.id)).scalars().all()
-    assert len(ordered_ids) == 2
-    home_id, fallback_id = ordered_ids
+    assert len(ordered_ids) == target.shard_count
+    home_id, fallback_id = ordered_ids[:2]
     waiter_started = threading.Event()
     waiter: dict[str, int] = {}
 
@@ -2176,6 +2163,156 @@ def test_shard_admission_retries_after_locked_home_fills(
                 schema.registry_shards.c.id == home_id).values(
                     reserved_manifests=schema.registry_shards.c.max_manifests))
         assert result.result(timeout=5) == fallback_id
+
+
+def test_prepared_location_retention_uses_verified_time_and_workspace_policy(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    assert regional.last_used_at is None
+    assert regional.last_verified_at is not None
+
+    assert topology_state.claim_next_eviction(
+        worker_id='lifecycle-1',
+        unused_before=regional.last_verified_at + 1000,
+        workspace_unused_before={'research': None},
+        lease_seconds=60,
+        now=100) is None
+    assert topology_state.claim_next_eviction(
+        worker_id='lifecycle-1',
+        unused_before=regional.last_verified_at + 1000,
+        workspace_unused_before={'research': regional.last_verified_at},
+        lease_seconds=60,
+        now=100) is None
+
+    claimed = topology_state.claim_next_eviction(
+        worker_id='lifecycle-1',
+        unused_before=0,
+        workspace_unused_before={'research': regional.last_verified_at + 1},
+        lease_seconds=60,
+        now=100)
+    assert claimed is not None and claimed.id == regional.id
+
+
+def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == regional.shard_id).values(
+                eviction_enabled=False))
+    assert topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                              unused_before=1000,
+                                              lease_seconds=60,
+                                              now=100) is None
+
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == regional.shard_id).values(
+                eviction_enabled=True))
+    original = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert original is not None and original.id == regional.id
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == regional.shard_id).values(
+                eviction_enabled=False))
+    reclaimed = topology_state.claim_next_eviction(worker_id='lifecycle-2',
+                                                   unused_before=1000,
+                                                   lease_seconds=60,
+                                                   now=161)
+    assert reclaimed is not None and reclaimed.id == regional.id
+    assert reclaimed.lease_kind == 'RECLAIM'
+
+
+def test_locked_oldest_shard_does_not_block_global_eviction(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, publication_record, canonical, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    assert publication_record.image_id is not None
+    target = profile.targets[0]
+    older_image_id = str(uuid.uuid4())
+    older_location_id = str(uuid.uuid4())
+    physical_fingerprint = hashlib.sha256(
+        f'{target.target_fingerprint}:1'.encode()).hexdigest()
+    with orm.Session(image_database) as session, session.begin():
+        older_shard = topology_state.upsert_qualified_shard(
+            session,
+            workspace='research',
+            profile=profile.name,
+            target_id=target.name,
+            provider='aws',
+            partition=profile.partition,
+            account=profile.registry_account,
+            region=target.region,
+            shard_generation=0,
+            shard_index=1,
+            target_fingerprint=target.target_fingerprint,
+            physical_fingerprint=physical_fingerprint,
+            registry=target.registry,
+            repository_name=f'{target.repository_prefix}/test/s01',
+            repository_arn=(f'arn:{profile.partition}:ecr:{target.region}:'
+                            f'{profile.registry_account}:repository/'
+                            f'{target.repository_prefix}/test/s01'),
+            max_manifests=100,
+            max_declared_bytes=1_000_000,
+            max_in_flight=4,
+            now=1)
+        older_shard_id = older_shard.id
+        session.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == older_shard_id).values(
+                state=models.ImageShardState.READY.value,
+                qualified_at=1,
+                eviction_enabled=True,
+                reserved_manifests=1,
+                reserved_declared_bytes=4096))
+        session.execute(schema.images.insert().values(
+            id=older_image_id,
+            workspace='research',
+            runtime_digest=_OTHER_DIGEST,
+            platform='linux/amd64',
+            config_digest='sha256:' + 'd' * 64,
+            manifest_media_type=_MANIFEST_MEDIA_TYPE,
+            manifest_size_bytes=512,
+            declared_size_bytes=4096,
+            creator_user_hash='1' * 64,
+            producer_kind='external_oci',
+            created_at=1,
+            updated_at=1))
+        session.execute(schema.locations.insert().values(
+            id=older_location_id,
+            workspace='research',
+            image_id=older_image_id,
+            shard_id=older_shard_id,
+            target_fingerprint=target.target_fingerprint,
+            physical_fingerprint=physical_fingerprint,
+            runtime_digest=_OTHER_DIGEST,
+            canonical=False,
+            canonical_location_id=canonical.id,
+            target_ref=(f'{target.registry}/'
+                        f'{target.repository_prefix}/test/s01@{_OTHER_DIGEST}'),
+            state=models.ImageLocationState.READY.value,
+            attempt_count=1,
+            last_verified_at=1,
+            reserved_declared_bytes=4096,
+            created_at=1,
+            updated_at=1))
+
+    with orm.Session(image_database) as blocker, blocker.begin():
+        blocker.execute(
+            sqlalchemy.select(schema.registry_shards.c.id).where(
+                schema.registry_shards.c.id ==
+                older_shard_id).with_for_update()).one()
+        claim = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                   unused_before=1000,
+                                                   lease_seconds=60,
+                                                   now=100)
+    assert claim is not None
+    assert claim.id == regional.id
 
 
 def test_eviction_exact_absence_with_new_demand_requeues_without_release(
