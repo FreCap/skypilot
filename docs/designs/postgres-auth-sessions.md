@@ -87,7 +87,8 @@ full local-state migration.
 1. Add the global-state table and Alembic revision.
 2. Replace direct SQLite auth-session statements with SQLAlchemy transactions.
 3. Add regression tests for shared visibility, atomic consumption, overwrite,
-   expiry, migration creation, and PostgreSQL statement shape.
+   expiry, migration creation, PostgreSQL statement shape, and real-PostgreSQL
+   cross-replica execution.
 4. Run focused auth and migration tests, static analysis, formatting, and the
    complete pull-request check set.
 
@@ -114,6 +115,8 @@ and resumes using the legacy SQLite file. The additive table can remain.
   creation.
 - Compile the upsert and atomic consume statements for PostgreSQL to prevent a
   SQLite-only implementation from passing local tests.
+- Execute shared visibility and concurrent one-time consumption against a real
+  PostgreSQL database through independent engines, matching separate API pods.
 - Run the auth endpoint and session unit tests, global-state migration tests,
   BasedPyright, Ruff async checks, `format.sh`, and all visible PR checks.
 
