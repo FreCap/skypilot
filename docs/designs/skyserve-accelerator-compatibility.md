@@ -1,6 +1,6 @@
 # SkyServe exact-accelerator compatibility, priority, and per-card capacity plan
 
-_Created: 2026-07-19_
+_Created: 2026-07-19. Updated: 2026-07-21._
 
 ## Decision summary
 
@@ -14,7 +14,7 @@ Scheduling and scaling follow these rules:
 4. A request uses already-ready compatible capacity before causing a scale-up, even if that ready capacity is a larger card. Among otherwise-valid ready assignments, prefer reserved/zero-cost replicas before paid replicas so paid capacity can become idle and scale down.
 5. A healthy provisioning replica is committed future capacity, not a routable slot: count it against the target to avoid a duplicate launch. For demand still unmet after ready and committed capacity, launch into a free compatible reserved-capacity slot, then cold-start the cheapest compatible paid card.
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
-7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. The UI shows all three.
+7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. With reserved fill enabled, every fresh broker-granted slot is launched independently of demand while total live and planned capacity remains below the hard `max_replicas` ceiling. The UI shows all three signals.
 8. `A100` and `A100-80GB` are distinct identifiers in validation, queue indexes, metrics, APIs, placement, tests, and UI. Matching may be case-insensitive, but it must never use family, prefix, regex, or memory-suffix normalization.
 
 The priority rule deliberately means that a flexible priority-50 request remains ahead of a constrained priority-20 request. Within the same numeric priority, however, an `A100`-only request has no fallback and therefore gets the next A100 slot ahead of older flexible `L4/A100/H100` work. This preserves the existing strict-priority contract while protecting scarce-card access among peers.
@@ -23,10 +23,12 @@ The priority rule deliberately means that a flexible priority-50 request remains
 
 - SkyPilot merge baseline: `boltz-bio/skypilot` `origin/improvements` at `33074d9e0995028104e711119a5e4d152762a769`.
 - The implementation was synchronized again on 2026-07-21 with
-  `origin/improvements` at `ddb6df245c62e474c117ec25b27631e4d7e616b6`.
+  `origin/improvements` at `ae8388ccdb49fc133b3345feb63ca8584d4d63a7`.
   This includes the production-calibrated simulation runbook from PR #740,
   the bounded consecutive downscale-veto fix from PR #744, and logical versus
-  reserved-fill history from PR #748.
+  reserved-fill history from PR #748. It also includes demand-independent
+  reserved fill, consumed bench-retry admission, one-snapshot pool scheduling,
+  and off-event-loop autoscaler status serialization.
 - PR #748 owns Serve database revision `020`. Exact-accelerator autoscaler
   history therefore uses revision `021`, with `020` as its predecessor. This
   preserves a linear PostgreSQL upgrade path for installations that already
@@ -88,6 +90,27 @@ deployed and a held-out trace includes priority and compatibility dimensions.
 The 30-second duration remains a pressure-conversion horizon; it is not an
 estimate of end-to-end request runtime because live in-flight work is measured
 directly.
+
+### Demand-independent reserved-fill increment
+
+The 2026-07-21 base increment corrects the aggregate reserved-fill overlay and
+is part of this exact-card design:
+
+- A fresh spendable reserved slot is launch intent, not merely a target to
+  compare with traffic demand. The autoscaler emits one zero-cost-only launch
+  for every broker-granted slot that fits under `max_replicas`, even when paid
+  replicas already satisfy a larger demand target.
+- The hard-ceiling budget counts every nonterminal old-version replica plus the
+  greater of latest-version nonterminal capacity and the latest demand target.
+  This reserves room for ordinary demand launches and prevents rolling-update
+  rows from hiding physical occupancy.
+- At `max_replicas`, fill waits for normal autoscaling or lifecycle transitions
+  to create headroom. It does not overlap replicas or evict paid capacity.
+  Generic `cost_rebalance` remains a separate, incompatible policy because its
+  ready-before-drain replacement contract intentionally uses temporary overlap.
+- Freshness damping, pending-row occupancy debit, broker grants, grant epochs,
+  active-location checks, and zero-cost-only launch pinning remain mandatory.
+  The aggregate demand target and capacity hint remain demand-only.
 
 ## Behavioral contract
 
@@ -278,9 +301,11 @@ The control loop exposes three related but different values:
 global demand target = sum(demand target per exact card)
 effective desired per card = max(demand target, reserved-fill target)
 actual replicas = ready + provisioning + other live states
+reserved-fill launch budget = min(fresh granted slots,
+                                  max_replicas - live/planned capacity)
 ```
 
-This keeps global and per-card targets independently understandable without allowing them to contradict each other.
+The effective desired value governs steady-state retention. The launch budget is deliberately independent: a mixed paid/reserved fleet may launch all free reserved slots immediately while paid scale-down is still draining, provided the hard aggregate ceiling has headroom. This keeps global and per-card targets independently understandable without allowing them to contradict each other.
 
 ### Reserved capacity
 
@@ -291,8 +316,10 @@ Reserved capacity is supply, not accelerator identity and not hidden demand.
 - A free compatible reserved slot has zero incremental infrastructure cost and therefore wins before a paid cold start, including when it is a larger card.
 - A healthy ready replica already running on reserved infrastructure wins before an otherwise-equivalent ready paid replica. This makes paid replicas idle sooner so the normal graceful scale-down can remove them; request priority, compatibility matching, and concurrency safety still take precedence.
 - Keep `reserved_capacity_fill` as an optional overlay, reported as `fill_target_by_accelerator` and `free_reserved_slots_by_accelerator`, not folded into demand target.
+- With fill enabled, launch every fresh broker-granted reserved slot that fits under the aggregate `max_replicas` ceiling. Do not suppress launches merely because the demand target is greater than the fill target or because paid replicas currently satisfy demand.
 - With fill enabled, zero-cost serving replicas may intentionally remain above demand/floors; the UI labels them as fill capacity. With fill disabled, idle serving replicas gracefully drain to demand/floors while the underlying reserved physical machines may remain up and appear as free reserved supply. This is expected extra capacity, not a failed scale-down.
 - When demand and fill both want the same exact-card replica, count it once via `max(demand_target, fill_target)`, not by adding both targets.
+- `max_replicas` is a hard aggregate fill ceiling. Count all old-version nonterminal capacity and reserve the latest-version demand plan before emitting fill launches. At the ceiling, retain the observed free-slot intent for a later control cycle instead of launching overlap.
 
 ## Architecture flow
 
@@ -402,6 +429,7 @@ SkyPilot changes:
   may retire once aggregate capacity and every new exact-card target remain
   covered; it does not have to masquerade as a current compatible card.
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
+- In the existing aggregate fill overlay, make free-slot launch emission independent of the demand/fill target ordering while preserving the hard aggregate ceiling across rolling-update versions.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
 - Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
 
@@ -409,6 +437,11 @@ Tests:
 
 - Extend `tests/unit_tests/test_instance_aware_autoscaler.py` and `tests/unit_tests/test_reserved_capacity_fill.py` with empty-fleet cheapest selection, already-ready larger-card selection, healthy-provisioning capacity preventing duplicate launch, timed-out provisioning triggering replanning, free-reserved-before-paid residual scale-out, constrained demand reserving/scaling its exact card, crossed-set fallback-cost allocation, and no double-count of flexible demand.
 - Cover global min greater than floor sum, floor sum greater than calculated demand, max-replica saturation, per-card graceful scale-down, optional fill enabled/disabled, and reserved physical machines remaining after serving replicas drain.
+- Cover a paid fleet satisfying a demand target larger than the reserved
+  target, all fresh granted slots launching into available headroom, planned
+  demand consuming ceiling headroom, and old-version replicas counting against
+  the hard ceiling. Exercise the interaction in both exact-card QPS and
+  concurrency modes.
 - Preserve and expand the existing A100/A100-80GB reserved-pool separation tests.
 - Test that demand and fill replicas on reserved infrastructure both advertise zero-cost provenance to the LB, while a paid replica and a replica with unknown/stale provenance do not receive reserved-first preference.
 - Add controller/LB synchronization tests for service-version changes and stale reserved observations.
@@ -649,6 +682,7 @@ Production checks:
 - A waiter has exactly one lifecycle state and at most one granted card reservation.
 - Sum of compatibility-group demand is total demand; it is not multiplied by compatible-card count.
 - Sum of demand targets by card equals the aggregate demand target. Fill is an overlapping overlay, not added demand.
+- Fresh broker-granted reserved slots are consumed independently of demand-target ordering, but a fill decision never takes total nonterminal plus planned demand capacity above `max_replicas`.
 - Per-card floors are hard for serving replicas; reserved physical machines are supply and do not satisfy a serving floor until a replica is launched.
 - All comparisons use exact canonical IDs. No code path may use `startswith`, hardware regex groups, generic `A100*`, or suffix stripping for compatibility.
 - If exact-card telemetry is missing or stale, do not route or scale on a guessed family. Mark the replica/card unknown, exclude it from compatibility grants, and surface degraded status.
@@ -679,9 +713,10 @@ resources, one with distinct per-card QPS targets and one with
 7. Submit explicit `A100` and `A100-80GB` requests and confirm exact isolation. Submit both together and confirm either exact type is allowed.
 8. Start a compatible replica provisioning and confirm it prevents a duplicate launch without receiving traffic; exceed/fail its startup SLA and confirm reserved/paid residual capacity is replanned.
 9. Set A100 floor zero. Remove A100 demand and confirm paid replicas drain after grace; then repeat with reserved fill enabled and confirm any retained replica is shown as fill, while physical reserved capacity remains separately visible.
-10. Set distinct floors for all cards, drive mixed demand, and reconcile global target, per-card targets, actual states, fill targets, and free reserved slots through API, metrics, and dashboard.
-11. Change the active service version while requests are queued; confirm compatible waiters retain sequence and an emptied intersection receives retryable 503.
-12. Point the platform test client at a pre-capability LB: confirm an omitted field keeps default-all behavior, an explicit subset may spill only to an exact-compatible concrete provider, and otherwise fails closed. Point it at version 1 and confirm each selected fleet receives only its exact non-empty intersection plus the numeric priority header on every retry.
+10. Keep paid replicas above the reserved fill target, expose several fresh broker-granted reserved slots, and confirm every slot launches zero-cost-only without changing the demand target. Repeat near `max_replicas` and confirm only hard-ceiling headroom launches; include old-version draining rows in the ceiling check.
+11. Set distinct floors for all cards, drive mixed demand, and reconcile global target, per-card targets, actual states, fill targets, and free reserved slots through API, metrics, and dashboard.
+12. Change the active service version while requests are queued; confirm compatible waiters retain sequence and an emptied intersection receives retryable 503.
+13. Point the platform test client at a pre-capability LB: confirm an omitted field keeps default-all behavior, an explicit subset may spill only to an exact-compatible concrete provider, and otherwise fails closed. Point it at version 1 and confirm each selected fleet receives only its exact non-empty intersection plus the numeric priority header on every retry.
 
 ## Completion criteria
 

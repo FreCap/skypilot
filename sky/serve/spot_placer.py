@@ -746,6 +746,27 @@ class SpotPlacer:
         return (resolved is not None and
                 self._effective_status(resolved) == LocationStatus.ACTIVE)
 
+    def is_launch_admissible(self, location: Location, *,
+                             selected_at: float | None) -> bool:
+        """Whether a queued placement is still valid for launch admission.
+
+        Selecting an expired bench consumes its one retry by refreshing the
+        bench timestamp before the replica row is created. That specific row
+        remains admissible even though the location is no longer effectively
+        ACTIVE. A bench recorded after the row was selected is newer failure
+        evidence and fences the queued launch.
+        """
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            return False
+        if self._effective_status(resolved) == LocationStatus.ACTIVE:
+            return True
+        if (self.location2status[resolved] != LocationStatus.PREEMPTED or
+                selected_at is None):
+            return False
+        preempted_at = self.location2preempted_at.get(resolved)
+        return preempted_at is not None and preempted_at <= selected_at
+
     def cost_per_hour(self, location: Location) -> float:
         """Return the current cached catalog cost for a known location."""
         resolved = self.resolve_location(location)

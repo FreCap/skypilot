@@ -156,6 +156,7 @@ export function useManagedJobsPageData() {
   const initialLoadRef = useRef(true);
   const jobsRefreshRef = useRef(null);
   const poolsRefreshRef = useRef(null);
+  const refreshInFlightRef = useRef(null);
   const [poolsData, setPoolsData] = useState([]);
   const [preloadingComplete, setPreloadingComplete] = useState(false);
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
@@ -228,15 +229,28 @@ export function useManagedJobsPageData() {
       requestVersionRef.current += 1;
       jobsRefreshRef.current = null;
       poolsRefreshRef.current = null;
+      refreshInFlightRef.current = null;
     };
   }, [loadPageData]);
 
   const handleRefresh = useCallback(() => {
+    if (refreshInFlightRef.current !== null) {
+      return;
+    }
+
     jobsCacheManager.invalidateCache();
     dashboardCache.invalidate(getPoolStatus, [{}]);
     dashboardCache.invalidate(getWorkspaces);
     setPreloadingComplete(false);
-    loadPageData({ forcePreload: true, refreshChildren: true });
+    const refreshPromise = loadPageData({
+      forcePreload: true,
+      refreshChildren: true,
+    }).finally(() => {
+      if (refreshInFlightRef.current === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = refreshPromise;
   }, [loadPageData]);
 
   return {

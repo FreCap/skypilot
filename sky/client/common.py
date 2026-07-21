@@ -120,9 +120,14 @@ def download_logs_from_api_server(
         json=json.loads(body.model_dump_json()),
         stream=True,
         timeout=(API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None))
-    if response.status_code == 200:
+    try:
+        if response.status_code != 200:
+            raise Exception(f'Failed to download logs: '
+                            f'{response.status_code} {response.text}')
+
         remote_home_path = response.headers.get('X-Home-Path')
-        assert remote_home_path is not None, response.headers
+        if remote_home_path is None:
+            raise RuntimeError('/download response missing X-Home-Path header')
         with tempfile.NamedTemporaryFile(prefix='skypilot-logs-download-',
                                          delete=True) as temp_file:
             # Download the zip file from the API server to the local machine.
@@ -158,9 +163,8 @@ def download_logs_from_api_server(
                             new_path.write_bytes(member_file.read())
 
         return remote2local_path_dict
-    else:
-        raise Exception(
-            f'Failed to download logs: {response.status_code} {response.text}')
+    finally:
+        response.close()
 
 
 # === Upload files to API server ===
@@ -374,7 +378,8 @@ def upload_mounts_to_api_server(
         task_.file_mounts_mapping = {}
         if task_.workdir and isinstance(task_.workdir, str):
             workdir = task_.workdir
-            assert os.path.isabs(workdir)
+            if not os.path.isabs(workdir):
+                raise AssertionError
             upload_list.append(workdir)
             task_.file_mounts_mapping[workdir] = workdir
         if workdir_only:
@@ -382,7 +387,8 @@ def upload_mounts_to_api_server(
         if task_.file_mounts is not None:
             for src in task_.file_mounts.values():
                 if not data_utils.is_cloud_store_url(src):
-                    assert os.path.isabs(src)
+                    if not os.path.isabs(src):
+                        raise AssertionError
                     upload_list.append(src)
                     task_.file_mounts_mapping[src] = src
                 if src == constants.LOCAL_SKYPILOT_CONFIG_PATH_PLACEHOLDER:

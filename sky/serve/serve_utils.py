@@ -2213,21 +2213,22 @@ def get_service_status_pickled(
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         statuses = list(ex.map(_run_in_context, service_names))
-    for status in statuses:
+    live_statuses = sorted(
+        (status for status in statuses if status is not None),
+        key=lambda status: status['name'])
+    for status in live_statuses:
         # The rendered YAML carries plaintext secrets (replicas need it
         # launchable), so it never leaves the controller for services:
         # clients get the redacted `service_yaml` instead. Pools keep it
         # because the batch coordinator and worker-count updates parse
         # `yaml_content`/`pool_yaml` back into a launchable task.
-        if status is not None and not status.get('pool'):
+        if not status.get('pool'):
             status.pop('yaml_content', None)
-    service_statuses: list[dict[str, str]] = [{
+    return [{
         k: base64.b64encode(pickle.dumps(v)).decode('utf-8')
         for k, v in s.items()
     }
-                                              for s in statuses
-                                              if s is not None]
-    return sorted(service_statuses, key=lambda x: x['name'])
+            for s in live_statuses]
 
 
 # TODO (kyuds): remove when serve codegen is removed
@@ -2300,6 +2301,13 @@ def get_ready_replicas(
     ]
 
 
+def _get_pool_cluster_records(
+    replicas: list['replica_managers.ReplicaInfo']
+) -> dict[str, dict[str, Any] | None]:
+    return global_user_state.get_clusters_from_names(
+        [replica_info.cluster_name for replica_info in replicas])
+
+
 def _task_fits(task_resources: 'resources_lib.Resources',
                free_resources: 'resources_lib.Resources') -> bool:
     """Check if the task resources fit in the free resources."""
@@ -2325,7 +2333,8 @@ def _is_empty_resource(resource: 'resources_lib.Resources') -> bool:
 
 def get_free_worker_resources(
     pool: str,
-    replicas: list['replica_managers.ReplicaInfo'] | None = None
+    replicas: list['replica_managers.ReplicaInfo'] | None = None,
+    cluster_records: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
@@ -2333,6 +2342,9 @@ def get_free_worker_resources(
         pool: Pool name (service name)
         replicas: Optional replica snapshot to reuse; fetched from the state
             store when not provided.
+        cluster_records: Optional cluster-table snapshot keyed by worker name.
+            When provided, the free-resource walk reuses it instead of issuing
+            a second batched cluster read.
 
     Returns:
         Dictionary mapping cluster_name (worker) to free Resources object (or
@@ -2352,8 +2364,8 @@ def get_free_worker_resources(
     # Snapshot every worker's cluster record in one batched read; the
     # per-replica ``handle()`` fallback would issue one cluster-table read
     # per worker on every scheduling attempt.
-    cluster_records = global_user_state.get_clusters_from_names(
-        [replica_info.cluster_name for replica_info in replicas])
+    if cluster_records is None:
+        cluster_records = _get_pool_cluster_records(replicas)
     for replica_info in replicas:
         cluster_name = replica_info.cluster_name
 
@@ -2454,9 +2466,13 @@ def get_next_cluster_name(
                           not _is_empty_resource(task_resources_list[0]))
 
         free_resources = None
+        cluster_records = None
         if resource_aware:
-            free_resources = get_free_worker_resources(service_name,
-                                                       replicas=replicas)
+            cluster_records = _get_pool_cluster_records(replicas)
+            free_resources = get_free_worker_resources(
+                service_name,
+                replicas=replicas,
+                cluster_records=cluster_records)
             logger.debug(f'Free resources: {free_resources!r}')
             resource_aware = free_resources is not None
         if resource_aware and free_resources is not None:
@@ -2542,7 +2558,12 @@ def get_next_cluster_name(
                                                    replica_info.cluster_name)
 
         # Set infrastructure info for sorting/filtering
-        handle = replica_info.handle()
+        if cluster_records is None:
+            handle = replica_info.handle()
+        else:
+            cluster_record = cluster_records.get(replica_info.cluster_name)
+            handle = (None if cluster_record is None else
+                      replica_info.handle(cluster_record))
         if handle is not None and handle.launched_resources is not None:
             lr = handle.launched_resources
             managed_job_state.set_job_infra(

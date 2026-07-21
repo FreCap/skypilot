@@ -27,6 +27,7 @@ export function useVolumeDetails({ volumeName }) {
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(true);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   const fetchData = useCallback(async () => {
     if (!volumeName) return;
@@ -56,13 +57,34 @@ export function useVolumeDetails({ volumeName }) {
     fetchData();
     return () => {
       requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.volumeName === volumeName) {
+        refreshInFlightRef.current = null;
+      }
     };
-  }, [fetchData]);
+  }, [fetchData, volumeName]);
 
-  const refreshData = useCallback(async () => {
-    dashboardCache.invalidateFunction(getVolumes);
-    await fetchData();
-  }, [fetchData]);
+  const refreshData = useCallback(() => {
+    if (!volumeName) {
+      return Promise.resolve();
+    }
+
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.volumeName === volumeName) {
+      return inFlight.promise;
+    }
+
+    const refreshPromise = (async () => {
+      dashboardCache.invalidateFunction(getVolumes);
+      await fetchData();
+    })().finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+
+    refreshInFlightRef.current = { volumeName, promise: refreshPromise };
+    return refreshPromise;
+  }, [fetchData, volumeName]);
 
   return { volumeData, loading, refreshData };
 }

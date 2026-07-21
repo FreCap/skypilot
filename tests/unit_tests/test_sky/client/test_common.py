@@ -58,6 +58,7 @@ def test_download_logs_resolves_remote_prefix_per_call():
     mock_prefix.assert_called_once_with()
     assert mock_request.call_args.kwargs['timeout'] == (
         client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None)
+    response.close.assert_called_once_with()
 
 
 def test_download_logs_preserves_explicit_remote_prefix():
@@ -83,6 +84,59 @@ def test_download_logs_preserves_explicit_remote_prefix():
 
     assert result == {'/explicit/sky_logs/job-1': '/local-logs/job-1'}
     mock_prefix.assert_not_called()
+
+
+def test_download_logs_rejects_missing_remote_home_header():
+    response = mock.MagicMock(status_code=200, headers={})
+
+    with mock.patch.object(client_common.server_common,
+                           'make_authenticated_request',
+                           return_value=response):
+        with pytest.raises(
+                RuntimeError,
+                match='/download response missing X-Home-Path header'):
+            client_common.download_logs_from_api_server(
+                ['/server-home/sky_logs/job-1'],
+                remote_machine_prefix='/server-home/sky_logs',
+                local_machine_prefix='/local-logs')
+
+    response.iter_content.assert_not_called()
+    response.close.assert_called_once_with()
+
+
+def test_download_logs_closes_response_when_streaming_fails():
+    response = mock.MagicMock(status_code=200,
+                              headers={'X-Home-Path': '/server-home'})
+    response.iter_content.side_effect = OSError('connection reset')
+
+    with mock.patch.object(client_common.server_common,
+                           'make_authenticated_request',
+                           return_value=response):
+        with pytest.raises(OSError, match='connection reset'):
+            client_common.download_logs_from_api_server(
+                ['/server-home/sky_logs/job-1'],
+                remote_machine_prefix='/server-home/sky_logs',
+                local_machine_prefix='/local-logs')
+
+    response.close.assert_called_once_with()
+
+
+def test_download_logs_closes_failed_response():
+    response = mock.MagicMock(status_code=503, text='service unavailable')
+
+    with mock.patch.object(client_common.server_common,
+                           'make_authenticated_request',
+                           return_value=response):
+        with pytest.raises(
+                Exception,
+                match='Failed to download logs: 503 service unavailable'):
+            client_common.download_logs_from_api_server(
+                ['/server-home/sky_logs/job-1'],
+                remote_machine_prefix='/server-home/sky_logs',
+                local_machine_prefix='/local-logs')
+
+    response.iter_content.assert_not_called()
+    response.close.assert_called_once_with()
 
 
 def test_blob_id_determinism(tmp_path):

@@ -4,6 +4,8 @@
 
 from unittest import mock
 
+import pytest
+
 from sky import exceptions
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
@@ -18,11 +20,13 @@ class _FakeBackend:
 
     def __init__(self):
         self.tail_calls = 0
+        self.tail_kwargs = None
         self.status_calls = 0
 
     def tail_logs(self, *args, **kwargs):
-        del args, kwargs
+        del args
         self.tail_calls += 1
+        self.tail_kwargs = kwargs
         return exceptions.JobExitCode.SUCCEEDED.value
 
     def get_job_status(self, *args, **kwargs):
@@ -82,7 +86,16 @@ class TestWaitForNextTask:
 class TestStreamLogsByIdLifecycle:
     """Checks integration with the full managed-job log follower."""
 
-    def test_terminal_transition_between_tasks_ends_follow(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ('context', 'expected_cluster', 'expected_pool_job_id',
+         'expected_tail_calls'), [
+             ((None, None, None, 'first'), 'cluster', None, 1),
+             (('pool-a', 'pool-cluster', 73, 'first'), 'pool-cluster', 73, 1),
+             ((None, None, None, None), None, None, 0),
+         ])
+    def test_terminal_transition_between_tasks_ends_follow(
+            self, monkeypatch, context, expected_cluster, expected_pool_job_id,
+            expected_tail_calls):
         backend = _FakeBackend()
         status_read = mock.Mock(side_effect=[
             managed_job_state.ManagedJobStatus.RUNNING,
@@ -95,6 +108,9 @@ class TestStreamLogsByIdLifecycle:
         sleep = mock.Mock()
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
+        context_read = mock.Mock(return_value=context)
+        generate_cluster_name = mock.Mock(return_value='cluster')
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
         monkeypatch.setattr(jobs_utils.select, 'select',
@@ -108,15 +124,22 @@ class TestStreamLogsByIdLifecycle:
                             latest_status_read)
         monkeypatch.setattr(managed_job_state, 'is_batch_job',
                             mock.Mock(return_value=False))
-        monkeypatch.setattr(managed_job_state, 'get_pool_from_job_id',
-                            mock.Mock(return_value=None))
-        monkeypatch.setattr(managed_job_state, 'get_task_name',
-                            mock.Mock(return_value='first'))
+        monkeypatch.setattr(managed_job_state, 'get_log_stream_context',
+                            context_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_pool_from_job_id',
+            mock.Mock(side_effect=AssertionError('scalar pool read used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_pool_submit_info',
+            mock.Mock(
+                side_effect=AssertionError('scalar pool target read used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_name',
+            mock.Mock(side_effect=AssertionError('scalar task read used')))
         monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
-                            mock.Mock(return_value='cluster'))
+                            generate_cluster_name)
         monkeypatch.setattr(jobs_utils.global_user_state,
-                            'get_handle_from_cluster_name',
-                            mock.Mock(return_value=_FakeHandle()))
+                            'get_handle_from_cluster_name', handle_lookup)
         monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
                             _FakeHandle)
         monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
@@ -131,6 +154,19 @@ class TestStreamLogsByIdLifecycle:
         assert exit_code == exceptions.JobExitCode.from_managed_job_status(
             managed_job_state.ManagedJobStatus.FAILED)
         assert latest_status_read.call_count == 2
-        assert backend.tail_calls == 1
-        assert backend.status_calls == 1
-        sleep.assert_not_called()
+        context_read.assert_called_once_with(42, 0)
+        if expected_cluster is None:
+            handle_lookup.assert_not_called()
+        else:
+            handle_lookup.assert_called_once_with(expected_cluster)
+        if context[0] is None and context[3] is not None:
+            generate_cluster_name.assert_called_once_with('first', 42)
+        else:
+            generate_cluster_name.assert_not_called()
+        assert backend.tail_calls == expected_tail_calls
+        assert backend.status_calls == expected_tail_calls
+        if expected_tail_calls:
+            assert backend.tail_kwargs['job_id'] == expected_pool_job_id
+            sleep.assert_not_called()
+        else:
+            assert sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS

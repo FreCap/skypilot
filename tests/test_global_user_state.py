@@ -172,6 +172,22 @@ async def test_cluster_event_retention_daemon():
                 mock_sleep.assert_any_call(7200)
 
 
+@pytest.mark.asyncio
+async def test_cluster_event_retention_daemon_propagates_cleanup_cancellation():
+    with mock.patch('sky.global_user_state.skypilot_config') as mock_config, \
+         mock.patch(
+             'sky.global_user_state.cleanup_cluster_events_with_retention',
+             side_effect=asyncio.CancelledError()):
+        mock_config.get_nested.return_value = 1
+        task = asyncio.create_task(
+            sky.global_user_state.cluster_event_retention_daemon())
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled()
+
+
 def test_add_or_update_cluster_update_only(_mock_db_conn):
     # if no record exists and existing_cluster_hash is specified
     # should raise ValueError

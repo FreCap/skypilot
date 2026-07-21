@@ -12,6 +12,7 @@ from sky.serve import controller as serve_controller
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
 from sky.utils import operator_notifications
 
@@ -1180,18 +1181,25 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
 class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     """Exact-card demand allocation and graceful transition behavior."""
 
-    def _spec(self, *, max_replicas=4, floors=None, num_overprovision=None):
-        return types.SimpleNamespace(min_replicas=0,
-                                     min_replicas_by_accelerator=floors or {},
-                                     max_replicas=max_replicas,
-                                     num_overprovision=num_overprovision,
-                                     target_qps_per_replica={
-                                         'L4': 1.0,
-                                         'A100': 1.0,
-                                         'H100': 1.0,
-                                     },
-                                     upscale_delay_seconds=0,
-                                     downscale_delay_seconds=0)
+    def _spec(self,
+              *,
+              max_replicas=4,
+              floors=None,
+              num_overprovision=None,
+              reserved_capacity_fill=False):
+        return types.SimpleNamespace(
+            min_replicas=0,
+            min_replicas_by_accelerator=floors or {},
+            max_replicas=max_replicas,
+            num_overprovision=num_overprovision,
+            target_qps_per_replica={
+                'L4': 1.0,
+                'A100': 1.0,
+                'H100': 1.0,
+            },
+            upscale_delay_seconds=0,
+            downscale_delay_seconds=0,
+            reserved_capacity_fill=reserved_capacity_fill)
 
     def _autoscaler(self, **kwargs):
         return autoscalers.InstanceAwareRequestRateAutoscaler(
@@ -1251,6 +1259,77 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
+
+    def test_reserved_fill_stays_independent_then_replaces_paid_capacity(self):
+        autoscaler = self._autoscaler(max_replicas=10,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        now = time.time()
+        autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'],
+                                                           count=300)
+        autoscaler.request_timestamps = [now] * 300
+        autoscaler._compatibility_demand_complete = True
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 2})
+        reserved_key = {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                'A100': 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        }
+        for _ in range(2):
+            autoscaler.collect_reserved_capacity(2, [reserved_key], now)
+
+        paid = [self._replica(replica_id, 'L4') for replica_id in range(1, 6)]
+        for info in paid:
+            info.status = serve_state.ReplicaStatus.READY
+            info.reserved_fill = False
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+
+        first = autoscaler.generate_scaling_decisions(paid, [1])
+        fill_ups = [
+            decision for decision in first
+            if decision.operator == autoscalers.AutoscalerDecisionOperator.
+            SCALE_UP and isinstance(decision.target, dict) and
+            decision.target.get(constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
+        ]
+
+        self.assertEqual(autoscaler.get_final_target_num_replicas(), 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
+        self.assertEqual(len(fill_ups), 2)
+
+        reserved = [
+            self._replica(replica_id, 'A100', zero_cost=True)
+            for replica_id in (6, 7)
+        ]
+        for info in reserved:
+            info.status = serve_state.ReplicaStatus.READY
+            info.reserved_fill = True
+            info.created_at = now - 10
+            info.get_spot_location.return_value = (
+                spot_placer.Location.from_pickleable(reserved_key))
+        autoscaler.collect_reserved_capacity(0, [reserved_key], now + 1)
+        autoscaler.set_free_reserved_slots_by_accelerator({})
+
+        second = autoscaler.generate_scaling_decisions([*paid, *reserved], [1])
+        scale_downs = [
+            decision.target for decision in second if decision.operator ==
+            autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+        ]
+
+        self.assertEqual(autoscaler.get_final_target_num_replicas(), 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 3,
+            'A100': 2,
+        })
+        self.assertEqual(len(scale_downs), 2)
+        self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
     def test_empty_fleet_cold_starts_service_order_without_reserved_supply(
             self):

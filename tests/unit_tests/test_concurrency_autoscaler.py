@@ -18,6 +18,7 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
@@ -39,7 +40,8 @@ def _spec(knob=1.0,
           min_replicas_by_accelerator=None,
           num_overprovision=None,
           adaptive_scale_up=None,
-          lb_request_queue=None):
+          lb_request_queue=None,
+          reserved_capacity_fill=False):
     # Default delays resolve to one decision interval -> hysteresis
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
@@ -58,6 +60,7 @@ def _spec(knob=1.0,
         scale_up_rate_period_seconds=scale_up_rate_period_seconds,
         adaptive_scale_up=adaptive_scale_up,
         lb_request_queue=lb_request_queue,
+        reserved_capacity_fill=reserved_capacity_fill,
         max_scale_down_rate_percentage=max_scale_down_rate_percentage,
         upscale_delay_seconds=(upscale_delay_seconds if upscale_delay_seconds
                                is not None else interval),
@@ -644,6 +647,79 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 generation=3)
         scale_down = _decisions(autoscaler, [l4, a100])
         self.assertEqual(_scale_downs(scale_down), [1])
+
+    def test_reserved_fill_stays_independent_then_replaces_paid_capacity(self):
+        autoscaler = _make_autoscaler(max_replicas=10,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        now = time.time()
+        reserved_key = {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                'A100': 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        }
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 2})
+        for _ in range(2):
+            autoscaler.collect_reserved_capacity(2, [reserved_key], now)
+
+        paid = [_replica(replica_id, card='L4') for replica_id in range(1, 6)]
+        for info in paid:
+            info.is_zero_cost = False
+            info.reserved_fill = False
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+        _report(autoscaler,
+                in_flight={info.replica_id: 1 for info in paid},
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        first = _decisions(autoscaler, paid)
+        fill_ups = [
+            decision for decision in first if decision.operator == _SCALE_UP and
+            isinstance(decision.target, dict) and
+            decision.target.get(constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
+        ]
+
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
+        self.assertEqual(len(fill_ups), 2)
+
+        reserved = [_replica(replica_id, card='A100') for replica_id in (6, 7)]
+        for info in reserved:
+            info.is_zero_cost = True
+            info.reserved_fill = True
+            info.created_at = now - 10
+            info.get_spot_location.return_value = (
+                spot_placer.Location.from_pickleable(reserved_key))
+            info.handle.return_value.launched_resources.get_cost.return_value = 0
+        autoscaler.collect_reserved_capacity(0, [reserved_key], now + 1)
+        autoscaler.set_free_reserved_slots_by_accelerator({})
+        _report(autoscaler,
+                in_flight={info.replica_id: 0 for info in [*paid, *reserved]},
+                queue_depth=5,
+                queued_profiles=[self._profile(50, ['L4', 'A100'], 5)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        second = _decisions(autoscaler, [*paid, *reserved])
+        scale_downs = _scale_downs(second)
+
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 3,
+            'A100': 2,
+        })
+        self.assertEqual(len(scale_downs), 2)
+        self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
     def test_num_overprovision_keeps_exact_card_scale_up_shaped(self):
         autoscaler = _make_autoscaler(max_replicas=2, num_overprovision=1)

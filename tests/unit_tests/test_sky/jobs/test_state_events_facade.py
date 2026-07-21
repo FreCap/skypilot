@@ -4,6 +4,8 @@ import ast
 import asyncio
 import inspect
 
+import pytest
+
 from sky.jobs import state
 from sky.jobs import state_events
 from sky.jobs import state_schema
@@ -59,15 +61,30 @@ def test_lifecycle_transition_resolves_event_writer_from_facade():
     assert 'add_job_event' in called_names
 
 
-def test_event_retention_daemon_handles_cancellation(monkeypatch):
+def test_event_retention_daemon_propagates_cancellation(monkeypatch):
     cleanup_calls = []
 
-    async def _cancel_cleanup(retention_hours):
-        cleanup_calls.append(retention_hours)
-        raise asyncio.CancelledError
+    async def _run():
+        cleanup_started = asyncio.Event()
+        cleanup_blocked = asyncio.Event()
 
-    monkeypatch.setattr(state_events, 'cleanup_job_events_with_retention_async',
-                        _cancel_cleanup)
-    asyncio.run(state.job_event_retention_daemon())
+        async def _blocked_cleanup(retention_hours):
+            cleanup_calls.append(retention_hours)
+            cleanup_started.set()
+            await cleanup_blocked.wait()
+
+        monkeypatch.setattr(state_events,
+                            'cleanup_job_events_with_retention_async',
+                            _blocked_cleanup)
+        task = asyncio.create_task(state.job_event_retention_daemon())
+        await cleanup_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled()
+
+    asyncio.run(_run())
 
     assert cleanup_calls == [state.DEFAULT_JOB_EVENT_RETENTION_HOURS]

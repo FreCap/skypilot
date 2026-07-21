@@ -1649,12 +1649,9 @@ def stream_logs_by_id(job_id: int,
             cluster_name = None
             job_id_to_tail = None
             if task_id is not None:
-                pool = managed_job_state.get_pool_from_job_id(job_id)
-                if pool is not None:
-                    cluster_name, job_id_to_tail = (
-                        managed_job_state.get_pool_submit_info(job_id))
-                else:
-                    task_name = managed_job_state.get_task_name(job_id, task_id)
+                pool, cluster_name, job_id_to_tail, task_name = (
+                    managed_job_state.get_log_stream_context(job_id, task_id))
+                if pool is None and task_name is not None:
                     cluster_name = generate_managed_job_cluster_name(
                         task_name, job_id)
                 if cluster_name is not None:
