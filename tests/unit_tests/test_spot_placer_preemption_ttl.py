@@ -137,6 +137,28 @@ class TestPreemptionTtlRetry:
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         assert placer.select_next_location() == cheap
 
+    def test_consumed_retry_remains_admissible_until_newer_failure(
+            self, placer_and_locations, monkeypatch):
+        placer, cheap, other, third = placer_and_locations
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+
+        assert placer.is_launch_admissible(other, selected_at=None)
+        placer.set_preemptive(cheap)
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+        assert placer.select_next_location() == cheap
+        selected_at = now[0]
+
+        # Selection consumed the retry, so the location is benched again.
+        assert not placer.is_active_location(cheap)
+        assert placer.is_launch_admissible(cheap, selected_at=selected_at)
+        assert not placer.is_launch_admissible(cheap, selected_at=None)
+
+        # A subsequent failure is newer than this queued placement and wins.
+        now[0] += 1
+        placer.set_preemptive(cheap)
+        assert not placer.is_launch_admissible(cheap, selected_at=selected_at)
+
     def test_env_override_ttl(self, placer_and_locations, monkeypatch):
         placer, cheap, other, third = placer_and_locations
         now = [1000.0]
