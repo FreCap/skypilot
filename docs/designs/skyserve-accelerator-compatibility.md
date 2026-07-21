@@ -600,6 +600,16 @@ replica snapshot, the response intentionally withholds the routing spec; the LB
 acknowledges the demand batch but retains its last coherent routing epoch until
 the next complete sync.
 
+On controller recovery, a logical autoscaler reconstructs its aggregate safety
+target from current committed capacity before it considers a lower fresh demand
+target. Its process-local exact-card target map is reconstructed at the same
+time from the committed exact-card inventory, including a bounded migration
+toward any newly constrained demand. The empty recovered map is not itself a
+card increase and must not reset the aggregate downscale window. The held
+aggregate and reconstructed per-card targets therefore remain reconcilable
+through the normal graceful downscale delay instead of disabling exact-card
+actuation until demand happens to reach the old aggregate target.
+
 HA cutover snapshots carry both accepted compatibility arrivals and the live
 compatibility queue, recent-rejection, and exact-card in-flight gauges. Arrival
 events transfer to the promoted controller state exactly once; replaceable

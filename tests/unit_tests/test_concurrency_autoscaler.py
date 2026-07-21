@@ -1084,6 +1084,158 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertTrue(autoscaler._snap_target_on_next_recompute)
         self.assertEqual(autoscaler.target_num_replicas, 1)
 
+    def test_logical_restart_seeds_card_map_before_downscale(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300,
+                                      max_scale_down_rate_percentage=50)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = ([_replica(i, card='L4') for i in range(1, 7)] +
+                    [_replica(i, card='A100') for i in range(7, 11)])
+        idle = {replica.replica_id: 0 for replica in replicas}
+        slots = {replica.replica_id: 1 for replica in replicas}
+        _report(autoscaler,
+                in_flight=idle,
+                observed_slots=slots,
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            first = _decisions(autoscaler, replicas)
+            self.assertEqual(first, [])
+            self.assertEqual(autoscaler.target_num_replicas, 10)
+            self.assertEqual(
+                sum(autoscaler.target_num_replicas_by_accelerator.values()), 10)
+            self.assertGreaterEqual(
+                autoscaler.target_num_replicas_by_accelerator['A100'], 1)
+
+            # The reconstructed map is a baseline, not an upscale. It must
+            # not lower the aggregate early or restart the quiet window.
+            started_at = autoscaler._downscale_started_at
+            clock.return_value = 120.0
+            second = _decisions(autoscaler, replicas)
+            self.assertEqual(second, [])
+            self.assertEqual(autoscaler.target_num_replicas, 10)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+
+            clock.return_value = 380.0
+            _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(
+            sum(autoscaler.target_num_replicas_by_accelerator.values()), 5)
+        self.assertGreaterEqual(
+            autoscaler.target_num_replicas_by_accelerator['A100'], 1)
+
+    def test_logical_ramped_restart_does_not_stall_empty_card_map(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300,
+                                      max_scale_up_rate_percentage=50,
+                                      scale_up_rate_min_replicas=1,
+                                      scale_up_rate_period_seconds=60,
+                                      max_scale_down_rate_percentage=50)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = ([_replica(i, card='L4') for i in range(1, 7)] +
+                    [_replica(i, card='A100') for i in range(7, 11)])
+        idle = {replica.replica_id: 0 for replica in replicas}
+        slots = {replica.replica_id: 1 for replica in replicas}
+        _report(autoscaler,
+                in_flight=idle,
+                observed_slots=slots,
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock, mock.patch.object(
+                                   autoscalers.time,
+                                   'time',
+                                   return_value=1000.0):
+            _decisions(autoscaler, replicas)
+            started_at = autoscaler._downscale_started_at
+            self.assertEqual(
+                sum(autoscaler.target_num_replicas_by_accelerator.values()), 10)
+
+            clock.return_value = 120.0
+            _decisions(autoscaler, replicas)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+            self.assertEqual(
+                sum(autoscaler.target_num_replicas_by_accelerator.values()), 10)
+
+            clock.return_value = 380.0
+            _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(
+            sum(autoscaler.target_num_replicas_by_accelerator.values()), 5)
+
+    def test_logical_ramped_restart_card_migration_uses_one_wave(self):
+        autoscaler = _make_autoscaler(max_replicas=10,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300,
+                                      max_scale_up_rate_percentage=50,
+                                      scale_up_rate_min_replicas=1,
+                                      scale_up_rate_period_seconds=60)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = [_replica(i, card='L4') for i in range(1, 11)]
+        idle = {replica.replica_id: 0 for replica in replicas}
+        slots = {replica.replica_id: 1 for replica in replicas}
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0), mock.patch.object(
+                                   autoscalers.time,
+                                   'time',
+                                   return_value=1000.0) as clock:
+            _report(autoscaler,
+                    in_flight=idle,
+                    observed_slots=slots,
+                    queue_depth=10,
+                    queued_profiles=[self._profile(20, ['A100'], 10)],
+                    rejected_profiles=[],
+                    compatibility_complete=True)
+            first = _decisions(autoscaler, replicas)
+
+            self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+                'L4': 5,
+                'A100': 5,
+            })
+            self.assertEqual(len(first), 1)
+            self.assertEqual(
+                dict(first[0].target.target_capacity_by_accelerator), {
+                    'L4': 5,
+                    'A100': 5,
+                })
+
+            clock.return_value = 1020.0
+            _report(autoscaler,
+                    in_flight=idle,
+                    observed_slots=slots,
+                    queue_depth=10,
+                    queued_profiles=[self._profile(20, ['A100'], 10)],
+                    rejected_profiles=[],
+                    compatibility_complete=True,
+                    generation=2)
+            cooldown = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 5,
+            'A100': 5,
+        })
+        self.assertEqual(len(cooldown), 1)
+        self.assertEqual(
+            dict(cooldown[0].target.target_capacity_by_accelerator), {
+                'L4': 5,
+                'A100': 5,
+            })
+
 
 class TestSignalGap(unittest.TestCase):
     """No shrink of any kind while the demand report is stale."""
