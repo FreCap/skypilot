@@ -7,11 +7,13 @@ from unittest import mock
 
 import pytest
 
+from sky import exceptions
 from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterDoesNotExist
 from sky.jobs import state
 from sky.jobs import utils
 from sky.utils import controller_utils
+from sky.utils import message_utils
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
@@ -1278,3 +1280,131 @@ class TestCleanupExpiredApiAccessTokens:
     def test_no_expired_tokens_is_noop(self, mock_get_expired):
         mock_get_expired.return_value = []
         assert utils.cleanup_expired_api_access_tokens() == 0
+
+
+class TestStreamControllerLogs:
+    """Characterize the controller-local branch of stream_logs()."""
+
+    def test_non_following_missing_log_is_noop(self, tmp_path):
+        missing_log = tmp_path / 'missing.log'
+
+        with mock.patch.object(utils,
+                               'controller_log_file_for_job',
+                               return_value=str(missing_log)):
+            message, exit_code = utils.stream_logs(job_id=42,
+                                                   job_name=None,
+                                                   controller=True,
+                                                   follow=False)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_non_following_full_log_filters_relayed_payload(
+            self, tmp_path, capsys):
+        log_path = tmp_path / '42.log'
+        log_path.write_text('first\n' + message_utils.encode_payload('hidden') +
+                            'last\n',
+                            encoding='utf-8')
+
+        with mock.patch.object(utils,
+                               'controller_log_file_for_job',
+                               return_value=str(log_path)):
+            message, exit_code = utils.stream_logs(job_id=42,
+                                                   job_name=None,
+                                                   controller=True,
+                                                   follow=False)
+
+        assert capsys.readouterr().out == 'first\nlast\n'
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_payload_filter_hook_remains_late_bound(self, tmp_path, capsys):
+        log_path = tmp_path / '42.log'
+        log_path.write_text('hidden-control\nvisible\n', encoding='utf-8')
+
+        with (mock.patch.object(utils,
+                                'controller_log_file_for_job',
+                                return_value=str(log_path)),
+              mock.patch.object(
+                  utils,
+                  '_is_relayed_status_payload_line',
+                  side_effect=lambda line: line.startswith('hidden')) as
+              is_payload):
+            message, exit_code = utils.stream_logs(job_id=42,
+                                                   job_name=None,
+                                                   controller=True,
+                                                   follow=False)
+
+        assert capsys.readouterr().out == 'visible\n'
+        assert is_payload.call_args_list == [
+            mock.call('hidden-control\n'),
+            mock.call('visible\n'),
+        ]
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_non_following_tail_honors_offset(self, tmp_path, capsys):
+        log_path = tmp_path / '42.log'
+        log_path.write_text('zero\none\ntwo\nthree\nfour\n', encoding='utf-8')
+
+        with mock.patch.object(utils,
+                               'controller_log_file_for_job',
+                               return_value=str(log_path)):
+            message, exit_code = utils.stream_logs(job_id=42,
+                                                   job_name=None,
+                                                   controller=True,
+                                                   follow=False,
+                                                   tail=2,
+                                                   tail_offset=1)
+
+        assert capsys.readouterr().out == 'two\nthree\n'
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+
+    @mock.patch('sky.jobs.utils.managed_job_state.'
+                'get_managed_jobs_with_filters')
+    def test_controller_name_lookup_includes_terminal_jobs(
+            self, mock_get_jobs, tmp_path):
+        mock_get_jobs.return_value = ([{
+            'job_id': 17,
+            'job_name': 'finished',
+            'status': state.ManagedJobStatus.SUCCEEDED,
+        }], None)
+        log_path = tmp_path / '17.log'
+        log_path.touch()
+
+        with mock.patch.object(utils,
+                               'controller_log_file_for_job',
+                               return_value=str(log_path)) as resolve_log:
+            message, exit_code = utils.stream_logs(job_id=None,
+                                                   job_name='finished',
+                                                   controller=True,
+                                                   follow=False)
+
+        mock_get_jobs.assert_called_once_with(
+            name_match='finished', fields=['job_id', 'job_name', 'status'])
+        resolve_log.assert_called_once_with(17)
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+
+    def test_follow_drains_until_terminal_status(self, tmp_path, capsys):
+        log_path = tmp_path / '42.log'
+        log_path.write_text('complete\n', encoding='utf-8')
+
+        with (mock.patch.object(utils,
+                                'controller_log_file_for_job',
+                                return_value=str(log_path)),
+              mock.patch.object(utils.managed_job_state,
+                                'get_status',
+                                return_value=state.ManagedJobStatus.SUCCEEDED)
+              as get_status, mock.patch.object(utils.time, 'sleep') as sleep):
+            message, exit_code = utils.stream_logs(job_id=42,
+                                                   job_name=None,
+                                                   controller=True,
+                                                   follow=True)
+
+        assert capsys.readouterr().out == 'complete\n'
+        get_status.assert_called_once_with(42)
+        sleep.assert_called_once()
+        assert 'Job finished (status: ManagedJobStatus.SUCCEEDED).' in message
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
