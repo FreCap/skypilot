@@ -62,6 +62,7 @@ export function Volumes() {
   const [volumesData, setVolumesData] = useState([]);
   const pluginTabs = usePluginComponents('volumes.tabs');
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   const handleTabChange = useCallback(
     (tab) => {
@@ -104,11 +105,27 @@ export function Volumes() {
     setLastFetchedTime(new Date());
   }, []);
 
-  const handleRefresh = useCallback(() => {
-    trackVolumeAction('refresh');
-    dashboardCache.invalidate(getVolumes);
-    return runPreload({ force: true });
-  }, [runPreload]);
+  const startRefresh = useCallback(
+    ({ supersede = false } = {}) => {
+      trackVolumeAction('refresh');
+      if (!supersede && refreshInFlightRef.current !== null) {
+        return refreshInFlightRef.current;
+      }
+      const refreshPromise = runPreload({ force: true }).finally(() => {
+        if (refreshInFlightRef.current === refreshPromise) {
+          refreshInFlightRef.current = null;
+        }
+      });
+      refreshInFlightRef.current = refreshPromise;
+      return refreshPromise;
+    },
+    [runPreload]
+  );
+  const handleRefresh = useCallback(() => startRefresh(), [startRefresh]);
+  const handleMutationRefresh = useCallback(
+    () => startRefresh({ supersede: true }),
+    [startRefresh]
+  );
 
   const handleDeleteVolumeClick = (volume) => {
     trackVolumeAction('delete');
@@ -134,7 +151,7 @@ export function Volumes() {
       setVolumeToDelete(null);
       setShowPurgeUI(false);
       setPurgeConfirmed(false);
-      handleRefresh();
+      handleMutationRefresh();
     } catch (error) {
       setDeleteError(error);
     } finally {
@@ -157,7 +174,7 @@ export function Volumes() {
       setVolumeToDelete(null);
       setShowPurgeUI(false);
       setPurgeConfirmed(false);
-      handleRefresh();
+      handleMutationRefresh();
     } catch (error) {
       setDeleteError(error);
     } finally {
@@ -182,6 +199,7 @@ export function Volumes() {
     runPreload();
     return () => {
       requestVersionRef.current += 1;
+      refreshInFlightRef.current = null;
     };
   }, [runPreload]);
 
@@ -240,7 +258,7 @@ export function Volumes() {
             <PluginSlot
               name="volumes.header-actions"
               context={{
-                onVolumeChange: handleRefresh,
+                onVolumeChange: handleMutationRefresh,
                 volumes: volumesData,
               }}
               wrapperClassName="contents"
