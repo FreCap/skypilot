@@ -617,7 +617,8 @@ def get_engine(
                             pool_recycle=1800))
             engine = _postgres_engine_cache[cache_key]
     else:
-        assert db_name is not None, 'db_name must be provided for SQLite'
+        if db_name is None:
+            raise ValueError('db_name must be provided for SQLite')
         db_path = runtime_utils.get_runtime_dir_path(f'.sky/{db_name}.db')
         pathlib.Path(db_path).parents[0].mkdir(parents=True, exist_ok=True)
         if async_engine:
