@@ -1104,8 +1104,9 @@ def test_pause_does_not_resurrect_cancelled_request(pause_harness):
 
 def test_pause_drops_request_removed_before_retry(pause_harness):
     """Request retention may remove a terminal row before retry handoff."""
-    asyncio.run(requests_lib._delete_requests(  # pylint: disable=protected-access
-        [pause_harness.request_id]))
+    asyncio.run(
+        requests_lib._delete_requests(  # pylint: disable=protected-access
+            [pause_harness.request_id]))
     condition = _RecordingCondition(verdict=True)
 
     pause_harness.run(condition)
