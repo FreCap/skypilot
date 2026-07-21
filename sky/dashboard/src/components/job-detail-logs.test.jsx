@@ -9,6 +9,7 @@ import {
 import JobDetails from '@/pages/jobs/[job]';
 import TaskDetails from '@/pages/jobs/[job]/[task]';
 import {
+  computeJobGroupStatus,
   downloadManagedJobLogs,
   streamManagedJobLogs,
   useManagedJobPools,
@@ -365,5 +366,41 @@ it('shares links extracted by the log viewer with job metadata', async () => {
   expect(await screen.findByRole('link', { name: 'W&B Run' })).toHaveAttribute(
     'href',
     'https://wandb.ai/acme/project/runs/run-42'
+  );
+});
+
+it('projects grouped job metadata through the details section', async () => {
+  const groupedJobs = [
+    {
+      ...job,
+      task_job_id: 100,
+      task: 'trainer',
+      is_job_group: true,
+      requested_resources: '1x A100',
+    },
+    {
+      ...job,
+      task_job_id: 101,
+      task: 'evaluator',
+      status: 'SUCCEEDED',
+      requested_resources: '1x A100',
+    },
+  ];
+  computeJobGroupStatus.mockReturnValue('RUNNING');
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: groupedJobs },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<JobDetails />);
+
+  await screen.findByText('Job ID (Name)');
+  expect(computeJobGroupStatus).toHaveBeenCalledWith(groupedJobs);
+  expect(screen.getAllByText('JobGroup')).toHaveLength(1);
+  expect(screen.getByText('1x A100 (x2 tasks)')).toBeInTheDocument();
+  expect(screen.getByRole('link', { name: 'AWS' })).toHaveAttribute(
+    'href',
+    '/infra'
   );
 });
