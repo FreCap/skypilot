@@ -1,3 +1,4 @@
+# pyright: reportOptionalMemberAccess=error
 """Cloud-neutral VM provision utils."""
 import dataclasses
 import json
@@ -312,7 +313,8 @@ def _post_provision_setup(
         launched_resources: resources_lib.Resources,
         cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
         provision_record: provision_common.ProvisionRecord,
-        custom_resource: str | None) -> provision_common.ClusterInfo:
+        custom_resource: str | None,
+        existing_cluster_hash: str | None) -> provision_common.ClusterInfo:
     config_from_yaml = global_user_state.get_cluster_yaml_dict(
         handle_cluster_yaml)
     provider_config = config_from_yaml.get('provider')
@@ -326,9 +328,16 @@ def _post_provision_setup(
     # allows us to expose provision logs to debug nodes that failed during post
     # provision setup.
     handle = global_user_state.get_handle_from_cluster_name(
-        cluster_name.display_name)
+        cluster_name.display_name, existing_cluster_hash=existing_cluster_hash)
+    if handle is None:
+        raise exceptions.ClusterDoesNotExist(
+            f'Cluster {cluster_name.display_name!r} was removed or replaced '
+            'while provisioning was in progress.')
     handle.cached_cluster_info = cluster_info
-    global_user_state.update_cluster_handle(cluster_name.display_name, handle)
+    global_user_state.update_cluster_handle(
+        cluster_name.display_name,
+        handle,
+        existing_cluster_hash=existing_cluster_hash)
 
     if cluster_info.num_instances > 1:
         # Only worker nodes have logs in the per-instance log directory. Head
@@ -610,10 +619,13 @@ def _post_provision_setup(
 @timeline.event
 def post_provision_runtime_setup(
         launched_resources: resources_lib.Resources,
-        cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
+        cluster_name: resources_utils.ClusterName,
+        handle_cluster_yaml: str,
         provision_record: provision_common.ProvisionRecord,
         custom_resource: str | None,
-        log_dir: str) -> provision_common.ClusterInfo:
+        log_dir: str,
+        existing_cluster_hash: str | None = None
+) -> provision_common.ClusterInfo:
     """Run internal setup commands after provisioning and before user setup.
 
     Here are the steps:
@@ -635,7 +647,8 @@ def post_provision_runtime_setup(
                 cluster_name,
                 handle_cluster_yaml=handle_cluster_yaml,
                 provision_record=provision_record,
-                custom_resource=custom_resource)
+                custom_resource=custom_resource,
+                existing_cluster_hash=existing_cluster_hash)
         except Exception:  # pylint: disable=broad-except
             logger.error(
                 ux_utils.error_message(
