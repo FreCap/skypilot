@@ -267,9 +267,11 @@ Terminal errors are code-valued and value-free: `IMAGE_NOT_PUBLISHED`,
 `ARTIFACT_NOT_READY`, `PROFILE_NOT_ACTIVE`, `PLATFORM_UNSUPPORTED`,
 `IMAGE_LOCALITY_UNSUPPORTED`,
 `RELEASE_CONFLICT`, `IDEMPOTENCY_KEY_REUSED`, `AUTH_BINDING_UNAVAILABLE`,
-`REGISTRY_CAPACITY_EXHAUSTED`, `IMAGE_LIMIT_EXCEEDED`, `TARGET_READ_ONLY`,
+`REGISTRY_CAPACITY_EXHAUSTED`, `REGISTRY_SHARD_UNAVAILABLE`,
+`REGISTRY_LOCATION_QUARANTINED`, `IMAGE_LIMIT_EXCEEDED`, `TARGET_READ_ONLY`,
 `IMAGE_PREPARATION_FAILED`, `QUALIFICATION_FAILED`, `CANARY_FAILED`, and
-`PERMISSION_DENIED`. `IMAGE_WARMING` and provider
+`PERMISSION_DENIED`.
+`IMAGE_WARMING` and provider
 throttling are nonterminal states with bounded retry/ETA metadata. CLI and UI map
 each code to one copyable remediation without reflecting provider or secret
 values.
@@ -379,7 +381,9 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    of an unbound pre-inspection failure locks only its publication and requeues
    inspection. Once bound, retry locks the shared canonical location before
    dependent publications, returns retained failures to PENDING, and reuses the
-   location. It never creates a second physical copy.
+   location. It never creates a second physical copy. Exceeding the per-artifact
+   release ceiling is a typed `IMAGE_LIMIT_EXCEEDED` failure rather than a
+   source-content validation failure.
 
 An existing READY release is immutable. A conflicting digest is rejected. A
 failed replacement never changes another release or any deployment already
@@ -442,16 +446,21 @@ Location transitions are:
 | READY | MISSING | Completed inventory plus exact digest absence |
 | READY | EVICTING | Regional, automatic eviction enabled, past the workspace retention anchor, and no live demand |
 | FAILED, MISSING, EVICTED | PENDING | Explicit prepare/retry or new authorized demand |
+| EVICTING (`EVICT`) | EVICTING (`DELETE`) | Same fenced owner durably authorizes the first destructive provider call |
 | EVICTING | EVICTED | Exact digest absence after delete |
-| EVICTING | READY | Exact digest remains after terminal delete denial |
-| EVICTING | EVICTING | Ambiguous/retryable delete; reclaim after lease expiry |
+| EVICTING (`DELETE`) | READY | Exact digest remains after a successful provider conclusion or an explicit no-mutation rejection |
+| EVICTING (`EVICT`) | READY or EVICTING (`EVICT`) | Expired pre-delete claim, restore for live demand or retry the still-demand-free eviction |
+| EVICTING (`DELETE`) | QUARANTINED | Delete outcome is ambiguous or the destructive-intent lease expires |
 
 Only INSPECTING publications carry an inspection token and expiry. Only
 COPYING, VERIFYING, or EVICTING locations carry a random location token, expiry,
-and matching lease kind. PENDING, READY, FAILED, MISSING, and EVICTED carry no
-lease. Canonical locations never enter EVICTING or EVICTED. Every retry records a
-bounded attempt count, code, and `next_retry_at`; throttles, timeouts, and unknown
-provider outcomes are retryable, never guessed terminal failures.
+and matching lease kind. `EVICT` means no destructive provider call may have
+started; `DELETE` is the durable point after which a delete may already be in
+flight. PENDING, READY, FAILED, MISSING, EVICTED, and QUARANTINED carry no lease.
+Canonical locations never enter EVICTING, EVICTED, or QUARANTINED. Every retry
+records a bounded attempt count, code, and `next_retry_at`; throttles and
+timeouts before provider I/O remain retryable. An unknown delete outcome is
+terminal for that physical location because ECR has no conditional-delete token.
 
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
@@ -681,12 +690,13 @@ epoch. If eviction changed a metadata snapshot from READY before demand
 creation, that locked recheck returns typed warming state; the new durable demand
 keeps the location fenced, an expired eviction is reclaimed, and the attempt
 never degrades to a generic resolution failure. A new authorized demand
-re-admits FAILED, MISSING, or EVICTED state before creating its fence. A replaying
+re-admits FAILED, MISSING, or EVICTED state before creating its fence.
+QUARANTINED is never re-admitted to the same physical reference. A replaying
 live demand re-admits MISSING or EVICTED state, including from its exact retired
-profile snapshot, while a FAILED live demand is superseded and reported as
-terminal. Central demand state is the durable source for normal launch, Serve, and
-managed-job controllers, so their own SQLite-compatible state stores only the
-demand ID and generation.
+profile snapshot, while a FAILED or QUARANTINED live demand is superseded and
+reported as terminal. Central demand state is the durable source for normal
+launch, Serve, and managed-job controllers, so their own SQLite-compatible state
+stores only the demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
 An owner epoch with a live demand reloads that demand's exact immutable profile
@@ -718,15 +728,47 @@ demand exists, exact absence changes the location to `EVICTED`, decrements the
 reservation exactly once, and zeros the location's charged bytes. Re-admission
 or explicit retry atomically restores count and bytes before changing an
 EVICTED location to `PENDING`. A provider operation known not to have started may
-restore READY only for its fresh `EVICT` lease; the completion transaction
-rejects that shortcut for `VERIFY` and `RECLAIM`. After provider I/O, only exact
-presence may restore READY. Ambiguous
-readback remains fenced in `EVICTING` for another worker. An expired EVICTING
-lease is always reclaimable and first performs an exact presence read. If no
-demand exists, exact presence may proceed to a newly authorized delete; if
-deletion is now disabled it restores READY. If a live demand appeared during the
-expired attempt, the reclaimer is strictly verify-only: presence restores READY
-and absence requeues PENDING, without deleting bytes the demand now wants.
+restore READY only while the exact current lease still has `EVICT` kind.
+Immediately before the first ECR delete call, the SDK hook atomically changes
+that lease from `EVICT` to `DELETE`; database completion rejects any provider
+result that lacks this durable intent. A successful ECR response, or an explicit
+provider rejection that proves no mutation was accepted, may be followed by
+exact readback. A transport failure, timeout, ambiguous server response, or
+failure without a provider conclusion is never read back as proof of that
+delete's terminal state; it immediately yields an ambiguous outcome. After
+provider I/O, only exact presence following a concluded call may restore READY
+and only exact absence following a concluded call may requeue or release
+capacity.
+
+An expired `EVICT` lease proves that no destructive call could have passed the
+hook. A live demand therefore restores READY without provider I/O; otherwise a
+new owner may retry the eviction. An ambiguous result or expired `DELETE` lease
+cannot be made safe by later readback: an old process may still resume after the
+read and send, or complete, its delete. The location is therefore atomically
+changed to `QUARANTINED`, its in-flight slot is released, and its capacity
+reservation remains charged. Inventory may observe the digest but never clears
+QUARANTINED, and prepare, demand replay, and explicit retry cannot reuse the same
+repository/digest reference. Recovery requires a qualified profile target with
+a different repository-ring fingerprint. Other digests on the shard remain
+admissible, limiting the exceptional blast radius to the one ambiguous digest.
+The bounded readiness projection reports both quarantined-location count and
+their retained declared bytes per target, so operators can size and verify a
+ring rotation without scanning the catalog.
+Every lifecycle claim uses the same durable background lease heartbeat as copy
+work. The worker proves the exact location token before assuming its provider
+role, synchronously re-proves ownership in the hook immediately before every ECR
+delete begins, records `DELETE` intent in that hook, and rechecks ownership again
+before database completion. Lease loss sets cancellation state and starts no
+later provider call. A call that may already have started is never treated as
+cancelled, present, or absent; it converges only to QUARANTINED. The same
+unexpired owner may use exact readback only after the provider successfully
+concludes the delete request or explicitly rejects it before mutation. Failed
+explicit retries bind a terminal idempotent operation before returning a typed
+conflict, so replay cannot leave or conceal an unattached nonterminal operation.
+When exact absence releases the final capacity reservation on a `FULL` shard,
+the same locked transaction changes it to `READY` if both reservation ceilings
+are now below their activated limits. It does not wait for the next inventory
+epoch to reopen admission.
 
 Consumer terminal or supersede handling writes a tombstone and advances one
 stable-owner generation watermark in the same transaction. Demand creation
@@ -1531,10 +1573,11 @@ later becomes `DRIFTED` or `DISABLED`; recovery performs an exact destination
 read and repairs the in-flight counter, but fresh writes remain blocked outside
 `READY|FULL`. Re-admitting a `FAILED`, `MISSING`, or `EVICTED` location is new
 write admission and therefore also requires `READY|FULL`, including canonical
-publication retry. The dispatcher rechecks this state from its locked shard row
-after selecting a location, so an expired-lease heartbeat cannot make a
-`DRIFTED` shard fall through to fresh work. Lease reconciliation repairs
-in-flight counters after a worker expires.
+publication retry. QUARANTINED is not retryable on its original physical
+reference. The dispatcher rechecks shard state from its locked row after
+selecting a location, so an expired-lease heartbeat cannot make a `DRIFTED`
+shard fall through to fresh work. Lease reconciliation repairs in-flight
+counters after a worker expires.
 
 The lifecycle worker reloads workspace retention policy behind a failure
 boundary. A malformed or temporarily unreadable configuration keeps the last
@@ -1556,11 +1599,17 @@ Lifecycle workers own their lifecycle attestation and claim only demand-free,
 noncanonical, managed locations past retention, plus provably
 empty failed canonical reservations for counter reclamation. They inspect the
 exact digest after ambiguous deletion and never delete a repository or a READY
-canonical manifest.
+canonical manifest. Copy and lifecycle use one shared lease-heartbeat primitive.
+Copy observes cancellation while transferring immutable content and still relies
+on token-checked state convergence. Lifecycle additionally makes exact lease
+ownership and durable `DELETE` intent synchronous preconditions of every
+destructive provider call.
 
 Shutdown stops new claims, cancels work that has not started provider I/O, and
 lets leases expire after ambiguous I/O. Restart recovery verifies actual
-registry state before completion or retry.
+registry state for immutable copy work and pre-delete claims. An expired
+destructive intent quarantines its exact physical reference without trusting a
+read to bound an older delete.
 
 ## Dashboard
 
@@ -1596,6 +1645,19 @@ Authorized users can:
 The UI never fetches credentials or raw server configuration. It displays
 bounded, code-valued errors and copyable remediation commands.
 
+An explicit Retry location request distinguishes a concurrent successful retry
+from a still-failed location on a shard outside `READY|FULL`. The former returns
+the refreshed row; the latter fails with `REGISTRY_SHARD_UNAVAILABLE` instead of
+recording a misleading nonterminal operation against an unchanged failed row.
+
+`REGISTRY_SHARD_UNAVAILABLE` is a typed 409 conflict from the persistence fence
+through the direct REST API. Client-safe error text and the dashboard direct the
+operator to repair shard drift or activate a qualified revision; arbitrary
+provider text never crosses the boundary.
+`REGISTRY_LOCATION_QUARANTINED` is the corresponding typed 409 for an exact
+physical reference that may still be affected by a late delete. Its remediation
+requires a newly qualified repository-ring fingerprint, not an unsafe retry.
+
 Mutation forms validate source digest, release, platform, distribution, binding,
 and target combinations locally and again on the server. One idempotency key is
 retained for the form submission until terminal state. Polls are keyed by
@@ -1608,7 +1670,8 @@ Status labels never conflate layers:
 
 - publication `PENDING|INSPECTING|READY|FAILED`;
 - registry location
-  `PENDING|COPYING|VERIFYING|READY|FAILED|MISSING|EVICTING|EVICTED` and a
+  `PENDING|COPYING|VERIFYING|READY|FAILED|MISSING|EVICTING|EVICTED|QUARANTINED`
+  and a
   queue/quota-based preparation ETA;
 - deployment node pull `UNKNOWN|IN_PROGRESS|COMPLETE|FAILED`; and
 - SkyServe replica health, linked from Serve rather than synthesized by Images.
@@ -2075,3 +2138,49 @@ expired copy lease on the shard. The next revision separates admission from
 dispatch, reclaims expired leases across later admission-state changes, fences
 re-admission to `READY|FULL`, and preserves the last valid workspace-retention
 policy when configuration refresh fails.
+
+Implementation review round 17 at
+`d82b953f1c7013aa01348b2f2477e8ae0363129d` returned paired Codex `PURSUE` and
+Fable `PURSUE`. Both independently traced the repaired FULL-shard dispatch,
+expired-lease recovery, candidate isolation, activation fencing, and retention
+reload behavior without finding a blocker.
+
+Implementation review round 18 repeated the exact immutable
+`d82b953f1c7013aa01348b2f2477e8ae0363129d` tree and returned Codex `RESHAPE`
+and Fable `PURSUE`, resetting the acceptance streak. Codex proved that a stale
+lifecycle worker could resume a destructive delete after its lease was
+reassigned, after a verifier restored the location to READY, and after live
+demand committed. This revision therefore shares the copy heartbeat with
+lifecycle work and makes exact lease ownership a precondition of every provider
+call. It also incorporates Fable's bounded findings by reopening a FULL shard in
+the reservation-release transaction, preserving the typed release-limit error,
+and making explicit retry report an unavailable shard instead of binding an
+unchanged failed row. The resulting full-suite run also exposed that Python's
+`pathlib` treats a terminal `/**` as directory-only; the disabled builder harness
+now expands that documented recursive include, including bare `**`, portably
+instead of omitting late-bound source files. The unavailable-shard fence is also
+now typed end to end as an HTTP 409 conflict, with bounded client and dashboard
+remediation, rather than degrading into `INVALID_IMAGE_REQUEST`.
+
+The focused round-18 repair review then split: Fable accepted the synchronous
+lease fences, while Codex rejected a remaining in-flight-delete schedule. A
+worker can durably pass the last lease check, pause while its ECR request is in
+flight, lose the lease, and complete its delete after a successor has read
+presence and restored READY. Because ECR offers no conditional delete keyed by
+the database lease, exact readback cannot close that interval. This revision
+therefore adds the durable `EVICT` to `DELETE` intent boundary and permanent
+per-location quarantine described above. It deliberately preserves the capacity
+charge and requires a different repository-ring fingerprint rather than
+guessing that an old request has stopped. The acceptance streak remains reset
+until both reviewers approve this exact implementation.
+
+The third focused repair review returned Codex `ACCEPT_REPAIR` and Fable
+`REJECT_REPAIR`. Fable proved that a transport timeout after ECR accepted a
+delete could be followed by a temporarily-present readback and an unsafe READY
+restore before the delayed delete landed. This revision permits delete readback
+only after a successful provider conclusion or an explicit no-mutation
+rejection; transport, timeout, and ambiguous server failures now enter the
+existing quarantine path without readback. It also restricts no-I/O restoration
+to pre-delete `EVICT` leases, fixes the race test's logical heartbeat clock,
+binds typed retry conflicts to terminal idempotent operations, and projects
+bounded quarantine-retained capacity in the readiness UI.

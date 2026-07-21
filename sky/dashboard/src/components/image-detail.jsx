@@ -21,6 +21,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import {
+  IMAGE_REMEDIATIONS,
   PrepareImageDialog,
   RetryImageDialog,
 } from '@/components/image-action-dialogs';
@@ -436,6 +437,11 @@ export function ImageDetail() {
                       <div className="mt-1 text-xs text-red-700">
                         {location.error_code}
                       </div>
+                      {IMAGE_REMEDIATIONS?.[location.error_code] && (
+                        <div className="mt-1 max-w-xs text-xs text-gray-600">
+                          {IMAGE_REMEDIATIONS[location.error_code]}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell className="max-w-md">
                       <CopyCode value={location.target_ref} />

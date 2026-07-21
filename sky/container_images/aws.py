@@ -52,6 +52,21 @@ _INVALID_INVENTORY_CURSOR_CODES = frozenset({
     'InvalidParameterException',
     'ValidationException',
 })
+_DELETE_NO_MUTATION_ERROR_CODES = _THROTTLE_ERROR_CODES | frozenset({
+    'AccessDenied',
+    'AccessDeniedException',
+    'ExpiredToken',
+    'ExpiredTokenException',
+    'IncompleteSignature',
+    'InvalidClientTokenId',
+    'InvalidParameterException',
+    'InvalidSignatureException',
+    'MissingAuthenticationToken',
+    'RepositoryNotFoundException',
+    'UnauthorizedException',
+    'UnrecognizedClientException',
+    'ValidationException',
+})
 
 requests = adaptor_common.LazyImport(
     'requests', import_error_message='AWS image workers require requests.')
@@ -570,6 +585,19 @@ def _error_code(error: BaseException) -> str | None:
     return str(code) if code is not None else None
 
 
+def _error_code_in_chain(error: BaseException) -> str | None:
+    """Finds the provider response hidden by a typed adapter exception."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = _error_code(current)
+        if code is not None:
+            return code
+        current = current.__cause__
+    return None
+
+
 def _canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True,
@@ -1010,10 +1038,16 @@ class EcrRepository:
                                             imageIds=[{
                                                 'imageDigest': digest
                                             }])
-        except Exception:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             calls_after = getattr(self._client, 'started_calls', None)
             if (calls_before is not None and calls_after == calls_before):
                 return DeleteOutcome.NOT_STARTED
+            # A read after a transport failure cannot prove that the timed-out
+            # delete will not arrive later. Only an explicit provider rejection
+            # known not to mutate may safely proceed to exact readback.
+            if (_error_code_in_chain(error)
+                    not in _DELETE_NO_MUTATION_ERROR_CODES):
+                return DeleteOutcome.AMBIGUOUS
         try:
             return (DeleteOutcome.ABSENT if self._batch_get_manifest(digest)
                     is None else DeleteOutcome.PRESENT)

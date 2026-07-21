@@ -12,13 +12,13 @@ metadata = sqlalchemy.MetaData()
 
 PUBLICATION_STATES = ('PENDING', 'INSPECTING', 'READY', 'FAILED')
 LOCATION_STATES = ('PENDING', 'COPYING', 'VERIFYING', 'READY', 'FAILED',
-                   'MISSING', 'EVICTING', 'EVICTED')
+                   'MISSING', 'EVICTING', 'EVICTED', 'QUARANTINED')
 OPERATION_STATES = ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')
 PROFILE_STATES = ('QUALIFYING', 'ACTIVE', 'FAILED', 'SUPERSEDED', 'RETIRED')
 SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
-LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'RECLAIM', 'RECONCILE')
+LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'DELETE')
 
 
 def _one_of(column: str, values: tuple[str, ...],
@@ -399,10 +399,11 @@ locations = sqlalchemy.Table(
         name='ck_container_image_location_lease'),
     sqlalchemy.CheckConstraint(
         "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
-        "'RECLAIM')",
+        "'DELETE')",
         name='ck_container_image_location_lease_kind'),
     sqlalchemy.CheckConstraint(
-        "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED')",
+        "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED', "
+        "'QUARANTINED')",
         name='ck_container_image_location_canonical_permanent'),
     sqlalchemy.CheckConstraint(
         'attempt_count >= 0 AND reserved_declared_bytes >= 0',

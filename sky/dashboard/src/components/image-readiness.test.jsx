@@ -46,6 +46,10 @@ const readiness = {
       queue_depth_at_least: false,
       failed_count: 3,
       failed_count_at_least: false,
+      quarantined_count: 2,
+      quarantined_count_at_least: false,
+      quarantined_reserved_declared_bytes: 512,
+      quarantined_reserved_declared_bytes_at_least: false,
       oldest_queued_at: 9_900,
       quota_bound_eta_seconds: 51,
       quota_bound_eta_at_least: false,
@@ -108,6 +112,7 @@ describe('Image readiness', () => {
     expect(screen.getByText('51s')).toBeVisible();
     expect(screen.getAllByText('501')).toHaveLength(2);
     expect(screen.getByText('3 failed')).toBeVisible();
+    expect(screen.getByText('2 quarantined · 512 B retained')).toBeVisible();
     expect(screen.getByText('copy')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     expect(onRefresh).toHaveBeenCalledTimes(1);

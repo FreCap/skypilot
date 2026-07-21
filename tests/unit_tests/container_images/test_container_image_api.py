@@ -348,3 +348,28 @@ def test_closed_error_mapping_never_reflects_provider_text() -> None:
             RuntimeError('provider said token=must-not-reflect'))
     assert error.value.status_code == 503
     assert error.value.detail == {'code': 'IMAGE_CATALOG_UNAVAILABLE'}
+
+
+@pytest.mark.parametrize(('failure', 'code'), (
+    (topology_state.RegistryShardUnavailableError('REGISTRY_SHARD_UNAVAILABLE'),
+     'REGISTRY_SHARD_UNAVAILABLE'),
+    (topology_state.RegistryLocationQuarantinedError(
+        'REGISTRY_LOCATION_QUARANTINED'), 'REGISTRY_LOCATION_QUARANTINED')))
+def test_retry_route_returns_typed_registry_conflict(
+        monkeypatch: pytest.MonkeyPatch, failure: ValueError,
+        code: str) -> None:
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda request, requested: 'research')
+    monkeypatch.setattr(server, '_require_publisher',
+                        lambda request, workspace: None)
+    monkeypatch.setattr(server.preparation, 'retry_location',
+                        mock.Mock(side_effect=failure))
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        server.retry_location(
+            str(uuid.uuid4()),
+            _request(),
+            api_models.WorkspaceMutation(workspace='research'),
+            idempotency_key='retry-location-0001')
+    assert error.value.status_code == 409
+    assert error.value.detail == {'code': code}

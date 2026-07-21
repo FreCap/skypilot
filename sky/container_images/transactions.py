@@ -38,6 +38,10 @@ class DemandLocationNotReadyError(ValueError):
         super().__init__('Demand location is not READY.')
 
 
+class ImageLimitExceededError(ValueError):
+    """A bounded per-artifact release or location ceiling was reached."""
+
+
 def _target_reference(shard: sqlalchemy.engine.RowMapping,
                       runtime_digest: str) -> str:
     return (f"{str(shard['registry']).rstrip('/')}/"
@@ -389,7 +393,7 @@ def bind_inspected_publication(
                                  publications.c.id
                                  != publication_id)).scalar_one()
         if int(release_count) >= max_releases_per_artifact:
-            raise ValueError('IMAGE_LIMIT_EXCEEDED')
+            raise ImageLimitExceededError('IMAGE_LIMIT_EXCEEDED')
         publication = session.execute(publications.update().where(
             publications.c.id == publication_id).values(
                 state=models.ImagePublicationState.PENDING.value,
@@ -475,7 +479,7 @@ def reserve_regional_location(
                 if str(shard['state']) not in (
                         models.ImageShardState.READY.value,
                         models.ImageShardState.FULL.value):
-                    raise topology_state.RegistryCapacityExhaustedError(
+                    raise topology_state.RegistryShardUnavailableError(
                         'REGISTRY_SHARD_UNAVAILABLE')
                 location_values: dict[str, Any] = {
                     'state': models.ImageLocationState.PENDING.value,
@@ -515,7 +519,7 @@ def reserve_regional_location(
                 locations.c.image_id == image_id,
                 locations.c.canonical.is_(False))).scalar_one()
         if int(regional_count) >= max_regional_locations:
-            raise ValueError('IMAGE_LIMIT_EXCEEDED')
+            raise ImageLimitExceededError('IMAGE_LIMIT_EXCEEDED')
         target_ref = _target_reference(shard, str(artifact['runtime_digest']))
         inserted = session.execute(
             postgresql.insert(locations).values(
@@ -826,7 +830,7 @@ def retry_publication(
                 raise RuntimeError('Canonical location shard is unavailable.')
             if str(shard['state']) not in (models.ImageShardState.READY.value,
                                            models.ImageShardState.FULL.value):
-                raise topology_state.RegistryCapacityExhaustedError(
+                raise topology_state.RegistryShardUnavailableError(
                     'REGISTRY_SHARD_UNAVAILABLE')
             session.execute(locations.update().where(
                 locations.c.id == location['id']).values(

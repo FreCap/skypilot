@@ -360,6 +360,20 @@ export function ImageReadiness({
                       failed
                     </div>
                   )}
+                  {queue.quarantined_count > 0 && (
+                    <div className="text-xs text-red-700">
+                      {bounded(
+                        queue.quarantined_count,
+                        queue.quarantined_count_at_least
+                      )}{' '}
+                      quarantined ·{' '}
+                      {queue.quarantined_reserved_declared_bytes_at_least
+                        ? '≥'
+                        : ''}
+                      {bytes(queue.quarantined_reserved_declared_bytes)}{' '}
+                      retained
+                    </div>
+                  )}
                 </TableCell>
                 <TableCell>{age(now, queue.oldest_queued_at)}</TableCell>
                 <TableCell>

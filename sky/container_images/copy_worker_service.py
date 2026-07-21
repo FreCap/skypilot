@@ -31,6 +31,7 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
+from sky.container_images import worker_lease
 
 _ECR_AUTHORITY = re.compile(
     r'^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.'
@@ -82,44 +83,7 @@ def _ingest_qualification_manifests(directory: str) -> int:
     return ingested
 
 
-class _LeaseHeartbeat:
-    """Renews one durable lease and cancels provider I/O on loss."""
-
-    def __init__(self, heartbeat: Callable[[], bool], interval: float) -> None:
-        self.cancel_event = threading.Event()
-        self._stop = threading.Event()
-        self._heartbeat = heartbeat
-        self._interval = interval
-        self._lost = False
-        self._thread = threading.Thread(target=self._run,
-                                        name='image-worker-lease-heartbeat',
-                                        daemon=True)
-
-    def __enter__(self) -> _LeaseHeartbeat:
-        if not self._heartbeat():
-            raise RuntimeError('Container image work lease was lost.')
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self._stop.set()
-        self._thread.join(timeout=self._interval + 1)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            try:
-                owned = self._heartbeat()
-            except Exception:  # pylint: disable=broad-except
-                owned = False
-            if not owned:
-                self._lost = True
-                self.cancel_event.set()
-                return
-
-    def assert_owned(self) -> None:
-        if self._lost or not self._heartbeat():
-            self.cancel_event.set()
-            raise RuntimeError('Container image work lease was lost.')
+_LeaseHeartbeat = worker_lease.LeaseHeartbeat
 
 
 def _docker_config_credentials(binding: models.RegistryAccessBinding,
@@ -300,6 +264,13 @@ def inspect_publication(publication: catalog_state.PublicationRecord,
             models.ImageLocationErrorCode.REGISTRY_CAPACITY_EXHAUSTED.value,
             retry_at=None,
             terminal=True)
+        return False
+    except transactions.ImageLimitExceededError:
+        catalog_state.fail_publication_inspection(publication.id,
+                                                  token,
+                                                  'IMAGE_LIMIT_EXCEEDED',
+                                                  retry_at=None,
+                                                  terminal=True)
         return False
     except (ValueError, TypeError):
         catalog_state.fail_publication_inspection(

@@ -63,6 +63,19 @@ def test_context_manifest_is_deterministic_and_bounded(tmp_path: Path) -> None:
     assert json.loads(first.payload)['entries'][0]['path'] == 'requirements.txt'
 
 
+def test_bare_recursive_glob_includes_files_portably(tmp_path: Path) -> None:
+    _context(tmp_path)
+    raw = _spec()
+    raw['context']['include'] = ['**']
+    raw['source']['include'] = []
+
+    manifest = builder_prototype.create_context_manifest(
+        tmp_path, builder_prototype.BuildSpec.from_dict(raw))
+
+    assert [entry.path for entry in manifest.entries
+           ] == ['requirements.txt', 'src/app.py']
+
+
 def test_late_bound_code_change_does_not_invalidate_dependency_cache(
         tmp_path: Path) -> None:
     _context(tmp_path)

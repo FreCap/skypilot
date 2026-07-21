@@ -50,6 +50,8 @@ _CLOSED_ERRORS = frozenset({
     'PROFILE_NOT_ACTIVE',
     'QUALIFICATION_FAILED',
     'REGISTRY_CAPACITY_EXHAUSTED',
+    'REGISTRY_LOCATION_QUARANTINED',
+    'REGISTRY_SHARD_UNAVAILABLE',
     'RELEASE_CONFLICT',
     'TARGET_READ_ONLY',
 })
@@ -116,7 +118,8 @@ def _raise_code(code: str) -> NoReturn:
     elif code in ('IMAGE_LOCATION_NOT_FOUND', 'IMAGE_NOT_PUBLISHED',
                   'IMAGE_OPERATION_NOT_FOUND', 'IMAGE_PUBLICATION_NOT_FOUND'):
         status = 404
-    elif code in ('IDEMPOTENCY_KEY_REUSED', 'RELEASE_CONFLICT'):
+    elif code in ('IDEMPOTENCY_KEY_REUSED', 'REGISTRY_LOCATION_QUARANTINED',
+                  'REGISTRY_SHARD_UNAVAILABLE', 'RELEASE_CONFLICT'):
         status = 409
     elif code == 'IMAGE_CATALOG_UNAVAILABLE':
         status = 503
@@ -132,6 +135,10 @@ def _api_error(error: BaseException) -> NoReturn:
         _raise_code('RELEASE_CONFLICT')
     if isinstance(error, topology_state.RegistryCapacityExhaustedError):
         _raise_code('REGISTRY_CAPACITY_EXHAUSTED')
+    if isinstance(error, topology_state.RegistryLocationQuarantinedError):
+        _raise_code('REGISTRY_LOCATION_QUARANTINED')
+    if isinstance(error, topology_state.RegistryShardUnavailableError):
+        _raise_code('REGISTRY_SHARD_UNAVAILABLE')
     code = error.args[0] if error.args else None
     if isinstance(code, str) and code in _CLOSED_ERRORS:
         _raise_code(code)

@@ -30,9 +30,17 @@ def _terminal(
 ) -> tuple[models.ImageOperationState | None, str | None]:
     if location.state == models.ImageLocationState.READY:
         return models.ImageOperationState.SUCCEEDED, None
-    if location.state == models.ImageLocationState.FAILED:
+    if location.state in (models.ImageLocationState.FAILED,
+                          models.ImageLocationState.QUARANTINED):
         return models.ImageOperationState.FAILED, location.error_code
     return None, None
+
+
+def _raise_retry_conflict(error_code: str | None) -> None:
+    if error_code == 'REGISTRY_LOCATION_QUARANTINED':
+        raise topology_state.RegistryLocationQuarantinedError(error_code)
+    if error_code == 'REGISTRY_SHARD_UNAVAILABLE':
+        raise topology_state.RegistryShardUnavailableError(error_code)
 
 
 def prepare(*, image_id: str, distribution: str, target_id: str, workspace: str,
@@ -147,12 +155,33 @@ def retry_location(*, location_id: str, workspace: str, actor_hash: str,
         location = topology_state.get_location(operation.result_id)
         if location is None:
             raise ValueError('Operation location result is unavailable.')
+        _raise_retry_conflict(operation.error_code)
         return LocationMutation(operation=operation, location=location)
     location = topology_state.retry_location(location_id, workspace)
     if location is None:
         location = topology_state.get_location(location_id)
     if location is None or location.workspace != workspace:
         raise ValueError('IMAGE_LOCATION_NOT_FOUND')
+    conflict_code: str | None = None
+    if location.state == models.ImageLocationState.QUARANTINED:
+        conflict_code = 'REGISTRY_LOCATION_QUARANTINED'
+    if location.state in (models.ImageLocationState.FAILED,
+                          models.ImageLocationState.MISSING,
+                          models.ImageLocationState.EVICTED):
+        conflict_code = 'REGISTRY_SHARD_UNAVAILABLE'
+    if conflict_code is not None:
+        operation = catalog_state.bind_operation_result(
+            operation.id,
+            result_kind='location',
+            result_id=location.id,
+            result={
+                'location_id': location.id,
+                'state': location.state.value,
+            },
+            terminal_state=models.ImageOperationState.FAILED,
+            error_code=conflict_code)
+        _raise_retry_conflict(operation.error_code)
+        return LocationMutation(operation=operation, location=location)
     terminal_state, error_code = _terminal(location)
     operation = catalog_state.bind_operation_result(
         operation.id,

@@ -23,7 +23,9 @@ from sky.container_images import demand_state
 from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
 from sky.container_images import topology_state
+from sky.container_images import transactions
 from sky.container_images import worker_health
+from sky.container_images import worker_lease
 
 _DIGEST = 'sha256:' + 'a' * 64
 _CONFIG_DIGEST = 'sha256:' + 'b' * 64
@@ -550,6 +552,18 @@ class _OwnedHeartbeat(contextlib.AbstractContextManager['_OwnedHeartbeat']):
         return None
 
 
+def test_shared_lease_heartbeat_fails_closed_on_synchronous_renewal() -> None:
+    renew = mock.Mock(side_effect=(True, False))
+    heartbeat = worker_lease.LeaseHeartbeat(renew, interval=60)
+
+    with heartbeat:
+        with pytest.raises(worker_lease.LeaseLostError):
+            heartbeat.assert_owned()
+        assert heartbeat.cancel_event.is_set()
+
+    assert renew.call_count == 2
+
+
 def test_ambiguous_copy_is_verified_before_ready(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -671,43 +685,72 @@ def test_copy_maintenance_also_recovers_pending_publication_fanout(
     schedule_canaries.assert_called_once_with()
 
 
-@pytest.mark.parametrize('delete_enabled', [True, False])
-def test_reclaimed_eviction_with_demand_verifies_without_deleting(
-        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        delete_enabled: bool) -> None:
-    if not delete_enabled:
-        profile = dataclasses.replace(profile,
-                                      targets=(dataclasses.replace(
-                                          profile.targets[0],
-                                          delete_authority=None),))
+def test_publication_release_limit_keeps_typed_error(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    publication = SimpleNamespace(
+        id='publication-id',
+        workspace='research',
+        operation_id='operation-id',
+        profile_revision_id=_REVISION_ID,
+        inspection_lease_token='inspection-token',
+        source_ref=f'ghcr.io/example/runtime@{_DIGEST}',
+        source_root_digest=_DIGEST,
+        requested_platform='linux/amd64',
+        source_auth_binding_id=None,
+        source_auth_fingerprint=None,
+        attempt_count=1,
+        created_at=10)
+    graph = SimpleNamespace(runtime_digest=_DIGEST,
+                            config=SimpleNamespace(digest=_CONFIG_DIGEST),
+                            platform='linux/amd64',
+                            source_root_media_type='application/vnd.oci.image.'
+                            'manifest.v1+json',
+                            runtime_media_type='application/vnd.oci.image.'
+                            'manifest.v1+json',
+                            raw_runtime_manifest=b'{}',
+                            declared_size_bytes=2)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'get_profile_revision', lambda _: _revision(profile))
+    monkeypatch.setattr(copy_worker_service.catalog_state, 'get_operation',
+                        lambda *_: SimpleNamespace(actor_hash='actor'))
+    monkeypatch.setattr(copy_worker_service, '_source_reader',
+                        lambda *_: mock.sentinel.reader)
+    monkeypatch.setattr(copy_worker_service, '_inspection_graph',
+                        lambda *_: graph)
+    monkeypatch.setattr(copy_worker_service, '_LeaseHeartbeat', _OwnedHeartbeat)
+    monkeypatch.setattr(
+        copy_worker_service.transactions, 'bind_inspected_publication',
+        mock.Mock(side_effect=transactions.ImageLimitExceededError(
+            'IMAGE_LIMIT_EXCEEDED')))
+    fail = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'fail_publication_inspection', fail)
+
+    assert not copy_worker_service.inspect_publication(publication)
+
+    fail.assert_called_once_with('publication-id',
+                                 'inspection-token',
+                                 'IMAGE_LIMIT_EXCEEDED',
+                                 retry_at=None,
+                                 terminal=True)
+
+
+def test_nonclaim_eviction_state_never_reaches_provider(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
     location = dataclasses.replace(_copying_location(profile),
                                    state=models.ImageLocationState.EVICTING,
-                                   lease_kind='VERIFY')
-    repository = mock.Mock()
-    repository.exact_manifest_exists.return_value = False
+                                   lease_kind='DELETE')
+    provider = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
-                        lambda _: _shard(profile))
-    monkeypatch.setattr(lifecycle_worker_service.topology_state,
-                        'get_profile_revision', lambda _: _revision(profile))
-    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
-                        'get_catalog_authority_id', lambda: 'catalog')
-    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
-                        lambda *_args, **_kwargs: repository)
-    complete = mock.Mock()
-    monkeypatch.setattr(lifecycle_worker_service.topology_state,
-                        'complete_eviction', complete)
+                        provider)
 
-    assert lifecycle_worker_service.evict_location(location, mock.Mock())
-
-    repository.exact_manifest_exists.assert_called_once_with(
-        location.runtime_digest)
-    repository.delete_outcome.assert_not_called()
-    complete.assert_called_once_with(location.id,
-                                     location.lease_token,
-                                     present=False)
+    assert not lifecycle_worker_service.evict_location(location, mock.Mock())
+    provider.assert_not_called()
 
 
-def test_expired_eviction_without_delete_authority_reads_before_restore(
+def test_eviction_without_delete_authority_restores_without_provider_io(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     profile = dataclasses.replace(
@@ -716,38 +759,29 @@ def test_expired_eviction_without_delete_authority_reads_before_restore(
                                      delete_authority=None),))
     location = dataclasses.replace(_copying_location(profile),
                                    state=models.ImageLocationState.EVICTING,
-                                   lease_kind='RECLAIM')
-    repository = mock.Mock()
-    repository.exact_manifest_exists.return_value = True
+                                   lease_kind='EVICT')
     monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
                         lambda _: _shard(profile))
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'get_profile_revision', lambda _: _revision(profile))
-    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
-                        'get_catalog_authority_id', lambda: 'catalog')
-    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
-                        lambda *_args, **_kwargs: repository)
     complete = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'complete_eviction', complete)
 
     assert not lifecycle_worker_service.evict_location(location, mock.Mock())
 
-    repository.exact_manifest_exists.assert_called_once_with(
-        location.runtime_digest)
-    repository.delete_outcome.assert_not_called()
     complete.assert_called_once_with(location.id,
                                      location.lease_token,
-                                     present=True)
+                                     present=None,
+                                     provider_not_called=True)
 
 
-@pytest.mark.parametrize('lease_kind', ['EVICT', 'VERIFY', 'RECLAIM'])
-def test_eviction_resolution_failure_preserves_prior_outcome(
-        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        lease_kind: str) -> None:
+def test_eviction_resolution_failure_restores_without_provider_io(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
     location = dataclasses.replace(_copying_location(profile),
                                    state=models.ImageLocationState.EVICTING,
-                                   lease_kind=lease_kind)
+                                   lease_kind='EVICT')
     monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
                         lambda _: _shard(profile))
     monkeypatch.setattr(lifecycle_worker_service,
@@ -758,15 +792,10 @@ def test_eviction_resolution_failure_preserves_prior_outcome(
 
     assert not lifecycle_worker_service.evict_location(location, mock.Mock())
 
-    if lease_kind == 'EVICT':
-        complete.assert_called_once_with(location.id,
-                                         location.lease_token,
-                                         present=None,
-                                         provider_not_called=True)
-    else:
-        complete.assert_called_once_with(location.id,
-                                         location.lease_token,
-                                         present=None)
+    complete.assert_called_once_with(location.id,
+                                     location.lease_token,
+                                     present=None,
+                                     provider_not_called=True)
 
 
 def test_eviction_uses_shard_activated_revision(
@@ -778,18 +807,32 @@ def test_eviction_uses_shard_activated_revision(
                                    state=models.ImageLocationState.EVICTING,
                                    lease_kind='EVICT')
     repository = mock.Mock()
-    repository.delete_outcome.return_value = aws.DeleteOutcome.ABSENT
     roles: list[aws.AwsRoleBinding] = []
+    call_order: list[str] = []
     monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
                         lambda _: _shard(profile))
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'get_profile_revision', lambda _: old_revision)
     monkeypatch.setattr(lifecycle_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    begin_delete = mock.Mock(
+        side_effect=lambda *_args: call_order.append('intent') or True)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'begin_eviction_delete', begin_delete)
 
     def repository_from_role(role: aws.AwsRoleBinding, *_args: object,
                              **_kwargs: object) -> mock.Mock:
         roles.append(role)
+        hooks = _kwargs['hooks']
+
+        def delete_outcome(_digest: str) -> aws.DeleteOutcome:
+            hooks.before_call()
+            call_order.append('delete')
+            return aws.DeleteOutcome.ABSENT
+
+        repository.delete_outcome.side_effect = delete_outcome
         return repository
 
     monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
@@ -797,10 +840,53 @@ def test_eviction_uses_shard_activated_revision(
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'complete_eviction', mock.Mock())
 
-    assert lifecycle_worker_service.evict_location(location, mock.Mock())
+    limiter = mock.Mock()
+    assert lifecycle_worker_service.evict_location(location, limiter)
     delete_authority = profile.targets[0].delete_authority
     assert delete_authority is not None
     assert roles[0].role_arn == profile.bindings[delete_authority].authority
+    begin_delete.assert_called_once_with(location.id, location.lease_token)
+    assert call_order == ['intent', 'delete']
+
+
+def test_not_started_after_delete_intent_fails_closed(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    location = dataclasses.replace(_copying_location(profile),
+                                   state=models.ImageLocationState.EVICTING,
+                                   lease_kind='EVICT')
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _: _shard(profile))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_profile_revision', lambda _: _revision(profile))
+    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'begin_eviction_delete', lambda *_args: True)
+
+    def repository_from_role(*_args: object, **kwargs: object) -> mock.Mock:
+        repository = mock.Mock()
+
+        def delete_outcome(_digest: str) -> aws.DeleteOutcome:
+            kwargs['hooks'].before_call()
+            return aws.DeleteOutcome.NOT_STARTED
+
+        repository.delete_outcome.side_effect = delete_outcome
+        return repository
+
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    complete = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'complete_eviction', complete)
+
+    assert not lifecycle_worker_service.evict_location(location, mock.Mock())
+    complete.assert_called_once_with(location.id,
+                                     location.lease_token,
+                                     present=None,
+                                     provider_not_called=False)
 
 
 def test_copy_and_inventory_use_operational_revision_not_newer_candidate(

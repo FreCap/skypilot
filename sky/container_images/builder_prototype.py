@@ -295,7 +295,12 @@ def create_context_manifest(root: Path, spec: BuildSpec) -> ContextManifest:
         raise ValueError('Build context root must be a directory.')
     paths: dict[str, Path] = {}
     for pattern in spec.context_include + spec.source_include:
-        for candidate in context_root.glob(pattern):
+        # pathlib treats a terminal `/**` as matching directories only on
+        # supported Python versions. The builder contract defines it as the
+        # recursive contents of that directory, matching common glob syntax.
+        expanded_pattern = (f'{pattern}/*' if pattern == '**' or
+                            pattern.endswith('/**') else pattern)
+        for candidate in context_root.glob(expanded_pattern):
             relative = candidate.relative_to(context_root).as_posix()
             if candidate.is_symlink():
                 raise ValueError('Build context symlinks are not accepted.')

@@ -25,6 +25,7 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
+from sky.container_images import worker_lease
 from sky.jobs import state as managed_job_state
 from sky.serve import serve_state
 
@@ -34,6 +35,8 @@ _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
 _UNATTACHED_REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 
 logger = sky_logging.init_logger(__name__)
+
+_LeaseHeartbeat = worker_lease.LeaseHeartbeat
 
 
 def _ecr_hooks(
@@ -108,76 +111,77 @@ def _refresh_workspace_eviction_cutoffs(
         return previous
 
 
-def evict_location(location: topology_state.LocationRecord,
-                   limiter: budgets.ProviderBudgetLimiter) -> bool:
+def evict_location(
+    location: topology_state.LocationRecord,
+    limiter: budgets.ProviderBudgetLimiter,
+    *,
+    lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+) -> bool:
     token = location.lease_token
-    if token is None or location.canonical:
+    if (token is None or location.canonical or location.lease_kind != 'EVICT'):
         return False
     shard = topology_state.get_shard(location.shard_id)
     if shard is None:
         return False
     resolved = _profile_target_for_location(location, shard)
     if resolved is None:
-        if location.lease_kind == 'EVICT':
-            topology_state.complete_eviction(location.id,
-                                             token,
-                                             present=None,
-                                             provider_not_called=True)
-        else:
-            # VERIFY and RECLAIM may represent provider I/O from an expired
-            # owner. Preserve ambiguity until an exact authority is available.
-            topology_state.complete_eviction(location.id, token, present=None)
+        topology_state.complete_eviction(location.id,
+                                         token,
+                                         present=None,
+                                         provider_not_called=True)
         return False
     profile, target = resolved
-    verify_only = location.lease_kind == 'VERIFY'
-    reclaimed = location.lease_kind == 'RECLAIM'
-    if not verify_only and not reclaimed and target.delete_authority is None:
+    if target.delete_authority is None:
         topology_state.complete_eviction(location.id,
                                          token,
                                          present=None,
                                          provider_not_called=True)
         return False
-    authority = (target.delete_authority or
-                 target.qualification_delete_authority)
-    binding = profile.bindings[authority]
-    repository = aws.EcrRepository.from_role(
-        _lifecycle_role(binding, profile),
-        shard.region,
-        shard.repository_name,
-        hooks=aws.EcrCallHooks(
-            before_call=lambda: limiter.before_call(shard),
-            on_throttle=lambda: limiter.record_throttle(shard)))
-    if verify_only or reclaimed:
-        manifest_present = repository.exact_manifest_exists(
-            location.runtime_digest)
-        if reclaimed and manifest_present and target.delete_authority is not None:
-            outcome = repository.delete_outcome(location.runtime_digest)
-            if outcome == aws.DeleteOutcome.NOT_STARTED:
-                topology_state.complete_eviction(location.id,
-                                                 token,
-                                                 present=True)
-                return False
-            present = (True if outcome == aws.DeleteOutcome.PRESENT else
-                       False if outcome == aws.DeleteOutcome.ABSENT else None)
-            topology_state.complete_eviction(location.id,
-                                             token,
-                                             present=present)
-            return outcome == aws.DeleteOutcome.ABSENT
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         present=manifest_present)
-        return not manifest_present
-    outcome = repository.delete_outcome(location.runtime_digest)
-    if outcome == aws.DeleteOutcome.NOT_STARTED:
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         present=None,
-                                         provider_not_called=True)
-        return False
-    present = (True if outcome == aws.DeleteOutcome.PRESENT else
-               False if outcome == aws.DeleteOutcome.ABSENT else None)
-    topology_state.complete_eviction(location.id, token, present=present)
-    return outcome == aws.DeleteOutcome.ABSENT
+    binding = profile.bindings[target.delete_authority]
+    heartbeat = _LeaseHeartbeat(
+        lambda: topology_state.heartbeat_location(location.id, token,
+                                                  lease_seconds),
+        max(1.0, lease_seconds / 3))
+    with heartbeat:
+        delete_intent = False
+
+        def before_call() -> None:
+            nonlocal delete_intent
+            # Provider budgets can wait. Fence the exact lease both before and
+            # after that wait. The first call then commits durable DELETE intent
+            # before the SDK can send anything destructive.
+            heartbeat.assert_owned()
+            limiter.before_call(shard)
+            heartbeat.assert_owned()
+            if not delete_intent:
+                if not topology_state.begin_eviction_delete(location.id, token):
+                    raise worker_lease.LeaseLostError(
+                        'Container image eviction lease was lost.')
+                delete_intent = True
+                heartbeat.assert_owned()
+
+        repository = aws.EcrRepository.from_role(
+            _lifecycle_role(binding, profile),
+            shard.region,
+            shard.repository_name,
+            hooks=aws.EcrCallHooks(
+                before_call=before_call,
+                on_throttle=lambda: limiter.record_throttle(shard)))
+        outcome = repository.delete_outcome(location.runtime_digest)
+        heartbeat.assert_owned()
+        if outcome == aws.DeleteOutcome.NOT_STARTED:
+            topology_state.complete_eviction(
+                location.id,
+                token,
+                present=None,
+                provider_not_called=(not delete_intent))
+            return False
+        present = (True if outcome == aws.DeleteOutcome.PRESENT else
+                   False if outcome == aws.DeleteOutcome.ABSENT else None)
+        completed = topology_state.complete_eviction(location.id,
+                                                     token,
+                                                     present=present)
+        return (completed is not None and outcome == aws.DeleteOutcome.ABSENT)
 
 
 def _reconcile_publication_fanout(limit: int = 100) -> int:
@@ -567,8 +571,10 @@ class LifecycleWorkerService:
                     if claim is None:
                         break
                     futures.add(
-                        executor.submit(evict_location, claim,
-                                        self._budget_limiter))
+                        executor.submit(evict_location,
+                                        claim,
+                                        self._budget_limiter,
+                                        lease_seconds=self.lease_seconds))
                 self._stop.wait(1 if futures else 5)
 
 

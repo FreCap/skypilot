@@ -35,6 +35,7 @@ export const getStatusStyle = (status) => {
     case 'SUCCEEDED':
       return 'bg-blue-50 text-blue-700';
     case 'FAILED':
+    case 'QUARANTINED':
       return 'bg-red-50 text-red-700';
     case 'CANCELLED':
       return 'bg-yellow-50 text-yellow-700';
@@ -130,6 +131,7 @@ export const getStatusIcon = (status) => {
       return <CircularProgress size={12} className="w-3 h-3 mr-1" />;
     case 'TERMINATED':
     case 'FAILED':
+    case 'QUARANTINED':
     case 'CANCELLED':
     case 'EVICTED':
     case 'RETIRED':

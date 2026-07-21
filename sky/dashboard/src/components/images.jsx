@@ -499,6 +499,7 @@ export function Images() {
                     'MISSING',
                     'EVICTING',
                     'EVICTED',
+                    'QUARANTINED',
                   ].map((state) => (
                     <option key={state} value={state}>
                       {state}

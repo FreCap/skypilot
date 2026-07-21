@@ -42,6 +42,12 @@ _SAFE_MESSAGES = {
     'REGISTRY_CAPACITY_EXHAUSTED':
         ('REGISTRY_CAPACITY_EXHAUSTED: add a shard or raise verified capacity.'
         ),
+    'REGISTRY_LOCATION_QUARANTINED':
+        ('REGISTRY_LOCATION_QUARANTINED: activate a qualified target with a '
+         'new repository ring.'),
+    'REGISTRY_SHARD_UNAVAILABLE': (
+        'REGISTRY_SHARD_UNAVAILABLE: repair shard drift or activate a qualified '
+        'revision.'),
 }
 
 _MAX_NESTED_ERRORS = 64

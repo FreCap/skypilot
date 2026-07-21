@@ -472,7 +472,7 @@ def _create_tables() -> None:
             name='uq_container_image_location_target_ref'),
         sqlalchemy.CheckConstraint(
             "state IN ('PENDING', 'COPYING', 'VERIFYING', 'READY', 'FAILED', "
-            "'MISSING', 'EVICTING', 'EVICTED')",
+            "'MISSING', 'EVICTING', 'EVICTED', 'QUARANTINED')",
             name='ck_container_image_location_state'),
         sqlalchemy.CheckConstraint(
             '(canonical IS TRUE AND canonical_location_id IS NULL) OR '
@@ -487,10 +487,11 @@ def _create_tables() -> None:
             name='ck_container_image_location_lease'),
         sqlalchemy.CheckConstraint(
             "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
-            "'RECLAIM')",
+            "'DELETE')",
             name='ck_container_image_location_lease_kind'),
         sqlalchemy.CheckConstraint(
-            "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED')",
+            "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED', "
+            "'QUARANTINED')",
             name='ck_container_image_location_canonical_permanent'),
         sqlalchemy.CheckConstraint(
             'attempt_count >= 0 AND reserved_declared_bytes >= 0',

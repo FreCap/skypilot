@@ -38,11 +38,17 @@ export const IMAGE_REMEDIATIONS = {
   PLATFORM_UNSUPPORTED: 'Publish a supported OCI platform child.',
   PROFILE_NOT_ACTIVE:
     'Apply Terraform evidence and complete profile qualification first.',
+  PROVIDER_OUTCOME_AMBIGUOUS:
+    'Activate a qualified target with a new repository ring. This physical reference is quarantined.',
   PROVIDER_THROTTLED: 'The shared provider budget will retry automatically.',
   QUALIFICATION_FAILED:
     'Compare the profile revision, Terraform handoff, and attestations.',
   REGISTRY_CAPACITY_EXHAUSTED:
     'Provision and qualify a new fixed shard generation before retrying.',
+  REGISTRY_LOCATION_QUARANTINED:
+    'Activate a qualified target with a new repository ring before preparing again.',
+  REGISTRY_SHARD_UNAVAILABLE:
+    'Repair shard drift or activate a qualified revision before retrying.',
   RELEASE_CONFLICT: 'Use a new release or the existing immutable artifact.',
 };
 

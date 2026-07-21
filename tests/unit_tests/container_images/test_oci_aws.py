@@ -390,8 +390,11 @@ class _EcrClient:
         self.present = False
         self.deleted: list[str] = []
         self.put_error: BaseException | None = None
+        self.delete_error: BaseException | None = None
+        self.get_calls = 0
 
     def batch_get_image(self, **_: Any) -> dict[str, Any]:
+        self.get_calls += 1
         if not self.present:
             return {
                 'images': [],
@@ -423,6 +426,8 @@ class _EcrClient:
         self.present = True
 
     def batch_delete_image(self, **kwargs: Any) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
         self.deleted.append(kwargs['imageIds'][0]['imageDigest'])
         self.present = False
 
@@ -451,3 +456,77 @@ def test_ecr_copy_and_delete_converge_only_on_exact_digest() -> None:
     client.put_error = _AwsError('ServiceUnavailable')
     assert repository.copy_graph(graph, mock.Mock(),
                                  threading.Event()) == aws.CopyOutcome.AMBIGUOUS
+
+
+@pytest.mark.parametrize('error', [
+    TimeoutError('read timeout'),
+    ConnectionError('connection reset'),
+    _AwsError('ServiceUnavailable'),
+])
+def test_ecr_delete_transport_or_server_ambiguity_skips_readback(
+        error: BaseException) -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = _EcrClient(graph)
+    client.present = True
+    client.delete_error = error
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+
+    assert (repository.delete_outcome(
+        graph.runtime_digest) == aws.DeleteOutcome.AMBIGUOUS)
+    assert client.get_calls == 0
+
+
+@pytest.mark.parametrize('code', [
+    'AccessDeniedException',
+    'ThrottlingException',
+    'ValidationException',
+])
+def test_ecr_delete_explicit_no_mutation_rejection_allows_readback(
+        code: str) -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = _EcrClient(graph)
+    client.present = True
+    client.delete_error = _AwsError(code)
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+
+    assert (repository.delete_outcome(
+        graph.runtime_digest) == aws.DeleteOutcome.PRESENT)
+    assert client.get_calls == 1
+
+
+def test_ecr_delete_finds_rejection_response_through_hooked_adapter() -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = _EcrClient(graph)
+    client.present = True
+    client.delete_error = _AwsError('ThrottlingException')
+    hooks = aws.EcrCallHooks(before_call=mock.Mock(), on_throttle=mock.Mock())
+    hooked = aws._HookedEcrClient(  # pylint: disable=protected-access
+        client, hooks)
+    repository = aws.EcrRepository(hooked, 'skypilot/images/shard')
+
+    assert (repository.delete_outcome(
+        graph.runtime_digest) == aws.DeleteOutcome.PRESENT)
+    assert client.get_calls == 1
+    assert hooks.before_call.call_count == 2
+    hooks.on_throttle.assert_called_once_with()
+
+
+def test_ecr_delete_hooked_transport_timeout_never_reads_back() -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = _EcrClient(graph)
+    client.present = True
+    client.delete_error = TimeoutError('read timeout')
+    hooks = aws.EcrCallHooks(before_call=mock.Mock(), on_throttle=mock.Mock())
+    hooked = aws._HookedEcrClient(  # pylint: disable=protected-access
+        client, hooks)
+    repository = aws.EcrRepository(hooked, 'skypilot/images/shard')
+
+    assert (repository.delete_outcome(
+        graph.runtime_digest) == aws.DeleteOutcome.AMBIGUOUS)
+    assert client.get_calls == 0
+    hooks.before_call.assert_called_once_with()
+    hooks.on_throttle.assert_not_called()

@@ -620,7 +620,8 @@ def resolve_for_placement(resources: resources_lib.Resources,
         target_fingerprint=target.target_fingerprint,
         location_id=location.id,
         placement=placement_payload)
-    if location.state == models.ImageLocationState.FAILED:
+    if location.state in (models.ImageLocationState.FAILED,
+                          models.ImageLocationState.QUARANTINED):
         demand_state.fail_and_supersede_demand(
             demand.id, location.error_code or 'IMAGE_PREPARATION_FAILED')
         raise ContainerImagePreparationFailedError(demand.id)
@@ -654,7 +655,8 @@ def resolve_for_placement(resources: resources_lib.Resources,
         # the location lock in between; the durable demand then requeues that
         # location, so this attempt remains warming rather than a generic
         # resolution failure.
-        if e.state == models.ImageLocationState.FAILED:
+        if e.state in (models.ImageLocationState.FAILED,
+                       models.ImageLocationState.QUARANTINED):
             demand_state.fail_and_supersede_demand(
                 demand.id, e.error_code or 'IMAGE_PREPARATION_FAILED')
             raise ContainerImagePreparationFailedError(demand.id) from e

@@ -828,6 +828,7 @@ class ImageLocationState(enum.Enum):
     MISSING = 'MISSING'
     EVICTING = 'EVICTING'
     EVICTED = 'EVICTED'
+    QUARANTINED = 'QUARANTINED'
 
 
 class ImageLocationErrorCode(enum.Enum):

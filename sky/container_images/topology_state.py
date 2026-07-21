@@ -31,6 +31,14 @@ class RegistryCapacityExhaustedError(ValueError):
     """Every qualified fixed shard is full for the requested reservation."""
 
 
+class RegistryShardUnavailableError(ValueError):
+    """The selected shard cannot admit or retry the requested location."""
+
+
+class RegistryLocationQuarantinedError(ValueError):
+    """The exact physical location cannot be safely reused after a delete."""
+
+
 class LocationLeaseLostError(RuntimeError):
     """A location completion no longer owns the random database fence."""
 
@@ -1017,6 +1025,23 @@ def _bounded_location_count(session: orm.Session, shard_ids: list[str],
     return int(session.execute(statement).scalar_one())
 
 
+def _bounded_location_reservation_stats(session: orm.Session,
+                                        shard_ids: list[str], state: str,
+                                        result_cap: int) -> tuple[int, int]:
+    bounded = sqlalchemy.select(
+        schema.locations.c.id,
+        schema.locations.c.reserved_declared_bytes).where(
+            schema.locations.c.shard_id.in_(shard_ids),
+            schema.locations.c.state == state).limit(result_cap + 1).subquery()
+    statement = sqlalchemy.select(
+        sqlalchemy.func.count(),  # pylint: disable=not-callable
+        sqlalchemy.func.coalesce(
+            sqlalchemy.func.sum(bounded.c.reserved_declared_bytes), 0),
+    ).select_from(bounded)
+    count, reserved_bytes = session.execute(statement).one()
+    return int(count), int(reserved_bytes)
+
+
 def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
     """Returns bounded queue and capacity aggregates without provider I/O."""
     result_cap = 10_000
@@ -1054,8 +1079,13 @@ def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
             queued_count = _bounded_location_count(session, shard_ids,
                                                    pending_states, result_cap)
             failed_count = _bounded_location_count(
-                session, shard_ids, (models.ImageLocationState.FAILED.value,),
-                result_cap)
+                session, shard_ids,
+                (models.ImageLocationState.FAILED.value,
+                 models.ImageLocationState.QUARANTINED.value), result_cap)
+            quarantined_count, quarantined_bytes = (
+                _bounded_location_reservation_stats(
+                    session, shard_ids,
+                    models.ImageLocationState.QUARANTINED.value, result_cap))
             # The minimum of each shard/state index head is the exact global
             # oldest row, without scanning or sorting the complete queue.
             oldest_statement = sqlalchemy.text("""
@@ -1095,6 +1125,11 @@ def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
                 'queue_depth_at_least': queued_count > result_cap,
                 'failed_count': min(failed_count, result_cap),
                 'failed_count_at_least': failed_count > result_cap,
+                'quarantined_count': min(quarantined_count, result_cap),
+                'quarantined_count_at_least': quarantined_count > result_cap,
+                'quarantined_reserved_declared_bytes': quarantined_bytes,
+                'quarantined_reserved_declared_bytes_at_least':
+                    quarantined_count > result_cap,
                 'oldest_queued_at': oldest_queued_at,
             })
     return results
@@ -1270,6 +1305,23 @@ def heartbeat_location(location_id: str,
                 models.ImageLocationState.EVICTING.value,
             ])).values(lease_expires_at=current + lease_seconds,
                        updated_at=current)).rowcount
+    return changed == 1
+
+
+def begin_eviction_delete(location_id: str,
+                          lease_token: str,
+                          *,
+                          now: int | None = None) -> bool:
+    """Durably records that the fenced ECR delete may now begin."""
+    current = int(time.time()) if now is None else now
+    locations = schema.locations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(locations.update().where(
+            locations.c.id == location_id,
+            locations.c.state == models.ImageLocationState.EVICTING.value,
+            locations.c.lease_kind == 'EVICT',
+            locations.c.lease_token == lease_token, locations.c.lease_expires_at
+            > current).values(lease_kind='DELETE', updated_at=current)).rowcount
     return changed == 1
 
 
@@ -1490,6 +1542,33 @@ def heartbeat_worker(worker_id: str,
     return changed == 1
 
 
+def _quarantine_eviction(
+    session: orm.Session,
+    row: sqlalchemy.engine.RowMapping,
+    *,
+    now: int,
+) -> LocationRecord:
+    """Fails one possibly in-flight delete closed without releasing capacity."""
+    locations = schema.locations
+    shards = schema.registry_shards
+    updated = session.execute(
+        locations.update().where(locations.c.id == row['id']).values(
+            state=models.ImageLocationState.QUARANTINED.value,
+            lease_kind=None,
+            lease_token=None,
+            lease_expires_at=None,
+            next_retry_at=None,
+            error_code=(
+                models.ImageLocationErrorCode.PROVIDER_OUTCOME_AMBIGUOUS.value),
+            updated_at=now).returning(locations)).mappings().one()
+    changed = session.execute(shards.update().where(
+        shards.c.id == row['shard_id'], shards.c.in_flight
+        > 0).values(in_flight=shards.c.in_flight - 1, updated_at=now)).rowcount
+    if changed != 1:
+        raise RuntimeError('Eviction quarantine accounting drifted.')
+    return _location(updated)
+
+
 def claim_next_eviction(*,
                         worker_id: str,
                         unused_before: int,
@@ -1586,15 +1665,33 @@ def claim_next_eviction(*,
                 ])).limit(1)).first()
         if live_demand is not None and not reclaimed:
             return None
-        # Every expired eviction determines the prior provider outcome first.
-        # A new demand makes that read strictly verify-only.
-        verify_only = reclaimed and live_demand is not None
-        lease_kind = ('VERIFY'
-                      if verify_only else 'RECLAIM' if reclaimed else 'EVICT')
+        if reclaimed and row['lease_kind'] != 'EVICT':
+            # DELETE means an old request may still resume or complete after
+            # any later read. Never restore or recopy this physical reference.
+            return _quarantine_eviction(session, row, now=current)
+        if reclaimed and live_demand is not None:
+            # No DELETE intent means the old worker could not pass its provider
+            # hook. Restore the wanted bytes without performing provider I/O.
+            updated = session.execute(
+                locations.update().where(locations.c.id == row['id']).values(
+                    state=models.ImageLocationState.READY.value,
+                    lease_kind=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    next_retry_at=None,
+                    error_code=None,
+                    updated_at=current).returning(locations)).mappings().one()
+            changed = session.execute(shards.update().where(
+                shards.c.id == row['shard_id'], shards.c.in_flight
+                > 0).values(in_flight=shards.c.in_flight - 1,
+                            updated_at=current)).rowcount
+            if changed != 1:
+                raise RuntimeError('Eviction recovery accounting drifted.')
+            return _location(updated)
         updated = session.execute(
             locations.update().where(locations.c.id == row['id']).values(
                 state=models.ImageLocationState.EVICTING.value,
-                lease_kind=lease_kind,
+                lease_kind='EVICT',
                 lease_token=token,
                 lease_expires_at=current + lease_seconds,
                 attempt_count=locations.c.attempt_count + 1,
@@ -1641,6 +1738,10 @@ def complete_eviction(location_id: str,
             return None
         if provider_not_called and row['lease_kind'] != 'EVICT':
             return None
+        if not provider_not_called and row['lease_kind'] != 'DELETE':
+            # Provider results are inadmissible unless the same lease first
+            # committed its durable destructive intent.
+            return None
         live_demand = session.execute(
             sqlalchemy.select(schema.demands.c.id).where(
                 schema.demands.c.location_id == location_id,
@@ -1649,15 +1750,7 @@ def complete_eviction(location_id: str,
                     models.ImageDemandState.READY.value,
                 ])).limit(1)).first()
         if present is None and not provider_not_called:
-            # Keep the ambiguous EVICTING state. Clearing the expired lease is
-            # forbidden by the schema, so extend it for the next exact read.
-            updated = session.execute(
-                locations.update().where(locations.c.id == location_id).values(
-                    lease_expires_at=current + 30,
-                    error_code=(models.ImageLocationErrorCode.
-                                PROVIDER_OUTCOME_AMBIGUOUS.value),
-                    updated_at=current).returning(locations)).mappings().one()
-            return _location(updated)
+            return _quarantine_eviction(session, row, now=current)
         release_reservation = False
         if provider_not_called:
             new_state = models.ImageLocationState.READY
@@ -1695,7 +1788,15 @@ def complete_eviction(location_id: str,
             shard_values.update(
                 reserved_manifests=shards.c.reserved_manifests - 1,
                 reserved_declared_bytes=(shards.c.reserved_declared_bytes -
-                                         row['reserved_declared_bytes']))
+                                         row['reserved_declared_bytes']),
+                state=sqlalchemy.case((sqlalchemy.and_(
+                    shards.c.state == models.ImageShardState.FULL.value,
+                    shards.c.reserved_manifests - 1 < shards.c.max_manifests,
+                    shards.c.reserved_declared_bytes -
+                    row['reserved_declared_bytes']
+                    < shards.c.max_declared_bytes),
+                                       models.ImageShardState.READY.value),
+                                      else_=shards.c.state))
         shard_predicates = [shards.c.id == row['shard_id']]
         if release_reservation:
             shard_predicates.extend((

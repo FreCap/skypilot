@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import {
   CanaryProfileDialog,
+  IMAGE_REMEDIATIONS,
   PublishImageDialog,
 } from '@/components/image-action-dialogs';
 import {
@@ -69,6 +70,21 @@ describe('managed image action dialogs', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     newIdempotencyKey.mockReturnValue('stable-key');
+  });
+
+  it('offers bounded remediation for an unavailable registry shard', () => {
+    expect(IMAGE_REMEDIATIONS.REGISTRY_SHARD_UNAVAILABLE).toBe(
+      'Repair shard drift or activate a qualified revision before retrying.'
+    );
+  });
+
+  it('never recommends retrying a quarantined physical reference', () => {
+    expect(IMAGE_REMEDIATIONS.REGISTRY_LOCATION_QUARANTINED).toBe(
+      'Activate a qualified target with a new repository ring before preparing again.'
+    );
+    expect(IMAGE_REMEDIATIONS.PROVIDER_OUTCOME_AMBIGUOUS).toContain(
+      'This physical reference is quarantined.'
+    );
   });
 
   it('rejects mutable tags and enables publish only for a digest', async () => {

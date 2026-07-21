@@ -23,6 +23,7 @@ import sqlalchemy
 from sqlalchemy import orm
 
 from sky import global_user_state
+from sky.container_images import aws
 from sky.container_images import builder_prototype
 from sky.container_images import catalog_state
 from sky.container_images import config
@@ -35,6 +36,7 @@ from sky.container_images import runtime
 from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
+from sky.container_images import worker_lease
 
 _POSTGRES_REQUIRED = os.environ.get(
     'SKYPILOT_REQUIRE_CONTAINER_IMAGE_POSTGRES') == '1'
@@ -810,7 +812,7 @@ def test_canonical_publication_retry_obeys_shard_admission_state(
                                                        now=40)
         assert reclaimed is not None and reclaimed.id == location.id
     else:
-        with pytest.raises(topology_state.RegistryCapacityExhaustedError,
+        with pytest.raises(topology_state.RegistryShardUnavailableError,
                            match='REGISTRY_SHARD_UNAVAILABLE'):
             retry()
         retained = topology_state.get_location(location.id)
@@ -971,6 +973,20 @@ def _ready_regional(
     return active, publication_record, canonical, regional
 
 
+def _begin_delete(
+    location: topology_state.LocationRecord,
+    *,
+    now: int,
+) -> topology_state.LocationRecord:
+    assert location.lease_token is not None
+    assert topology_state.begin_eviction_delete(location.id,
+                                                location.lease_token,
+                                                now=now)
+    updated = topology_state.get_location(location.id)
+    assert updated is not None and updated.lease_kind == 'DELETE'
+    return updated
+
+
 def test_drifted_shard_rejects_location_readmission(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -990,8 +1006,28 @@ def test_drifted_shard_rejects_location_readmission(
 
     assert topology_state.retry_location(regional.id, 'research',
                                          now=50) is None
+    with pytest.raises(topology_state.RegistryShardUnavailableError,
+                       match='REGISTRY_SHARD_UNAVAILABLE'):
+        preparation.retry_location(location_id=regional.id,
+                                   workspace='research',
+                                   actor_hash='publisher',
+                                   idempotency_key='retry-drifted-location')
+    with pytest.raises(topology_state.RegistryShardUnavailableError,
+                       match='REGISTRY_SHARD_UNAVAILABLE'):
+        preparation.retry_location(location_id=regional.id,
+                                   workspace='research',
+                                   actor_hash='publisher',
+                                   idempotency_key='retry-drifted-location')
+    with image_database.connect() as connection:
+        operation = connection.execute(
+            sqlalchemy.select(schema.operations).where(
+                schema.operations.c.idempotency_key ==
+                'retry-drifted-location')).mappings().one()
+    assert operation['state'] == models.ImageOperationState.FAILED.value
+    assert operation['error_code'] == 'REGISTRY_SHARD_UNAVAILABLE'
+    assert operation['result_id'] == regional.id
     assert publication_record.image_id is not None
-    with pytest.raises(topology_state.RegistryCapacityExhaustedError,
+    with pytest.raises(topology_state.RegistryShardUnavailableError,
                        match='REGISTRY_SHARD_UNAVAILABLE'):
         transactions.reserve_regional_location(
             image_id=publication_record.image_id,
@@ -1301,6 +1337,7 @@ def test_demand_fences_eviction_until_two_terminal_observations(
     assert eviction.lease_token is not None
     shard_before = topology_state.get_shard(regional.shard_id)
     assert shard_before is not None
+    eviction = _begin_delete(eviction, now=3701)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -2400,7 +2437,9 @@ def test_ready_commit_and_evicted_readmission_follow_global_lock_order(
                                                   unused_before=1000,
                                                   lease_seconds=60,
                                                   now=100)
-    assert eviction is not None and eviction.lease_token is not None
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -2950,7 +2989,7 @@ def test_copy_completion_cannot_finish_an_eviction_lease(
     assert after is not None and after.in_flight == 1
 
 
-def test_no_io_restore_requires_a_fresh_eviction_lease(
+def test_provider_result_requires_durable_delete_intent(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
@@ -2960,9 +2999,36 @@ def test_no_io_restore_requires_a_fresh_eviction_lease(
                                                   now=100)
     assert eviction is not None and eviction.id == regional.id
     assert eviction.lease_token is not None
-    with image_database.begin() as connection:
-        connection.execute(schema.locations.update().where(
-            schema.locations.c.id == eviction.id).values(lease_kind='VERIFY'))
+
+    assert topology_state.complete_eviction(eviction.id,
+                                            eviction.lease_token,
+                                            present=False,
+                                            now=101) is None
+    retained = topology_state.get_location(eviction.id)
+    assert retained is not None
+    assert retained.state == models.ImageLocationState.EVICTING
+    assert retained.lease_kind == 'EVICT'
+    assert retained.lease_token == eviction.lease_token
+    restored = topology_state.complete_eviction(eviction.id,
+                                                eviction.lease_token,
+                                                present=None,
+                                                provider_not_called=True,
+                                                now=102)
+    assert restored is not None
+    assert restored.state == models.ImageLocationState.READY
+
+
+def test_no_io_restore_rejects_committed_delete_intent(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
 
     assert topology_state.complete_eviction(eviction.id,
                                             eviction.lease_token,
@@ -2972,8 +3038,14 @@ def test_no_io_restore_requires_a_fresh_eviction_lease(
     retained = topology_state.get_location(eviction.id)
     assert retained is not None
     assert retained.state == models.ImageLocationState.EVICTING
-    assert retained.lease_kind == 'VERIFY'
-    assert retained.lease_token == eviction.lease_token
+    assert retained.lease_kind == 'DELETE'
+
+    completed = topology_state.complete_eviction(eviction.id,
+                                                 eviction.lease_token,
+                                                 present=True,
+                                                 now=102)
+    assert completed is not None
+    assert completed.state == models.ImageLocationState.READY
 
 
 def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(
@@ -3007,7 +3079,7 @@ def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(
                                                    lease_seconds=60,
                                                    now=161)
     assert reclaimed is not None and reclaimed.id == regional.id
-    assert reclaimed.lease_kind == 'RECLAIM'
+    assert reclaimed.lease_kind == 'EVICT'
 
 
 def test_locked_oldest_shard_does_not_block_global_eviction(
@@ -3110,6 +3182,7 @@ def test_eviction_exact_absence_with_new_demand_requeues_without_release(
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
     _warming_demand(active, publication_record, regional, profile, now=101)
+    eviction = _begin_delete(eviction, now=101)
 
     completed = topology_state.complete_eviction(eviction.id,
                                                  eviction.lease_token,
@@ -3155,7 +3228,7 @@ def test_eviction_won_before_demand_commit_reports_typed_warming_state(
     assert exc_info.value.error_code is None
 
 
-def test_expired_eviction_with_live_demand_reclaims_for_exact_read(
+def test_expired_pre_delete_eviction_with_live_demand_restores_ready(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     active, publication_record, _, regional = _ready_regional(
@@ -3165,7 +3238,11 @@ def test_expired_eviction_with_live_demand_reclaims_for_exact_read(
                                                lease_seconds=60,
                                                now=100)
     assert first is not None and first.lease_token is not None
-    _warming_demand(active, publication_record, regional, profile, now=101)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             now=101)
 
     reclaimed = topology_state.claim_next_eviction(worker_id='lifecycle-2',
                                                    unused_before=1000,
@@ -3173,19 +3250,165 @@ def test_expired_eviction_with_live_demand_reclaims_for_exact_read(
                                                    now=161)
 
     assert reclaimed is not None and reclaimed.id == regional.id
-    assert reclaimed.lease_token is not None
-    assert reclaimed.lease_token != first.lease_token
-    assert reclaimed.lease_kind == 'VERIFY'
-    completed = topology_state.complete_eviction(reclaimed.id,
-                                                 reclaimed.lease_token,
-                                                 present=False,
-                                                 now=162)
-    assert completed is not None
-    assert completed.state == models.ImageLocationState.PENDING
-    assert (
-        completed.reserved_declared_bytes == regional.reserved_declared_bytes)
+    assert reclaimed.state == models.ImageLocationState.READY
+    assert reclaimed.lease_token is None
+    assert reclaimed.lease_kind is None
+    committed = transactions.commit_ready_demand(
+        demand_id=demand.id,
+        consumer_generation=demand.consumer_generation,
+        pull_plan=_pull_plan(active, regional),
+        now=162)
+    assert committed.state == models.ImageDemandState.READY
     shard = topology_state.get_shard(regional.shard_id)
     assert shard is not None and shard.in_flight == 0
+
+
+def test_inflight_delete_expiry_quarantines_before_late_completion(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    """A delete that outlives its lease can never restore or recopy READY."""
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    current = int(time.time())
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=current + 1,
+                                                  lease_seconds=60,
+                                                  now=current)
+    assert eviction is not None and eviction.lease_token is not None
+
+    class SynchronousHeartbeat:
+        """Runs exact ownership checks without renewing in the background."""
+
+        def __init__(self, heartbeat: Any, _interval: float) -> None:
+            self._heartbeat = heartbeat
+
+        def __enter__(self):
+            self.assert_owned()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def assert_owned(self) -> None:
+            if not self._heartbeat():
+                raise worker_lease.LeaseLostError(
+                    'Container image work lease was lost.')
+
+    provider_call_started = threading.Event()
+    resume_provider_call = threading.Event()
+    delete_completed = threading.Event()
+
+    class PausedRepository:
+        """Pauses after the durable hook, with provider I/O in flight."""
+
+        def __init__(self, hooks: Any) -> None:
+            self._hooks = hooks
+
+        def delete_outcome(self, digest: str) -> aws.DeleteOutcome:
+            assert digest == regional.runtime_digest
+            self._hooks.before_call()
+            provider_call_started.set()
+            assert resume_provider_call.wait(timeout=5)
+            delete_completed.set()
+            return aws.DeleteOutcome.ABSENT
+
+    def repository_from_role(*_args: Any, **kwargs: Any) -> PausedRepository:
+        return PausedRepository(kwargs['hooks'])
+
+    limiter = types.SimpleNamespace(before_call=lambda _shard: None,
+                                    record_throttle=lambda _shard: None)
+    heartbeat_location = topology_state.heartbeat_location
+
+    def fixed_clock_heartbeat(location_id: str, lease_token: str,
+                              lease_seconds: int) -> bool:
+        return heartbeat_location(location_id,
+                                  lease_token,
+                                  lease_seconds,
+                                  now=current)
+
+    monkeypatch.setattr(topology_state, 'heartbeat_location',
+                        fixed_clock_heartbeat)
+    monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
+                        SynchronousHeartbeat)
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        stale = executor.submit(lifecycle_worker_service.evict_location,
+                                eviction,
+                                limiter,
+                                lease_seconds=60)
+        assert provider_call_started.wait(timeout=5)
+        intent = topology_state.get_location(regional.id)
+        assert intent is not None and intent.lease_kind == 'DELETE'
+        demand = _warming_demand(active,
+                                 publication_record,
+                                 regional,
+                                 profile,
+                                 now=current + 1)
+        recovered = topology_state.claim_next_eviction(worker_id='lifecycle-2',
+                                                       unused_before=current +
+                                                       1,
+                                                       lease_seconds=30,
+                                                       now=current + 61)
+        assert recovered is not None
+        assert recovered.state == models.ImageLocationState.QUARANTINED
+        assert recovered.lease_token is None
+        with pytest.raises(
+                transactions.DemandLocationNotReadyError) as exc_info:
+            transactions.commit_ready_demand(
+                demand_id=demand.id,
+                consumer_generation=demand.consumer_generation,
+                pull_plan=_pull_plan(active, regional),
+                now=current + 62)
+        assert exc_info.value.state == models.ImageLocationState.QUARANTINED
+
+        resume_provider_call.set()
+        with pytest.raises(worker_lease.LeaseLostError):
+            stale.result(timeout=5)
+
+    assert delete_completed.is_set()
+    final = topology_state.get_location(regional.id)
+    assert final is not None
+    assert final.state == models.ImageLocationState.QUARANTINED
+    assert final.error_code == (
+        models.ImageLocationErrorCode.PROVIDER_OUTCOME_AMBIGUOUS.value)
+    shard = topology_state.get_shard(regional.shard_id)
+    assert shard is not None and shard.in_flight == 0
+    assert shard.reserved_manifests > 0
+
+
+def test_eviction_reopens_full_shard_when_reservation_is_released(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    shard = topology_state.get_shard(regional.shard_id)
+    assert shard is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                state=models.ImageShardState.FULL.value,
+                max_manifests=shard.reserved_manifests,
+                max_declared_bytes=shard.reserved_declared_bytes))
+
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
+    evicted = topology_state.complete_eviction(eviction.id,
+                                               eviction.lease_token,
+                                               present=False,
+                                               now=101)
+
+    assert evicted is not None
+    assert evicted.state == models.ImageLocationState.EVICTED
+    reopened = topology_state.get_shard(regional.shard_id)
+    assert reopened is not None
+    assert reopened.state == models.ImageShardState.READY
+    assert reopened.reserved_manifests < reopened.max_manifests
+    assert reopened.reserved_declared_bytes < reopened.max_declared_bytes
 
 
 def test_new_runtime_demand_readmits_evicted_location(
@@ -3198,6 +3421,7 @@ def test_new_runtime_demand_readmits_evicted_location(
                                                   lease_seconds=60,
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -3248,6 +3472,7 @@ def test_explicit_prepare_readmits_existing_evicted_location(
                                                   lease_seconds=60,
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -3334,7 +3559,7 @@ def test_retired_live_demand_readmits_inventory_missing_location(
     assert readmitted.state == models.ImageLocationState.PENDING
 
 
-def test_ambiguous_eviction_remains_fenced_until_exact_verification(
+def test_ambiguous_delete_quarantines_physical_location(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
@@ -3345,25 +3570,55 @@ def test_ambiguous_eviction_remains_fenced_until_exact_verification(
                                                   lease_seconds=60,
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
     ambiguous = topology_state.complete_eviction(eviction.id,
                                                  eviction.lease_token,
                                                  present=None,
                                                  now=101)
     assert ambiguous is not None
-    assert ambiguous.state == models.ImageLocationState.EVICTING
+    assert ambiguous.state == models.ImageLocationState.QUARANTINED
+    assert ambiguous.lease_token is None
     assert ambiguous.error_code == (
         models.ImageLocationErrorCode.PROVIDER_OUTCOME_AMBIGUOUS.value)
     exact = topology_state.complete_eviction(eviction.id,
                                              eviction.lease_token,
                                              present=True,
                                              now=102)
-    assert exact is not None and exact.state == models.ImageLocationState.READY
+    assert exact is None
+    with pytest.raises(topology_state.RegistryLocationQuarantinedError,
+                       match='REGISTRY_LOCATION_QUARANTINED'):
+        preparation.retry_location(location_id=eviction.id,
+                                   workspace='research',
+                                   actor_hash='publisher',
+                                   idempotency_key='retry-quarantined-location')
+    with pytest.raises(topology_state.RegistryLocationQuarantinedError,
+                       match='REGISTRY_LOCATION_QUARANTINED'):
+        preparation.retry_location(location_id=eviction.id,
+                                   workspace='research',
+                                   actor_hash='publisher',
+                                   idempotency_key='retry-quarantined-location')
+    with image_database.connect() as connection:
+        operation = connection.execute(
+            sqlalchemy.select(schema.operations).where(
+                schema.operations.c.idempotency_key ==
+                'retry-quarantined-location')).mappings().one()
+    assert operation['state'] == models.ImageOperationState.FAILED.value
+    assert operation['error_code'] == 'REGISTRY_LOCATION_QUARANTINED'
+    assert operation['result_id'] == eviction.id
     shard_after = topology_state.get_shard(regional.shard_id)
     assert shard_after is not None
     assert shard_after.reserved_manifests == shard_before.reserved_manifests
     assert (shard_after.reserved_declared_bytes ==
             shard_before.reserved_declared_bytes)
     assert shard_after.in_flight == 0
+    queue = next(
+        item for item in topology_state.readiness_queue_stats('research')
+        if item['target'] == profile.targets[0].name)
+    assert queue['quarantined_count'] == 1
+    assert not queue['quarantined_count_at_least']
+    assert (queue['quarantined_reserved_declared_bytes'] ==
+            regional.reserved_declared_bytes)
+    assert not queue['quarantined_reserved_declared_bytes_at_least']
 
 
 def test_failed_canonical_reap_waits_for_reservation_expiry_and_exact_absence(
