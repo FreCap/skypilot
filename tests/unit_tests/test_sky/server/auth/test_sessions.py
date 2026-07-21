@@ -111,6 +111,19 @@ class TestAuthSessionStore:
         assert sorted(results,
                       key=lambda result: result is None) == ['my_token', None]
 
+    def test_restore_session_preserves_newer_authorization(self, store):
+        code_verifier = 'test_verifier'
+        code_challenge = common_utils.compute_code_challenge(code_verifier)
+        store.create_session(code_challenge, 'token1')
+        assert store.poll_session(code_verifier) == 'token1'
+
+        store.restore_session(code_challenge, 'token1')
+        assert store.poll_session(code_verifier) == 'token1'
+
+        store.create_session(code_challenge, 'token2')
+        store.restore_session(code_challenge, 'token1')
+        assert store.poll_session(code_verifier) == 'token2'
+
     def test_poll_session_not_found(self, store):
         # Poll with a verifier that has no corresponding session
         token = store.poll_session('nonexistent_verifier')
@@ -159,7 +172,7 @@ class TestAuthSessionStore:
         assert len(rows) == 1
         assert rows[0].token == 'new_token'
 
-    def test_postgres_statements_use_upsert_and_atomic_consume(self):
+    def test_postgres_statements_use_upsert_consume_and_restore(self):
         executed_statements = []
 
         class FakeResult:
@@ -200,6 +213,12 @@ class TestAuthSessionStore:
             executed_statements[0].compile(dialect=postgresql.dialect()))
         assert consume_sql.startswith('DELETE FROM auth_sessions')
         assert 'RETURNING auth_sessions.token' in consume_sql
+
+        executed_statements.clear()
+        store.restore_session(code_challenge, 'my_token')
+        restore_sql = str(
+            executed_statements[0].compile(dialect=postgresql.dialect()))
+        assert 'ON CONFLICT (code_challenge) DO NOTHING' in restore_sql
 
 
 class TestGlobalStore:
