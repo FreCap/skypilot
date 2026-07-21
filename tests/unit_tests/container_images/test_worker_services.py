@@ -121,14 +121,18 @@ def test_unattached_cluster_demand_is_not_released_early(
     monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
                         'get_job_task_terminal_states', lambda _: {})
     defer = mock.Mock(return_value=True)
+    preserve = mock.Mock(return_value=True)
     reconcile = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'defer_consumer_reconciliation', defer)
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'defer_terminal_confirmation', preserve)
     monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
                         reconcile)
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
-    defer.assert_called_once_with(demand.id, now=current)
+    defer.assert_not_called()
+    preserve.assert_called_once_with(demand.id, now=current)
     reconcile.assert_not_called()
 
 

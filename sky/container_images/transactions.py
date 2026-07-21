@@ -373,6 +373,10 @@ def bind_inspected_publication(
             if changed != 1:
                 raise topology_state.RegistryCapacityExhaustedError(
                     'REGISTRY_CAPACITY_EXHAUSTED')
+            topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+                session,
+                str(shard_row['id']),
+                now=current)
 
         publication = session.execute(
             sqlalchemy.select(publications).where(
@@ -510,6 +514,10 @@ def reserve_regional_location(
                 winner = session.execute(locations.update().where(
                     locations.c.id == winner['id']).values(**location_values).
                                          returning(locations)).mappings().one()
+                topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+                    session,
+                    str(shard['id']),
+                    now=current)
             return topology_state._location(  # pylint: disable=protected-access
                 winner)
         regional_count = session.execute(
@@ -562,6 +570,10 @@ def reserve_regional_location(
         if changed != 1:
             raise topology_state.RegistryCapacityExhaustedError(
                 'REGISTRY_CAPACITY_EXHAUSTED')
+        topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+            session,
+            str(shard['id']),
+            now=current)
         return topology_state._location(  # pylint: disable=protected-access
             row)
 
@@ -611,6 +623,10 @@ def _finish_location(session: orm.Session, *, location_id: str,
         schema.registry_shards.c.in_flight
         > 0).values(in_flight=schema.registry_shards.c.in_flight - 1,
                     updated_at=now))
+    topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+        session,
+        str(row['shard_id']),
+        now=now)
     operation_values: dict[str, Any] = {
         'result_json': json.dumps({
             'location_id': location_id,
@@ -838,6 +854,10 @@ def retry_publication(
                     next_retry_at=None,
                     error_code=None,
                     updated_at=current))
+            topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+                session,
+                str(shard['id']),
+                now=current)
         ready = (location is not None and str(location['state'])
                  == models.ImageLocationState.READY.value)
         publication_state = (models.ImagePublicationState.READY.value if ready
@@ -1264,6 +1284,10 @@ def activate_profile(
                     state=(models.ImageShardState.FULL.value
                            if full else models.ImageShardState.READY.value),
                     updated_at=current))
+            topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
+                session,
+                str(shard['id']),
+                now=current)
         if any(target_counts[target.name] != target.shard_count
                for target in targets):
             raise ValueError('QUALIFICATION_FAILED')

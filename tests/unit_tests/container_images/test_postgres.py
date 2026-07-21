@@ -710,12 +710,14 @@ def _publish_and_bind(
     idempotency_key: str = 'publication-idempotency-0001',
     now: int = 20,
 ) -> tuple[catalog_state.PublicationRecord, topology_state.LocationRecord]:
-    mutation = publication.publish(source_ref=source,
-                                   release=release,
-                                   distribution=profile.name,
-                                   workspace='research',
-                                   actor_hash='1' * 64,
-                                   idempotency_key=idempotency_key)
+    with pytest.MonkeyPatch.context() as clock:
+        clock.setattr(catalog_state.time, 'time', lambda: now)
+        mutation = publication.publish(source_ref=source,
+                                       release=release,
+                                       distribution=profile.name,
+                                       workspace='research',
+                                       actor_hash='1' * 64,
+                                       idempotency_key=idempotency_key)
     assert catalog_state.get_ready_release(release, 'research') is None
     claimed = catalog_state.claim_publication_inspection(worker_id='copy-1',
                                                          lease_seconds=60,
@@ -737,6 +739,27 @@ def _publish_and_bind(
         now=now + 1)
     assert bound.id == mutation.publication.id
     return bound, location
+
+
+def test_bound_pending_publication_never_reenters_source_inspection(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    bound, _ = _publish_and_bind(profile)
+
+    with image_database.connect() as connection:
+        claimable_at = connection.execute(
+            sqlalchemy.select(
+                schema.publications.c.inspection_claimable_at).where(
+                    schema.publications.c.id == bound.id)).scalar_one()
+
+    assert bound.state == models.ImagePublicationState.PENDING
+    assert bound.canonical_location_id is not None
+    assert claimable_at is None
+    assert catalog_state.claim_publication_inspection(worker_id='copy-2',
+                                                      lease_seconds=60,
+                                                      now=100) is None
 
 
 def _complete_location(location: topology_state.LocationRecord, *,
@@ -857,12 +880,14 @@ def test_canonical_publication_retry_obeys_shard_admission_state(
             schema.registry_shards.c.id == shard.id).values(**values))
 
     def retry() -> publication.PublicationMutation:
-        return publication.retry(
-            publication_id=publication_record.id,
-            workspace='research',
-            actor_hash='2' * 64,
-            idempotency_key=(
-                f'canonical-retry-{shard_state.value.lower()}-0001'))
+        with pytest.MonkeyPatch.context() as clock:
+            clock.setattr(transactions.time, 'time', lambda: 32)
+            return publication.retry(
+                publication_id=publication_record.id,
+                workspace='research',
+                actor_hash='2' * 64,
+                idempotency_key=(
+                    f'canonical-retry-{shard_state.value.lower()}-0001'))
 
     if allowed:
         mutation = retry()
@@ -888,9 +913,15 @@ def test_canonical_publication_retry_obeys_shard_admission_state(
         assert failed_publication.state == models.ImagePublicationState.FAILED
 
 
-def test_expired_copy_lease_repairs_drifted_shard_in_flight(
+@pytest.mark.parametrize('shard_state', [
+    models.ImageShardState.PENDING,
+    models.ImageShardState.DRIFTED,
+    models.ImageShardState.DISABLED,
+])
+def test_expired_copy_lease_repairs_blocked_shard_in_flight(
         image_database, monkeypatch: pytest.MonkeyPatch,
-        profile: models.ManagedRegistryProfile) -> None:
+        profile: models.ManagedRegistryProfile,
+        shard_state: models.ImageShardState) -> None:
     _activate_profile(image_database, profile)
     _configure_profile(monkeypatch, profile)
     _, location = _publish_and_bind(profile)
@@ -899,15 +930,25 @@ def test_expired_copy_lease_repairs_drifted_shard_in_flight(
                                                workspace='research',
                                                now=30)
     assert first is not None and first.id == location.id
+    assert first.lease_token is not None
     with image_database.begin() as connection:
         connection.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == location.shard_id).values(
-                state=models.ImageShardState.DRIFTED.value))
+                state=shard_state.value))
+
+    assert topology_state.heartbeat_location(first.id,
+                                             first.lease_token,
+                                             lease_seconds=10,
+                                             now=35)
+    assert topology_state.claim_next_location(worker_id='copy-early',
+                                              lease_seconds=10,
+                                              workspace='research',
+                                              now=41) is None
 
     reclaimed = topology_state.claim_next_location(worker_id='copy-2',
                                                    lease_seconds=10,
                                                    workspace='research',
-                                                   now=41)
+                                                   now=46)
     assert reclaimed is not None and reclaimed.id == location.id
     assert reclaimed.state == models.ImageLocationState.VERIFYING
     assert reclaimed.lease_kind == 'VERIFY'
@@ -921,11 +962,11 @@ def test_expired_copy_lease_repairs_drifted_shard_in_flight(
         error_code=models.ImageLocationErrorCode.MANIFEST_MISSING.value,
         retry_at=50,
         terminal=False,
-        now=42)
+        now=47)
     assert pending.state == models.ImageLocationState.PENDING
     repaired = topology_state.get_shard(location.shard_id)
     assert repaired is not None
-    assert repaired.state == models.ImageShardState.DRIFTED
+    assert repaired.state == shard_state
     assert repaired.in_flight == 0
     assert topology_state.claim_next_location(worker_id='copy-3',
                                               lease_seconds=10,
@@ -1012,6 +1053,77 @@ def test_drifted_shard_heartbeat_race_never_dispatches_fresh_write(
     assert recovered.state == models.ImageLocationState.VERIFYING
 
 
+def test_copy_heartbeat_preserves_shard_fairness_floor(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, first_location = _publish_and_bind(profile)
+    shard = topology_state.get_shard(first_location.shard_id)
+    assert shard is not None
+    second_image_id = str(uuid.uuid4())
+    second_location_id = str(uuid.uuid4())
+    with orm.Session(image_database) as session, session.begin():
+        session.execute(schema.images.insert().values(
+            id=second_image_id,
+            workspace='research',
+            runtime_digest=_OTHER_DIGEST,
+            platform='linux/amd64',
+            config_digest=_CONFIG_DIGEST,
+            manifest_media_type=_MANIFEST_MEDIA_TYPE,
+            manifest_size_bytes=1,
+            declared_size_bytes=1,
+            creator_user_hash='3' * 64,
+            producer_kind='external_oci',
+            created_at=22,
+            updated_at=22))
+        session.execute(schema.locations.insert().values(
+            id=second_location_id,
+            workspace='research',
+            image_id=second_image_id,
+            shard_id=shard.id,
+            target_fingerprint=shard.target_fingerprint,
+            physical_fingerprint=shard.physical_fingerprint,
+            runtime_digest=_OTHER_DIGEST,
+            canonical=True,
+            canonical_location_id=None,
+            target_ref=(f'{shard.registry}/{shard.repository_name}@'
+                        f'{_OTHER_DIGEST}'),
+            state=models.ImageLocationState.PENDING.value,
+            attempt_count=0,
+            reserved_declared_bytes=1,
+            created_at=22,
+            updated_at=22))
+        session.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                reserved_manifests=(
+                    schema.registry_shards.c.reserved_manifests + 1),
+                reserved_declared_bytes=(
+                    schema.registry_shards.c.reserved_declared_bytes + 1)))
+        topology_state._refresh_shard_copy_queue_in_session(session,
+                                                            shard.id,
+                                                            now=22)
+
+    claimed = topology_state.claim_next_location(worker_id='copy-1',
+                                                 lease_seconds=20,
+                                                 workspace='research',
+                                                 now=30)
+    assert claimed is not None and claimed.id == first_location.id
+    assert claimed.lease_token is not None
+    assert topology_state.heartbeat_location(claimed.id,
+                                             claimed.lease_token,
+                                             lease_seconds=20,
+                                             now=31)
+    with image_database.connect() as connection:
+        copy_next_at, last_dispatch_at = connection.execute(
+            sqlalchemy.select(
+                schema.registry_shards.c.copy_next_at,
+                schema.registry_shards.c.last_dispatch_at).where(
+                    schema.registry_shards.c.id == shard.id)).one()
+    assert last_dispatch_at == 30
+    assert copy_next_at == 30
+
+
 def _ready_regional(
     engine: sqlalchemy.engine.Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -1070,11 +1182,11 @@ def _start_inventory_finalization(
     shard_id: str,
 ) -> topology_state.ShardRecord:
     with engine.begin() as connection:
-        connection.execute(
-            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().values(
+            inventory_completed_at=1000, inventory_next_at=1000))
         connection.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == shard_id).values(
-                inventory_completed_at=11))
+                inventory_completed_at=11, inventory_next_at=11))
     claimed = topology_state.claim_inventory_shard(worker_id='copy-inventory',
                                                    lease_seconds=60,
                                                    interval_seconds=1,
@@ -1093,11 +1205,11 @@ def _start_inventory_listing(
     digests: tuple[str, ...],
 ) -> topology_state.ShardRecord:
     with engine.begin() as connection:
-        connection.execute(
-            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().values(
+            inventory_completed_at=1000, inventory_next_at=1000))
         connection.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == shard_id).values(
-                inventory_completed_at=11))
+                inventory_completed_at=11, inventory_next_at=11))
     claimed = topology_state.claim_inventory_shard(worker_id='copy-listing',
                                                    lease_seconds=60,
                                                    interval_seconds=1,
@@ -1240,14 +1352,15 @@ def test_inventory_confirmation_pages_are_successor_resumable(
     with image_database.begin() as connection:
         connection.execute(schema.images.insert(), image_rows)
         connection.execute(schema.locations.insert(), location_rows)
-        connection.execute(
-            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().values(
+            inventory_completed_at=1000, inventory_next_at=1000))
         connection.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == shard.id).values(
                 max_manifests=200,
                 reserved_manifests=101,
                 reserved_declared_bytes=101,
                 inventory_completed_at=11,
+                inventory_next_at=11,
                 updated_at=20))
 
     first = topology_state.claim_inventory_shard(worker_id='copy-1',
@@ -1344,11 +1457,11 @@ def test_inventory_list_absence_requires_exact_confirmation(
         profile: models.ManagedRegistryProfile) -> None:
     _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
     with image_database.begin() as connection:
-        connection.execute(
-            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().values(
+            inventory_completed_at=1000, inventory_next_at=1000))
         connection.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == regional.shard_id).values(
-                inventory_completed_at=11))
+                inventory_completed_at=11, inventory_next_at=11))
     claimed = topology_state.claim_inventory_shard(worker_id='copy-1',
                                                    lease_seconds=60,
                                                    interval_seconds=1,
@@ -2001,6 +2114,61 @@ def test_cluster_request_terminal_lookup_is_index_bounded(
             """)).one()
     assert observed == 1
     assert unrelated == 0
+
+
+def test_unattached_request_terminal_proof_survives_age_gate(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='orphan-cluster:incarnation:request-proof',
+                             consumer_kind='cluster',
+                             controller_epoch='cluster-request:request-proof',
+                             controller_sequence=None,
+                             request_id='request-proof',
+                             consumer_metadata={
+                                 'workload_type': 'cluster',
+                                 'workload_id': 'orphan-cluster',
+                             },
+                             now=50)
+    assert demand_state.mark_cluster_request_terminal('request-proof',
+                                                      now=100) == 1
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(200) == 0
+    preserved = demand_state.get_demand(demand.id, 'research')
+    assert preserved is not None
+    assert preserved.first_terminal_observed_at == 100
+    assert preserved.last_terminal_observed_at == 100
+    assert preserved.terminal_observation_count == 1
+
+    after_age_gate = (
+        demand.created_at +
+        lifecycle_worker_service._UNATTACHED_REQUEST_RETENTION_SECONDS + 1)
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        after_age_gate) == 1
+    released = demand_state.get_demand(demand.id, 'research')
+    assert released is not None
+    assert released.state == models.ImageDemandState.RELEASED
+    with image_database.connect() as connection:
+        owner_deleted_at = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.owner_deleted_at).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    demand.consumer_owner)).scalar_one()
+    assert owner_deleted_at == after_age_gate
 
 
 def test_restart_stable_owner_epoch_reuses_one_target_fence(
@@ -4330,6 +4498,143 @@ def test_readiness_projection_is_capped_and_index_headed_at_scale(
             }).scalar_one()
     assert 'ix_container_image_locations_shard_readiness' in str(plan)
     assert 'Limit' in str(plan)
+
+
+def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, pending_location = _publish_and_bind(profile)
+    queued = publication.publish(source_ref=_OTHER_SOURCE,
+                                 release='queued-source-inspection',
+                                 distribution=profile.name,
+                                 workspace='research',
+                                 actor_hash='7' * 64,
+                                 idempotency_key='queued-source-inspection-key')
+    authority = catalog_state.get_catalog_authority_id(create=False)
+    assert authority is not None
+    target = profile.targets[0]
+    future = 10_000_000_000
+
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_operations (
+                    id, authority_id, scope, actor_hash, kind,
+                    idempotency_key, request_hash, state, created_at,
+                    updated_at, terminal_expires_at
+                )
+                SELECT md5('scale-operation-' || series::text), :authority,
+                       'research', :actor, 'PUBLISH',
+                       'scale-operation-key-' || series::text, :request_hash,
+                       'SUCCEEDED', 1, 1, 2
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'authority': authority,
+                'actor': '8' * 64,
+                'request_hash': '9' * 64,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_publications (
+                    id, workspace, operation_id, profile_revision_id,
+                    requested_release, reservation_active, source_ref,
+                    source_root_digest, requested_platform, state,
+                    attempt_count, created_at, updated_at
+                )
+                SELECT md5('scale-publication-' || series::text), 'research',
+                       md5('scale-operation-' || series::text), :revision,
+                       'expired-release-' || series::text, false, :source,
+                       :digest, 'linux/amd64', 'FAILED', 1, 1, 1
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'revision': active.id,
+                'source': _SOURCE,
+                'digest': _DIGEST,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_registry_shards (
+                    id, workspace, profile, profile_revision_id, target_id,
+                    provider, partition, account, region, shard_generation,
+                    shard_index, target_fingerprint, physical_fingerprint,
+                    eviction_enabled, registry, repository_name,
+                    repository_arn, max_manifests, max_declared_bytes,
+                    max_in_flight, state, qualified_at,
+                    inventory_completed_at, inventory_next_at, created_at,
+                    updated_at
+                )
+                SELECT md5('scale-shard-' || series::text), 'research',
+                       :profile, :revision, :target, 'aws', :partition,
+                       :account, :region, series + 1000, 0,
+                       :target_fingerprint,
+                       md5('scale-physical-' || series::text), false,
+                       :registry, 'scale/repository/' || series::text,
+                       'arn:aws:ecr:' || :region || ':' || :account ||
+                           ':' || 'repository/scale/' || series::text,
+                       100, 1000000, 4, 'READY', 1, 1, :future, 1, 1
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'profile': profile.name,
+                'revision': active.id,
+                'target': target.name,
+                'partition': profile.partition,
+                'account': profile.registry_account,
+                'region': target.region,
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'future': future,
+            })
+        connection.execute(
+            schema.registry_shards.update().values(inventory_next_at=future))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == pending_location.shard_id).values(
+                inventory_next_at=1))
+        connection.execute(
+            sqlalchemy.text('ANALYZE container_image_publications'))
+        connection.execute(
+            sqlalchemy.text('ANALYZE container_image_registry_shards'))
+        publication_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE canonical_location_id IS NULL
+                  AND state IN ('PENDING', 'INSPECTING')
+                  AND inspection_claimable_at <= :now
+                ORDER BY inspection_claimable_at, id
+                LIMIT 1 FOR UPDATE SKIP LOCKED
+            """), {
+                'now': future
+            }).scalars().all()
+        copy_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_registry_shards
+                WHERE copy_next_at IS NOT NULL AND copy_next_at <= :now
+                ORDER BY copy_next_at, id
+                LIMIT 1 FOR UPDATE SKIP LOCKED
+            """), {
+                'now': 100
+            }).scalars().all()
+        inventory_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_registry_shards
+                WHERE state IN ('PENDING', 'READY', 'FULL', 'DRIFTED')
+                  AND inventory_next_at <= :now
+                ORDER BY inventory_finalizing DESC, inventory_next_at, id
+                LIMIT 1 FOR UPDATE SKIP LOCKED
+            """), {
+                'now': 100
+            }).scalars().all()
+
+    assert queued.publication.canonical_location_id is None
+    assert ('ix_container_image_publications_inspection_queue'
+            in str(publication_plan))
+    assert ('ix_container_image_registry_shard_copy_queue' in str(copy_plan))
+    assert ('ix_container_image_registry_shard_inventory'
+            in str(inventory_plan))
 
 
 def _migration_call(engine: sqlalchemy.engine.Engine, function: Any) -> None:

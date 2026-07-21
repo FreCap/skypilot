@@ -337,12 +337,16 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue
-            if (not demand.consumer_attached and
-                (demand.first_terminal_observed_at is None or current -
-                 demand.created_at < _UNATTACHED_REQUEST_RETENTION_SECONDS)):
-                demand_state.defer_consumer_reconciliation(demand.id,
-                                                           now=current)
-                continue
+            if not demand.consumer_attached:
+                if demand.first_terminal_observed_at is None:
+                    demand_state.defer_consumer_reconciliation(demand.id,
+                                                               now=current)
+                    continue
+                if (current - demand.created_at
+                        < _UNATTACHED_REQUEST_RETENTION_SECONDS):
+                    demand_state.defer_terminal_confirmation(demand.id,
+                                                             now=current)
+                    continue
             if _reconcile_cluster_terminal(demand, cluster_name, current):
                 reconciled += 1
             continue

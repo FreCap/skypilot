@@ -351,19 +351,23 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
 1. Validate a digest-pinned source root, requested platform, required release,
    workspace, source access binding, and complete active profile. The request
    hash includes every field and exact profile revision.
-2. In one transaction, create a durable PENDING publication and reserve its
-   release. The canonical location remains null until source inspection;
-   deployment still cannot observe a release.
-3. A copy worker claims the publication with a random fenced inspection lease,
-   moves it to INSPECTING, authenticates only to the source, and builds
+2. In one transaction, create a durable unbound PENDING publication and reserve
+   its release. The canonical location remains null until source inspection;
+   deployment still cannot observe a release. A stored generated
+   `inspection_claimable_at` projects only unbound PENDING and INSPECTING rows
+   into one exact partial queue index.
+3. A copy worker claims only an unbound publication from that projection with a
+   random fenced inspection lease, moves it to INSPECTING, authenticates only to
+   the source, and builds
    `OciContentGraph` before destination authority or I/O. A single manifest must
    match the requested platform. An index must contain exactly one matching
    runnable child. In one transaction, the worker rechecks the inspection token,
    persists the immutable source-root digest, selected child/runtime digest, and
    platform, converges the artifact/source, reserves one shard, creates or reuses
    its canonical intent, enforces the artifact's release ceiling while holding
-   the artifact lock, clears the inspection lease, and returns the bound
-   publication to PENDING.
+   the artifact lock, clears the inspection lease, and returns the publication
+   to bound PENDING. Binding removes it from the inspection queue in the same
+   transaction.
 4. The worker separately acquires destination authority, copies only the selected
    exact raw manifest and referenced distributable layers, then verifies the
    destination child digest, config digest, and platform. It never uploads the
@@ -376,12 +380,14 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    publications stay on an indexed reconciliation queue, so a crash or a fan-out
    larger than one batch resumes deterministically without repeating provider
    I/O.
-6. A worker crash or ambiguous source read leaves INSPECTING until its lease
-   expires; another worker then reinspects from the immutable source root. Retry
+6. A worker crash or ambiguous source read leaves unbound INSPECTING until its
+   lease expires; another worker then reinspects from the immutable source root. Retry
    of an unbound pre-inspection failure locks only its publication and requeues
    inspection. Once bound, retry locks the shared canonical location before
    dependent publications, returns retained failures to PENDING, and reuses the
-   location. It never creates a second physical copy. Exceeding the per-artifact
+   location. A bound PENDING publication is never eligible for source inspection
+   again; only canonical convergence may finish it. It never creates a second
+   physical copy. Exceeding the per-artifact
    release ceiling is a typed `IMAGE_LIMIT_EXCEEDED` failure rather than a
    source-content validation failure.
 
@@ -427,7 +433,9 @@ digest, discard the credential, and submit the same publication transaction.
 ## Durable transition and ECR ambiguity contract
 
 The asynchronous state machines are closed. Publication moves from unbound
-PENDING to INSPECTING, back to bound PENDING, then to READY or FAILED. An
+PENDING to unbound INSPECTING, back to bound PENDING, then to READY or FAILED.
+The database rejects a bound INSPECTING row, and the inspection claim projection
+contains only unbound rows. An
 explicit retained FAILED retry returns it to PENDING. Operation moves from
 PENDING to RUNNING, then SUCCEEDED or FAILED. Cancellation before the intent
 transaction deletes PENDING; after commit it only detaches.
@@ -800,9 +808,12 @@ generation below maximum seen, at/below maximum terminal, or owned by a consumer
 that was authoritatively deleted. Owner deletion is irreversible for that stable
 owner key; a later incarnation uses a new stable owner. A replay of the exact
 live maximum-seen generation converges the existing demand. A WARMING request
-demand may expire
-only when its request is terminal, no durable consumer attached, and it is at
-least 24 hours old. For clusters, jobs, and services, reconciliation requires two
+demand may expire only when its request is terminal, no durable consumer
+attached, and it is at least 24 hours old. The one-shot request-terminal
+observation is preserved while that 24-hour age gate is pending; rotating the
+reconciliation candidate cannot clear it. A current binding, an authoritative
+nonterminal result, or an unknown lifecycle result still clears partial terminal
+proof. For clusters, jobs, and services, reconciliation requires two
 authoritative terminal observations separated by an hour before advancing a
 missing tombstone; absence or an unreachable consumer store never releases a
 fence.
@@ -928,9 +939,10 @@ Important constraints include:
   `reservation_active`, retained forever for READY publications and expiring
   after 30 days for unretried FAILED publications;
 - publication state in `PENDING|INSPECTING|READY|FAILED`, with an inspection
-  lease token and expiry only in INSPECTING, one canonical location, and the
-  collision behavior above; canonical location is null only before source
-  inspection and becomes immutable when bound;
+  lease token and expiry only in unbound INSPECTING, one canonical location, a
+  generated `inspection_claimable_at` only for unbound PENDING or INSPECTING,
+  and the collision behavior above; canonical location is null only before
+  source inspection and becomes immutable when bound;
 - release lookup is an indexed projection of READY publications and returns no
   reservation or failed row;
 - one provider budget row per provider, partition, account, region, and API
@@ -943,14 +955,16 @@ Important constraints include:
   reservation window;
 - one row per physical repository shard with immutable fingerprint, hard
   manifest and declared-byte ceilings, reserved/observed counters,
-  qualification timestamp, fair-dispatch timestamp and in-flight ceiling,
-  reconciliation epoch/cursor, a durable inventory-finalization bit, and
-  `READY|FULL|DRIFTED|DISABLED` admission state;
+  qualification timestamp, fair-dispatch timestamp, in-flight ceiling, a
+  nullable `copy_next_at` projection, reconciliation epoch/cursor, a durable
+  inventory-finalization bit, persisted inventory interval and exact
+  `inventory_next_at`, and `READY|FULL|DRIFTED|DISABLED` admission state;
 - unique logical location identity for artifact, immutable target-ring
   fingerprint, and runtime digest, independent of profile revision, plus a
   separately persisted physical repository-shard fingerprint;
 - canonical versus regional location relationship checks;
-- the exact location transitions and lease combinations above;
+- the exact location transitions and lease combinations above, plus a generated
+  `copy_claimable_at` for PENDING or COPY/VERIFY lease recovery;
 - an inventory epoch marker on each manifest-present location;
 - one server-owned demand per cluster generation, job recovery target, or Serve
   version target, with immutable owner identity/generation, target, terminal
@@ -960,10 +974,17 @@ Important constraints include:
 - worker kind in `COPY|LIFECYCLE|CANARY` with bounded heartbeat metadata and
   bounded provider-token grants.
 
-All queue discovery is bounded and indexed by state, retry time, inspection or
-location lease expiry, and ID. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O
-occurs outside the claim transaction. Completion validates the applicable random
-lease token after acquiring the row lock and reading the current clock.
+All queue discovery is bounded and uses a persisted or generated due-time
+projection whose partial index exactly matches the claim predicate and order.
+Publication inspection scans `(inspection_claimable_at, id)` only for unbound
+work. Copy dispatch scans `(copy_next_at, id)` only for shards with projected
+work, then uses the shard-local generated location projection. Inventory scans
+`(inventory_finalizing DESC, inventory_next_at, id)` only for operational shard
+states. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O occurs outside the
+claim transaction. Completion validates the applicable random lease token after
+acquiring the row lock and reading the current clock. Terminal publication
+history, idle shards, and future inventory epochs are absent from these hot
+claim indexes rather than filtered after a global sort.
 Global eviction discovery orders the oldest eligible location per shard, then
 locks the shard itself with `SKIP LOCKED` before selecting its location. A busy
 oldest shard therefore cannot stop independent shards, while the shard-before-
@@ -1387,12 +1408,17 @@ and bytes only after exact provider inspection proves that no manifest exists an
 no retained publication or demand can recreate it.
 
 Each shard stores a durable inventory epoch, provider cursor, started time,
-last-completed time, and `inventory_finalizing` bit. One reconciliation claim
-reads at most ten provider pages or runs for ten seconds, then commits its
-cursor. An invalid or expired provider cursor restarts the epoch safely. The
-terminal provider page durably sets `inventory_finalizing`; while that bit is
-set, every released or expired claim is immediately eligible and resumes the
-same completed epoch instead of relisting the repository. Observed managed
+last-completed time, `inventory_finalizing` bit, interval, and exact
+`inventory_next_at`. A live claim projects its lease expiry; a released listing
+or finalization continuation projects immediate work; successful attestation
+projects `inventory_completed_at + inventory_interval_seconds`. The partial
+queue index orders finalization first and then `(inventory_next_at, id)`, so idle
+polling does not scan or sort not-due shards. One reconciliation claim reads at
+most ten provider pages or runs for ten seconds, then commits its cursor. An
+invalid or expired provider cursor restarts the epoch safely. The terminal
+provider page durably sets `inventory_finalizing`; while that bit is set, every
+released or expired claim is immediately eligible and resumes the same completed
+epoch instead of relisting the repository. Observed managed
 digests update the matching location's epoch marker. Only a completed epoch may
 nominate a missing manifest for the exact confirmation required by the
 transition contract. List absence alone never marks a shard `DRIFTED` or a
@@ -1615,16 +1641,27 @@ qualification inputs. A provider throttle writes one shared exponential
 default `PutImage` rate is only 10 per second, and the UI reports a quota-bound ETA
 rather than implying worker replicas can exceed it.
 
-Location dispatch is two-level and no-starvation: select an eligible physical
-shard by oldest `last_dispatch_at` under its target in-flight ceiling, then claim
-its oldest eligible location. Source-inspection claims rotate by
-profile/workspace. If another target has eligible work, one target cannot consume
-every consecutive claim. `FULL` is an admission state, not a dispatch stop:
+Location dispatch is two-level and no-starvation. Every location has a generated
+`copy_claimable_at`: immediate or retry time for PENDING, lease expiry for
+COPYING/VERIFYING, and null otherwise. Every transaction that changes location
+queue membership or shard capacity refreshes the locked shard's `copy_next_at`
+from the first shard-local indexed candidate. The global claim locks the oldest
+due `(copy_next_at, id)` shard with `SKIP LOCKED`, then claims its oldest eligible
+location. After dispatch, remaining due work rotates the shard projection to the
+current claim time so another already-due shard runs first. The persisted
+`last_dispatch_at` is a floor on every later refresh, so a heartbeat cannot undo
+that rotation by rediscovering an older due location. A heartbeat refreshes the
+projection under shard-before-location lock; a stale projection is repaired
+synchronously without provider I/O before claim returns. The hot path
+therefore examines one indexed shard and one indexed local location rather than
+correlating every shard with the million-location table. Source-inspection claims
+use their exact generated due-time projection. `FULL` is an admission state, not a dispatch stop:
 already-reserved `PENDING` work remains claimable on `READY` and `FULL` shards.
-An expired `COPYING` or `VERIFYING` lease remains reclaimable even if the shard
-later becomes `DRIFTED` or `DISABLED`; recovery performs an exact destination
-read and repairs the in-flight counter, but fresh writes remain blocked outside
-`READY|FULL`. Re-admitting a `FAILED`, `MISSING`, or `EVICTED` location is new
+An expired `COPYING` or `VERIFYING` lease remains reclaimable in every shard
+state, including when the shard later becomes `PENDING`, `DRIFTED`, or
+`DISABLED`; recovery performs an exact destination read and repairs the
+in-flight counter, but fresh writes remain blocked outside `READY|FULL`.
+Re-admitting a `FAILED`, `MISSING`, or `EVICTED` location is new
 write admission and therefore also requires `READY|FULL`, including canonical
 publication retry. QUARANTINED is not retryable on its original physical
 reference. The dispatcher rechecks shard state from its locked row after
@@ -1941,9 +1978,13 @@ drained and every image table is empty; it is never part of Helm rollback.
 - one-million-row resumable inventory, exact missing confirmation, durable cursor,
   batched token grants, hot/cold target no-starvation, throttling, count/byte
   ceilings, and empty failed-reservation reclamation tests;
+- PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
+  inspection, copy-shard dispatch, and inventory claims use their exact partial
+  due-time indexes with large terminal or idle populations present;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
   version-target, controller loss, supersede, generation watermark,
-  interrupted terminal confirmation, INIT-versus-reconciliation absent-row
+  interrupted terminal confirmation, one-shot request-terminal proof preserved
+  across the pre-24-hour rotation, INIT-versus-reconciliation absent-row
   serialization, authoritative owner retirement, compaction, and unreachable
   consumer stores;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
@@ -2288,3 +2329,15 @@ deletes it and releases its reservation, causing the terminal page to compare
 pre-delete observations with post-delete accounting. This revision uses the
 same durable inventory-active predicate for lifecycle discovery, no-I/O restore,
 and capacity-releasing READBACK completion across both listing and finalization.
+
+The focused repair gate at `4c4a0525710a1406c7988f94ad0dc64911284f9b`
+returned paired `ACCEPT_REPAIR`, but the restarted full-feature round 1 returned
+paired `RESHAPE`. Codex found that copy-shard dispatch, publication inspection,
+and inventory scheduling sorted hot global populations with indexes that did not
+match their predicates and order. Fable found that bound PENDING publications
+could re-enter source inspection and that the pre-24-hour unattached-cluster
+delay erased one-shot request-terminal proof, leaking demand and eviction fences
+forever. This revision adds the exact generated and persisted queue projections
+described above, closes inspection to unbound publications, and preserves
+terminal request evidence while only the age gate is pending. The acceptance
+streak remains reset until both reviewers accept the complete repaired feature.

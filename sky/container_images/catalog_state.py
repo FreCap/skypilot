@@ -599,24 +599,20 @@ def claim_publication_inspection(
         lease_seconds: int,
         workspace: str | None = None,
         now: int | None = None) -> PublicationRecord | None:
-    """Claims one fair, bounded source inspection with a random fence."""
+    """Claims one indexed unbound source inspection with a random fence."""
     current = int(time.time()) if now is None else now
     token = f'{worker_id}:{uuid.uuid4()}'
     table = schema.publications
-    eligible = sqlalchemy.or_(
-        sqlalchemy.and_(
-            table.c.state == models.ImagePublicationState.PENDING.value,
-            sqlalchemy.or_(table.c.next_retry_at.is_(None),
-                           table.c.next_retry_at <= current)),
-        sqlalchemy.and_(
-            table.c.state == models.ImagePublicationState.INSPECTING.value,
-            table.c.inspection_lease_expires_at <= current),
-    )
-    statement = sqlalchemy.select(table.c.id).where(eligible)
+    statement = sqlalchemy.select(table.c.id).where(
+        table.c.canonical_location_id.is_(None),
+        table.c.state.in_([
+            models.ImagePublicationState.PENDING.value,
+            models.ImagePublicationState.INSPECTING.value,
+        ]), table.c.inspection_claimable_at <= current)
     if workspace is not None:
         statement = statement.where(table.c.workspace == workspace)
     statement = statement.order_by(
-        table.c.updated_at,
+        table.c.inspection_claimable_at,
         table.c.id).limit(1).with_for_update(skip_locked=True)
     with orm.Session(engine()) as session, session.begin():
         publication_id = session.execute(statement).scalar_one_or_none()

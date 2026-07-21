@@ -372,6 +372,7 @@ def _create_tables() -> None:
         sqlalchemy.Column('state', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column('qualified_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('last_dispatch_at', sqlalchemy.BigInteger),
+        sqlalchemy.Column('copy_next_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('inventory_epoch',
                           sqlalchemy.BigInteger,
                           nullable=False,
@@ -385,6 +386,14 @@ def _create_tables() -> None:
                           server_default=sqlalchemy.false()),
         sqlalchemy.Column('inventory_lease_token', sqlalchemy.Text),
         sqlalchemy.Column('inventory_lease_expires_at', sqlalchemy.BigInteger),
+        sqlalchemy.Column('inventory_interval_seconds',
+                          sqlalchemy.Integer,
+                          nullable=False,
+                          server_default='600'),
+        sqlalchemy.Column('inventory_next_at',
+                          sqlalchemy.BigInteger,
+                          nullable=False,
+                          server_default='0'),
         sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.UniqueConstraint(
@@ -418,15 +427,26 @@ def _create_tables() -> None:
             'inventory_finalizing IS FALSE OR inventory_completed_at IS NOT '
             'NULL',
             name='ck_container_image_registry_inventory_finalizing'),
+        sqlalchemy.CheckConstraint(
+            'inventory_interval_seconds > 0 AND inventory_next_at >= 0',
+            name='ck_container_image_registry_inventory_schedule'),
     )
     op.create_index('ix_container_image_registry_shard_dispatch',
                     'container_image_registry_shards', [
                         'workspace', 'profile', 'target_id', 'state',
                         'last_dispatch_at', 'id'
                     ])
+    op.create_index(
+        'ix_container_image_registry_shard_copy_queue',
+        'container_image_registry_shards', ['copy_next_at', 'id'],
+        postgresql_where=sqlalchemy.text('copy_next_at IS NOT NULL'))
     op.create_index('ix_container_image_registry_shard_inventory',
-                    'container_image_registry_shards',
-                    ['state', 'inventory_lease_expires_at', 'id'])
+                    'container_image_registry_shards', [
+                        sqlalchemy.text('inventory_finalizing DESC'),
+                        'inventory_next_at', 'id'
+                    ],
+                    postgresql_where=sqlalchemy.text(
+                        "state IN ('PENDING', 'READY', 'FULL', 'DRIFTED')"))
 
     op.create_table(
         'container_image_locations',
@@ -465,6 +485,13 @@ def _create_tables() -> None:
         sqlalchemy.Column('last_verified_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('last_used_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('inventory_epoch_seen', sqlalchemy.BigInteger),
+        sqlalchemy.Column(
+            'copy_claimable_at', sqlalchemy.BigInteger,
+            sqlalchemy.Computed(
+                "CASE WHEN state = 'PENDING' THEN COALESCE(next_retry_at, "
+                "updated_at) WHEN state IN ('COPYING', 'VERIFYING') THEN "
+                'lease_expires_at ELSE NULL END',
+                persisted=True)),
         sqlalchemy.Column('reserved_declared_bytes',
                           sqlalchemy.BigInteger,
                           nullable=False),
@@ -505,12 +532,14 @@ def _create_tables() -> None:
             'attempt_count >= 0 AND reserved_declared_bytes >= 0',
             name='ck_container_image_location_nonnegative'),
     )
-    op.create_index('ix_container_image_locations_queue',
+    op.create_index('ix_container_image_locations_copy_pending',
                     'container_image_locations',
-                    ['state', 'next_retry_at', 'lease_expires_at', 'id'])
-    op.create_index('ix_container_image_locations_shard_queue',
-                    'container_image_locations',
-                    ['shard_id', 'state', 'next_retry_at', 'updated_at', 'id'])
+                    ['shard_id', 'copy_claimable_at', 'id'],
+                    postgresql_where=sqlalchemy.text("state = 'PENDING'"))
+    op.create_index(
+        'ix_container_image_locations_copy_recovery',
+        'container_image_locations', ['shard_id', 'copy_claimable_at', 'id'],
+        postgresql_where=sqlalchemy.text("state IN ('COPYING', 'VERIFYING')"))
     op.create_index('ix_container_image_locations_shard_readiness',
                     'container_image_locations',
                     ['shard_id', 'state', 'updated_at', 'id'])
@@ -581,6 +610,14 @@ def _create_tables() -> None:
         sqlalchemy.Column(
             'canonical_location_id', sqlalchemy.Text,
             sqlalchemy.ForeignKey('container_image_locations.id')),
+        sqlalchemy.Column(
+            'inspection_claimable_at', sqlalchemy.BigInteger,
+            sqlalchemy.Computed(
+                "CASE WHEN canonical_location_id IS NULL AND state = "
+                "'PENDING' THEN COALESCE(next_retry_at, updated_at) WHEN "
+                "canonical_location_id IS NULL AND state = 'INSPECTING' "
+                'THEN inspection_lease_expires_at ELSE NULL END',
+                persisted=True)),
         sqlalchemy.Column('reservation_expires_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('record_expires_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
@@ -603,6 +640,9 @@ def _create_tables() -> None:
             "state <> 'READY' OR (reservation_active IS TRUE AND image_id IS "
             "NOT NULL AND canonical_location_id IS NOT NULL)",
             name='ck_container_image_publication_ready'),
+        sqlalchemy.CheckConstraint(
+            "state <> 'INSPECTING' OR canonical_location_id IS NULL",
+            name='ck_container_image_publication_inspecting_unbound'),
     )
     op.create_index(
         'uq_container_image_publication_release_reservation',
@@ -611,8 +651,8 @@ def _create_tables() -> None:
         postgresql_where=sqlalchemy.text('reservation_active IS TRUE'))
     op.create_index(
         'ix_container_image_publications_inspection_queue',
-        'container_image_publications',
-        ['state', 'next_retry_at', 'inspection_lease_expires_at', 'id'])
+        'container_image_publications', ['inspection_claimable_at', 'id'],
+        postgresql_where=sqlalchemy.text('inspection_claimable_at IS NOT NULL'))
     op.create_index('ix_container_image_publications_canonical_queue',
                     'container_image_publications',
                     ['canonical_location_id', 'state', 'id'])

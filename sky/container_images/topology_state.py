@@ -704,6 +704,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
         'inventory_started_at': None,
         'inventory_completed_at': None,
         'inventory_finalizing': False,
+        'inventory_next_at': now,
         'observed_manifests': 0,
     }
     if str(row['state']) in (models.ImageShardState.READY.value,
@@ -789,13 +790,6 @@ def claim_inventory_shard(*,
         raise ValueError('Inventory lease and interval must be positive.')
     current = int(time.time()) if now is None else now
     table = schema.registry_shards
-    expired = sqlalchemy.and_(table.c.inventory_lease_token.is_not(None),
-                              table.c.inventory_lease_expires_at <= current)
-    available = sqlalchemy.or_(table.c.inventory_lease_token.is_(None), expired)
-    due = sqlalchemy.or_(
-        expired, table.c.inventory_finalizing.is_(True),
-        table.c.inventory_completed_at.is_(None), table.c.inventory_completed_at
-        <= current - interval_seconds)
     token = f'{worker_id}:{uuid.uuid4()}'
     with orm.Session(catalog_state.engine()) as session, session.begin():
         row = session.execute(
@@ -805,11 +799,11 @@ def claim_inventory_shard(*,
                     models.ImageShardState.READY.value,
                     models.ImageShardState.FULL.value,
                     models.ImageShardState.DRIFTED.value,
-                ]), available,
-                due).order_by(table.c.inventory_finalizing.desc(),
-                              table.c.inventory_completed_at.asc().nullsfirst(),
-                              table.c.id).limit(1).with_for_update(
-                                  skip_locked=True)).mappings().first()
+                ]), table.c.inventory_next_at
+                <= current).order_by(table.c.inventory_finalizing.desc(),
+                                     table.c.inventory_next_at,
+                                     table.c.id).limit(1).with_for_update(
+                                         skip_locked=True)).mappings().first()
         if row is None:
             return None
         in_progress = (row['inventory_started_at'] is not None and
@@ -818,6 +812,8 @@ def claim_inventory_shard(*,
         values: dict[str, Any] = {
             'inventory_lease_token': token,
             'inventory_lease_expires_at': current + lease_seconds,
+            'inventory_interval_seconds': interval_seconds,
+            'inventory_next_at': current + lease_seconds,
             'updated_at': current,
         }
         if not in_progress:
@@ -849,6 +845,7 @@ def heartbeat_inventory_shard(shard_id: str,
             table.c.inventory_lease_token == lease_token,
             table.c.inventory_lease_expires_at > current).values(
                 inventory_lease_expires_at=current + lease_seconds,
+                inventory_next_at=current + lease_seconds,
                 updated_at=current)).rowcount
     return changed == 1
 
@@ -931,6 +928,7 @@ def record_inventory_page(shard_id: str,
         updated = session.execute(
             shards.update().where(shards.c.id == shard_id).values(
                 **values).returning(shards)).mappings().one()
+        _refresh_shard_copy_queue_in_session(session, shard_id, now=current)
         return _shard(updated)
 
 
@@ -943,14 +941,26 @@ def release_inventory_claim(shard_id: str,
     current = int(time.time()) if now is None else now
     table = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.id == shard_id).with_for_update()).mappings().first()
+        if (row is None or
+                int(row['inventory_epoch']) != expected_inventory_epoch or
+                row['inventory_lease_token'] != lease_token or
+                row['inventory_lease_expires_at'] is None or
+                int(row['inventory_lease_expires_at']) <= current):
+            return False
+        if (row['inventory_completed_at'] is not None and
+                not bool(row['inventory_finalizing'])):
+            next_at = (int(row['inventory_completed_at']) +
+                       int(row['inventory_interval_seconds']))
+        else:
+            next_at = current
         changed = session.execute(table.update().where(
-            table.c.id == shard_id,
-            table.c.inventory_epoch == expected_inventory_epoch,
-            table.c.inventory_lease_token == lease_token,
-            table.c.inventory_lease_expires_at
-            > current).values(inventory_lease_token=None,
-                              inventory_lease_expires_at=None,
-                              updated_at=current)).rowcount
+            table.c.id == shard_id).values(inventory_lease_token=None,
+                                           inventory_lease_expires_at=None,
+                                           inventory_next_at=next_at,
+                                           updated_at=current)).rowcount
     return changed == 1
 
 
@@ -964,6 +974,7 @@ def abandon_inventory_claim(shard_id: str,
     values: dict[str, Any] = {
         'inventory_lease_token': None,
         'inventory_lease_expires_at': None,
+        'inventory_next_at': current,
         'updated_at': current,
     }
     if invalid_cursor:
@@ -998,8 +1009,11 @@ def mark_shard_drifted(shard_id: str,
                               inventory_started_at=None,
                               inventory_completed_at=None,
                               inventory_finalizing=False,
+                              inventory_next_at=current,
                               observed_manifests=0,
                               updated_at=current)).rowcount
+        if changed == 1:
+            _refresh_shard_copy_queue_in_session(session, shard_id, now=current)
     return changed == 1
 
 
@@ -1153,6 +1167,7 @@ def record_inventory_attestation_and_release(
             session.execute(shards.update().where(
                 shards.c.id == shard_id).values(inventory_lease_token=None,
                                                 inventory_lease_expires_at=None,
+                                                inventory_next_at=current,
                                                 updated_at=current))
             return None
         recorded = record_profile_attestation_in_session(
@@ -1167,6 +1182,8 @@ def record_inventory_attestation_and_release(
             inventory_finalizing=False,
             inventory_lease_token=None,
             inventory_lease_expires_at=None,
+            inventory_next_at=(expected_inventory_completed_at +
+                               int(shard['inventory_interval_seconds'])),
             updated_at=current))
         return recorded
 
@@ -1334,6 +1351,51 @@ def get_location_for_target(*, image_id: str, workspace: str,
     return _location(row) if row is not None else None
 
 
+def _refresh_shard_copy_queue_in_session(
+        session: orm.Session,
+        shard_id: str,
+        *,
+        now: int,
+        rotate_due: bool = False) -> int | None:
+    """Refreshes one exact shard-level projection under its row lock."""
+    shards = schema.registry_shards
+    locations = schema.locations
+    shard = session.execute(
+        sqlalchemy.select(shards).where(
+            shards.c.id == shard_id).with_for_update()).mappings().one()
+    candidates: list[int] = []
+    recovery_at = session.execute(
+        sqlalchemy.select(locations.c.copy_claimable_at).where(
+            locations.c.shard_id == shard_id,
+            locations.c.state.in_([
+                models.ImageLocationState.COPYING.value,
+                models.ImageLocationState.VERIFYING.value,
+            ])).order_by(locations.c.copy_claimable_at,
+                         locations.c.id).limit(1)).scalar_one_or_none()
+    if recovery_at is not None:
+        candidates.append(int(recovery_at))
+    if (str(shard['state']) in (models.ImageShardState.READY.value,
+                                models.ImageShardState.FULL.value) and
+            int(shard['in_flight']) < int(shard['max_in_flight'])):
+        fresh_at = session.execute(
+            sqlalchemy.select(locations.c.copy_claimable_at).where(
+                locations.c.shard_id == shard_id, locations.c.state ==
+                models.ImageLocationState.PENDING.value).order_by(
+                    locations.c.copy_claimable_at,
+                    locations.c.id).limit(1)).scalar_one_or_none()
+        if fresh_at is not None:
+            candidates.append(int(fresh_at))
+    next_at = min(candidates) if candidates else None
+    if next_at is not None:
+        dispatch_floor = int(shard['last_dispatch_at'] or 0)
+        if rotate_due and next_at <= now:
+            dispatch_floor = max(dispatch_floor, now)
+        next_at = max(next_at, dispatch_floor)
+    session.execute(shards.update().where(shards.c.id == shard_id).values(
+        copy_next_at=next_at))
+    return next_at
+
+
 def list_locations(
         image_id: str,
         workspace: str,
@@ -1359,45 +1421,16 @@ def claim_next_location(*,
                         lease_seconds: int,
                         workspace: str | None = None,
                         now: int | None = None) -> LocationRecord | None:
-    """Claims via oldest eligible target shard, then its oldest location."""
+    """Claims one indexed due shard, then one indexed local location."""
     current = int(time.time()) if now is None else now
     shards = schema.registry_shards
     locations = schema.locations
-    fresh = sqlalchemy.and_(
-        locations.c.state == models.ImageLocationState.PENDING.value,
-        sqlalchemy.or_(locations.c.next_retry_at.is_(None),
-                       locations.c.next_retry_at <= current))
-    expired = sqlalchemy.and_(
-        locations.c.state.in_([
-            models.ImageLocationState.COPYING.value,
-            models.ImageLocationState.VERIFYING.value,
-        ]), locations.c.lease_expires_at <= current)
-    eligible_location = sqlalchemy.or_(fresh, expired)
-    accepts_reserved_work = shards.c.state.in_([
-        models.ImageShardState.READY.value,
-        models.ImageShardState.FULL.value,
-    ])
-    recovers_expired_work = shards.c.state.in_([
-        models.ImageShardState.READY.value,
-        models.ImageShardState.FULL.value,
-        models.ImageShardState.DRIFTED.value,
-        models.ImageShardState.DISABLED.value,
-    ])
     shard_statement = sqlalchemy.select(shards).where(
-        sqlalchemy.or_(
-            sqlalchemy.and_(
-                accepts_reserved_work, shards.c.in_flight
-                < shards.c.max_in_flight,
-                sqlalchemy.exists().where(locations.c.shard_id == shards.c.id,
-                                          fresh)),
-            sqlalchemy.and_(
-                recovers_expired_work,
-                sqlalchemy.exists().where(locations.c.shard_id == shards.c.id,
-                                          expired))))
+        shards.c.copy_next_at.is_not(None), shards.c.copy_next_at <= current)
     if workspace is not None:
         shard_statement = shard_statement.where(shards.c.workspace == workspace)
     shard_statement = shard_statement.order_by(
-        shards.c.last_dispatch_at.asc().nullsfirst(),
+        shards.c.copy_next_at,
         shards.c.id).limit(1).with_for_update(skip_locked=True)
     token = f'{worker_id}:{uuid.uuid4()}'
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -1407,12 +1440,29 @@ def claim_next_location(*,
         location_row = session.execute(
             sqlalchemy.select(locations).where(
                 locations.c.shard_id == shard_row['id'],
-                eligible_location).order_by(
-                    sqlalchemy.case((expired, 0),
-                                    else_=1), locations.c.updated_at,
-                    locations.c.id).limit(1).with_for_update(
-                        skip_locked=True)).mappings().first()
+                locations.c.state.in_([
+                    models.ImageLocationState.COPYING.value,
+                    models.ImageLocationState.VERIFYING.value,
+                ]), locations.c.copy_claimable_at
+                <= current).order_by(locations.c.copy_claimable_at,
+                                     locations.c.id).limit(1).with_for_update(
+                                         skip_locked=True)).mappings().first()
+        if (location_row is None and str(
+                shard_row['state']) in (models.ImageShardState.READY.value,
+                                        models.ImageShardState.FULL.value) and
+                int(shard_row['in_flight']) < int(shard_row['max_in_flight'])):
+            location_row = session.execute(
+                sqlalchemy.select(locations).where(
+                    locations.c.shard_id == shard_row['id'], locations.c.state
+                    == models.ImageLocationState.PENDING.value,
+                    locations.c.copy_claimable_at <= current).order_by(
+                        locations.c.copy_claimable_at,
+                        locations.c.id).limit(1).with_for_update(
+                            skip_locked=True)).mappings().first()
         if location_row is None:
+            _refresh_shard_copy_queue_in_session(session,
+                                                 str(shard_row['id']),
+                                                 now=current)
             return None
         reclaimed = str(location_row['state']) in (
             models.ImageLocationState.COPYING.value,
@@ -1441,6 +1491,10 @@ def claim_next_location(*,
                            if reclaimed else shards.c.in_flight + 1),
                 last_dispatch_at=current,
                 updated_at=current))
+        _refresh_shard_copy_queue_in_session(session,
+                                             str(shard_row['id']),
+                                             now=current,
+                                             rotate_due=True)
         return _location(row)
 
 
@@ -1451,6 +1505,21 @@ def heartbeat_location(location_id: str,
                        now: int | None = None) -> bool:
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        snapshot = session.execute(
+            sqlalchemy.select(
+                schema.locations.c.shard_id, schema.locations.c.state).where(
+                    schema.locations.c.id == location_id,
+                    schema.locations.c.lease_token == lease_token)).first()
+        if snapshot is None:
+            return False
+        copy_lease = str(
+            snapshot.state) in (models.ImageLocationState.COPYING.value,
+                                models.ImageLocationState.VERIFYING.value)
+        if copy_lease:
+            session.execute(
+                sqlalchemy.select(schema.registry_shards.c.id).where(
+                    schema.registry_shards.c.id ==
+                    snapshot.shard_id).with_for_update()).one()
         changed = session.execute(schema.locations.update().where(
             schema.locations.c.id == location_id,
             schema.locations.c.lease_token == lease_token,
@@ -1461,6 +1530,10 @@ def heartbeat_location(location_id: str,
                 models.ImageLocationState.EVICTING.value,
             ])).values(lease_expires_at=current + lease_seconds,
                        updated_at=current)).rowcount
+        if changed == 1 and copy_lease:
+            _refresh_shard_copy_queue_in_session(session,
+                                                 str(snapshot.shard_id),
+                                                 now=current)
     return changed == 1
 
 
@@ -1576,6 +1649,7 @@ def _finish_location(session: orm.Session, *, location_id: str,
         schema.registry_shards.c.in_flight
         > 0).values(in_flight=schema.registry_shards.c.in_flight - 1,
                     updated_at=now))
+    _refresh_shard_copy_queue_in_session(session, str(row['shard_id']), now=now)
     return updated
 
 
@@ -1675,6 +1749,9 @@ def retry_location(location_id: str,
         updated = session.execute(
             locations.update().where(locations.c.id == location_id).values(
                 **values).returning(locations)).mappings().one()
+        _refresh_shard_copy_queue_in_session(session,
+                                             str(shard['id']),
+                                             now=current)
         return _location(updated)
 
 
@@ -1757,6 +1834,7 @@ def _quarantine_eviction(
         > 0).values(in_flight=shards.c.in_flight - 1, updated_at=now)).rowcount
     if changed != 1:
         raise RuntimeError('Eviction quarantine accounting drifted.')
+    _refresh_shard_copy_queue_in_session(session, str(row['shard_id']), now=now)
     return _location(updated)
 
 
@@ -1898,6 +1976,9 @@ def claim_next_eviction(*,
                             updated_at=current)).rowcount
             if changed != 1:
                 raise RuntimeError('Eviction recovery accounting drifted.')
+            _refresh_shard_copy_queue_in_session(session,
+                                                 str(row['shard_id']),
+                                                 now=current)
             return _location(updated)
         updated = session.execute(
             locations.update().where(locations.c.id == row['id']).values(
@@ -1914,6 +1995,9 @@ def claim_next_eviction(*,
                            if reclaimed else shards.c.in_flight + 1),
                 last_dispatch_at=current,
                 updated_at=current))
+        _refresh_shard_copy_queue_in_session(session,
+                                             str(row['shard_id']),
+                                             now=current)
         return _location(updated)
 
 
@@ -2033,6 +2117,9 @@ def complete_eviction(location_id: str,
             *shard_predicates).values(**shard_values)).rowcount
         if changed != 1:
             raise RuntimeError('Eviction reservation accounting drifted.')
+        _refresh_shard_copy_queue_in_session(session,
+                                             str(row['shard_id']),
+                                             now=current)
         return _location(updated)
 
 

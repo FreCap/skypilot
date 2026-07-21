@@ -300,6 +300,7 @@ registry_shards = sqlalchemy.Table(
     sqlalchemy.Column('state', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('qualified_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('last_dispatch_at', sqlalchemy.BigInteger),
+    sqlalchemy.Column('copy_next_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('inventory_epoch',
                       sqlalchemy.BigInteger,
                       nullable=False,
@@ -313,6 +314,14 @@ registry_shards = sqlalchemy.Table(
                       server_default=sqlalchemy.false()),
     sqlalchemy.Column('inventory_lease_token', sqlalchemy.Text),
     sqlalchemy.Column('inventory_lease_expires_at', sqlalchemy.BigInteger),
+    sqlalchemy.Column('inventory_interval_seconds',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='600'),
+    sqlalchemy.Column('inventory_next_at',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.UniqueConstraint('workspace',
@@ -340,10 +349,22 @@ registry_shards = sqlalchemy.Table(
     sqlalchemy.CheckConstraint(
         'inventory_finalizing IS FALSE OR inventory_completed_at IS NOT NULL',
         name='ck_container_image_registry_inventory_finalizing'),
+    sqlalchemy.CheckConstraint(
+        'inventory_interval_seconds > 0 AND inventory_next_at >= 0',
+        name='ck_container_image_registry_inventory_schedule'),
     sqlalchemy.Index('ix_container_image_registry_shard_dispatch', 'workspace',
                      'profile', 'target_id', 'state', 'last_dispatch_at', 'id'),
-    sqlalchemy.Index('ix_container_image_registry_shard_inventory', 'state',
-                     'inventory_lease_expires_at', 'id'),
+    sqlalchemy.Index(
+        'ix_container_image_registry_shard_copy_queue',
+        'copy_next_at',
+        'id',
+        postgresql_where=sqlalchemy.text('copy_next_at IS NOT NULL')),
+    sqlalchemy.Index('ix_container_image_registry_shard_inventory',
+                     sqlalchemy.text('inventory_finalizing DESC'),
+                     'inventory_next_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text(
+                         "state IN ('PENDING', 'READY', 'FULL', 'DRIFTED')")),
 )
 
 locations = sqlalchemy.Table(
@@ -380,6 +401,13 @@ locations = sqlalchemy.Table(
     sqlalchemy.Column('last_verified_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('last_used_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('inventory_epoch_seen', sqlalchemy.BigInteger),
+    sqlalchemy.Column(
+        'copy_claimable_at', sqlalchemy.BigInteger,
+        sqlalchemy.Computed(
+            "CASE WHEN state = 'PENDING' THEN COALESCE(next_retry_at, "
+            "updated_at) WHEN state IN ('COPYING', 'VERIFYING') THEN "
+            'lease_expires_at ELSE NULL END',
+            persisted=True)),
     sqlalchemy.Column('reserved_declared_bytes',
                       sqlalchemy.BigInteger,
                       nullable=False),
@@ -415,10 +443,17 @@ locations = sqlalchemy.Table(
     sqlalchemy.CheckConstraint(
         'attempt_count >= 0 AND reserved_declared_bytes >= 0',
         name='ck_container_image_location_nonnegative'),
-    sqlalchemy.Index('ix_container_image_locations_queue', 'state',
-                     'next_retry_at', 'lease_expires_at', 'id'),
-    sqlalchemy.Index('ix_container_image_locations_shard_queue', 'shard_id',
-                     'state', 'next_retry_at', 'updated_at', 'id'),
+    sqlalchemy.Index('ix_container_image_locations_copy_pending',
+                     'shard_id',
+                     'copy_claimable_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text("state = 'PENDING'")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_copy_recovery',
+        'shard_id',
+        'copy_claimable_at',
+        'id',
+        postgresql_where=sqlalchemy.text("state IN ('COPYING', 'VERIFYING')")),
     sqlalchemy.Index('ix_container_image_locations_shard_readiness', 'shard_id',
                      'state', 'updated_at', 'id'),
     sqlalchemy.Index('ix_container_image_locations_inventory_confirmation',
@@ -485,6 +520,14 @@ publications = sqlalchemy.Table(
                       sqlalchemy.ForeignKey('container_image_sources.id')),
     sqlalchemy.Column('canonical_location_id', sqlalchemy.Text,
                       sqlalchemy.ForeignKey('container_image_locations.id')),
+    sqlalchemy.Column(
+        'inspection_claimable_at', sqlalchemy.BigInteger,
+        sqlalchemy.Computed(
+            "CASE WHEN canonical_location_id IS NULL AND state = 'PENDING' "
+            'THEN COALESCE(next_retry_at, updated_at) WHEN '
+            "canonical_location_id IS NULL AND state = 'INSPECTING' THEN "
+            'inspection_lease_expires_at ELSE NULL END',
+            persisted=True)),
     sqlalchemy.Column('reservation_expires_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('record_expires_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
@@ -506,6 +549,9 @@ publications = sqlalchemy.Table(
         "state <> 'READY' OR (reservation_active IS TRUE AND image_id IS NOT "
         "NULL AND canonical_location_id IS NOT NULL)",
         name='ck_container_image_publication_ready'),
+    sqlalchemy.CheckConstraint(
+        "state <> 'INSPECTING' OR canonical_location_id IS NULL",
+        name='ck_container_image_publication_inspecting_unbound'),
     sqlalchemy.Index(
         'uq_container_image_publication_release_reservation',
         'workspace',
@@ -513,8 +559,10 @@ publications = sqlalchemy.Table(
         unique=True,
         postgresql_where=sqlalchemy.text('reservation_active IS TRUE')),
     sqlalchemy.Index('ix_container_image_publications_inspection_queue',
-                     'state', 'next_retry_at', 'inspection_lease_expires_at',
-                     'id'),
+                     'inspection_claimable_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text(
+                         'inspection_claimable_at IS NOT NULL')),
     sqlalchemy.Index('ix_container_image_publications_canonical_queue',
                      'canonical_location_id', 'state', 'id'),
     sqlalchemy.Index('ix_container_image_publications_image', 'image_id',
