@@ -10,6 +10,15 @@ applied as service version 36 with the 600/60-second priority thresholds,
 normal and adaptive scale-up waves, five-minute downscale delay, and
 independent 50 percent downscale limits described below.
 
+A follow-up observation found the adopted target pinned at 144 while raw
+demand was 3 to 8 because the magnitude-blind pressure latch could re-arm and
+restart downscale delay indefinitely under trickle traffic. Commit
+`1269e3b57230414a9d96562c219e3ea7409ae94d` bounded consecutive vetoes to two
+per downscale episode, merged as
+`9a78ea0c13ddcab3cb74ded646273487666a2d6a`, and was released as SkyPilot
+`1.1.583`. At the time of this documentation update, the release was not yet
+deployed to the production control plane.
+
 The numerical production policy is an initial operating point, not a permanent
 default recommendation for every service. Future tuning must follow the
 [SkyServe autoscaling simulation runbook](serve-autoscaling-simulation.md) and
@@ -21,7 +30,7 @@ supply traces.
 SkyServe already supports strict request priority, concurrency-native logical
 autoscaling, deduplicated rejected-job pressure, bounded scale-up waves, a
 wall-clock downscale delay, and a configurable whole-fleet scale-down limit.
-Those controls still leave three gaps for bursty one-request-per-GPU services:
+Those controls still leave four gaps for bursty one-request-per-GPU services:
 
 1. One queue timeout applies to every priority. A short timeout spills all
    traffic before slow GPU capacity can start, while a long timeout makes every
@@ -32,6 +41,8 @@ Those controls still leave three gaps for bursty one-request-per-GPU services:
 3. A 50 percent whole-fleet downscale can cancel almost the complete
    provisioning cohort when ready capacity is already more than half the
    fleet. A burst one minute later must then relaunch the same capacity.
+4. A magnitude-blind pressure delta can repeatedly restart downscale delay
+   under harmless trickle traffic, leaving adopted demand far above raw demand.
 
 The production incident on 2026-07-20 demonstrated the third gap. The service
 had 124 ready logical slots and 109 provisioning slots. Its adopted target fell
@@ -50,6 +61,7 @@ limit was respected, but more than 90 percent of pending capacity was lost.
 - Use deduplicated offered arrivals as a raise-only load floor.
 - Accelerate scale-up under sustained pressure while retaining time pacing.
 - Prevent fresh demand from racing a downscale decision.
+- Bound pressure vetoes so the protection cannot starve downscale forever.
 - Apply the configured downscale percentage independently to committed capacity
   and to the provisioning cohort.
 - Preserve scalar-only specs and mixed old/new controller and load-balancer
@@ -350,9 +362,10 @@ Autoscaler status exposes:
 - 60-second and 300-second offered-arrival counts and arrival floor;
 - raw and adopted targets plus committed and provisioning capacity;
 - pressure streak, adaptive-active state, and adaptive hold remaining;
-- downscale elapsed time, veto reason, whole-fleet allowance, provisioning
-  allowance, frozen provisioning-retention floor, and pending slots spent in
-  the current episode.
+- downscale elapsed time, veto reason, consecutive-veto streak and budget,
+  whole-fleet allowance, provisioning allowance, frozen
+  provisioning-retention floor, and pending slots spent in the current
+  episode.
 
 These values flow through the existing Serve status surface. Minute history
 keeps its existing aggregate schema in this change. Persisting priority maps
@@ -376,6 +389,11 @@ adopted, its baseline replay must be calibrated against observed targets,
 ready and provisioning capacity, queue depth, and rejections. A candidate that
 only wins under an uncalibrated or optimistic model is not eligible for
 rollout.
+
+Every report must name raw demand, adopted demand after hysteresis, and the
+effective capacity target after reserved fill separately. Utilization used for
+cost tuning must also separate ordinary capacity from free reserved capacity;
+free capacity cannot make an incrementally paid fleet appear underutilized.
 
 ## Alternatives considered
 

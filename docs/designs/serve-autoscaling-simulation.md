@@ -11,7 +11,7 @@ for decisions about:
 - minimum replicas or a fixed queue floor;
 - normal and adaptive scale-up waves;
 - startup delay, placement failure, and cluster scarcity;
-- downscale delay, pressure vetoes, and scale-down limits.
+- downscale delay, pressure-veto budgets, and scale-down limits.
 
 The goal is not to find one policy that perfectly explains one day. The goal
 is to compare the exact current policy with a small set of candidates under
@@ -70,6 +70,7 @@ serve-sim-<service>-<UTC timestamp>/
   requests.csv
   supply.csv
   scenarios.yaml
+  simulator/
   results.json
   comparison.csv
   timeline.html
@@ -82,6 +83,7 @@ serve-sim-<service>-<UTC timestamp>/
 - timezone, simulator revision, command line, and random seeds;
 - source system and query identifier for each input;
 - whether each field is observed, derived, or assumed;
+- the capacity unit and incremental-cost class used by every supply series;
 - SHA-256 checksums of every input file.
 
 Never store request payloads, authorization headers, secrets, raw stable job
@@ -198,7 +200,7 @@ system with this logical schema:
 
 ```text
 arrival_ts,job_id_hash,retry_group_hash,priority,duration_seconds,
-terminal_outcome,provider
+terminal_outcome,provider,accelerator,workload_class
 ```
 
 Requirements:
@@ -211,15 +213,22 @@ Requirements:
 - `priority` is the actual value sent on the wire, not the product label that
   was later mapped to it.
 - `duration_seconds` measures model execution, not total workflow duration.
+- `accelerator` identifies the card on which the duration was observed.
+  Duration from another accelerator may be used only as a labeled sensitivity
+  input, never as observed duration for the target service.
+- `workload_class` is a privacy-safe request-shape bucket when execution time
+  varies materially by model input or method.
 - `terminal_outcome` distinguishes served, queue timeout, queue full, provider
   failure, caller timeout, and trace truncation.
 - `provider` lets the analysis distinguish a local rejection from a failed
   logical job. A SkyServe rejection that succeeds elsewhere is still offered
   pressure, but it is not a second unique arrival.
 
-Use the empirical joint distribution when duration correlates with priority,
-time of day, or request type. A single average duration erases the long tail
-that determines queue delay and capacity recovery.
+Use the empirical joint distribution when duration correlates with accelerator,
+priority, time of day, or request type. Report p50, p90, p95, p99, and the mean
+for every accelerator and workload class with enough samples. A single average
+duration erases the long tail that determines queue delay and capacity
+recovery.
 
 If only minute counts exist, generate at least three within-minute traces:
 
@@ -237,12 +246,18 @@ entire trace. For a supply-aware replay, create `supply.csv` with:
 
 ```text
 observed_ts,cluster,provider,region,accelerator,free_gpus,
-placement_outcome,startup_seconds,failure_code
+capacity_cost_class,placement_outcome,startup_seconds,failure_code
 ```
 
 Include every eligible source, especially prepaid or reserved research-cluster
 capacity. Model cloud fallback separately from research-cluster capacity so a
 failed or delayed placement is not treated as an immediately available GPU.
+Classify each supply row as `incremental_cost` or `no_incremental_cost` from the
+decision's perspective. This classification affects cost and utilization
+scoring, not dispatch or availability. The existing replica-history
+[capacity modes](serve-replica-history-capacity-modes.md) provide durable
+logical capacity and free-reserved attribution after their migration, but they
+do not reconstruct historical cluster supply before a replica was launched.
 Use the Placement tab or `/serve/placement` API as supporting evidence for
 recent attempt outcomes, but obtain the time-varying free-GPU series from the
 cluster or provider telemetry that observed it at the time.
@@ -251,6 +266,48 @@ Startup samples must include unsuccessful attempts and cancellations. Current
 ready replicas are success-biased. When historical supply is missing, run a
 grid such as 25, 50, 75, and 100 percent launch success plus observed startup
 p50, p90, and p99. Label that grid as sensitivity analysis.
+
+## Run sequence
+
+The simulator used for a production decision must be checked into the
+evaluation bundle under `simulator/` or referenced by an immutable repository
+commit. It must expose commands that perform these four phases separately:
+
+```text
+validate inputs -> replay baseline -> calibrate -> replay scenario matrix
+```
+
+Record the exact commands in `provenance.json`. A typical invocation is:
+
+```bash
+python "$SIMULATOR" validate \
+  --skyserve "$RUN_DIR/skyserve.json" \
+  --requests "$RUN_DIR/requests.csv" \
+  --supply "$RUN_DIR/supply.csv" \
+  --scenarios "$RUN_DIR/scenarios.yaml"
+
+python "$SIMULATOR" replay \
+  --scenario baseline \
+  --output "$RUN_DIR/baseline.json"
+
+python "$SIMULATOR" calibrate \
+  --observed "$RUN_DIR/skyserve.json" \
+  --simulated "$RUN_DIR/baseline.json" \
+  --output "$RUN_DIR/calibration.json"
+
+python "$SIMULATOR" replay-matrix \
+  --scenarios "$RUN_DIR/scenarios.yaml" \
+  --results "$RUN_DIR/results.json" \
+  --comparison "$RUN_DIR/comparison.csv" \
+  --timeline "$RUN_DIR/timeline.html"
+```
+
+These command names define the minimum workflow contract, not a claim that an
+arbitrary investigation script already implements this interface. If the
+simulator uses different flags, record its real commands and produce the same
+four phase outputs. Do not proceed to the matrix when input validation fails.
+Do not use candidate results as rollout evidence when baseline calibration is
+outside the predeclared tolerance.
 
 ## Simulation model contract
 
@@ -307,12 +364,27 @@ production outputs for:
 - upscale and downscale delays;
 - normal and adaptive scale-up wave size and cadence;
 - pressure activation, hold, and downscale veto consumption;
+- maximum consecutive pressure vetoes and every episode-reset condition;
 - independent total-fleet and provisioning-cohort scale-down allowances;
 - controller restart and stale or incomplete demand behavior.
 
 The simulated target is not simulated capacity. Launches become ready only
 after sampled placement and startup events. Provisioning capacity counts as
 committed for scale-up pacing but does not serve requests.
+
+Keep these target series distinct throughout the replay and its graphs:
+
+- `raw_demand_target`: the instantaneous result of outstanding work and
+  arrival floors before downscale stabilization;
+- `adopted_demand_target`: the demand target after delay, pressure vetoes,
+  rate limits, and service bounds;
+- `capacity_target`: the effective target after any free reserved-capacity
+  fill overlay.
+
+The 2026-07-20 incident is the calibration case for this distinction: raw
+demand was 3 to 8 while the adopted target remained 144 under trickle traffic.
+A simulator that calls both values `target` cannot diagnose or compare the
+control-loop behavior.
 
 ### Cross-system and saturation comparisons
 
@@ -328,6 +400,21 @@ or a combination. Record the exact numerator, denominator, window, threshold,
 and missing-data behavior. Port the concept only if SkyServe observes the
 required signal with comparable semantics. A similarly named flag with a
 different window or capacity unit is not an equivalent algorithm.
+
+Report at least two utilization measures:
+
+```text
+service_utilization = busy_slot_seconds / ready_slot_seconds
+incremental_cost_utilization =
+    busy_incremental_cost_slot_seconds /
+    ready_incremental_cost_slot_seconds
+```
+
+The first describes dispatch efficiency. The second is the selection metric
+when the goal is at least 80 percent utilization while excluding research
+capacity that has no incremental cost. Report no-incremental-cost capacity and
+its utilization separately. If busy time cannot be attributed to the two cost
+classes, report a bounded range and do not claim the 80 percent gate passed.
 
 ### Minimum replicas and minimum queue
 
@@ -365,6 +452,7 @@ Keep the exact deployed policy as `baseline`. A useful first matrix is:
 | Baseline | None | Does the model resemble production? |
 | Normal-ramp alternatives | One wave percentage or minimum | What is the steady response/cost tradeoff? |
 | Adaptive alternatives | Pressure observations, fast wave, hold | Does sustained pressure need a temporary faster ramp? |
+| Pressure-veto budget | Unbounded, 0, 1, and 2 consecutive vetoes | Does trickle traffic protect a real rebound or starve downscale? |
 | Warm floors | Several `min_replicas` values | What cold-start SLO is purchased by idle capacity? |
 | Queue floors | Several `min_size` values | Does retaining work help, or only defer spill? |
 | Priority patience | Candidate threshold sets | Which lane receives capacity and which spills? |
@@ -397,7 +485,8 @@ report:
 
 - ready, busy, provisioning, draining, and failed slot-hours;
 - average and peak ready, target, and committed capacity;
-- busy/ready utilization, with the metric definition stated;
+- raw demand, adopted demand, and effective capacity target separately;
+- service and incremental-cost utilization, with reserved capacity separate;
 - launch attempts, placement failures, pending cancellations, and replacements;
 - number and magnitude of scale-up and scale-down decisions;
 - target overshoot, target deficit, and capacity-minutes below target;
@@ -427,7 +516,10 @@ the observed history. At minimum, check:
 - observed rejection bursts appear within the same windows;
 - simulated startup quantiles match observed successful startup quantiles;
 - placement failure and capacity scarcity rates match the supply trace;
-- controller or version transitions are represented.
+- controller or version transitions are represented;
+- raw and adopted targets diverge in the same windows and for the same reason;
+- the old unbounded-veto scenario reproduces a low-raw, high-adopted plateau,
+  while the capped scenario releases it within its declared veto budget.
 
 Investigate material divergence before tuning. Common causes include retry
 double counting, a success-biased startup sample, missing research-cluster
@@ -445,7 +537,8 @@ Use the freshest 24 hours for rapid iteration only. Before choosing a policy:
 - replay all available 72-hour SkyServe history;
 - split calibration and holdout windows chronologically;
 - include at least one burst, one idle-to-burst transition, one scarcity
-  period, and one ordinary low-traffic period;
+  period, one trickle-traffic downscale period, and one ordinary low-traffic
+  period;
 - repeat on another day when older source telemetry is available;
 - run optimistic, median, and conservative duration/startup cases;
 - run supply failure and controller restart stress cases.

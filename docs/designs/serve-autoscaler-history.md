@@ -140,9 +140,11 @@ do not count as healthy or unhealthy.
 The history is the SkyServe side of the reproducible input bundle defined by
 the [autoscaling simulation runbook](serve-autoscaling-simulation.md). It
 provides request and rejection buckets, actual targets, ready and provisioning
-capacity, controller/version transitions, and aggregate pressure. Those fields
-are sufficient to calibrate an aggregate replay and to detect a simulator that
-does not resemble the real controller.
+capacity, controller/version transitions, and aggregate pressure. The
+[replica-history capacity modes](serve-replica-history-capacity-modes.md) add
+logical width and free-reserved attribution for post-migration samples. Those
+fields are sufficient to calibrate an aggregate replay and to detect a
+simulator that does not resemble the real controller.
 
 It is not a complete request-level trace. In particular, it does not persist
 request duration, priority, queue wait, stable job identity, retry lineage, or
