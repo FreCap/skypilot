@@ -1423,7 +1423,7 @@ async def cluster_event_retention_daemon():
                                                       ClusterEventType.TERMINAL)
         except asyncio.CancelledError:
             logger.info('Cluster event retention daemon cancelled')
-            break
+            raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error running cluster event retention daemon: {e}')
 
