@@ -1048,10 +1048,6 @@ async def _execute_request_coroutine(request: api_requests.Request):
                 result = await fut
                 await api_requests.set_request_succeeded_async(
                     request_id, result)
-            except asyncio.CancelledError:
-                # The task is cancelled by ctx.cancel(), where the status
-                # should already be set to CANCELLED.
-                pass
             except Exception as e:  # pylint: disable=broad-except
                 ctx.redirect_log(original_output)
                 await api_requests.set_request_failed_async(request_id, e)
