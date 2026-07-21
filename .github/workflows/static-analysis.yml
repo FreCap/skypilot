@@ -64,6 +64,8 @@ jobs:
           ruff check sky/server/requests/payloads.py --select S101
           # Stream response identity checks must survive `python -O`.
           ruff check sky/client/sdk.py --select S101
+          # Client download protocol guards must survive `python -O`.
+          ruff check sky/client/common.py --select S101
           # Parallel cluster metadata must not silently truncate nodes.
           ruff check sky/backends/cloud_vm_ray_backend.py --select B905
           # Batch worker validation errors must reach the coordinator result.
