@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access,redefined-outer-name
 
+import asyncio
 import contextlib
 import importlib
 import os
@@ -1640,6 +1641,78 @@ async def test_superseded_coordinator_never_marks_batch_failed(monkeypatch):
 
     batch_coordinator.handle_superseded.assert_awaited_once_with()
     batch_coordinator.mark_failed.assert_not_called()
+
+
+@pytest.mark.parametrize('supersession_source', ['run', 'mark_failed'])
+@pytest.mark.asyncio
+async def test_supersession_cleanup_preserves_owner_signal_under_cancellation(
+        supersession_source, monkeypatch):
+    batch_coordinator = mock.Mock()
+    if supersession_source == 'run':
+        batch_coordinator.run.side_effect = coordinator.SupersededCoordinator(
+            'new owner')
+    else:
+        batch_coordinator.run.side_effect = RuntimeError('batch failed')
+        batch_coordinator.mark_failed.side_effect = (
+            coordinator.SupersededCoordinator('new owner'))
+
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+
+    async def blocked_superseded_cleanup():
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_completed.set()
+
+    batch_coordinator.handle_superseded = mock.AsyncMock(
+        side_effect=blocked_superseded_cleanup)
+    monkeypatch.setattr(jobs_controller.batch_coordinator, 'BatchCoordinator',
+                        mock.Mock(return_value=batch_coordinator))
+    monkeypatch.setattr(
+        jobs_controller.managed_job_state, 'get_latest_task_id_status_async',
+        mock.AsyncMock(return_value=(0, state.ManagedJobStatus.RUNNING)))
+    task = mock.Mock()
+    task.metadata = {
+        'batch_dataset_path': 's3://bucket/input.jsonl',
+        'batch_output_path': 's3://bucket/output.jsonl',
+        'batch_size': 4,
+        'batch_pool_name': 'pool',
+        'batch_serialized_fn': 'serialized',
+        'batch_input_format': {},
+        'batch_output_formats': [],
+    }
+    controller_instance = types.SimpleNamespace(_job_id=1)
+
+    run_task = asyncio.create_task(
+        jobs_controller.JobController._run_batch_coordinator_task(
+            controller_instance,
+            task_id=0,
+            task=task,
+            callback_func=mock.AsyncMock(),
+            is_resume=True))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    run_task.cancel()
+    await asyncio.sleep(0)
+    run_task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert not run_task.done()
+        assert not cleanup_completed.is_set()
+    finally:
+        # Release retained cleanup even after an assertion failure so the test
+        # cannot leak a cancellation-resistant task.
+        allow_cleanup.set()
+        task_result = await asyncio.gather(run_task, return_exceptions=True)
+
+    assert isinstance(task_result[0], coordinator.SupersededCoordinator)
+    assert cleanup_completed.is_set()
+    batch_coordinator.handle_superseded.assert_awaited_once_with()
+    if supersession_source == 'run':
+        batch_coordinator.mark_failed.assert_not_called()
+    else:
+        batch_coordinator.mark_failed.assert_called_once_with('batch failed')
 
 
 @pytest.mark.asyncio

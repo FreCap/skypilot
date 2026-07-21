@@ -770,7 +770,7 @@ class JobController:
         except batch_coordinator.SupersededCoordinator:
             logger.info('Batch coordinator was superseded; leaving job state '
                         'to the replacement coordinator.')
-            await coordinator.handle_superseded()
+            await _finish_superseded_cleanup(coordinator)  # noqa: ASYNC120
             raise
         except asyncio.CancelledError:
             coordinator.cancel()
@@ -780,7 +780,7 @@ class JobController:
             try:
                 await asyncio.to_thread(coordinator.mark_failed, str(e))
             except batch_coordinator.SupersededCoordinator:
-                await coordinator.handle_superseded()
+                await _finish_superseded_cleanup(coordinator)  # noqa: ASYNC120
                 raise
             await callback_func('FAILED')
             return False
@@ -2737,6 +2737,23 @@ class ControllerManager:
                     continue
 
             await self.start_job(job_id, pool)
+
+
+async def _finish_superseded_cleanup(
+        coordinator: batch_coordinator.BatchCoordinator) -> None:
+    """Finish bounded cleanup before preserving the supersession signal."""
+    cleanup_task = asyncio.create_task(coordinator.handle_superseded())
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError:  # noqa: ASYNC103
+            # Cancellation must not let the old controller resume durable
+            # finalization while the replacement controller owns the job.
+            if cleanup_task.done():
+                break  # noqa: ASYNC104
+
+    cleanup_task.result()
 
 
 async def main(controller_uuid: str):
