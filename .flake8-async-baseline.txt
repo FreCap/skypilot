@@ -22,7 +22,7 @@ sky/server/requests/process.py:90:12: ASYNC103 BaseException block with a code p
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/server.py:2092:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/server.py:2119:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/ssh_proxy.py:387:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/server/ssh_proxy.py:425:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/stream_utils.py:330:21: ASYNC119 Yield in contextmanager in async generator might not trigger cleanup. Use `@asynccontextmanager` or refactor.
 sky/server/stream_utils.py:345:17: ASYNC119 Yield in contextmanager in async generator might not trigger cleanup. Use `@asynccontextmanager` or refactor.
 sky/utils/thread_utils.py:59:20: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.

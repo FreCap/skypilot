@@ -83,6 +83,61 @@ async def _get_cluster_and_validate(
     return handle
 
 
+async def _terminate_and_reap_kubectl_process(
+        proc: subprocess.Popen,
+        loop: asyncio.AbstractEventLoop,
+        reason: str,
+        stdout_reader: asyncio.StreamReader | None = None,
+        stdout_pipe_connected: bool = False) -> None:
+    try:
+        logger.info('Terminating kubectl port-forward process')
+        proc.terminate()
+    except ProcessLookupError:
+        stdout = (await stdout_reader.read() if stdout_pipe_connected and
+                  stdout_reader is not None else b'')
+        logger.error('kubectl port-forward was terminated before the '
+                     'ssh websocket connection was closed. Remaining '
+                     f'output: {str(stdout)}')
+        reason = 'KubectlPortForwardExit'
+    metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
+        pid=os.getpid(), reason=reason).inc()
+    # `subprocess.Popen` is outside asyncio's child watcher, so wait() must run
+    # explicitly or the API server can retain a zombie kubectl child.
+    wait_task = asyncio.ensure_future(loop.run_in_executor(None, proc.wait))
+    try:
+        await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+    except asyncio.TimeoutError:
+        logger.warning(
+            'kubectl did not exit 5s after SIGTERM; sending SIGKILL.')
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            # The child exited after the timeout but before SIGKILL.
+            pass
+        await wait_task
+
+
+async def _await_owned_kubectl_spawn(
+    spawn_future: asyncio.Future,
+    loop: asyncio.AbstractEventLoop,
+) -> subprocess.Popen:
+    proc = None
+    try:
+        proc = await asyncio.shield(spawn_future)
+        return proc
+    finally:
+        if proc is None and not spawn_future.cancelled():
+            try:
+                proc = await spawn_future
+            except Exception:  # pylint: disable=broad-except
+                # A failed spawn did not create a child for this handler to
+                # own. Preserve the original spawn exception.
+                pass
+            if proc is not None:
+                await _terminate_and_reap_kubectl_process(
+                    proc, loop, 'KubectlPortForwardExit')
+
+
 @router.websocket('/kubernetes-pod-ssh-proxy')
 async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
                                    cluster_name: str,
@@ -152,7 +207,11 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
         )
 
     loop = asyncio.get_running_loop()
-    proc = await loop.run_in_executor(None, _spawn_sync)
+    spawn_future = loop.run_in_executor(None, _spawn_sync)
+    # Recover ownership if cancellation races with the executor returning an
+    # already-started child. The helper reaps that child before propagating
+    # cancellation; on success, this handler owns the returned process.
+    proc = await _await_owned_kubectl_spawn(spawn_future, loop)
     logger.info(f'Started kubectl port-forward with command: {kubectl_cmd}')
 
     # Wrap the sync Popen's stdout pipe as an asyncio StreamReader so the
@@ -214,33 +273,12 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
     finally:
         if connection_counted and conn_gauge is not None:
             conn_gauge.dec()
-        try:
-            logger.info('Terminating kubectl port-forward process')
-            proc.terminate()
-        except ProcessLookupError:
-            stdout = (await stdout_reader.read()
-                      if stdout_pipe_connected else b'')
-            logger.error('kubectl port-forward was terminated before the '
-                         'ssh websocket connection was closed. Remaining '
-                         f'output: {str(stdout)}')
-            reason = 'KubectlPortForwardExit'
-        metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-            pid=os.getpid(), reason=reason).inc()
-        # Reap the kubectl child. `asyncio.create_subprocess_exec` had this
-        # handled by asyncio's child watcher; `subprocess.Popen` is outside
-        # that watcher so we must wait() ourselves or leave a zombie.
-        wait_task = asyncio.ensure_future(loop.run_in_executor(None, proc.wait))
-        try:
-            await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning(
-                'kubectl did not exit 5s after SIGTERM; sending SIGKILL.')
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                # The child exited after the timeout but before SIGKILL.
-                pass
-            await wait_task
+        await _terminate_and_reap_kubectl_process(
+            proc,
+            loop,
+            reason,
+            stdout_reader=stdout_reader,
+            stdout_pipe_connected=stdout_pipe_connected)
 
 
 @router.websocket('/slurm-job-ssh-proxy')
