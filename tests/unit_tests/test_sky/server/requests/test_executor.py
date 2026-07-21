@@ -709,6 +709,15 @@ def _retryable_error_entrypoint():
                                              retry_wait_seconds=0)
 
 
+def _cancelled_retryable_error_entrypoint():
+    with requests_lib.update_request('test-cancelled-retryable') as request:
+        assert request is not None
+        request.status = requests_lib.RequestStatus.CANCELLED
+    raise exceptions.ExecutionRetryableError('Cancelled before retry handoff',
+                                             hint='This must not retry',
+                                             retry_wait_seconds=0)
+
+
 def _general_error_entrypoint():
     raise ValueError('Simulated error')
 
@@ -738,6 +747,13 @@ def _dummy_entrypoint_for_retry_test():
             'expected_exception': exceptions.ExecutionRetryableError,
         },
         id='retryable_error'),
+    pytest.param(
+        {
+            'request_id': 'test-cancelled-retryable',
+            'entrypoint': _cancelled_retryable_error_entrypoint,
+            'expected_exception': None,
+        },
+        id='cancelled_retryable_error'),
     pytest.param(
         {
             'request_id': 'test-error',
@@ -1069,6 +1085,36 @@ def test_pause_dropped_when_wait_returns_false(pause_harness):
     assert pause_harness.queue_items == []
 
 
+def test_pause_does_not_resurrect_cancelled_request(pause_harness):
+    """A cancellation committed before retry handoff remains terminal."""
+    with requests_lib.update_request(pause_harness.request_id) as request:
+        assert request is not None
+        request.status = requests_lib.RequestStatus.CANCELLED
+    condition = _RecordingCondition(verdict=True)
+
+    pause_harness.run(condition)
+
+    assert not condition.calls
+    assert pause_harness.queue_items == []
+    request = requests_lib.get_request(pause_harness.request_id,
+                                       fields=['status'])
+    assert request is not None
+    assert request.status == requests_lib.RequestStatus.CANCELLED
+
+
+def test_pause_drops_request_removed_before_retry(pause_harness):
+    """Request retention may remove a terminal row before retry handoff."""
+    asyncio.run(
+        requests_lib._delete_requests(  # pylint: disable=protected-access
+            [pause_harness.request_id]))
+    condition = _RecordingCondition(verdict=True)
+
+    pause_harness.run(condition)
+
+    assert not condition.calls
+    assert pause_harness.queue_items == []
+
+
 def test_pause_base_condition_does_fixed_fallback_wait(pause_harness):
     """The base ContinueCondition just waits the fallback, then reschedules."""
     condition = continue_condition_lib.ContinueCondition()
@@ -1100,6 +1146,33 @@ def test_pause_base_condition_dropped_if_cancelled_during_wait(
     pause_harness.run(continue_condition_lib.ContinueCondition())
 
     assert pause_harness.queue_items == []
+
+
+def test_retry_dropped_if_cancelled_during_backoff(pause_harness, monkeypatch):
+    """A fixed-backoff retry cannot resurrect a concurrent cancellation."""
+
+    def cancel_on_sleep(seconds):
+        pause_harness.sleep_calls.append(seconds)
+        with requests_lib.update_request(pause_harness.request_id) as request:
+            assert request is not None
+            request.status = requests_lib.RequestStatus.CANCELLED
+
+    monkeypatch.setattr('time.sleep', cancel_on_sleep)
+    retryable_error = exceptions.ExecutionRetryableError('Transient failure',
+                                                         hint='Retry after 30s',
+                                                         retry_wait_seconds=30)
+    fut = concurrent.futures.Future()
+    fut.set_exception(retryable_error)
+    request_element = (pause_harness.request_id, False, True)
+
+    pause_harness.worker.handle_task_result(fut, request_element)
+
+    assert pause_harness.sleep_calls == [30]
+    assert pause_harness.queue_items == []
+    request = requests_lib.get_request(pause_harness.request_id,
+                                       fields=['status'])
+    assert request is not None
+    assert request.status == requests_lib.RequestStatus.CANCELLED
 
 
 def test_pause_marks_executor_free_before_wait(pause_harness, monkeypatch):
