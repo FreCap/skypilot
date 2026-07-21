@@ -480,11 +480,33 @@ unknown delete outcome and cannot quarantine the location.
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
 and teardown deadline. The canary resource is tagged with operation/profile/
-generation, may exercise only one target/backend, and always auto-terminates.
-After a crash, the next claimant reads the child launch and qualification
-repository before retrying or teardown; it never launches a second live canary
-for the same operation. Other operation kinds project their publication,
-location, or profile work and carry no provider lease.
+generation, may exercise only one target/backend, and always auto-terminates. A
+continuous lease heartbeat starts before credential acquisition. The actual STS,
+EC2, EKS, IAM, and Kubernetes call boundaries synchronously prove ownership both
+before and after each call. A provider create uses a stronger ordered fence: it
+renews exact ownership, rechecks the teardown deadline after that potentially
+blocking renewal, immediately invokes the raw provider create, then rechecks
+ownership. Initial child attachment and successful evidence require the exact
+live lease and a future teardown deadline; terminal failure requires the live
+lease, while an already-expired deadline has a separate timeout/teardown-only
+transition that cannot launch or qualify a child. An initial persisted intent
+does not falsely imply a provider child: if the same owner has not attempted a
+create, a client or discovery failure can terminalize without teardown. After a
+crash, the next claimant reads the persisted child identity before deciding
+between resume and teardown. An unverified or failed teardown after a possible
+create remains RUNNING for successor cleanup and never discards the deterministic
+child identity by terminalizing the operation. EC2 `RunInstances` uses one stable
+operation-derived `ClientToken`, and EKS uses one deterministic namespaced pod
+name, so a lost response or successor replay converges on the same child rather
+than launching a second paid resource. An ambiguous launch response remains
+reclaimable until that idempotent replay identifies the child or bounded
+provider settling proves repeated absence. EC2 cleanup follows the known child
+through `shutting-down` to `terminated`; EKS cleanup accounts for a timed-out
+create that becomes visible after the first delete. A persisted child also
+remains reclaimable if its immutable contract cannot be reloaded, because no
+terminal transition may substitute for provider teardown. Other operation
+kinds project their publication, location, or profile work and carry no
+provider lease.
 
 Canary intent creation locks the desired profile row and reserves its conservative
 worst-case cost in a UTC daily window before committing the operation. Concurrent
@@ -1230,8 +1252,13 @@ its ordinary `delete_authority: disabled` setting to skip qualification cleanup.
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
 before any child launch. It is a conservative operator-set ceiling for one run,
 not an observed bill. `canary_timeout_seconds` bounds launch, pull, observation,
-and teardown. V0 supports only `linux/amd64`; configuration rejects another
-canary platform rather than building or launching an unused architecture.
+and teardown. Once that deadline passes, an exact live owner may only discover
+and tear down the already-persisted deterministic child and record
+`CANARY_TIMEOUT` after verified teardown; an unverified teardown remains
+reclaimable work. It cannot attach a new child, publish success, or perform
+another launch. V0 supports only `linux/amd64`;
+configuration rejects another canary platform rather than building or launching
+an unused architecture.
 
 Each service writes a bounded attestation through its authenticated internal
 endpoint. A canary result includes a single-use nonce and actual-principal
@@ -1970,7 +1997,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
-  automatic refresh, concurrent daily-cost reservation, and stale-binding tests;
+  automatic refresh, concurrent daily-cost reservation, stale-binding tests,
+  expired-owner/successor interleavings at attach/fail/provider boundaries,
+  pre-create client failure, stable EC2 `ClientToken` replay, provider-call
+  pre/post lease fences, and renewal-crosses-deadline rejection for EC2/EKS;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
 - source/destination/compute account separation, cross-identity attestation,
@@ -2374,3 +2404,25 @@ models: capabilities query only the bounded configured ACTIVE set, while the
 operator history endpoint uses an indexed, opaque-cursor keyset page with a
 1-through-100 public limit. The response remains additively compatible through
 the existing version, items, and optional next-cursor envelope.
+
+Valid full-feature round 2 at
+`33697358d134c85bcf08bb438792fb9ebddd0be4` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the acceptance streak. Codex proved that a canary worker
+whose lease had expired but had not yet been replaced could still attach its
+synthetic child, acquire provider sessions, launch an EC2 instance without an
+idempotency token, or irreversibly fail recoverable work. A successor could then
+launch a second paid instance. This revision moves the shared continuous
+heartbeat and synchronous fences across the complete canary provider boundary,
+requires live database ownership for child and terminal transitions, uses a
+stable operation-derived EC2 client token, and makes deadline-expired recovery
+teardown-only as specified above.
+
+The first focused repair gate at
+`58efc07064ec6d89f7a741057b185dd1b404a4d44d1d474e0048066879c2ea9e`
+returned Codex `REJECT_REPAIR` and Fable `ACCEPT_REPAIR`. Codex proved that an
+initial intent followed by client-construction failure was treated as an
+unverified provider child and could remain reclaimable forever. It also proved
+that the generic provider pre-call lease renewal could block across the teardown
+deadline, allowing EC2 or Kubernetes create to begin late. This revision
+separates current-attempt create possibility from the durable intent and adds
+the ordered create fence described above.

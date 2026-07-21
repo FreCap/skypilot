@@ -37,6 +37,32 @@ _SHARD_ID = '00000000-0000-4000-8000-000000000003'
 _REVISION_ID = '00000000-0000-4000-8000-000000000004'
 
 
+def _canary_operation(
+    *,
+    operation_id: str = '00000000-0000-4000-8000-000000000009',
+) -> catalog_state.OperationRecord:
+    return catalog_state.OperationRecord(
+        id=operation_id,
+        authority_id='00000000-0000-4000-8000-000000000010',
+        scope='research',
+        actor_hash='a' * 64,
+        kind='PROFILE_CANARY',
+        idempotency_key='canary-idempotency-key',
+        request_hash='b' * 64,
+        state=models.ImageOperationState.RUNNING,
+        result_kind='profile_revision',
+        result_id=_REVISION_ID,
+        result=None,
+        error_code=None,
+        lease_token='canary-lease-token',
+        lease_expires_at=10**12,
+        child_launch_id=None,
+        teardown_deadline=10**12,
+        created_at=10,
+        updated_at=11,
+        terminal_expires_at=None)
+
+
 def _cluster_demand(
         *,
         created_at: int,
@@ -273,15 +299,138 @@ def test_lifecycle_policy_refresh_keeps_last_valid_cutoffs(
      ('CANARY_TIMEOUT', 'CANARY_TIMEOUT')])
 def test_canary_persists_only_closed_error_codes(
         monkeypatch: pytest.MonkeyPatch, message: str, expected: str) -> None:
-    operation = mock.sentinel.operation
+    operation = _canary_operation()
     monkeypatch.setattr(canary_worker_service, '_load_contract',
                         mock.Mock(side_effect=ValueError(message)))
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
     failed = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
                         failed)
 
     assert not canary_worker_service.run_canary(operation)
-    failed.assert_called_once_with(operation, expected)
+    failed.assert_called_once_with(operation, expected, now=mock.ANY)
+
+
+def test_deadline_expired_canary_without_child_terminalizes_without_provider(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = dataclasses.replace(_canary_operation(), teardown_deadline=1)
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
+    run_ec2 = mock.Mock()
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary', run_ec2)
+    fail_expired = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_expired_canary', fail_expired)
+
+    assert not canary_worker_service.run_canary(operation)
+    run_ec2.assert_not_called()
+    fail_expired.assert_called_once_with(operation,
+                                         'CANARY_TIMEOUT',
+                                         teardown_verified=True,
+                                         now=mock.ANY)
+
+
+def test_unverified_canary_teardown_remains_reclaimable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
+    monkeypatch.setattr(
+        canary_worker_service, '_run_ec2_canary',
+        mock.Mock(side_effect=ValueError('CANARY_TEARDOWN_FAILED')))
+    fail = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
+                        fail)
+    fail_expired = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_expired_canary', fail_expired)
+
+    assert not canary_worker_service.run_canary(operation)
+    fail.assert_not_called()
+    fail_expired.assert_not_called()
+
+
+def test_persisted_canary_child_survives_contract_reload_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = dataclasses.replace(_canary_operation(),
+                                    child_launch_id='ec2:us-west-2:child')
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract',
+        mock.Mock(side_effect=ValueError('QUALIFICATION_FAILED')))
+    fail = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
+                        fail)
+    fail_expired = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_expired_canary', fail_expired)
+
+    assert not canary_worker_service.run_canary(operation)
+    fail.assert_not_called()
+    fail_expired.assert_not_called()
+
+
+@pytest.mark.parametrize('backend', ['aws_vm', 'aws_eks'])
+def test_initial_canary_client_failure_terminalizes_without_provider_child(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        backend: str) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding(backend)
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    runtime_id = (target.region if backend == 'aws_vm' else
+                  binding.qualified_clusters[0].context)
+    payload = {
+        'backend': backend,
+        'nonce': '3' * 32,
+        'runtime_id': runtime_id,
+        'timeout_seconds': 900,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        (payload, _revision(profile), profile, target, binding, _DIGEST,
+         reference))
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    if backend == 'aws_vm':
+        monkeypatch.setattr(
+            canary_worker_service, '_assumed_client',
+            mock.Mock(side_effect=RuntimeError('EC2 client unavailable')))
+    else:
+        monkeypatch.setattr(
+            canary_worker_service, '_kubernetes_core',
+            mock.Mock(
+                side_effect=RuntimeError('Kubernetes client unavailable')))
+    failed = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
+                        failed)
+    fail_expired = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_expired_canary', fail_expired)
+
+    assert not canary_worker_service.run_canary(operation)
+    failed.assert_called_once_with(operation, 'CANARY_FAILED', now=mock.ANY)
+    fail_expired.assert_not_called()
 
 
 def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
@@ -290,6 +439,12 @@ def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
                            spec=SimpleNamespace(
                                provider_id=f'aws:///us-west-2a/{instance_id}',
                                unschedulable=False))
+
+
+def _api_error(status: int) -> RuntimeError:
+    error = RuntimeError(f'Kubernetes API status {status}')
+    error.status = status  # type: ignore[attr-defined]
+    return error
 
 
 def test_eks_qualification_proves_every_selected_node_role(
@@ -322,12 +477,15 @@ def test_eks_qualification_proves_every_selected_node_role(
     iam = mock.Mock()
     monkeypatch.setattr(
         canary_worker_service.aws, 'assumed_client',
-        lambda _role, service, _region: ec2 if service == 'ec2' else iam)
+        lambda _role, service, _region, **_kwargs: ec2
+        if service == 'ec2' else iam)
     monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
                         lambda _iam, _name: qualified.node_role)
+    heartbeat = _OwnedHeartbeat()
+    fenced_core = canary_worker_service._FencedClient(core, heartbeat)
 
     count, node_set_hash = canary_worker_service._qualified_eks_nodes(
-        core, mock.sentinel.role, target, qualified)
+        fenced_core, mock.sentinel.role, target, qualified, heartbeat)
 
     assert count == 2
     assert len(node_set_hash) == 64
@@ -363,7 +521,7 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
     }
     monkeypatch.setattr(
         canary_worker_service.aws, 'assumed_client',
-        lambda _role, service, _region: ec2
+        lambda _role, service, _region, **_kwargs: ec2
         if service == 'ec2' else mock.Mock())
     monkeypatch.setattr(
         canary_worker_service, '_instance_profile_role',
@@ -372,8 +530,11 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
 
     with pytest.raises(ValueError,
                        match='QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED'):
-        canary_worker_service._qualified_eks_nodes(core, mock.sentinel.role,
-                                                   target, qualified)
+        heartbeat = _OwnedHeartbeat()
+        fenced_core = canary_worker_service._FencedClient(core, heartbeat)
+        canary_worker_service._qualified_eks_nodes(fenced_core,
+                                                   mock.sentinel.role, target,
+                                                   qualified, heartbeat)
 
 
 def _artifact() -> catalog_state.ArtifactRecord:
@@ -557,6 +718,270 @@ class _OwnedHeartbeat(contextlib.AbstractContextManager['_OwnedHeartbeat']):
 
     def assert_owned(self) -> None:
         return None
+
+
+def test_canary_provider_call_rechecks_lease_after_response() -> None:
+    provider = mock.Mock()
+    provider.describe_instances.return_value = {'Reservations': []}
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = (
+        None, worker_lease.LeaseLostError('canary lease lost'))
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(worker_lease.LeaseLostError, match='canary lease lost'):
+        client.describe_instances()
+
+    provider.describe_instances.assert_called_once_with()
+    assert heartbeat.assert_owned.call_count == 2
+
+
+def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = worker_lease.LeaseLostError(
+        'canary lease lost')
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(worker_lease.LeaseLostError, match='canary lease lost'):
+        client.describe_instances()
+
+    provider.describe_instances.assert_not_called()
+
+
+@pytest.mark.parametrize('method_name',
+                         ['run_instances', 'create_namespaced_pod'])
+def test_canary_create_rechecks_deadline_after_ownership_renewal(
+        monkeypatch: pytest.MonkeyPatch, method_name: str) -> None:
+    current = [99]
+    monkeypatch.setattr(canary_worker_service.time, 'time', lambda: current[0])
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = lambda: current.__setitem__(0, 100)
+    started = mock.Mock()
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(ValueError, match='CANARY_TIMEOUT'):
+        client.call_before_deadline(method_name, 100, started)
+
+    started.assert_not_called()
+    getattr(provider, method_name).assert_not_called()
+    heartbeat.assert_owned.assert_called_once_with()
+
+
+def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    assert binding.instance_profile is not None
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    instance = {
+        'InstanceId': 'i-canary',
+        'IamInstanceProfile': {
+            'Arn': ('arn:aws:iam::123456789012:instance-profile/' +
+                    binding.instance_profile),
+        },
+        'State': {
+            'Name': 'stopped'
+        },
+    }
+    terminated_instance = {
+        **instance,
+        'State': {
+            'Name': 'terminated'
+        },
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = ({
+        'Reservations': []
+    }, {
+        'Reservations': [{
+            'Instances': [instance]
+        }]
+    }, {
+        'Reservations': [{
+            'Instances': [instance]
+        }]
+    }, {
+        'Reservations': [{
+            'Instances': [instance]
+        }]
+    }, {
+        'Reservations': [{
+            'Instances': [terminated_instance]
+        }]
+    })
+    ec2.run_instances.side_effect = (
+        TimeoutError('ambiguous EC2 launch response'), {
+            'Instances': [{
+                'InstanceId': 'i-canary'
+            }]
+        })
+    marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
+    ec2.get_console_output.return_value = {
+        'Output': base64.b64encode(marker.encode()).decode()
+    }
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0]
+            }]
+        }
+    }
+    provider_fences: list[object] = []
+
+    def assumed_client(_role: object,
+                       service: str,
+                       _region: str,
+                       *,
+                       provider_fence: object = None) -> object:
+        provider_fences.append(provider_fence)
+        return ec2 if service == 'ec2' else iam
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
+                        assumed_client)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    heartbeat = _OwnedHeartbeat()
+
+    evidence = canary_worker_service._run_ec2_canary(
+        operation, payload, _revision(profile), profile, target, binding,
+        _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+
+    assert evidence['child_instance_id'] == 'i-canary'
+    assert ec2.run_instances.call_args.kwargs['ClientToken'] == (
+        canary_worker_service._ec2_client_token(operation.id))
+    assert len(ec2.run_instances.call_args.kwargs['ClientToken']) == 64
+    assert ec2.run_instances.call_count == 2
+    assert ec2.run_instances.call_args_list[0].kwargs == (
+        ec2.run_instances.call_args_list[1].kwargs)
+    assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
+
+
+def test_eks_canary_fences_clients_and_verifies_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    node = _eks_node('node-a', 'i-a')
+    pod = SimpleNamespace(metadata=SimpleNamespace(labels={
+        'skypilot.co/image-canary-operation': operation.id,
+    }),
+                          spec=SimpleNamespace(
+                              containers=[SimpleNamespace(image=reference)],
+                              node_name='node-a'),
+                          status=SimpleNamespace(phase='Succeeded'))
+    core = mock.Mock()
+    core.api_client = SimpleNamespace(configuration=SimpleNamespace(
+        host='https://eks.example'))
+    core.list_node.return_value = SimpleNamespace(
+        items=[node], metadata=SimpleNamespace(_continue=None))
+    core.read_namespaced_pod.side_effect = (pod, _api_error(404))
+    core.read_namespaced_pod_log.return_value = payload['nonce']
+    core.read_node.return_value = node
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://eks.example',
+        }
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-a',
+                'IamInstanceProfile': {
+                    'Arn': ('arn:aws:iam::210987654321:'
+                            'instance-profile/EksNodeProfile'),
+                },
+            }]
+        }]
+    }
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': qualified.node_role,
+            }]
+        }
+    }
+    clients = {'eks': eks, 'ec2': ec2, 'iam': iam}
+    provider_fences: list[object] = []
+
+    def assumed_client(_role: object,
+                       service: str,
+                       _region: str,
+                       *,
+                       provider_fence: object = None) -> object:
+        provider_fences.append(provider_fence)
+        return clients[service]
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
+                        assumed_client)
+    monkeypatch.setattr(canary_worker_service.kubernetes, 'core_api',
+                        lambda _context: core)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    heartbeat = _OwnedHeartbeat()
+
+    evidence = canary_worker_service._run_eks_canary(operation, payload,
+                                                     _revision(profile),
+                                                     profile, target, binding,
+                                                     _DIGEST, reference,
+                                                     heartbeat)
+
+    assert evidence['node_uid'] == 'node-a'
+    assert evidence['teardown_verified'] is True
+    assert provider_fences == [
+        heartbeat.assert_owned, heartbeat.assert_owned, heartbeat.assert_owned
+    ]
+    core.delete_namespaced_pod.assert_called_once()
+
+
+def test_eks_teardown_catches_late_ambiguous_create(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(
+        canary_worker_service.time, 'sleep',
+        lambda seconds: current.__setitem__(0, current[0] + seconds))
+    monkeypatch.setattr(canary_worker_service, '_EKS_TEARDOWN_POLL_SECONDS', 1)
+    monkeypatch.setattr(canary_worker_service, '_EKS_ABSENCE_SETTLE_SECONDS', 2)
+    core = mock.Mock()
+    core.delete_namespaced_pod.side_effect = (_api_error(404), None)
+    core.read_namespaced_pod.side_effect = (_api_error(404),
+                                            mock.sentinel.late_pod,
+                                            _api_error(404), _api_error(404),
+                                            _api_error(404))
+
+    assert canary_worker_service._delete_eks_pod(core,
+                                                 'canary-pod',
+                                                 'canary-namespace',
+                                                 settle_absence=True)
+    assert core.delete_namespaced_pod.call_count == 2
 
 
 def test_shared_lease_heartbeat_fails_closed_on_synchronous_renewal() -> None:

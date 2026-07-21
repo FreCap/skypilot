@@ -32,6 +32,7 @@ from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
 from sky.container_images import preparation
 from sky.container_images import publication
+from sky.container_images import qualification
 from sky.container_images import runtime
 from sky.container_images import schema
 from sky.container_images import topology_state
@@ -295,6 +296,124 @@ def _stage_candidate_profile(
         max_daily_canary_microusd=(
             profile.qualification.max_daily_canary_microusd),
         now=now)
+
+
+def _request_ec2_canary(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: models.ManagedRegistryProfile,
+    *,
+    idempotency_key: str,
+) -> catalog_state.OperationRecord:
+    _configure_profile(monkeypatch, profile)
+    target = profile.targets[0]
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    runtime_id = qualification.runtime_ids(target, 'aws_vm',
+                                           profile.bindings[binding_id])[0]
+    operation, _ = qualification.request_canary(workspace='research',
+                                                profile_name=profile.name,
+                                                target_id=target.name,
+                                                backend='aws_vm',
+                                                runtime_id=runtime_id,
+                                                actor_hash='1' * 64,
+                                                idempotency_key=idempotency_key)
+    return operation
+
+
+def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-expired-owner-key')
+    first = qualification.claim_canary(worker_id='worker-a',
+                                       lease_seconds=10,
+                                       now=100)
+    assert first is not None and first.lease_token is not None
+    child_id = f'ec2:{profile.targets[0].region}:{first.id}'
+    assert qualification.attach_canary_child(first.id,
+                                             first.lease_token,
+                                             child_id,
+                                             now=109)
+    assert not qualification.attach_canary_child(
+        first.id, first.lease_token, child_id, now=110)
+    assert not qualification.complete_canary(first, {'teardown_verified': True},
+                                             now=110)
+    assert not qualification.fail_canary(first, 'CANARY_FAILED', now=110)
+
+    successor = qualification.claim_canary(worker_id='worker-b',
+                                           lease_seconds=10,
+                                           now=110)
+    assert successor is not None and successor.lease_token is not None
+    assert successor.lease_token != first.lease_token
+    assert qualification.attach_canary_child(successor.id,
+                                             successor.lease_token,
+                                             child_id,
+                                             now=111)
+    assert not qualification.fail_canary(first, 'CANARY_FAILED', now=111)
+    with pytest.raises(ValueError, match='must remain reclaimable'):
+        qualification.fail_canary(successor, 'CANARY_TEARDOWN_FAILED', now=111)
+    assert qualification.fail_canary(successor, 'CANARY_FAILED', now=111)
+
+
+def test_deadline_expired_canary_is_teardown_only(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-expired-deadline-key')
+    claimed = qualification.claim_canary(worker_id='worker-a',
+                                         lease_seconds=2000,
+                                         now=200)
+    assert claimed is not None and claimed.lease_token is not None
+    assert claimed.teardown_deadline is not None
+    child_id = f'ec2:{profile.targets[0].region}:{claimed.id}'
+
+    assert not qualification.attach_canary_child(claimed.id,
+                                                 claimed.lease_token,
+                                                 child_id,
+                                                 now=claimed.teardown_deadline)
+    assert not qualification.complete_canary(
+        claimed, {'teardown_verified': True}, now=claimed.teardown_deadline)
+    assert not qualification.fail_canary(
+        claimed, 'CANARY_FAILED', now=claimed.teardown_deadline)
+    with pytest.raises(ValueError, match='must be verified'):
+        qualification.fail_expired_canary(claimed,
+                                          'CANARY_TIMEOUT',
+                                          teardown_verified=False,
+                                          now=claimed.teardown_deadline)
+    assert qualification.fail_expired_canary(claimed,
+                                             'CANARY_TIMEOUT',
+                                             teardown_verified=True,
+                                             now=claimed.teardown_deadline)
+
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-expired-child-key')
+    original = qualification.claim_canary(worker_id='worker-a',
+                                          lease_seconds=10,
+                                          now=300)
+    assert original is not None and original.lease_token is not None
+    assert original.teardown_deadline is not None
+    persisted_child = f'ec2:{profile.targets[0].region}:{original.id}'
+    assert qualification.attach_canary_child(original.id,
+                                             original.lease_token,
+                                             persisted_child,
+                                             now=301)
+    cleanup_owner = qualification.claim_canary(worker_id='worker-b',
+                                               lease_seconds=2000,
+                                               now=original.teardown_deadline)
+    assert cleanup_owner is not None and cleanup_owner.lease_token is not None
+    assert qualification.attach_canary_child(cleanup_owner.id,
+                                             cleanup_owner.lease_token,
+                                             persisted_child,
+                                             now=original.teardown_deadline)
+    assert qualification.fail_expired_canary(cleanup_owner,
+                                             'CANARY_TIMEOUT',
+                                             teardown_verified=True,
+                                             now=original.teardown_deadline)
 
 
 def test_candidate_attestation_requires_unchanged_operational_inventory(
