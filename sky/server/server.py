@@ -491,7 +491,10 @@ async def poll_auth_token(
         raise fastapi.HTTPException(status_code=400,
                                     detail='code_verifier is required')
 
-    auth_token = auth_sessions.auth_session_store.poll_session(code_verifier)
+    # The auth session store performs a synchronous DB transaction. Keep CLI
+    # polling from blocking unrelated API requests on this worker's event loop.
+    auth_token = await asyncio.to_thread(
+        auth_sessions.auth_session_store.poll_session, code_verifier)
 
     if auth_token is None:
         raise fastapi.HTTPException(status_code=404, detail='Session not found')
@@ -532,7 +535,10 @@ async def authorize_auth_session(
     auth_token = _generate_auth_token(request)
 
     # Create the session with the token
-    auth_sessions.auth_session_store.create_session(code_challenge, auth_token)
+    # Session creation is a synchronous DB transaction and can wait on another
+    # worker, so run it outside the request event loop.
+    await asyncio.to_thread(auth_sessions.auth_session_store.create_session,
+                            code_challenge, auth_token)
 
     return fastapi.responses.JSONResponse(content={'status': 'authorized'},
                                           headers={'Cache-Control': 'no-store'})
