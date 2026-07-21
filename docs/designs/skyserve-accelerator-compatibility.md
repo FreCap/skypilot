@@ -225,8 +225,9 @@ service:
   persisted replacement pair that no longer matches the active catalog is
   unwound by retaining the incumbent and gracefully retiring the replacement.
 - For this first version, require one GPU-count shape per exact accelerator ID in a multi-card service. Reject ambiguous configurations such as both `A100:1` and `A100:8` under one `A100` floor until the public identity is extended to an exact card-plus-count shape.
-- Exact-card compatibility and per-card floors support either dict
-  `target_qps_per_replica` or `target_concurrency_per_replica`, and require
+- Exact-card compatibility and per-card floors support either dictionary
+  `target_qps_per_replica` or scalar per-GPU
+  `target_concurrency_per_replica`, and require
   `instance_aware_least_load`. Other autoscalers retain their legacy aggregate
   behavior and do not advertise the compatibility capability, preventing
   constrained demand from triggering generic scale-ups onto the wrong card.
