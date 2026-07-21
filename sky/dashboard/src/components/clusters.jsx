@@ -188,22 +188,34 @@ export function useClustersPageData({
   }, [runPreload]);
 
   const handleRefresh = useCallback(() => {
-    if (refreshInFlightRef.current !== null) {
-      return refreshInFlightRef.current;
+    const refreshScope = showHistory ? `history:${historyDays}` : 'active';
+    const refreshOwner = refreshInFlightRef.current;
+    if (refreshOwner !== null) {
+      if (refreshOwner.scope !== refreshScope) {
+        if (showHistory) {
+          dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
+        }
+        refreshOwner.scope = refreshScope;
+      }
+      return refreshOwner.promise;
     }
     if (showHistory) {
       dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
     }
-    const refreshPromise = runPreload({
+    const nextRefreshOwner = {
+      promise: null,
+      scope: refreshScope,
+    };
+    nextRefreshOwner.promise = runPreload({
       force: true,
       refreshTable: true,
     }).finally(() => {
-      if (refreshInFlightRef.current === refreshPromise) {
+      if (refreshInFlightRef.current === nextRefreshOwner) {
         refreshInFlightRef.current = null;
       }
     });
-    refreshInFlightRef.current = refreshPromise;
-    return refreshPromise;
+    refreshInFlightRef.current = nextRefreshOwner;
+    return nextRefreshOwner.promise;
   }, [historyDays, runPreload, showHistory]);
 
   return { preloadingComplete, lastFetchedTime, handleRefresh };
