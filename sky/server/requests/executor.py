@@ -1070,7 +1070,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         # Current coroutine is cancelled due to client disconnect, set the
         # request status for consistency.
         await api_requests.set_request_cancelled_async(request.request_id)
-        pass
+        raise
     # pylint: disable=broad-except
     except (Exception, KeyboardInterrupt, SystemExit) as e:
         # Handle any other error
