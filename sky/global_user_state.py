@@ -88,6 +88,14 @@ user_table = sqlalchemy.Table(
                       server_default=None),
 )
 
+auth_session_table = sqlalchemy.Table(
+    'auth_sessions',
+    Base.metadata,
+    sqlalchemy.Column('code_challenge', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('token', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Float, nullable=False),
+)
+
 cluster_table = sqlalchemy.Table(
     'clusters',
     Base.metadata,
