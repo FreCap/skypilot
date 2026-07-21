@@ -1280,8 +1280,8 @@ def start(
         threads.
     """
     global _queue_factory
-    factory = queue_base.get_queue_backend_factory()
-    # Use specified factory if any, and fallback to default impl
+    factory = queue_base.get_registered_queue_backend_factory()
+    # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
         _queue_factory = factory
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
