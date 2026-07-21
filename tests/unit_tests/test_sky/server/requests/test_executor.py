@@ -31,6 +31,101 @@ from sky.skylet import constants
 from sky.utils import context_utils
 
 
+def _make_server_config(
+        queue_backend: server_config.QueueBackend
+) -> server_config.ServerConfig:
+    worker_config = server_config.WorkerConfig(garanteed_parallelism=1,
+                                               burstable_parallelism=0,
+                                               num_db_connections_per_worker=0)
+    return server_config.ServerConfig(num_server_workers=1,
+                                      long_worker_config=worker_config,
+                                      short_worker_config=worker_config,
+                                      num_db_connections_per_worker=0,
+                                      queue_backend=queue_backend)
+
+
+def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+
+    assert executor.queue_base.get_registered_queue_backend_factory() is None
+    assert isinstance(executor.queue_base.get_queue_backend_factory(),
+                      executor.queue_base.MultiprocessingQueueFactory)
+
+    registered_factory = mock.MagicMock()
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory',
+                        registered_factory)
+
+    assert (executor.queue_base.get_registered_queue_backend_factory()
+            is registered_factory)
+    assert executor.queue_base.get_queue_backend_factory() is registered_factory
+
+
+@pytest.mark.parametrize(
+    ('queue_backend', 'expected_factory_name', 'unexpected_factory_name'), [
+        (server_config.QueueBackend.LOCAL, 'LocalQueueFactory',
+         'MultiprocessingQueueFactory'),
+        (server_config.QueueBackend.MULTIPROCESSING,
+         'MultiprocessingQueueFactory', 'LocalQueueFactory'),
+    ])
+def test_start_honors_configured_queue_backend(monkeypatch, queue_backend,
+                                               expected_factory_name,
+                                               unexpected_factory_name):
+    factory = mock.MagicMock()
+    factory.start.return_value = None
+    expected_factory = mock.MagicMock(return_value=factory)
+    unexpected_factory = mock.MagicMock()
+    worker = mock.MagicMock()
+    worker_constructor = mock.MagicMock(return_value=worker)
+
+    monkeypatch.setattr(executor.queue_base,
+                        'get_registered_queue_backend_factory', lambda: None)
+    monkeypatch.setattr(executor.queue_base, expected_factory_name,
+                        expected_factory)
+    monkeypatch.setattr(executor.queue_base, unexpected_factory_name,
+                        unexpected_factory)
+    monkeypatch.setattr(executor, 'RequestWorker', worker_constructor)
+    monkeypatch.setattr(executor, '_queue_factory', None)
+
+    queue_server, workers = executor.start(_make_server_config(queue_backend))
+
+    assert queue_server is None
+    assert getattr(executor, '_queue_factory') is factory
+    assert workers == [worker, worker]
+    expected_factory.assert_called_once_with()
+    unexpected_factory.assert_not_called()
+    factory.start.assert_called_once_with()
+    assert worker_constructor.call_count == 2
+    assert worker.run_in_background.call_count == 2
+
+
+def test_start_prefers_registered_queue_backend(monkeypatch):
+    queue_server = mock.sentinel.queue_server
+    registered_factory = mock.MagicMock()
+    registered_factory.start.return_value = queue_server
+    local_factory = mock.MagicMock()
+    multiprocessing_factory = mock.MagicMock()
+    worker = mock.MagicMock()
+
+    monkeypatch.setattr(executor.queue_base,
+                        'get_registered_queue_backend_factory',
+                        lambda: registered_factory)
+    monkeypatch.setattr(executor.queue_base, 'LocalQueueFactory', local_factory)
+    monkeypatch.setattr(executor.queue_base, 'MultiprocessingQueueFactory',
+                        multiprocessing_factory)
+    monkeypatch.setattr(executor, 'RequestWorker',
+                        mock.MagicMock(return_value=worker))
+    monkeypatch.setattr(executor, '_queue_factory', None)
+
+    result, _ = executor.start(
+        _make_server_config(server_config.QueueBackend.LOCAL))
+
+    assert result is queue_server
+    assert getattr(executor, '_queue_factory') is registered_factory
+    local_factory.assert_not_called()
+    multiprocessing_factory.assert_not_called()
+    registered_factory.start.assert_called_once_with()
+
+
 def test_worker_preserves_executor_construction_error(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.LONG,

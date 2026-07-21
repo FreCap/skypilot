@@ -149,10 +149,16 @@ class MultiprocessingQueueFactory(QueueBackendFactory):
 _queue_backend_factory: QueueBackendFactory | None = None
 
 
+def get_registered_queue_backend_factory() -> QueueBackendFactory | None:
+    """Get the explicitly registered queue backend factory, if any."""
+    return _queue_backend_factory
+
+
 def get_queue_backend_factory() -> QueueBackendFactory:
-    """Get the registered queue backend factory."""
-    if _queue_backend_factory is not None:
-        return _queue_backend_factory
+    """Get the registered factory, or the default multiprocessing factory."""
+    registered_factory = get_registered_queue_backend_factory()
+    if registered_factory is not None:
+        return registered_factory
     return MultiprocessingQueueFactory()
 
 
