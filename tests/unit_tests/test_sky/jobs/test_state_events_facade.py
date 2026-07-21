@@ -1,7 +1,9 @@
 """Characterization tests for the managed-jobs event state facade."""
+# pylint: disable=protected-access
 
 import ast
 import asyncio
+import datetime
 import inspect
 
 import pytest
@@ -49,6 +51,23 @@ def test_event_facade_uses_direct_repository_aliases():
     assert state_events.job_events_table is state_schema.job_events_table
     assert getattr(state_events, '_db_manager') is state_storage.db_manager
     assert state_events.logger.name == 'sky.jobs.state'
+
+
+def test_job_event_timestamp_normalization_is_utc_aware():
+    naive = datetime.datetime(2026, 7, 21, 12, 0)
+    assert state_events._normalize_timestamp(naive) == datetime.datetime(
+        2026, 7, 21, 12, 0, tzinfo=datetime.timezone.utc)
+
+    offset = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    aware = datetime.datetime(2026, 7, 21, 12, 0, tzinfo=offset)
+    assert state_events._normalize_timestamp(aware) == datetime.datetime(
+        2026, 7, 21, 6, 30, tzinfo=datetime.timezone.utc)
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    generated = state_events._normalize_timestamp()
+    after = datetime.datetime.now(datetime.timezone.utc)
+    assert generated.tzinfo is datetime.timezone.utc
+    assert before <= generated <= after
 
 
 def test_lifecycle_transition_resolves_event_writer_from_facade():

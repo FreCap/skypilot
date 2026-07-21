@@ -1,11 +1,16 @@
-"""Real-PostgreSQL ordering proof for the Batch coordinator owner fence."""
+"""Real-PostgreSQL proofs for managed jobs and Batch state."""
 # pylint: disable=protected-access,redefined-outer-name
+import asyncio
+import datetime
+import os
 import shutil
 import threading
+import time
 from unittest import mock
 
 import pytest
 import sqlalchemy
+from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky.jobs import batch_state as batch_state_lib
 from sky.jobs import state
@@ -32,6 +37,93 @@ def postgres_engine():
     finally:
         engine.dispose()
         container.stop()
+
+
+def test_postgres_job_event_writers_preserve_utc_instants(
+        postgres_engine, monkeypatch):
+    """A non-UTC process must not shift timestamptz event writes."""
+
+    def _set_session_utc(dbapi_connection, *_args):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET TIME ZONE 'UTC'")
+        finally:
+            cursor.close()
+
+    sqlalchemy.event.listen(postgres_engine, 'checkout', _set_session_utc)
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    async_url = postgres_engine.url.render_as_string(
+        hide_password=False).replace('postgresql+psycopg2',
+                                     'postgresql+asyncpg')
+    async_engine = sqlalchemy_async.create_async_engine(
+        async_url, connect_args={'server_settings': {
+            'timezone': 'UTC'
+        }})
+    monkeypatch.setattr(state._db_manager, '_engine_async', async_engine)
+
+    original_tz = os.environ.get('TZ')
+    os.environ['TZ'] = 'Asia/Kolkata'
+    time.tzset()
+    try:
+        before = datetime.datetime.now(datetime.timezone.utc)
+        state.add_job_event(90_001, 0, state.ManagedJobStatus.PENDING,
+                            'sync event')
+        state.add_job_event(90_004,
+                            0,
+                            state.ManagedJobStatus.PENDING,
+                            'recent explicit event',
+                            timestamp=before)
+        state.add_job_event(90_005,
+                            0,
+                            state.ManagedJobStatus.PENDING,
+                            'stale explicit event',
+                            timestamp=before - datetime.timedelta(hours=2))
+
+        async def _write_async_event_and_apply_retention():
+            try:
+                await state.add_job_event_async(90_002, 0,
+                                                state.ManagedJobStatus.STARTING,
+                                                'async event')
+                await state.cleanup_job_events_with_retention_async(1)
+            finally:
+                await async_engine.dispose()
+
+        asyncio.run(_write_async_event_and_apply_retention())
+
+        with postgres_engine.begin() as connection:
+            connection.execute(state.job_info_table.insert().values(
+                spot_job_id=90_003, is_batch=True))
+            connection.execute(state.spot_table.insert().values(
+                spot_job_id=90_003,
+                task_id=0,
+                status=state.ManagedJobStatus.RUNNING.value,
+                end_at=None))
+        assert state.acquire_batch_coordinator(90_003, 'owner') is None
+        assert state.set_batch_succeeded(
+            90_003, 0, 'owner',
+            end_time=123) is (state.BatchLifecycleTransition.APPLIED)
+        after = datetime.datetime.now(datetime.timezone.utc)
+
+        with postgres_engine.connect() as connection:
+            rows = connection.execute(
+                sqlalchemy.select(state.job_events_table.c.spot_job_id,
+                                  state.job_events_table.c.timestamp).where(
+                                      state.job_events_table.c.spot_job_id.in_([
+                                          90_001, 90_002, 90_003, 90_004, 90_005
+                                      ]))).all()
+
+        assert {row.spot_job_id for row in rows
+               } == {90_001, 90_002, 90_003, 90_004}
+        for row in rows:
+            assert row.timestamp.tzinfo is not None
+            assert before <= row.timestamp <= after
+    finally:
+        sqlalchemy.event.remove(postgres_engine, 'checkout', _set_session_utc)
+        if original_tz is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = original_tz
+        time.tzset()
 
 
 def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
