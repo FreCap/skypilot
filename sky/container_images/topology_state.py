@@ -99,6 +99,7 @@ class ShardRecord:
     inventory_cursor: str | None
     inventory_started_at: int | None
     inventory_completed_at: int | None
+    inventory_finalizing: bool
     inventory_lease_token: str | None
     inventory_lease_expires_at: int | None
     created_at: int
@@ -228,11 +229,27 @@ def _shard(row: sqlalchemy.engine.RowMapping) -> ShardRecord:
         inventory_cursor=row['inventory_cursor'],
         inventory_started_at=row['inventory_started_at'],
         inventory_completed_at=row['inventory_completed_at'],
+        inventory_finalizing=bool(row['inventory_finalizing']),
         inventory_lease_token=row['inventory_lease_token'],
         inventory_lease_expires_at=row['inventory_lease_expires_at'],
         created_at=int(row['created_at']),
         updated_at=int(row['updated_at']),
     )
+
+
+def _inventory_active(row: sqlalchemy.engine.RowMapping) -> bool:
+    """Returns whether one shard is listing or finalizing an inventory epoch."""
+    return (row['inventory_started_at'] is not None and
+            (row['inventory_completed_at'] is None or
+             bool(row['inventory_finalizing'])))
+
+
+def _inventory_active_condition(table: sqlalchemy.Table) -> Any:
+    """Builds the SQL equivalent of `_inventory_active`."""
+    return sqlalchemy.and_(
+        table.c.inventory_started_at.is_not(None),
+        sqlalchemy.or_(table.c.inventory_completed_at.is_(None),
+                       table.c.inventory_finalizing.is_(True)))
 
 
 def _location(row: sqlalchemy.engine.RowMapping) -> LocationRecord:
@@ -556,6 +573,7 @@ def record_candidate_shard_attestation(
                 int(shard['inventory_epoch']) != expected_inventory_epoch or
                 shard['inventory_completed_at']
                 != expected_inventory_completed_at or
+                bool(shard['inventory_finalizing']) or
                 shard['inventory_lease_token'] is not None):
             return None
         operational_state = session.execute(
@@ -674,7 +692,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
                           int(row['max_in_flight']) != max_in_flight)
     if not capacities_changed:
         return _shard(row)
-    if row['inventory_lease_token'] is not None:
+    if row['inventory_lease_token'] is not None or _inventory_active(row):
         raise ValueError(
             'Bootstrap shard inventory must finish before limits change.')
     values: dict[str, Any] = {
@@ -685,6 +703,7 @@ def upsert_qualified_shard(session: orm.Session, *, workspace: str,
         'inventory_cursor': None,
         'inventory_started_at': None,
         'inventory_completed_at': None,
+        'inventory_finalizing': False,
         'observed_manifests': 0,
     }
     if str(row['state']) in (models.ImageShardState.READY.value,
@@ -770,9 +789,11 @@ def claim_inventory_shard(*,
         raise ValueError('Inventory lease and interval must be positive.')
     current = int(time.time()) if now is None else now
     table = schema.registry_shards
-    available = sqlalchemy.or_(table.c.inventory_lease_token.is_(None),
-                               table.c.inventory_lease_expires_at <= current)
+    expired = sqlalchemy.and_(table.c.inventory_lease_token.is_not(None),
+                              table.c.inventory_lease_expires_at <= current)
+    available = sqlalchemy.or_(table.c.inventory_lease_token.is_(None), expired)
     due = sqlalchemy.or_(
+        expired, table.c.inventory_finalizing.is_(True),
         table.c.inventory_completed_at.is_(None), table.c.inventory_completed_at
         <= current - interval_seconds)
     token = f'{worker_id}:{uuid.uuid4()}'
@@ -785,13 +806,15 @@ def claim_inventory_shard(*,
                     models.ImageShardState.FULL.value,
                     models.ImageShardState.DRIFTED.value,
                 ]), available,
-                due).order_by(table.c.inventory_completed_at.asc().nullsfirst(),
+                due).order_by(table.c.inventory_finalizing.desc(),
+                              table.c.inventory_completed_at.asc().nullsfirst(),
                               table.c.id).limit(1).with_for_update(
                                   skip_locked=True)).mappings().first()
         if row is None:
             return None
         in_progress = (row['inventory_started_at'] is not None and
-                       row['inventory_completed_at'] is None)
+                       (row['inventory_completed_at'] is None or
+                        bool(row['inventory_finalizing'])))
         values: dict[str, Any] = {
             'inventory_lease_token': token,
             'inventory_lease_expires_at': current + lease_seconds,
@@ -802,11 +825,32 @@ def claim_inventory_shard(*,
                           inventory_cursor=None,
                           inventory_started_at=current,
                           inventory_completed_at=None,
+                          inventory_finalizing=False,
                           observed_manifests=0)
         updated = session.execute(
             table.update().where(table.c.id == row['id']).values(
                 **values).returning(table)).mappings().one()
         return _shard(updated)
+
+
+def heartbeat_inventory_shard(shard_id: str,
+                              lease_token: str,
+                              lease_seconds: int,
+                              *,
+                              now: int | None = None) -> bool:
+    """Renews one exact inventory authority, including its final readback."""
+    current = int(time.time()) if now is None else now
+    if lease_seconds <= 0:
+        return False
+    table = schema.registry_shards
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(table.update().where(
+            table.c.id == shard_id,
+            table.c.inventory_lease_token == lease_token,
+            table.c.inventory_lease_expires_at > current).values(
+                inventory_lease_expires_at=current + lease_seconds,
+                updated_at=current)).rowcount
+    return changed == 1
 
 
 def record_inventory_page(shard_id: str,
@@ -836,7 +880,8 @@ def record_inventory_page(shard_id: str,
                 shard['inventory_lease_expires_at'] is None or
                 int(shard['inventory_lease_expires_at']) <= current or
                 shard['inventory_started_at'] is None or
-                shard['inventory_completed_at'] is not None):
+                shard['inventory_completed_at'] is not None or
+                bool(shard['inventory_finalizing'])):
             return None
         epoch = int(shard['inventory_epoch'])
         known = 0
@@ -861,22 +906,9 @@ def record_inventory_page(shard_id: str,
         values: dict[str, Any] = {
             'observed_manifests': observed,
             'inventory_cursor': next_cursor,
-            'inventory_lease_token': None,
-            'inventory_lease_expires_at': None,
             'updated_at': current,
         }
         if next_cursor is None:
-            missing = session.execute(
-                sqlalchemy.select(locations.c.id).where(
-                    locations.c.shard_id == shard_id,
-                    locations.c.state == models.ImageLocationState.READY.value,
-                    locations.c.last_verified_at.is_not(None),
-                    locations.c.last_verified_at
-                    < int(shard['inventory_started_at']),
-                    sqlalchemy.or_(locations.c.inventory_epoch_seen.is_(None),
-                                   locations.c.inventory_epoch_seen
-                                   < epoch)).limit(1)).first()
-            drifted = drifted or missing is not None
             if drifted:
                 state = models.ImageShardState.DRIFTED.value
             elif (int(shard['reserved_manifests']) >= int(
@@ -886,16 +918,40 @@ def record_inventory_page(shard_id: str,
                 state = models.ImageShardState.FULL.value
             else:
                 state = models.ImageShardState.READY.value
-            values.update(inventory_completed_at=current,
-                          state=state,
-                          qualified_at=(current if state
-                                        in (models.ImageShardState.READY.value,
-                                            models.ImageShardState.FULL.value)
-                                        else shard['qualified_at']))
+            values.update(
+                inventory_completed_at=current,
+                inventory_finalizing=(state
+                                      in (models.ImageShardState.READY.value,
+                                          models.ImageShardState.FULL.value)),
+                state=state,
+                qualified_at=(current
+                              if state in (models.ImageShardState.READY.value,
+                                           models.ImageShardState.FULL.value)
+                              else shard['qualified_at']))
         updated = session.execute(
             shards.update().where(shards.c.id == shard_id).values(
                 **values).returning(shards)).mappings().one()
         return _shard(updated)
+
+
+def release_inventory_claim(shard_id: str,
+                            lease_token: str,
+                            expected_inventory_epoch: int,
+                            *,
+                            now: int | None = None) -> bool:
+    """Releases one successfully persisted continuation or drift result."""
+    current = int(time.time()) if now is None else now
+    table = schema.registry_shards
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(table.update().where(
+            table.c.id == shard_id,
+            table.c.inventory_epoch == expected_inventory_epoch,
+            table.c.inventory_lease_token == lease_token,
+            table.c.inventory_lease_expires_at
+            > current).values(inventory_lease_token=None,
+                              inventory_lease_expires_at=None,
+                              updated_at=current)).rowcount
+    return changed == 1
 
 
 def abandon_inventory_claim(shard_id: str,
@@ -914,6 +970,7 @@ def abandon_inventory_claim(shard_id: str,
         values.update(inventory_cursor=None,
                       inventory_started_at=None,
                       inventory_completed_at=None,
+                      inventory_finalizing=False,
                       observed_manifests=0)
     with orm.Session(catalog_state.engine()) as session, session.begin():
         changed = session.execute(schema.registry_shards.update().where(
@@ -932,16 +989,34 @@ def mark_shard_drifted(shard_id: str,
     with orm.Session(catalog_state.engine()) as session, session.begin():
         changed = session.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == shard_id,
-            schema.registry_shards.c.inventory_lease_token ==
-            lease_token).values(state=models.ImageShardState.DRIFTED.value,
-                                inventory_lease_token=None,
-                                inventory_lease_expires_at=None,
-                                inventory_cursor=None,
-                                inventory_started_at=None,
-                                inventory_completed_at=None,
-                                observed_manifests=0,
-                                updated_at=current)).rowcount
+            schema.registry_shards.c.inventory_lease_token == lease_token,
+            schema.registry_shards.c.inventory_lease_expires_at
+            > current).values(state=models.ImageShardState.DRIFTED.value,
+                              inventory_lease_token=None,
+                              inventory_lease_expires_at=None,
+                              inventory_cursor=None,
+                              inventory_started_at=None,
+                              inventory_completed_at=None,
+                              inventory_finalizing=False,
+                              observed_manifests=0,
+                              updated_at=current)).rowcount
     return changed == 1
+
+
+def _inventory_missing_candidate_conditions(
+    shard_id: Any,
+    inventory_epoch: Any,
+    inventory_started_at: Any,
+) -> tuple[Any, ...]:
+    locations = schema.locations
+    return (
+        locations.c.shard_id == shard_id,
+        locations.c.state == models.ImageLocationState.READY.value,
+        locations.c.last_verified_at.is_not(None),
+        locations.c.last_verified_at < inventory_started_at,
+        sqlalchemy.or_(locations.c.inventory_epoch_seen.is_(None),
+                       locations.c.inventory_epoch_seen < inventory_epoch),
+    )
 
 
 def list_inventory_missing_candidates(shard_id: str,
@@ -960,14 +1035,10 @@ def list_inventory_missing_candidates(shard_id: str,
                     shards.c.id == shard_id,
                     shards.c.inventory_epoch == inventory_epoch,
                     shards.c.inventory_completed_at.is_not(None),
-                    locations.c.state == models.ImageLocationState.READY.value,
-                    locations.c.last_verified_at.is_not(None),
-                    locations.c.last_verified_at
-                    < shards.c.inventory_started_at,
-                    sqlalchemy.or_(
-                        locations.c.inventory_epoch_seen.is_(None),
-                        locations.c.inventory_epoch_seen
-                        < inventory_epoch)).order_by(
+                    shards.c.inventory_finalizing.is_(True),
+                    *_inventory_missing_candidate_conditions(
+                        shards.c.id, shards.c.inventory_epoch,
+                        shards.c.inventory_started_at)).order_by(
                             locations.c.last_verified_at,
                             locations.c.id).limit(limit)).mappings().all()
     return [_location(row) for row in rows]
@@ -977,10 +1048,11 @@ def complete_inventory_confirmation(
         location_id: str,
         shard_id: str,
         inventory_epoch: int,
+        inventory_lease_token: str,
         *,
         present: bool,
         now: int | None = None) -> LocationRecord | None:
-    """Records an exact digest read after rechecking the completed epoch."""
+    """Records an exact digest read under the completed epoch's live lease."""
     current = int(time.time()) if now is None else now
     shards = schema.registry_shards
     locations = schema.locations
@@ -989,7 +1061,12 @@ def complete_inventory_confirmation(
             sqlalchemy.select(shards).where(
                 shards.c.id == shard_id).with_for_update()).mappings().first()
         if (shard is None or int(shard['inventory_epoch']) != inventory_epoch or
-                shard['inventory_completed_at'] is None):
+                shard['inventory_completed_at'] is None or
+                not bool(shard['inventory_finalizing']) or
+                shard['inventory_started_at'] is None or
+                shard['inventory_lease_token'] != inventory_lease_token or
+                shard['inventory_lease_expires_at'] is None or
+                int(shard['inventory_lease_expires_at']) <= current):
             return None
         row = session.execute(
             sqlalchemy.select(locations).where(
@@ -1008,11 +1085,90 @@ def complete_inventory_confirmation(
                        if present else models.ImageLocationState.MISSING.value),
                 inventory_epoch_seen=(inventory_epoch if present else
                                       row['inventory_epoch_seen']),
+                last_verified_at=(current
+                                  if present else row['last_verified_at']),
                 error_code=(
                     None if present else
                     models.ImageLocationErrorCode.MANIFEST_MISSING.value),
                 updated_at=current).returning(locations)).mappings().one()
         return _location(updated)
+
+
+def record_inventory_attestation_and_release(
+    *,
+    profile_revision_id: str,
+    expected_generation: int,
+    expected_config_hash: str,
+    shard_id: str,
+    inventory_lease_token: str,
+    expected_profile_revision_id: str | None,
+    expected_target_fingerprint: str,
+    expected_physical_fingerprint: str,
+    expected_inventory_epoch: int,
+    expected_inventory_completed_at: int,
+    kind: str,
+    evidence: dict[str, Any],
+    now: int | None = None,
+) -> ProfileRevisionRecord | None:
+    """Publishes evidence only after finalization, then releases atomically."""
+    current = int(time.time()) if now is None else now
+    profiles = schema.profile_revisions
+    shards = schema.registry_shards
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        revision = session.execute(
+            sqlalchemy.select(profiles).where(
+                profiles.c.id ==
+                profile_revision_id).with_for_update()).mappings().first()
+        if revision is None:
+            return None
+        shard = session.execute(
+            sqlalchemy.select(shards).where(
+                shards.c.id == shard_id).with_for_update()).mappings().first()
+        if (shard is None or shard['workspace'] != revision['workspace'] or
+                shard['profile'] != revision['profile'] or
+                shard['profile_revision_id'] != expected_profile_revision_id or
+                shard['target_fingerprint'] != expected_target_fingerprint or
+                shard['physical_fingerprint'] != expected_physical_fingerprint
+                or str(shard['state'])
+                not in (models.ImageShardState.READY.value,
+                        models.ImageShardState.FULL.value) or
+                int(shard['inventory_epoch']) != expected_inventory_epoch or
+                shard['inventory_completed_at']
+                != expected_inventory_completed_at or
+                not bool(shard['inventory_finalizing']) or
+                shard['inventory_started_at'] is None or
+                shard['inventory_lease_token'] != inventory_lease_token or
+                shard['inventory_lease_expires_at'] is None or
+                int(shard['inventory_lease_expires_at']) <= current):
+            return None
+        has_candidates = session.execute(
+            sqlalchemy.select(sqlalchemy.exists().where(
+                *_inventory_missing_candidate_conditions(
+                    shard_id, expected_inventory_epoch,
+                    int(shard['inventory_started_at']))))).scalar_one()
+        if has_candidates:
+            # Exact confirmation is intentionally paged. Releasing the token
+            # while preserving inventory_finalizing makes the same completed
+            # epoch immediately successor-claimable without relisting ECR.
+            session.execute(shards.update().where(
+                shards.c.id == shard_id).values(inventory_lease_token=None,
+                                                inventory_lease_expires_at=None,
+                                                updated_at=current))
+            return None
+        recorded = record_profile_attestation_in_session(
+            session,
+            profile_revision_id=profile_revision_id,
+            kind=kind,
+            evidence=evidence,
+            expected_generation=expected_generation,
+            expected_config_hash=expected_config_hash,
+            now=current)
+        session.execute(shards.update().where(shards.c.id == shard_id).values(
+            inventory_finalizing=False,
+            inventory_lease_token=None,
+            inventory_lease_expires_at=None,
+            updated_at=current))
+        return recorded
 
 
 def _bounded_location_count(session: orm.Session, shard_ids: list[str],
@@ -1325,6 +1481,41 @@ def begin_eviction_delete(location_id: str,
     return changed == 1
 
 
+def cancel_eviction_delete(location_id: str,
+                           lease_token: str,
+                           *,
+                           now: int | None = None) -> bool:
+    """Restores pre-delete intent only when the SDK proved no call began."""
+    current = int(time.time()) if now is None else now
+    locations = schema.locations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(locations.update().where(
+            locations.c.id == location_id,
+            locations.c.state == models.ImageLocationState.EVICTING.value,
+            locations.c.lease_kind == 'DELETE',
+            locations.c.lease_token == lease_token, locations.c.lease_expires_at
+            > current).values(lease_kind='EVICT', updated_at=current)).rowcount
+    return changed == 1
+
+
+def mark_eviction_readback(location_id: str,
+                           lease_token: str,
+                           *,
+                           now: int | None = None) -> bool:
+    """Records a conclusive delete response before any exact readback."""
+    current = int(time.time()) if now is None else now
+    locations = schema.locations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        changed = session.execute(locations.update().where(
+            locations.c.id == location_id,
+            locations.c.state == models.ImageLocationState.EVICTING.value,
+            locations.c.lease_kind == 'DELETE',
+            locations.c.lease_token == lease_token, locations.c.lease_expires_at
+            > current).values(lease_kind='READBACK',
+                              updated_at=current)).rowcount
+    return changed == 1
+
+
 def transition_location_to_verifying(location_id: str,
                                      lease_token: str,
                                      *,
@@ -1617,10 +1808,12 @@ def claim_next_eviction(*,
     token = f'{worker_id}:{uuid.uuid4()}'
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        claimable_for_shard = sqlalchemy.or_(
-            sqlalchemy.and_(ready_due, shards.c.eviction_enabled.is_(True),
-                            shards.c.in_flight < shards.c.max_in_flight),
-            expired)
+        claimable_for_shard = sqlalchemy.and_(
+            sqlalchemy.not_(_inventory_active_condition(shards)),
+            sqlalchemy.or_(
+                sqlalchemy.and_(ready_due, shards.c.eviction_enabled.is_(True),
+                                shards.c.in_flight < shards.c.max_in_flight),
+                expired))
         shard_locations = sqlalchemy.and_(locations.c.shard_id == shards.c.id,
                                           claimable_for_shard)
         oldest_anchor = sqlalchemy.select(age_anchor).where(
@@ -1638,6 +1831,8 @@ def claim_next_eviction(*,
                     shards.c.id).limit(1).with_for_update(
                         of=shards, skip_locked=True)).mappings().first()
         if shard is None:
+            return None
+        if _inventory_active(shard):
             return None
         ready_claimable = sqlalchemy.and_(
             ready_due, bool(shard['eviction_enabled']),
@@ -1665,9 +1860,25 @@ def claim_next_eviction(*,
                 ])).limit(1)).first()
         if live_demand is not None and not reclaimed:
             return None
+        if reclaimed and row['lease_kind'] == 'DELETE':
+            # An unconcluded DELETE may still resume or complete after any
+            # later read. Never restore or recopy this physical reference.
+            return _quarantine_eviction(session, row, now=current)
+        if reclaimed and row['lease_kind'] == 'READBACK':
+            # The provider conclusion is durable, so a successor repeats only
+            # exact presence resolution and never submits another delete.
+            updated = session.execute(
+                locations.update().where(locations.c.id == row['id']).values(
+                    lease_token=token,
+                    lease_expires_at=current + lease_seconds,
+                    attempt_count=locations.c.attempt_count + 1,
+                    error_code=None,
+                    updated_at=current).returning(locations)).mappings().one()
+            session.execute(shards.update().where(
+                shards.c.id == row['shard_id']).values(last_dispatch_at=current,
+                                                       updated_at=current))
+            return _location(updated)
         if reclaimed and row['lease_kind'] != 'EVICT':
-            # DELETE means an old request may still resume or complete after
-            # any later read. Never restore or recopy this physical reference.
             return _quarantine_eviction(session, row, now=current)
         if reclaimed and live_demand is not None:
             # No DELETE intent means the old worker could not pass its provider
@@ -1724,9 +1935,9 @@ def complete_eviction(location_id: str,
                 locations.c.id == location_id)).first()
         if optimistic is None:
             return None
-        session.execute(
-            sqlalchemy.select(shards.c.id).where(
-                shards.c.id == optimistic[0]).with_for_update()).one()
+        shard = session.execute(
+            sqlalchemy.select(shards).where(shards.c.id == optimistic[0]).
+            with_for_update()).mappings().one()
         row = session.execute(
             sqlalchemy.select(locations).where(locations.c.id == location_id).
             with_for_update()).mappings().first()
@@ -1738,9 +1949,19 @@ def complete_eviction(location_id: str,
             return None
         if provider_not_called and row['lease_kind'] != 'EVICT':
             return None
-        if not provider_not_called and row['lease_kind'] != 'DELETE':
-            # Provider results are inadmissible unless the same lease first
-            # committed its durable destructive intent.
+        inventory_active = _inventory_active(shard)
+        if provider_not_called and inventory_active:
+            # A completed-list nominee cannot race to READY without the exact
+            # provider proof required by inventory finalization.
+            return None
+        if (not provider_not_called and present is None and
+                row['lease_kind'] != 'DELETE'):
+            # Ambiguity is admissible only for the still-unconcluded intent.
+            return None
+        if (not provider_not_called and present is not None and
+                row['lease_kind'] != 'READBACK'):
+            # Presence is admissible only after a provider conclusion was
+            # durably separated from an in-flight or ambiguous delete.
             return None
         live_demand = session.execute(
             sqlalchemy.select(schema.demands.c.id).where(
@@ -1765,6 +1986,10 @@ def complete_eviction(location_id: str,
             new_state = models.ImageLocationState.EVICTED
             error_code = None
             release_reservation = True
+        if release_reservation and inventory_active:
+            # Keep provider-proven absence in READBACK until inventory stops
+            # comparing earlier observations with capacity accounting.
+            return None
         location_values: dict[str, Any] = {
             'state': new_state.value,
             'lease_kind': None,

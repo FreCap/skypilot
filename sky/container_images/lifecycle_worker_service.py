@@ -30,6 +30,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import serve_state
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
+_READBACK_ATTEMPTS = 3
 _CONSUMER_RECONCILIATION_SECONDS = 60
 _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
 _UNATTACHED_REQUEST_RETENTION_SECONDS = 24 * 60 * 60
@@ -111,6 +112,23 @@ def _refresh_workspace_eviction_cutoffs(
         return previous
 
 
+def _exact_presence_with_retry(
+    repository: aws.EcrRepository,
+    digest: str,
+    heartbeat: worker_lease.LeaseHeartbeat,
+) -> bool | None:
+    """Retries only transient reads after destructive I/O has concluded."""
+    for attempt in range(_READBACK_ATTEMPTS):
+        try:
+            return repository.exact_manifest_exists(digest)
+        except (aws.ProviderThrottledError, aws.AmbiguousProviderOutcomeError,
+                budgets.ProviderBudgetUnavailableError):
+            if attempt + 1 == _READBACK_ATTEMPTS:
+                return None
+            heartbeat.assert_owned()
+    return None
+
+
 def evict_location(
     location: topology_state.LocationRecord,
     limiter: budgets.ProviderBudgetLimiter,
@@ -118,24 +136,27 @@ def evict_location(
     lease_seconds: int = _DEFAULT_LEASE_SECONDS,
 ) -> bool:
     token = location.lease_token
-    if (token is None or location.canonical or location.lease_kind != 'EVICT'):
+    if (token is None or location.canonical or
+            location.lease_kind not in ('EVICT', 'READBACK')):
         return False
     shard = topology_state.get_shard(location.shard_id)
     if shard is None:
         return False
     resolved = _profile_target_for_location(location, shard)
     if resolved is None:
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         present=None,
-                                         provider_not_called=True)
+        if location.lease_kind == 'EVICT':
+            topology_state.complete_eviction(location.id,
+                                             token,
+                                             present=None,
+                                             provider_not_called=True)
         return False
     profile, target = resolved
     if target.delete_authority is None:
-        topology_state.complete_eviction(location.id,
-                                         token,
-                                         present=None,
-                                         provider_not_called=True)
+        if location.lease_kind == 'EVICT':
+            topology_state.complete_eviction(location.id,
+                                             token,
+                                             present=None,
+                                             provider_not_called=True)
         return False
     binding = profile.bindings[target.delete_authority]
     heartbeat = _LeaseHeartbeat(
@@ -144,6 +165,7 @@ def evict_location(
         max(1.0, lease_seconds / 3))
     with heartbeat:
         delete_intent = False
+        destructive = location.lease_kind == 'EVICT'
 
         def before_call() -> None:
             nonlocal delete_intent
@@ -153,35 +175,61 @@ def evict_location(
             heartbeat.assert_owned()
             limiter.before_call(shard)
             heartbeat.assert_owned()
-            if not delete_intent:
+            if destructive and not delete_intent:
                 if not topology_state.begin_eviction_delete(location.id, token):
                     raise worker_lease.LeaseLostError(
                         'Container image eviction lease was lost.')
                 delete_intent = True
                 heartbeat.assert_owned()
 
+        heartbeat.assert_owned()
         repository = aws.EcrRepository.from_role(
             _lifecycle_role(binding, profile),
             shard.region,
             shard.repository_name,
             hooks=aws.EcrCallHooks(
                 before_call=before_call,
-                on_throttle=lambda: limiter.record_throttle(shard)))
-        outcome = repository.delete_outcome(location.runtime_digest)
+                on_throttle=lambda: limiter.record_throttle(shard)),
+            provider_fence=heartbeat.assert_owned)
         heartbeat.assert_owned()
-        if outcome == aws.DeleteOutcome.NOT_STARTED:
-            topology_state.complete_eviction(
-                location.id,
-                token,
-                present=None,
-                provider_not_called=(not delete_intent))
+        if not destructive:
+            present = _exact_presence_with_retry(repository,
+                                                 location.runtime_digest,
+                                                 heartbeat)
+            if present is None:
+                return False
+            heartbeat.assert_owned()
+            completed = topology_state.complete_eviction(location.id,
+                                                         token,
+                                                         present=present)
+            return completed is not None and not present
+
+        request = repository.delete_request_outcome(location.runtime_digest)
+        if request == aws.DeleteRequestOutcome.NOT_STARTED:
+            if (delete_intent and not topology_state.cancel_eviction_delete(
+                    location.id, token)):
+                return False
+            topology_state.complete_eviction(location.id,
+                                             token,
+                                             present=None,
+                                             provider_not_called=True)
             return False
-        present = (True if outcome == aws.DeleteOutcome.PRESENT else
-                   False if outcome == aws.DeleteOutcome.ABSENT else None)
+        if request == aws.DeleteRequestOutcome.AMBIGUOUS:
+            topology_state.complete_eviction(location.id, token, present=None)
+            return False
+        heartbeat.assert_owned()
+        if not topology_state.mark_eviction_readback(location.id, token):
+            return False
+        heartbeat.assert_owned()
+        present = _exact_presence_with_retry(repository,
+                                             location.runtime_digest, heartbeat)
+        if present is None:
+            return False
+        heartbeat.assert_owned()
         completed = topology_state.complete_eviction(location.id,
                                                      token,
                                                      present=present)
-        return (completed is not None and outcome == aws.DeleteOutcome.ABSENT)
+        return completed is not None and not present
 
 
 def _reconcile_publication_fanout(limit: int = 100) -> int:

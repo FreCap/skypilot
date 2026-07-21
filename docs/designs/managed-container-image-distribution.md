@@ -447,20 +447,27 @@ Location transitions are:
 | READY | EVICTING | Regional, automatic eviction enabled, past the workspace retention anchor, and no live demand |
 | FAILED, MISSING, EVICTED | PENDING | Explicit prepare/retry or new authorized demand |
 | EVICTING (`EVICT`) | EVICTING (`DELETE`) | Same fenced owner durably authorizes the first destructive provider call |
-| EVICTING | EVICTED | Exact digest absence after delete |
-| EVICTING (`DELETE`) | READY | Exact digest remains after a successful provider conclusion or an explicit no-mutation rejection |
+| EVICTING (`DELETE`) | EVICTING (`READBACK`) | The destructive request conclusively returned, or the provider explicitly rejected it before mutation |
+| EVICTING (`READBACK`) | EVICTED | Exact digest absence and no live demand |
+| EVICTING (`READBACK`) | PENDING | Exact digest absence and live demand |
+| EVICTING (`READBACK`) | READY | Exact digest remains |
 | EVICTING (`EVICT`) | READY or EVICTING (`EVICT`) | Expired pre-delete claim, restore for live demand or retry the still-demand-free eviction |
+| EVICTING (`DELETE`) | EVICTING (`EVICT`) | The same live owner proves in-process that the provider wrapper did not start a call |
 | EVICTING (`DELETE`) | QUARANTINED | Delete outcome is ambiguous or the destructive-intent lease expires |
+| EVICTING (`READBACK`) | EVICTING (`READBACK`) | Readback is transiently unavailable or its lease expires; a new fenced owner retries readback without repeating delete |
 
 Only INSPECTING publications carry an inspection token and expiry. Only
 COPYING, VERIFYING, or EVICTING locations carry a random location token, expiry,
 and matching lease kind. `EVICT` means no destructive provider call may have
 started; `DELETE` is the durable point after which a delete may already be in
-flight. PENDING, READY, FAILED, MISSING, EVICTED, and QUARANTINED carry no lease.
-Canonical locations never enter EVICTING, EVICTED, or QUARANTINED. Every retry
-records a bounded attempt count, code, and `next_retry_at`; throttles and
-timeouts before provider I/O remain retryable. An unknown delete outcome is
-terminal for that physical location because ECR has no conditional-delete token.
+flight; `READBACK` durably proves that no delete remains in flight and that only
+exact presence resolution remains. PENDING, READY, FAILED, MISSING, EVICTED, and
+QUARANTINED carry no lease. Canonical locations never enter EVICTING, EVICTED,
+or QUARANTINED. Every retry records a bounded attempt count, code, and
+`next_retry_at`; throttles and timeouts before provider I/O remain retryable. An
+unknown delete outcome is terminal for that physical location because ECR has
+no conditional-delete token. A failed read after a concluded delete is not an
+unknown delete outcome and cannot quarantine the location.
 
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
@@ -742,17 +749,21 @@ restore READY only while the exact current lease still has `EVICT` kind.
 Immediately before the first ECR delete call, the SDK hook atomically changes
 that lease from `EVICT` to `DELETE`; database completion rejects any provider
 result that lacks this durable intent. A successful ECR response, or an explicit
-provider rejection that proves no mutation was accepted, may be followed by
-exact readback. A transport failure, timeout, ambiguous server response, or
-failure without a provider conclusion is never read back as proof of that
-delete's terminal state; it immediately yields an ambiguous outcome. After
-provider I/O, only exact presence following a concluded call may restore READY
-and only exact absence following a concluded call may requeue or release
-capacity.
+provider rejection that proves no mutation was accepted, atomically advances
+the same token from `DELETE` to `READBACK` before exact readback. A transport
+failure, timeout, ambiguous server response, or failure without a provider
+conclusion is never read back as proof of that delete's terminal state; it
+immediately yields an ambiguous outcome. A transient readback failure leaves
+`READBACK` intact. The same owner may retry while its lease is live, and an
+expired `READBACK` claim may be fenced to a new owner that repeats only the
+exact read. It never repeats the delete. Only exact presence may restore READY
+and only exact absence may requeue or release capacity.
 
 An expired `EVICT` lease proves that no destructive call could have passed the
 hook. A live demand therefore restores READY without provider I/O; otherwise a
-new owner may retry the eviction. An ambiguous result or expired `DELETE` lease
+new owner may retry the eviction. An expired `READBACK` lease is safely
+reclaimable because the preceding transaction proved that no destructive call
+can arrive later. An ambiguous result or expired `DELETE` lease
 cannot be made safe by later readback: an old process may still resume after the
 read and send, or complete, its delete. The location is therefore atomically
 changed to `QUARANTINED`, its in-flight slot is released, and its capacity
@@ -765,16 +776,18 @@ The bounded readiness projection reports both quarantined-location count and
 their retained declared bytes per target, so operators can size and verify a
 ring rotation without scanning the catalog.
 Every lifecycle claim uses the same durable background lease heartbeat as copy
-work. The worker proves the exact location token before assuming its provider
-role, synchronously re-proves ownership in the hook immediately before every ECR
-delete begins, records `DELETE` intent in that hook, and rechecks ownership again
-before database completion. Lease loss sets cancellation state and starts no
-later provider call. A call that may already have started is never treated as
-cancelled, present, or absent; it converges only to QUARANTINED. The same
-unexpired owner may use exact readback only after the provider successfully
-concludes the delete request or explicitly rejects it before mutation. Failed
-explicit retries bind a terminal idempotent operation before returning a typed
-conflict, so replay cannot leave or conceal an unattached nonterminal operation.
+work. The AWS adapter invokes the exact lease fence immediately before and after
+its STS `AssumeRole` request; caller-side checks alone are not credential
+fencing. The worker synchronously re-proves ownership in the hook immediately
+before every ECR call, records `DELETE` intent before the destructive call, and
+rechecks ownership again before database completion. Lease loss sets
+cancellation state and starts no later provider call. A call that may already
+have started is never treated as cancelled, present, or absent; it converges
+only to QUARANTINED unless its conclusive response was durably recorded as
+`READBACK`. Readback failure after that durable conclusion remains retryable
+across workers without another delete. Failed explicit retries bind a terminal
+idempotent operation before returning a typed conflict, so replay cannot leave
+or conceal an unattached nonterminal operation.
 When exact absence releases the final capacity reservation on a `FULL` shard,
 the same locked transaction changes it to `READY` if both reservation ceilings
 are now below their activated limits. It does not wait for the next inventory
@@ -931,7 +944,8 @@ Important constraints include:
 - one row per physical repository shard with immutable fingerprint, hard
   manifest and declared-byte ceilings, reserved/observed counters,
   qualification timestamp, fair-dispatch timestamp and in-flight ceiling,
-  reconciliation epoch/cursor, and `READY|FULL|DRIFTED|DISABLED` admission state;
+  reconciliation epoch/cursor, a durable inventory-finalization bit, and
+  `READY|FULL|DRIFTED|DISABLED` admission state;
 - unique logical location identity for artifact, immutable target-ring
   fingerprint, and runtime digest, independent of profile revision, plus a
   separately persisted physical repository-shard fingerprint;
@@ -1372,16 +1386,45 @@ canonical reservation is permanent in v0. Failed reservations decrement count
 and bytes only after exact provider inspection proves that no manifest exists and
 no retained publication or demand can recreate it.
 
-Each shard stores a durable inventory epoch, provider cursor, started time, and
-last-completed time. One reconciliation claim reads at most ten provider pages
-or runs for ten seconds, then commits its cursor. An invalid or expired provider
-cursor restarts the epoch safely. Observed managed digests update the matching
-location's epoch marker. Only a completed epoch may nominate a missing manifest
-for the exact confirmation required by the transition contract.
+Each shard stores a durable inventory epoch, provider cursor, started time,
+last-completed time, and `inventory_finalizing` bit. One reconciliation claim
+reads at most ten provider pages or runs for ten seconds, then commits its
+cursor. An invalid or expired provider cursor restarts the epoch safely. The
+terminal provider page durably sets `inventory_finalizing`; while that bit is
+set, every released or expired claim is immediately eligible and resumes the
+same completed epoch instead of relisting the repository. Observed managed
+digests update the matching location's epoch marker. Only a completed epoch may
+nominate a missing manifest for the exact confirmation required by the
+transition contract. List absence alone never marks a shard `DRIFTED` or a
+location `MISSING`.
+
+One finalization claim exactly confirms at most 100 nominated locations. An
+exact-present result advances both the epoch marker and verification timestamp,
+so the ordered partial-index scan never rewalks already confirmed rows. It then
+enters a profile-before-shard transaction that independently proves no
+nominations remain. If another page remains, that transaction releases the
+token but keeps `inventory_finalizing`, so another worker can resume immediately
+without repeating the provider listing. Only the zero-candidate transaction may
+record the revision-scoped attestation, clear `inventory_finalizing`, and release
+the lease atomically. The reconciliation lease remains live through credential
+acquisition, every ECR and service-quota call, and its bounded confirmation
+page. A transient failure before final attestation leaves no activatable
+evidence. A shard is inventory-active from the durable start of listing through
+the atomic end of finalization, including between page leases. Bootstrap
+ceilings cannot change while inventory-active. A finalizing shard cannot provide
+candidate evidence or participate in activation. An inventory-active shard
+admits no fresh or expired lifecycle claim and cannot restore a pre-delete
+`EVICT` to READY without provider I/O. A pre-existing exact `READBACK` may record
+presence or demand-backed absence because both retain the reservation; an
+absence that would release capacity waits until the inventory epoch is idle.
+Continuation pages release their token only after durably committing the
+cursor. A partial million-row absence sweep is therefore bounded, interruptible,
+and successor-resumable.
 An in-flight or not-yet-written location consumes a reservation but is not
-expected in inventory. An unexplained manifest, observed count above reserved
-count, or manifest-present location absent from a complete epoch marks the shard
-`DRIFTED` and stops new admission without breaking existing pulls.
+expected in inventory. An unexplained manifest or observed count above reserved
+count marks the shard `DRIFTED` and stops new admission without breaking
+existing pulls. A managed location absent from a complete list remains unchanged
+until exact readback proves presence or moves it to `MISSING` for rematerialization.
 
 Failed canonical reservations are reaped only after every dependent publication
 reservation has expired, no demand remains, no lease is live,
@@ -2208,3 +2251,40 @@ therefore starts the heartbeat before source or destination credentials, moves
 destination authority acquisition after source validation, fences credential
 acquisition on both sides, and binds synchronous lease checks before and after
 every copy ECR provider-budget wait.
+
+Restarted final acceptance round 1 at
+`dcdd54dd92baadd94bac4e5c49b4f413086ea7a0` returned paired `RESHAPE` verdicts.
+Codex found that inventory had neither a heartbeat nor synchronous fences around
+STS, ECR, and service-quota calls, and that lifecycle STS could begin after its
+location lease was lost. Fable found that a conclusive delete followed by a
+transient exact-read failure was collapsed into delete ambiguity and permanently
+quarantined. The adjacent audit also found that list absence directly marked a
+shard `DRIFTED`, preventing the exact confirmation required by this contract.
+This revision therefore keeps inventory authority through atomic attestation,
+fences all of its provider calls, fences lifecycle credential acquisition, and
+separates durable `READBACK` recovery from genuinely ambiguous `DELETE` intent.
+
+The next focused repair review rejected the inventory finalization path because
+it confirmed only the first 100 absent READY locations before publishing live
+evidence. This revision adds the durable `inventory_finalizing` phase described
+above, a partial PostgreSQL index for exact-confirmation candidates, an atomic
+zero-candidate attestation fence, and a 101-location interruption and successor
+recovery proof. Bootstrap handoff, candidate evidence, and activation all reject
+the between-page finalization state.
+
+The following focused gate split: Fable returned `ACCEPT_REPAIR`, while Codex
+rejected caller-side STS checks as weaker than a fence at the actual
+`AssumeRole` boundary. The adjacent audit also found that an eviction could move
+a nominated READY row to `EVICTING` between exact read and database completion,
+then restore it without provider I/O, and that bootstrap ceiling handoff could
+reset a listing epoch between continuation claims. This revision moves the
+optional fence into the shared AWS credential adapter, pauses unsafe lifecycle
+transitions during inventory finalization, and treats the entire durable
+inventory phase as busy for bootstrap handoff.
+
+The next focused Codex gate rejected finalization-only lifecycle fencing. A
+multi-page provider list can observe a digest before a concurrent eviction
+deletes it and releases its reservation, causing the terminal page to compare
+pre-delete observations with post-delete accounting. This revision uses the
+same durable inventory-active predicate for lifecycle discovery, no-I/O restore,
+and capacity-releasing READBACK completion across both listing and finalization.

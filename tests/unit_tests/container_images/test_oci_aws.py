@@ -530,3 +530,71 @@ def test_ecr_delete_hooked_transport_timeout_never_reads_back() -> None:
     assert client.get_calls == 0
     hooks.before_call.assert_called_once_with()
     hooks.on_throttle.assert_not_called()
+
+
+def test_ecr_concluded_delete_readback_failure_is_retryable() -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = _EcrClient(graph)
+    client.present = True
+    client.batch_get_image = mock.Mock(
+        side_effect=TimeoutError('readback timeout'))
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+
+    assert (repository.delete_outcome(
+        graph.runtime_digest) == aws.DeleteOutcome.READBACK_RETRY)
+    assert client.deleted == [graph.runtime_digest]
+    client.batch_get_image.assert_called_once()
+
+
+def test_service_quota_calls_are_synchronously_provider_fenced(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class QuotaClient:
+
+        def get_service_quota(self, **_kwargs: object) -> dict[str, object]:
+            events.append('quota')
+            return {'Quota': {'Value': 100.0}}
+
+    def assumed_client(*_args: object,
+                       provider_fence: Any = None) -> QuotaClient:
+        assert provider_fence is not None
+        provider_fence()
+        events.append('sts')
+        provider_fence()
+        return QuotaClient()
+
+    monkeypatch.setattr(aws, 'assumed_client', assumed_client)
+    binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
+                                 external_id=None,
+                                 session_name='test',
+                                 catalog_tag='catalog',
+                                 profile_tag='profile')
+
+    quota = aws.applied_ecr_images_per_repository_quota(
+        binding, 'us-east-1', provider_fence=lambda: events.append('lease'))
+
+    assert quota == 100
+    assert events == ['lease', 'sts', 'lease', 'lease', 'quota', 'lease']
+
+
+def test_ecr_role_acquisition_fences_actual_sts_boundary(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    sts = mock.Mock()
+    monkeypatch.setattr(aws.aws_adaptor, 'client', lambda _service: sts)
+    binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
+                                 external_id=None,
+                                 session_name='test',
+                                 catalog_tag='catalog',
+                                 profile_tag='profile')
+    lost = mock.Mock(side_effect=RuntimeError('lease lost at STS boundary'))
+
+    with pytest.raises(RuntimeError, match='lease lost at STS boundary'):
+        aws.EcrRepository.from_role(binding,
+                                    'us-east-1',
+                                    'skypilot/images/shard',
+                                    provider_fence=lost)
+
+    lost.assert_called_once_with()
+    sts.assume_role.assert_not_called()

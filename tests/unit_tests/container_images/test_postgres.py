@@ -368,6 +368,52 @@ def test_candidate_attestation_requires_unchanged_operational_inventory(
     assert unchanged.state == models.ImageShardState.READY
 
 
+def test_bootstrap_handoff_waits_between_inventory_pages(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    shard = topology_state.list_target_shards('research', profile.name,
+                                              profile.targets[0].name)[0]
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                profile_revision_id=None,
+                inventory_started_at=20,
+                inventory_completed_at=None,
+                inventory_finalizing=False,
+                inventory_lease_token=None,
+                inventory_lease_expires_at=None,
+                updated_at=20))
+
+    with orm.Session(image_database) as session, session.begin():
+        with pytest.raises(ValueError,
+                           match='inventory must finish before limits change'):
+            topology_state.upsert_qualified_shard(
+                session,
+                workspace=shard.workspace,
+                profile=shard.profile,
+                target_id=shard.target_id,
+                provider=shard.provider,
+                partition=shard.partition,
+                account=shard.account,
+                region=shard.region,
+                shard_generation=shard.shard_generation,
+                shard_index=shard.shard_index,
+                target_fingerprint=shard.target_fingerprint,
+                physical_fingerprint=shard.physical_fingerprint,
+                registry=shard.registry,
+                repository_name=shard.repository_name,
+                repository_arn=shard.repository_arn,
+                max_manifests=80,
+                max_declared_bytes=800_000,
+                max_in_flight=3,
+                now=21)
+    unchanged = topology_state.get_shard(shard.id)
+    assert unchanged is not None
+    assert unchanged.max_manifests == shard.max_manifests
+    assert unchanged.inventory_started_at == 20
+    assert unchanged.inventory_completed_at is None
+
+
 def test_candidate_handoff_is_nonmutating_and_activation_applies_atomically(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     active = _activate_profile(image_database, profile)
@@ -575,6 +621,24 @@ def test_candidate_handoff_is_nonmutating_and_activation_applies_atomically(
         },
         now=25)
     assert refreshed is not None and refreshed.attestations_hash is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == current.id).values(
+                inventory_finalizing=True, updated_at=26))
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        transactions.activate_profile(
+            profile_revision_id=candidate.id,
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            expected_terraform_hash='e' * 64,
+            expected_attestations_hash=refreshed.attestations_hash,
+            required_attestations={'terraform': None},
+            now=26)
+    assert topology_state.get_active_profile('research', profile.name) == active
+    with image_database.begin() as connection:
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == current.id).values(
+                inventory_finalizing=False, updated_at=27))
     activated = transactions.activate_profile(
         profile_revision_id=candidate.id,
         expected_generation=candidate.desired_generation,
@@ -582,7 +646,7 @@ def test_candidate_handoff_is_nonmutating_and_activation_applies_atomically(
         expected_terraform_hash='e' * 64,
         expected_attestations_hash=refreshed.attestations_hash,
         required_attestations={'terraform': None},
-        now=26)
+        now=28)
 
     assert activated.id == candidate.id
     assert all(
@@ -987,6 +1051,515 @@ def _begin_delete(
     return updated
 
 
+def _mark_readback(
+    location: topology_state.LocationRecord,
+    *,
+    now: int,
+) -> topology_state.LocationRecord:
+    assert location.lease_token is not None
+    assert topology_state.mark_eviction_readback(location.id,
+                                                 location.lease_token,
+                                                 now=now)
+    updated = topology_state.get_location(location.id)
+    assert updated is not None and updated.lease_kind == 'READBACK'
+    return updated
+
+
+def _start_inventory_finalization(
+    engine: sqlalchemy.engine.Engine,
+    shard_id: str,
+) -> topology_state.ShardRecord:
+    with engine.begin() as connection:
+        connection.execute(
+            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard_id).values(
+                inventory_completed_at=11))
+    claimed = topology_state.claim_inventory_shard(worker_id='copy-inventory',
+                                                   lease_seconds=60,
+                                                   interval_seconds=1,
+                                                   now=100)
+    assert claimed is not None and claimed.id == shard_id
+    assert claimed.inventory_lease_token is not None
+    completed = topology_state.record_inventory_page(
+        claimed.id, claimed.inventory_lease_token, (), None, now=101)
+    assert completed is not None and completed.inventory_finalizing
+    return completed
+
+
+def _start_inventory_listing(
+    engine: sqlalchemy.engine.Engine,
+    shard_id: str,
+    digests: tuple[str, ...],
+) -> topology_state.ShardRecord:
+    with engine.begin() as connection:
+        connection.execute(
+            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard_id).values(
+                inventory_completed_at=11))
+    claimed = topology_state.claim_inventory_shard(worker_id='copy-listing',
+                                                   lease_seconds=60,
+                                                   interval_seconds=1,
+                                                   now=100)
+    assert claimed is not None and claimed.id == shard_id
+    assert claimed.inventory_lease_token is not None
+    continued = topology_state.record_inventory_page(
+        claimed.id,
+        claimed.inventory_lease_token,
+        digests,
+        'next-page',
+        now=101)
+    assert continued is not None
+    assert continued.inventory_completed_at is None
+    assert topology_state.release_inventory_claim(continued.id,
+                                                  claimed.inventory_lease_token,
+                                                  continued.inventory_epoch,
+                                                  now=102)
+    released = topology_state.get_shard(continued.id)
+    assert released is not None
+    assert released.inventory_started_at is not None
+    assert released.inventory_completed_at is None
+    assert released.inventory_lease_token is None
+    return released
+
+
+def test_inventory_attestation_and_lease_release_are_atomic(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    claimed = topology_state.claim_inventory_shard(worker_id='copy-1',
+                                                   lease_seconds=60,
+                                                   interval_seconds=1,
+                                                   now=100)
+    assert claimed is not None
+    assert claimed.inventory_lease_token is not None
+    completed = topology_state.record_inventory_page(
+        claimed.id, claimed.inventory_lease_token, (), None, now=101)
+    assert completed is not None
+    assert completed.inventory_completed_at == 101
+    assert completed.inventory_finalizing
+    assert completed.inventory_lease_token == claimed.inventory_lease_token
+    key = f'infrastructure_shard:{claimed.physical_fingerprint}'
+    evidence = {
+        'status': 'READY',
+        'observed_at': 102,
+        'inventory_epoch': completed.inventory_epoch,
+        'inventory_completed_at': completed.inventory_completed_at,
+    }
+
+    stale = topology_state.record_inventory_attestation_and_release(
+        profile_revision_id=active.id,
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        shard_id=completed.id,
+        inventory_lease_token='wrong-token',
+        expected_profile_revision_id=active.id,
+        expected_target_fingerprint=completed.target_fingerprint,
+        expected_physical_fingerprint=completed.physical_fingerprint,
+        expected_inventory_epoch=completed.inventory_epoch,
+        expected_inventory_completed_at=completed.inventory_completed_at,
+        kind=key,
+        evidence=evidence,
+        now=102)
+    assert stale is None
+    unchanged = topology_state.get_profile_revision(active.id)
+    assert unchanged is not None and key not in unchanged.attestations
+    still_claimed = topology_state.get_shard(completed.id)
+    assert still_claimed is not None
+    assert still_claimed.inventory_lease_token == claimed.inventory_lease_token
+
+    recorded = topology_state.record_inventory_attestation_and_release(
+        profile_revision_id=active.id,
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        shard_id=completed.id,
+        inventory_lease_token=claimed.inventory_lease_token,
+        expected_profile_revision_id=active.id,
+        expected_target_fingerprint=completed.target_fingerprint,
+        expected_physical_fingerprint=completed.physical_fingerprint,
+        expected_inventory_epoch=completed.inventory_epoch,
+        expected_inventory_completed_at=completed.inventory_completed_at,
+        kind=key,
+        evidence=evidence,
+        now=102)
+    assert recorded is not None
+    assert recorded.attestations[key] == evidence
+    released = topology_state.get_shard(completed.id)
+    assert released is not None
+    assert not released.inventory_finalizing
+    assert released.inventory_lease_token is None
+    assert released.inventory_lease_expires_at is None
+
+
+def test_inventory_confirmation_pages_are_successor_resumable(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    shard = topology_state.list_target_shards('research', profile.name,
+                                              profile.targets[0].name)[0]
+    image_rows = []
+    location_rows = []
+    for index in range(101):
+        digest = f'sha256:{index + 1:064x}'
+        image_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f'inventory-image-{index}'))
+        location_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f'inventory-location-{index}'))
+        image_rows.append({
+            'id': image_id,
+            'workspace': 'research',
+            'runtime_digest': digest,
+            'platform': 'linux/amd64',
+            'config_digest': _CONFIG_DIGEST,
+            'manifest_media_type': _MANIFEST_MEDIA_TYPE,
+            'manifest_size_bytes': 1,
+            'declared_size_bytes': 1,
+            'creator_user_hash': '4' * 64,
+            'producer_kind': 'external_oci',
+            'created_at': 20,
+            'updated_at': 20,
+        })
+        location_rows.append({
+            'id': location_id,
+            'workspace': 'research',
+            'image_id': image_id,
+            'shard_id': shard.id,
+            'target_fingerprint': shard.target_fingerprint,
+            'physical_fingerprint': shard.physical_fingerprint,
+            'runtime_digest': digest,
+            'canonical': True,
+            'canonical_location_id': None,
+            'target_ref': f'{shard.registry}/{shard.repository_name}@{digest}',
+            'state': models.ImageLocationState.READY.value,
+            'attempt_count': 0,
+            'last_verified_at': 20,
+            'inventory_epoch_seen': shard.inventory_epoch,
+            'reserved_declared_bytes': 1,
+            'created_at': 20,
+            'updated_at': 20,
+        })
+    with image_database.begin() as connection:
+        connection.execute(schema.images.insert(), image_rows)
+        connection.execute(schema.locations.insert(), location_rows)
+        connection.execute(
+            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == shard.id).values(
+                max_manifests=200,
+                reserved_manifests=101,
+                reserved_declared_bytes=101,
+                inventory_completed_at=11,
+                updated_at=20))
+
+    first = topology_state.claim_inventory_shard(worker_id='copy-1',
+                                                 lease_seconds=60,
+                                                 interval_seconds=1,
+                                                 now=100)
+    assert first is not None and first.id == shard.id
+    assert first.inventory_lease_token is not None
+    completed = topology_state.record_inventory_page(
+        first.id, first.inventory_lease_token, (), None, now=101)
+    assert completed is not None and completed.inventory_finalizing
+    first_page = topology_state.list_inventory_missing_candidates(
+        completed.id, completed.inventory_epoch, limit=100)
+    assert len(first_page) == 100
+    for location in first_page:
+        assert topology_state.complete_inventory_confirmation(
+            location.id,
+            completed.id,
+            completed.inventory_epoch,
+            first.inventory_lease_token,
+            present=False,
+            now=102) is not None
+
+    key = models.profile_attestation_key('infrastructure_shard',
+                                         shard.physical_fingerprint)
+    evidence = {
+        'status': 'READY',
+        'observed_at': 103,
+        'inventory_epoch': completed.inventory_epoch,
+        'inventory_completed_at': completed.inventory_completed_at,
+    }
+    pending = topology_state.record_inventory_attestation_and_release(
+        profile_revision_id=active.id,
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        shard_id=completed.id,
+        inventory_lease_token=first.inventory_lease_token,
+        expected_profile_revision_id=active.id,
+        expected_target_fingerprint=completed.target_fingerprint,
+        expected_physical_fingerprint=completed.physical_fingerprint,
+        expected_inventory_epoch=completed.inventory_epoch,
+        expected_inventory_completed_at=completed.inventory_completed_at,
+        kind=key,
+        evidence=evidence,
+        now=103)
+    assert pending is None
+    partial = topology_state.get_shard(completed.id)
+    assert partial is not None and partial.inventory_finalizing
+    assert partial.inventory_lease_token is None
+
+    successor = topology_state.claim_inventory_shard(worker_id='copy-2',
+                                                     lease_seconds=60,
+                                                     interval_seconds=600,
+                                                     now=104)
+    assert successor is not None and successor.id == completed.id
+    assert successor.inventory_epoch == completed.inventory_epoch
+    assert successor.inventory_started_at == completed.inventory_started_at
+    assert successor.inventory_completed_at == completed.inventory_completed_at
+    assert successor.inventory_lease_token is not None
+    final_page = topology_state.list_inventory_missing_candidates(
+        successor.id, successor.inventory_epoch, limit=100)
+    assert len(final_page) == 1
+    assert topology_state.complete_inventory_confirmation(
+        final_page[0].id,
+        successor.id,
+        successor.inventory_epoch,
+        successor.inventory_lease_token,
+        present=False,
+        now=105) is not None
+    recorded = topology_state.record_inventory_attestation_and_release(
+        profile_revision_id=active.id,
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        shard_id=successor.id,
+        inventory_lease_token=successor.inventory_lease_token,
+        expected_profile_revision_id=active.id,
+        expected_target_fingerprint=successor.target_fingerprint,
+        expected_physical_fingerprint=successor.physical_fingerprint,
+        expected_inventory_epoch=successor.inventory_epoch,
+        expected_inventory_completed_at=successor.inventory_completed_at,
+        kind=key,
+        evidence=evidence,
+        now=106)
+    assert recorded is not None and recorded.attestations[key] == evidence
+    finalized = topology_state.get_shard(successor.id)
+    assert finalized is not None and not finalized.inventory_finalizing
+    assert finalized.inventory_lease_token is None
+    assert not topology_state.list_inventory_missing_candidates(
+        successor.id, successor.inventory_epoch, limit=1)
+
+
+def test_inventory_list_absence_requires_exact_confirmation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    with image_database.begin() as connection:
+        connection.execute(
+            schema.registry_shards.update().values(inventory_completed_at=1000))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.id == regional.shard_id).values(
+                inventory_completed_at=11))
+    claimed = topology_state.claim_inventory_shard(worker_id='copy-1',
+                                                   lease_seconds=60,
+                                                   interval_seconds=1,
+                                                   now=100)
+    assert claimed is not None and claimed.id == regional.shard_id
+    assert claimed.inventory_lease_token is not None
+
+    completed = topology_state.record_inventory_page(
+        claimed.id, claimed.inventory_lease_token, (), None, now=101)
+
+    assert completed is not None
+    assert completed.state in (models.ImageShardState.READY,
+                               models.ImageShardState.FULL)
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.READY
+    candidates = topology_state.list_inventory_missing_candidates(
+        claimed.id, completed.inventory_epoch)
+    assert [item.id for item in candidates] == [regional.id]
+
+    missing = topology_state.complete_inventory_confirmation(
+        regional.id,
+        claimed.id,
+        completed.inventory_epoch,
+        claimed.inventory_lease_token,
+        present=False,
+        now=102)
+    assert missing is not None
+    assert missing.state == models.ImageLocationState.MISSING
+
+
+def test_inventory_exact_presence_refreshes_confirmation_anchor(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    completed = _start_inventory_finalization(image_database, regional.shard_id)
+    assert completed.inventory_lease_token is not None
+    candidates = topology_state.list_inventory_missing_candidates(
+        completed.id, completed.inventory_epoch)
+    assert [item.id for item in candidates] == [regional.id]
+
+    present = topology_state.complete_inventory_confirmation(
+        regional.id,
+        completed.id,
+        completed.inventory_epoch,
+        completed.inventory_lease_token,
+        present=True,
+        now=102)
+
+    assert present is not None
+    assert present.state == models.ImageLocationState.READY
+    assert present.inventory_epoch_seen == completed.inventory_epoch
+    assert present.last_verified_at == 102
+    assert not topology_state.list_inventory_missing_candidates(
+        completed.id, completed.inventory_epoch)
+
+
+def test_inventory_finalization_blocks_fresh_eviction_claim(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    completed = _start_inventory_finalization(image_database, regional.shard_id)
+    assert [
+        item.id for item in topology_state.list_inventory_missing_candidates(
+            completed.id, completed.inventory_epoch)
+    ] == [regional.id]
+
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=102)
+
+    assert eviction is None
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.READY
+
+
+def test_inventory_finalization_blocks_no_io_eviction_restore(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=50)
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    _start_inventory_finalization(image_database, regional.shard_id)
+
+    restored = topology_state.complete_eviction(eviction.id,
+                                                eviction.lease_token,
+                                                present=None,
+                                                provider_not_called=True,
+                                                now=102)
+
+    assert restored is None
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.EVICTING
+    assert unchanged.lease_kind == 'EVICT'
+
+
+def test_inventory_listing_blocks_fresh_eviction_between_pages(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    listing = _start_inventory_listing(image_database, regional.shard_id,
+                                       (regional.runtime_digest,))
+    assert listing.observed_manifests == 1
+
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=103)
+
+    assert eviction is None
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.READY
+
+
+def test_inventory_listing_blocks_no_io_eviction_restore(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=50)
+    assert eviction is not None and eviction.id == regional.id
+    assert eviction.lease_token is not None
+    _start_inventory_listing(image_database, regional.shard_id,
+                             (regional.runtime_digest,))
+
+    restored = topology_state.complete_eviction(eviction.id,
+                                                eviction.lease_token,
+                                                present=None,
+                                                provider_not_called=True,
+                                                now=103)
+
+    assert restored is None
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.EVICTING
+    assert unchanged.lease_kind == 'EVICT'
+
+
+def test_inventory_listing_defers_capacity_releasing_readback(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=50)
+    assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=51)
+    eviction = _mark_readback(eviction, now=52)
+    shard_before = topology_state.get_shard(regional.shard_id)
+    assert shard_before is not None
+    _start_inventory_listing(image_database, regional.shard_id,
+                             (regional.runtime_digest,))
+
+    completed = topology_state.complete_eviction(eviction.id,
+                                                 eviction.lease_token,
+                                                 present=False,
+                                                 now=103)
+
+    assert completed is None
+    retained = topology_state.get_location(regional.id)
+    assert retained is not None
+    assert retained.state == models.ImageLocationState.EVICTING
+    assert retained.lease_kind == 'READBACK'
+    shard_after = topology_state.get_shard(regional.shard_id)
+    assert shard_after is not None
+    assert shard_after.reserved_manifests == shard_before.reserved_manifests
+
+
+def test_expired_readback_is_reclaimed_without_repeating_delete(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    eviction = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                  unused_before=1000,
+                                                  lease_seconds=60,
+                                                  now=100)
+    assert eviction is not None and eviction.lease_token is not None
+    eviction = _begin_delete(eviction, now=100)
+    eviction = _mark_readback(eviction, now=100)
+    old_token = eviction.lease_token
+
+    reclaimed = topology_state.claim_next_eviction(worker_id='lifecycle-2',
+                                                   unused_before=1000,
+                                                   lease_seconds=60,
+                                                   now=161)
+
+    assert reclaimed is not None and reclaimed.id == regional.id
+    assert reclaimed.state == models.ImageLocationState.EVICTING
+    assert reclaimed.lease_kind == 'READBACK'
+    assert reclaimed.lease_token != old_token
+    shard = topology_state.get_shard(regional.shard_id)
+    assert shard is not None and shard.in_flight == 1
+    completed = topology_state.complete_eviction(reclaimed.id,
+                                                 reclaimed.lease_token,
+                                                 present=False,
+                                                 now=162)
+    assert completed is not None
+    assert completed.state == models.ImageLocationState.EVICTED
+
+
 def test_drifted_shard_rejects_location_readmission(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -1338,6 +1911,7 @@ def test_demand_fences_eviction_until_two_terminal_observations(
     shard_before = topology_state.get_shard(regional.shard_id)
     assert shard_before is not None
     eviction = _begin_delete(eviction, now=3701)
+    eviction = _mark_readback(eviction, now=3701)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -2440,6 +3014,7 @@ def test_ready_commit_and_evicted_readmission_follow_global_lock_order(
     assert eviction is not None and eviction.id == regional.id
     assert eviction.lease_token is not None
     eviction = _begin_delete(eviction, now=100)
+    eviction = _mark_readback(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -3040,10 +3615,11 @@ def test_no_io_restore_rejects_committed_delete_intent(
     assert retained.state == models.ImageLocationState.EVICTING
     assert retained.lease_kind == 'DELETE'
 
+    eviction = _mark_readback(eviction, now=102)
     completed = topology_state.complete_eviction(eviction.id,
                                                  eviction.lease_token,
                                                  present=True,
-                                                 now=102)
+                                                 now=103)
     assert completed is not None
     assert completed.state == models.ImageLocationState.READY
 
@@ -3183,6 +3759,7 @@ def test_eviction_exact_absence_with_new_demand_requeues_without_release(
     assert eviction is not None and eviction.lease_token is not None
     _warming_demand(active, publication_record, regional, profile, now=101)
     eviction = _begin_delete(eviction, now=101)
+    eviction = _mark_readback(eviction, now=101)
 
     completed = topology_state.complete_eviction(eviction.id,
                                                  eviction.lease_token,
@@ -3304,13 +3881,14 @@ def test_inflight_delete_expiry_quarantines_before_late_completion(
         def __init__(self, hooks: Any) -> None:
             self._hooks = hooks
 
-        def delete_outcome(self, digest: str) -> aws.DeleteOutcome:
+        def delete_request_outcome(self,
+                                   digest: str) -> aws.DeleteRequestOutcome:
             assert digest == regional.runtime_digest
             self._hooks.before_call()
             provider_call_started.set()
             assert resume_provider_call.wait(timeout=5)
             delete_completed.set()
-            return aws.DeleteOutcome.ABSENT
+            return aws.DeleteRequestOutcome.CONCLUDED
 
     def repository_from_role(*_args: Any, **kwargs: Any) -> PausedRepository:
         return PausedRepository(kwargs['hooks'])
@@ -3397,6 +3975,7 @@ def test_eviction_reopens_full_shard_when_reservation_is_released(
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
     eviction = _begin_delete(eviction, now=100)
+    eviction = _mark_readback(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -3422,6 +4001,7 @@ def test_new_runtime_demand_readmits_evicted_location(
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
     eviction = _begin_delete(eviction, now=100)
+    eviction = _mark_readback(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,
@@ -3473,6 +4053,7 @@ def test_explicit_prepare_readmits_existing_evicted_location(
                                                   now=100)
     assert eviction is not None and eviction.lease_token is not None
     eviction = _begin_delete(eviction, now=100)
+    eviction = _mark_readback(eviction, now=100)
     evicted = topology_state.complete_eviction(eviction.id,
                                                eviction.lease_token,
                                                present=False,

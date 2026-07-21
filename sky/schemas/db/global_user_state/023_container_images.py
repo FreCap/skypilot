@@ -379,6 +379,10 @@ def _create_tables() -> None:
         sqlalchemy.Column('inventory_cursor', sqlalchemy.Text),
         sqlalchemy.Column('inventory_started_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('inventory_completed_at', sqlalchemy.BigInteger),
+        sqlalchemy.Column('inventory_finalizing',
+                          sqlalchemy.Boolean,
+                          nullable=False,
+                          server_default=sqlalchemy.false()),
         sqlalchemy.Column('inventory_lease_token', sqlalchemy.Text),
         sqlalchemy.Column('inventory_lease_expires_at', sqlalchemy.BigInteger),
         sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
@@ -410,6 +414,10 @@ def _create_tables() -> None:
             'NULL) OR (inventory_lease_token IS NOT NULL AND '
             'inventory_lease_expires_at IS NOT NULL)',
             name='ck_container_image_registry_inventory_lease'),
+        sqlalchemy.CheckConstraint(
+            'inventory_finalizing IS FALSE OR inventory_completed_at IS NOT '
+            'NULL',
+            name='ck_container_image_registry_inventory_finalizing'),
     )
     op.create_index('ix_container_image_registry_shard_dispatch',
                     'container_image_registry_shards', [
@@ -487,7 +495,7 @@ def _create_tables() -> None:
             name='ck_container_image_location_lease'),
         sqlalchemy.CheckConstraint(
             "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
-            "'DELETE')",
+            "'DELETE', 'READBACK')",
             name='ck_container_image_location_lease_kind'),
         sqlalchemy.CheckConstraint(
             "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED', "
@@ -506,6 +514,12 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_locations_shard_readiness',
                     'container_image_locations',
                     ['shard_id', 'state', 'updated_at', 'id'])
+    op.create_index(
+        'ix_container_image_locations_inventory_confirmation',
+        'container_image_locations',
+        ['shard_id', 'last_verified_at', 'id', 'inventory_epoch_seen'],
+        postgresql_where=sqlalchemy.text(
+            "state = 'READY' AND last_verified_at IS NOT NULL"))
     op.create_index(
         'ix_container_image_locations_eviction',
         'container_image_locations', [

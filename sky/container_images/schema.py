@@ -18,7 +18,7 @@ PROFILE_STATES = ('QUALIFYING', 'ACTIVE', 'FAILED', 'SUPERSEDED', 'RETIRED')
 SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
-LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'DELETE')
+LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'DELETE', 'READBACK')
 
 
 def _one_of(column: str, values: tuple[str, ...],
@@ -307,6 +307,10 @@ registry_shards = sqlalchemy.Table(
     sqlalchemy.Column('inventory_cursor', sqlalchemy.Text),
     sqlalchemy.Column('inventory_started_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('inventory_completed_at', sqlalchemy.BigInteger),
+    sqlalchemy.Column('inventory_finalizing',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
     sqlalchemy.Column('inventory_lease_token', sqlalchemy.Text),
     sqlalchemy.Column('inventory_lease_expires_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
@@ -333,6 +337,9 @@ registry_shards = sqlalchemy.Table(
         'NULL) OR (inventory_lease_token IS NOT NULL AND '
         'inventory_lease_expires_at IS NOT NULL)',
         name='ck_container_image_registry_inventory_lease'),
+    sqlalchemy.CheckConstraint(
+        'inventory_finalizing IS FALSE OR inventory_completed_at IS NOT NULL',
+        name='ck_container_image_registry_inventory_finalizing'),
     sqlalchemy.Index('ix_container_image_registry_shard_dispatch', 'workspace',
                      'profile', 'target_id', 'state', 'last_dispatch_at', 'id'),
     sqlalchemy.Index('ix_container_image_registry_shard_inventory', 'state',
@@ -399,7 +406,7 @@ locations = sqlalchemy.Table(
         name='ck_container_image_location_lease'),
     sqlalchemy.CheckConstraint(
         "lease_kind IS NULL OR lease_kind IN ('COPY', 'VERIFY', 'EVICT', "
-        "'DELETE')",
+        "'DELETE', 'READBACK')",
         name='ck_container_image_location_lease_kind'),
     sqlalchemy.CheckConstraint(
         "canonical IS FALSE OR state NOT IN ('EVICTING', 'EVICTED', "
@@ -414,6 +421,13 @@ locations = sqlalchemy.Table(
                      'state', 'next_retry_at', 'updated_at', 'id'),
     sqlalchemy.Index('ix_container_image_locations_shard_readiness', 'shard_id',
                      'state', 'updated_at', 'id'),
+    sqlalchemy.Index('ix_container_image_locations_inventory_confirmation',
+                     'shard_id',
+                     'last_verified_at',
+                     'id',
+                     'inventory_epoch_seen',
+                     postgresql_where=sqlalchemy.text(
+                         "state = 'READY' AND last_verified_at IS NOT NULL")),
     sqlalchemy.Index(
         'ix_container_image_locations_eviction',
         'shard_id',

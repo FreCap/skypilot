@@ -1132,6 +1132,7 @@ def _activation_shard_capacities(
             live['inventory_epoch'] != int(shard['inventory_epoch']) or
             type(live.get('inventory_completed_at')) is not int or
             live['inventory_completed_at'] != shard['inventory_completed_at'] or
+            bool(shard['inventory_finalizing']) or
             shard['inventory_lease_token'] is not None):
         raise ValueError('QUALIFICATION_FAILED')
     max_manifests = expected.get('max_manifests')

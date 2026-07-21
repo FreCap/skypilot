@@ -97,6 +97,15 @@ class DeleteOutcome(enum.Enum):
     PRESENT = 'PRESENT'
     AMBIGUOUS = 'AMBIGUOUS'
     NOT_STARTED = 'NOT_STARTED'
+    READBACK_RETRY = 'READBACK_RETRY'
+
+
+class DeleteRequestOutcome(enum.Enum):
+    """Provider conclusion for the destructive request, before readback."""
+
+    CONCLUDED = 'CONCLUDED'
+    AMBIGUOUS = 'AMBIGUOUS'
+    NOT_STARTED = 'NOT_STARTED'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -604,20 +613,35 @@ def _canonical_json_hash(value: Any) -> str:
                    separators=(',', ':')).encode()).hexdigest()
 
 
-def applied_ecr_images_per_repository_quota(binding: AwsRoleBinding,
-                                            region: str) -> int:
+def applied_ecr_images_per_repository_quota(
+    binding: AwsRoleBinding,
+    region: str,
+    *,
+    provider_fence: Callable[[], None] | None = None,
+) -> int:
     """Reads the customized quota, falling back to the AWS default."""
-    client = assumed_client(binding, 'service-quotas', region)
+    client = assumed_client(binding,
+                            'service-quotas',
+                            region,
+                            provider_fence=provider_fence)
     kwargs = {
         'ServiceCode': 'ecr',
         'QuotaCode': 'L-03A36CE1',
     }
     try:
+        if provider_fence is not None:
+            provider_fence()
         response = client.get_service_quota(**kwargs)
+        if provider_fence is not None:
+            provider_fence()
     except Exception as error:  # pylint: disable=broad-except
         if _error_code(error) != 'NoSuchResourceException':
             raise
+        if provider_fence is not None:
+            provider_fence()
         response = client.get_aws_default_service_quota(**kwargs)
+        if provider_fence is not None:
+            provider_fence()
     value = (response.get('Quota') or {}).get('Value')
     if (not isinstance(value, (int, float)) or isinstance(value, bool) or
             value < 1 or int(value) != value):
@@ -669,7 +693,13 @@ class _HookedEcrClient:
         return call
 
 
-def assumed_client(binding: AwsRoleBinding, service: str, region: str) -> Any:
+def assumed_client(
+    binding: AwsRoleBinding,
+    service: str,
+    region: str,
+    *,
+    provider_fence: Callable[[], None] | None = None,
+) -> Any:
     """Mints one short-lived role session for a bounded worker adapter."""
     assume_kwargs: dict[str, Any] = {
         'RoleArn': binding.role_arn,
@@ -685,7 +715,12 @@ def assumed_client(binding: AwsRoleBinding, service: str, region: str) -> Any:
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
-    response = aws_adaptor.client('sts').assume_role(**assume_kwargs)
+    sts = aws_adaptor.client('sts')
+    if provider_fence is not None:
+        provider_fence()
+    response = sts.assume_role(**assume_kwargs)
+    if provider_fence is not None:
+        provider_fence()
     credentials = response['Credentials']
     session = aws_adaptor.boto3.Session(
         aws_access_key_id=credentials['AccessKeyId'],
@@ -700,8 +735,13 @@ def assumed_client(binding: AwsRoleBinding, service: str, region: str) -> Any:
                                          retries={'max_attempts': 1}))
 
 
-def _assumed_ecr_client(binding: AwsRoleBinding, region: str) -> Any:
-    return assumed_client(binding, 'ecr', region)
+def _assumed_ecr_client(
+    binding: AwsRoleBinding,
+    region: str,
+    *,
+    provider_fence: Callable[[], None] | None = None,
+) -> Any:
+    return assumed_client(binding, 'ecr', region, provider_fence=provider_fence)
 
 
 def mint_ecr_source_credentials(
@@ -710,10 +750,15 @@ def mint_ecr_source_credentials(
     region: str,
     account: str,
     expected_authority: str,
+    provider_fence: Callable[[], None] | None = None,
 ) -> providers.SourceCredentials:
     """Mints one in-memory Docker bearer credential for an exact ECR source."""
-    client = _assumed_ecr_client(binding, region)
+    client = _assumed_ecr_client(binding, region, provider_fence=provider_fence)
+    if provider_fence is not None:
+        provider_fence()
     response = client.get_authorization_token(registryIds=[account])
+    if provider_fence is not None:
+        provider_fence()
     entries = response.get('authorizationData', [])
     if len(entries) != 1:
         raise ValueError('ECR authorization returned an unexpected registry.')
@@ -740,13 +785,17 @@ class EcrRepository:
         self.repository_name = repository_name
 
     @classmethod
-    def from_role(cls,
-                  binding: AwsRoleBinding,
-                  region: str,
-                  repository_name: str,
-                  *,
-                  hooks: EcrCallHooks | None = None) -> EcrRepository:
-        client = _assumed_ecr_client(binding, region)
+    def from_role(
+            cls,
+            binding: AwsRoleBinding,
+            region: str,
+            repository_name: str,
+            *,
+            hooks: EcrCallHooks | None = None,
+            provider_fence: Callable[[], None] | None = None) -> EcrRepository:
+        client = _assumed_ecr_client(binding,
+                                     region,
+                                     provider_fence=provider_fence)
         if hooks is not None:
             client = _HookedEcrClient(client, hooks)
         return cls(client, repository_name)
@@ -1029,8 +1078,8 @@ class EcrRepository:
                 return CopyOutcome.AMBIGUOUS
             raise AssertionError('unreachable') from error
 
-    def delete_outcome(self, digest: str) -> DeleteOutcome:
-        """Deletes one digest and reports only provider-proven outcomes."""
+    def delete_request_outcome(self, digest: str) -> DeleteRequestOutcome:
+        """Submits one delete without collapsing later readback failures."""
         digest = models.validate_sha256_digest(digest, 'ECR delete digest')
         calls_before = getattr(self._client, 'started_calls', None)
         try:
@@ -1041,21 +1090,27 @@ class EcrRepository:
         except Exception as error:  # pylint: disable=broad-except
             calls_after = getattr(self._client, 'started_calls', None)
             if (calls_before is not None and calls_after == calls_before):
-                return DeleteOutcome.NOT_STARTED
+                return DeleteRequestOutcome.NOT_STARTED
             # A read after a transport failure cannot prove that the timed-out
             # delete will not arrive later. Only an explicit provider rejection
             # known not to mutate may safely proceed to exact readback.
             if (_error_code_in_chain(error)
                     not in _DELETE_NO_MUTATION_ERROR_CODES):
-                return DeleteOutcome.AMBIGUOUS
+                return DeleteRequestOutcome.AMBIGUOUS
+        return DeleteRequestOutcome.CONCLUDED
+
+    def delete_outcome(self, digest: str) -> DeleteOutcome:
+        """Deletes one digest and reports request and readback outcomes."""
+        request = self.delete_request_outcome(digest)
+        if request == DeleteRequestOutcome.NOT_STARTED:
+            return DeleteOutcome.NOT_STARTED
+        if request == DeleteRequestOutcome.AMBIGUOUS:
+            return DeleteOutcome.AMBIGUOUS
         try:
             return (DeleteOutcome.ABSENT if self._batch_get_manifest(digest)
                     is None else DeleteOutcome.PRESENT)
         except Exception:  # pylint: disable=broad-except
-            calls_after = getattr(self._client, 'started_calls', None)
-            if (calls_before is not None and calls_after == calls_before):
-                return DeleteOutcome.NOT_STARTED
-            return DeleteOutcome.AMBIGUOUS
+            return DeleteOutcome.READBACK_RETRY
 
     def exact_delete(self, digest: str) -> bool:
         """Deletes one regional digest and proves exact absence."""

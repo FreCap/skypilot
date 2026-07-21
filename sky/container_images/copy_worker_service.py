@@ -149,8 +149,11 @@ def _docker_config_credentials(binding: models.RegistryAccessBinding,
     return providers.SourceCredentials(username=username, password=password)
 
 
-def _source_reader(source: catalog_state.SourceRecord,
-                   profile_name: str) -> providers.RegistryV2Source:
+def _source_reader(
+    source: catalog_state.SourceRecord,
+    profile_name: str,
+    provider_fence: Callable[[], None] | None = None,
+) -> providers.RegistryV2Source:
     binding = config.get_source_binding(source.source_auth_binding_id)
     if binding is not None and binding.fingerprint != source.source_auth_fingerprint:
         raise ValueError('AUTH_BINDING_UNAVAILABLE')
@@ -182,7 +185,8 @@ def _source_reader(source: catalog_state.SourceRecord,
                     profile_tag=profile_name),
                 region=match.group('region'),
                 account=match.group('account'),
-                expected_authority=authority)
+                expected_authority=authority,
+                provider_fence=provider_fence)
         else:
             raise ValueError('AUTH_BINDING_UNAVAILABLE')
         cached.append(credentials)
@@ -233,12 +237,13 @@ def inspect_publication(publication: catalog_state.PublicationRecord,
         source_auth_binding_id=publication.source_auth_binding_id,
         source_auth_fingerprint=publication.source_auth_fingerprint,
         created_at=publication.created_at)
-    reader = _source_reader(source, profile.name)
     heartbeat = _LeaseHeartbeat(
         lambda: catalog_state.heartbeat_publication_inspection(
             publication.id, token, lease_seconds), max(1.0, lease_seconds / 3))
     try:
         with heartbeat:
+            reader = _source_reader(source, profile.name,
+                                    heartbeat.assert_owned)
             graph = _inspection_graph(reader, publication.requested_platform,
                                       profile.limits.max_artifact_bytes)
             heartbeat.assert_owned()
@@ -334,7 +339,7 @@ def _graph_for_location(
         source = catalog_state.source_for_canonical_location(location.id)
         if source is None:
             raise ValueError('Canonical location has no retained source.')
-        reader = _source_reader(source, profile.name)
+        reader = _source_reader(source, profile.name, heartbeat.assert_owned)
         graph = _inspection_graph(reader, artifact.platform,
                                   profile.limits.max_artifact_bytes)
         return graph, reader.read_blob
@@ -354,7 +359,8 @@ def _graph_for_location(
         source_role,
         source_shard.region,
         source_shard.repository_name,
-        hooks=_ecr_hooks(limiter, source_shard, heartbeat))
+        hooks=_ecr_hooks(limiter, source_shard, heartbeat),
+        provider_fence=heartbeat.assert_owned)
     heartbeat.assert_owned()
     limits = oci.OciInspectionLimits(
         max_artifact_bytes=profile.limits.max_artifact_bytes)
@@ -446,12 +452,12 @@ def copy_location(location: topology_state.LocationRecord,
             destination_role = _aws_role(write_binding, profile,
                                          'destination_write')
             heartbeat.assert_owned()
-            destination = aws.EcrRepository.from_role(destination_role,
-                                                      shard.region,
-                                                      shard.repository_name,
-                                                      hooks=_ecr_hooks(
-                                                          limiter, shard,
-                                                          heartbeat))
+            destination = aws.EcrRepository.from_role(
+                destination_role,
+                shard.region,
+                shard.repository_name,
+                hooks=_ecr_hooks(limiter, shard, heartbeat),
+                provider_fence=(heartbeat.assert_owned))
             heartbeat.assert_owned()
             if location.state == models.ImageLocationState.COPYING:
                 outcome = destination.copy_graph(graph, read_blob,
@@ -565,11 +571,15 @@ def _matching_shard_metadata(
     role: aws.AwsRoleBinding,
     shard: topology_state.ShardRecord,
     expected: dict[str, Any],
+    provider_fence: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], int, int] | None:
     """Returns exact live facts only when Terraform and quota still agree."""
     metadata = repository.repository_metadata()
+    quota_kwargs = ({
+        'provider_fence': provider_fence
+    } if provider_fence is not None else {})
     applied_quota = aws.applied_ecr_images_per_repository_quota(
-        role, shard.region)
+        role, shard.region, **quota_kwargs)
     expected_values = {
         'repository_arn': expected.get('repository_arn'),
         'repository_uri': expected.get('repository_uri'),
@@ -825,66 +835,97 @@ def reconcile_inventory(
     shard: topology_state.ShardRecord,
     *,
     limiter: budgets.ProviderBudgetLimiter,
+    lease_seconds: int = _DEFAULT_LEASE_SECONDS,
 ) -> bool:
-    """Advances one provider page and exactly confirms bounded absences."""
+    """Advances one provider or finalization page under durable authority."""
     token = shard.inventory_lease_token
     if token is None:
         return False
+    heartbeat = _LeaseHeartbeat(
+        lambda: topology_state.heartbeat_inventory_shard(
+            shard.id, token, lease_seconds), max(1.0, lease_seconds / 3))
     try:
-        revision, profile = _profile_for_shard(shard)
-        target = profile.target(shard.target_id)
-        binding = profile.bindings[target.write_authority]
-        role = _aws_role(binding, profile, 'verify')
-        repository = aws.EcrRepository.from_role(role,
-                                                 shard.region,
-                                                 shard.repository_name,
-                                                 hooks=_ecr_hooks(
-                                                     limiter, shard))
-        live_key, expected = _expected_shard_attestation(revision, shard)
-        verified = _matching_shard_metadata(repository, role, shard, expected)
-        if verified is None:
-            topology_state.mark_shard_drifted(shard.id, token)
-            return False
-        metadata, applied_quota, headroom = verified
-        digests, cursor = repository.inventory_page(
-            next_token=shard.inventory_cursor)
-        completed = topology_state.record_inventory_page(
-            shard.id, token, digests, cursor)
-        if completed is None:
-            return False
-        if cursor is not None:
-            return True
-        if completed.state not in (models.ImageShardState.READY,
-                                   models.ImageShardState.FULL):
-            return True
-        candidates = topology_state.list_inventory_missing_candidates(
-            shard.id,
-            completed.inventory_epoch,
-            limit=_INVENTORY_CONFIRMATION_LIMIT)
-        for location in candidates:
-            present = repository.exact_manifest_exists(location.runtime_digest)
-            topology_state.complete_inventory_confirmation(
-                location.id,
+        with heartbeat:
+            revision, profile = _profile_for_shard(shard)
+            target = profile.target(shard.target_id)
+            binding = profile.bindings[target.write_authority]
+            role = _aws_role(binding, profile, 'verify')
+            heartbeat.assert_owned()
+            repository = aws.EcrRepository.from_role(
+                role,
+                shard.region,
+                shard.repository_name,
+                hooks=_ecr_hooks(limiter, shard, heartbeat),
+                provider_fence=(heartbeat.assert_owned))
+            heartbeat.assert_owned()
+            live_key, expected = _expected_shard_attestation(revision, shard)
+            verified = _matching_shard_metadata(
+                repository,
+                role,
+                shard,
+                expected,
+                provider_fence=heartbeat.assert_owned)
+            if verified is None:
+                return topology_state.mark_shard_drifted(shard.id, token)
+            metadata, applied_quota, headroom = verified
+            completed: topology_state.ShardRecord | None
+            if shard.inventory_finalizing:
+                completed = shard
+            else:
+                digests, cursor = repository.inventory_page(
+                    next_token=shard.inventory_cursor)
+                completed = topology_state.record_inventory_page(
+                    shard.id, token, digests, cursor)
+                if completed is None:
+                    return False
+                if cursor is not None or completed.state not in (
+                        models.ImageShardState.READY,
+                        models.ImageShardState.FULL):
+                    return topology_state.release_inventory_claim(
+                        shard.id, token, completed.inventory_epoch)
+            candidates = topology_state.list_inventory_missing_candidates(
                 shard.id,
                 completed.inventory_epoch,
-                present=present)
-        topology_state.record_profile_attestation(
-            profile_revision_id=revision.id,
-            kind=live_key,
-            evidence={
-                'status': 'READY',
-                'observed_at': int(time.time()),
-                'physical_fingerprint': shard.physical_fingerprint,
-                'target_fingerprint': shard.target_fingerprint,
-                **metadata,
-                'applied_images_per_repository_quota': applied_quota,
-                'reserved_headroom': headroom,
-                'inventory_epoch': completed.inventory_epoch,
-                'inventory_completed_at': completed.inventory_completed_at,
-            },
-            expected_generation=revision.desired_generation,
-            expected_config_hash=revision.config_hash)
-        return True
+                limit=_INVENTORY_CONFIRMATION_LIMIT)
+            for location in candidates:
+                present = repository.exact_manifest_exists(
+                    location.runtime_digest)
+                confirmed = topology_state.complete_inventory_confirmation(
+                    location.id,
+                    shard.id,
+                    completed.inventory_epoch,
+                    token,
+                    present=present)
+                if confirmed is None:
+                    return False
+            if completed.inventory_completed_at is None:
+                return False
+            recorded = (topology_state.record_inventory_attestation_and_release(
+                profile_revision_id=revision.id,
+                expected_generation=revision.desired_generation,
+                expected_config_hash=revision.config_hash,
+                shard_id=shard.id,
+                inventory_lease_token=token,
+                expected_profile_revision_id=shard.profile_revision_id,
+                expected_target_fingerprint=shard.target_fingerprint,
+                expected_physical_fingerprint=shard.physical_fingerprint,
+                expected_inventory_epoch=completed.inventory_epoch,
+                expected_inventory_completed_at=(
+                    completed.inventory_completed_at),
+                kind=live_key,
+                evidence={
+                    'status': 'READY',
+                    'observed_at': int(time.time()),
+                    'physical_fingerprint': shard.physical_fingerprint,
+                    'target_fingerprint': shard.target_fingerprint,
+                    **metadata,
+                    'applied_images_per_repository_quota': applied_quota,
+                    'reserved_headroom': headroom,
+                    'inventory_epoch': completed.inventory_epoch,
+                    'inventory_completed_at':
+                        (completed.inventory_completed_at),
+                }))
+            return recorded is not None
     except (aws.ProviderThrottledError, aws.AmbiguousProviderOutcomeError,
             budgets.ProviderBudgetUnavailableError):
         topology_state.abandon_inventory_claim(shard.id, token)
@@ -1022,7 +1063,8 @@ class CopyWorkerService:
                         futures.add(
                             executor.submit(reconcile_inventory,
                                             record,
-                                            limiter=self._budget_limiter))
+                                            limiter=self._budget_limiter,
+                                            lease_seconds=self.lease_seconds))
                 self._stop.wait(1 if futures else 5)
 
 
