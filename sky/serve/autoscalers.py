@@ -3985,13 +3985,31 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> int:
-        """Latest-version planned slots not already leaving the fleet."""
+        """Latest-version planned slots, from every launch origin."""
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
             if
             (not info.is_terminal and info.version == self.latest_version and
              getattr(info.status_property, 'is_scale_down', False) is not True))
+
+    def _latest_demand_owned_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Latest-version planned slots whose launch origin was demand.
+
+        ``reserved_fill`` is launch-origin attribution, not placement-cost
+        provenance. A demand launch remains demand-owned when it lands on a
+        zero-cost location. Legacy rows missing the additive flag default to
+        demand-owned, which is the conservative compatibility direction.
+        """
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if (not info.is_terminal and info.version == self.latest_version and
+                getattr(info.status_property, 'is_scale_down', False)
+                is not True and not getattr(info, 'reserved_fill', False)))
 
     def _limit_logical_scale_up(
         self,
@@ -4064,7 +4082,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     ) -> int:
         if self.replica_unit != 'logical':
             return raw_target
-        committed = self._latest_committed_logical_capacity(replica_infos)
+        committed = self._latest_demand_owned_logical_capacity(replica_infos)
         allowance = max(
             1,
             math.ceil(committed * self.max_scale_down_rate_percentage / 100.0))
@@ -4087,6 +4105,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 info.status in provisioning_statuses and getattr(
                     info.status_property, 'is_scale_down', False) is not True))
 
+    def _provisioning_demand_owned_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Demand-owned subset of provisioning logical capacity."""
+        provisioning_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+        }
+        return sum(
+            self._committed_capacity(info)
+            for info in replica_infos
+            if (not info.is_terminal and info.version == self.latest_version and
+                info.status in provisioning_statuses and
+                getattr(info.status_property, 'is_scale_down', False)
+                is not True and not getattr(info, 'reserved_fill', False)))
+
     def _adopt_scale_down_target(
         self,
         raw_target: int,
@@ -4097,7 +4133,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return
         self.target_num_replicas = self._limit_logical_scale_down(
             raw_target, replica_infos)
-        provisioning = self._provisioning_logical_capacity(replica_infos)
+        provisioning = self._provisioning_demand_owned_logical_capacity(
+            replica_infos)
         allowance = (max(
             1,
             math.ceil(provisioning * self.max_scale_down_rate_percentage /
@@ -4655,14 +4692,18 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (self.replica_unit == 'logical' and
                 self._snap_target_on_next_recompute):
             # The adopted target is controller-local and rebuilds at
-            # min_replicas, while the latest-version fleet may already be much
-            # larger. Re-establish that committed fleet as the actuation
-            # baseline once, before applying hysteresis and the downscale limit.
+            # min_replicas, while the latest-version demand-owned fleet may
+            # already be much larger. Re-establish that traffic fleet as the
+            # actuation baseline once, before applying hysteresis and the
+            # downscale limit. Fill-origin rows remain independently protected
+            # by the reserved-capacity overlay; including them here would turn
+            # opportunistic supply into paid replacement demand.
             # Otherwise the first fresh report after a restart can publish a
             # tiny target and retire the whole live fleet in one tick. Do not
             # repeat this after the one-shot snap: an adopted downscale target
             # must remain below committed capacity while retirement catches up.
-            committed = self._latest_committed_logical_capacity(replica_infos)
+            committed = self._latest_demand_owned_logical_capacity(
+                replica_infos)
             self.target_num_replicas = max(
                 self.target_num_replicas,
                 self._clip_concurrency_demand_target(committed))
@@ -5400,10 +5441,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             serve_state.ReplicaStatus.PROVISIONING,
             serve_state.ReplicaStatus.STARTING,
         }
-        remaining_pending = sum(
+        remaining_demand_pending = sum(
             self._committed_capacity(info)
             for info in latest_nonterminal_replicas
-            if info.status in provisioning_statuses)
+            if (info.status in provisioning_statuses and
+                not getattr(info, 'reserved_fill', False)))
         decisions: list[AutoscalerDecision] = []
         for info in candidates:
             card = _card(info)
@@ -5415,9 +5457,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             remaining_card_ready = (remaining_ready_by_card.get(card, 0)
                                     if card is not None else 0)
             committed_width = self._committed_capacity(info)
-            if (info.status in provisioning_statuses and
+            demand_owned = not getattr(info, 'reserved_fill', False)
+            if (info.status in provisioning_statuses and demand_owned and
                     self._pending_retention_floor is not None and
-                    remaining_pending - committed_width
+                    remaining_demand_pending - committed_width
                     < self._pending_retention_floor):
                 # The frozen episode budget is measured in logical slots. A
                 # multi-slot victim that would overspend is conservatively
@@ -5457,8 +5500,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if card is not None:
                 remaining_committed_by_card[card] = (
                     remaining_committed_by_card.get(card, 0) - committed_width)
-            if info.status in provisioning_statuses:
-                remaining_pending -= committed_width
+            if info.status in provisioning_statuses and demand_owned:
+                remaining_demand_pending -= committed_width
             decisions.append(
                 AutoscalerDecision(
                     AutoscalerDecisionOperator.SCALE_DOWN,
@@ -5474,7 +5517,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             self.configured_accelerator_shapes.items())
                                             if use_card_targets else ()))))
         self._pending_budget_spent = max(
-            0, self._pending_capacity_at_adoption - remaining_pending)
+            0, self._pending_capacity_at_adoption - remaining_demand_pending)
         return decisions
 
     def _select_victims_capacity_and_cost_aware(

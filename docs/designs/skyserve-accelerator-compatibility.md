@@ -112,6 +112,43 @@ is part of this exact-card design:
   active-location checks, and zero-cost-only launch pinning remain mandatory.
   The aggregate demand target and capacity hint remain demand-only.
 
+### Demand-only paid backfill and retirement accounting
+
+Reserved fill is opportunistic supply, not traffic intent. A replica launched
+by the reserved-fill overlay (`reserved_fill=true`) must never raise or retain
+the traffic target and must never cause a paid replacement when its reserved
+slot is reclaimed. The broker may replace that row only through the existing
+epoch-fenced, zero-cost-only fill launch path. Replicas launched for traffic
+remain demand-owned even when placement happens to put them on a zero-cost
+location; losing one may therefore require an ordinary compatible replacement.
+
+For logical concurrency scaling, use demand-owned latest-version capacity for
+all three traffic-retirement state transitions:
+
+- the one-shot aggregate target reconstruction after controller restart;
+- the configurable percentage limit applied after a completed downscale
+  hysteresis window; and
+- the frozen pending-capacity retention budget for that downscale episode.
+
+Apply the pending budget only to demand-owned pending rows. Fill-origin pending
+rows neither enlarge the cancellation allowance nor consume the protected
+demand cohort. Rows persisted by versions that predate `reserved_fill` default
+to demand-owned, which is the conservative compatibility direction.
+
+Do not replace the existing total-committed accounting used for scale-up wave
+budgets, duplicate-launch suppression, aggregate hard ceilings, readiness
+coverage, or status/history capacity. Already committed fill capacity can
+satisfy compatible traffic and must prevent a duplicate paid launch while it
+exists. The separation controls which capacity can retain demand intent, not
+whether compatible reserved capacity can serve requests.
+
+During a controller/LB mixed-version interval, the existing active-Pod,
+HA-slot, lifecycle-generation, and routing-version fences remain authoritative.
+An incomplete exact-card report cannot authorize scaling. It also must not
+convert the committed fill fleet into traffic demand: the held traffic baseline
+is reconstructed from demand-owned rows, while the independent fill overlay
+continues protecting observed zero-cost capacity.
+
 ## Behavioral contract
 
 ### Request compatibility wire contract

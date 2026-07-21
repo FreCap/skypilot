@@ -80,7 +80,8 @@ def _replica(replica_id,
              card='L4',
              status=serve_state.ReplicaStatus.READY,
              version=1,
-             planned_capacity=None):
+             planned_capacity=None,
+             reserved_fill=False):
     info = mock.Mock()
     info.replica_id = replica_id
     info.version = version
@@ -91,6 +92,7 @@ def _replica(replica_id,
     info.planned_capacity = (gpu_count
                              if planned_capacity is None else planned_capacity)
     info.unknown_capacity_replacement = False
+    info.reserved_fill = reserved_fill
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
     info.status_property.is_scale_down = False
@@ -1207,6 +1209,40 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertTrue(autoscaler._snap_target_on_next_recompute)
         self.assertEqual(autoscaler.target_num_replicas, 1)
 
+    def test_fill_restart_survives_old_to_new_lb_report_handoff(self):
+        autoscaler = _make_autoscaler(max_replicas=1000, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = [
+            _replica(i + 1, card='L4', reserved_fill=True) for i in range(159)
+        ]
+        idle = {replica.replica_id: 0 for replica in replicas}
+
+        # The selected old LB is authoritative for aggregate demand, but its
+        # older wire protocol cannot prove exact-card attribution. Keep the
+        # restart fence armed and do not turn fill capacity into demand.
+        _report(autoscaler, in_flight=idle, compatibility_complete=False)
+        self.assertEqual(_decisions(autoscaler, replicas), [])
+        self.assertTrue(autoscaler._snap_target_on_next_recompute)
+        self.assertEqual(autoscaler.target_num_replicas, 0)
+
+        # The first complete report from the upgraded active LB supersedes the
+        # incomplete snapshot. Orange follows observed traffic, not the 159
+        # fill-origin slots that remain usable capacity.
+        _report(autoscaler,
+                in_flight=idle,
+                queue_depth=17,
+                queued_profiles=[self._profile(20, ['L4'], 17)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        _decisions(autoscaler, replicas)
+
+        self.assertFalse(autoscaler._snap_target_on_next_recompute)
+        self.assertEqual(autoscaler._raw_target_num_replicas, 17)
+        self.assertEqual(autoscaler.target_num_replicas, 17)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 17})
+
     def test_logical_restart_seeds_card_map_before_downscale(self):
         autoscaler = _make_autoscaler(max_replicas=20,
                                       replica_unit='logical',
@@ -1891,6 +1927,102 @@ class TestLogicalScalingWaves(unittest.TestCase):
             clock.return_value = 380.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_fill_origin_does_not_become_restart_or_downscale_demand(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        demand = [_replica(i + 1) for i in range(60)]
+        fill = [_replica(61 + i, reserved_fill=True) for i in range(100)]
+        replicas = demand + fill
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas},
+                queue_depth=10)
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            # Restart reconstruction protects only the 60 demand-origin
+            # slots. The 100 fill slots remain capacity, not orange demand.
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 60)
+            self.assertEqual(
+                autoscaler._latest_committed_logical_capacity(replicas), 160)
+
+            # After one complete quiet window, the 50% wave is 30 demand
+            # slots, not 80 slots derived from the demand+fill fleet.
+            clock.return_value = 380.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 30)
+        self.assertEqual(autoscaler._last_scale_down_allowance, 30)
+
+    def test_all_fill_restart_adopts_only_observed_demand(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1, reserved_fill=True) for i in range(159)]
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas},
+                queue_depth=17)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 17)
+        self.assertEqual(autoscaler.target_num_replicas, 17)
+        self.assertFalse(autoscaler._snap_target_on_next_recompute)
+
+    def test_fill_pending_does_not_enlarge_demand_cancellation_budget(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=1000,
+            replica_unit='logical',
+            max_scale_down_rate_percentage=50,
+        )
+        pending = serve_state.ReplicaStatus.PENDING
+        demand = [_replica(i + 1, status=pending) for i in range(10)]
+        fill = [
+            _replica(11 + i, status=pending, reserved_fill=True)
+            for i in range(100)
+        ]
+        replicas = demand + fill
+        autoscaler.target_num_replicas = 110
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler, in_flight={})
+
+        decisions = _decisions(autoscaler, replicas)
+        victims = {
+            decision.target.replica_id
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        }
+
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(autoscaler._pending_retention_floor, 5)
+        self.assertEqual(autoscaler._last_pending_allowance, 5)
+        self.assertEqual(len(victims & set(range(1, 11))), 5)
+        self.assertEqual(autoscaler._pending_budget_spent, 5)
+
+    def test_fill_capacity_still_sizes_demand_scale_up_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        replicas = [_replica(i + 1, reserved_fill=True) for i in range(159)]
+        autoscaler.target_num_replicas = 17
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas},
+                queue_depth=1000)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        # Total committed capacity still supplies the 20% wave basis. The
+        # accounting split prevents paid backfill; it does not pretend that
+        # already-live compatible capacity is absent during a real burst.
+        self.assertEqual(autoscaler.target_num_replicas, 191)
 
     def test_downscale_elapsed_window_resets_on_rebound_and_stale_signal(self):
         autoscaler = self._ramped_autoscaler(
