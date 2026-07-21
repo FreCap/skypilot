@@ -7,6 +7,7 @@ import inspect
 import json
 import pickle
 import struct
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -378,6 +379,64 @@ async def test_kubernetes_proxy_reaps_child_on_parent_cancellation():
     proc.terminate.assert_called_once_with()
     proc.kill.assert_not_called()
     event_loop.run_in_executor.assert_any_await(None, proc.wait)
+    connection_gauge.inc.assert_not_called()
+    connection_gauge.dec.assert_not_called()
+    close_metric.labels.assert_called_once_with(pid=mock.ANY,
+                                                reason='KubectlPortForwardExit')
+    close_counter.inc.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_proxy_reaps_child_when_cancelled_during_spawn():
+    websocket = mock.AsyncMock(spec=fastapi.WebSocket)
+    runner = mock.Mock()
+    runner.port_forward_command.return_value = ['kubectl', 'port-forward']
+    handle = SimpleNamespace(
+        head_ssh_port=22,
+        get_command_runners=mock.Mock(return_value=[runner]),
+    )
+    proc = SimpleNamespace(
+        stdout=object(),
+        terminate=mock.Mock(),
+        wait=mock.Mock(return_value=0),
+        kill=mock.Mock(),
+    )
+    spawn_started = threading.Event()
+    allow_spawn_return = threading.Event()
+
+    def blocking_popen(*args, **kwargs):
+        del args, kwargs
+        spawn_started.set()
+        assert allow_spawn_return.wait(5)
+        return proc
+
+    (connection_metric, connection_gauge, close_metric,
+     close_counter) = _metric_mocks()
+
+    with mock.patch.object(ssh_proxy, '_get_cluster_and_validate',
+                           new=mock.AsyncMock(return_value=handle)), \
+         mock.patch.object(ssh_proxy, '_KUBECTL_PATH', '/usr/bin/kubectl'), \
+         mock.patch.object(ssh_proxy.subprocess, 'Popen',
+                           side_effect=blocking_popen), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CONNECTIONS',
+                           connection_metric), \
+         mock.patch.object(metrics_utils,
+                           'SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL',
+                           close_metric):
+        proxy_task = asyncio.create_task(
+            server.kubernetes_pod_ssh_proxy(websocket, 'cluster'))
+        try:
+            assert await asyncio.to_thread(spawn_started.wait, 5)
+            proxy_task.cancel()
+        finally:
+            allow_spawn_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy_task
+
+    proc.terminate.assert_called_once_with()
+    proc.wait.assert_called_once_with()
+    proc.kill.assert_not_called()
     connection_gauge.inc.assert_not_called()
     connection_gauge.dec.assert_not_called()
     close_metric.labels.assert_called_once_with(pid=mock.ANY,
