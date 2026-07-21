@@ -473,6 +473,26 @@ async def token(request: fastapi.Request,
         })
 
 
+async def _poll_auth_session(code_verifier: str) -> str | None:
+    """Consume an auth session without losing it to caller cancellation."""
+    store = auth_sessions.auth_session_store
+    poll_task = asyncio.create_task(
+        asyncio.to_thread(store.poll_session, code_verifier))
+    try:
+        return await asyncio.shield(poll_task)
+    except asyncio.CancelledError:
+        try:
+            auth_token = await poll_task
+            if auth_token is not None:
+                code_challenge = common_utils.compute_code_challenge(
+                    code_verifier)
+                await asyncio.to_thread(store.restore_session, code_challenge,
+                                        auth_token)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception('Failed to restore a cancelled auth session poll')
+        raise
+
+
 @app.get('/api/v1/auth/token')
 async def poll_auth_token(
         code_verifier: str | None = None) -> fastapi.responses.Response:
@@ -493,8 +513,7 @@ async def poll_auth_token(
 
     # The auth session store performs a synchronous DB transaction. Keep CLI
     # polling from blocking unrelated API requests on this worker's event loop.
-    auth_token = await asyncio.to_thread(
-        auth_sessions.auth_session_store.poll_session, code_verifier)
+    auth_token = await _poll_auth_session(code_verifier)
 
     if auth_token is None:
         raise fastapi.HTTPException(status_code=404, detail='Session not found')

@@ -8,8 +8,12 @@ from typing import Any
 from unittest import mock
 
 import pytest
+import sqlalchemy
 
+from sky import global_user_state
 from sky.server import server
+from sky.server.auth import sessions
+from sky.utils import common_utils
 
 
 async def _assert_call_runs_off_event_loop(call: Callable[[], Awaitable[Any]],
@@ -66,6 +70,55 @@ async def test_poll_auth_session_does_not_block_event_loop(monkeypatch):
         finished)
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_poll_auth_session_cancellation_restores_consumed_token(
+        monkeypatch, tmp_path):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "auth-sessions.db"}',
+        connect_args={'check_same_thread': False},
+    )
+    global_user_state.Base.metadata.create_all(engine)
+    store = sessions.AuthSessionStore(lambda: engine)
+    code_verifier = 'cancelled-poll-verifier'
+    code_challenge = common_utils.compute_code_challenge(code_verifier)
+    store.create_session(code_challenge, 'test-token')
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_poll_session = store.poll_session
+
+    def blocking_poll_session(verifier: str) -> str | None:
+        started.set()
+        release.wait(timeout=2)
+        try:
+            return original_poll_session(verifier)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(store, 'poll_session', blocking_poll_session)
+    monkeypatch.setattr(server.auth_sessions, 'auth_session_store', store)
+    poll_task = asyncio.create_task(server.poll_auth_token(code_verifier))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    poll_task.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not poll_task.done()
+    finally:
+        release.set()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await poll_task
+
+        assert await asyncio.to_thread(finished.wait, 1)
+        monkeypatch.setattr(store, 'poll_session', original_poll_session)
+        assert await asyncio.to_thread(store.poll_session,
+                                       code_verifier) == 'test-token'
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,26 @@ class AuthSessionStore:
                     table.c.created_at < expiry_time))
             connection.execute(upsert_statement)
 
+    def restore_session(self, code_challenge: str, token: str) -> None:
+        """Restore a consumed session unless a newer authorization exists."""
+        engine = self._engine_provider()
+        table = global_user_state.auth_session_table
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            insert_statement = postgresql.insert(table)
+        elif engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_statement = sqlite.insert(table)
+        else:
+            raise ValueError(
+                f'Unsupported database dialect: {engine.dialect.name}')
+
+        restore_statement = insert_statement.values(
+            code_challenge=code_challenge,
+            token=token,
+            created_at=time.time(),
+        ).on_conflict_do_nothing(index_elements=[table.c.code_challenge])
+        with engine.begin() as connection:
+            connection.execute(restore_statement)
+
     def poll_session(self, code_verifier: str) -> str | None:
         """Atomically consume and return an unexpired session token."""
         code_challenge = common_utils.compute_code_challenge(code_verifier)
