@@ -319,6 +319,13 @@ Reserved capacity is supply, not accelerator identity and not hidden demand.
 - With fill enabled, launch every fresh broker-granted reserved slot that fits under the aggregate `max_replicas` ceiling. Do not suppress launches merely because the demand target is greater than the fill target or because paid replicas currently satisfy demand.
 - With fill enabled, zero-cost serving replicas may intentionally remain above demand/floors; the UI labels them as fill capacity. With fill disabled, idle serving replicas gracefully drain to demand/floors while the underlying reserved physical machines may remain up and appear as free reserved supply. This is expected extra capacity, not a failed scale-down.
 - When demand and fill both want the same exact-card replica, count it once via `max(demand_target, fill_target)`, not by adding both targets.
+- Scale-down sheltering applies that overlap per exact card. Allocate the
+  aggregate broker fill target to existing zero-cost holdings in configured
+  card order before projecting any remainder onto free supply, then subtract
+  only demand for the same exact card. Demand assigned to L4, for example,
+  cannot reduce the shelter for A100 or A100-80GB holdings. If a rolling-update
+  row has no safely attributable exact card, retain the legacy aggregate
+  shelter for that tick rather than guessing or widening accelerator identity.
 - `max_replicas` is a hard aggregate fill ceiling. Count all old-version nonterminal capacity and reserve the latest-version demand plan before emitting fill launches. At the ceiling, retain the observed free-slot intent for a later control cycle instead of launching overlap.
 
 ## Architecture flow

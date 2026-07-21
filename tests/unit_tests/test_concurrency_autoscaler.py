@@ -721,6 +721,129 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(len(scale_downs), 2)
         self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
+    def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+            'A100-80GB': 0,
+        }
+        now = time.time()
+        reserved_keys = [{
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                card: 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        } for card in ('A100', 'A100-80GB')]
+        autoscaler.collect_reserved_capacity(0, reserved_keys, now)
+
+        paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
+        reserved = [
+            *[_replica(replica_id, card='A100') for replica_id in (3, 4, 5)],
+            *[
+                _replica(replica_id, card='A100-80GB')
+                for replica_id in (6, 7, 8)
+            ],
+        ]
+        location_by_card = {
+            card: spot_placer.Location.from_pickleable(key)
+            for card, key in zip(('A100', 'A100-80GB'), reserved_keys)
+        }
+        for info in paid:
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+        for info in reserved:
+            card = next(iter(info.resources_override['accelerators']))
+            info.created_at = now - 10
+            info.reserved_fill = True
+            info.get_spot_location.return_value = location_by_card[card]
+
+        ordinary = [
+            autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
+            for replica_id in (4, 5, 6, 7, 8)
+        ]
+        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
+                                                             ordinary)
+
+        # Fill owns all six A100-family holdings. Only one of them overlaps
+        # A100 demand; L4 demand cannot consume the other five units of
+        # A100-family shelter. The legacy aggregate subtraction (6 - 3)
+        # would incorrectly drain two reserved replicas and relaunch them.
+        self.assertEqual(_scale_downs(decisions), [])
+
+    def test_lower_fill_grant_shelters_existing_cards_before_free_supply(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+            'A100-80GB': 0,
+        }
+        now = time.time()
+        reserved_keys = [{
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                card: 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        } for card in ('A100', 'A100-80GB')]
+        autoscaler.collect_reserved_capacity(0, reserved_keys, now, grant=4)
+
+        paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
+        reserved = [
+            *[_replica(replica_id, card='A100') for replica_id in (3, 4, 5)],
+            *[
+                _replica(replica_id, card='A100-80GB')
+                for replica_id in (6, 7, 8)
+            ],
+        ]
+        location_by_card = {
+            card: spot_placer.Location.from_pickleable(key)
+            for card, key in zip(('A100', 'A100-80GB'), reserved_keys)
+        }
+        for info in paid:
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+        for info in reserved:
+            card = next(iter(info.resources_override['accelerators']))
+            info.created_at = now - 10
+            info.reserved_fill = True
+            info.get_spot_location.return_value = location_by_card[card]
+
+        ordinary = [
+            autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
+            for replica_id in (4, 5, 6, 7, 8)
+        ]
+        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
+                                                             ordinary)
+
+        # The reduced grant retains the three existing A100s and one existing
+        # A100-80GB. A100 demand overlaps one retained A100, so the shelter is
+        # two A100s plus one A100-80GB. Exactly two A100-80GB victims drain.
+        self.assertEqual(_scale_downs(decisions), [6, 7])
+
     def test_num_overprovision_keeps_exact_card_scale_up_shaped(self):
         autoscaler = _make_autoscaler(max_replicas=2, num_overprovision=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
