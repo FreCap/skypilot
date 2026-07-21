@@ -1715,11 +1715,12 @@ async def test_cancel_get_request_async():
         await asyncio.sleep(0.2)
         for task in tasks:
             task.cancel()
-            # This is critical to proactively calls GC to ensure GC will not
-            # affect the lock release, refer to
-            # https://github.com/skypilot-org/skypilot/issues/7663
-            # for more details.
-            gc.collect()
+        # Proactively run GC while the shielded operations finish to verify it
+        # cannot interfere with lock release. The tasks remain strongly held in
+        # ``tasks``, so collecting once after all cancellations exercises the
+        # same lifetime boundary without 1,000 full-heap traversals.
+        # See https://github.com/skypilot-org/skypilot/issues/7663.
+        gc.collect()
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
