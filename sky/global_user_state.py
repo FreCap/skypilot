@@ -1671,15 +1671,26 @@ def update_last_use(cluster_name: str):
 
 @db_retries.retry
 @metrics_lib.time_me
-def remove_cluster(cluster_name: str, terminate: bool) -> None:
-    """Removes cluster_name mapping."""
+def remove_cluster(cluster_name: str,
+                   terminate: bool,
+                   existing_cluster_hash: str | None = None) -> None:
+    """Removes or stops a cluster mapping.
+
+    If ``existing_cluster_hash`` is provided, only that cluster generation is
+    mutated. A missing or replaced generation is a no-op.
+    """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
-        row = session.query(
+        query = session.query(
             cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
-            cluster_table.c.handle).filter_by(name=cluster_name).first()
+            cluster_table.c.handle).filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        row = query.first()
+        if row is None and existing_cluster_hash is not None:
+            return
         cluster_hash = row.cluster_hash if row is not None else None
         provision_log_path = (row.provision_log_path
                               if row is not None else None)
@@ -1703,8 +1714,13 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
                 cluster_history_table.c.provision_log_path: provision_log_path
             })
 
+        mutation_query = session.query(cluster_table).filter_by(
+            name=cluster_name)
+        if existing_cluster_hash is not None:
+            mutation_query = mutation_query.filter_by(
+                cluster_hash=existing_cluster_hash)
         if terminate:
-            session.query(cluster_table).filter_by(name=cluster_name).delete()
+            count = mutation_query.delete()
         else:
             if row is None or row.handle is None:
                 return
@@ -1716,11 +1732,12 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
                                      handle)
                 handle.stable_internal_external_ips = None
             current_time = int(time.time())
-            session.query(cluster_table).filter_by(name=cluster_name).update({
+            count = mutation_query.update({
                 cluster_table.c.handle: pickle.dumps(handle),
                 cluster_table.c.status: status_lib.ClusterStatus.STOPPED.value,
                 cluster_table.c.status_updated_at: current_time
             })
+        assert count <= 1, count
         session.commit()
 
 
