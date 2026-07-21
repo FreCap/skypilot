@@ -1634,6 +1634,7 @@ class TestLaunchOwnershipFence:
         info = mock.Mock()
         info.status = replica_managers.serve_state.ReplicaStatus.PENDING
         info.status_property = mock.Mock()
+        info.created_at = 100.0
         return info
 
     @staticmethod
@@ -2016,7 +2017,7 @@ class TestLaunchOwnershipFence:
         location = mock.Mock()
         placer = mock.Mock()
         placer.resolve_location.return_value = location
-        placer.is_active_location.return_value = True
+        placer.is_launch_admissible.return_value = True
         mgr._spot_placer = placer
         for info in infos.values():
             info.get_spot_location.return_value = location
@@ -2047,8 +2048,48 @@ class TestLaunchOwnershipFence:
                     common_utils.ProcessStatus.RUNNING)
         for launch_thread in mgr._launch_thread_pool.values():
             launch_thread.start.assert_called_once_with()
-        placer.is_active_location.assert_has_calls([mock.call(location)] * 3)
+        placer.is_launch_admissible.assert_has_calls(
+            [mock.call(location, selected_at=100.0)] * 3)
         assert persist.call_count == 3
+
+    def test_consumed_retry_is_admitted_once(self, tmp_path):
+        mgr, infos = self._queued_manager([1])
+        launch_thread = mgr._launch_thread_pool[1]
+        location = mock.Mock()
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        placer.is_active_location.return_value = False
+        placer.is_launch_admissible.return_value = True
+        mgr._spot_placer = placer
+        infos[1].get_spot_location.return_value = location
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value=infos), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_provision',
+                               return_value=True), \
+             mock.patch.object(mgr, '_remove_replica') as remove, \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        placer.is_launch_admissible.assert_called_once_with(location,
+                                                            selected_at=100.0)
+        placer.is_active_location.assert_not_called()
+        launch_thread.start.assert_called_once_with()
+        remove.assert_not_called()
+        persist.assert_called_once_with(1, infos[1])
 
     def test_benched_placement_discards_queued_wave(self):
         mgr, infos = self._queued_manager([1, 2, 3])
@@ -2056,7 +2097,7 @@ class TestLaunchOwnershipFence:
         location = mock.Mock()
         placer = mock.Mock()
         placer.resolve_location.return_value = location
-        placer.is_active_location.return_value = False
+        placer.is_launch_admissible.return_value = False
         mgr._spot_placer = placer
         for info in infos.values():
             info.get_spot_location.return_value = location
@@ -2075,7 +2116,8 @@ class TestLaunchOwnershipFence:
              mock.patch.object(mgr, '_persist_replica') as persist:
             mgr._refresh_thread_pool()
 
-        placer.is_active_location.assert_has_calls([mock.call(location)] * 3)
+        placer.is_launch_admissible.assert_has_calls(
+            [mock.call(location, selected_at=100.0)] * 3)
         assert remove.call_args_list == [
             mock.call(1), mock.call(2),
             mock.call(3)

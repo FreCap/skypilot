@@ -5439,7 +5439,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         location = resolved_location
                     if (location is not None and
                         (location in failed_spot_locations or
-                         not self._spot_placer.is_active_location(location))):
+                         not self._spot_placer.is_launch_admissible(
+                             location,
+                             selected_at=getattr(info, 'created_at', None)))):
                         # This exact placement failed after the batch was
                         # queued but before this thread was admitted. Drop the
                         # never-started row so the autoscaler replans it on the
