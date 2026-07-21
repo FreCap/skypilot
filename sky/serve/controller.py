@@ -2675,7 +2675,9 @@ class SkyServeController:
         @self._app.get(
             '/autoscaler/info',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
-        async def get_autoscaler_info() -> fastapi.Response:
+        # Deliberately sync so FastAPI runs fleet-wide status serialization in
+        # its worker pool instead of blocking health and control-plane traffic.
+        def get_autoscaler_info() -> fastapi.Response:
             info = self._autoscaler.info()
             counts = self._replica_counts_snapshot
             if counts is not None:
