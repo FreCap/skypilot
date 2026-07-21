@@ -803,16 +803,25 @@ def defer_consumer_reconciliation(demand_id: str,
     """Invalidates partial terminal proof and rotates a live candidate."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        changed = session.execute(schema.demands.update().where(
-            schema.demands.c.id == demand_id,
-            schema.demands.c.state.in_([
-                models.ImageDemandState.WARMING.value,
-                models.ImageDemandState.READY.value,
-                models.ImageDemandState.FAILED.value,
-            ])).values(first_terminal_observed_at=None,
-                       last_terminal_observed_at=None,
-                       terminal_observation_count=0,
-                       updated_at=current)).rowcount
+        return defer_consumer_reconciliation_in_session(session,
+                                                        demand_id,
+                                                        now=current)
+
+
+def defer_consumer_reconciliation_in_session(session: orm.Session,
+                                             demand_id: str, *,
+                                             now: int) -> bool:
+    """Clears partial terminal proof inside a caller-owned transaction."""
+    changed = session.execute(schema.demands.update().where(
+        schema.demands.c.id == demand_id,
+        schema.demands.c.state.in_([
+            models.ImageDemandState.WARMING.value,
+            models.ImageDemandState.READY.value,
+            models.ImageDemandState.FAILED.value,
+        ])).values(first_terminal_observed_at=None,
+                   last_terminal_observed_at=None,
+                   terminal_observation_count=0,
+                   updated_at=now)).rowcount
     return changed == 1
 
 
@@ -896,64 +905,72 @@ def observe_consumer_terminal(demand_id: str,
     if not authoritative:
         return False
     current = int(time.time()) if now is None else now
-    demands = schema.demands
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        optimistic = session.execute(
-            sqlalchemy.select(demands).where(
-                demands.c.id == demand_id,
-                demands.c.workspace == workspace)).mappings().first()
-        if optimistic is None:
-            return False
-        owner_workspace = str(optimistic['workspace'])
-        owner_kind = str(optimistic['consumer_kind'])
-        owner = str(optimistic['consumer_owner'])
-        _lock_existing_watermark(session,
-                                 workspace=owner_workspace,
-                                 consumer_kind=owner_kind,
-                                 consumer_owner=owner)
-        row = session.execute(
-            sqlalchemy.select(demands).where(
-                demands.c.id == demand_id, demands.c.workspace ==
-                workspace).with_for_update()).mappings().first()
-        if row is None:
-            return False
-        if str(row['state']) in (models.ImageDemandState.RELEASED.value,
-                                 models.ImageDemandState.SUPERSEDED.value):
-            return _mark_owner_deleted_in_session(session,
-                                                  workspace=owner_workspace,
-                                                  consumer_kind=owner_kind,
-                                                  consumer_owner=owner,
-                                                  now=current)
-        first = row['first_terminal_observed_at']
-        count = int(row['terminal_observation_count'])
-        if first is None:
-            session.execute(
-                demands.update().where(demands.c.id == demand_id).values(
-                    first_terminal_observed_at=current,
-                    last_terminal_observed_at=current,
-                    terminal_observation_count=1,
-                    updated_at=current))
-            return False
-        if current - int(first) < _TERMINAL_CONFIRMATION_SECONDS:
-            session.execute(
-                demands.update().where(demands.c.id == demand_id).values(
-                    last_terminal_observed_at=current,
-                    terminal_observation_count=max(count, 1),
-                    updated_at=current))
-            return False
-        session.execute(
-            demands.update().where(demands.c.id == demand_id).values(
-                last_terminal_observed_at=current,
-                terminal_observation_count=max(count + 1, 2)))
-        _terminalize(session,
-                     row,
-                     models.ImageDemandState.RELEASED,
-                     now=current)
+        return observe_consumer_terminal_in_session(session,
+                                                    demand_id,
+                                                    workspace,
+                                                    authoritative=authoritative,
+                                                    now=current)
+
+
+def observe_consumer_terminal_in_session(session: orm.Session, demand_id: str,
+                                         workspace: str, *, authoritative: bool,
+                                         now: int) -> bool:
+    """Observes terminal state inside a caller-owned transaction."""
+    if not authoritative:
+        return False
+    demands = schema.demands
+    optimistic = session.execute(
+        sqlalchemy.select(demands).where(
+            demands.c.id == demand_id,
+            demands.c.workspace == workspace)).mappings().first()
+    if optimistic is None:
+        return False
+    owner_workspace = str(optimistic['workspace'])
+    owner_kind = str(optimistic['consumer_kind'])
+    owner = str(optimistic['consumer_owner'])
+    _lock_existing_watermark(session,
+                             workspace=owner_workspace,
+                             consumer_kind=owner_kind,
+                             consumer_owner=owner)
+    row = session.execute(
+        sqlalchemy.select(demands).where(
+            demands.c.id == demand_id, demands.c.workspace ==
+            workspace).with_for_update()).mappings().first()
+    if row is None:
+        return False
+    if str(row['state']) in (models.ImageDemandState.RELEASED.value,
+                             models.ImageDemandState.SUPERSEDED.value):
         return _mark_owner_deleted_in_session(session,
                                               workspace=owner_workspace,
                                               consumer_kind=owner_kind,
                                               consumer_owner=owner,
-                                              now=current)
+                                              now=now)
+    first = row['first_terminal_observed_at']
+    count = int(row['terminal_observation_count'])
+    if first is None:
+        session.execute(demands.update().where(
+            demands.c.id == demand_id).values(first_terminal_observed_at=now,
+                                              last_terminal_observed_at=now,
+                                              terminal_observation_count=1,
+                                              updated_at=now))
+        return False
+    if now - int(first) < _TERMINAL_CONFIRMATION_SECONDS:
+        session.execute(
+            demands.update().where(demands.c.id == demand_id).values(
+                last_terminal_observed_at=now,
+                terminal_observation_count=max(count, 1),
+                updated_at=now))
+        return False
+    session.execute(demands.update().where(demands.c.id == demand_id).values(
+        last_terminal_observed_at=now,
+        terminal_observation_count=max(count + 1, 2)))
+    _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+    return _mark_owner_deleted_in_session(session,
+                                          workspace=owner_workspace,
+                                          consumer_kind=owner_kind,
+                                          consumer_owner=owner,
+                                          now=now)
 
 
 def compact_terminal_demands(*,

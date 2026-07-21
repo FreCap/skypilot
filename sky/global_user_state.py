@@ -190,6 +190,20 @@ volume_table = sqlalchemy.Table(
 )
 
 
+def lock_container_image_cluster_lifecycle_in_session(
+        session: orm.Session, cluster_name: str) -> None:
+    """Serializes cluster-row presence with image-owner reconciliation."""
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return
+    lock_key = json.dumps(('container_image_cluster_lifecycle', cluster_name),
+                          separators=(',', ':'))
+    session.execute(
+        sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                        'hashtextextended(CAST(:lock_key AS text), 0))'),
+        {'lock_key': lock_key})
+
+
 # Container image catalog tables live exclusively in
 # sky.container_images.schema. Cluster state stores only a validated resolved
 # plan and its demand ID; it does not mirror image-plane tables.
@@ -213,11 +227,8 @@ def _validate_container_image_resolution(
     launched_resources: Any,
     resolved_image: Any,
     workspace: str,
-    *,
-    allow_persisted_init_plan: bool = False,
 ) -> tuple[str, str] | None:
     """Rejects forged or stale managed pull plans before persistence."""
-    del allow_persisted_init_plan
     # pylint: disable=import-outside-toplevel
     from sky.container_images import config as container_image_config
     from sky.container_images import models as container_image_models
@@ -1084,6 +1095,7 @@ def add_or_update_cluster(cluster_name: str,
         })
 
     with orm.Session(engine) as session:
+        lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
         # with_for_update() locks the row until commit() or rollback()
         # is called, or until the code escapes the with block.
         cluster_row = session.query(cluster_table).filter_by(
@@ -1100,38 +1112,10 @@ def add_or_update_cluster(cluster_name: str,
                              if cluster_row is not None and
                              cluster_row.workspace else active_workspace or
                              constants.SKYPILOT_DEFAULT_WORKSPACE)
-        ready_continuation = (ready and cluster_row is not None and
-                              cluster_row.status
-                              == status_lib.ClusterStatus.INIT.value)
-        previous_image_execution_state = None
-        if cluster_row is not None and (not is_launch or ready_continuation):
-            try:
-                previous_handle = pickle.loads(cluster_row.handle)
-                previous_resources = getattr(previous_handle,
-                                             'launched_resources', None)
-                previous_image_execution_state = (
-                    _container_image_execution_state(previous_resources))
-            except Exception:  # pylint: disable=broad-except
-                # A status refresh may skip catalog work only after proving it
-                # carries the same complete image execution state as the
-                # existing durable handle. A legacy or unreadable handle falls
-                # through to full validation.
-                previous_image_execution_state = None
-        current_image_execution_state = _container_image_execution_state(
-            launched_resources)
-        persisted_warming_continuation = (ready_continuation and
-                                          resolved_image is not None and
-                                          resolved_image.location_id is None and
-                                          previous_image_execution_state
-                                          == current_image_execution_state)
         if (launched_resources is not None and getattr(
                 launched_resources, 'container_image', None) is not None):
             container_image_consumer = _validate_container_image_resolution(
-                session,
-                launched_resources,
-                resolved_image,
-                cluster_workspace,
-                allow_persisted_init_plan=(persisted_warming_continuation))
+                session, launched_resources, resolved_image, cluster_workspace)
             if container_image_consumer is not None:
                 (container_image_consumer_kind,
                  container_image_consumer_owner) = container_image_consumer
@@ -1893,6 +1877,7 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
     """Removes cluster_name mapping."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
         row = session.query(
@@ -1920,11 +1905,19 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
                           is None) == (terminal_consumer_owner is None))
         if (terminate and row is not None and row.handle and
             (not terminal_binding_known or not binding_valid)):
-            prior_handle = pickle.loads(row.handle)
-            prior_resources = getattr(prior_handle, 'launched_resources', None)
-            prior_resolution = getattr(prior_resources,
-                                       'resolved_container_image', None)
-            terminal_demand_id = getattr(prior_resolution, 'demand_id', None)
+            try:
+                prior_handle = pickle.loads(row.handle)
+                prior_resources = getattr(prior_handle, 'launched_resources',
+                                          None)
+                prior_resolution = getattr(prior_resources,
+                                           'resolved_container_image', None)
+                terminal_demand_id = getattr(prior_resolution, 'demand_id',
+                                             None)
+            except Exception:  # pylint: disable=broad-except
+                # A corrupt pre-binding handle cannot prove which owner to
+                # retire. Deleting the cluster row is safe; the independent
+                # two-observation reconciler will later release its fence.
+                terminal_demand_id = None
         usage_intervals = _get_cluster_usage_intervals(cluster_hash)
 
         # usage_intervals is not None and not empty
@@ -2711,14 +2704,38 @@ def get_cluster_image_consumers(
             batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
             rows = query.filter(cluster_table.c.name.in_(batch)).all()
             for row in rows:
-                kind = row.container_image_consumer_kind
-                owner = row.container_image_consumer_owner
-                binding_valid = (kind is None) == (owner is None)
-                if not row.container_image_binding_known or not binding_valid:
-                    result[str(row.name)] = None
-                else:
-                    result[str(row.name)] = (kind, owner)
+                result[str(row.name)] = _cluster_image_consumer_binding(row)
     return result
+
+
+def _cluster_image_consumer_binding(
+        row: Any) -> tuple[str | None, str | None] | None:
+    kind = row.container_image_consumer_kind
+    owner = row.container_image_consumer_owner
+    binding_valid = (kind is None) == (owner is None)
+    if not row.container_image_binding_known or not binding_valid:
+        return None
+    return kind, owner
+
+
+def get_cluster_image_consumer_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    *,
+    for_update: bool = False,
+) -> tuple[bool, tuple[str | None, str | None] | None]:
+    """Returns row existence and its binding inside a caller transaction."""
+    query = session.query(
+        cluster_table.c.container_image_binding_known,
+        cluster_table.c.container_image_consumer_kind,
+        cluster_table.c.container_image_consumer_owner).filter(
+            cluster_table.c.name == cluster_name)
+    if for_update:
+        query = query.with_for_update()
+    row = query.first()
+    if row is None:
+        return False, None
+    return True, _cluster_image_consumer_binding(row)
 
 
 @metrics_lib.time_me

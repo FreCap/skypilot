@@ -593,6 +593,10 @@ validated consumer kind and owner beside the authoritative cluster row, rather
 than relying on a later handle decode. A first-party named-cluster deletion uses
 that binding to release every live demand and permanently retire the launch
 incarnation in the same PostgreSQL transaction that deletes the cluster row.
+If a pre-binding handle is unreadable, deletion never guesses an owner: it
+removes the row and leaves the fence for the independent two-observation
+reconciler. Every managed pull plan is revalidated against READY catalog state
+before persistence; there is no persisted-plan validation bypass.
 Managed-job and Serve replica cluster rows carry their shared non-cluster
 binding and never retire it during replica teardown. Recreating the same named
 cluster receives a new request epoch and therefore a new stable owner.
@@ -608,14 +612,25 @@ set that scalar true and leave both consumer fields `NULL` when the handle prove
 there is no managed consumer, so an unrelated direct-image recreation does not
 mask an old managed incarnation. A current binding, an authoritative
 nonterminal state, or an unknown lifecycle result clears any partial terminal
-confirmation. The
-separate confirmation-delay rotation preserves its first observation, so
+confirmation. The separate confirmation-delay rotation preserves its first
+observation, so
 retirement requires two uninterrupted authoritative terminal observations at
 least one hour apart. The delay applies only to reconciliation that infers a
 missing owner, never to an authoritative `sky down` transition. When
 reconciliation proves a cluster, managed-job task, or Serve version terminal,
 its final observation terminalizes the last demand and retires that owner in
 one watermark-then-demand transaction.
+
+Cluster-row absence is serialized rather than inferred from an unlocked
+snapshot. On PostgreSQL, every cluster INIT/upsert, direct deletion, and final
+cluster reconciliation acquires the same transaction-scoped advisory lock keyed
+by the globally unique cluster name. The final reconciler re-reads the binding
+and performs its demand observation in that transaction; the earlier bounded
+batch lookup is only a safe fast-path hint. Thus either INIT commits first and
+reconciliation observes the exact live binding, or reconciliation commits first
+and a later INIT fails READY-demand validation. The lock order is cluster
+lifecycle advisory lock, cluster row when present, consumer watermark, then
+demand rows. The advisory lock has no persistent per-cluster table cardinality.
 
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
@@ -1697,8 +1712,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   ceilings, and empty failed-reservation reclamation tests;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
   version-target, controller loss, supersede, generation watermark,
-  interrupted terminal confirmation, authoritative owner retirement,
-  compaction, and unreachable consumer stores;
+  interrupted terminal confirmation, INIT-versus-reconciliation absent-row
+  serialization, authoritative owner retirement, compaction, and unreachable
+  consumer stores;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
   nested index, artifact, nondistributable/foreign layer, external URL, config
   platform, raw-byte digest, and size-bound reject-before-write tests;
@@ -1883,3 +1899,17 @@ binding, replacement by B, and two fresh observations before A is retired.
 Rows with a false binding-known bit remain conservative during mixed rollout,
 while current direct-image rows record a known absence and cannot mask an old
 managed incarnation.
+
+Implementation review round 9 at
+`438c03a8af1707610635c186e01fffea0e4a0bbe` returned Codex `RESHAPE` and
+Fable `PURSUE`. Codex proved an absent-row race: reconciliation could classify a
+cluster as missing, then a concurrent INIT could validate its READY demand and
+insert the exact live binding before terminal observation retired that owner.
+This revision serializes every INIT/upsert, deletion, and final reconciliation
+with one transaction-scoped PostgreSQL advisory lock keyed by cluster name. The
+reconciler now performs its final binding read and demand mutation in the same
+transaction, and a deterministic PostgreSQL interleaving proves it waits behind
+uncommitted INIT and preserves the live fence. It also requires durable terminal
+request evidence before the 24-hour unattached-demand fallback, makes corrupt
+legacy handles fall back to conservative reconciliation, and removes the unused
+persisted-plan bypass scaffolding identified by Fable.

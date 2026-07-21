@@ -336,6 +336,51 @@ def _pull_plan(active: topology_state.ProfileRevisionRecord,
     }
 
 
+def _cluster_handle_for_demand(
+    active: topology_state.ProfileRevisionRecord,
+    publication_record: catalog_state.PublicationRecord,
+    location: topology_state.LocationRecord,
+    profile: models.ManagedRegistryProfile,
+    demand: demand_state.DemandRecord,
+    *,
+    controller_epoch: str,
+) -> types.SimpleNamespace:
+    pull_plan = _pull_plan(active, location)
+    assert publication_record.image_id is not None
+    resolved = models.ResolvedContainerImage(
+        image_id=publication_record.image_id,
+        reference=location.target_ref,
+        target_id=str(pull_plan['target_id']),
+        digest=_DIGEST,
+        auth_strategy='ecr_runtime_identity',
+        location_id=location.id,
+        distribution=profile.name,
+        profile_revision=active.revision,
+        policy_fingerprint='a' * 64,
+        profile_revision_id=active.id,
+        target_fingerprint=location.target_fingerprint,
+        demand_id=demand.id,
+        demand_generation=demand.consumer_generation,
+        controller_epoch=controller_epoch,
+        owner_epoch=demand.owner_epoch,
+        credential_helper='ecr-login',
+        runtime_principal=pull_plan['runtime_principal'],
+        instance_profile=pull_plan['instance_profile'])
+    resources = types.SimpleNamespace(
+        container_image=models.ContainerImage(release='boltz-l4',
+                                              distribution=profile.name),
+        resolved_container_image=resolved,
+        container_image_from_legacy_image_id=False,
+        cloud=None,
+        region=None,
+        zone=None,
+        instance_type=None,
+        docker_login_config=None)
+    return types.SimpleNamespace(launched_resources=resources,
+                                 launched_nodes=1,
+                                 cached_cluster_info=None)
+
+
 def test_publication_is_invisible_until_canonical_ready_and_replay_converges(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -743,39 +788,13 @@ def test_cluster_init_persists_validated_consumer_binding(
         consumer_generation=demand.consumer_generation,
         pull_plan=pull_plan,
         now=51)
-    assert publication_record.image_id is not None
-    resolved = models.ResolvedContainerImage(
-        image_id=publication_record.image_id,
-        reference=regional.target_ref,
-        target_id=str(pull_plan['target_id']),
-        digest=_DIGEST,
-        auth_strategy='ecr_runtime_identity',
-        location_id=regional.id,
-        distribution=profile.name,
-        profile_revision=active.revision,
-        policy_fingerprint='a' * 64,
-        profile_revision_id=active.id,
-        target_fingerprint=regional.target_fingerprint,
-        demand_id=demand.id,
-        demand_generation=demand.consumer_generation,
-        controller_epoch='cluster-request:launch-a',
-        owner_epoch=demand.owner_epoch,
-        credential_helper='ecr-login',
-        runtime_principal=pull_plan['runtime_principal'],
-        instance_profile=pull_plan['instance_profile'])
-    resources = types.SimpleNamespace(
-        container_image=models.ContainerImage(release='boltz-l4',
-                                              distribution=profile.name),
-        resolved_container_image=resolved,
-        container_image_from_legacy_image_id=False,
-        cloud=None,
-        region=None,
-        zone=None,
-        instance_type=None,
-        docker_login_config=None)
-    handle = types.SimpleNamespace(launched_resources=resources,
-                                   launched_nodes=1,
-                                   cached_cluster_info=None)
+    handle = _cluster_handle_for_demand(
+        active,
+        publication_record,
+        regional,
+        profile,
+        demand,
+        controller_epoch='cluster-request:launch-a')
     global_user_state.cluster_table.create(image_database, checkfirst=True)
     global_user_state.cluster_history_table.create(image_database,
                                                    checkfirst=True)
@@ -823,6 +842,129 @@ def test_cluster_init_persists_validated_consumer_binding(
             'cluster-direct': (None, None),
             'cluster-legacy': None,
         }
+
+
+def test_cluster_init_serializes_with_missing_row_reconciliation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    controller_epoch = 'cluster-request:launch-a'
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='cluster-a:incarnation:launch-hash',
+                             consumer_kind='cluster',
+                             controller_epoch=controller_epoch,
+                             controller_sequence=None,
+                             consumer_metadata={
+                                 'workload_type': 'cluster',
+                                 'workload_id': 'cluster-a',
+                             })
+    demand = transactions.commit_ready_demand(
+        demand_id=demand.id,
+        consumer_generation=demand.consumer_generation,
+        pull_plan=_pull_plan(active, regional),
+        now=51)
+    assert demand_state.attach_consumer(demand.id, 'research', now=52)
+    assert not demand_state.observe_consumer_terminal(
+        demand.id, 'research', authoritative=True, now=100)
+    handle = _cluster_handle_for_demand(active,
+                                        publication_record,
+                                        regional,
+                                        profile,
+                                        demand,
+                                        controller_epoch=controller_epoch)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    global_user_state.cluster_history_table.create(image_database,
+                                                   checkfirst=True)
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+    monkeypatch.setattr(global_user_state.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+
+    init_inserted_uncommitted = threading.Event()
+    allow_init_to_commit = threading.Event()
+    reconciliation_attempted_lock = threading.Event()
+    reconciliation_backend: dict[str, int] = {}
+
+    def _pause_init_after_cluster_insert(_connection, _cursor, statement,
+                                         _parameters, _context,
+                                         _executemany) -> None:
+        normalized = ' '.join(statement.split()).upper()
+        if (threading.current_thread().name.startswith('cluster-init') and
+                normalized.startswith('INSERT INTO CLUSTERS ')):
+            init_inserted_uncommitted.set()
+            if not allow_init_to_commit.wait(timeout=10):
+                raise TimeoutError('Cluster INIT race test timed out.')
+
+    def _observe_reconciliation_lock(_connection, _cursor, statement,
+                                     _parameters, _context,
+                                     _executemany) -> None:
+        normalized = ' '.join(statement.split()).upper()
+        if (threading.current_thread().name.startswith('cluster-reconcile') and
+                'PG_ADVISORY_XACT_LOCK' in normalized):
+            reconciliation_backend['pid'] = int(
+                _cursor.connection.get_backend_pid())
+            reconciliation_attempted_lock.set()
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                            _pause_init_after_cluster_insert)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _observe_reconciliation_lock)
+    init_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='cluster-init')
+    reconcile_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='cluster-reconcile')
+    try:
+        init_future = init_executor.submit(
+            global_user_state.add_or_update_cluster,
+            'cluster-a',
+            handle,
+            requested_resources=None,
+            ready=False)
+        assert init_inserted_uncommitted.wait(timeout=5)
+        reconcile_future = reconcile_executor.submit(
+            lifecycle_worker_service._reconcile_terminal_consumers, 4000)
+        assert reconciliation_attempted_lock.wait(timeout=5)
+        assert _wait_for_backend_lock(image_database,
+                                      reconciliation_backend['pid'])
+        allow_init_to_commit.set()
+
+        assert init_future.result(timeout=5) is None
+        assert reconcile_future.result(timeout=5) == 0
+        current = demand_state.get_demand(demand.id, 'research')
+        assert current is not None
+        assert current.state == models.ImageDemandState.READY
+        assert current.consumer_attached
+        assert current.first_terminal_observed_at is None
+        assert current.last_terminal_observed_at is None
+        assert current.terminal_observation_count == 0
+        assert global_user_state.get_cluster_image_consumers(['cluster-a']) == {
+            'cluster-a': ('cluster', demand.consumer_owner),
+        }
+        with image_database.connect() as connection:
+            deleted_at = connection.execute(
+                sqlalchemy.select(
+                    schema.consumer_watermarks.c.owner_deleted_at).where(
+                        schema.consumer_watermarks.c.workspace == 'research',
+                        schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                        schema.consumer_watermarks.c.consumer_owner ==
+                        demand.consumer_owner)).scalar_one()
+        assert deleted_at is None
+    finally:
+        allow_init_to_commit.set()
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                _pause_init_after_cluster_insert)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _observe_reconciliation_lock)
+        init_executor.shutdown(wait=True)
+        reconcile_executor.shutdown(wait=True)
 
 
 def test_cluster_row_and_demand_release_commit_atomically(
@@ -893,6 +1035,50 @@ def test_cluster_row_and_demand_release_commit_atomically(
                                 now=101)
     assert recreated.state == models.ImageDemandState.WARMING
     assert recreated.consumer_owner != demand.consumer_owner
+
+
+def test_corrupt_legacy_handle_does_not_block_cluster_deletion(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='cluster-a:incarnation:launch-hash',
+                             consumer_kind='cluster',
+                             controller_epoch='cluster-request:launch-a',
+                             controller_sequence=None)
+    global_user_state.cluster_table.create(image_database, checkfirst=True)
+    with image_database.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert().values(
+            name='cluster-a',
+            handle=b'unreadable-pre-binding-cluster-handle',
+            status='UP',
+            workspace='research',
+            container_image_binding_known=0))
+    monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
+                        lambda: image_database)
+
+    global_user_state.remove_cluster('cluster-a', terminate=True)
+
+    with image_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(global_user_state.cluster_table.c.name).where(
+                global_user_state.cluster_table.c.name ==
+                'cluster-a')).first() is None
+        owner_deleted_at = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.owner_deleted_at).where(
+                    schema.consumer_watermarks.c.workspace == 'research',
+                    schema.consumer_watermarks.c.consumer_kind == 'cluster',
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    demand.consumer_owner)).scalar_one()
+    retained = demand_state.get_demand(demand.id, 'research')
+    assert retained is not None
+    assert retained.state == models.ImageDemandState.WARMING
+    assert owner_deleted_at is None
 
 
 def test_replica_cluster_deletion_preserves_shared_job_owner(

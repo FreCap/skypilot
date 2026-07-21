@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 
+from sqlalchemy import orm
+
 from sky import global_user_state
 from sky.container_images import aws
 from sky.container_images import budgets
@@ -103,6 +105,31 @@ def _reconcile_publication_fanout(limit: int = 100) -> int:
     return transactions.reconcile_pending_canonical_publications(limit)
 
 
+def _reconcile_cluster_terminal(demand: demand_state.DemandRecord,
+                                cluster_name: str, current: int) -> bool:
+    """Re-proves cluster absence and observes it in one transaction."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        global_user_state.lock_container_image_cluster_lifecycle_in_session(
+            session, cluster_name)
+        row_exists, active_consumer = (
+            global_user_state.get_cluster_image_consumer_in_session(
+                session, cluster_name, for_update=True))
+        legacy_name_owner = ':incarnation:' not in demand.consumer_owner
+        if (row_exists and
+            (legacy_name_owner or active_consumer is None or
+             active_consumer == (demand.consumer_kind, demand.consumer_owner))):
+            demand_state.defer_consumer_reconciliation_in_session(session,
+                                                                  demand.id,
+                                                                  now=current)
+            return False
+        return demand_state.observe_consumer_terminal_in_session(
+            session,
+            demand.id,
+            demand.workspace,
+            authoritative=True,
+            now=current)
+
+
 def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
     """Releases fences only from each consumer's authoritative lifecycle."""
     candidates = demand_state.list_consumer_reconciliation_candidates(
@@ -179,12 +206,15 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue
-            if (not demand.consumer_attached and current - demand.created_at
-                    < _UNATTACHED_REQUEST_RETENTION_SECONDS):
+            if (not demand.consumer_attached and
+                (demand.first_terminal_observed_at is None or current -
+                 demand.created_at < _UNATTACHED_REQUEST_RETENTION_SECONDS)):
                 demand_state.defer_consumer_reconciliation(demand.id,
                                                            now=current)
                 continue
-            authoritative_terminal = True
+            if _reconcile_cluster_terminal(demand, cluster_name, current):
+                reconciled += 1
+            continue
         elif demand.consumer_kind == 'service_version':
             current_service_identity = demand_service_identity.get(demand.id)
             state = (service_states.get(current_service_identity)

@@ -71,7 +71,63 @@ def _cluster_demand(
         updated_at=created_at)
 
 
-def test_unattached_cluster_demand_is_observed_after_bounded_retention(
+def test_terminal_unattached_cluster_is_reconciled_after_bounded_retention(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    demand = _cluster_demand(
+        created_at=current -
+        lifecycle_worker_service._UNATTACHED_REQUEST_RETENTION_SECONDS,
+        first_terminal_at=current - 3600)
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [demand])
+    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
+                        'get_cluster_image_consumers', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    defer = mock.Mock()
+    reconcile = mock.Mock(return_value=False)
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'defer_consumer_reconciliation', defer)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
+    defer.assert_not_called()
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
+
+
+def test_unattached_cluster_demand_is_not_released_early(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    demand = _cluster_demand(
+        created_at=current -
+        lifecycle_worker_service._UNATTACHED_REQUEST_RETENTION_SECONDS + 1,
+        first_terminal_at=current - 1)
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [demand])
+    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
+                        'get_cluster_image_consumers', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    defer = mock.Mock(return_value=True)
+    reconcile = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'defer_consumer_reconciliation', defer)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
+    defer.assert_called_once_with(demand.id, now=current)
+    reconcile.assert_not_called()
+
+
+def test_old_unattached_cluster_without_terminal_request_proof_is_retained(
         monkeypatch: pytest.MonkeyPatch) -> None:
     current = 200_000
     demand = _cluster_demand(
@@ -86,46 +142,16 @@ def test_unattached_cluster_demand_is_observed_after_bounded_retention(
                         'get_service_version_terminal_states', lambda _: {})
     monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
                         'get_job_task_terminal_states', lambda _: {})
-    defer = mock.Mock()
-    observe = mock.Mock(return_value=False)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'defer_consumer_reconciliation', defer)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'observe_consumer_terminal', observe)
-
-    assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
-    defer.assert_not_called()
-    observe.assert_called_once_with(demand.id,
-                                    demand.workspace,
-                                    authoritative=True,
-                                    now=current)
-
-
-def test_unattached_cluster_demand_is_not_released_early(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    current = 200_000
-    demand = _cluster_demand(
-        created_at=current -
-        lifecycle_worker_service._UNATTACHED_REQUEST_RETENTION_SECONDS + 1)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'list_consumer_reconciliation_candidates',
-                        lambda **_: [demand])
-    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
-                        'get_cluster_image_consumers', lambda _: {})
-    monkeypatch.setattr(lifecycle_worker_service.serve_state,
-                        'get_service_version_terminal_states', lambda _: {})
-    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
-                        'get_job_task_terminal_states', lambda _: {})
     defer = mock.Mock(return_value=True)
-    observe = mock.Mock()
+    reconcile = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'defer_consumer_reconciliation', defer)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'observe_consumer_terminal', observe)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     defer.assert_called_once_with(demand.id, now=current)
-    observe.assert_not_called()
+    reconcile.assert_not_called()
 
 
 @pytest.mark.parametrize('binding', [
@@ -148,21 +174,22 @@ def test_current_or_indeterminate_cluster_binding_is_never_inferred_terminal(
     monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
                         'get_job_task_terminal_states', lambda _: {})
     defer = mock.Mock(return_value=True)
-    observe = mock.Mock()
+    reconcile = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'defer_consumer_reconciliation', defer)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'observe_consumer_terminal', observe)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     defer.assert_called_once_with(demand.id, now=current)
-    observe.assert_not_called()
+    reconcile.assert_not_called()
 
 
 def test_known_absent_binding_does_not_mask_old_cluster_incarnation(
         monkeypatch: pytest.MonkeyPatch) -> None:
     current = 200_000
-    demand = _cluster_demand(created_at=current - 100_000)
+    demand = _cluster_demand(created_at=current - 100_000,
+                             first_terminal_at=current - 3600)
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'list_consumer_reconciliation_candidates',
                         lambda **_: [demand])
@@ -174,21 +201,18 @@ def test_known_absent_binding_does_not_mask_old_cluster_incarnation(
     monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
                         'get_job_task_terminal_states', lambda _: {})
     defer = mock.Mock()
-    observe = mock.Mock(return_value=False)
+    reconcile = mock.Mock(return_value=False)
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'defer_consumer_reconciliation', defer)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'observe_consumer_terminal', observe)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     defer.assert_not_called()
-    observe.assert_called_once_with(demand.id,
-                                    demand.workspace,
-                                    authoritative=True,
-                                    now=current)
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
 
 
-def test_terminal_confirmation_wait_preserves_first_observation(
+def test_cluster_terminal_confirmation_uses_locked_reconciliation(
         monkeypatch: pytest.MonkeyPatch) -> None:
     current = 200_000
     demand = _cluster_demand(created_at=current - 100_000,
@@ -203,19 +227,15 @@ def test_terminal_confirmation_wait_preserves_first_observation(
     monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
                         'get_job_task_terminal_states', lambda _: {})
     clear = mock.Mock()
-    preserve = mock.Mock(return_value=True)
-    observe = mock.Mock()
+    reconcile = mock.Mock(return_value=False)
     monkeypatch.setattr(lifecycle_worker_service.demand_state,
                         'defer_consumer_reconciliation', clear)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'defer_terminal_confirmation', preserve)
-    monkeypatch.setattr(lifecycle_worker_service.demand_state,
-                        'observe_consumer_terminal', observe)
+    monkeypatch.setattr(lifecycle_worker_service, '_reconcile_cluster_terminal',
+                        reconcile)
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
-    preserve.assert_called_once_with(demand.id, now=current)
     clear.assert_not_called()
-    observe.assert_not_called()
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
 
 
 @pytest.mark.parametrize(
