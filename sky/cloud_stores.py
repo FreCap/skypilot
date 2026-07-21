@@ -1028,8 +1028,9 @@ def get_storage_from_path(url: str) -> CloudStorage:
     """Returns a CloudStorage by identifying the scheme:// in a URL."""
     result = urllib.parse.urlsplit(url)
     if result.scheme not in _REGISTRY:
-        assert False, (f'Scheme {result.scheme} not found in'
-                       f' supported storage ({_REGISTRY.keys()}); path {url}')
+        raise AssertionError(
+            f'Scheme {result.scheme} not found in'
+            f' supported storage ({_REGISTRY.keys()}); path {url}')
     if result.scheme == 'oci' and oci_s3.use_s3_api():
         return _OCI_S3_CLOUD_STORAGE
     return _REGISTRY[result.scheme]
