@@ -649,7 +649,10 @@ export function Workspaces() {
       dashboardCache.invalidate(getClusters);
       dashboardCache.invalidateFunction(getManagedJobs);
 
-      await fetchData({ showLoadingIndicators: true });
+      await fetchData({
+        showLoadingIndicators: true,
+        supersede: true,
+      });
     } catch (error) {
       console.error('Error deleting workspace:', error);
 

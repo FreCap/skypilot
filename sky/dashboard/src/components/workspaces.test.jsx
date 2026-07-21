@@ -11,6 +11,7 @@ import { Workspaces } from '@/components/workspaces';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
 import {
+  deleteWorkspace,
   getEnabledCloudsBatch,
   getWorkspaces,
 } from '@/data/connectors/workspaces';
@@ -355,6 +356,59 @@ describe('Workspaces request lifecycle', () => {
       intervalRefresh.resolve({ alpha: {} });
       await intervalRefresh.promise;
     });
+  });
+
+  it('supersedes an in-flight interval sweep after deleting a workspace', async () => {
+    jest.useFakeTimers();
+    const intervalRefresh = deferred();
+    const postDeleteRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall === 2) return intervalRefresh.promise;
+        return postDeleteRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    deleteWorkspace.mockResolvedValue(undefined);
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+
+    fireEvent.click(screen.getByTitle('Delete workspace'));
+    await screen.findByText('Delete Workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith('alpha'));
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(3));
+
+    await act(async () => {
+      postDeleteRefresh.resolve({});
+      intervalRefresh.resolve({ alpha: {} });
+      await Promise.all([postDeleteRefresh.promise, intervalRefresh.promise]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText('alpha')).not.toBeInTheDocument()
+    );
   });
 
   it('keeps manual refresh ownership when an interval tick fires', async () => {
