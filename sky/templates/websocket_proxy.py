@@ -99,15 +99,31 @@ async def run_websocket_proxy(websocket: ClientConnection,
         websocket_closed_event = asyncio.Event()
         websocket_lock = asyncio.Lock()
 
-        await asyncio.gather(
-            stdin_to_websocket(stdin_reader, websocket, timestamps_supported,
-                               websocket_closed_event, websocket_lock),
-            websocket_to_stdout(websocket, stdout_writer, timestamps_supported,
-                                last_ping_time_dict, websocket_closed_event,
-                                websocket_lock, first_message),
-            latency_monitor(websocket, last_ping_time_dict,
-                            websocket_closed_event, websocket_lock),
-            return_exceptions=True)
+        tasks = [
+            asyncio.create_task(
+                stdin_to_websocket(stdin_reader, websocket,
+                                   timestamps_supported, websocket_closed_event,
+                                   websocket_lock)),
+            asyncio.create_task(
+                websocket_to_stdout(websocket, stdout_writer,
+                                    timestamps_supported, last_ping_time_dict,
+                                    websocket_closed_event, websocket_lock,
+                                    first_message)),
+        ]
+        if last_ping_time_dict is not None:
+            tasks.append(
+                asyncio.create_task(
+                    latency_monitor(websocket, last_ping_time_dict,
+                                    websocket_closed_event, websocket_lock)))
+        try:
+            done, _ = await asyncio.wait(tasks,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         if restore_terminal is not None:
             restore_terminal()
