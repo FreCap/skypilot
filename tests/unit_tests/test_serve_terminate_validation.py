@@ -6,7 +6,9 @@ from unittest import mock
 import fastapi
 import pytest
 
+from sky.serve import constants
 from sky.serve import controller
+from sky.serve import serve_rpc_utils
 from sky.serve import serve_utils
 
 
@@ -65,6 +67,48 @@ def test_missing_replica_returns_not_found(monkeypatch):
     lookup.assert_called_once_with('service', 17)
 
 
+def test_already_terminating_replica_remains_conflict(monkeypatch):
+    replica_info = mock.Mock(
+        status=controller.serve_state.ReplicaStatus.SHUTTING_DOWN)
+    monkeypatch.setattr(controller.serve_state, 'get_replica_info_from_id',
+                        mock.Mock(return_value=replica_info))
+    replica_manager = mock.Mock()
+
+    response = controller._terminate_replica_sync('service', replica_manager,
+                                                  17, False)
+
+    assert response.status_code == 409
+    replica_manager.scale_down.assert_not_called()
+
+
+def test_failed_replica_requires_purge(monkeypatch):
+    replica_info = mock.Mock(
+        status=controller.serve_state.ReplicaStatus.FAILED_PROVISION)
+    monkeypatch.setattr(controller.serve_state, 'get_replica_info_from_id',
+                        mock.Mock(return_value=replica_info))
+    replica_manager = mock.Mock()
+
+    response = controller._terminate_replica_sync('service', replica_manager,
+                                                  17, False)
+
+    assert response.status_code == 409
+    replica_manager.scale_down.assert_not_called()
+
+
+def test_failed_replica_can_still_be_purged(monkeypatch):
+    replica_info = mock.Mock(
+        status=controller.serve_state.ReplicaStatus.FAILED_PROVISION)
+    monkeypatch.setattr(controller.serve_state, 'get_replica_info_from_id',
+                        mock.Mock(return_value=replica_info))
+    replica_manager = mock.Mock()
+
+    response = controller._terminate_replica_sync('service', replica_manager,
+                                                  17, True)
+
+    assert response.status_code == 200
+    replica_manager.scale_down.assert_called_once_with(17, purge=True)
+
+
 @pytest.mark.parametrize('body, status_code', [
     ({
         'detail': 'Replica 17 does not exist.'
@@ -106,3 +150,50 @@ def test_client_surfaces_non_json_error_body(monkeypatch):
 
     with pytest.raises(ValueError):
         serve_utils.terminate_replica('service', 17, purge=False)
+
+
+def test_client_uses_termination_acceptance_timeout(monkeypatch):
+    monkeypatch.setattr(serve_utils, '_get_service_status',
+                        mock.Mock(return_value={'hash': 'h'}))
+    monkeypatch.setattr(serve_utils.serve_state, 'get_replica_info_from_id',
+                        mock.Mock(return_value=object()))
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {'message': 'scheduled'}
+    post = mock.Mock(return_value=response)
+    monkeypatch.setattr(serve_utils, '_post_to_controller_with_retry', post)
+
+    assert serve_utils.terminate_replica('service', 17,
+                                         purge=False) == 'scheduled'
+
+    post.assert_called_once_with(
+        'service',
+        'h',
+        '/controller/terminate_replica',
+        json={
+            'replica_id': 17,
+            'purge': False,
+        },
+        timeout=(serve_utils._CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.TERMINATE_REPLICA_TIMEOUT_SECONDS))
+    assert serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS == 1
+
+
+def test_rpc_runner_terminates_without_transport_replay(monkeypatch):
+    handle = mock.Mock(is_grpc_enabled_with_flag=True)
+    client = mock.Mock()
+    client.terminate_replica.return_value = mock.Mock(message='scheduled')
+    monkeypatch.setattr(serve_rpc_utils.backends, 'SkyletClient',
+                        mock.Mock(return_value=client))
+    request = mock.Mock()
+    monkeypatch.setattr(serve_rpc_utils.servev1_pb2, 'TerminateReplicaRequest',
+                        mock.Mock(return_value=request))
+    invoke = mock.Mock(side_effect=lambda operation, max_attempts: operation())
+    monkeypatch.setattr(serve_rpc_utils.backend_utils,
+                        'invoke_skylet_with_retries', invoke)
+
+    assert serve_rpc_utils.RpcRunner.terminate_replica(
+        handle, 'service', 17, purge=False) == 'scheduled'
+
+    invoke.assert_called_once()
+    assert invoke.call_args.kwargs == {'max_attempts': 1}
+    client.terminate_replica.assert_called_once_with(request)

@@ -329,3 +329,20 @@ def test_invoke_skylet_with_retries_raises_fallback_error_on_unimplemented():
     with pytest.raises(exceptions.SkyletMethodNotImplementedError,
                        match='falling back to legacy execution'):
         backend_utils.invoke_skylet_with_retries(func)
+
+
+def test_invoke_skylet_with_retries_honors_single_attempt():
+    attempts = 0
+
+    def func():
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+    with mock.patch.object(skylet_rpc, '_handle_grpc_error') as handler:
+        with pytest.raises(exceptions.SkyletUnavailableError,
+                           match='after 1 attempts'):
+            backend_utils.invoke_skylet_with_retries(func, max_attempts=1)
+
+    assert attempts == 1
+    handler.assert_called_once()
