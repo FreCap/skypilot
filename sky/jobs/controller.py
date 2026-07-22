@@ -2554,6 +2554,7 @@ class ControllerManager:
         """Run one scan of the cancel signal directory."""
         cancels = await asyncio.to_thread(
             os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+        cancel_job_ids = []
         for cancel in cancels:
             if not cancel.isdigit():
                 # There maybe unexpected files that are written to the
@@ -2563,15 +2564,32 @@ class ControllerManager:
                     logger.debug('Detected unexpected file in signal '
                                  f'directory: {cancel}. Skipping...')
                 continue
-            job_id = int(cancel)
-            async with self._job_tasks_lock:
-                task = self.job_tasks.get(job_id)
-            if task is None:
-                await self._reap_orphan_cancel_signal(job_id)
-                continue
-            logger.info(f'Cancelling job {job_id}')
+            cancel_job_ids.append(int(cancel))
 
+        # Snapshot ownership once, then deliver local cancellations before
+        # waiting on status I/O for signals owned by other controllers. A
+        # concurrent local claim conservatively leaves its non-terminal signal
+        # for the next scan.
+        async with self._job_tasks_lock:
+            owned_tasks = [(job_id, self.job_tasks[job_id])
+                           for job_id in cancel_job_ids
+                           if job_id in self.job_tasks]
+        owned_job_ids = {job_id for job_id, _ in owned_tasks}
+        orphan_job_ids = [
+            job_id for job_id in cancel_job_ids if job_id not in owned_job_ids
+        ]
+
+        for job_id, task in owned_tasks:
+            logger.info(f'Cancelling job {job_id}')
             await self._consume_and_cancel_task(job_id, task)
+
+        if not orphan_job_ids:
+            return
+        orphan_statuses = await managed_job_state.get_statuses_async(
+            orphan_job_ids)
+        for job_id in orphan_job_ids:
+            await self._reap_orphan_cancel_signal(job_id,
+                                                  orphan_statuses[job_id])
 
     @asyncio_utils.shield
     async def _consume_and_cancel_task(self, job_id: int,
@@ -2628,7 +2646,9 @@ class ControllerManager:
         """Consume a job's cancel signal file, tolerating a lost race."""
         await ControllerManager._consume_signal_file(job_id)
 
-    async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
+    async def _reap_orphan_cancel_signal(
+            self, job_id: int,
+            status: managed_job_state.ManagedJobStatus | None) -> None:
         """Remove a cancel signal that no consumer will ever pick up.
 
         A signal file is normally consumed either by the owning job task
@@ -2640,7 +2660,6 @@ class ControllerManager:
         job is terminal (or gone): a non-terminal job is either owned by
         another controller process or will be handled at claim time.
         """
-        status = await managed_job_state.get_status_async(job_id)
         if status is not None and not status.is_terminal():
             return
         try:

@@ -131,6 +131,52 @@ def _get_api_access_token_rows(engine):
     return [(row.job_id, row.token_id) for row in rows]
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_async_batches_latest_task_semantics(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 1, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 1, 1, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, 1, 2, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, 2, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 2, 1, status=ManagedJobStatus.FAILED)
+
+    async_engine = state._db_manager._engine_async
+    assert async_engine is not None
+    with _count_sql_statements(async_engine.sync_engine) as counts:
+        statuses = await state.get_statuses_async([2, 1, 3, 1])
+
+    assert counts['n'] == 1, counts
+    assert statuses == {
+        2: ManagedJobStatus.FAILED,
+        1: ManagedJobStatus.RUNNING,
+        3: None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_async_bounds_chunk_queries_and_empty_input(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    for job_id in range(1, 6):
+        _insert_task(engine, job_id, 0, status=ManagedJobStatus.SUCCEEDED)
+    monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+
+    async_engine = state._db_manager._engine_async
+    assert async_engine is not None
+    with _count_sql_statements(async_engine.sync_engine) as counts:
+        statuses = await state.get_statuses_async([1, 2, 3, 4, 5, 1])
+
+    assert counts['n'] == 3, counts
+    assert statuses == {
+        job_id: ManagedJobStatus.SUCCEEDED for job_id in range(1, 6)
+    }
+
+    with _count_sql_statements(async_engine.sync_engine) as counts:
+        assert await state.get_statuses_async([]) == {}
+    assert counts['n'] == 0, counts
+
+
 def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
 

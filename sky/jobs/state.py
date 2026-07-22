@@ -2053,6 +2053,41 @@ async def get_latest_task_id_status_async(
 
 
 @db_retries.retry_async
+async def get_statuses_async(
+        job_ids: list[int]) -> dict[int, ManagedJobStatus | None]:
+    """Return latest task statuses for jobs from bounded batch reads."""
+    if not job_ids:
+        return {}
+
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    statuses: dict[int, ManagedJobStatus | None] = {
+        job_id: None for job_id in unique_job_ids
+    }
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+            chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+            task_statuses: dict[int, list[tuple[int, ManagedJobStatus]]] = {
+                job_id: [] for job_id in chunk
+            }
+            result = await session.execute(
+                sqlalchemy.select(
+                    spot_table.c.spot_job_id,
+                    spot_table.c.task_id,
+                    spot_table.c.status,
+                ).where(spot_table.c.spot_job_id.in_(chunk)).order_by(
+                    spot_table.c.spot_job_id.asc(), spot_table.c.task_id.asc()))
+            for job_id, task_id, status in result.fetchall():
+                task_statuses[job_id].append(
+                    (task_id, ManagedJobStatus(status)))
+            for job_id, job_statuses in task_statuses.items():
+                statuses[job_id] = get_latest_task_id_from_statuses(
+                    job_statuses)[1]
+
+    return statuses
+
+
+@db_retries.retry_async
 async def get_all_task_ids_statuses_async(
         job_id: int) -> list[tuple[int, ManagedJobStatus]]:
     """Returns all (task_id, status) pairs for a job (async version)."""
