@@ -788,6 +788,38 @@ can therefore retain ready capacity conservatively, but it cannot authorize a
 new paid cold start. This does not change request-priority semantics: no READY
 replica is preempted, and normal scale-down keeps its graceful drain contract.
 
+Production validation exposed a second, independent cold-launch authority
+edge. Running and occupancy-unknown work is pinned to its current exact card so
+that a card migration cannot preempt it. That pin is a retention floor, not a
+claim that every unit of work above the card's already-materialized serving
+capacity needs a new replica on the same card. Otherwise a brief concurrency
+burst or occupancy-unknown wave can turn 126 units already executing on 121
+ready reserved A100 slots into an apparent five-slot A100 shortfall, even when
+the aggregate fleet is short only one slot and L4 is the cheapest compatible
+paid cold start.
+
+For concurrency scaling, cap fixed in-flight and unknown work on each exact
+card at the latest non-retiring materialized work capacity of that card. Keep
+that capped portion exact so every serving replica carrying work remains
+protected. Reintroduce only the non-negative overflow as one all-configured-card
+compatibility profile at the lowest numeric priority before allocation. The
+overflow represents additional pressure from work that is already being
+served; it does not move or preempt those requests. New queued and rejected
+profiles retain their original priority and compatibility sets, so explicit
+A100-only demand can still justify an A100 cold start while flexible or
+headerless overflow uses ready compatible supply and then the cheapest
+compatible paid card. Preserve total work exactly: capped fixed work plus its
+flexible overflow must equal the original fixed work in both logical-slot and
+physical-replica modes.
+
+In logical mode, count that flexible overflow as allocator-attributed work
+before shaping any offered-arrival floor gap. This prevents the same accepted
+work from reappearing through the retained arrival window. The remaining
+arrival gap still keeps its recorded priority and compatibility, so an
+A100-only arrival profile is allocated before the lowest-priority flexible
+overflow. Per-card rounding is then applied to those distinct profiles without
+turning oversubscribed in-flight work back into same-card cold-launch authority.
+
 HA cutover snapshots carry both accepted compatibility arrivals and the live
 compatibility queue, recent-rejection, and exact-card in-flight gauges. Arrival
 events transfer to the promoted controller state exactly once; replaceable
