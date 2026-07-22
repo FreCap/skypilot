@@ -1066,7 +1066,9 @@ Important constraints include:
 - unique operation `(authority, scope, actor_hash, kind, idempotency_key)` plus a
   bounded request hash, `PENDING|RUNNING|SUCCEEDED|FAILED` state, result
   projection, and 30-day terminal expiry, with a lease/child/teardown tuple only
-  for RUNNING PROFILE_CANARY;
+  for RUNNING PROFILE_CANARY. A generated `canary_claimable_at` is `updated_at`
+  for pending canaries, the later of lease expiry and `updated_at` for running
+  canaries, and null for every unrelated or terminal operation;
 - one permanent custody row per `(workspace, profile)`, written atomically with
   the first READY publication and carrying the immutable physical-manifest hash
   plus its first profile revision. Profile staging and activation use this
@@ -1122,7 +1124,11 @@ Publication inspection scans `(inspection_claimable_at, id)` only for unbound
 work. Copy dispatch scans `(copy_next_at, id)` only for shards with projected
 work, then uses the shard-local generated location projection. Inventory scans
 `(inventory_finalizing DESC, inventory_next_at, id)` only for operational shard
-states. Claim uses `FOR UPDATE SKIP LOCKED`. Provider I/O occurs outside the
+states. Canary workers scan `(canary_claimable_at, id)` only where that
+projection is nonnull and due, excluding unrelated and retained terminal
+operations. Rotating an incompatible expired child advances `updated_at`, which
+also moves that row behind older due recovery work. Claim uses `FOR UPDATE SKIP
+LOCKED`. Provider I/O occurs outside the
 claim transaction. Completion validates the applicable random lease token after
 acquiring the row lock and reading the current clock. Terminal publication
 history, idle shards, and future inventory epochs are absent from these hot
@@ -1449,6 +1455,9 @@ runtime roles. `transactions.activate_profile()` locks the
 current desired row and promotes it only after rechecking desired generation,
 config and Terraform hashes, target fingerprints, and fresh required
 attestations. Production callers do not pass a pre-lock application timestamp.
+The lifecycle scheduler may use its sampled time for interval bookkeeping and
+deterministic evidence tests, but neither reconciliation nor activation forwards
+that value as database-time authority.
 Activation samples the database wall clock only after its profile advisory lock,
 candidate and active profile rows, provider-budget rows, and physical shard rows
 have been acquired, then revalidates attestation freshness and budget facts
@@ -2318,7 +2327,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   reclamation tests;
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, inventory claims and runtime-digest matches,
-  readiness, live/terminal demand pages, expired reservations, canonical
+  canary pending and expired-lease claims, readiness, live/terminal demand
+  pages, expired reservations, canonical
   publication fan-out, terminal operation compaction, worker cleanup, and
   state-filtered history use their exact indexes with large terminal or idle
   populations present;
@@ -2879,3 +2889,19 @@ validation, and applies the same epoch, token, live-lease, and database-clock
 fence to inventory abandonment. Blocking PostgreSQL regressions exercise the
 production caller paths. The acceptance streak remains zero until both reviewers
 accept one immutable current-base head three consecutive times.
+
+Restarted paired final-acceptance round 1 at
+`49698aeb766f5e56e497ccea2268942264fd641a` returned Fable `PURSUE` and Codex
+`RESHAPE`, resetting the streak. Codex proved that the lifecycle scheduler still
+passed its pre-lock application timestamp into reconciliation and therefore
+through both nominally post-lock activation clock reads. It also proved that the
+PROFILE_CANARY claim OR-query had no index-bounded pending branch and globally
+sorted retained unrelated operations, contradicting the million-row queue
+contract. This revision removes timestamp authority at both production caller
+boundaries, adds a blocking regression through lifecycle reconciliation, and
+replaces the split canary predicate with one generated due-time projection and
+exact partial index. Migration preview adoption upgrades the former projection-
+less operation table explicitly, and large-population plan coverage proves both
+pending and expired-running canaries stay index-bounded. The acceptance streak
+remains zero until both reviewers accept one immutable current-base head three
+consecutive times.

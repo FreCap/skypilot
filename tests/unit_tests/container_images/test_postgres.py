@@ -370,7 +370,12 @@ def _request_ec2_canary(
                                                 runtime_id=runtime_id,
                                                 actor_hash='1' * 64,
                                                 idempotency_key=idempotency_key)
-    return operation
+    with catalog_state.engine().begin() as connection:
+        row = connection.execute(schema.operations.update().where(
+            schema.operations.c.id == operation.id).values(
+                created_at=1,
+                updated_at=1).returning(schema.operations)).mappings().one()
+    return catalog_state._operation(row)
 
 
 def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
@@ -5542,8 +5547,10 @@ def test_profile_staging_is_serialized_by_transaction_advisory_lock(
            ].count(models.ImageProfileState.SUPERSEDED) == 1
 
 
-def test_profile_activation_rechecks_freshness_after_advisory_lock(
-        image_database, profile: models.ManagedRegistryProfile) -> None:
+def _short_lived_qualifying_profile(
+    image_database, profile: models.ManagedRegistryProfile
+) -> tuple[models.ManagedRegistryProfile, topology_state.ProfileRevisionRecord,
+           int]:
     short_lived = dataclasses.replace(
         profile,
         qualification=dataclasses.replace(
@@ -5557,6 +5564,8 @@ def test_profile_activation_rechecks_freshness_after_advisory_lock(
         evidence = (dict(existing) if isinstance(existing, dict) else {
             'status': 'READY'
         })
+        if key.startswith(('copy:', 'lifecycle:')):
+            evidence['runtime_digest'] = _DIGEST
         observed_at = int(time.time())
         evidence.update(status='READY', observed_at=observed_at)
         revision = topology_state.record_profile_attestation(
@@ -5566,19 +5575,19 @@ def test_profile_activation_rechecks_freshness_after_advisory_lock(
             expected_generation=revision.desired_generation,
             expected_config_hash=revision.config_hash,
             now=observed_at)
+    scheduler_now = int(time.time())
     for key, max_age in requirements.items():
         if max_age != 2:
             continue
-        observed_at = int(time.time())
         evidence = dict(revision.attestations[key])
-        evidence['observed_at'] = observed_at
+        evidence['observed_at'] = scheduler_now
         revision = topology_state.record_profile_attestation(
             profile_revision_id=revision.id,
             kind=key,
             evidence=evidence,
             expected_generation=revision.desired_generation,
             expected_config_hash=revision.config_hash,
-            now=observed_at)
+            now=scheduler_now)
     assert revision.attestations_hash is not None
     with image_database.begin() as connection:
         connection.execute(schema.profile_revisions.update().where(
@@ -5589,6 +5598,13 @@ def test_profile_activation_rechecks_freshness_after_advisory_lock(
             schema.registry_shards.c.workspace == 'research',
             schema.registry_shards.c.profile == short_lived.name).values(
                 profile_revision_id=None))
+    return short_lived, revision, scheduler_now
+
+
+def test_profile_activation_rechecks_freshness_after_advisory_lock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    short_lived, revision, _ = _short_lived_qualifying_profile(
+        image_database, profile)
 
     lock_key = json.dumps(['research', short_lived.name], separators=(',', ':'))
     lock_connection = image_database.connect()
@@ -5606,6 +5622,38 @@ def test_profile_activation_rechecks_freshness_after_advisory_lock(
             lock_connection.exec_driver_sql('SELECT pg_sleep(3.2)')
             lock_transaction.commit()
             assert future.result(timeout=10) is None
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    unchanged = topology_state.get_profile_revision(revision.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageProfileState.QUALIFYING
+
+
+def test_lifecycle_reconciliation_does_not_forward_scheduler_clock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    short_lived, revision, scheduler_now = _short_lived_qualifying_profile(
+        image_database, profile)
+    lock_key = json.dumps(['research', short_lived.name], separators=(',', ':'))
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                lifecycle_worker_service.reconcile_qualification_lifecycle,
+                types.SimpleNamespace(),
+                now=scheduler_now)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(3.2)')
+            lock_transaction.commit()
+            assert future.result(timeout=10)
     finally:
         if lock_transaction.is_active:
             lock_transaction.rollback()
@@ -5962,6 +6010,35 @@ def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
                 'actor': '8' * 64,
                 'request_hash': '9' * 64,
             })
+        connection.execute(schema.operations.insert(), [
+            {
+                'id': 'scale-pending-canary',
+                'authority_id': authority,
+                'scope': 'research',
+                'actor_hash': 'a' * 64,
+                'kind': 'PROFILE_CANARY',
+                'idempotency_key': 'scale-pending-canary-key',
+                'request_hash': 'b' * 64,
+                'state': models.ImageOperationState.PENDING.value,
+                'created_at': 1,
+                'updated_at': 1,
+            },
+            {
+                'id': 'scale-expired-canary',
+                'authority_id': authority,
+                'scope': 'research',
+                'actor_hash': 'c' * 64,
+                'kind': 'PROFILE_CANARY',
+                'idempotency_key': 'scale-expired-canary-key',
+                'request_hash': 'd' * 64,
+                'state': models.ImageOperationState.RUNNING.value,
+                'lease_token': 'scale-worker:token',
+                'lease_expires_at': 2,
+                'teardown_deadline': 10,
+                'created_at': 1,
+                'updated_at': 3,
+            },
+        ])
         connection.execute(
             sqlalchemy.text("""
                 INSERT INTO container_image_publications (
@@ -6021,7 +6098,20 @@ def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
         connection.execute(
             sqlalchemy.text('ANALYZE container_image_publications'))
         connection.execute(
+            sqlalchemy.text('ANALYZE container_image_operations'))
+        connection.execute(
             sqlalchemy.text('ANALYZE container_image_registry_shards'))
+        canary_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_operations
+                WHERE canary_claimable_at IS NOT NULL
+                  AND canary_claimable_at <= :now
+                ORDER BY canary_claimable_at, id
+                LIMIT 16 FOR UPDATE SKIP LOCKED
+            """), {
+                'now': 100
+            }).scalars().all()
         publication_plan = connection.execute(
             sqlalchemy.text("""
                 EXPLAIN (COSTS OFF)
@@ -6057,6 +6147,7 @@ def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
             }).scalars().all()
 
     assert queued.publication.canonical_location_id is None
+    assert 'ix_container_image_operations_canary_queue' in str(canary_plan)
     assert ('ix_container_image_publications_inspection_queue'
             in str(publication_plan))
     assert ('ix_container_image_registry_shard_copy_queue' in str(copy_plan))
@@ -6555,6 +6646,18 @@ def test_bootstrap_mode_migrates_all_central_schemas_in_one_shared_schema(
          "WHERE state IN ('COPYING', 'VERIFYING')"),
         'structurally incompatible.*columns',
         id='changed-generated-expression'),
+    pytest.param(
+        ('ALTER TABLE container_image_operations DROP COLUMN '
+         'canary_claimable_at CASCADE',
+         'ALTER TABLE container_image_operations ADD COLUMN '
+         'canary_claimable_at BIGINT GENERATED ALWAYS AS '
+         "(CASE WHEN kind = 'PROFILE_CANARY' AND state = 'PENDING' THEN "
+         'created_at ELSE NULL END) STORED',
+         'CREATE INDEX ix_container_image_operations_canary_queue ON '
+         'container_image_operations (canary_claimable_at, id) '
+         'WHERE canary_claimable_at IS NOT NULL'),
+        'structurally incompatible.*columns',
+        id='changed-canary-generated-expression'),
     pytest.param(('DROP TABLE container_image_workers',),
                  'incomplete managed image state; missing tables',
                  id='missing-table'),
@@ -6767,6 +6870,13 @@ def test_migration_024_adopts_old_preview_custody_and_operation_link(
                 'ALTER TABLE container_image_publications ADD CONSTRAINT '
                 'container_image_publications_operation_id_fkey FOREIGN KEY '
                 '(operation_id) REFERENCES container_image_operations(id)')
+            connection.exec_driver_sql(
+                'ALTER TABLE container_image_operations DROP COLUMN '
+                'canary_claimable_at CASCADE')
+            connection.exec_driver_sql(
+                'CREATE INDEX ix_container_image_operations_canary_queue ON '
+                'container_image_operations (state, lease_expires_at, id) '
+                "WHERE kind = 'PROFILE_CANARY' AND state = 'RUNNING'")
 
         _migration_call(preview_engine, migration_024.upgrade)
 
@@ -6779,8 +6889,18 @@ def test_migration_024_adopts_old_preview_custody_and_operation_link(
             foreign_key for foreign_key in inspector.get_foreign_keys(
                 'container_image_publications')
             if foreign_key['constrained_columns'] == ['operation_id'])
+        canary_column = next(
+            column
+            for column in inspector.get_columns('container_image_operations')
+            if column['name'] == 'canary_claimable_at')
+        canary_index = next(
+            index
+            for index in inspector.get_indexes('container_image_operations')
+            if index['name'] == 'ix_container_image_operations_canary_queue')
         assert operation_column['nullable']
         assert operation_fk['options']['ondelete'] == 'SET NULL'
+        assert canary_column['computed']['persisted']
+        assert canary_index['column_names'] == ['canary_claimable_at', 'id']
         with preview_engine.connect() as connection:
             custody = connection.execute(
                 sqlalchemy.text(

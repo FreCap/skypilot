@@ -213,6 +213,7 @@ def request_canary(
         'runtime_id': runtime_id,
     })
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session)
         operation, created = catalog_state.begin_operation(
             session,
             authority_id=authority_id,
@@ -220,7 +221,8 @@ def request_canary(
             actor_hash=actor_hash,
             kind='PROFILE_CANARY',
             idempotency_key=idempotency_key,
-            request_hash=request_hash)
+            request_hash=request_hash,
+            now=current)
         if created:
             payload = {
                 'profile_revision_id': desired.id,
@@ -244,7 +246,7 @@ def request_canary(
                     result_json=json.dumps(payload,
                                            sort_keys=True,
                                            separators=(',', ':')),
-                    updated_at=int(time.time())).returning(
+                    updated_at=current).returning(
                         schema.operations)).mappings().one()
             operation = catalog_state._operation(  # pylint: disable=protected-access
                 row)
@@ -287,16 +289,11 @@ def claim_canary(
         clock = catalog_state.database_epoch_expression(now=now)
         rows = session.execute(
             sqlalchemy.select(table).where(
-                table.c.kind == 'PROFILE_CANARY',
-                sqlalchemy.or_(
-                    table.c.state == models.ImageOperationState.PENDING.value,
-                    sqlalchemy.and_(
-                        table.c.state ==
-                        models.ImageOperationState.RUNNING.value,
-                        table.c.lease_expires_at <= clock))).order_by(
-                            table.c.updated_at,
-                            table.c.id).limit(16).with_for_update(
-                                skip_locked=True)).mappings().all()
+                table.c.canary_claimable_at.is_not(None),
+                table.c.canary_claimable_at
+                <= clock).order_by(table.c.canary_claimable_at,
+                                   table.c.id).limit(16).with_for_update(
+                                       skip_locked=True)).mappings().all()
         for row in rows:
             operation = catalog_state._operation(  # pylint: disable=protected-access
                 row)

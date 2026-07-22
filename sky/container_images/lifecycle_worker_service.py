@@ -474,7 +474,7 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 expected_generation=revision.desired_generation,
                 expected_config_hash=revision.config_hash,
                 now=current)
-        qualification.maybe_activate_profile(revision.id, now=now)
+        qualification.maybe_activate_profile(revision.id)
     return True
 
 
@@ -592,9 +592,7 @@ class LifecycleWorkerService:
                         qualification_future is None and
                         len(futures) < self.max_in_flight):
                     qualification_future = executor.submit(
-                        reconcile_qualification_lifecycle,
-                        self._budget_limiter,
-                        now=current)
+                        reconcile_qualification_lifecycle, self._budget_limiter)
                     futures.add(qualification_future)
                     last_qualification_reconciliation = current
                 if (current - last_canonical_reconciliation

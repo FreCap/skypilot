@@ -146,6 +146,13 @@ operations = sqlalchemy.Table(
     sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('terminal_expires_at', sqlalchemy.BigInteger),
+    sqlalchemy.Column(
+        'canary_claimable_at', sqlalchemy.BigInteger,
+        sqlalchemy.Computed(
+            "CASE WHEN kind = 'PROFILE_CANARY' AND state = 'PENDING' THEN "
+            "updated_at WHEN kind = 'PROFILE_CANARY' AND state = 'RUNNING' "
+            'THEN GREATEST(lease_expires_at, updated_at) ELSE NULL END',
+            persisted=True)),
     sqlalchemy.UniqueConstraint(
         'authority_id',
         'scope',
@@ -170,12 +177,11 @@ operations = sqlalchemy.Table(
         name='ck_container_image_operation_terminal_expiry'),
     sqlalchemy.Index('ix_container_image_operations_lookup', 'scope',
                      'updated_at', 'id'),
-    sqlalchemy.Index('ix_container_image_operations_canary_queue',
-                     'state',
-                     'lease_expires_at',
-                     'id',
-                     postgresql_where=sqlalchemy.text(
-                         "kind = 'PROFILE_CANARY' AND state = 'RUNNING'")),
+    sqlalchemy.Index(
+        'ix_container_image_operations_canary_queue',
+        'canary_claimable_at',
+        'id',
+        postgresql_where=sqlalchemy.text('canary_claimable_at IS NOT NULL')),
     sqlalchemy.Index(
         'ix_container_image_operations_expiry',
         'terminal_expires_at',

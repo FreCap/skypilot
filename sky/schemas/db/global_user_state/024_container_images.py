@@ -60,12 +60,19 @@ _CLUSTER_BINDING_COLUMN_NAMES = (
 )
 _PUBLICATION_HISTORY_INDEX = (
     'ix_container_image_publications_workspace_history')
+_CANARY_QUEUE_INDEX = 'ix_container_image_operations_canary_queue'
+_CANARY_CLAIMABLE_EXPRESSION = (
+    "CASE WHEN kind = 'PROFILE_CANARY' AND state = 'PENDING' THEN updated_at "
+    "WHEN kind = 'PROFILE_CANARY' AND state = 'RUNNING' THEN "
+    'GREATEST(lease_expires_at, updated_at) ELSE NULL END')
 _PREVIEW_COMPATIBLE_INDEXES = (
     (_PUBLICATION_HISTORY_INDEX, 'container_image_publications',
      ('workspace', 'created_at', 'id'), None),
     ('ix_container_image_profile_qualification_queue',
      'container_image_profile_revisions', ('updated_at', 'id'),
      "state IN ('QUALIFYING', 'ACTIVE')"),
+    (_CANARY_QUEUE_INDEX, 'container_image_operations',
+     ('canary_claimable_at', 'id'), 'canary_claimable_at IS NOT NULL'),
     ('ix_container_image_locations_inventory_digest',
      'container_image_locations', ('shard_id', 'runtime_digest'), None),
     ('ix_container_image_publications_fanout', 'container_image_publications',
@@ -99,7 +106,12 @@ _PREVIEW_COMPATIBLE_INDEXES = (
 )
 
 _SCHEMA_SHAPE_QUERIES = {
-    'columns': """SELECT table_name, column_name, ordinal_position,
+    # Compare the visible column order while ignoring attnum holes left by a
+    # preview database that dropped a superseded column before convergence.
+    'columns': """SELECT table_name, column_name,
+                         row_number() OVER (
+                             PARTITION BY table_name
+                             ORDER BY ordinal_position),
                          data_type, udt_schema, udt_name, is_nullable,
                          column_default, is_generated, generation_expression,
                          is_identity, identity_generation, collation_name,
@@ -355,6 +367,34 @@ def _upgrade_preview_publication_operation_link(
                           ['id'],
                           source_schema=schema_name,
                           ondelete='SET NULL')
+
+
+def _upgrade_preview_canary_queue(bind: sqlalchemy.engine.Connection,
+                                  schema_name: str) -> None:
+    """Adds the generated canary due-time projection to an older preview."""
+    inspector = sqlalchemy.inspect(bind)
+    columns = {
+        column['name']
+        for column in inspector.get_columns('container_image_operations',
+                                            schema=schema_name)
+    }
+    if 'canary_claimable_at' in columns:
+        return
+    indexes = {
+        index['name']
+        for index in inspector.get_indexes('container_image_operations',
+                                           schema=schema_name)
+    }
+    if _CANARY_QUEUE_INDEX in indexes:
+        op.drop_index(_CANARY_QUEUE_INDEX,
+                      table_name='container_image_operations',
+                      schema=schema_name)
+    op.add_column('container_image_operations',
+                  sqlalchemy.Column(
+                      'canary_claimable_at', sqlalchemy.BigInteger,
+                      sqlalchemy.Computed(_CANARY_CLAIMABLE_EXPRESSION,
+                                          persisted=True)),
+                  schema=schema_name)
 
 
 def _backfill_and_validate_profile_custody(bind: sqlalchemy.engine.Connection,
@@ -648,6 +688,9 @@ def _create_tables() -> None:
         sqlalchemy.Column('created_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
         sqlalchemy.Column('terminal_expires_at', sqlalchemy.BigInteger),
+        sqlalchemy.Column(
+            'canary_claimable_at', sqlalchemy.BigInteger,
+            sqlalchemy.Computed(_CANARY_CLAIMABLE_EXPRESSION, persisted=True)),
         sqlalchemy.UniqueConstraint(
             'authority_id',
             'scope',
@@ -676,11 +719,10 @@ def _create_tables() -> None:
     )
     op.create_index('ix_container_image_operations_lookup',
                     'container_image_operations', ['scope', 'updated_at', 'id'])
-    op.create_index('ix_container_image_operations_canary_queue',
-                    'container_image_operations',
-                    ['state', 'lease_expires_at', 'id'],
-                    postgresql_where=sqlalchemy.text(
-                        "kind = 'PROFILE_CANARY' AND state = 'RUNNING'"))
+    op.create_index(
+        _CANARY_QUEUE_INDEX,
+        'container_image_operations', ['canary_claimable_at', 'id'],
+        postgresql_where=sqlalchemy.text('canary_claimable_at IS NOT NULL'))
     op.create_index(
         'ix_container_image_operations_expiry',
         'container_image_operations', ['terminal_expires_at', 'id'],
@@ -1392,6 +1434,7 @@ def upgrade():
         if preview_missing_custody:
             _create_profile_custody_table(str(schema_name))
         _upgrade_preview_publication_operation_link(bind, str(schema_name))
+        _upgrade_preview_canary_queue(bind, str(schema_name))
         _ensure_preview_compatible_indexes(bind, str(schema_name))
         _backfill_and_validate_profile_custody(bind, str(schema_name))
         _validate_preview_schema(bind, str(schema_name))
