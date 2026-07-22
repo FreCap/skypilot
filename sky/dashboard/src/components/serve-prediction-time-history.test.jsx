@@ -9,7 +9,7 @@ jest.mock('chart.js', () => ({
 
 jest.mock('react-chartjs-2', () => ({
   Bar: ({ data }) => (
-    <div data-testid="response-histogram">
+    <div data-testid="prediction-histogram">
       {data.datasets[0].data.join('|')}
     </div>
   ),
@@ -17,7 +17,7 @@ jest.mock('react-chartjs-2', () => ({
 
 jest.mock('./serve-history-range', () => ({
   SelectableHistoryLine: ({ data, ariaLabel }) => (
-    <div aria-label={ariaLabel} data-testid="response-trend">
+    <div aria-label={ariaLabel} data-testid="prediction-trend">
       {data.datasets.map((dataset) => dataset.label).join('|')}
     </div>
   ),
@@ -28,35 +28,35 @@ import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 
 import {
-  buildResponseTimeHistoryView,
-  ResponseTimeHistoryCard,
-} from './serve-response-time-history';
+  buildPredictionTimeHistoryView,
+  PredictionTimeHistoryCard,
+} from './serve-prediction-time-history';
 
 const history = {
   available: true,
   bucketSeconds: 60,
-  responseTimeHistogramVersion: 1,
-  responseTimeBucketUpperBoundsSeconds: [1, 2, 4],
-  responseTimeSamples: [
+  predictionTimeHistogramVersion: 1,
+  predictionTimeBucketUpperBoundsSeconds: [1, 2, 4],
+  predictionTimeSamples: [
     {
       timestamp: 120,
-      statusClassCounts: {
-        '2xx': [1, 1, 2, 0],
-        '5xx': [0, 0, 0, 1],
+      outcomeCounts: {
+        succeeded: [1, 1, 2, 0],
+        failed: [0, 0, 0, 1],
       },
     },
     {
       timestamp: 180,
-      statusClassCounts: {
-        '2xx': [0, 2, 0, 0],
+      outcomeCounts: {
+        succeeded: [0, 2, 0, 0],
       },
     },
   ],
 };
 
-describe('response-time history', () => {
-  it('aggregates status classes and derives fixed-bucket quantiles', () => {
-    const all = buildResponseTimeHistoryView(history, {
+describe('prediction-time history', () => {
+  it('aggregates outcomes and derives fixed-bucket quantiles', () => {
+    const all = buildPredictionTimeHistoryView(history, {
       start: 120,
       end: 180,
     });
@@ -67,10 +67,10 @@ describe('response-time history', () => {
     expect(all.selectedP95Overflow).toBe(true);
     expect(all.p50).toEqual([4, 2]);
 
-    const successes = buildResponseTimeHistoryView(
+    const successes = buildPredictionTimeHistoryView(
       history,
       { start: 120, end: 180 },
-      '2xx'
+      'succeeded'
     );
     expect(successes.aggregateCounts).toEqual([1, 3, 2, 0]);
     expect(successes.samples).toBe(6);
@@ -78,9 +78,9 @@ describe('response-time history', () => {
     expect(successes.selectedP95Overflow).toBe(false);
   });
 
-  it('switches the visible histogram by final status class', () => {
+  it('switches the visible histogram by prediction outcome', () => {
     render(
-      <ResponseTimeHistoryCard
+      <PredictionTimeHistoryCard
         history={history}
         range={{ start: 120, end: 180 }}
         onRangeSelect={() => {}}
@@ -90,14 +90,14 @@ describe('response-time history', () => {
     expect(
       screen.getByText('Completed in range').nextSibling
     ).toHaveTextContent('7');
-    expect(screen.getByTestId('response-trend')).toHaveTextContent(
+    expect(screen.getByTestId('prediction-trend')).toHaveTextContent(
       'p50|p95|p99'
     );
-    fireEvent.click(screen.getByRole('button', { name: '5xx' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Failed' }));
     expect(
       screen.getByText('Completed in range').nextSibling
     ).toHaveTextContent('1');
-    expect(screen.getByTestId('response-histogram')).toHaveTextContent(
+    expect(screen.getByTestId('prediction-histogram')).toHaveTextContent(
       '0|0|0|1'
     );
   });

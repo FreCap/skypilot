@@ -21,16 +21,16 @@ jest.mock('./serve-history-range', () => {
   };
 });
 
-jest.mock('./serve-response-time-history', () => ({
-  ResponseTimeHistoryCard: ({ range, onRangeSelect }) => (
+jest.mock('./serve-prediction-time-history', () => ({
+  PredictionTimeHistoryCard: ({ range, onRangeSelect }) => (
     <button
       type="button"
-      aria-label="Response time trend chart"
+      aria-label="Prediction time trend chart"
       data-start={range.start}
       data-end={range.end}
       onClick={() => onRangeSelect({ start: 120, end: 300 })}
     >
-      response chart
+      prediction chart
     </button>
   ),
 }));
@@ -115,7 +115,7 @@ const history = {
 function chartRanges() {
   return [
     'Request history chart',
-    'Response time trend chart',
+    'Prediction time trend chart',
     'Demand pressure chart',
     'L4 accelerator history chart',
     'Machine history chart',

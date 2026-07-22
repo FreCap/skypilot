@@ -480,18 +480,18 @@ class RequestsAggregator:
         """Mark a request-history snapshot as durably accepted."""
         raise NotImplementedError
 
-    def add_response_time(self, duration_seconds: float,
-                          status_code: int) -> None:
-        """Record one completed inference response."""
+    def add_prediction_time(self, duration_seconds: float,
+                            outcome: str) -> None:
+        """Record one completed prediction."""
         raise NotImplementedError
 
-    def response_time_history_snapshot(self) -> dict[str, Any] | None:
-        """Return response-time counters awaiting acknowledgement."""
+    def prediction_time_history_snapshot(self) -> dict[str, Any] | None:
+        """Return prediction-time counters awaiting acknowledgement."""
         raise NotImplementedError
 
-    def mark_response_time_history_accepted(
+    def mark_prediction_time_history_accepted(
             self, snapshot: dict[str, Any] | None) -> None:
-        """Mark a response-time snapshot as durably accepted."""
+        """Mark a prediction-time snapshot as durably accepted."""
         raise NotImplementedError
 
     def __repr__(self) -> str:
@@ -521,10 +521,10 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history: dict[int, int] = {}
         self._rejection_history: dict[int, int] = {}
         self._acknowledged_rejection_history: dict[int, int] = {}
-        self._response_time_history: dict[int, dict[str, list[int]]] = {}
-        self._acknowledged_response_time_history: dict[int,
-                                                       dict[str,
-                                                            list[int]]] = {}
+        self._prediction_time_history: dict[int, dict[str, list[int]]] = {}
+        self._acknowledged_prediction_time_history: dict[int,
+                                                         dict[str,
+                                                              list[int]]] = {}
         # Pruning rebuilds both bounded history dictionaries. Keep that work on
         # minute boundaries (and controller snapshots), never on every request.
         self._last_pruned_request_history_bucket: int | None = None
@@ -561,27 +561,26 @@ class RequestTimestamp(RequestsAggregator):
         if bucket_start != self._last_pruned_request_history_bucket:
             self._prune_request_history(bucket_start)
 
-    def add_response_time(self, duration_seconds: float,
-                          status_code: int) -> None:
-        """Record one completed response in its completion-minute bucket."""
+    def add_prediction_time(self, duration_seconds: float,
+                            outcome: str) -> None:
+        """Record one completed prediction in its observation minute."""
         timestamp = time.time()
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
-        if (not isinstance(status_code, int) or isinstance(status_code, bool) or
-                status_code < 100 or status_code >= 600):
-            status_code = 500
-        status_class = f'{status_code // 100}xx'
+        if outcome not in constants.LB_PREDICTION_TIME_OUTCOMES:
+            raise ValueError(f'Unsupported prediction outcome: {outcome!r}.')
         if (not isinstance(duration_seconds, (int, float)) or
                 isinstance(duration_seconds, bool) or
                 not math.isfinite(duration_seconds)):
-            duration_seconds = 0.0
+            raise ValueError('Prediction duration must be finite.')
         duration_seconds = max(0.0, float(duration_seconds))
         duration_bucket = bisect.bisect_left(
-            constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS,
+            constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS,
             duration_seconds)
-        status_counts = self._response_time_history.setdefault(bucket_start, {})
-        counts = status_counts.setdefault(
-            status_class, [0] * constants.LB_RESPONSE_TIME_BUCKET_COUNT)
+        outcome_counts = self._prediction_time_history.setdefault(
+            bucket_start, {})
+        counts = outcome_counts.setdefault(
+            outcome, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
         counts[duration_bucket] += 1
         if bucket_start != self._last_pruned_request_history_bucket:
             self._prune_request_history(bucket_start)
@@ -594,8 +593,8 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
         self._acknowledged_rejection_history.clear()
-        self._response_time_history.clear()
-        self._acknowledged_response_time_history.clear()
+        self._prediction_time_history.clear()
+        self._acknowledged_prediction_time_history.clear()
         self._last_pruned_request_history_bucket = None
 
     def _prune_request_history(self, newest_bucket: int) -> None:
@@ -622,15 +621,15 @@ class RequestTimestamp(RequestsAggregator):
             for bucket, count in self._acknowledged_rejection_history.items()
             if bucket >= oldest_bucket
         }
-        self._response_time_history = {
+        self._prediction_time_history = {
             bucket: counts
-            for bucket, counts in self._response_time_history.items()
+            for bucket, counts in self._prediction_time_history.items()
             if bucket >= oldest_bucket
         }
-        self._acknowledged_response_time_history = {
+        self._acknowledged_prediction_time_history = {
             bucket: counts
             for bucket, counts in
-            self._acknowledged_response_time_history.items()
+            self._acknowledged_prediction_time_history.items()
             if bucket >= oldest_bucket
         }
         self._last_pruned_request_history_bucket = newest_bucket
@@ -692,35 +691,36 @@ class RequestTimestamp(RequestsAggregator):
                     self._acknowledged_rejection_history.get(bucket_start, 0))
 
     @staticmethod
-    def _response_counts_advance(
+    def _prediction_counts_advance(
             current: dict[str, list[int]],
             acknowledged: dict[str, list[int]] | None) -> bool:
         if acknowledged is None:
             return any(sum(counts) for counts in current.values())
-        for status_class, counts in current.items():
-            accepted = acknowledged.get(status_class, [])
+        for outcome, counts in current.items():
+            accepted = acknowledged.get(outcome, [])
             if any(count > (accepted[index] if index < len(accepted) else 0)
                    for index, count in enumerate(counts)):
                 return True
         return False
 
-    def response_time_history_snapshot(self) -> dict[str, Any] | None:
-        """Return completion histograms changed since durable acceptance."""
+    def prediction_time_history_snapshot(self) -> dict[str, Any] | None:
+        """Return prediction histograms changed since durable acceptance."""
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
         self._prune_request_history(newest_bucket)
         buckets = []
-        for bucket_start in sorted(self._response_time_history):
-            status_counts = self._response_time_history[bucket_start]
-            acknowledged = self._acknowledged_response_time_history.get(
+        for bucket_start in sorted(self._prediction_time_history):
+            outcome_counts = self._prediction_time_history[bucket_start]
+            acknowledged = self._acknowledged_prediction_time_history.get(
                 bucket_start)
-            if not self._response_counts_advance(status_counts, acknowledged):
+            if not self._prediction_counts_advance(outcome_counts,
+                                                   acknowledged):
                 continue
             buckets.append({
                 'bucket_start': bucket_start,
-                'status_class_counts': {
-                    status_class: list(counts)
-                    for status_class, counts in status_counts.items()
+                'outcome_counts': {
+                    outcome: list(counts)
+                    for outcome, counts in outcome_counts.items()
                     if any(counts)
                 },
             })
@@ -728,29 +728,29 @@ class RequestTimestamp(RequestsAggregator):
             return None
         return {
             'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
-            'histogram_version': constants.LB_RESPONSE_TIME_HISTOGRAM_VERSION,
+            'histogram_version': constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
             'buckets': buckets,
         }
 
-    def mark_response_time_history_accepted(
+    def mark_prediction_time_history_accepted(
             self, snapshot: dict[str, Any] | None) -> None:
         """Acknowledge only histogram counts present in one accepted report."""
         if snapshot is None:
             return
         for bucket in snapshot.get('buckets', []):
             bucket_start = bucket.get('bucket_start')
-            live = self._response_time_history.get(bucket_start)
-            reported = bucket.get('status_class_counts')
+            live = self._prediction_time_history.get(bucket_start)
+            reported = bucket.get('outcome_counts')
             if live is None or not isinstance(reported, dict):
                 continue
-            acknowledged = self._acknowledged_response_time_history.setdefault(
+            acknowledged = self._acknowledged_prediction_time_history.setdefault(
                 bucket_start, {})
-            for status_class, reported_counts in reported.items():
-                live_counts = live.get(status_class)
+            for outcome, reported_counts in reported.items():
+                live_counts = live.get(outcome)
                 if live_counts is None or not isinstance(reported_counts, list):
                     continue
                 accepted = acknowledged.setdefault(
-                    status_class, [0] * constants.LB_RESPONSE_TIME_BUCKET_COUNT)
+                    outcome, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
                 for index, reported_count in enumerate(reported_counts):
                     if index >= len(live_counts) or index >= len(accepted):
                         break
