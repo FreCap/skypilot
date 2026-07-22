@@ -427,6 +427,35 @@
                 }
             }
         },
+        "databaseMigration": {
+            "type": "object",
+            "properties": {
+                "activeDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "annotations": {
+                    "type": [
+                        "object",
+                        "null"
+                    ]
+                },
+                "backoffLimit": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "ttlSecondsAfterFinished": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            }
+        },
         "digitaloceanCredentials": {
             "type": "object",
             "properties": {

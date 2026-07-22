@@ -631,9 +631,14 @@ def create_table(engine: sqlalchemy.engine.Engine):
             # If the database is locked, it is OK to continue, as the WAL mode
             # is not critical and is likely to be enabled by other processes.
 
+    migration_mode = typing.cast(
+        migration_utils.MigrationMode,
+        os.environ.get(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'auto'))
     migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.GLOBAL_USER_STATE_DB_NAME,
-        migration_utils.GLOBAL_USER_STATE_VERSION)
+        engine,
+        migration_utils.GLOBAL_USER_STATE_DB_NAME,
+        migration_utils.GLOBAL_USER_STATE_VERSION,
+        mode=migration_mode)
 
 
 @annotations.lru_cache(scope='global', maxsize=1)

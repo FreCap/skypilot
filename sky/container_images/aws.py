@@ -22,7 +22,6 @@ from typing import Any, cast
 from sqlalchemy import orm
 
 from sky.adaptors import aws as aws_adaptor
-from sky.adaptors import common as adaptor_common
 from sky.container_images import catalog_state
 from sky.container_images import config as image_config
 from sky.container_images import models
@@ -67,9 +66,6 @@ _DELETE_NO_MUTATION_ERROR_CODES = _THROTTLE_ERROR_CODES | frozenset({
     'UnrecognizedClientException',
     'ValidationException',
 })
-
-requests = adaptor_common.LazyImport(
-    'requests', import_error_message='AWS image workers require requests.')
 
 
 class ProviderThrottledError(RuntimeError):
@@ -693,6 +689,31 @@ class _HookedEcrClient:
         return call
 
 
+class _ProviderFencedEcrClient:
+    """Re-proves a durable lease immediately around every ECR SDK call."""
+
+    def __init__(self, client: Any, provider_fence: Callable[[], None]) -> None:
+        self._client = client
+        self._provider_fence = provider_fence
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._client, name)
+        if not callable(value):
+            return value
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            self._provider_fence()
+            try:
+                result = value(*args, **kwargs)
+            except Exception:
+                self._provider_fence()
+                raise
+            self._provider_fence()
+            return result
+
+        return call
+
+
 def assumed_client(
     binding: AwsRoleBinding,
     service: str,
@@ -780,9 +801,33 @@ def mint_ecr_source_credentials(
 class EcrRepository:
     """Exact-manifest ECR operations scoped to one pre-created repository."""
 
-    def __init__(self, client: Any, repository_name: str) -> None:
+    def __init__(
+        self,
+        client: Any,
+        repository_name: str,
+        *,
+        provider_fence: Callable[[], None] | None = None,
+    ) -> None:
         self._client = client
         self.repository_name = repository_name
+        self._provider_fence = provider_fence
+        self._download_session: Any | None = None
+
+    def _fence(self) -> None:
+        if self._provider_fence is not None:
+            self._provider_fence()
+
+    def _fence_download(self, response: Any) -> None:
+        try:
+            self._fence()
+        except BaseException:
+            response.close()
+            raise
+
+    def _get_download_session(self) -> Any:
+        if self._download_session is None:
+            self._download_session = providers.guarded_https_session()
+        return self._download_session
 
     @classmethod
     def from_role(
@@ -796,9 +841,11 @@ class EcrRepository:
         client = _assumed_ecr_client(binding,
                                      region,
                                      provider_fence=provider_fence)
+        if provider_fence is not None:
+            client = _ProviderFencedEcrClient(client, provider_fence)
         if hooks is not None:
             client = _HookedEcrClient(client, hooks)
-        return cls(client, repository_name)
+        return cls(client, repository_name, provider_fence=provider_fence)
 
     def _batch_get_manifest(self, digest: str) -> tuple[bytes, str] | None:
         digest = models.validate_sha256_digest(digest, 'ECR image digest')
@@ -891,18 +938,42 @@ class EcrRepository:
             raise ValueError('ECR source manifest is missing.')
         return found[0]
 
-    def read_blob(self, descriptor: oci.OciDescriptor) -> Iterable[bytes]:
+    def _download_response(self, digest: str) -> Any:
+        self._fence()
         response = self._client.get_download_url_for_layer(
-            repositoryName=self.repository_name, layerDigest=descriptor.digest)
+            repositoryName=self.repository_name, layerDigest=digest)
+        self._fence()
         url = response.get('downloadUrl')
-        if not isinstance(url, str) or not url.startswith('https://'):
+        if not isinstance(url, str):
             raise ValueError('ECR layer response has no HTTPS download URL.')
-        download = requests.get(url, timeout=60, stream=True)
-        download.raise_for_status()
+        providers.validate_public_https_destination(url,
+                                                    'ECR layer download URL')
+        self._fence()
+        download = self._get_download_session().get(url,
+                                                    timeout=60,
+                                                    stream=True,
+                                                    allow_redirects=False)
+        self._fence_download(download)
+        if download.status_code in (301, 302, 303, 307, 308):
+            download.close()
+            raise ValueError('ECR layer download redirects are not allowed.')
+        try:
+            download.raise_for_status()
+        except Exception:
+            download.close()
+            raise
+        self._fence_download(download)
+        return download
+
+    def read_blob(self, descriptor: oci.OciDescriptor) -> Iterable[bytes]:
+        download = self._download_response(descriptor.digest)
 
         def chunks() -> Iterator[bytes]:
             try:
-                yield from download.iter_content(chunk_size=1024 * 1024)
+                self._fence()
+                for chunk in download.iter_content(chunk_size=1024 * 1024):
+                    self._fence()
+                    yield chunk
             finally:
                 download.close()
 
@@ -913,16 +984,12 @@ class EcrRepository:
             media_type='application/vnd.oci.image.config.v1+json',
             digest=models.validate_sha256_digest(digest, 'ECR blob digest'),
             size=max_bytes)
-        response = self._client.get_download_url_for_layer(
-            repositoryName=self.repository_name, layerDigest=descriptor.digest)
-        url = response.get('downloadUrl')
-        if not isinstance(url, str) or not url.startswith('https://'):
-            raise ValueError('ECR layer response has no HTTPS download URL.')
-        download = requests.get(url, timeout=60, stream=True)
-        download.raise_for_status()
+        download = self._download_response(descriptor.digest)
         payload = bytearray()
         try:
+            self._fence()
             for chunk in download.iter_content(chunk_size=1024 * 1024):
+                self._fence()
                 payload.extend(chunk)
                 if len(payload) > max_bytes:
                     raise ValueError(

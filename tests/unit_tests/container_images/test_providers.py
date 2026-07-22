@@ -78,6 +78,72 @@ def test_source_reader_disables_proxy_inheritance() -> None:
         adapter.proxy_manager_for('http://127.0.0.1:8080')
 
 
+def test_source_reader_fences_before_resolving_credentials() -> None:
+    resolver = mock.Mock()
+    fence = mock.Mock(side_effect=RuntimeError('source lease lost'))
+    source = providers.RegistryV2Source(
+        f'registry.example/repository/image@{_DIGEST}',
+        resolver,
+        provider_fence=fence)
+    source._session = mock.Mock()  # pylint: disable=protected-access
+
+    with pytest.raises(RuntimeError, match='source lease lost'):
+        source.read_root()
+
+    resolver.assert_not_called()
+    source._session.request.assert_not_called()  # pylint: disable=protected-access
+
+
+def test_source_reader_closes_response_when_lease_is_lost_after_request(
+) -> None:
+    response = mock.Mock(status_code=200, headers={})
+    fence = mock.Mock(
+        side_effect=[None, None, None,
+                     RuntimeError('source lease lost')])
+    source = providers.RegistryV2Source(
+        f'registry.example/repository/image@{_DIGEST}',
+        lambda: None,
+        provider_fence=fence)
+    source._session = mock.Mock()  # pylint: disable=protected-access
+    source._session.request.return_value = response
+
+    with pytest.raises(RuntimeError, match='source lease lost'):
+        source.read_root()
+
+    response.close.assert_called_once_with()
+
+
+def test_source_reader_fences_each_streamed_blob_chunk_and_closes_on_loss(
+) -> None:
+    response = mock.Mock(status_code=200, headers={})
+    response.iter_content.return_value = [b'first', b'second']
+    calls = 0
+
+    def fence() -> None:
+        nonlocal calls
+        calls += 1
+        # Five checks complete request setup, one precedes iteration, and the
+        # seventh check fences the first chunk before it leaves the adapter.
+        if calls == 7:
+            raise RuntimeError('source lease lost while streaming')
+
+    source = providers.RegistryV2Source(
+        f'registry.example/repository/image@{_DIGEST}',
+        lambda: None,
+        provider_fence=fence)
+    source._session = mock.Mock()  # pylint: disable=protected-access
+    source._session.request.return_value = response
+
+    chunks = iter(
+        source.read_blob(
+            mock.Mock(digest=_DIGEST,
+                      size=11,
+                      media_type='application/octet-stream')))
+    with pytest.raises(RuntimeError, match='lease lost while streaming'):
+        next(chunks)
+    response.close.assert_called_once_with()
+
+
 def test_basic_credentials_cannot_cross_to_bearer_realm() -> None:
     source = providers.RegistryV2Source(
         f'registry.example/repository/image@{_DIGEST}',

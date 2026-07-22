@@ -491,6 +491,35 @@ def list_profile_revisions(
     return [_profile(row) for row in rows]
 
 
+def list_operational_profile_revisions(
+    workspace: str,
+    *,
+    limit: int = 1001,
+) -> list[ProfileRevisionRecord]:
+    """Lists only current ACTIVE and QUALIFYING revisions for readiness.
+
+    Separate UNION branches let PostgreSQL use the partial unique index for
+    each operational state. Historical revisions cannot consume this bounded
+    readiness window.
+    """
+    if not 1 <= limit <= 1001:
+        raise ValueError('Operational profile revision page size is invalid.')
+    table = schema.profile_revisions
+    active = sqlalchemy.select(table).where(
+        table.c.workspace == workspace,
+        table.c.state == models.ImageProfileState.ACTIVE.value)
+    qualifying = sqlalchemy.select(table).where(
+        table.c.workspace == workspace,
+        table.c.state == models.ImageProfileState.QUALIFYING.value)
+    operational = active.union_all(qualifying).subquery()
+    statement = sqlalchemy.select(operational).order_by(
+        operational.c.profile, operational.c.state,
+        operational.c.id).limit(limit)
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(statement).mappings().all()
+    return [_profile(row) for row in rows]
+
+
 def list_profile_revision_history(
     workspace: str,
     *,

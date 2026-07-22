@@ -443,6 +443,11 @@ tests:
               secretKeyRef:
                 name: my-db-secret
                 key: connection_string
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
 
   # Test cases for dbConnectionString configuration
   - it: should set database connection environment variable from connection string
@@ -464,6 +469,20 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: SKYPILOT_DB_CONNECTION_URI
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+
+  - it: should retain API auto-migration fallback when migration job is disabled
+    set:
+      apiService.dbConnectionSecretName: my-db-secret
+      databaseMigration.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
 
   - it: should enable service accounts when auth.serviceAccount.enabled is explicitly true
     set:

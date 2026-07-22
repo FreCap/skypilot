@@ -749,8 +749,8 @@ def readiness(request: fastapi.Request,
     resolved = _resolve_workspace(request, workspace)
     try:
         policy = config.get_workspace_policy(resolved)
-        profile_records = topology_state.list_profile_revisions(resolved,
-                                                                limit=1001)
+        profile_records = topology_state.list_operational_profile_revisions(
+            resolved, limit=1001)
         shard_records = topology_state.list_shards(resolved, limit=1001)
         workers = topology_state.list_workers(limit=101)
         provider_budgets = topology_state.list_provider_budgets(limit=1001)
@@ -777,6 +777,14 @@ def readiness(request: fastapi.Request,
     queues_truncated = shards_truncated or queue_groups_truncated
     profiles_truncated = len(profile_records) > 1000
     profiles = profile_records[:1000]
+    if profiles_truncated:
+        # A profile can have both an ACTIVE and QUALIFYING revision. Exclude
+        # the boundary profile rather than returning half of its current state.
+        boundary_profile = profile_records[-1].profile
+        profiles = [
+            profile for profile in profiles
+            if profile.profile != boundary_profile
+        ]
     workers_truncated = len(workers) > 100
     workers = workers[:100]
     provider_budgets_truncated = len(provider_budgets) > 1000

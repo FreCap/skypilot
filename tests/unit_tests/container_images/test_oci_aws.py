@@ -21,6 +21,7 @@ _MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json'
 _INDEX_MEDIA_TYPE = 'application/vnd.oci.image.index.v1+json'
 _CONFIG_MEDIA_TYPE = 'application/vnd.oci.image.config.v1+json'
 _LAYER_MEDIA_TYPE = 'application/vnd.oci.image.layer.v1.tar+gzip'
+_DIGEST = 'sha256:' + 'a' * 64
 
 
 def _raw(value: Any) -> bytes:
@@ -607,6 +608,89 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
                                     'us-east-1',
                                     'skypilot/images/shard',
                                     provider_fence=lost)
-
     lost.assert_called_once_with()
     sts.assume_role.assert_not_called()
+
+
+def test_ecr_sdk_client_is_fenced_before_and_after_each_call() -> None:
+    events: list[str] = []
+
+    class Client:
+
+        def describe_repositories(self) -> str:
+            events.append('provider')
+            return 'result'
+
+    fenced = aws._ProviderFencedEcrClient(  # pylint: disable=protected-access
+        Client(), lambda: events.append('lease'))
+
+    assert fenced.describe_repositories() == 'result'
+    assert events == ['lease', 'provider', 'lease']
+
+
+def test_ecr_layer_download_uses_guarded_no_proxy_session() -> None:
+    repository = aws.EcrRepository(mock.Mock(), 'skypilot/images/shard')
+
+    assert repository._download_session is None  # pylint: disable=protected-access
+    session = repository._get_download_session(  # pylint: disable=protected-access
+    )
+    assert not session.trust_env
+    adapter = session.get_adapter('https://public.example')
+    with pytest.raises(ValueError, match='do not permit HTTP proxies'):
+        adapter.proxy_manager_for('http://127.0.0.1:8080')
+
+
+def test_ecr_layer_download_rejects_redirect_and_closes_response() -> None:
+    client = mock.Mock()
+    client.get_download_url_for_layer.return_value = {
+        'downloadUrl': 'https://public.example/layer'
+    }
+    download = mock.Mock(status_code=307)
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+    session = mock.Mock()
+    repository._download_session = session  # pylint: disable=protected-access
+    session.get.return_value = download
+
+    with pytest.raises(ValueError, match='redirects are not allowed'):
+        repository.read_blob_bytes(_DIGEST, max_bytes=100)
+
+    session.get.assert_called_once_with('https://public.example/layer',
+                                        timeout=60,
+                                        stream=True,
+                                        allow_redirects=False)
+    download.close.assert_called_once_with()
+
+
+def test_ecr_layer_download_is_fenced_per_chunk_and_closed_on_lease_loss(
+) -> None:
+    client = mock.Mock()
+    client.get_download_url_for_layer.return_value = {
+        'downloadUrl': 'https://public.example/layer'
+    }
+    download = mock.Mock(status_code=200)
+    download.iter_content.return_value = [b'first', b'second']
+    calls = 0
+
+    def fence() -> None:
+        nonlocal calls
+        calls += 1
+        # Five checks cover URL issuance and guarded HTTP setup. The sixth
+        # starts streaming and the seventh fences the first yielded chunk.
+        if calls == 7:
+            raise RuntimeError('source lease lost while streaming')
+
+    repository = aws.EcrRepository(client,
+                                   'skypilot/images/shard',
+                                   provider_fence=fence)
+    session = mock.Mock()
+    repository._download_session = session  # pylint: disable=protected-access
+    session.get.return_value = download
+
+    chunks = iter(
+        repository.read_blob(
+            oci.OciDescriptor(media_type='application/octet-stream',
+                              digest=_DIGEST,
+                              size=11)))
+    with pytest.raises(RuntimeError, match='lease lost while streaming'):
+        next(chunks)
+    download.close.assert_called_once_with()

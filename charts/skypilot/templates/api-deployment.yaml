@@ -120,6 +120,9 @@ spec:
         {{- $podIpInExtraEnvs := false }}
         {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
         {{- if eq .name "POD_IP" }}{{- $podIpInExtraEnvs = true }}{{- end }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
         {{- end }}
         {{- with $.Values.global.extraEnvs }}
         {{- toYaml . | nindent 8 }}
@@ -174,6 +177,10 @@ spec:
             secretKeyRef:
               name: {{ $fullName }}-db-connection
               key: connection_string
+        {{- end }}
+        {{- if and (or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString) .Values.databaseMigration.enabled }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: verify
         {{- end }}
         {{- if .Values.apiService.authUserHeaderName }}
         - name: SKYPILOT_AUTH_USER_HEADER

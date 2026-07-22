@@ -7,9 +7,12 @@ import concurrent.futures
 import dataclasses
 import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -4821,10 +4824,94 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
             """), {
                 'image_id': publication_record.image_id
             }).scalars().all()
+        workspace_history_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE workspace = 'research'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 51
+            """)).scalars().all()
     assert 'ix_container_image_publications_active_image' in str(
         publication_plan)
     assert 'ix_container_image_sources_image' in str(source_plan)
     assert 'ix_container_image_locations_artifact' in str(location_plan)
+    assert ('ix_container_image_publications_workspace_history'
+            in str(workspace_history_plan))
+
+
+def test_operational_profile_readiness_excludes_unbounded_history_and_uses_indexes(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    snapshot = json.dumps(profile.to_snapshot(),
+                          sort_keys=True,
+                          separators=(',', ':'))
+    rows = [{
+        'id': f'history-{index}',
+        'workspace': 'research',
+        'profile': 'history-heavy',
+        'revision': index + 1,
+        'desired_generation': index + 1,
+        'state': models.ImageProfileState.SUPERSEDED.value,
+        'config_hash': profile.config_hash,
+        'config_json': snapshot,
+        'physical_manifest_hash': profile.physical_manifest_hash,
+        'created_at': index + 1,
+        'updated_at': index + 1,
+    } for index in range(1500)]
+    rows.extend(({
+        'id': 'operational-active',
+        'workspace': 'research',
+        'profile': 'operational',
+        'revision': 1,
+        'desired_generation': 1,
+        'state': models.ImageProfileState.ACTIVE.value,
+        'config_hash': profile.config_hash,
+        'config_json': snapshot,
+        'physical_manifest_hash': profile.physical_manifest_hash,
+        'created_at': 2001,
+        'updated_at': 2001,
+    }, {
+        'id': 'operational-qualifying',
+        'workspace': 'research',
+        'profile': 'operational',
+        'revision': 2,
+        'desired_generation': 2,
+        'state': models.ImageProfileState.QUALIFYING.value,
+        'config_hash': profile.config_hash,
+        'config_json': snapshot,
+        'physical_manifest_hash': profile.physical_manifest_hash,
+        'created_at': 2002,
+        'updated_at': 2002,
+    }))
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.insert(), rows)
+        connection.execute(
+            sqlalchemy.text('ANALYZE container_image_profile_revisions'))
+
+    operational = topology_state.list_operational_profile_revisions('research')
+
+    assert [(item.id, item.state) for item in operational] == [
+        ('operational-active', models.ImageProfileState.ACTIVE),
+        ('operational-qualifying', models.ImageProfileState.QUALIFYING),
+    ]
+    with image_database.connect() as connection:
+        plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id, profile, state FROM (
+                    SELECT id, profile, state
+                    FROM container_image_profile_revisions
+                    WHERE workspace = 'research' AND state = 'ACTIVE'
+                    UNION ALL
+                    SELECT id, profile, state
+                    FROM container_image_profile_revisions
+                    WHERE workspace = 'research' AND state = 'QUALIFYING'
+                ) AS operational
+                ORDER BY profile, state, id
+                LIMIT 1001
+            """)).scalars().all()
+    assert 'uq_container_image_profile_active' in str(plan)
+    assert 'uq_container_image_profile_desired' in str(plan)
 
 
 def test_profile_history_is_keyset_paginated_and_indexed_at_scale(
@@ -5201,6 +5288,91 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
                 f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
 
 
+def test_safe_alembic_upgrade_serializes_api_processes_with_postgres_lock(
+        postgres_engine) -> None:
+    race_schema = f'image_migration_race_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {race_schema}')
+    race_engine = _schema_engine(postgres_engine, race_schema)
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        with race_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+            connection.exec_driver_sql('CREATE TABLE alembic_version_state_db '
+                                       '(version_num VARCHAR(32) PRIMARY KEY)')
+            connection.exec_driver_sql(
+                "INSERT INTO alembic_version_state_db VALUES ('023')")
+
+        url = postgres_engine.url.update_query_dict(
+            {'options': f'-csearch_path={race_schema}'})
+        script = """
+import contextlib
+import os
+import sqlalchemy
+from sky.utils.db import migration_utils
+
+@contextlib.contextmanager
+def unlocked(_section):
+    yield
+
+migration_utils.db_lock = unlocked
+engine = sqlalchemy.create_engine(os.environ['SKYPILOT_TEST_DATABASE_URL'])
+try:
+    migration_utils.safe_alembic_upgrade(
+        engine, migration_utils.GLOBAL_USER_STATE_DB_NAME,
+        migration_utils.GLOBAL_USER_STATE_VERSION)
+finally:
+    engine.dispose()
+"""
+        environment = dict(os.environ)
+        repository_root = str(Path(__file__).resolve().parents[3])
+        environment['PYTHONPATH'] = os.pathsep.join(
+            filter(None, (repository_root, environment.get('PYTHONPATH', ''))))
+        environment['SKYPILOT_TEST_DATABASE_URL'] = url.render_as_string(
+            hide_password=False)
+
+        lock_connection = postgres_engine.connect()
+        lock_connection.execute(
+            sqlalchemy.text(
+                "SELECT pg_advisory_lock(hashtext('skypilot:alembic:state_db'))"
+            ))
+        processes = [
+            subprocess.Popen([sys.executable, '-c', script],
+                             cwd=repository_root,
+                             env=environment,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
+                             text=True) for _ in range(2)
+        ]
+        try:
+            time.sleep(1)
+            assert all(process.poll() is None for process in processes)
+        finally:
+            lock_connection.execute(
+                sqlalchemy.text("SELECT pg_advisory_unlock(hashtext("
+                                "'skypilot:alembic:state_db'))"))
+            lock_connection.close()
+
+        results = [process.communicate(timeout=90) for process in processes]
+        assert [process.returncode for process in processes] == [0, 0], results
+        with race_engine.connect() as connection:
+            revision = connection.execute(
+                sqlalchemy.text(
+                    'SELECT version_num FROM alembic_version_state_db')
+            ).scalar_one()
+        assert revision == '024'
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        race_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {race_schema} CASCADE')
+
+
 @pytest.mark.parametrize(('mutations', 'expected_error'), [
     pytest.param(("ALTER TABLE container_images ALTER COLUMN builder_version "
                   "TYPE VARCHAR(64)",),
@@ -5238,6 +5410,12 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
                   'ON container_images (workspace, id)'),
                  'structurally incompatible.*indexes',
                  id='changed-index-definition'),
+    pytest.param(
+        ('DROP INDEX ix_container_image_publications_workspace_history',
+         'CREATE INDEX ix_container_image_publications_workspace_history '
+         'ON container_image_publications (workspace, id, created_at)'),
+        'structurally incompatible.*indexes',
+        id='changed-known-preview-index-definition'),
     pytest.param(
         ('ALTER TABLE container_image_locations DROP COLUMN '
          'copy_claimable_at CASCADE',
@@ -5292,6 +5470,41 @@ def test_migration_024_preview_adoption_requires_exact_schema(
         # The failed adoption transaction must not leave the predecessor table
         # or other migration writes behind.
         assert not sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
+    finally:
+        preview_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {preview_schema} CASCADE')
+
+
+def test_migration_024_adopts_preview_missing_known_history_index(
+        postgres_engine) -> None:
+    preview_schema = f'image_preview_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {preview_schema}')
+    preview_engine = _schema_engine(postgres_engine, preview_schema)
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    try:
+        with preview_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+        _migration_call(preview_engine, migration_024.upgrade)
+        with preview_engine.begin() as connection:
+            connection.exec_driver_sql('DROP TABLE auth_sessions')
+            connection.exec_driver_sql(
+                'DROP INDEX '
+                'ix_container_image_publications_workspace_history')
+
+        _migration_call(preview_engine, migration_024.upgrade)
+
+        index_names = {
+            item['name'] for item in sqlalchemy.inspect(
+                preview_engine).get_indexes('container_image_publications')
+        }
+        assert ('ix_container_image_publications_workspace_history'
+                in index_names)
+        assert sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
     finally:
         preview_engine.dispose()
         with postgres_engine.begin() as connection:

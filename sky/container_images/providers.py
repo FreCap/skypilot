@@ -39,7 +39,7 @@ def _require_public_network_address(value: str) -> None:
         raise ValueError('OCI source network destination is not public.')
 
 
-def _validate_https_destination(url: str, subject: str) -> str:
+def validate_public_https_destination(url: str, subject: str) -> str:
     """Returns one normalized HTTPS authority after local literal rejection."""
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or
@@ -55,8 +55,13 @@ def _validate_https_destination(url: str, subject: str) -> str:
         raise ValueError(f'{subject} has an invalid HTTPS authority.') from None
 
 
-def _read_bounded_response(response: Any, *, max_bytes: int,
-                           subject: str) -> bytes:
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    subject: str,
+    provider_fence: Callable[[], None] | None = None,
+) -> bytes:
     """Reads and closes a response without allowing an eager unbounded body."""
     try:
         content_length = response.headers.get('Content-Length')
@@ -72,7 +77,11 @@ def _read_bounded_response(response: Any, *, max_bytes: int,
             if declared_length > max_bytes:
                 raise ValueError(f'{subject} exceeds the size limit.')
         payload = bytearray()
+        if provider_fence is not None:
+            provider_fence()
         for chunk in response.iter_content(chunk_size=64 * 1024):
+            if provider_fence is not None:
+                provider_fence()
             payload.extend(chunk)
             if len(payload) > max_bytes:
                 raise ValueError(f'{subject} exceeds the size limit.')
@@ -135,6 +144,16 @@ def _guarded_https_adapter_type() -> type[Any]:
     return GuardedHttpsAdapter
 
 
+def guarded_https_session() -> Any:
+    """Returns a no-proxy HTTPS session with connected-peer validation."""
+    session = requests.Session()
+    # Environment proxy configuration must not bypass the peer-address guard
+    # or become another credential-bearing trust boundary.
+    session.trust_env = False
+    session.mount('https://', _guarded_https_adapter_type()())
+    return session
+
+
 @dataclasses.dataclass(frozen=True)
 class SourceCredentials:
     """Ephemeral source credentials that refuse serialization and display."""
@@ -163,6 +182,7 @@ class RegistryV2Source:
         credential_resolver: Callable[[], SourceCredentials | None],
         *,
         timeout_seconds: int = 60,
+        provider_fence: Callable[[], None] | None = None,
     ) -> None:
         reference = models.validate_oci_reference(reference,
                                                   'OCI source reference')
@@ -184,19 +204,29 @@ class RegistryV2Source:
         self.digest = digest
         self._credential_resolver = credential_resolver
         self._timeout_seconds = timeout_seconds
-        self._session = requests.Session()
-        # Environment proxy configuration must not bypass the peer-address
-        # guard or become another credential-bearing trust boundary.
-        self._session.trust_env = False
-        self._session.mount('https://', _guarded_https_adapter_type()())
-        _validate_https_destination(f'https://{self.authority}',
-                                    'OCI source registry')
+        self._provider_fence = provider_fence
+        self._session = guarded_https_session()
+        validate_public_https_destination(f'https://{self.authority}',
+                                          'OCI source registry')
+
+    def _fence(self) -> None:
+        if self._provider_fence is not None:
+            self._provider_fence()
+
+    def _fence_response(self, response: Any) -> None:
+        try:
+            self._fence()
+        except BaseException:
+            response.close()
+            raise
 
     def _url(self, suffix: str) -> str:
         return f'https://{self.authority}/v2/{self.repository}/{suffix}'
 
     def _credentials(self) -> SourceCredentials | None:
+        self._fence()
         credentials = self._credential_resolver()
+        self._fence()
         if credentials is not None and not isinstance(credentials,
                                                       SourceCredentials):
             raise TypeError('Source credential resolver returned invalid data.')
@@ -218,6 +248,7 @@ class RegistryV2Source:
                     f'Bearer {credentials.bearer_token}')
             elif credentials.username is not None:
                 auth = (credentials.username, credentials.password)
+        self._fence()
         response = self._session.request(method,
                                          url,
                                          headers=request_headers,
@@ -225,6 +256,7 @@ class RegistryV2Source:
                                          timeout=self._timeout_seconds,
                                          stream=stream,
                                          allow_redirects=False)
+        self._fence_response(response)
         if response.status_code == 401:
             challenge = response.headers.get('WWW-Authenticate', '')
             if not challenge.lower().startswith('bearer '):
@@ -239,7 +271,7 @@ class RegistryV2Source:
             scope = challenge_fields.get('scope')
             if not isinstance(realm, str) or not isinstance(service, str):
                 raise ValueError('Registry bearer challenge is incomplete.')
-            realm_authority = _validate_https_destination(
+            realm_authority = validate_public_https_destination(
                 realm, 'Registry bearer challenge')
             if auth is not None and realm_authority != self.authority:
                 raise ValueError(
@@ -247,12 +279,14 @@ class RegistryV2Source:
             params = {'service': service}
             if scope is not None:
                 params['scope'] = scope
+            self._fence()
             token_response = self._session.get(realm,
                                                params=params,
                                                auth=auth,
                                                timeout=self._timeout_seconds,
                                                stream=True,
                                                allow_redirects=False)
+            self._fence_response(token_response)
             if token_response.status_code in (301, 302, 303, 307, 308):
                 token_response.close()
                 raise ValueError('Registry token redirects are not allowed.')
@@ -265,7 +299,8 @@ class RegistryV2Source:
                 token_payload = json.loads(
                     _read_bounded_response(token_response,
                                            max_bytes=_MAX_TOKEN_RESPONSE_BYTES,
-                                           subject='Registry token response'))
+                                           subject='Registry token response',
+                                           provider_fence=self._fence))
             except json.JSONDecodeError:
                 raise ValueError(
                     'Registry token response is not valid JSON.') from None
@@ -277,12 +312,14 @@ class RegistryV2Source:
             if not isinstance(token, str) or not token:
                 raise ValueError('Registry token response contained no token.')
             request_headers['Authorization'] = f'Bearer {token}'
+            self._fence()
             response = self._session.request(method,
                                              url,
                                              headers=request_headers,
                                              timeout=self._timeout_seconds,
                                              stream=stream,
                                              allow_redirects=False)
+            self._fence_response(response)
         # Blob redirects may point to a signed HTTPS object URL. Never forward
         # source Authorization outside the registry authority.
         if response.status_code in (301, 302, 303, 307, 308):
@@ -295,12 +332,15 @@ class RegistryV2Source:
                 raise ValueError('Registry redirect has no destination.')
             redirected = urllib.parse.urljoin(url, location)
             response.close()
-            _validate_https_destination(redirected, 'Registry blob redirect')
+            validate_public_https_destination(redirected,
+                                              'Registry blob redirect')
+            self._fence()
             response = self._session.request(method,
                                              redirected,
                                              timeout=self._timeout_seconds,
                                              stream=stream,
                                              allow_redirects=False)
+            self._fence_response(response)
             if response.status_code in (301, 302, 303, 307, 308):
                 response.close()
                 raise ValueError('Registry redirect chains are not allowed.')
@@ -309,6 +349,7 @@ class RegistryV2Source:
         except Exception:
             response.close()
             raise
+        self._fence_response(response)
         return response
 
     def read_manifest(self,
@@ -322,7 +363,8 @@ class RegistryV2Source:
                                  stream=True)
         payload = _read_bounded_response(response,
                                          max_bytes=max_bytes,
-                                         subject='OCI source manifest')
+                                         subject='OCI source manifest',
+                                         provider_fence=self._fence)
         if f'sha256:{hashlib.sha256(payload).hexdigest()}' != digest:
             raise ValueError('Source registry manifest digest mismatch.')
         return payload
@@ -340,7 +382,10 @@ class RegistryV2Source:
 
         def chunks() -> Iterator[bytes]:
             try:
-                yield from response.iter_content(chunk_size=1024 * 1024)
+                self._fence()
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    self._fence()
+                    yield chunk
             finally:
                 response.close()
 
@@ -354,7 +399,9 @@ class RegistryV2Source:
                                  allow_blob_redirect=True)
         payload = bytearray()
         try:
+            self._fence()
             for chunk in response.iter_content(chunk_size=1024 * 1024):
+                self._fence()
                 payload.extend(chunk)
                 if len(payload) > max_bytes:
                     raise ValueError(

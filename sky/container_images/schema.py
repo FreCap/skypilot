@@ -569,6 +569,8 @@ publications = sqlalchemy.Table(
                      'canonical_location_id', 'state', 'id'),
     sqlalchemy.Index('ix_container_image_publications_image', 'image_id',
                      'created_at', 'id'),
+    sqlalchemy.Index('ix_container_image_publications_workspace_history',
+                     'workspace', 'created_at', 'id'),
     sqlalchemy.Index('ix_container_image_publications_active_image',
                      'image_id',
                      'created_at',

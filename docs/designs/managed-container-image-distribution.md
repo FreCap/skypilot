@@ -541,10 +541,15 @@ An ECR destination claim executes this fenced algorithm:
    manifest/config size, excessive layer count, or the artifact byte limit before
    acquiring destination authority. The lease heartbeat is active before source
    credential acquisition or network reads. Generic OCI inspection remains
-   read-only and streamed blob transfer observes cancellation; destination
+   read-only. The exact durable lease is re-proved before and after credential
+   resolution and every HTTP request, and before each streamed response chunk
+   leaves the adapter. Lease loss closes the response immediately; destination
    authority cannot be acquired after that source work loses its lease. Managed
-   regional-source ECR credential acquisition and SDK calls are synchronously
-   fenced by the exact lease.
+   regional-source ECR credential acquisition, SDK calls, signed download-URL
+   issuance, and each downloaded chunk are synchronously fenced by the exact
+   lease. Both generic registry and signed ECR downloads use the same no-proxy,
+   public-connected-peer HTTPS guard and reject redirects that would escape the
+   validated request boundary.
 3. Re-prove the exact lease immediately before destination credential
    acquisition and again after it returns. Every destination ECR SDK hook
    re-proves ownership before and after any provider-budget wait, leaving no
@@ -981,6 +986,8 @@ Important constraints include:
   source inspection and becomes immutable when bound;
 - release lookup is an indexed projection of READY publications and returns no
   reservation or failed row;
+- workspace publication recovery uses `(workspace, created_at, id)` for its
+  bounded newest-first keyset page, so a page limit also bounds database work;
 - one provider budget row per provider, partition, account, region, and API
   family, with an applied rate, token state, and persisted throttle backoff;
 - profile revision state in
@@ -1083,7 +1090,11 @@ a UUID authority, and a positive creation time. The reference tables are
 discarded before adoption. This imports no live ORM metadata and requires no
 database-level `CREATE SCHEMA` grant. Missing, extra, or structurally different
 preview state fails closed in the migration transaction. Downgrade 024 never
-drops `auth_sessions`.
+drops `auth_sessions`. Preview builds predated the workspace-publication history
+index; adoption may create only that exact known-safe index before comparison.
+A missing index is added transactionally, a malformed same-name index still
+fails exact comparison, and every adoption write rolls back with any other
+drift.
 
 ## Registry profiles
 
@@ -1913,6 +1924,11 @@ per profile. Profile-history reads use an indexed, newest-first keyset page and
 never materialize the durable revision history. Capabilities first derive the
 at-most-128 configured and allowed profile names, then query only their ACTIVE
 rows through the partial unique index; it does not scan historical revisions.
+Readiness similarly uses a UNION of only ACTIVE and QUALIFYING branches, each
+served by its partial unique index. It fetches at most 1,001 operational rows,
+never lets SUPERSEDED or RETIRED history consume the window, and removes the
+last profile as a complete boundary if the cap splits its ACTIVE/QUALIFYING
+pair.
 Each catalog page loads at most ten active-publication, source, and location
 samples per artifact through three fixed lateral-limit statements and matching
 artifact indexes. `publications_truncated`, `sources_truncated`, and
@@ -1964,12 +1980,17 @@ CLI or Dashboard locates such a publication for explicit retry.
 
 1. Merge literal schema, typed API, worker images, UI, Terraform, and tests with
    the image feature and managed profiles disabled.
-2. Run migration 024 once in a Helm migration Job. The Job holds the PostgreSQL
-   migration advisory lock. Helm API pods run in `verify` mode, which refuses to
-   start below 023 but never races to upgrade. Local single-server development
-   may retain `auto` mode under the same PostgreSQL lock.
-3. While old 022 API replicas still serve traffic, confirm they ignore the
-   additive 023 tables. Roll every API replica to the new binary, then prove no
+2. Run migration 024 once in a revision-scoped Helm Kubernetes Job. It is a
+   normal chart resource rather than a hook, so chart-managed database Secrets
+   exist before it starts and Helm adds no hook wait to deployment latency. API
+   pods start concurrently in `verify` mode, refuse to serve below 024, and
+   become ready after the Job commits. The Job and transitional old `auto` pods
+   share the same cross-host PostgreSQL advisory lock, so only one Alembic
+   process can mutate the schema. Disabling `databaseMigration` explicitly keeps
+   the lock-protected `auto` fallback for local or operator-owned migration
+   workflows.
+3. While old 023 API replicas still serve traffic, confirm they ignore the
+   additive 024 tables. Roll every API replica to the new binary, then prove no
    old pod remains before feature activation.
 4. Apply Terraform in one dedicated registry account, import its qualification
    manifest, and stage the desired profile revision without activating it.
@@ -1987,7 +2008,7 @@ CLI or Dashboard locates such a publication for explicit retry.
 Rollback first disables profile activation and new publication, then stops
 worker claims, and only then rolls old API binaries. Existing digest pull plans
 remain usable and PostgreSQL intent is preserved. Old binaries tolerate the
-additive 023 schema. Unchanged direct digest-pinned OCI behavior remains the
+additive 024 schema. Unchanged direct digest-pinned OCI behavior remains the
 escape hatch.
 Downgrade is a separate manual operation allowed only after every new process is
 drained and every image table is empty; it is never part of Helm rollback.
@@ -2055,8 +2076,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   completion, publication fan-out, eviction, and attestation activation;
 - source-reader tests for private literals, DNS rebinding before TLS bytes,
   off-authority bearer realms, private and chained redirects, disabled token
-  redirects, absent proxy inheritance, credential non-forwarding, and streamed
-  token/manifest size ceilings;
+  redirects, absent proxy inheritance, credential non-forwarding, streamed
+  token/manifest size ceilings, pre/post-request lease fencing, and lease loss
+  during both generic registry and signed ECR chunk streaming;
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
@@ -2078,6 +2100,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, and inventory claims use their exact partial
   due-time indexes with large terminal or idle populations present;
+- workspace-publication history and operational-profile readiness scale fixtures
+  proving the former uses its `(workspace, created_at, id)` keyset index and the
+  latter uses both ACTIVE and QUALIFYING partial indexes despite more than 1,001
+  historical revisions;
 - hot-artifact catalog fixtures proving three fixed summary statements, ten-row
   child caps, explicit truncation flags, and publication/source/location index
   plans, plus many-target readiness fixtures proving one statement, a 100-group

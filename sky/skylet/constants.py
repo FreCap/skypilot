@@ -653,6 +653,10 @@ ENV_VAR_SERVER_AUTH_USER_HEADER = f'{SKYPILOT_ENV_VAR_PREFIX}AUTH_USER_HEADER'
 # Environment variable that is used as the DB connection string for the
 # skypilot server.
 ENV_VAR_DB_CONNECTION_URI = (f'{SKYPILOT_ENV_VAR_PREFIX}DB_CONNECTION_URI')
+# Helm runs central-state migrations once, then API replicas verify the shared
+# revision without racing to execute DDL. Local development defaults to auto.
+ENV_VAR_STATE_DB_MIGRATION_MODE = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}STATE_DB_MIGRATION_MODE')
 
 # Environment variable that is set to 'true' if basic
 # authentication is enabled in the API server.

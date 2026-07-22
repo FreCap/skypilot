@@ -192,7 +192,9 @@ def _source_reader(
         cached.append(credentials)
         return credentials
 
-    return providers.RegistryV2Source(source.source_ref, resolve)
+    return providers.RegistryV2Source(source.source_ref,
+                                      resolve,
+                                      provider_fence=provider_fence)
 
 
 def _inspection_graph(source_reader: providers.RegistryV2Source,

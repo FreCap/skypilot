@@ -264,6 +264,30 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
+# API replicas verify the resulting revision and never execute deployment DDL.
+# The Job is a regular Helm resource, so chart-managed database Secrets exist
+# before it starts and Helm does not add a hook-induced deploy-time wait.
+databaseMigration:
+  # @schema type: [boolean]
+  enabled: true
+  # @schema type: [integer]; minimum: 0
+  backoffLimit: 3
+  # @schema type: [integer]; minimum: 1
+  activeDeadlineSeconds: 600
+  # @schema type: [integer]; minimum: 0
+  ttlSecondsAfterFinished: 86400
+  # @schema type: [object, null]
+  annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
 # Managed container image distribution workers. All services are inert unless
 # explicitly enabled and require the same external PostgreSQL database as the
 # API server. They intentionally use independent Kubernetes service accounts so

@@ -385,6 +385,53 @@ def test_router_exposes_only_direct_image_api_contract() -> None:
     assert all('/api/get' not in path for path, _ in paths)
 
 
+def test_readiness_uses_operational_profiles_and_drops_partial_boundary(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    base = _profile_record(profile)
+    records = [
+        dataclasses.replace(base,
+                            id=str(uuid.uuid4()),
+                            profile=f'profile-{index:04d}')
+        for index in range(999)
+    ]
+    records.extend((
+        dataclasses.replace(base,
+                            id=str(uuid.uuid4()),
+                            profile='profile-boundary',
+                            state=models.ImageProfileState.ACTIVE),
+        dataclasses.replace(base,
+                            id=str(uuid.uuid4()),
+                            profile='profile-boundary',
+                            state=models.ImageProfileState.QUALIFYING),
+    ))
+    operational = mock.Mock(return_value=records)
+    monkeypatch.setattr(server, '_require_admin', lambda _request: None)
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    monkeypatch.setattr(server.config, 'get_workspace_policy',
+                        lambda _workspace: models.WorkspaceImagePolicy())
+    monkeypatch.setattr(server.topology_state,
+                        'list_operational_profile_revisions', operational)
+    monkeypatch.setattr(server.topology_state, 'list_shards',
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server.topology_state, 'list_workers',
+                        lambda **_kwargs: [])
+    monkeypatch.setattr(server.topology_state, 'list_provider_budgets',
+                        lambda **_kwargs: [])
+    monkeypatch.setattr(server.topology_state, 'readiness_queue_stats',
+                        lambda _shards: ([], False))
+    monkeypatch.setattr(server.catalog_state, 'get_catalog_authority_id',
+                        lambda: str(uuid.uuid4()))
+
+    view = server.readiness(_request(), workspace='research')
+
+    assert view.profiles_truncated
+    assert len(view.profiles) == 999
+    assert all(item.profile != 'profile-boundary' for item in view.profiles)
+    operational.assert_called_once_with('research', limit=1001)
+
+
 def test_closed_error_mapping_never_reflects_provider_text() -> None:
     with pytest.raises(fastapi.HTTPException) as error:
         server._api_error(  # pylint: disable=protected-access

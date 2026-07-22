@@ -56,6 +56,8 @@ _CLUSTER_BINDING_COLUMN_NAMES = (
     'container_image_consumer_kind',
     'container_image_consumer_owner',
 )
+_PUBLICATION_HISTORY_INDEX = (
+    'ix_container_image_publications_workspace_history')
 
 _SCHEMA_SHAPE_QUERIES = {
     'columns': """SELECT table_name, column_name, ordinal_position,
@@ -329,6 +331,21 @@ def _validate_preview_schema(bind: sqlalchemy.engine.Connection,
             'Migration 024 found structurally incompatible managed image '
             f'preview state: {mismatch}.')
     _validate_catalog_singleton(bind, schema_name)
+
+
+def _ensure_preview_compatible_indexes(bind: sqlalchemy.engine.Connection,
+                                       schema_name: str) -> None:
+    """Adds only known post-preview indexes before exact shape validation."""
+    existing_indexes = sqlalchemy.inspect(bind).get_indexes(
+        'container_image_publications', schema=schema_name)
+    if any(index['name'] == _PUBLICATION_HISTORY_INDEX
+           for index in existing_indexes):
+        # Exact shape validation below rejects a same-name malformed index.
+        return
+    op.create_index(_PUBLICATION_HISTORY_INDEX,
+                    'container_image_publications',
+                    ['workspace', 'created_at', 'id'],
+                    schema=schema_name)
 
 
 def _create_tables() -> None:
@@ -912,6 +929,8 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_publications_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'])
+    op.create_index(_PUBLICATION_HISTORY_INDEX, 'container_image_publications',
+                    ['workspace', 'created_at', 'id'])
     op.create_index('ix_container_image_publications_active_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'],
@@ -1129,6 +1148,7 @@ def upgrade():
         # already applied this exact image schema. Compare it with a temporary
         # reference built from this migration's literal DDL before adopting it.
         # Revision 024 then creates the base revision 023 auth table above.
+        _ensure_preview_compatible_indexes(bind, str(schema_name))
         _validate_preview_schema(bind, str(schema_name))
         return
     _create_tables()

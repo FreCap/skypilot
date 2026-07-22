@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import threading
+from typing import Literal
 
 from alembic import command as alembic_command
 from alembic.config import Config
@@ -27,6 +28,8 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 # prevent two threads from running different sections concurrently within
 # the same process.
 _alembic_thread_lock = threading.Lock()
+
+MigrationMode = Literal['auto', 'upgrade', 'verify']
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
 GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions
@@ -141,12 +144,52 @@ def needs_upgrade(engine: sqlalchemy.engine.Engine,
     return current_rev_num < target_rev_num
 
 
+def verify_alembic_revision(engine: sqlalchemy.engine.Engine,
+                            section: str,
+                            target_revision: str,
+                            alembic_ini_path: str | None = None) -> None:
+    """Refuses startup until another process has applied the target revision."""
+    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
+    version_table = alembic_config.get_section_option(
+        alembic_config.config_ini_section, 'version_table', 'alembic_version')
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(
+            connection, opts={'version_table': version_table})
+        current_revision = context.get_current_revision()
+    if current_revision is None or int(current_revision) < int(target_revision):
+        observed = current_revision or 'uninitialized'
+        raise RuntimeError(
+            f'{section} database is at revision {observed}, but this process '
+            f'requires revision {target_revision}. Run the database migration '
+            'job before starting API replicas.')
+
+
+@contextlib.contextmanager
+def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
+    """Serializes Alembic across hosts sharing one PostgreSQL database."""
+    if engine.dialect.name != 'postgresql':
+        yield
+        return
+    lock_name = f'skypilot:alembic:{section}'
+    with engine.connect() as connection:
+        connection.execute(
+            sqlalchemy.text('SELECT pg_advisory_lock(hashtext(:name))'),
+            {'name': lock_name})
+        try:
+            yield
+        finally:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_advisory_unlock(hashtext(:name))'),
+                {'name': lock_name})
+
+
 def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
                          section: str,
                          target_revision: str,
-                         alembic_ini_path: str | None = None):
-    """Upgrade the database if needed. Uses a file lock to ensure
-    that only one process tries to upgrade the database at a time.
+                         alembic_ini_path: str | None = None,
+                         *,
+                         mode: MigrationMode = 'auto'):
+    """Verify or upgrade one schema under local and distributed locks.
 
     Args:
         engine: SQLAlchemy engine for the database.
@@ -154,10 +197,20 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
         'spot_jobs_db').
         target_revision: Target revision to upgrade to (e.g., '001').
         alembic_ini_path: Optional path to a custom alembic.ini file.
+        mode: ``verify`` performs no DDL. ``auto`` and ``upgrade`` converge the
+            schema; the distinct names make API and migration-job intent
+            explicit in deployment configuration.
     """
+    if mode not in ('auto', 'upgrade', 'verify'):
+        raise ValueError(f'Invalid database migration mode: {mode!r}.')
     # set alembic logger to warning level
     alembic_logger = logging.getLogger('alembic')
     alembic_logger.setLevel(logging.WARNING)
+
+    if mode == 'verify':
+        verify_alembic_revision(engine, section, target_revision,
+                                alembic_ini_path)
+        return
 
     alembic_config = get_alembic_config(engine, section, alembic_ini_path)
 
@@ -165,8 +218,10 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
     if needs_upgrade(engine, section, target_revision, alembic_ini_path):
         with _alembic_thread_lock:
             with db_lock(section):
-                # check again if db needs upgrade in case another
-                # process upgraded it while we were waiting for the lock
-                if needs_upgrade(engine, section, target_revision,
-                                 alembic_ini_path):
-                    alembic_command.upgrade(alembic_config, target_revision)
+                with _distributed_migration_lock(engine, section):
+                    # Check again after the cross-host lock. The migration Job
+                    # or a transitional auto-mode API pod may have completed
+                    # the same migration while this process was waiting.
+                    if needs_upgrade(engine, section, target_revision,
+                                     alembic_ini_path):
+                        alembic_command.upgrade(alembic_config, target_revision)
