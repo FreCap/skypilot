@@ -44,7 +44,13 @@ class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
         If reuse_worker is False, wraps the function to exit after completion.
         """
         self.running.increment()
-        future = super().submit(fn, *args, **kwargs)
+        try:
+            future = super().submit(fn, *args, **kwargs)
+        except BaseException:
+            # A rejected submission never produces a future whose callback can
+            # release this capacity, so roll it back synchronously.
+            self.running.decrement()
+            raise
         future.add_done_callback(lambda _: self.running.decrement())
         return future
 
@@ -60,10 +66,11 @@ class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
         # Here wait means wait for the proactive cancellation complete.
         # TODO(aylei): we may support wait=True in the future if needed.
         assert wait is True, 'wait=False is not supported'
-        executor_processes = list(self._processes.values())
+        executor_processes = (list(self._processes.values())
+                              if self._processes is not None else [])
         # Shutdown the executor so that executor process can exit once the
         # running task is finished or interrupted.
-        super().shutdown(wait=False)
+        super().shutdown(wait=False, cancel_futures=cancel_futures)
         # Proactively interrupt the running task to avoid indefinite waiting.
         subprocess_utils.run_in_parallel(
             subprocess_utils.kill_process_with_grace_period,
