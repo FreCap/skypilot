@@ -4,6 +4,7 @@ import importlib
 import io
 import multiprocessing
 import os
+import pickle
 from typing import Any, Dict, Set
 from unittest import mock
 
@@ -18,6 +19,7 @@ from sky.serve import constants as serve_constants
 from sky.skylet import constants
 from sky.skylet import log_lib
 from sky.utils import common
+from sky.utils import controller_dependency_installation
 from sky.utils import controller_utils
 from sky.utils import registry
 
@@ -44,6 +46,14 @@ def test_controller_identity_public_contract(controller):
 ])
 def test_get_controller_for_pool_identity(pool, expected):
     assert controller_utils.get_controller_for_pool(pool) is expected
+
+
+def test_cloud_dependency_installation_facade_identity():
+    function = (controller_utils._get_cloud_dependencies_installation_commands)
+    assert (controller_dependency_installation.
+            _get_cloud_dependencies_installation_commands is function)
+    assert function.__module__ == 'sky.utils.controller_utils'
+    assert pickle.loads(pickle.dumps(function)) is function
 
 
 def test_configured_bucket_cleanup_manifest_precedes_upload(tmp_path):
