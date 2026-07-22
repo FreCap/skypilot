@@ -214,6 +214,98 @@ def test_interactive_auth_cancellation_cleans_up_forwarders():
                 pass
 
 
+def test_async_interactive_auth_cancellation_does_not_orphan_lock():
+    """Cancellation while waiting must not leave the global lock acquired."""
+
+    class SignallingLock:
+        """Threading lock that exposes blocked-acquire progress to the test."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._state_lock = threading.Lock()
+            self._release_count = 0
+            self.acquire_started = threading.Event()
+            self.acquire_completed = threading.Event()
+            self.cancelled_acquire_released = threading.Event()
+
+        def acquire(self, *args, **kwargs):
+            self.acquire_started.set()
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                self.acquire_completed.set()
+            return acquired
+
+        def release(self):
+            self._lock.release()
+            with self._state_lock:
+                self._release_count += 1
+                if self._release_count == 2:
+                    self.cancelled_acquire_released.set()
+
+        def locked(self):
+            return self._lock.locked()
+
+    async def run_test():
+        auth_lock = SignallingLock()
+        auth_lock.acquire()
+        auth_lock.acquire_started.clear()
+        auth_lock.acquire_completed.clear()
+
+        with mock.patch.object(interactive_utils, '_INTERACTIVE_AUTH_LOCK',
+                               auth_lock):
+            auth_task = asyncio.create_task(
+                interactive_utils.handle_interactive_auth_async(
+                    '<sky-interactive session="test"/>'))
+            assert await asyncio.to_thread(auth_lock.acquire_started.wait, 1)
+
+            auth_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await auth_task
+
+            auth_lock.release()
+            try:
+                assert await asyncio.to_thread(auth_lock.acquire_completed.wait,
+                                               1)
+                assert await asyncio.to_thread(
+                    auth_lock.cancelled_acquire_released.wait, 1)
+                assert not auth_lock.locked()
+            finally:
+                # Keep the pre-fix failure from hanging asyncio.run() while it
+                # shuts down the default executor.
+                if auth_lock.locked():
+                    auth_lock.release()
+
+    asyncio.run(run_test())
+
+
+def test_async_interactive_auth_waits_then_releases_lock():
+    """A queued auth session still runs after the current holder exits."""
+
+    async def run_test():
+        auth_lock = threading.Lock()
+        auth_lock.acquire()
+        websocket_handler = mock.AsyncMock()
+
+        with mock.patch.object(interactive_utils, '_INTERACTIVE_AUTH_LOCK',
+                               auth_lock), mock.patch.object(
+                                   interactive_utils,
+                                   '_handle_interactive_auth_websocket',
+                                   websocket_handler):
+            auth_task = asyncio.create_task(
+                interactive_utils.handle_interactive_auth_async(
+                    '<sky-interactive session="next"/>'))
+            await asyncio.sleep(0.02)
+            websocket_handler.assert_not_awaited()
+
+            auth_lock.release()
+            await asyncio.wait_for(auth_task, timeout=1)
+
+        websocket_handler.assert_awaited_once_with('next')
+        assert not auth_lock.locked()
+
+    asyncio.run(run_test())
+
+
 def test_interactive_auth_pipe_registration_failure_closes_duplicate_fds():
     """A failed transport setup must not leak either duplicated descriptor."""
     stdin_read, stdin_write = os.pipe()
