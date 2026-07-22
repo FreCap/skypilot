@@ -77,14 +77,14 @@ not evidence that the behavior is active in production.
 | `1.1.700` | PR #860, cold-launch authority visibility | Exposed the exact per-card signal that can create cold capacity, separately from demand, warm retention, and reserved fill. | Included in deployed `1.1.704`; the field remains the launch audit surface. |
 | `1.1.702` | PR #862, separate demand from actuation | Attributed flexible unmet demand to the cheapest compatible cold card, then independently adopted ready, provisioning, and free reserved compatible supply for actuation. | Included in deployed `1.1.704`; this remains the active allocation contract. |
 | `1.1.703` | PR #863, response-time history | Persisted the per-card response-time evidence needed for future card-specific duration and batching policy without changing current placement. | Included in deployed `1.1.704`; history remains active. |
-| `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial verification found no active paid GCP A100-class service rows; every pending A100-class launch was reserved, zero-cost Kubernetes fill. Monitoring through 03:00 America/New_York was in progress when this row was written. |
+| `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable
 replica location, `reserved_fill`, and `is_zero_cost` provenance. Provider
 inventory is the final billing check. A nonzero A100 or A100-80GB provisioning
 count is expected while the reserved research cluster has granted empty slots;
-it is not evidence of a paid GCP A2 launch.
+it is not evidence of a paid cloud launch.
 
 ### Production operating point
 
