@@ -3646,6 +3646,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # the old target during that wait: doing so makes the autoscaler issue
         # scale-down and scale-up intents for opposite demand snapshots.
         self._upscale_pending: bool = False
+        # Snapshotted before each decision tick mutates the aggregate wave
+        # timestamp. Exact-card actuation uses this budget to limit cold card
+        # migrations without retaining the physical supply mix in the public
+        # demand target.
+        self._logical_actuation_wave_budget: int | None = None
+        self._logical_actuation_wave_started: bool = False
+        self._logical_card_transition_pending: bool = False
+        self._logical_actuation_target_by_accelerator: dict[str, int] = {}
+        self._logical_actuation_desired_by_accelerator: dict[str, int] = {}
         if (self.replica_unit == 'logical' and
                 self.max_scale_up_rate_percentage is not None):
             # A cold logical service must enter through the configured slot
@@ -3685,6 +3694,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.rejected_compatibility_profiles = []
             self.warm_retention_target_by_accelerator = {}
             self.cold_launch_authority_by_accelerator = {}
+            self._logical_card_transition_pending = False
+            self._logical_actuation_target_by_accelerator = {}
+            self._logical_actuation_desired_by_accelerator = {}
             self._compatibility_demand_complete = False
         if not self.configured_accelerator_shapes:
             self.target_num_replicas_by_accelerator = {}
@@ -3694,6 +3706,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.queued_compatibility_profiles = []
             self.rejected_compatibility_profiles = []
             self.free_reserved_slots_by_accelerator = {}
+            self._logical_card_transition_pending = False
+            self._logical_actuation_target_by_accelerator = {}
+            self._logical_actuation_desired_by_accelerator = {}
             self._compatibility_demand_complete = False
             return
         floors = {
@@ -4934,7 +4949,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         }
         committed: dict[str, int] = {}
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    _replica_is_retiring_card_supply(info)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = configured_by_name.get(raw_card.casefold())
@@ -4944,45 +4960,74 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                self._committed_capacity(info))
         return committed
 
-    def _limit_logical_card_transition(
+    def _limit_logical_actuation_transition(
         self,
         desired: dict[str, int],
-        previous: dict[str, int],
-        previous_target: int,
         target: int,
         replica_infos: list['replica_managers.ReplicaInfo'],
         wave_budget: int | None,
     ) -> tuple[dict[str, int], int]:
-        """Move an exact-card target without bypassing slot wave limits.
+        """Limit cold card migration without changing demand attribution.
 
-        A card migration keeps the aggregate demand target constant, so the
-        aggregate wave limiter cannot see it. Limit positive per-card deltas
-        explicitly, retaining the corresponding old-card target until the new
-        slots are authorized. The actuation path separately waits for those
-        slots to become ready before retiring the old card.
+        Reconstruct the transition baseline from committed supply, preferring
+        cards already wanted by the fresh supply-aware actuator. Positive
+        deficits then consume the exact-card wave budget. Old-card capacity is
+        retained only in this private actuation map until each replacement
+        wave commits; it never appears in the public cheapest-compatible
+        demand map.
         """
-        if wave_budget is None and sum(desired.values()) == target:
-            return desired, 0
+        if sum(desired.values()) != target:
+            return {}, 0
         cards = self._configured_cards_from_profiles()
-        if sum(previous.values()) == previous_target:
+        committed = self._logical_committed_capacity_by_accelerator(
+            replica_infos)
+        previous = self._logical_actuation_target_by_accelerator
+        same_desired = (
+            desired == self._logical_actuation_desired_by_accelerator)
+        if same_desired and sum(previous.values()) == target:
+            # Preserve a previously authorized cold wave until its pending
+            # rows become committed, so a transiently dropped manager decision
+            # is retried during the cooldown instead of being forgotten.
             current = {
                 card: max(0, int(previous.get(card, 0))) for card in cards
             }
         else:
-            # Rebuild a conservative transition baseline after a controller
-            # restart, when the in-memory card target is not durable. Existing
-            # committed slots are preferred, bounded by the adopted aggregate.
             current = {card: 0 for card in cards}
-            remaining = max(0, previous_target)
-            committed = self._logical_committed_capacity_by_accelerator(
-                replica_infos)
+            remaining = max(0, target)
+            # Existing capacity on a desired card is a supply reuse, not a
+            # cold migration, so it does not consume a launch wave.
             for card in cards:
-                kept = min(remaining, committed.get(card, 0))
+                kept = min(remaining, committed.get(card, 0),
+                           max(0, int(desired.get(card, 0))))
                 current[card] = kept
                 remaining -= kept
-            if remaining > 0 and cards:
-                fallback = self._cold_paid_card_order(cards)[0]
-                current[fallback] += remaining
+            # Retain other committed cards as transition placeholders. They
+            # are removed only as authorized replacement capacity enters the
+            # map.
+            for card in cards:
+                available = max(0, committed.get(card, 0) - current[card])
+                kept = min(remaining, available)
+                current[card] += kept
+                remaining -= kept
+
+        # Supply that appeared after the prior authorization can immediately
+        # replace a transition placeholder. This is reuse, not a new cold
+        # wave, even when the desired profile itself is unchanged.
+        reusable = 0
+        for card in cards:
+            moved = min(max(0,
+                            desired.get(card, 0) - current.get(card, 0)),
+                        max(0,
+                            committed.get(card, 0) - current.get(card, 0)))
+            current[card] += moved
+            reusable += moved
+        for card in reversed(cards):
+            if reusable <= 0:
+                break
+            removable = max(0, current.get(card, 0) - desired.get(card, 0))
+            removed = min(reusable, removable)
+            current[card] -= removed
+            reusable -= removed
 
         additions_left = (sum(
             max(0,
@@ -5010,9 +5055,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         limited = {card: count for card, count in current.items() if count > 0}
         if sum(limited.values()) != target:
-            # Defensive fail closed. A valid aggregate wave always leaves
-            # enough positive desired deltas to reach its own target.
-            return previous, 0
+            # A valid aggregate wave always leaves enough budget to cover any
+            # target units not backed by committed supply. Fail closed rather
+            # than publish an incomplete exact-card actuator.
+            return {}, 0
         return limited, added
 
     def _actuation_target_by_accelerator(
@@ -5025,6 +5071,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 sum(demand_target.values()) != self.target_num_replicas):
             self.warm_retention_target_by_accelerator = {}
             self.cold_launch_authority_by_accelerator = {}
+            self._logical_card_transition_pending = False
             return {}, False
         final_target = self.get_final_target_num_replicas()
         desired_target, attribution_complete = (
@@ -5061,8 +5108,39 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
             final_target=final_target)
-        return (target, attribution_complete and
-                sum(target.values()) == final_target)
+        if not target and final_target > 0:
+            self._logical_card_transition_pending = False
+            return {}, False
+        wave_budget = self._logical_actuation_wave_budget
+        if wave_budget is not None:
+            if self._logical_actuation_wave_started:
+                # Several consumers ask for the actuation map in one
+                # controller tick. The shared snapshot, including the
+                # overprovision allowance, is one budget rather than one
+                # budget per caller.
+                wave_budget = 0
+            else:
+                # num_overprovision is deliberately outside the traffic target
+                # and historically was not charged to its demand scale-up
+                # wave.
+                wave_budget += max(0, final_target - self.target_num_replicas)
+        limited_target, added_card_slots = (
+            self._limit_logical_actuation_transition(target, final_target,
+                                                     replica_infos,
+                                                     wave_budget))
+        if not limited_target and final_target > 0:
+            self._logical_card_transition_pending = False
+            return {}, False
+        self._logical_actuation_target_by_accelerator = dict(limited_target)
+        self._logical_actuation_desired_by_accelerator = dict(target)
+        self._logical_card_transition_pending = limited_target != target
+        if (added_card_slots > 0 and
+                self.max_scale_up_rate_percentage is not None and
+                not self._logical_actuation_wave_started):
+            self._last_scale_up_wave_at = time.time()
+            self._logical_actuation_wave_started = True
+        return (limited_target, attribution_complete and
+                sum(limited_target.values()) == final_target)
 
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
@@ -5183,6 +5261,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         target_num_replicas = self._clip_concurrency_demand_target(
             raw_target_num)
         self._raw_target_num_replicas = target_num_replicas
+        candidate_covers_raw_target = (
+            candidate_target_by_accelerator is not None and
+            sum(candidate_target_by_accelerator.values())
+            >= target_num_replicas)
         if (self.replica_unit == 'logical' and
                 self._snap_target_on_next_recompute):
             # The adopted target is controller-local and rebuilds at
@@ -5204,33 +5286,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         old_target_num_replicas = self.target_num_replicas
         old_target_by_accelerator = dict(
             self.target_num_replicas_by_accelerator)
-        logical_wave_budget = self._logical_scale_up_budget(replica_infos)
-        if (self.replica_unit == 'logical' and
-                candidate_target_by_accelerator is not None and
+        if (self.replica_unit == 'logical' and candidate_covers_raw_target and
                 sum(old_target_by_accelerator.values())
                 != old_target_num_replicas):
             # A rebuilt controller reconstructs the aggregate safety target
-            # from committed capacity, while its process-local exact-card map
-            # starts empty. Seed a map that explains that held aggregate
-            # before comparing card deltas. Otherwise the first non-empty
-            # candidate looks like a card increase on every tick: the
-            # scale-up branch repeatedly resets downscale hysteresis, but its
-            # lower aggregate cannot replace the held restart target, leaving
-            # exact-card actuation disabled indefinitely.
-            recovered_map, recovered_card_slots = (
-                self._limit_logical_card_transition(
-                    candidate_target_by_accelerator, old_target_by_accelerator,
-                    old_target_num_replicas, old_target_num_replicas,
-                    replica_infos, logical_wave_budget))
-            if sum(recovered_map.values()) == old_target_num_replicas:
+            # from committed demand-owned capacity, while its process-local
+            # exact-card demand map starts empty. Attribute the entire held
+            # aggregate through the fresh compatibility allocator. Committed
+            # A100 supply belongs to the separate actuation map and must not
+            # become A100 demand merely because it survived the restart.
+            recovered_map, recovered_complete = (
+                self._calculate_concurrency_target_by_accelerator(
+                    replica_infos,
+                    target_ceiling=old_target_num_replicas,
+                    min_replicas_override=old_target_num_replicas))
+            if (recovered_complete and
+                    sum(recovered_map.values()) == old_target_num_replicas):
                 self.target_num_replicas_by_accelerator = recovered_map
                 old_target_by_accelerator = dict(recovered_map)
-                if (recovered_card_slots > 0 and
-                        self.max_scale_up_rate_percentage is not None):
-                    self._last_scale_up_wave_at = time.time()
-                    assert logical_wave_budget is not None
-                    logical_wave_budget = max(
-                        0, logical_wave_budget - recovered_card_slots)
         target_map_changed = (candidate_target_by_accelerator is not None and
                               candidate_target_by_accelerator
                               != old_target_by_accelerator)
@@ -5322,24 +5395,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._downscale_veto_streak = 0
 
         if ((apply_target or apply_card_transition) and
-                candidate_target_by_accelerator is not None):
+                candidate_covers_raw_target):
             adopted_map, attribution_complete = (
                 self._calculate_concurrency_target_by_accelerator(
-                    replica_infos, target_ceiling=self.target_num_replicas))
-            if attribution_complete and self.replica_unit == 'logical':
-                adopted_map, added_card_slots = (
-                    self._limit_logical_card_transition(
-                        adopted_map, old_target_by_accelerator,
-                        old_target_num_replicas, self.target_num_replicas,
-                        replica_infos, logical_wave_budget))
-            else:
-                added_card_slots = 0
+                    replica_infos,
+                    target_ceiling=self.target_num_replicas,
+                    min_replicas_override=self.target_num_replicas))
             if (attribution_complete and
                     sum(adopted_map.values()) == self.target_num_replicas):
                 self.target_num_replicas_by_accelerator = adopted_map
-                if (added_card_slots > 0 and
-                        self.max_scale_up_rate_percentage is not None):
-                    self._last_scale_up_wave_at = time.time()
 
         self._upscale_pending = (
             target_num_replicas > self.target_num_replicas or
@@ -5401,6 +5465,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # marrying a blind target to fresh-mode kills. All three
         # consumers read this snapshot instead of re-evaluating.
         self._tick_fresh = self.has_fresh_demand_report()
+        self._logical_actuation_wave_budget = self._logical_scale_up_budget(
+            replica_infos)
+        self._logical_actuation_wave_started = False
+        self._logical_card_transition_pending = False
         try:
             self._prune_gpu_shape_cache(
                 {info.replica_id for info in replica_infos})
@@ -5947,6 +6015,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 )
             ]
         if (not self._fresh_for_tick() or self._upscale_pending or
+                self._logical_card_transition_pending or
             (use_card_targets and not self._compatibility_demand_complete)):
             return []
 
