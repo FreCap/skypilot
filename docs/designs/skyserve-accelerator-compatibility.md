@@ -274,6 +274,12 @@ advertising compatibility. An unordered `resources.any_of` service keeps
 legacy aggregate behavior rather than turning transient availability or hash
 iteration into a cold-card policy.
 
+Nominal cost ordering is all-or-nothing for a configured catalog. If any
+configured card lacks a finite positive paid price, because catalog lookup
+failed or only zero-cost locations are known, the controller and autoscaler
+preserve the explicit service order for the whole catalog. A partial price map
+must never promote a larger priced card ahead of an unpriced cheaper card.
+
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 
 The adopted per-card map and the cold-launch map have different safety roles.
@@ -317,6 +323,23 @@ for that scale-up decision. While it differs from the adopted retirement map,
 the autoscaler suppresses retirement. After normal hysteresis adopts the new
 card assignment, scale-down again uses the adopted map and the existing
 idle/graceful-drain proofs.
+
+Reserved fill is reconciled against shaped demand launches in the same tick.
+Each exact-card demand launch first claims at most one freshly reported
+physical reserved slot of that card; logical targets convert their slot
+shortfall to physical backend claims using the configured GPU width. The fill
+overlay subtracts those claims before emitting zero-cost-only launches, so a
+hard floor or flexible demand target and reserved fill cannot create two rows
+for one free physical slot. A later poll restores any conservatively withheld
+fill after the demand row has committed or fallen back to paid supply. Any
+remaining same-tick fill intents carry exact-card overrides for the unclaimed
+free slots, so fill cannot collide with a demand claim on another reserved
+card.
+
+Preempted or already-scaling-down replacements are not committed capacity for
+logical reconciliation and cannot complete a recovered cost-rebalance pair.
+The incumbent remains serving until a healthy non-retiring replacement is
+ready.
 
 This is why an already-ready reserved A100 may serve flexible L4/A100/H100 work, while an empty fleet normally cold-starts the cheaper L4. When an A100-only request later arrives, no running flexible request is interrupted. At equal priority it owns the next A100 admission opportunity, and its demand increases the A100 target if capacity is otherwise occupied.
 

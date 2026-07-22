@@ -2334,11 +2334,12 @@ class SkyServeController:
                     continue
                 paid_costs[card] = min(hourly_cost,
                                        paid_costs.get(card, float('inf')))
-            fallback_order = {
-                card: index for index, card in enumerate(configured)
-            }
-            configured.sort(key=lambda card: (paid_costs.get(
-                card, float('inf')), fallback_order[card]))
+            if all(card in paid_costs for card in configured):
+                fallback_order = {
+                    card: index for index, card in enumerate(configured)
+                }
+                configured.sort(
+                    key=lambda card: (paid_costs[card], fallback_order[card]))
         return configured
 
     def _configured_accelerator_shapes(self,

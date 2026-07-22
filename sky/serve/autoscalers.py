@@ -602,6 +602,99 @@ class Autoscaler:
         }
         return shelter, replica_cards
 
+    def _reserved_slots_claimed_by_demand(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+    ) -> tuple[int, dict[str, int] | None]:
+        """Count free exact-card slots already claimed by demand decisions.
+
+        Reserved fill is overlaid after ordinary demand scaling. A shaped
+        demand launch can consume one of the same freshly reported reserved
+        slots, so emitting the full fill delta as well would create two rows
+        for one physical slot. Count only claims that match a currently free
+        exact card. Unknown or aggregate decisions retain the legacy fill
+        behavior because they cannot be reconciled safely by card here.
+        """
+        raw_free = getattr(self, 'free_reserved_slots_by_accelerator', None)
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        shape_resolver = getattr(self, '_get_gpu_shape_from_replica_info', None)
+        if (not isinstance(raw_free, dict) or not raw_free or
+                not isinstance(configured_shapes, dict) or
+                not configured_shapes or not callable(shape_resolver)):
+            return 0, None
+        shape_resolver_fn = typing.cast(
+            typing.Callable[['replica_managers.ReplicaInfo'], tuple[str, int]],
+            shape_resolver)
+        canonical_by_name = {
+            str(card).casefold(): str(card) for card in configured_shapes
+        }
+        remaining_free: dict[str, int] = {}
+        for raw_card, raw_count in raw_free.items():
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                continue
+            remaining_free[card] = max(0, int(raw_count))
+
+        current_capacity_by_card = {
+            card: 0 for card in canonical_by_name.values()
+        }
+        for info in replica_infos:
+            if (info.is_terminal or info.version != self.latest_version or
+                    _replica_is_retiring_card_supply(info)):
+                continue
+            raw_card, _ = shape_resolver_fn(  # pylint: disable=not-callable
+                info)
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is not None:
+                current_capacity_by_card[card] += self._fill_capacity_units(
+                    info)
+
+        claimed = 0
+
+        def claim(card: str, count: int) -> None:
+            nonlocal claimed
+            available = remaining_free.get(card, 0)
+            consumed = min(available, max(0, count))
+            remaining_free[card] = available - consumed
+            claimed += consumed
+
+        for decision in decisions:
+            if decision.operator != AutoscalerDecisionOperator.SCALE_UP:
+                continue
+            target = decision.target
+            if isinstance(target, dict):
+                if target.get(constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY):
+                    continue
+                accelerators = target.get('accelerators')
+                if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                    continue
+                raw_card = next(iter(accelerators))
+                card = canonical_by_name.get(str(raw_card).casefold())
+                if card is not None:
+                    claim(card, 1)
+                continue
+            if not isinstance(target, LogicalScaleTarget):
+                continue
+            target_by_card = dict(target.target_capacity_by_accelerator)
+            shapes = dict(target.accelerator_shapes)
+            for raw_card, raw_target in target_by_card.items():
+                card = canonical_by_name.get(str(raw_card).casefold())
+                if card is None:
+                    continue
+                raw_gpu_count = shapes.get(raw_card)
+                if raw_gpu_count is None:
+                    raw_gpu_count = configured_shapes.get(card)
+                if (not isinstance(raw_gpu_count, int) or
+                        isinstance(raw_gpu_count, bool) or raw_gpu_count <= 0):
+                    continue
+                gpu_count = raw_gpu_count
+                shortfall = max(
+                    0,
+                    int(raw_target) - current_capacity_by_card.get(card, 0))
+                claim(card, math.ceil(shortfall / gpu_count))
+        return claimed, remaining_free
+
     def _apply_reserved_capacity_fill(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -811,6 +904,13 @@ class Autoscaler:
             # rolling update.
             fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
         desired_fill_up = max(0, fill_target_launch - zero_cost_latest)
+        (demand_reserved_claims,
+         remaining_free_by_card) = self._reserved_slots_claimed_by_demand(
+             replica_infos, decisions)
+        desired_fill_up = max(0, desired_fill_up - demand_reserved_claims)
+        if remaining_free_by_card is not None:
+            desired_fill_up = min(desired_fill_up,
+                                  sum(remaining_free_by_card.values()))
         num_old_nonterminal = num_nonterminal - num_latest_nonterminal
         planned_total = (num_old_nonterminal +
                          max(num_latest_nonterminal, demand_target))
@@ -822,6 +922,7 @@ class Autoscaler:
                         f'{zero_cost_latest} + spendable free slots '
                         f'{spendable_free_slots}), demand target '
                         f'{demand_target}, planned total {planned_total}, '
+                        f'demand-reserved claims {demand_reserved_claims}, '
                         f'hard-ceiling headroom {hard_ceiling_headroom}; '
                         f'scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
@@ -842,8 +943,37 @@ class Autoscaler:
                     fill_override[
                         constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY] = (
                             self._fill_grant_pool_key)
-            result.extend(
-                _generate_scale_up_decisions(num_fill_up, fill_override))
+            if remaining_free_by_card is None:
+                result.extend(
+                    _generate_scale_up_decisions(num_fill_up, fill_override))
+            else:
+                configured_shapes = getattr(self,
+                                            'configured_accelerator_shapes', {})
+                remaining = num_fill_up
+                for card, raw_gpu_count in configured_shapes.items():
+                    if remaining <= 0:
+                        break
+                    if (not isinstance(raw_gpu_count, int) or
+                            isinstance(raw_gpu_count, bool) or
+                            raw_gpu_count <= 0):
+                        continue
+                    launches = min(remaining,
+                                   remaining_free_by_card.get(card, 0))
+                    exact_fill_override = {
+                        **fill_override,
+                        'accelerators': {
+                            card: raw_gpu_count
+                        },
+                    }
+                    result.extend(
+                        _generate_scale_up_decisions(launches,
+                                                     exact_fill_override))
+                    remaining -= launches
+                if remaining > 0:
+                    # Exact free-slot telemetry was present, so never guess a
+                    # card for the unaccounted remainder. A later poll can
+                    # restore the conservatively withheld fill.
+                    num_fill_up -= remaining
             # Invariant: a free slot is SPENT the moment a launch decision
             # is emitted, not when the poller next observes the pod. Fill
             # launches persist replica rows immediately, so
@@ -1231,6 +1361,7 @@ class Autoscaler:
                     victim, replacement_location))
             if self.cost_rebalance and replacement_preserves_policy:
                 if (replacement.is_ready and
+                        not _replica_is_retiring_card_supply(replacement) and
                         getattr(victim.status_property, 'sky_down_status',
                                 None) is None):
                     decisions.extend(
@@ -2612,6 +2743,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
             paid_costs[card] = min(hourly_cost,
                                    paid_costs.get(card, float('inf')))
+        if any(card not in paid_costs for card in configured_cards):
+            return list(configured_cards)
         service_order = {
             card: index for index, card in enumerate(configured_cards)
         }
@@ -3507,6 +3640,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 continue
             paid_costs[card] = min(hourly_cost,
                                    paid_costs.get(card, float('inf')))
+        if any(card not in paid_costs for card in configured_cards):
+            return list(configured_cards)
         service_order = {
             card: index for index, card in enumerate(configured_cards)
         }
@@ -3912,7 +4047,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _committed_capacity(self, info: 'replica_managers.ReplicaInfo') -> int:
         """Pinned capacity used to suppress duplicate logical launches."""
-        if getattr(info.status_property, 'is_scale_down', False) is True:
+        if _replica_is_retiring_card_supply(info):
             return 0
         planned = int(self._replica_capacity(info))
         observed = self._observed_slots_by_replica_id.get(info.replica_id)
