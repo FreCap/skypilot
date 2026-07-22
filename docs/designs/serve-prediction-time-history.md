@@ -33,7 +33,7 @@ delivery to the caller.
 
 ### Synchronous requests
 
-For a request outside the known asynchronous action protocol, timing starts
+For a request outside the known asynchronous protocol, timing starts
 immediately before the accepted upstream HTTP dispatch and ends when that
 replica returns terminal response headers. A retriable response or transport
 error does not produce a sample for that attempt. The final non-retriable
@@ -54,6 +54,9 @@ customer-facing boundary without changing every model image.
 Known asynchronous actions are `async_predict`, `async_status`,
 `async_capacity`, and `async_cancel`.
 
+- A nonempty SkyServe stable-job header also identifies a platform-held async
+  submission, even when its body omits `action`. Its acceptance response never
+  produces a prediction-time sample.
 - `async_predict` is only an acceptance acknowledgement and never produces a
   prediction-time sample.
 - Non-terminal `async_status` responses do not produce a sample.

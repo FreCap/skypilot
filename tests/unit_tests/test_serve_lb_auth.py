@@ -709,6 +709,10 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
                 'request_id': 'job-1',
                 'status': 'QUEUED',
             }),
+            (202, {
+                'request_id': 'job-header',
+                'status': 'QUEUED',
+            }),
             (200, {
                 'request_id': 'job-1',
                 'status': 'SUCCEEDED',
@@ -725,13 +729,30 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
                 'status': 'FAILED',
                 'processing_time_ms': 1,
             }),
+            (500, {
+                'error': 'prediction failed',
+            }),
+            (503, {
+                'error': 'warming',
+            }),
+            (200, {
+                'request_id': 'job-gzip',
+                'status': 'SUCCEEDED',
+                'processing_time_ms': 1,
+            }, {
+                'content-encoding': 'gzip',
+            }),
         ]
 
         async def _handler(request):
             del request
-            status_code, payload = responses.pop(0)
+            response_spec = responses.pop(0)
+            status_code, payload = response_spec[:2]
+            headers = {'content-type': 'application/json'}
+            if len(response_spec) == 3:
+                headers.update(response_spec[2])
             return httpx.Response(status_code,
-                                  headers={'content-type': 'application/json'},
+                                  headers=headers,
                                   stream=httpx.ByteStream(
                                       json.dumps(payload).encode('utf-8')))
 
@@ -740,7 +761,7 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
         lb._client_pool[url] = client
         lb._load_balancing_policy.set_ready_replicas([url])
 
-        def _request(body):
+        def _request(body, *, job_id=None):
             delivered = False
 
             async def _receive():
@@ -754,6 +775,10 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
                     'more_body': False,
                 }
 
+            headers = [(b'content-type', b'application/json')]
+            if job_id is not None:
+                headers.append((constants.LB_JOB_ID_HEADER.lower().encode(),
+                                job_id.encode()))
             return fastapi.Request(
                 {
                     'type': 'http',
@@ -763,7 +788,7 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
                     'path': '/predict',
                     'raw_path': b'/predict',
                     'query_string': b'',
-                    'headers': [(b'content-type', b'application/json')],
+                    'headers': headers,
                 }, _receive)
 
         sync_response = await lb._proxy_request_to(url, _request(b'{"x":1}'))
@@ -775,6 +800,11 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
             url, _request(b'{"action":"async_predict","request_id":"job-1"}'))
         assert not isinstance(async_ack, Exception)
         async for _ in async_ack.body_iterator:
+            pass
+        header_async_ack = await lb._proxy_request_to(
+            url, _request(b'{"request_id":"job-header"}', job_id='job-header'))
+        assert not isinstance(header_async_ack, Exception)
+        async for _ in header_async_ack.body_iterator:
             pass
         async_status = await lb._proxy_request_to(
             url, _request(b'{"action":"async_status","request_id":"job-1"}'))
@@ -794,13 +824,29 @@ def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
         assert rejected_status.status_code == 400
         async for _ in rejected_status.body_iterator:
             pass
+        failed_sync = await lb._proxy_request_to(url, _request(b'{"x":2}'))
+        assert not isinstance(failed_sync, Exception)
+        assert failed_sync.status_code == 500
+        async for _ in failed_sync.body_iterator:
+            pass
+        lb._retriable_status_codes = frozenset({503})
+        retriable_sync = await lb._proxy_request_to(url, _request(b'{"x":3}'))
+        assert isinstance(retriable_sync, load_balancer._RetriableStatusError)
+        lb._retriable_status_codes = frozenset()
+        compressed_status = await lb._proxy_request_to(
+            url,
+            _request(b'{"action":"async_status",'
+                     b'"request_id":"job-gzip"}'))
+        assert not isinstance(compressed_status, Exception)
+        async for _ in compressed_status.body_iterator:
+            pass
         await client.aclose()
 
         snapshot = lb._request_aggregator.prediction_time_history_snapshot()
         counts = snapshot['buckets'][0]['outcome_counts']
         assert sum(counts['succeeded']) == 2
         assert counts['succeeded'][5] == 1
-        assert 'failed' not in counts
+        assert sum(counts['failed']) == 1
 
     asyncio.run(_run_test())
 

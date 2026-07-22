@@ -2129,6 +2129,11 @@ class SkyServeLoadBalancer:
         } for (priority, compatible), (count, recent_count) in sorted(
             grouped.items(), key=lambda item: (-item[0][0], item[0][1]))]
 
+    @staticmethod
+    def _request_has_stable_job_id(request: fastapi.Request) -> bool:
+        stable_job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
+        return isinstance(stable_job_id, str) and bool(stable_job_id)
+
     async def _request_uses_async_occupancy(self,
                                             request: fastapi.Request) -> bool:
         """Infer the deployed fast-ack request contract for compatibility.
@@ -2140,8 +2145,7 @@ class SkyServeLoadBalancer:
         contract. JSON parsing is skipped on the platform path and for all
         non-JSON requests.
         """
-        stable_job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
-        if isinstance(stable_job_id, str) and stable_job_id:
+        if self._request_has_stable_job_id(request):
             return True
         return await self._request_action(request) == _ASYNC_ACTION_PREDICT
 
@@ -2154,7 +2158,16 @@ class SkyServeLoadBalancer:
         content_type = request.headers.get('content-type', '')
         if 'application/json' in content_type.lower():
             try:
-                payload = json.loads(await self._request_body(request))
+                bounded_body = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
+                if bounded_body is not None:
+                    payload = json.loads(bounded_body)
+                elif self._request_queue_config is None:
+                    # Preserve the established Request.json() contract for
+                    # direct callers. Starlette caches the body, so the later
+                    # proxy read can forward the same bytes unchanged.
+                    payload = await request.json()
+                else:
+                    payload = json.loads(await self._request_body(request))
                 if isinstance(payload, dict) and isinstance(
                         payload.get('action'), str):
                     action = payload['action']
@@ -3980,6 +3993,8 @@ class SkyServeLoadBalancer:
                                    query=request.url.query.encode('utf-8'))
             request_body = await self._request_body(request)
             request_action = await self._request_action(request)
+            is_async_request = (self._request_has_stable_job_id(request) or
+                                request_action in _ASYNC_ACTIONS)
             proxy_request = client.build_request(
                 request.method,
                 worker_url,
@@ -3994,8 +4009,8 @@ class SkyServeLoadBalancer:
                 timeout=httpx.Timeout(
                     self._stream_timeout_seconds,
                     connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
-            prediction_started_at = (time.monotonic() if request_action
-                                     not in _ASYNC_ACTIONS else None)
+            prediction_started_at = (None
+                                     if is_async_request else time.monotonic())
             proxy_response = await client.send(proxy_request, stream=True)
 
             if proxy_response.status_code in self._retriable_status_codes:
@@ -4050,11 +4065,19 @@ class SkyServeLoadBalancer:
                         yield chunk
                     stream_completed = True
                 finally:
-                    if stream_completed and status_body is not None:
-                        self._record_async_prediction_status(
-                            bytes(status_body),
-                            proxy_response.headers.get('content-encoding', ''))
-                    await _release_slot()
+                    try:
+                        await _release_slot()
+                    finally:
+                        if stream_completed and status_body is not None:
+                            try:
+                                self._record_async_prediction_status(
+                                    bytes(status_body),
+                                    proxy_response.headers.get(
+                                        'content-encoding', ''))
+                            except Exception as e:  # pylint: disable=broad-except
+                                logger.warning(
+                                    'Failed to record async prediction-time '
+                                    'history: %s', e)
 
             response = _ReleasingStreamingResponse(
                 content=_stream_with_release(),
