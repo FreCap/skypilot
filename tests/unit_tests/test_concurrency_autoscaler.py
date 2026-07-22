@@ -534,6 +534,263 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             profile['recent_count'] = recent_count
         return profile
 
+    @classmethod
+    def _arrival_profile(cls, priority, cards, count, timestamp=None):
+        profile = cls._profile(priority, cards, count)
+        profile['timestamp'] = time.time() if timestamp is None else timestamp
+        return profile
+
+    def test_logical_exact_card_preserves_production_arrival_floor(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, gpu_count=40, card='L4', planned_capacity=40)
+        _report(
+            autoscaler,
+            in_flight={1: 40},
+            observed_slots={1: 40},
+            compatibility_profiles=[
+                self._arrival_profile(50, ['L4', 'A100'], 126)
+            ],
+            compatibility_complete=True,
+            unique_arrivals_60s=126,
+            unique_arrivals_300s=126,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        _decisions(autoscaler, [l4])
+
+        # 126 arrivals/minute at 30 seconds imply 63 concurrent jobs. At 90%
+        # utilization that is 70 slots. Exact-card allocation previously
+        # replaced this floor with the 45-slot in-flight-only candidate.
+        self.assertEqual(autoscaler._arrival_floor_target, 70)
+        self.assertEqual(autoscaler.target_num_replicas, 70)
+        self.assertEqual(
+            sum(autoscaler.target_num_replicas_by_accelerator.values()), 70)
+
+    def test_arrival_gap_preserves_a100_only_compatibility(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, gpu_count=40, card='L4', planned_capacity=40)
+        _report(
+            autoscaler,
+            in_flight={1: 40},
+            observed_slots={1: 40},
+            compatibility_profiles=[self._arrival_profile(50, ['A100'], 126)],
+            compatibility_complete=True,
+            unique_arrivals_60s=126,
+            unique_arrivals_300s=126,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        _decisions(autoscaler, [l4])
+
+        # Fixed L4 work needs 45 slots. The 23-work-unit arrival gap needs 26
+        # A100 slots. Per-card rounding therefore legitimately exceeds the
+        # aggregate 70-slot floor by one, without widening the gap to L4.
+        self.assertEqual(autoscaler._arrival_floor_target, 70)
+        self.assertEqual(autoscaler.target_num_replicas, 71)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 45,
+            'A100': 26,
+        })
+
+    def test_attributed_work_above_arrivals_adds_no_arrival_gap(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100 = _replica(1, gpu_count=80, card='A100', planned_capacity=80)
+        _report(
+            autoscaler,
+            in_flight={1: 80},
+            observed_slots={1: 80},
+            compatibility_profiles=[self._arrival_profile(50, ['A100'], 126)],
+            compatibility_complete=True,
+            unique_arrivals_60s=126,
+            unique_arrivals_300s=126,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        _decisions(autoscaler, [a100])
+
+        # Eighty units of fixed work already exceed the 63-unit arrival
+        # estimate. Adding the full arrival window again would produce 159
+        # slots instead of the correct ceil(80 / 0.9) = 89.
+        self.assertEqual(autoscaler.target_num_replicas, 89)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 89})
+
+    def test_retained_arrival_floor_uses_300_second_profiles(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(
+            autoscaler,
+            in_flight={},
+            compatibility_profiles=[
+                self._arrival_profile(50, ['A100'],
+                                      600,
+                                      timestamp=time.time() - 120)
+            ],
+            compatibility_complete=True,
+            unique_arrivals_60s=0,
+            unique_arrivals_300s=600,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+        # A subsequent complete report exercises collection-time pruning. The
+        # 120-second profile must survive for the retained arrival window.
+        _report(autoscaler,
+                in_flight={},
+                compatibility_profiles=[],
+                compatibility_complete=True,
+                unique_arrivals_60s=0,
+                unique_arrivals_300s=600,
+                headerless_arrivals_60s=0,
+                headerless_arrivals_300s=0,
+                generation=2)
+
+        _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler._arrival_floor_target, 77)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 77})
+
+    def test_unknown_arrival_compatibility_holds_without_guessing_card(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                compatibility_profiles=[],
+                compatibility_complete=True,
+                unique_arrivals_60s=126,
+                unique_arrivals_300s=126,
+                headerless_arrivals_60s=0,
+                headerless_arrivals_300s=0)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas, 70)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {})
+        self.assertEqual(_scale_ups(decisions), [])
+
+    def test_arrival_floor_respects_max_and_wave_ceiling(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=50,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(
+            autoscaler,
+            in_flight={},
+            compatibility_profiles=[self._arrival_profile(50, ['A100'], 1000)],
+            compatibility_complete=True,
+            unique_arrivals_60s=1000,
+            unique_arrivals_300s=1000,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        candidate, complete = (
+            autoscaler._calculate_concurrency_target_by_accelerator(
+                [], target_ceiling=20))
+        _decisions(autoscaler, [])
+
+        self.assertTrue(complete)
+        self.assertEqual(candidate, {'A100': 20})
+        self.assertEqual(autoscaler._arrival_floor_target, 50)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 50})
+
+    def test_stale_arrival_profiles_cannot_retarget_unbacked_card(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1,
+            replica_unit='logical',
+            expected_request_duration_seconds=60,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        now = 1000.0
+        with mock.patch.object(autoscalers.time, 'time', return_value=now), \
+                mock.patch.object(
+                    autoscaler,
+                    '_cold_paid_card_order',
+                    return_value=['L4', 'A100']):
+            _report(
+                autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                compatibility_profiles=[
+                    self._arrival_profile(50, ['L4'], 100, timestamp=now - 250),
+                    self._arrival_profile(20, ['A100'], 1, timestamp=now),
+                ],
+                compatibility_complete=True,
+                unique_arrivals_60s=0,
+                unique_arrivals_300s=1,
+                headerless_arrivals_60s=0,
+                headerless_arrivals_300s=0,
+            )
+            _decisions(autoscaler, [l4])
+            self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                             {'L4': 1})
+
+            # The report is stale after 70 seconds. The older L4 arrival has
+            # also fallen outside the 300-second retained evidence window,
+            # leaving only A100 evidence. Mark the adopted L4 supply unbacked:
+            # actuation may replace that safe adopted L4 target, but must not
+            # reshape it to A100 from stale arrival evidence.
+            l4.status_property.preempted = True
+            with mock.patch.object(autoscalers.time,
+                                   'time',
+                                   return_value=now + 70):
+                decisions = _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 1})
+        self.assertIsNotNone(autoscaler.logical_target_state)
+        assert autoscaler.logical_target_state is not None
+        self.assertEqual(autoscaler.logical_target_state[3], (('L4', 1),))
+        for decision in _scale_ups(decisions):
+            target = decision.target
+            self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+            self.assertEqual(dict(target.target_capacity_by_accelerator),
+                             {'L4': 1})
+
     def test_physical_scale_from_zero_uses_exact_override(self):
         autoscaler = _make_autoscaler(max_replicas=2)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
