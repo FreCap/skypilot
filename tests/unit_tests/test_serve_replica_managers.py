@@ -20,6 +20,8 @@ import types
 from unittest import mock
 
 import pytest
+from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 
 from sky import exceptions
 from sky.serve import replica_managers
@@ -2733,6 +2735,8 @@ class TestScaleUpBatch:
         mgr = _make_manager(next_replica_id=1)
         mgr.lock = self._CountingLock()
         mgr._spot_placer = mock.Mock()
+        mgr._spot_placer.active_locations.return_value = []
+        mgr._spot_placer.zero_cost_locations.return_value = []
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         mgr.yaml_content = 'dummy: yaml'
         initial = [_fake_replica_info(40), _fake_replica_info(41)]
@@ -2741,7 +2745,8 @@ class TestScaleUpBatch:
 
         def _launch(replica_id,
                     _resources_override,
-                    existing_replica_infos=None):
+                    existing_replica_infos=None,
+                    **_kwargs):
             assert existing_replica_infos is not None
             snapshots.append(
                 (existing_replica_infos, len(existing_replica_infos)))
@@ -3315,6 +3320,60 @@ class TestLogicalCapacityPlanning:
                 'A100': 8
             }
         }]
+
+    def test_saturated_exact_card_does_not_block_other_card_target(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 2, (('L4', 1), ('A100', 1)),
+                                   (('L4', 1), ('A100', 1)))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        attempted_cards = []
+
+        def _launch(resources_override, _used_ids, existing, _budget,
+                    logical_reconcile_fence):
+            del logical_reconcile_fence
+            card = next(iter(resources_override['accelerators']))
+            attempted_cards.append(card)
+            if card == 'L4':
+                return False
+            info = mock.Mock(replica_id=1,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=1,
+                             resources_override=resources_override)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = None
+            existing.append(info)
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_launch):
+            mgr.scale_up_to_logical_capacity(target_capacity=2,
+                                             version=1,
+                                             reconcile_generation=7,
+                                             target_capacity_by_accelerator={
+                                                 'L4': 1,
+                                                 'A100': 1,
+                                             },
+                                             accelerator_shapes={
+                                                 'L4': 1,
+                                                 'A100': 1,
+                                             })
+
+        assert attempted_cards == ['L4', 'A100']
 
     def test_unknown_capacity_replacement_launch_is_durably_attributed(self):
         mgr = _make_manager()
@@ -6893,6 +6952,205 @@ class TestFailedCleanupReconciliation:
         assert 1 in manager._down_thread_pool
         assert (info.status_property.sky_down_status ==
                 common_utils.ProcessStatus.SCHEDULED)
+
+
+class TestPaidLocationLaunchBudget:
+
+    @staticmethod
+    def _manager(costs):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager.yaml_content = 'resources:\n  use_spot: true\n'
+        manager.latest_version = 1
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._spot_placer = make_placer(costs)
+        return manager
+
+    @staticmethod
+    def _info(replica_id, location, status):
+        info = replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'svc-{replica_id}',
+            replica_port='8080',
+            is_spot=True,
+            location=location,
+            version=1,
+            resources_override=location.to_dict())
+        if status == replica_managers.serve_state.ReplicaStatus.PROVISIONING:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.RUNNING)
+        elif status == replica_managers.serve_state.ReplicaStatus.STARTING:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+        elif status == replica_managers.serve_state.ReplicaStatus.READY:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            info.status_property.service_ready_now = True
+        else:
+            assert status == replica_managers.serve_state.ReplicaStatus.PENDING
+        assert info.status == status
+        return info
+
+    def test_env_override_and_invalid_fallback(self, monkeypatch, caplog):
+        replica_managers._parse_paid_location_launch_window.cache_clear()
+        monkeypatch.delenv(
+            replica_managers._PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR,
+            raising=False)
+        assert replica_managers._paid_location_launch_window() == 4
+
+        monkeypatch.setenv(
+            replica_managers._PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR, '7')
+        assert replica_managers._paid_location_launch_window() == 7
+
+        caplog.set_level(logging.WARNING)
+        monkeypatch.setenv(
+            replica_managers._PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR, '0')
+        assert replica_managers._paid_location_launch_window() == 4
+        assert 'Invalid SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW' in (
+            caplog.text)
+        replica_managers._parse_paid_location_launch_window.cache_clear()
+
+    def test_only_pending_and_provisioning_rows_consume_window(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        other = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        zero = make_location('research', {'L4': 1},
+                             use_spot=False,
+                             cloud_name='Kubernetes')
+        manager = self._manager({cheap: 1.0, other: 2.0, zero: 0.0})
+        infos = [
+            self._info(1, cheap,
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(2, cheap,
+                       replica_managers.serve_state.ReplicaStatus.PROVISIONING),
+            self._info(3, other,
+                       replica_managers.serve_state.ReplicaStatus.STARTING),
+            self._info(4, other,
+                       replica_managers.serve_state.ReplicaStatus.READY),
+        ]
+
+        with mock.patch.object(replica_managers,
+                               '_paid_location_launch_window',
+                               return_value=2):
+            budget = manager._build_paid_location_launch_budget(infos)
+
+        assert budget is not None
+        assert budget.remaining_by_location == {cheap: 0, other: 2}
+
+    def test_cheapest_location_fills_cohort_then_spills(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        persisted = []
+        manager._persist_replica = mock.Mock(
+            side_effect=lambda _replica_id, info: persisted.append(info))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(replica_managers,
+                               '_paid_location_launch_window',
+                               return_value=2), \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            manager._scale_up_batch_locked([{'use_spot': True}] * 5)
+
+        assert [info.get_spot_location().region for info in persisted
+               ] == ['us-east-1', 'us-east-1', 'us-west-2', 'us-west-2']
+        assert manager._next_replica_id == 5
+        assert len(manager._launch_thread_pool) == 4
+        assert all(replica_id in manager._launch_thread_pool
+                   for replica_id in (1, 2, 3, 4))
+
+    def test_exact_card_subsets_keep_independent_paid_windows(self):
+        cheap_l4 = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive_l4 = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        a100 = make_location('eu-west-1', {'A100': 1}, cloud_name='AWS')
+        manager = self._manager({
+            cheap_l4: 1.0,
+            expensive_l4: 2.0,
+            a100: 3.0,
+        })
+        budget = replica_managers._PaidLocationLaunchBudget({
+            cheap_l4: 1,
+            expensive_l4: 1,
+            a100: 1,
+        })
+        l4_locations = {cheap_l4, expensive_l4}
+
+        first_l4 = manager._select_with_paid_location_budget(
+            budget, allowed_locations=l4_locations)
+        manager._debit_paid_location_launch_budget(budget, first_l4)
+        second_l4 = manager._select_with_paid_location_budget(
+            budget, allowed_locations=l4_locations)
+        selected_a100 = manager._select_with_paid_location_budget(
+            budget, allowed_locations={a100})
+
+        assert (first_l4, second_l4, selected_a100) == (cheap_l4, expensive_l4,
+                                                        a100)
+
+    def test_saturated_wave_persists_nothing(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        unresolved = [
+            self._info(1, cheap,
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(2, expensive,
+                       replica_managers.serve_state.ReplicaStatus.PROVISIONING),
+        ]
+        manager._next_replica_id = 3
+        manager._persist_replica = mock.Mock()
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+
+        with mock.patch.object(replica_managers,
+                               '_paid_location_launch_window',
+                               return_value=1), \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'
+                       ) as safe_thread:
+            budget = manager._build_paid_location_launch_budget(unresolved)
+            assert budget is not None
+            launched = manager._scale_up_one_locked(
+                None, {1, 2}, unresolved, paid_location_launch_budget=budget)
+
+        assert not launched
+        assert len(unresolved) == 2
+        assert manager._next_replica_id == 3
+        manager._persist_replica.assert_not_called()
+        safe_thread.assert_not_called()
+
+    def test_unsatisfiable_exact_card_still_raises(self):
+        l4 = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({l4: 1.0})
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'
+                       ) as safe_thread, \
+             pytest.raises(ValueError,
+                           match='matches exact accelerator override'):
+            manager._launch_replica(
+                replica_id=1,
+                resources_override={'accelerators': {
+                    'A100': 1
+                }},
+                existing_replica_infos=[])
+
+        safe_thread.assert_not_called()
 
 
 class TestZeroCostDemandProbeBudget:
