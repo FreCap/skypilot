@@ -200,6 +200,8 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._routing_spec = None  # pylint: disable=protected-access
+    ctrl._applied_version = 1  # pylint: disable=protected-access
+    ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
 
@@ -233,7 +235,8 @@ class _FakeSpec:
                  lb_stream_timeout_seconds,
                  lb_retriable_status_codes=None,
                  lb_max_retries=None,
-                 lb_retry_initial_backoff_seconds=None) -> None:
+                 lb_retry_initial_backoff_seconds=None,
+                 target_concurrency_per_replica=None) -> None:
         self.load_balancing_policy = load_balancing_policy
         self.target_qps_per_replica = target_qps_per_replica
         self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
@@ -241,6 +244,7 @@ class _FakeSpec:
         self.lb_max_retries = lb_max_retries
         self.lb_retry_initial_backoff_seconds = (
             lb_retry_initial_backoff_seconds)
+        self.target_concurrency_per_replica = (target_concurrency_per_replica)
 
 
 class TestGetRoutingSpec:
@@ -271,6 +275,16 @@ class TestGetRoutingSpec:
             'request_queue': None,
         }
 
+    def test_routing_spec_preserves_scalar_qps(self):
+        ctrl = _make_controller()
+        spec = _FakeSpec(load_balancing_policy='round_robin',
+                         target_qps_per_replica=2.5,
+                         lb_stream_timeout_seconds=30)
+
+        routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_qps_per_replica'] == 2.5
+
     def test_routing_spec_repeated_calls_do_not_hit_db(self):
         ctrl = _make_controller()
         ctrl._routing_spec = ctrl._build_routing_spec(  # pylint: disable=protected-access
@@ -285,17 +299,173 @@ class TestGetRoutingSpec:
         get_service.assert_not_called()
         get_spec.assert_not_called()
 
+    def test_concurrency_autoscaler_advertises_exact_card_capability(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.ConcurrencyAutoscaler)
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica=None,
+                         target_concurrency_per_replica=1,
+                         lb_stream_timeout_seconds=120)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['L4', 'A100']):
+            routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_concurrency_per_replica'] == 1
+        assert routing_spec['request_accelerator_compatibility_version'] == 1
+        assert routing_spec['configured_accelerators'] == ['L4', 'A100']
+
+    def test_concurrency_least_load_withholds_exact_card_capability(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.ConcurrencyAutoscaler)
+        spec = _FakeSpec(load_balancing_policy='least_load',
+                         target_qps_per_replica=None,
+                         target_concurrency_per_replica=1,
+                         lb_stream_timeout_seconds=120)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['L4', 'A100'
+                                            ]) as configured_accelerators:
+            routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['target_concurrency_per_replica'] == 1
+        assert 'request_accelerator_compatibility_version' not in routing_spec
+        assert 'configured_accelerators' not in routing_spec
+        configured_accelerators.assert_not_called()
+        ctrl._configure_instance_aware_accelerators(spec)  # pylint: disable=protected-access
+        ctrl._autoscaler.set_configured_accelerator_shapes.assert_called_once_with(  # pylint: disable=line-too-long
+            {})
+
+    def test_compatibility_report_requires_applied_routing_version(self):
+        ctrl = _make_controller()
+        report = {
+            'routing_version': ctrl._applied_version,  # pylint: disable=protected-access
+            'in_flight': {},
+            'queue_depth': 0,
+            'rejected_in_window': 0,
+            'rejected_in_recent_window': 0,
+            'unknown_in_flight_urls': [],
+            'queued_requests_by_compatibility': [],
+            'rejected_requests_by_compatibility': [],
+        }
+
+        assert ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+        report['routing_version'] -= 1
+        assert not ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+        del report['routing_version']
+        assert not ctrl._compatibility_demand_report_is_complete(  # pylint: disable=protected-access
+            report)
+
+    def test_only_instance_aware_autoscaler_advertises_exact_card_capability(
+            self):
+        ctrl = _make_controller()
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica={'A100': 1.0},
+                         lb_stream_timeout_seconds=30)
+        with mock.patch.object(ctrl,
+                               '_configured_accelerators',
+                               return_value=['A100']):
+            ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+                spec=controller.autoscalers.RequestRateAutoscaler)
+            legacy = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+            assert 'request_accelerator_compatibility_version' not in legacy
+
+            ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+                spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
+            capable = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+            assert capable['request_accelerator_compatibility_version'] == 1
+            assert capable['configured_accelerators'] == ['A100']
+
+    def test_controller_feeds_exact_task_gpu_counts_to_autoscaler(self):
+        ctrl = _make_controller()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}')
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'A100': 8}),
+            types.SimpleNamespace(accelerators={'A100-80GB': 1}),
+        ])
+        spec = types.SimpleNamespace(
+            min_replicas_by_accelerator={},
+            load_balancing_policy='instance_aware_least_load')
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            ctrl._configure_instance_aware_accelerators(  # pylint: disable=protected-access
+                spec)
+        ctrl._autoscaler.set_configured_accelerator_shapes.assert_called_once_with(  # pylint: disable=line-too-long
+            {
+                'A100': 8,
+                'A100-80GB': 1,
+            })
+
+    def test_unordered_any_of_without_placer_withholds_compatibility(self):
+        ctrl = _make_controller()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=None)
+        l4 = mock.Mock(accelerators={'L4': 1})
+        a100 = mock.Mock(accelerators={'A100': 1})
+        task = types.SimpleNamespace(resources={l4, a100})
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'L4': 1.0,
+                                         'A100': 1.0,
+                                     })
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert not configured
+
+    def test_configured_catalog_uses_active_paid_cost_order(self):
+        ctrl = _make_controller()
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.active_locations.return_value = [l4_location, a100_location]
+        placer.cost_per_hour.side_effect = (lambda location: 4.0
+                                            if location is l4_location else 2.0)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=placer)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'A100': 1}),
+        ])
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'L4': 1.0,
+                                         'A100': 1.0,
+                                     })
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert configured == ['A100', 'L4']
+
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
         assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
 
-    def test_apply_service_update_keeps_old_spec_until_runtime_transition(self):
+    @pytest.mark.parametrize('new_target_qps', [2.5, {'L4': 2.5}])
+    def test_apply_service_update_keeps_old_spec_until_runtime_transition(
+            self, new_target_qps):
         ctrl = _make_controller()
         old_spec = _FakeSpec(load_balancing_policy='round_robin',
                              target_qps_per_replica=None,
                              lb_stream_timeout_seconds=30)
         new_spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
-                             target_qps_per_replica={'L4': 2.5},
+                             target_qps_per_replica=new_target_qps,
                              lb_stream_timeout_seconds=90)
         ctrl._routing_spec = ctrl._build_routing_spec(old_spec)  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
@@ -333,6 +503,7 @@ class TestGetRoutingSpec:
             # The DB already points at the new version, but the controller has
             # not finished applying it locally yet. Syncs must keep serving the
             # old routing spec until the runtime transition completes.
+            assert ctrl._applied_version == 1  # pylint: disable=protected-access
             assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
                 'load_balancing_policy_name': 'round_robin',
                 'target_qps_per_replica': None,
@@ -349,11 +520,10 @@ class TestGetRoutingSpec:
         assert not updater.is_alive()
         ctrl._replica_manager.clear_pending_version.assert_called_once_with(  # pylint: disable=line-too-long
             2)
+        assert ctrl._applied_version == 2  # pylint: disable=protected-access
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
-            'target_qps_per_replica': {
-                'L4': 2.5
-            },
+            'target_qps_per_replica': new_target_qps,
             'target_concurrency_per_replica': None,
             'stream_timeout_seconds': 90,
             'retriable_status_codes': None,
@@ -1412,6 +1582,37 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
 
+    def test_incomplete_exact_logical_tick_revokes_prior_target(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)
+        decision_autoscaler.latest_version = 1
+        decision_autoscaler.replica_unit = 'logical'
+        decision_autoscaler.logical_target_state = None
+        decision_autoscaler.configured_accelerator_shapes = {
+            'L4': 1,
+            'A100': 1,
+        }
+        decision_autoscaler.generate_scaling_decisions.return_value = []
+        decision_autoscaler.get_decision_interval.return_value = 0
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.invalidate_logical_target.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
         decision_autoscaler = mock.Mock()
@@ -1853,6 +2054,11 @@ class TestAuthoritativeLbReportIngestion:
             'request_aggregator': {
                 'timestamps': [201, 202]
             },
+            'queued_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 3,
+            }],
             'in_flight': {
                 self._URL: 2
             },
@@ -1995,8 +2201,118 @@ class TestAuthoritativeLbReportIngestion:
             total_capacity=14,
             peak_in_flight=5,
             peak_queue_depth=4,
+            accelerator_breakdown=None,
             timestamp=None,
         )
+
+    def test_autoscaler_history_keeps_exact_card_capacity_distinct(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.configured_accelerator_shapes = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.has_recomputed_with_fresh_data.return_value = True
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 1,
+            'A100-80GB': 2,
+        }
+        autoscaler.min_replicas_by_accelerator = {'A100-80GB': 1}
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        breakdown = ctrl._get_accelerator_history_breakdown(  # pylint: disable=protected-access
+            {
+                'ready_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+                'provisioning_replicas_by_accelerator': {'A100-80GB': 1},
+                'total_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 2,
+                },
+                'zero_cost_ready_replicas_by_accelerator': {'A100': 1},
+                'fill_target_by_accelerator': {'A100': 1},
+                'free_reserved_slots_by_accelerator': {'A100': 2},
+            }, 1)
+
+        assert breakdown == {
+            'configured_accelerators': ['A100', 'A100-80GB'],
+            'min_replicas': {
+                'A100-80GB': 1
+            },
+            'demand_target': {
+                'A100': 1,
+                'A100-80GB': 2
+            },
+            'ready_capacity': {
+                'A100': 1,
+                'A100-80GB': 1
+            },
+            'provisioning_capacity': {
+                'A100-80GB': 1
+            },
+            'total_capacity': {
+                'A100': 1,
+                'A100-80GB': 2
+            },
+            'zero_cost_ready_capacity': {
+                'A100': 1
+            },
+            'fill_target': {
+                'A100': 1
+            },
+            'free_reserved_slots': {
+                'A100': 2
+            },
+        }
+
+    def test_exact_fill_overlay_withholds_unattributed_stale_grant(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.reserved_capacity_fill = True
+        autoscaler._fill_target = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 0,
+            'A100-80GB': 0,
+        }
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        fill = ctrl._get_fill_target_by_accelerator(  # pylint: disable=protected-access
+            {'A100-80GB': 1}, {'A100-80GB': 1})
+
+        assert not fill
+
+    def test_history_withholds_exact_cards_for_unattributed_fill(self):
+        ctrl, _, _ = self._controller_and_report()
+        autoscaler = mock.Mock()
+        autoscaler.configured_accelerator_shapes = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.has_recomputed_with_fresh_data.return_value = True
+        autoscaler.target_num_replicas = 2
+        autoscaler.target_num_replicas_by_accelerator = {
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.min_replicas_by_accelerator = {}
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+
+        breakdown = ctrl._get_accelerator_history_breakdown(  # pylint: disable=protected-access
+            {
+                'ready_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+                'total_replicas_by_accelerator': {
+                    'A100': 1,
+                    'A100-80GB': 1,
+                },
+            }, 1)
+
+        assert breakdown is None
 
     @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])
     def test_request_history_rejects_invalid_process_session(self, session_id):
@@ -2060,6 +2376,40 @@ class TestAuthoritativeLbReportIngestion:
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
 
+    def test_sync_with_mid_snapshot_update_withholds_mixed_routing_epoch(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._routing_spec = {'catalog': ['A100']}  # pylint: disable=protected-access
+
+        def _finish_replica_snapshot(*_args, **_kwargs):
+            with ctrl._routing_state_lock:  # pylint: disable=protected-access
+                ctrl._routing_spec = {'catalog': ['H100']}  # pylint: disable=protected-access
+                ctrl._applied_version = 2  # pylint: disable=protected-access
+            return {}, 1
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 ctrl, '_lb_report_authority', return_value=(True, True, True)), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_lb_replica_info',
+                 side_effect=_finish_replica_snapshot), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        body = json.loads(response.body)
+        assert body['service_version'] == 2
+        assert body['routing_spec'] is None
+
     def test_live_max_surge_reporter_persists_request_history(self):
         ctrl, info, report = self._controller_and_report()
         ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
@@ -2110,6 +2460,44 @@ class TestAuthoritativeLbReportIngestion:
             ({
                 self._URL: 2
             }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
+
+    def test_old_report_cannot_cross_catalog_publication_epoch(self):
+        ctrl, info, report = self._controller_and_report()
+        report.update({
+            'routing_version': 1,
+            'rejected_requests_by_compatibility': [],
+        })
+        reached_epoch_fence = threading.Event()
+        errors = []
+
+        def _unknown_ids(*_args, **_kwargs):
+            reached_epoch_fence.set()
+            return {1}
+
+        def _ingest():
+            try:
+                ctrl._apply_load_balancer_report(  # pylint: disable=protected-access
+                    report, [info], {1: True}, (True, True, True), {})
+            except BaseException as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        # Hold the same publication lock used by _apply_service_update. The
+        # old report reaches the fence under version 1, but cannot validate or
+        # collect until the version-2 catalog epoch is visible.
+        with mock.patch.object(ctrl,
+                               '_unknown_async_replica_ids',
+                               side_effect=_unknown_ids):
+            with ctrl._routing_state_lock:  # pylint: disable=protected-access
+                reporter = threading.Thread(target=_ingest)
+                reporter.start()
+                assert reached_epoch_fence.wait(timeout=5)
+                ctrl._applied_version = 2  # pylint: disable=protected-access
+            reporter.join(timeout=5)
+
+        assert not reporter.is_alive()
+        assert not errors
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'compatibility_demand_complete'] is False
 
     def test_logical_report_publishes_capacity_and_demand_as_one_generation(
             self):
@@ -2322,6 +2710,16 @@ class TestAuthoritativeLbReportIngestion:
             }, {1}, 11, 13, 1)
         assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
             'unknown_capacity_replica_ids'] == []
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'queued_requests_by_compatibility'] == [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'count': 3,
+            }]
+        # An old LB omitting the new rejection-profile gauge must not unlock
+        # card-specific target changes during a mixed-version rollout.
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'compatibility_demand_complete'] is False
         # The reporter's clean-looking drain fields are not copied. A blocking
         # view also invalidates any still-fresh proof from before the rollout.
         assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
@@ -2614,6 +3012,15 @@ class TestGetCapacityHint:
             'physical_ready_replicas': 2,
             'physical_total_replicas': 5,
             'physical_failed_replicas': 0,
+            'ready_replicas_by_accelerator': {
+                'A100': 8,
+            },
+            'provisioning_replicas_by_accelerator': {
+                'A100': 5,
+            },
+            'total_replicas_by_accelerator': {
+                'A100': 13,
+            },
             'planned_capacity_by_url': {
                 'http://eight': 8,
                 'http://four': 4,
@@ -2728,6 +3135,42 @@ class TestGetCapacityHint:
         assert counts['ready_replicas'] == 8
         assert counts['total_replicas'] == 9
         assert counts['physical_ready_replicas'] == 2
+
+    def test_zero_cost_exact_cards_include_legacy_location_match(self):
+        ctrl = _make_controller()
+        autoscaler = _FakeAutoscaler(target=3,
+                                     recomputed=True,
+                                     latest_version=2)
+        autoscaler.is_replica_on_zero_cost_location = (
+            lambda info: info.replica_id == 1)
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        legacy = _FakeReplicaInfo(1, serve_state.ReplicaStatus.READY, version=2)
+        legacy.is_zero_cost = False
+        persisted = _FakeReplicaInfo(2,
+                                     serve_state.ReplicaStatus.READY,
+                                     version=2)
+        persisted.is_zero_cost = True
+        unknown = _FakeReplicaInfo(3,
+                                   serve_state.ReplicaStatus.READY,
+                                   version=2)
+        unknown.is_zero_cost = False
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://legacy', 'A100-80GB', 1),
+            2: ('http://persisted', 'A100', 1),
+            3: ('http://unknown', 'H100', 1),
+        }
+
+        counts = ctrl._get_replica_counts(  # pylint: disable=protected-access
+            [legacy, persisted, unknown])
+
+        assert counts['zero_cost_ready_replicas_by_accelerator'] == {
+            'A100-80GB': 1,
+            'A100': 1,
+        }
+        assert counts['zero_cost_total_replicas_by_accelerator'] == {
+            'A100-80GB': 1,
+            'A100': 1,
+        }
 
 
 class TestReservedCapacityPollerStart:
@@ -2861,8 +3304,11 @@ class TestLbSyncBlockingReadsOffLoop:
         body = json.loads(response.body)
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
-            'capacity_hint', 'request_history_accepted'
+            'capacity_hint', 'request_history_accepted',
+            'queued_compatibility_demand_supported', 'service_version'
         }
+        assert body['queued_compatibility_demand_supported'] is True
+        assert body['service_version'] == 1
 
 
 class TestLbSyncOwnershipFences:

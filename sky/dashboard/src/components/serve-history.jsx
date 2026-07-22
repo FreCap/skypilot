@@ -9,6 +9,7 @@ import {
   resolveHistoryRange,
 } from '@/components/serve-history-range';
 import { DemandPressureCard } from '@/components/serve-demand-pressure';
+import { AcceleratorHistoryCard } from '@/components/serve-accelerator-history';
 import { ReplicaHistoryCard } from '@/components/serve-replica-history';
 import { RequestHistoryCard } from '@/components/serve-request-history';
 
@@ -43,6 +44,14 @@ export function ServeHistorySection({ history, loading = false }) {
         loading={loading}
       />
       <DemandPressureCard
+        history={history}
+        range={range}
+        onRangeSelect={({ start, end }) =>
+          setSelection({ kind: 'custom', start, end })
+        }
+        loading={loading}
+      />
+      <AcceleratorHistoryCard
         history={history}
         range={range}
         onRangeSelect={({ start, end }) =>

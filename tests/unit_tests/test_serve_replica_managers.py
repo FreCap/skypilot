@@ -388,7 +388,7 @@ def test_confirm_logical_bridge_capacity_is_durable_and_monotonic():
         confirmed = mgr.confirm_logical_bridge_capacities({1: 8})
 
     assert confirmed == {1: 8}
-    assert info.to_storage_dict()['replica_info_version'] == 10
+    assert info.to_storage_dict()['replica_info_version'] == 11
     assert info.planned_capacity == 8
     assert info.logical_bridge_capacity_verified is True
     assert persisted == [(1, info)]
@@ -1677,6 +1677,7 @@ class TestLaunchOwnershipFence:
         info = mock.Mock()
         info.status = replica_managers.serve_state.ReplicaStatus.PENDING
         info.status_property = mock.Mock()
+        info.created_at = 100.0
         return info
 
     @staticmethod
@@ -2059,7 +2060,7 @@ class TestLaunchOwnershipFence:
         location = mock.Mock()
         placer = mock.Mock()
         placer.resolve_location.return_value = location
-        placer.is_active_location.return_value = True
+        placer.is_launch_admissible.return_value = True
         mgr._spot_placer = placer
         for info in infos.values():
             info.get_spot_location.return_value = location
@@ -2090,8 +2091,48 @@ class TestLaunchOwnershipFence:
                     common_utils.ProcessStatus.RUNNING)
         for launch_thread in mgr._launch_thread_pool.values():
             launch_thread.start.assert_called_once_with()
-        placer.is_active_location.assert_has_calls([mock.call(location)] * 3)
+        placer.is_launch_admissible.assert_has_calls(
+            [mock.call(location, selected_at=100.0)] * 3)
         assert persist.call_count == 3
+
+    def test_consumed_retry_is_admitted_once(self, tmp_path):
+        mgr, infos = self._queued_manager([1])
+        launch_thread = mgr._launch_thread_pool[1]
+        location = mock.Mock()
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        placer.is_active_location.return_value = False
+        placer.is_launch_admissible.return_value = True
+        mgr._spot_placer = placer
+        infos[1].get_spot_location.return_value = location
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value=infos), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_provision',
+                               return_value=True), \
+             mock.patch.object(mgr, '_remove_replica') as remove, \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        placer.is_launch_admissible.assert_called_once_with(location,
+                                                            selected_at=100.0)
+        placer.is_active_location.assert_not_called()
+        launch_thread.start.assert_called_once_with()
+        remove.assert_not_called()
+        persist.assert_called_once_with(1, infos[1])
 
     def test_benched_placement_discards_queued_wave(self):
         mgr, infos = self._queued_manager([1, 2, 3])
@@ -2099,7 +2140,7 @@ class TestLaunchOwnershipFence:
         location = mock.Mock()
         placer = mock.Mock()
         placer.resolve_location.return_value = location
-        placer.is_active_location.return_value = False
+        placer.is_launch_admissible.return_value = False
         mgr._spot_placer = placer
         for info in infos.values():
             info.get_spot_location.return_value = location
@@ -2118,7 +2159,8 @@ class TestLaunchOwnershipFence:
              mock.patch.object(mgr, '_persist_replica') as persist:
             mgr._refresh_thread_pool()
 
-        placer.is_active_location.assert_has_calls([mock.call(location)] * 3)
+        placer.is_launch_admissible.assert_has_calls(
+            [mock.call(location, selected_at=100.0)] * 3)
         assert remove.call_args_list == [
             mock.call(1), mock.call(2),
             mock.call(3)
@@ -2998,6 +3040,66 @@ class TestLogicalCapacityPlanning:
         scale_locked.assert_called_once_with(8, 1, 3,
                                              mgr._logical_reconcile_snapshot,
                                              ())
+
+    def test_logical_scale_up_honors_each_exact_card_target(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 9, (('L4', 1), ('A100', 8)),
+                                   (('L4', 1), ('A100', 8)))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        overrides = []
+
+        def _append_shape(resources_override, _used_ids, existing, _budget,
+                          logical_reconcile_fence):
+            del logical_reconcile_fence
+            overrides.append(resources_override)
+            _, width = next(iter(resources_override['accelerators'].items()))
+            info = mock.Mock(replica_id=len(existing) + 1,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=width,
+                             resources_override=resources_override)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = None
+            existing.append(info)
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_append_shape):
+            mgr.scale_up_to_logical_capacity(target_capacity=9,
+                                             version=1,
+                                             reconcile_generation=7,
+                                             target_capacity_by_accelerator={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             },
+                                             accelerator_shapes={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             })
+
+        assert overrides == [{
+            'accelerators': {
+                'L4': 1
+            }
+        }, {
+            'accelerators': {
+                'A100': 8
+            }
+        }]
 
     def test_unknown_capacity_replacement_launch_is_durably_attributed(self):
         mgr = _make_manager()
@@ -4205,6 +4307,38 @@ class TestLogicalCapacityPlanning:
         assert not mgr._recovering_logical_retirement_ids
         mgr._persist_replica.assert_called_once_with(1, retiring)
 
+    def test_exact_recovery_reactivates_before_same_card_is_ready(self):
+        retiring = self._recoverable_logical_retirement(1)
+        retiring.resources_override = {'accelerators': {'L4': 1}}
+        provisioning = self._ready_backend(2, 1)
+        provisioning.version = 2
+        provisioning.resources_override = {'accelerators': {'L4': 1}}
+        provisioning.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        provisioning.status_property.service_ready_now = False
+        provisioning.status_property.first_ready_time = None
+        mgr = self._logical_recovery_manager([retiring], provisioning)
+        mgr.latest_version = 2
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            version=2,
+            observed_slots_by_replica_id={},
+            in_flight_by_replica_id={
+                1: 0,
+                2: 0,
+            })
+        mgr._logical_target = (2, 5, 1, (('L4', 1),), (('L4', 1),))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, provisioning]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        assert retiring.is_ready
+        assert not retiring.status_property.is_scale_down
+        assert not mgr._recovering_logical_retirement_ids
+        mgr._persist_replica.assert_called_once_with(1, retiring)
+
     def test_recovery_shortfall_reactivation_is_bounded_per_generation(self):
         candidates = [
             self._recoverable_logical_retirement(replica_id)
@@ -4387,6 +4521,123 @@ class TestLogicalCapacityPlanning:
         defer.assert_called_once_with(2,
                                       logical_retirement=(1, 3, 8),
                                       replica_info=four)
+
+    def test_manager_rejects_same_total_wrong_card_retirement(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        l4 = self._ready_backend(1, 1)
+        a100 = self._ready_backend(2, 1)
+        l4.resources_override = {'accelerators': {'L4': 1}}
+        a100.resources_override = {'accelerators': {'A100': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={
+                    1: 1,
+                    2: 1,
+                },
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        target_by_card = (('L4', 1),)
+        shapes = (('L4', 1), ('A100', 1))
+        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[l4, a100]):
+            mgr.scale_down_logically(1, 1, 1, 3, target_by_card, shapes)
+
+        defer.assert_not_called()
+
+    def test_manager_accepts_exact_card_zero_target_retirement(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        l4 = self._ready_backend(1, 1)
+        l4.resources_override = {'accelerators': {'L4': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={1: 1},
+                in_flight_by_replica_id={1: 0},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        shapes = (('L4', 1), ('A100', 1))
+        mgr._logical_target = (1, 3, 0, (), shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[l4]):
+            mgr.scale_down_logically(1, 0, 1, 3, (), shapes)
+
+        defer.assert_called_once_with(1,
+                                      logical_retirement=(1, 3, 0),
+                                      replica_info=l4)
+
+    def test_manager_retires_old_card_removed_from_exact_catalog(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        old_a100 = self._ready_backend(1, 1)
+        old_a100.version = 0
+        old_a100.resources_override = {'accelerators': {'A100': 1}}
+        h100 = self._ready_backend(2, 1)
+        h100.resources_override = {'accelerators': {'H100': 1}}
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={
+                    1: 1,
+                    2: 1,
+                },
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        target_by_card = (('H100', 1),)
+        shapes = (('H100', 1),)
+        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[old_a100, h100]):
+            mgr.scale_down_logically(1, 1, 1, 3, target_by_card, shapes)
+
+        defer.assert_called_once_with(1,
+                                      logical_retirement=(1, 3, 1),
+                                      replica_info=old_a100)
+
+    def test_invalidate_logical_target_blocks_recovery_adoption(self):
+        retiring = self._recoverable_logical_retirement(1)
+        survivor = self._ready_backend(2, 1)
+        retiring.resources_override = {'accelerators': {'L4': 1}}
+        survivor.resources_override = {'accelerators': {'A100': 1}}
+        mgr = self._logical_recovery_manager([retiring], survivor)
+        mgr._logical_target = (1, 5, 1, (('L4', 1),), (('L4', 1), ('A100', 1)))
+
+        mgr.invalidate_logical_target()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+
+        mgr._persist_replica.assert_not_called()
+        assert retiring.status_property.logical_retirement_controller_epoch == (
+            'old-controller-epoch')
+        assert 1 in mgr._recovering_logical_retirement_ids
 
     @pytest.mark.parametrize('victim_still_present', [True, False])
     def test_logical_retirement_uses_one_fleet_snapshot(self,
@@ -6761,6 +7012,37 @@ class TestZeroCostDemandProbeBudget:
         assert budget.remaining_by_pool == {
             ('research-ctx', 'a100'): 223,
             ('research-ctx', 'h100'): 16,
+        }
+
+    def test_targeted_zero_cost_selection_keeps_a100_variants_exact(self):
+        a100 = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        a100_80gb = self._location('Kubernetes',
+                                   'research-ctx',
+                                   'A100-80GB',
+                                   use_spot=False)
+        manager = self._manager([a100, a100_80gb], [a100, a100_80gb])
+        manager._spot_placer.select_next_zero_cost_location.side_effect = (
+            lambda *, allowed_locations: next(iter(allowed_locations)))
+        budget = replica_managers._ZeroCostDemandBudget(
+            remaining_by_pool={
+                ('research-ctx', 'a100'): 1,
+                ('research-ctx', 'a100-80gb'): 1,
+            },
+            measured_by_pool={
+                ('research-ctx', 'a100'): 1,
+                ('research-ctx', 'a100-80gb'): 1,
+            })
+
+        selected = manager._select_budgeted_zero_cost_location(
+            budget, {a100_80gb})
+
+        assert selected == a100_80gb
+        assert budget.remaining_by_pool == {
+            ('research-ctx', 'a100'): 1,
+            ('research-ctx', 'a100-80gb'): 0,
         }
 
     def test_successful_zero_snapshot_does_not_speculate(self):

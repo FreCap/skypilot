@@ -193,6 +193,26 @@ tuna import.log  # pip install tuna
 
 ## Architecture Patterns
 
+### Design Documents and Implementation Plans
+
+For non-trivial changes, the repository must contain the canonical design at
+`docs/designs/<descriptive-slug>.md` before implementation begins.
+
+- Iterate on that file in place as decisions change. Do not create timestamped
+  replacement copies that can diverge from the implementation.
+- Keep the design's behavior contract, alternatives, milestones, rollout, and
+  test plan synchronized with the code throughout implementation and review.
+- Commit the canonical design and include subsequent design corrections in the
+  same PR as the implementation they affect. Do not leave the only current copy
+  untracked or outside the repository.
+- External planning locations such as `~/agent-plans` or a `.plans` symlink may
+  be used as scratch space or a pointer, but they are never authoritative. Sync
+  an accepted external plan into `docs/designs/` and continue editing only the
+  repository copy.
+- Run adversarial review against the exact repository design. If that review or
+  implementation changes the contract, update the repository file first and
+  re-review the updated version before proceeding.
+
 ### Cloud Provider Abstraction
 
 All cloud providers inherit from `sky.clouds.Cloud` (in `sky/clouds/cloud.py`). Cloud objects are **lightweight and stateless**. Key design principles:

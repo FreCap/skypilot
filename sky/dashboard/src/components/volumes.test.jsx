@@ -1,4 +1,5 @@
 import React from 'react';
+import PropTypes from 'prop-types';
 import {
   act,
   fireEvent,
@@ -20,8 +21,10 @@ jest.mock('@/hooks/useMobile', () => ({
   useMobile: () => false,
 }));
 
+const mockUsePluginComponents = jest.fn();
+
 jest.mock('@/plugins/PluginProvider', () => ({
-  usePluginComponents: () => [],
+  usePluginComponents: (...args) => mockUsePluginComponents(...args),
   useTableColumns: () => [],
 }));
 
@@ -41,6 +44,7 @@ jest.mock('@/lib/cache', () => ({
   default: {
     get: jest.fn(),
     invalidate: jest.fn(),
+    setPreloader: jest.fn(),
   },
 }));
 
@@ -48,6 +52,19 @@ import { Volumes, VolumesTable } from '@/components/volumes';
 import { getVolumes } from '@/data/connectors/volumes';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
+import { trackVolumeAction } from '@/lib/analytics';
+
+const actualCachePreloader = jest.requireActual(
+  '@/lib/cache-preloader'
+).default;
+
+function PluginMutationAction({ onVolumeChange }) {
+  return <button onClick={onVolumeChange}>Plugin mutation</button>;
+}
+
+PluginMutationAction.propTypes = {
+  onVolumeChange: PropTypes.func.isRequired,
+};
 
 function deferred() {
   let resolve;
@@ -80,7 +97,10 @@ describe('Volumes request ownership', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.useFakeTimers();
-    cachePreloader.preloadForPage.mockResolvedValue();
+    cachePreloader.preloadForPage.mockReset().mockResolvedValue();
+    dashboardCache.get.mockReset();
+    dashboardCache.invalidate.mockReset();
+    mockUsePluginComponents.mockReset().mockReturnValue([]);
   });
 
   afterEach(() => {
@@ -138,7 +158,137 @@ describe('Volumes request ownership', () => {
       'volumes',
       { force: true }
     );
-    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes);
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('invalidates and fetches the volume preload key exactly once when forced', async () => {
+    dashboardCache.get.mockResolvedValue([]);
+
+    await actualCachePreloader.preloadForPage('volumes', {
+      force: true,
+      backgroundPreload: false,
+    });
+
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes, []);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getVolumes, []);
+  });
+
+  it('coalesces overlapping manual refreshes into one forced preload', async () => {
+    const initialPreload = deferred();
+    const refreshPreload = deferred();
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    cachePreloader.preloadForPage
+      .mockReturnValueOnce(initialPreload.promise)
+      .mockReturnValueOnce(refreshPreload.promise)
+      .mockResolvedValueOnce(undefined);
+    render(<Volumes />);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      2,
+      'volumes',
+      { force: true }
+    );
+    expect(trackVolumeAction).toHaveBeenCalledTimes(2);
+    expect(trackVolumeAction).toHaveBeenCalledWith('refresh');
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      initialPreload.resolve();
+      await initialPreload.promise;
+    });
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+      await Promise.resolve();
+    });
+    await screen.findByText('current-volume');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(refreshButton);
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+  });
+
+  it('releases manual refresh ownership after preload failure', async () => {
+    const failedRefresh = deferred();
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    cachePreloader.preloadForPage
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(failedRefresh.promise)
+      .mockResolvedValueOnce(undefined);
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    render(<Volumes />);
+    await screen.findByText('current-volume');
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    await act(async () => {
+      failedRefresh.reject(new Error('preload unavailable'));
+      await failedRefresh.promise.catch(() => {});
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        'Error preloading volumes data:',
+        expect.objectContaining({ message: 'preload unavailable' })
+      )
+    );
+
+    fireEvent.click(refreshButton);
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
+    consoleError.mockRestore();
+  });
+
+  it('lets plugin mutation supersede a pending manual refresh', async () => {
+    const manualRefresh = deferred();
+    const mutationRefresh = deferred();
+    mockUsePluginComponents.mockImplementation((slot) =>
+      slot === 'volumes.header-actions'
+        ? [{ id: 'mutation', component: PluginMutationAction }]
+        : []
+    );
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    cachePreloader.preloadForPage
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(manualRefresh.promise)
+      .mockReturnValueOnce(mutationRefresh.promise);
+    render(<Volumes />);
+    await screen.findByText('current-volume');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Plugin mutation' }));
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      3,
+      'volumes',
+      { force: true }
+    );
+
+    await act(async () => {
+      manualRefresh.resolve();
+      await manualRefresh.promise;
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      mutationRefresh.resolve();
+      await mutationRefresh.promise;
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('does not let an initial preload republish after a manual refresh supersedes it', async () => {
@@ -172,19 +322,22 @@ describe('Volumes request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 
-  it('does not continue a preload that finishes after unmount', async () => {
-    const preload = deferred();
-    cachePreloader.preloadForPage.mockReturnValue(preload.promise);
-
+  it('does not continue a manual refresh that finishes after unmount', async () => {
+    const refreshPreload = deferred();
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    cachePreloader.preloadForPage
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(refreshPreload.promise);
     const { unmount } = render(<Volumes />);
-
+    await screen.findByText('current-volume');
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     unmount();
     await act(async () => {
-      preload.resolve();
-      await preload.promise;
+      refreshPreload.resolve();
+      await refreshPreload.promise;
     });
 
-    expect(dashboardCache.get).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 
   it('does not let an older failure erase a newer interval result', async () => {

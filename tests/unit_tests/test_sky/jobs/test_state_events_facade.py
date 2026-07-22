@@ -1,8 +1,12 @@
 """Characterization tests for the managed-jobs event state facade."""
+# pylint: disable=protected-access
 
 import ast
 import asyncio
+import datetime
 import inspect
+
+import pytest
 
 from sky.jobs import state
 from sky.jobs import state_events
@@ -49,6 +53,23 @@ def test_event_facade_uses_direct_repository_aliases():
     assert state_events.logger.name == 'sky.jobs.state'
 
 
+def test_job_event_timestamp_normalization_is_utc_aware():
+    naive = datetime.datetime(2026, 7, 21, 12, 0)
+    assert state_events._normalize_timestamp(naive) == datetime.datetime(
+        2026, 7, 21, 12, 0, tzinfo=datetime.timezone.utc)
+
+    offset = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    aware = datetime.datetime(2026, 7, 21, 12, 0, tzinfo=offset)
+    assert state_events._normalize_timestamp(aware) == datetime.datetime(
+        2026, 7, 21, 6, 30, tzinfo=datetime.timezone.utc)
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    generated = state_events._normalize_timestamp()
+    after = datetime.datetime.now(datetime.timezone.utc)
+    assert generated.tzinfo is datetime.timezone.utc
+    assert before <= generated <= after
+
+
 def test_lifecycle_transition_resolves_event_writer_from_facade():
     tree = ast.parse(inspect.getsource(state.set_pending))
     called_names = {
@@ -59,15 +80,30 @@ def test_lifecycle_transition_resolves_event_writer_from_facade():
     assert 'add_job_event' in called_names
 
 
-def test_event_retention_daemon_handles_cancellation(monkeypatch):
+def test_event_retention_daemon_propagates_cancellation(monkeypatch):
     cleanup_calls = []
 
-    async def _cancel_cleanup(retention_hours):
-        cleanup_calls.append(retention_hours)
-        raise asyncio.CancelledError
+    async def _run():
+        cleanup_started = asyncio.Event()
+        cleanup_blocked = asyncio.Event()
 
-    monkeypatch.setattr(state_events, 'cleanup_job_events_with_retention_async',
-                        _cancel_cleanup)
-    asyncio.run(state.job_event_retention_daemon())
+        async def _blocked_cleanup(retention_hours):
+            cleanup_calls.append(retention_hours)
+            cleanup_started.set()
+            await cleanup_blocked.wait()
+
+        monkeypatch.setattr(state_events,
+                            'cleanup_job_events_with_retention_async',
+                            _blocked_cleanup)
+        task = asyncio.create_task(state.job_event_retention_daemon())
+        await cleanup_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled()
+
+    asyncio.run(_run())
 
     assert cleanup_calls == [state.DEFAULT_JOB_EVENT_RETENTION_HOURS]

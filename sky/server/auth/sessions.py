@@ -1,88 +1,95 @@
-"""SQLite-based auth session storage for CLI login flow.
-
-This module provides server-side session storage for the polling-based
-CLI authentication flow. Sessions are keyed by code_challenge and
-expire after a configurable timeout. Uses SQLite for cross-worker access.
-"""
-import os
-import sqlite3
+"""Shared auth-session storage for the CLI browser-login flow."""
+from collections.abc import Callable
 import time
 
+import sqlalchemy
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import sqlite
+
+from sky import global_user_state
 from sky.server import constants as server_constants
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 
-# Table name for auth sessions
-_AUTH_SESSIONS_TABLE = 'auth_sessions'
-
 
 class AuthSessionStore:
-    """SQLite-backed storage for auth sessions."""
+    """Store short-lived auth sessions in the global-state database."""
 
-    def __init__(self):
-        self._db_path = os.path.expanduser(
-            server_constants.API_SERVER_REQUEST_DB_PATH)
-
-    def _get_cursor(self):
-        """Get a cursor to the database, creating table if needed."""
-        return db_utils.safe_cursor(self._db_path)
-
-    def _ensure_table(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure the auth_sessions table exists."""
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {_AUTH_SESSIONS_TABLE} (
-                code_challenge TEXT PRIMARY KEY,
-                token TEXT NOT NULL,
-                created_at REAL NOT NULL
-            )
-        """)
-
-    def _cleanup_expired(self, cursor: sqlite3.Cursor) -> None:
-        """Remove expired sessions."""
-        expiry_time = time.time(
-        ) - server_constants.AUTH_SESSION_TIMEOUT_SECONDS
-        cursor.execute(
-            f'DELETE FROM {_AUTH_SESSIONS_TABLE} WHERE created_at < ?',
-            (expiry_time,))
+    def __init__(
+        self,
+        engine_provider: Callable[
+            [],
+            sqlalchemy.engine.Engine] = global_user_state.initialize_and_get_db,
+    ):
+        self._engine_provider = engine_provider
 
     def create_session(self, code_challenge: str, token: str) -> None:
-        """Create an authorized session with the given token."""
-        with self._get_cursor() as cursor:
-            self._ensure_table(cursor)
-            self._cleanup_expired(cursor)
+        """Create or atomically replace an authorized session."""
+        engine = self._engine_provider()
+        created_at = time.time()
+        expiry_time = created_at - server_constants.AUTH_SESSION_TIMEOUT_SECONDS
+        table = global_user_state.auth_session_table
 
-            # Insert or replace (in case of duplicate authorize clicks)
-            cursor.execute(
-                f'INSERT OR REPLACE INTO {_AUTH_SESSIONS_TABLE} '
-                '(code_challenge, token, created_at) VALUES (?, ?, ?)',
-                (code_challenge, token, time.time()))
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            insert_statement = postgresql.insert(table)
+        elif engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_statement = sqlite.insert(table)
+        else:
+            raise ValueError(
+                f'Unsupported database dialect: {engine.dialect.name}')
+
+        insert_statement = insert_statement.values(
+            code_challenge=code_challenge,
+            token=token,
+            created_at=created_at,
+        )
+        upsert_statement = insert_statement.on_conflict_do_update(
+            index_elements=[table.c.code_challenge],
+            set_={
+                table.c.token: insert_statement.excluded.token,
+                table.c.created_at: insert_statement.excluded.created_at,
+            })
+
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.delete(table).where(
+                    table.c.created_at < expiry_time))
+            connection.execute(upsert_statement)
+
+    def restore_session(self, code_challenge: str, token: str) -> None:
+        """Restore a consumed session unless a newer authorization exists."""
+        engine = self._engine_provider()
+        table = global_user_state.auth_session_table
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            insert_statement = postgresql.insert(table)
+        elif engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_statement = sqlite.insert(table)
+        else:
+            raise ValueError(
+                f'Unsupported database dialect: {engine.dialect.name}')
+
+        restore_statement = insert_statement.values(
+            code_challenge=code_challenge,
+            token=token,
+            created_at=time.time(),
+        ).on_conflict_do_nothing(index_elements=[table.c.code_challenge])
+        with engine.begin() as connection:
+            connection.execute(restore_statement)
 
     def poll_session(self, code_verifier: str) -> str | None:
-        """Poll a session for its token using code_verifier.
-
-        Computes code_challenge from code_verifier to look up the session.
-        If found and valid, atomically consumes the session and returns the
-        token. Uses DELETE ... RETURNING for atomicity (requires SQLite 3.35+,
-        which is already required by the API server).
-
-        Returns:
-            The token if session exists and is valid, None otherwise.
-        """
+        """Atomically consume and return an unexpired session token."""
         code_challenge = common_utils.compute_code_challenge(code_verifier)
-        expiry_threshold = time.time(
-        ) - server_constants.AUTH_SESSION_TIMEOUT_SECONDS
+        expiry_threshold = (time.time() -
+                            server_constants.AUTH_SESSION_TIMEOUT_SECONDS)
+        table = global_user_state.auth_session_table
+        statement = (sqlalchemy.delete(table).where(
+            table.c.code_challenge == code_challenge, table.c.created_at
+            > expiry_threshold).returning(table.c.token))
 
-        with self._get_cursor() as cursor:
-            self._ensure_table(cursor)
-
-            # Atomically delete and return token if not expired
-            cursor.execute(
-                f'DELETE FROM {_AUTH_SESSIONS_TABLE} '
-                f'WHERE code_challenge = ? AND created_at > ? '
-                f'RETURNING token', (code_challenge, expiry_threshold))
-            row = cursor.fetchone()
-            return row[0] if row else None
+        engine = self._engine_provider()
+        with engine.begin() as connection:
+            row = connection.execute(statement).first()
+        return row.token if row is not None else None
 
 
-# Global session store instance
 auth_session_store = AuthSessionStore()

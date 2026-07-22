@@ -534,16 +534,18 @@ class SpotPlacer:
                 'Only one policy can be default.')
             DEFAULT_SPOT_PLACER = name
 
-    def select_next_location(self,
-                             *,
-                             skip_zero_cost_preference: bool = False
-                            ) -> Location:
+    def select_next_location(
+            self,
+            *,
+            skip_zero_cost_preference: bool = False,
+            allowed_locations: set[Location] | None = None) -> Location:
         """Select next location to place spot instance.
 
         skip_zero_cost_preference disables the fill-the-free-tier-first
         rule in placers that have one; the placer stays service-agnostic
         and the decision to skip (the broker's demand-placement gate) is
-        made by the caller in the launch path.
+        made by the caller in the launch path. ``allowed_locations`` keeps a
+        card-targeted launch inside its exact accelerator subset.
         """
         raise NotImplementedError
 
@@ -765,6 +767,27 @@ class SpotPlacer:
         return (resolved is not None and
                 self._effective_status(resolved) == LocationStatus.ACTIVE)
 
+    def is_launch_admissible(self, location: Location, *,
+                             selected_at: float | None) -> bool:
+        """Whether a queued placement is still valid for launch admission.
+
+        Selecting an expired bench consumes its one retry by refreshing the
+        bench timestamp before the replica row is created. That specific row
+        remains admissible even though the location is no longer effectively
+        ACTIVE. A bench recorded after the row was selected is newer failure
+        evidence and fences the queued launch.
+        """
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            return False
+        if self._effective_status(resolved) == LocationStatus.ACTIVE:
+            return True
+        if (self.location2status[resolved] != LocationStatus.PREEMPTED or
+                selected_at is None):
+            return False
+        preempted_at = self.location2preempted_at.get(resolved)
+        return preempted_at is not None and preempted_at <= selected_at
+
     def cost_per_hour(self, location: Location) -> float:
         """Return the current cached catalog cost for a known location."""
         resolved = self.resolve_location(location)
@@ -868,11 +891,19 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                     f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
                     'TTL).')
 
-    def select_next_location(self,
-                             *,
-                             skip_zero_cost_preference: bool = False
-                            ) -> Location:
-        active_locations = self.active_locations()
+    def select_next_location(
+            self,
+            *,
+            skip_zero_cost_preference: bool = False,
+            allowed_locations: set[Location] | None = None) -> Location:
+        active_locations = [
+            location for location in self.active_locations()
+            if allowed_locations is None or location in allowed_locations
+        ]
+        if not active_locations:
+            raise RuntimeError(
+                'No active placement location satisfies the requested exact '
+                'accelerator override.')
         # Zero-cost tier first: locations that cost nothing (reserved /
         # already-paid capacity, e.g. a Kubernetes pool) are filled
         # COMPLETELY before any paid location is considered, regardless

@@ -296,13 +296,18 @@ only establishes a baseline and is never pressure.
 When a downscale is accepted, let:
 
 ```text
-committed = latest-version nonterminal planned logical capacity
-provisioning = committed capacity in PENDING, PROVISIONING, or STARTING
-total_allowance = ceil(committed * max_scale_down_rate_percentage / 100)
-pending_allowance = ceil(provisioning * max_scale_down_rate_percentage / 100)
+traffic_committed = latest-version nonterminal planned logical capacity
+                    whose launch origin is not reserved fill
+traffic_provisioning = traffic_committed capacity in PENDING, PROVISIONING,
+                       or STARTING
+total_allowance = ceil(traffic_committed
+                       * max_scale_down_rate_percentage / 100)
+pending_allowance = ceil(traffic_provisioning
+                         * max_scale_down_rate_percentage / 100)
 
-limited_target = max(raw_target, committed - total_allowance)
-pending_retention_floor = max(0, provisioning - pending_allowance)
+limited_target = max(raw_target, traffic_committed - total_allowance)
+pending_retention_floor = max(0,
+                              traffic_provisioning - pending_allowance)
 ```
 
 The accepted lower target freezes `pending_retention_floor` for that downscale
@@ -316,6 +321,16 @@ may consider idle READY capacity under the existing ready-capacity fence and
 the whole-fleet target. A new lower target and new cohort budget require another
 complete continuous downscale delay. An equal target never refreshes the
 budget.
+
+`reserved_fill=true` is the persisted launch-origin marker. Those rows do not
+retain traffic intent, enlarge either allowance, or consume the protected
+pending cohort. They remain independently sheltered or replenished by the
+zero-cost-only fill overlay. A demand launch that lands on reserved capacity
+remains traffic-owned because its launch origin is demand. Legacy rows missing
+the marker default to traffic-owned. Total committed capacity remains the
+basis for scale-up wave sizing, duplicate-launch suppression, hard ceilings,
+and readiness coverage, so compatible fill capacity can serve demand without
+causing a duplicate paid launch.
 
 This makes the limits independent instead of taking the maximum of two target
 floors. A single stuck provisioning replica cannot reduce a 200-ready fleet to

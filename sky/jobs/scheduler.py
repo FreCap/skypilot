@@ -360,6 +360,29 @@ async def _release_launch_slot(job_id: int, starting: set[int],
         starting_signal.notify()
 
 
+async def _complete_launch_state_transition(
+        transition: typing.Coroutine[typing.Any, typing.Any, None]) -> None:
+    """Finish a durable launch outcome before honoring cancellation."""
+    transition_task = asyncio.create_task(transition)
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(transition_task)
+            break
+        except asyncio.CancelledError:  # noqa: ASYNC103
+            # Repeated cancellation must not release the in-memory launch slot
+            # while the durable row still says LAUNCHING.
+            cancelled = True
+            if transition_task.done():
+                break  # noqa: ASYNC104
+
+    # Preserve transition failures instead of misreporting them as caller
+    # cancellation.
+    transition_task.result()
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
 @contextlib.asynccontextmanager
 async def scheduled_launch(
     job_id: int,
@@ -441,10 +464,14 @@ async def scheduled_launch(
         await state.scheduler_set_launching_async(job_id)
         yield
     except exceptions.NoClusterLaunchedError:
-        await state.scheduler_set_backoff_async(job_id)
+        # Cancellation intentionally wins over the launch error, but only
+        # after the backoff row is durable.
+        await _complete_launch_state_transition(  # noqa: ASYNC120
+            state.scheduler_set_backoff_async(job_id))
         raise
     else:
-        await state.scheduler_set_alive_async(job_id)
+        await _complete_launch_state_transition(
+            state.scheduler_set_alive_async(job_id))
     finally:
         await _release_launch_slot(job_id, starting, starting_lock,
                                    starting_signal)

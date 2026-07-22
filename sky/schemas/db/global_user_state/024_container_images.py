@@ -1,7 +1,7 @@
 """Add managed container image distribution state.
 
-Revision ID: 023
-Revises: 022
+Revision ID: 024
+Revises: 023
 Create Date: 2026-07-13
 
 """
@@ -16,13 +16,13 @@ import sqlalchemy
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
-revision: str = '023'
-down_revision: str | Sequence[str] | None = '022'
+revision: str = '024'
+down_revision: str | Sequence[str] | None = '023'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _CATALOG_ROW_ID = 'authority'
-_MIGRATION_LOCK = 'skypilot:global-user-state:023:container-images'
+_MIGRATION_LOCK = 'skypilot:global-user-state:024:container-images'
 _TABLE_NAMES = (
     'container_image_catalog',
     'container_image_profile_revisions',
@@ -59,17 +59,35 @@ def _lock_migration() -> None:
         bindparams(name=_MIGRATION_LOCK))
 
 
-def _add_cluster_binding_columns() -> None:
-    db_utils.add_column_to_table_alembic('clusters',
-                                         'container_image_binding_known',
-                                         sqlalchemy.Integer(),
-                                         server_default='0')
-    db_utils.add_column_to_table_alembic('clusters',
-                                         'container_image_consumer_kind',
-                                         sqlalchemy.Text())
-    db_utils.add_column_to_table_alembic('clusters',
-                                         'container_image_consumer_owner',
-                                         sqlalchemy.Text())
+def _ensure_auth_sessions_table(bind: sqlalchemy.engine.Connection) -> None:
+    """Converge databases stamped by the former image revision 023."""
+    if sqlalchemy.inspect(bind).has_table('auth_sessions'):
+        return
+    op.create_table(
+        'auth_sessions',
+        sqlalchemy.Column('code_challenge', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('token', sqlalchemy.Text, nullable=False),
+        sqlalchemy.Column('created_at', sqlalchemy.Float, nullable=False),
+    )
+
+
+def _add_cluster_binding_columns(bind: sqlalchemy.engine.Connection) -> None:
+    existing_columns = {
+        column['name']
+        for column in sqlalchemy.inspect(bind).get_columns('clusters')
+    }
+    columns = (
+        ('container_image_binding_known', sqlalchemy.Integer(), '0'),
+        ('container_image_consumer_kind', sqlalchemy.Text(), None),
+        ('container_image_consumer_owner', sqlalchemy.Text(), None),
+    )
+    for column_name, column_type, server_default in columns:
+        if column_name in existing_columns:
+            continue
+        db_utils.add_column_to_table_alembic('clusters',
+                                             column_name,
+                                             column_type,
+                                             server_default=server_default)
 
 
 def _drop_cluster_binding_columns() -> None:
@@ -841,8 +859,22 @@ def upgrade():
         bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
     if is_postgres:
         _lock_migration()
-    _add_cluster_binding_columns()
+    _ensure_auth_sessions_table(bind)
+    _add_cluster_binding_columns(bind)
     if not is_postgres:
+        return
+    existing_tables = set(sqlalchemy.inspect(bind).get_table_names())
+    existing_image_tables = existing_tables.intersection(_TABLE_NAMES)
+    if existing_image_tables:
+        missing_tables = set(_TABLE_NAMES).difference(existing_image_tables)
+        if missing_tables:
+            missing = ', '.join(sorted(missing_tables))
+            raise RuntimeError(
+                'Migration 024 found incomplete managed image state; missing '
+                f'tables: {missing}.')
+        # A preview database stamped with the former image revision 023 has
+        # already applied this exact image schema. Revision 024 adopts it after
+        # creating the base revision 023 auth table above.
         return
     _create_tables()
     bind.execute(
@@ -868,7 +900,7 @@ def downgrade():
             sqlalchemy.text(f'SELECT count(*) FROM {table_name}')).scalar_one()
         if count != 0:
             raise RuntimeError(
-                'Migration 023 downgrade requires all operational managed '
+                'Migration 024 downgrade requires all operational managed '
                 f'image tables to be empty; {table_name} contains rows.')
     catalog_rows = bind.execute(
         sqlalchemy.text(
@@ -876,7 +908,7 @@ def downgrade():
     if (len(catalog_rows) != 1 or catalog_rows[0][0] != _CATALOG_ROW_ID or
             not catalog_rows[0][1]):
         raise RuntimeError(
-            'Migration 023 downgrade requires exactly the expected catalog '
+            'Migration 024 downgrade requires exactly the expected catalog '
             'authority singleton.')
     bind.execute(
         sqlalchemy.text('DELETE FROM container_image_catalog WHERE id = :id'),

@@ -1,7 +1,7 @@
-"""Persist the user workspace and reconcile former revision 018 layouts.
+"""Persist the user workspace and reconcile former preview layouts.
 
-Revision ID: 021
-Revises: 020
+Revision ID: 022
+Revises: 021
 Create Date: 2026-07-18
 
 """
@@ -10,26 +10,56 @@ from collections.abc import Sequence
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from sky.serve import placement_history
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
-revision: str = '021'
-down_revision: str | Sequence[str] | None = '020'
+revision: str = '022'
+down_revision: str | Sequence[str] | None = '021'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_AUTOSCALER_HISTORY_TABLE = 'serve_autoscaler_history'
+_ACCELERATOR_BREAKDOWN = 'accelerator_breakdown'
+_ACCELERATOR_BREAKDOWN_OBSERVED_AT = 'accelerator_breakdown_observed_at'
+
+
+def _ensure_exact_accelerator_history(bind: sa.engine.Connection) -> None:
+    """Converge databases stamped by the former workspace revision 021."""
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return
+    existing_columns = {
+        column['name']
+        for column in sa.inspect(bind).get_columns(_AUTOSCALER_HISTORY_TABLE)
+    }
+    if _ACCELERATOR_BREAKDOWN not in existing_columns:
+        op.add_column(
+            _AUTOSCALER_HISTORY_TABLE,
+            sa.Column(_ACCELERATOR_BREAKDOWN,
+                      postgresql.JSONB,
+                      nullable=False,
+                      server_default=sa.text("'{}'::jsonb")))
+    if _ACCELERATOR_BREAKDOWN_OBSERVED_AT not in existing_columns:
+        op.add_column(
+            _AUTOSCALER_HISTORY_TABLE,
+            sa.Column(_ACCELERATOR_BREAKDOWN_OBSERVED_AT,
+                      sa.DateTime(timezone=True),
+                      nullable=True))
+
 
 def upgrade():
-    """Persist workspace and converge both former revision 018 schemas."""
+    """Persist workspace and converge former preview migration layouts."""
     with op.get_context().autocommit_block():
-        # Before these branches were merged, the managed-image preview and the
-        # placement-history branch both used revision 018. A preview database
-        # stamped 018 may therefore lack the placement table that current 018
-        # owns. Repair it idempotently before adding the preview's workspace
-        # column so either history converges at revision 021.
         bind = op.get_bind()
+        # The feature preview and the exact-accelerator history branch both
+        # used revision 021. A preview database stamped 021 therefore lacks
+        # the columns owned by the canonical revision 021. Adopt them before
+        # applying the workspace revision.
+        _ensure_exact_accelerator_history(bind)
+        # An older preview also collided at revision 018 and may lack the
+        # placement table owned by canonical revision 018.
         if bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             placement_history.serve_placement_events_table.create(
                 bind, checkfirst=True)
@@ -65,6 +95,6 @@ def upgrade():
 
 
 def downgrade():
-    # Placement and autoscaler history belong to revisions 018 and 019. Only
+    # Placement and accelerator history belong to predecessor revisions. Only
     # the workspace column is owned by this convergence revision.
     op.drop_column('services', 'workspace')

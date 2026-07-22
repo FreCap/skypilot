@@ -8,6 +8,7 @@ from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
 # Target under test
 from sky.jobs.server import core as jobs_core
+from sky.jobs.server import kubernetes_queue
 from sky.skylet import constants as skylet_constants
 
 
@@ -628,6 +629,133 @@ class TestQueue:
         assert total == 2
         assert sorted([j['job_id'] for j in filtered]) == [2, 3]
         assert total_no_filter == 3
+
+
+class TestKubernetesPodQueue:
+    """Characterizes the Kubernetes controller-pod queue gateway."""
+
+    class _Running:
+
+        def is_terminal(self):
+            return False
+
+    class _Finished:
+
+        def is_terminal(self):
+            return True
+
+    @staticmethod
+    def _patch_gateway(monkeypatch, *, jobs, result_type, returncode=0):
+        calls = {}
+
+        class _Runner:
+
+            def run(self, code, **kwargs):
+                calls['run'] = (code, kwargs)
+                return returncode, 'payload', 'stderr'
+
+        def _get_command_runners(provider, cluster_info):
+            calls['runner'] = (provider, cluster_info)
+            return [_Runner()]
+
+        def _get_job_table(**kwargs):
+            calls['codegen'] = kwargs
+            return 'generated-code'
+
+        def _load(payload):
+            calls['load'] = payload
+            return list(jobs), len(jobs), result_type, len(jobs), {}
+
+        monkeypatch.setattr(kubernetes_queue.provision_lib,
+                            'get_command_runners', _get_command_runners)
+        monkeypatch.setattr(
+            kubernetes_queue.managed_job_utils.ManagedJobCodeGen,
+            'get_job_table', _get_job_table)
+        monkeypatch.setattr(kubernetes_queue.managed_job_utils,
+                            'load_managed_job_queue', _load)
+        return calls
+
+    def test_kubernetes_pod_queue_preserves_transport_contract(
+            self, monkeypatch):
+        jobs = [{'job_id': 1, 'status': self._Running()}]
+        calls = self._patch_gateway(
+            monkeypatch,
+            jobs=jobs,
+            result_type=jobs_utils.ManagedJobQueueResultType.DICT)
+
+        result = jobs_core.queue_from_kubernetes_pod('controller-pod',
+                                                     context='test-context',
+                                                     skip_finished=True)
+
+        assert result == jobs
+        provider, cluster_info = calls['runner']
+        assert provider == 'kubernetes'
+        assert cluster_info.provider_name == 'kubernetes'
+        assert cluster_info.head_instance_id == 'controller-pod'
+        assert cluster_info.provider_config == {'context': 'test-context'}
+        assert list(cluster_info.instances) == ['controller-pod']
+        assert calls['codegen'] == {
+            'skip_finished': True,
+            'fields': kubernetes_queue.MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES,
+        }
+        assert calls['run'] == ('generated-code', {
+            'require_outputs': True,
+            'separate_stderr': True,
+            'stream_logs': False,
+        })
+        assert calls['load'] == 'payload'
+        assert (jobs_core.queue_from_kubernetes_pod
+                is kubernetes_queue.queue_from_kubernetes_pod)
+        assert (vars(jobs_core)['_MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES']
+                is kubernetes_queue.MANAGED_JOB_FIELDS_FOR_QUEUE_KUBERNETES)
+
+    def test_kubernetes_pod_queue_legacy_filter_preserves_active_job_tasks(
+            self, monkeypatch):
+        jobs = [
+            {
+                'job_id': 1,
+                'status': self._Running()
+            },
+            {
+                'job_id': 1,
+                'status': self._Finished()
+            },
+            {
+                'job_id': 2,
+                'status': self._Finished()
+            },
+        ]
+        self._patch_gateway(
+            monkeypatch,
+            jobs=jobs,
+            result_type=jobs_utils.ManagedJobQueueResultType.LIST)
+
+        result = jobs_core.queue_from_kubernetes_pod('controller-pod',
+                                                     skip_finished=True)
+
+        assert [job['job_id'] for job in result] == [1, 1]
+
+    def test_kubernetes_pod_queue_legacy_response_skips_no_jobs_by_default(
+            self, monkeypatch):
+        jobs = [{'job_id': 2, 'status': self._Finished()}]
+        self._patch_gateway(
+            monkeypatch,
+            jobs=jobs,
+            result_type=jobs_utils.ManagedJobQueueResultType.LIST)
+
+        result = jobs_core.queue_from_kubernetes_pod('controller-pod')
+
+        assert result == jobs
+
+    def test_kubernetes_pod_queue_wraps_command_error(self, monkeypatch):
+        self._patch_gateway(
+            monkeypatch,
+            jobs=[],
+            result_type=jobs_utils.ManagedJobQueueResultType.DICT,
+            returncode=1)
+
+        with pytest.raises(RuntimeError, match='Failed to fetch managed jobs'):
+            jobs_core.queue_from_kubernetes_pod('controller-pod')
 
 
 class TestDumpManagedJobQueue:

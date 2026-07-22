@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import enum
 import logging
+import sys
 import threading
 import typing
 from typing import Optional, Union
@@ -280,13 +281,17 @@ class RichSafeStreamHandler(logging.StreamHandler):
 
     def emit(self, record: logging.LogRecord) -> None:
         with safe_logger():
-            try:
-                return super().emit(record)
-            except ValueError as e:
-                # Ignore "I/O operation on closed file" errors that occur
-                # when pytest-xdist workers close stdout during parallel tests
-                if str(e) != 'I/O operation on closed file':
-                    raise
+            return super().emit(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        error = sys.exc_info()[1]
+        # StreamHandler.emit() catches write failures before this subclass can
+        # observe them in emit(). Suppress only pytest-xdist's closed capture
+        # stream; retain the standard diagnostic for every other log failure.
+        if (isinstance(error, ValueError) and
+                getattr(self.stream, 'closed', False)):
+            return
+        super().handleError(record)
 
 
 def client_status(msg: str) -> Union['rich_console.Status', _NoOpConsoleStatus]:

@@ -582,6 +582,8 @@ class NetworkConfigurator:
 
         success_count = 0
         for i, result in enumerate(results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if result is True:
                 success_count += 1
                 continue

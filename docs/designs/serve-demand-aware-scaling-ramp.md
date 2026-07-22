@@ -333,8 +333,9 @@ An HA load-balancer promotion temporarily preserves the previous active slot's
 demand gauges so a cold promoted process cannot prove idle capacity and trigger
 an early drain. The 60-second handoff countdown starts after the promoted,
 authoritative slot reports the complete demand-gauge contract: in-flight work,
-queue depth, retained and recent rejections, and explicit unknown-occupancy
-URLs. It does not wait for every backend occupancy probe to succeed.
+aggregate queue depth, the compatibility-aware queue profile list, retained and
+recent rejections, and explicit unknown-occupancy URLs. It does not wait for
+every backend occupancy probe to succeed.
 
 Backends missing a fresh occupancy sample remain represented in the current
 report's unknown set and stay individually protected from retirement. Coupling
@@ -352,12 +353,23 @@ target by at most:
 ```text
 allowance = max(
     1,
-    ceil(current_committed_capacity
+    ceil(current_demand_owned_capacity
          * max_scale_down_rate_percentage / 100))
 
 next_target = max(raw_target,
-                  current_committed_capacity - allowance)
+                  current_demand_owned_capacity - allowance)
 ```
+
+`current_demand_owned_capacity` includes latest-version nonterminal logical
+capacity whose persisted launch origin is ordinary demand. It excludes
+`reserved_fill=true` rows even when those rows currently serve traffic. A fill
+row reclaimed by the reserved provider must not retain the traffic target or
+cause a paid replacement; current requests, queueing, and rejections create
+new demand in the normal way. Demand-launched rows remain demand-owned when
+they happen to land on zero-cost capacity, and legacy rows without the marker
+default to demand-owned. The frozen pending-retention budget uses the same
+demand-owned cohort. Total committed capacity remains unchanged for scale-up
+wave sizing, duplicate-launch suppression, hard ceilings, and coverage.
 
 The elapsed window starts when a fresh recompute first observes raw demand
 below the adopted target. For compatibility with the established one-tick
@@ -372,10 +384,12 @@ Decision-loop counts are diagnostic only. They cannot implement this delay:
 large-fleet probing can make a nominal 20-second decision tick take much
 longer, which turned a configured 300-second delay into roughly 9.5 minutes in
 production. Busy-replica and stale-signal safety continue to clip actual
-victims. Controller reconstruction may restore the committed fleet as the
-target baseline only for the first fresh recompute. An adopted lower target
-must not rebound to committed capacity on later ticks while asynchronous
-retirement is still catching up.
+victims. Controller reconstruction may restore the demand-owned committed
+fleet as the traffic-target baseline only for the first fresh recompute.
+Independent fill capacity remains protected by the fill overlay, not by the
+traffic target. An adopted lower target must not rebound to demand-owned
+committed capacity on later ticks while asynchronous retirement is still
+catching up.
 
 Failed/stopping cleanup, explicit shutdown, cost rebalance, and old-version
 retirement remain exempt. These are lifecycle actions rather than ordinary
@@ -570,6 +584,10 @@ rate to 100, then restore the previous control-plane image if required.
   decision ticks are irregular or slow, resets on a demand rebound or stale
   report, does not rebound while retirement lags, and works for mixed 1, 4,
   and 8-slot backends.
+- Verify fill-origin ready and pending capacity cannot retain the traffic
+  target, enlarge the 50 percent retirement allowance, or cause paid backfill;
+  demand-origin zero-cost and legacy rows remain in the protected cohort, and
+  total committed capacity still suppresses duplicate demand launches.
 - Verify logical rolling retirement starts before latest capacity reaches the
   complete target, never reduces conservative coverage below raw or adopted
   demand, retires non-READY old backends first, protects busy or unknown old

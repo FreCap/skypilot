@@ -27,6 +27,10 @@ import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import { trackClusterAction } from '@/lib/analytics';
 
+const actualCachePreloader = jest.requireActual(
+  '@/lib/cache-preloader'
+).default;
+
 const router = {
   isReady: true,
   pathname: '/clusters',
@@ -57,6 +61,7 @@ jest.mock('@/lib/cache', () => ({
   default: {
     get: jest.fn(),
     invalidate: jest.fn(),
+    setPreloader: jest.fn(),
   },
 }));
 
@@ -127,6 +132,20 @@ describe('Clusters preload lifecycle', () => {
     expect(dashboardCache.get).not.toHaveBeenCalled();
   });
 
+  it('invalidates and fetches each cluster preload key exactly once when forced', async () => {
+    await actualCachePreloader.preloadForPage('clusters', {
+      force: true,
+      backgroundPreload: false,
+    });
+
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters, []);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getWorkspaces, []);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getClusters, []);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getWorkspaces, []);
+  });
+
   it('does not continue a preload that finishes after unmount', async () => {
     const preload = deferred();
     cachePreloader.preloadForPage.mockReturnValue(preload.promise);
@@ -175,11 +194,7 @@ describe('Clusters preload lifecycle', () => {
       'clusters',
       { force: true }
     );
-    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters);
-    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getWorkspaces);
-    expect(dashboardCache.invalidate).not.toHaveBeenCalledWith(
-      getClusterHistory
-    );
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
 
     await act(async () => {
       initialPreload.resolve();
@@ -196,6 +211,140 @@ describe('Clusters preload lifecycle', () => {
     expect(screen.getByText(/Updated just now/)).toBeInTheDocument();
   });
 
+  it('coalesces overlapping manual refreshes into one forced preload', async () => {
+    const initialPreload = deferred();
+    const refreshPreload = deferred();
+    cachePreloader.preloadForPage
+      .mockReturnValueOnce(initialPreload.promise)
+      .mockReturnValueOnce(refreshPreload.promise);
+    render(<Clusters />);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(
+      2,
+      'clusters',
+      { force: true }
+    );
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      initialPreload.resolve();
+      await initialPreload.promise;
+    });
+    expect(refreshClusters).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(refreshClusters).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(refreshButton);
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(refreshClusters).toHaveBeenCalledTimes(2));
+  });
+
+  it('releases manual refresh ownership after preload failure', async () => {
+    const failedRefresh = deferred();
+    cachePreloader.preloadForPage
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(failedRefresh.promise)
+      .mockResolvedValueOnce(undefined);
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    render(<Clusters />);
+    await screen.findByText(/Updated just now/);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    await act(async () => {
+      failedRefresh.reject(new Error('preload unavailable'));
+      try {
+        await failedRefresh.promise;
+      } catch {
+        // The page handles the failed preload and releases refresh ownership.
+      }
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        'Error preloading clusters data:',
+        expect.objectContaining({ message: 'preload unavailable' })
+      )
+    );
+
+    fireEvent.click(refreshButton);
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(refreshClusters).toHaveBeenCalledTimes(2));
+    consoleError.mockRestore();
+  });
+
+  it('revokes manual refresh ownership when the page unmounts', async () => {
+    const refreshPreload = deferred();
+    cachePreloader.preloadForPage
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(refreshPreload.promise);
+    const { unmount } = render(<Clusters />);
+    await screen.findByText(/Updated just now/);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    unmount();
+    await act(async () => {
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+    });
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
+    expect(refreshClusters).not.toHaveBeenCalled();
+  });
+
+  it('adopts a new history scope without duplicating the forced preload', async () => {
+    const initialPreload = deferred();
+    const refreshPreload = deferred();
+    cachePreloader.preloadForPage
+      .mockReturnValueOnce(initialPreload.promise)
+      .mockReturnValueOnce(refreshPreload.promise);
+    render(<Clusters />);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    fireEvent.click(refreshButton);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show history' }));
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+    fireEvent.click(screen.getAllByRole('combobox')[1]);
+    fireEvent.click(screen.getByRole('option', { name: '5 days' }));
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+      1,
+      getClusterHistory,
+      [null, 1]
+    );
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+      2,
+      getClusterHistory,
+      [null, 5]
+    );
+
+    await act(async () => {
+      initialPreload.resolve();
+      await initialPreload.promise;
+      refreshPreload.resolve();
+      await refreshPreload.promise;
+    });
+    await waitFor(() => expect(refreshClusters).toHaveBeenCalledTimes(1));
+  });
+
   it('invalidates the visible history cache key', async () => {
     router.query = { history: 'true', historyDays: '5' };
     render(<Clusters />);
@@ -210,6 +359,7 @@ describe('Clusters preload lifecycle', () => {
       null,
       5,
     ]);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
   });
 });
 

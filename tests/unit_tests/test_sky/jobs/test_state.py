@@ -339,6 +339,59 @@ def test_get_job_controller_process_reuses_bulk_reader(monkeypatch):
     assert calls == [[7], [8]]
 
 
+def test_get_log_stream_context_reads_one_recovery_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 3, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_log_stream_context(job_id, 3)
+
+    assert context == ('pool-a', 'replica-a', 41, 'task-3')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        recovered_context = state.get_log_stream_context(job_id, 3)
+
+    assert recovered_context == ('pool-a', 'replica-b', 41, 'task-3')
+    assert counts['n'] == 1, counts
+
+
+def test_get_log_stream_context_missing_task_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_log_stream_context(job_id, 999)
+
+    assert context == (None, None, None, None)
+    assert counts['n'] == 1, counts
+
+
+def test_get_log_stream_context_keeps_task_without_job_info(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 999, 3, status=ManagedJobStatus.RUNNING)
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_log_stream_context(999, 3)
+
+    assert context == (None, None, None, 'task-3')
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_cancellation_states_batches_lifecycle_snapshot(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

@@ -401,9 +401,16 @@ class RequestWorker:
                             f'retrying in {retry_wait_seconds}s')
             status_msg = (f'{reason} ({retry_suffix})'
                           if reason else retry_suffix.capitalize())
-            # Set request to WAITING status for visibility
+            # Set request to WAITING status for visibility. Cancellation can
+            # win after the executor raises but before this monitor handles the
+            # future. Only the RUNNING owner may hand the request back to the
+            # retry queue; otherwise this write would resurrect CANCELLED.
             with api_requests.update_request(request_id) as request_task:
-                assert request_task is not None, request_id
+                if (request_task is None or request_task.status
+                        != api_requests.RequestStatus.RUNNING):
+                    logger.info(f'Dropping retry for request {request_id}: '
+                                'request is gone or no longer running')
+                    return
                 request_task.status = api_requests.RequestStatus.WAITING
                 request_task.status_msg = status_msg
             try:
@@ -421,7 +428,8 @@ class RequestWorker:
                     f'{common_utils.format_exception(wait_err)}')
                 time.sleep(retry_wait_seconds)
                 should_reschedule = True
-            if should_reschedule:
+            if (should_reschedule and
+                    not _request_is_gone_or_cancelled(request_id)):
                 # Reschedule the request.
                 queue = _get_queue(self.schedule_type)
                 queue.put(request_element)
@@ -863,14 +871,21 @@ def _request_execution_wrapper(request_id: str,
         logger.error(safe_retry_error)
         if safe_retry_error is e:
             logger.info(e.hint)
+        should_retry = False
         with api_requests.update_request(request_id) as request_task:
-            assert request_task is not None, request_id
-            # Retried request will undergo rescheduling and a new execution,
-            # clear the pid of the request.
-            request_task.pid = None
+            if (request_task is not None and
+                    request_task.status == api_requests.RequestStatus.RUNNING):
+                # Retried request will undergo rescheduling and a new execution,
+                # clear the pid of the request.
+                request_task.pid = None
+                should_retry = True
         # Yield control to the scheduler for uniform handling of retries.
         _restore_output()
-        raise
+        if should_retry:
+            raise
+        logger.info(f'Dropping retry for request {request_id}: request is gone '
+                    'or no longer running')
+        return
     except (Exception, SystemExit) as e:  # pylint: disable=broad-except
         safe_failure_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
@@ -1064,10 +1079,6 @@ async def _execute_request_coroutine(request: api_requests.Request):
                 result = await fut
                 await api_requests.set_request_succeeded_async(
                     request_id, result)
-            except asyncio.CancelledError:
-                # The task is cancelled by ctx.cancel(), where the status
-                # should already be set to CANCELLED.
-                pass
             except Exception as e:  # pylint: disable=broad-except
                 ctx.redirect_log(original_output)
                 safe_future_error = api_requests.sanitize_request_error(
@@ -1089,7 +1100,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         # Current coroutine is cancelled due to client disconnect, set the
         # request status for consistency.
         await api_requests.set_request_cancelled_async(request.request_id)
-        pass
+        raise
     # pylint: disable=broad-except
     except (Exception, KeyboardInterrupt, SystemExit) as e:
         # Handle any other error
@@ -1308,8 +1319,8 @@ def start(
         threads.
     """
     global _queue_factory
-    factory = queue_base.get_queue_backend_factory()
-    # Use specified factory if any, and fallback to default impl
+    factory = queue_base.get_registered_queue_backend_factory()
+    # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
         _queue_factory = factory
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:

@@ -132,6 +132,8 @@ export function useServiceDetails({ serviceName }) {
   const [replicasLoading, setReplicasLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
+  const historyRefreshInFlightRef = useRef(null);
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
@@ -152,7 +154,8 @@ export function useServiceDetails({ serviceName }) {
     // fresh summary must still replace whatever an earlier invocation
     // left behind.
     let fullLanded = false;
-    const summaryPromise = dashboardCache
+    let summaryPromise;
+    summaryPromise = dashboardCache
       .get(getServices, [
         {
           serviceNames: [serviceName],
@@ -172,11 +175,18 @@ export function useServiceDetails({ serviceName }) {
         console.error('Failed to fetch service summary:', error);
       })
       .finally(() => {
+        if (historyRefreshInFlightRef.current?.promise === summaryPromise) {
+          historyRefreshInFlightRef.current = null;
+        }
         if (isCurrentRequest()) {
           setLoading(false);
           setHistoryLoading(false);
         }
       });
+    historyRefreshInFlightRef.current = {
+      serviceName,
+      promise: summaryPromise,
+    };
     const fullPromise = dashboardCache
       .get(getServices, [{ serviceNames: [serviceName] }])
       .then(({ services }) => {
@@ -198,12 +208,20 @@ export function useServiceDetails({ serviceName }) {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+    return () => {
+      requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.serviceName === serviceName) {
+        refreshInFlightRef.current = null;
+      }
+      if (historyRefreshInFlightRef.current?.serviceName === serviceName) {
+        historyRefreshInFlightRef.current = null;
+      }
+    };
+  }, [fetchData, serviceName]);
 
   useEffect(() => {
     if (!serviceName) return undefined;
     let active = true;
-    let refreshInFlight = false;
     const historyArgs = [
       {
         serviceNames: [serviceName],
@@ -213,28 +231,43 @@ export function useServiceDetails({ serviceName }) {
       },
     ];
     const refreshHistory = async () => {
-      if (refreshInFlight) return;
-      refreshInFlight = true;
+      const inFlight = historyRefreshInFlightRef.current;
+      if (inFlight?.serviceName === serviceName) {
+        return inFlight.promise;
+      }
       const requestVersion = requestVersionRef.current;
       const isCurrentRequest = () =>
         active && requestVersionRef.current === requestVersion;
-      setHistoryLoading(true);
-      dashboardCache.invalidate(getServices, historyArgs);
-      try {
-        const { services } = await dashboardCache.get(getServices, historyArgs);
-        if (!isCurrentRequest()) return;
-        const found = (services || []).find((s) => s.name === serviceName);
-        setReplicaHistory(found?.replicaHistory || null);
-      } catch (error) {
-        if (isCurrentRequest()) {
-          console.error('Failed to refresh service history:', error);
+      let historyPromise;
+      historyPromise = (async () => {
+        setHistoryLoading(true);
+        dashboardCache.invalidate(getServices, historyArgs);
+        try {
+          const { services } = await dashboardCache.get(
+            getServices,
+            historyArgs
+          );
+          if (!isCurrentRequest()) return;
+          const found = (services || []).find((s) => s.name === serviceName);
+          setReplicaHistory(found?.replicaHistory || null);
+        } catch (error) {
+          if (isCurrentRequest()) {
+            console.error('Failed to refresh service history:', error);
+          }
+        } finally {
+          if (historyRefreshInFlightRef.current?.promise === historyPromise) {
+            historyRefreshInFlightRef.current = null;
+          }
+          if (isCurrentRequest()) {
+            setHistoryLoading(false);
+          }
         }
-      } finally {
-        refreshInFlight = false;
-        if (isCurrentRequest()) {
-          setHistoryLoading(false);
-        }
-      }
+      })();
+      historyRefreshInFlightRef.current = {
+        serviceName,
+        promise: historyPromise,
+      };
+      return historyPromise;
     };
     const interval = setInterval(refreshHistory, 60 * 1000);
     return () => {
@@ -243,11 +276,24 @@ export function useServiceDetails({ serviceName }) {
     };
   }, [serviceName]);
 
-  const refreshData = useCallback(async () => {
-    // Drop every args-keyed getServices variant (summary and full).
-    dashboardCache.invalidateFunction(getServices);
-    await fetchData();
-  }, [fetchData]);
+  const refreshData = useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.serviceName === serviceName) {
+      return inFlight.promise;
+    }
+
+    const refreshPromise = (async () => {
+      // Drop every args-keyed getServices variant (summary and full).
+      dashboardCache.invalidateFunction(getServices);
+      await fetchData();
+    })().finally(() => {
+      if (refreshInFlightRef.current?.promise === refreshPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = { serviceName, promise: refreshPromise };
+    return refreshPromise;
+  }, [fetchData, serviceName]);
 
   return {
     serviceData,
@@ -392,6 +438,7 @@ function ServiceDetails() {
                 requestHistory={replicaHistory}
                 pricingLoading={replicasLoading && serviceData.summaryOnly}
               />
+              <AcceleratorCapacityCard serviceData={serviceData} />
               <ServeHistorySection
                 key={serviceName}
                 history={replicaHistory}
@@ -414,6 +461,71 @@ function ServiceDetails() {
         )}
       </>
     </>
+  );
+}
+
+export function AcceleratorCapacityCard({ serviceData }) {
+  const rows = serviceData.acceleratorCapacity || [];
+  if (!rows.length) return null;
+  return (
+    <Card className="mb-6 overflow-hidden">
+      <div className="flex items-start justify-between border-b px-4 py-3">
+        <div>
+          <h3 className="text-lg font-semibold">Capacity by exact card</h3>
+          <p className="mt-1 text-sm text-gray-500">
+            Demand targets and hard floors are independent from reserved-fill
+            capacity. A100 and A100-80GB are always separate rows.
+          </p>
+        </div>
+        {(serviceData.fillTarget != null ||
+          serviceData.freeReservedSlots != null) && (
+          <div className="text-right text-xs text-gray-500">
+            {serviceData.fillTarget != null && (
+              <div>Aggregate fill target: {serviceData.fillTarget}</div>
+            )}
+            {serviceData.freeReservedSlots != null && (
+              <div>
+                Aggregate free reserved slots: {serviceData.freeReservedSlots}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Card</TableHead>
+            <TableHead className="text-right">Ready</TableHead>
+            <TableHead className="text-right">Provisioning</TableHead>
+            <TableHead className="text-right">Total</TableHead>
+            <TableHead className="text-right">Demand target</TableHead>
+            <TableHead className="text-right">Hard floor</TableHead>
+            <TableHead className="text-right">Zero-cost ready</TableHead>
+            <TableHead className="text-right">Fill target</TableHead>
+            <TableHead className="text-right">Free reserved</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((row) => (
+            <TableRow key={row.card}>
+              <TableCell className="font-medium">{row.card}</TableCell>
+              <TableCell className="text-right">{row.ready}</TableCell>
+              <TableCell className="text-right">{row.provisioning}</TableCell>
+              <TableCell className="text-right">{row.total}</TableCell>
+              <TableCell className="text-right">{row.demandTarget}</TableCell>
+              <TableCell className="text-right">{row.hardFloor}</TableCell>
+              <TableCell className="text-right">{row.zeroCostReady}</TableCell>
+              <TableCell className="text-right">
+                {row.fillTarget ?? '—'}
+              </TableCell>
+              <TableCell className="text-right">
+                {row.freeReserved ?? '—'}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
   );
 }
 

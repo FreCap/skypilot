@@ -3,9 +3,9 @@
 Opt-in (replica_policy.reserved_capacity_fill): the autoscaler additionally
 scales up onto FREE zero-cost capacity reported by a controller poller,
 bounded by max_replicas. The demand target and the controller's capacity
-hint stay demand-only; surplus scale-ups carry a sentinel override that the
-launch path pins to zero-cost ACTIVE locations (skipping entirely when none
-is available -- fill must never spill to paid capacity).
+hint stay demand-only; every free-slot scale-up carries a sentinel override
+that the launch path pins to zero-cost ACTIVE locations (skipping entirely
+when none is available -- fill must never spill to paid capacity).
 """
 # pylint: disable=protected-access
 import time
@@ -146,18 +146,18 @@ class TestFlagOff(unittest.TestCase):
 
 
 class TestSentinelScaleUps(unittest.TestCase):
-    """Surplus beyond demand carries ONLY the sentinel; demand ups don't."""
+    """Reserved fill carries ONLY the sentinel; demand ups do not."""
 
     def test_surplus_ups_sentinel_demand_ups_plain(self):
         autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
         _feed(autoscaler, 3)
         decisions = _decisions(autoscaler, [])
         ups = _ups(decisions)
-        self.assertEqual(len(ups), 3)  # 1 demand (to min) + 2 fill
+        self.assertEqual(len(ups), 4)  # 1 demand (to min) + all 3 free slots
         plain = [d for d in ups if d.target is None]
         sentinel = [d for d in ups if d.target == {_FILL_KEY: True}]
         self.assertEqual(len(plain), 1)
-        self.assertEqual(len(sentinel), 2)
+        self.assertEqual(len(sentinel), 3)
         # Sentinel override carries NOTHING else.
         for decision in sentinel:
             self.assertEqual(set(decision.target), {_FILL_KEY})
@@ -202,8 +202,68 @@ class TestLogicalReplicaFill(unittest.TestCase):
 
         fill_ups = _ups(autoscaler._apply_reserved_capacity_fill([paid], []))
 
-        self.assertEqual(len(fill_ups), 1)
-        self.assertTrue(fill_ups[0].target[_FILL_KEY])
+        self.assertEqual(len(fill_ups), 5)
+        self.assertTrue(all(up.target[_FILL_KEY] for up in fill_ups))
+
+
+class TestDemandIndependentFill(unittest.TestCase):
+    """Fresh reserved slots launch regardless of demand-target ordering."""
+
+    def test_paid_fleet_satisfying_larger_demand_does_not_block_fill(self):
+        autoscaler = _make_autoscaler(min_replicas=5, max_replicas=10)
+        paid_replicas = [_replica(replica_id) for replica_id in range(1, 6)]
+        _feed(autoscaler, 2)
+
+        decisions = _decisions(autoscaler, paid_replicas)
+
+        self.assertEqual(len(_fill_ups(decisions)), 2)
+        self.assertEqual(len(_downs(decisions)), 0)
+        self.assertEqual(autoscaler.get_final_target_num_replicas(), 5)
+        self.assertEqual(autoscaler.info()['fill_target'], 2)
+
+    def test_planned_demand_reserves_hard_ceiling_headroom(self):
+        autoscaler = _make_autoscaler(min_replicas=9, max_replicas=10)
+        paid_replicas = [_replica(replica_id) for replica_id in range(1, 9)]
+        _feed(autoscaler, 5)
+
+        decisions = _decisions(autoscaler, paid_replicas)
+
+        plain_ups = [
+            decision for decision in _ups(decisions) if decision.target is None
+        ]
+        self.assertEqual(len(plain_ups), 1)
+        self.assertEqual(len(_fill_ups(decisions)), 1)
+
+    def test_old_versions_count_against_hard_ceiling(self):
+        autoscaler = autoscalers.RequestRateAutoscaler('svc',
+                                                       _spec(min_replicas=2,
+                                                             max_replicas=6),
+                                                       version=2)
+        replicas = [
+            _replica(1, version=1),
+            _replica(2, version=1),
+            _replica(3, version=1),
+            _replica(4, version=2),
+        ]
+        _feed(autoscaler, 5)
+        demand_up = autoscalers.AutoscalerDecision(_SCALE_UP, None)
+        ordinary_decisions = [demand_up]
+
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            replicas, ordinary_decisions)
+
+        self.assertEqual(len(_fill_ups(decisions)), 1)
+        self.assertEqual(len(_ups(decisions)), 2)
+        self.assertEqual(ordinary_decisions, [demand_up])
+
+    def test_at_hard_ceiling_waits_for_headroom(self):
+        autoscaler = _make_autoscaler(min_replicas=5, max_replicas=10)
+        paid_replicas = [_replica(replica_id) for replica_id in range(1, 11)]
+        _feed(autoscaler, 3)
+
+        decisions = autoscaler._apply_reserved_capacity_fill(paid_replicas, [])
+
+        self.assertEqual(_fill_ups(decisions), [])
 
 
 class TestScaleDownSuppression(unittest.TestCase):
@@ -284,10 +344,9 @@ def _fill_ups(decisions):
 class TestVersionAwareLaunchBaseline(unittest.TestCase):
     """Old-version zero-cost replicas never inflate fill launches.
 
-    The launch baseline (max(latest nonterminal, demand target)) is
-    latest-version-only, so the zero-cost count feeding the launch math
-    must be too -- otherwise a rolling update's draining old fleet
-    compounds fill launches every tick.
+    The zero-cost count feeding the launch target is latest-version-only;
+    otherwise a rolling update's draining old fleet compounds fill launches
+    every tick. All old-version rows still count against hard-ceiling headroom.
     """
 
     def test_rolling_update_zero_free_no_fill_launches(self):
@@ -322,10 +381,10 @@ class TestVersionAwareLaunchBaseline(unittest.TestCase):
         _feed(autoscaler, 3)
         replicas = [_replica(i, _K8S_KEY, version=1) for i in range(1, 6)]
         decisions = autoscaler.generate_scaling_decisions(replicas, [1])
-        # Latest zero-cost 0 + 3 free slots, demand target 1: fill ups
-        # bounded by the free slots (2 fill + 1 demand), NOT inflated to
+        # Latest zero-cost 0 + 3 free slots: all three slots launch,
+        # independently of the demand launch, and are NOT inflated to
         # 5 old + 3 free by the draining old-version fleet.
-        self.assertEqual(len(_fill_ups(decisions)), 2)
+        self.assertEqual(len(_fill_ups(decisions)), 3)
 
 
 class TestAllVersionOccupancyDebit(unittest.TestCase):
@@ -350,11 +409,11 @@ class TestAllVersionOccupancyDebit(unittest.TestCase):
                      version=1)
         ]
         decisions = autoscaler.generate_scaling_decisions(replicas, [1])
-        # Spendable 3 - 1 (old-version pending claim) = 2; the launch
-        # baseline stays latest-only: fill_target_launch = 0 latest
-        # zero-cost + 2 spendable, demand target 1 -> exactly 1 fill up
-        # (a latest-only debit would emit 2, one onto the claimed slot).
-        self.assertEqual(len(_fill_ups(decisions)), 1)
+        # Spendable 3 - 1 (old-version pending claim) = 2;
+        # fill_target_launch = 0 latest zero-cost + 2 spendable. Both truly
+        # free slots launch independently of the demand target (a latest-only
+        # occupancy debit would emit 3, one onto the claimed slot).
+        self.assertEqual(len(_fill_ups(decisions)), 2)
 
 
 class TestPendingReplicasOccupySlots(unittest.TestCase):
@@ -1025,6 +1084,43 @@ class TestFillLaunchPath(unittest.TestCase):
         # relies on it.
         self.assertIsNotNone(info.created_at)
 
+    def test_targeted_fill_keeps_a100_variants_exact(self):
+        a100 = make_location('research-ctx',
+                             accelerators={'A100': 1},
+                             use_spot=False)
+        a100_80gb = make_location('research-ctx',
+                                  accelerators={'A100-80GB': 1},
+                                  use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [a100, a100_80gb]
+        placer.select_next_zero_cost_location.return_value = a100_80gb
+        manager = _make_manager(placer)
+        override = {
+            _FILL_KEY: True,
+            'accelerators': {
+                'A100-80GB': 1
+            },
+        }
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica') as add_mock:
+            manager._scale_up_one_locked(override, set())
+
+        placer.select_next_zero_cost_location.assert_called_once_with(
+            allowed_locations={a100_80gb})
+        info = add_mock.call_args[0][2]
+        self.assertEqual(info.resources_override['accelerators'],
+                         {'A100-80GB': 1})
+
     def test_redriven_pinned_launch_keeps_location(self):
         # Controller crash mid-PENDING: the launch is re-driven with the
         # persisted override (location inlined, sentinel already
@@ -1540,10 +1636,9 @@ class TestGrantCeiling(unittest.TestCase):
         _feed_broker(autoscaler, 5, grant=2)
         decisions = _decisions(autoscaler, [])
         sentinel = [d for d in _ups(decisions) if d.target is not None]
-        # Without the ceiling the feed of 5 would fund 4 fill ups (demand
-        # target 1); the grant of 2 allows only 2 - 1 = 1 beyond the
-        # demand baseline.
-        self.assertEqual(len(sentinel), 1)
+        # Without the ceiling the feed of 5 would fund 5 fill ups. The grant
+        # of 2 allows exactly two fill replicas, independent of demand.
+        self.assertEqual(len(sentinel), 2)
 
     def test_snap_back_reclaim_shrinks_borrower(self):
         # The load-bearing broker actuator: the #108 fill target is
@@ -1579,10 +1674,10 @@ class TestGrantCeiling(unittest.TestCase):
         # Rolling update: 3 OLD-version demand-placed zero-cost rows are
         # still draining. The launch-side ceiling must count only
         # LATEST-version demand-placed rows (here 0), so fill launches
-        # stay capped at the grant: ceiling 2, demand baseline 1 ->
-        # exactly 1 fill up. An all-version launch ceiling (2 + 3 old
-        # rows) would fund 4 fill ups, overshooting the grant by the old
-        # rows' count.
+        # stay capped at the grant: ceiling 2 produces exactly 2 fill ups,
+        # independent of demand. An all-version launch ceiling (2 + 3 old
+        # rows) would fund 5 fill ups, overshooting the grant by the old rows'
+        # count.
         autoscaler = autoscalers.RequestRateAutoscaler('svc',
                                                        _spec(min_replicas=1,
                                                              max_replicas=20),
@@ -1592,7 +1687,7 @@ class TestGrantCeiling(unittest.TestCase):
         for row in old_demand:
             row.reserved_fill = False
         decisions = autoscaler.generate_scaling_decisions(old_demand, [1])
-        self.assertEqual(len(_fill_ups(decisions)), 1)
+        self.assertEqual(len(_fill_ups(decisions)), 2)
         # The target/shelter-side ceiling keeps the all-version count
         # (grant 2 + 3 demand-placed rows): existing rows keep their
         # exemption regardless of version.

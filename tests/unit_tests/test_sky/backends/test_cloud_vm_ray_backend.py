@@ -57,17 +57,22 @@ class TestCloudVmRayResourceHandleCardinality:
     def test_update_cluster_ips_rejects_mismatched_lists_under_optimization(
             self):
         if sys.flags.optimize == 0:
-            node_id = (f'{__file__}::TestCloudVmRayResourceHandleCardinality::'
-                       'test_update_cluster_ips_rejects_mismatched_lists_'
-                       'under_optimization')
-            result = subprocess.run([
-                sys.executable, '-O', '-m', 'pytest', '-n', '0', '--dist', 'no',
-                '-q', node_id
-            ],
+            # Load this module directly in the optimized child instead of
+            # starting a nested pytest session. Nested pytest competes with
+            # the already parallel unit suite for shared fixtures and has
+            # repeatedly exceeded this otherwise generous process timeout.
+            # The direct child still imports SkyPilot, and a passing probe has
+            # exceeded 30 seconds under the 16-way Python 3.14 CI suite. Keep
+            # the probe bounded while allowing for that observed contention.
+            script = ('import runpy; '
+                      f'module = runpy.run_path({__file__!r}); '
+                      "module['TestCloudVmRayResourceHandleCardinality']()."
+                      'test_update_cluster_ips_rejects_mismatched_lists()')
+            result = subprocess.run([sys.executable, '-O', '-c', script],
                                     check=False,
                                     capture_output=True,
                                     text=True,
-                                    timeout=30)
+                                    timeout=120)
             assert result.returncode == 0, result.stdout + result.stderr
             return
 
@@ -950,6 +955,7 @@ class TestCloudVmRayBackendLockedProvision:
             'provisioning_skipped': False,
             'ray': '/tmp/cluster.yaml',
             'handle': handle,
+            'cluster_hash': 'generation-hash',
         }
 
         monkeypatch.setattr(backend, '_check_existing_cluster',
@@ -983,7 +989,44 @@ class TestCloudVmRayBackendLockedProvision:
 
         assert result == (handle, False)
         update_after_provisioned.assert_called_once_with(
-            handle, None, task_obj, None, None)
+            handle, None, task_obj, None, None, 'generation-hash')
+
+    def test_ready_transition_is_fenced_by_generation(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = MagicMock(cluster_name='test-cluster', launched_nodes=1)
+        handle.launched_resources.ports = None
+        handle.provision_runtime_metadata.has_job_queue = False
+        handle.provision_runtime_metadata.ssh_available = False
+        task_obj = MagicMock(resources=set())
+        task_obj.to_yaml_config.return_value = {'run': 'echo ok'}
+
+        with patch.object(
+                cloud_vm_ray_backend.global_user_state,
+                'add_or_update_cluster') as add_or_update, patch.object(
+                    cloud_vm_ray_backend.global_user_state,
+                    'add_cluster_event') as add_event, patch.object(
+                        cloud_vm_ray_backend.usage_lib.messages.usage,
+                        'update_cluster_resources'), patch.object(
+                            cloud_vm_ray_backend.usage_lib.messages.usage,
+                            'update_final_cluster_status'):
+            backend._update_after_cluster_provisioned(  # pylint: disable=protected-access
+                handle,
+                prev_handle=None,
+                task=task_obj,
+                prev_cluster_status=None,
+                config_hash=None,
+                cluster_hash='generation-hash')
+
+        add_or_update.assert_called_once_with(
+            'test-cluster',
+            handle,
+            set(),
+            ready=True,
+            config_hash=None,
+            task_config={'run': 'echo ok'},
+            existing_cluster_hash='generation-hash')
+        assert add_event.call_args.kwargs['existing_cluster_hash'] == (
+            'generation-hash')
 
 
 class TestPostTeardownCleanupYamlFetch:

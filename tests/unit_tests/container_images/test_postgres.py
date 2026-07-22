@@ -2624,7 +2624,9 @@ def test_cluster_init_serializes_with_missing_row_reconciliation(
                                       reconciliation_backend['pid'])
         allow_init_to_commit.set()
 
-        assert init_future.result(timeout=5) is None
+        cluster_hash = init_future.result(timeout=5)
+        assert isinstance(cluster_hash, str)
+        assert cluster_hash
         assert reconcile_future.result(timeout=5) == 0
         current = demand_state.get_demand(demand.id, 'research')
         assert current is not None
@@ -2637,6 +2639,11 @@ def test_cluster_init_serializes_with_missing_row_reconciliation(
             'cluster-a': ('cluster', demand.consumer_owner),
         }
         with image_database.connect() as connection:
+            stored_cluster_hash = connection.execute(
+                sqlalchemy.select(
+                    global_user_state.cluster_table.c.cluster_hash).where(
+                        global_user_state.cluster_table.c.name ==
+                        'cluster-a')).scalar_one()
             deleted_at = connection.execute(
                 sqlalchemy.select(
                     schema.consumer_watermarks.c.owner_deleted_at).where(
@@ -2644,6 +2651,7 @@ def test_cluster_init_serializes_with_missing_row_reconciliation(
                         schema.consumer_watermarks.c.consumer_kind == 'cluster',
                         schema.consumer_watermarks.c.consumer_owner ==
                         demand.consumer_owner)).scalar_one()
+        assert stored_cluster_hash == cluster_hash
         assert deleted_at is None
     finally:
         allow_init_to_commit.set()
@@ -4882,7 +4890,7 @@ def _schema_shape(engine: sqlalchemy.engine.Engine,
     }
 
 
-def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
+def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
         postgres_engine) -> None:
     migration_schema = f'image_migration_{uuid.uuid4().hex}'
     runtime_schema = f'image_runtime_{uuid.uuid4().hex}'
@@ -4891,15 +4899,15 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
         connection.exec_driver_sql(f'CREATE SCHEMA {runtime_schema}')
     migration_engine = _schema_engine(postgres_engine, migration_schema)
     runtime_engine = _schema_engine(postgres_engine, runtime_schema)
-    migration_023 = importlib.import_module(
-        'sky.schemas.db.global_user_state.023_container_images')
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
     try:
         with migration_engine.begin() as connection:
             connection.exec_driver_sql(
                 'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
             connection.exec_driver_sql(
                 "INSERT INTO clusters (name) VALUES ('legacy-cluster')")
-        _migration_call(migration_engine, migration_023.upgrade)
+        _migration_call(migration_engine, migration_024.upgrade)
         schema.metadata.create_all(runtime_engine)
         assert _schema_shape(migration_engine,
                              migration_schema) == _schema_shape(
@@ -4920,6 +4928,19 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
                                 "WHERE name = 'legacy-cluster'")).one()
         assert tuple(legacy_binding) == (0, None, None)
 
+        # A preview database may already contain the complete image schema
+        # while being stamped at the former image revision 023. The canonical
+        # predecessor now owns auth_sessions, so revision 024 must create that
+        # missing predecessor table without replaying image DDL.
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql('DROP TABLE auth_sessions')
+        _migration_call(migration_engine, migration_024.upgrade)
+        auth_columns = {
+            column['name'] for column in sqlalchemy.inspect(
+                migration_engine).get_columns('auth_sessions')
+        }
+        assert auth_columns == {'code_challenge', 'token', 'created_at'}
+
         authority = str(uuid.uuid4())
         with migration_engine.begin() as connection:
             connection.execute(
@@ -4936,14 +4957,14 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
                     'request_hash': '2' * 64,
                 })
         with pytest.raises(RuntimeError, match='requires all operational'):
-            _migration_call(migration_engine, migration_023.downgrade)
+            _migration_call(migration_engine, migration_024.downgrade)
         with migration_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.text('DELETE FROM container_image_operations'))
-        _migration_call(migration_engine, migration_023.downgrade)
-        assert sqlalchemy.inspect(migration_engine).get_table_names() == [
-            'clusters'
-        ]
+        _migration_call(migration_engine, migration_024.downgrade)
+        assert set(sqlalchemy.inspect(migration_engine).get_table_names()) == {
+            'auth_sessions', 'clusters'
+        }
         assert {
             column['name'] for column in sqlalchemy.inspect(
                 migration_engine).get_columns('clusters')
@@ -4958,7 +4979,8 @@ def test_migration_023_matches_runtime_metadata_and_downgrade_is_empty_only(
                 f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
 
 
-def test_migration_023_adds_only_cluster_binding_columns_to_sqlite() -> None:
+def test_migration_024_adds_auth_and_cluster_binding_columns_to_sqlite(
+) -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     metadata = sqlalchemy.MetaData()
     sqlalchemy.Table(
@@ -4969,12 +4991,12 @@ def test_migration_023_adds_only_cluster_binding_columns_to_sqlite() -> None:
         connection.execute(
             sqlalchemy.text(
                 "INSERT INTO clusters (name) VALUES ('legacy-cluster')"))
-    migration_023 = importlib.import_module(
-        'sky.schemas.db.global_user_state.023_container_images')
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
     try:
-        _migration_call(engine, migration_023.upgrade)
+        _migration_call(engine, migration_024.upgrade)
         inspector = sqlalchemy.inspect(engine)
-        assert inspector.get_table_names() == ['clusters']
+        assert set(inspector.get_table_names()) == {'auth_sessions', 'clusters'}
         assert {column['name'] for column in inspector.get_columns('clusters')
                } == {
                    'name', 'container_image_binding_known',
@@ -4988,11 +5010,15 @@ def test_migration_023_adds_only_cluster_binding_columns_to_sqlite() -> None:
                                 'container_image_consumer_owner FROM clusters '
                                 "WHERE name = 'legacy-cluster'")).one()
         assert tuple(legacy_binding) == (0, None, None)
-        _migration_call(engine, migration_023.downgrade)
+        _migration_call(engine, migration_024.downgrade)
         assert {
             column['name']
             for column in sqlalchemy.inspect(engine).get_columns('clusters')
         } == {'name'}
+        assert {
+            column['name'] for column in sqlalchemy.inspect(engine).get_columns(
+                'auth_sessions')
+        } == {'code_challenge', 'token', 'created_at'}
     finally:
         engine.dispose()
 

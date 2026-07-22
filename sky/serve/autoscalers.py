@@ -54,6 +54,8 @@ class LogicalScaleTarget:
     version: int
     reconcile_generation: int
     target_capacity: int
+    target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
+    accelerator_shapes: tuple[tuple[str, int], ...] = ()
     replace_unknown_replica_ids: tuple[int, ...] = ()
 
 
@@ -65,6 +67,8 @@ class LogicalScaleDownTarget:
     reconcile_generation: int
     target_capacity: int
     replica_id: int
+    target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
+    accelerator_shapes: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass
@@ -220,11 +224,16 @@ class Autoscaler:
         """
         self._service_name: str = service_name
         self.min_replicas: int = spec.min_replicas
+        self.min_replicas_by_accelerator: dict[str, int] = dict(
+            getattr(spec, 'min_replicas_by_accelerator', {}))
         self.max_replicas: int = (spec.max_replicas if spec.max_replicas
                                   is not None else spec.min_replicas)
         self.num_overprovision: int | None = spec.num_overprovision
         # Target number of replicas is initialized to min replicas
-        self.target_num_replicas: int = spec.min_replicas
+        self.target_num_replicas: int = max(
+            spec.min_replicas, sum(self.min_replicas_by_accelerator.values()))
+        self.target_num_replicas_by_accelerator: dict[str, int] = dict(
+            self.min_replicas_by_accelerator)
         # Seed from the constructed service version (not always
         # INITIAL_VERSION). On a controller restart/respawn the autoscaler is
         # rebuilt; if it reset to version 1 while live replicas are at version
@@ -306,6 +315,8 @@ class Autoscaler:
             return
         self.latest_version = version
         self.min_replicas = spec.min_replicas
+        self.min_replicas_by_accelerator = dict(
+            getattr(spec, 'min_replicas_by_accelerator', {}))
         self.max_replicas = (spec.max_replicas if spec.max_replicas is not None
                              else spec.min_replicas)
         # Re-clip self.target_num_replicas with new min and max replicas.
@@ -510,10 +521,86 @@ class Autoscaler:
             self._fill_location_matches(location, zero_cost)
             for zero_cost in self._fill_zero_cost_locations)
 
+    def is_replica_on_zero_cost_location(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether a replica occupies a configured zero-cost location.
+
+        The controller uses this same classifier for exact-card history.  In
+        particular, legacy ReplicaInfo rows predate persisted is_zero_cost
+        provenance but still retain enough placement identity to match the
+        autoscaler's active reserved locations.
+        """
+        return self._replica_on_zero_cost_location(info)
+
     def _fill_capacity_units(self, info: 'replica_managers.ReplicaInfo') -> int:
         """Autoscaling units represented by one row for fill accounting."""
         del info
         return 1
+
+    def _exact_card_fill_shelter(
+        self,
+        zero_cost_infos: list['replica_managers.ReplicaInfo'],
+        fill_target: int,
+    ) -> tuple[dict[str, int], dict[int, str]] | None:
+        """Return per-card scale-down shelter and replica attribution.
+
+        The aggregate fill target overlaps only demand assigned to the same
+        exact reserved card. Existing zero-cost holdings receive the target
+        first, in configured card order, so a demand-only downscale cannot
+        drain one reserved card and immediately refill another. Autoscalers
+        without a complete exact-card view retain the legacy aggregate path.
+        """
+        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        if (not isinstance(demand_target, dict) or
+                not isinstance(configured_shapes, dict) or
+                not configured_shapes):
+            return None
+
+        canonical_by_name = {
+            str(card).casefold(): str(card) for card in configured_shapes
+        }
+        demand_by_card: dict[str, int] = {}
+        for raw_card, raw_target in demand_target.items():
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                return None
+            demand_by_card[card] = max(0, int(raw_target))
+
+        current_by_card: dict[str, int] = {}
+        replica_cards: dict[int, str] = {}
+        for info in zero_cost_infos:
+            location = info.get_spot_location()
+            accelerators = (location.accelerators
+                            if location is not None else None)
+            if not accelerators or len(accelerators) != 1:
+                return None
+            raw_card = next(iter(accelerators))
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                # Old-version or partially launched rows may not have a
+                # trustworthy exact shape. Aggregate shelter is conservative
+                # and avoids inventing an accelerator identity for them.
+                return None
+            replica_cards[info.replica_id] = card
+            current_by_card[card] = (current_by_card.get(card, 0) +
+                                     self._fill_capacity_units(info))
+
+        remaining = max(0, fill_target)
+        fill_by_card: dict[str, int] = {}
+        for card in configured_shapes:
+            canonical = canonical_by_name[str(card).casefold()]
+            allocated = min(remaining, current_by_card.get(canonical, 0))
+            if allocated > 0:
+                fill_by_card[canonical] = allocated
+                remaining -= allocated
+            if remaining <= 0:
+                break
+        shelter = {
+            card: max(0, fill - demand_by_card.get(card, 0))
+            for card, fill in fill_by_card.items()
+        }
+        return shelter, replica_cards
 
     def _apply_reserved_capacity_fill(
         self,
@@ -531,9 +618,11 @@ class Autoscaler:
         replicas are opportunistic supply, and the platform's spill
         logic must not read them as demand.
 
-        - Surplus scale-ups beyond max(current, demand target) carry the
-          sentinel override so the launch path pins them to zero-cost
-          ACTIVE locations only (and skips entirely when none is).
+        - Every spendable free slot that fits below the hard aggregate
+          max_replicas ceiling carries the sentinel override so the launch
+          path pins it to zero-cost ACTIVE locations only (and skips entirely
+          when none is). Demand and rolling-update launches reserve their
+          planned ceiling headroom first, but do not otherwise suppress fill.
         - Scale-downs covered by the fill surplus are suppressed, taking
           the shelter quota from the TAIL of the zero-cost victims: the
           subclass ordered its victims most-preferred-first (initializing
@@ -549,13 +638,12 @@ class Autoscaler:
         if not self.reserved_capacity_fill:
             return decisions
         # Zero-cost accounting is version-asymmetric by design; the
-        # three roles use different version scopes:
-        # - LAUNCH BASELINE: latest-version only. The baseline below is
-        #   max(num_latest_nonterminal, demand_target), which is
-        #   latest-only, so old-version zero-cost replicas (a rolling
-        #   update draining its previous fleet) would inflate the launch
-        #   target by replicas the baseline never sees -- compounding
-        #   fill launches every tick.
+        # four roles use different version scopes:
+        # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
+        #   zero-cost replicas (a rolling update draining its previous fleet)
+        #   would otherwise inflate the target and compound fill launches.
+        #   The HARD CEILING below is deliberately all-version: old rows still
+        #   occupy physical capacity and must reduce aggregate headroom.
         # - OCCUPANCY DEBIT: all versions. ANY nonterminal zero-cost row
         #   whose pod may be unbound (not READY, or created after the
         #   snapshot) holds a claim on a slot the snapshot counted free
@@ -583,15 +671,19 @@ class Autoscaler:
         zero_cost_occupying = 0
         zero_cost_demand_placed = 0
         zero_cost_demand_placed_latest = 0
+        num_nonterminal = 0
         num_latest_nonterminal = 0
+        zero_cost_infos: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.is_terminal:
                 continue
             capacity_units = self._fill_capacity_units(info)
+            num_nonterminal += capacity_units
             is_latest = info.version == self.latest_version
             if is_latest:
                 num_latest_nonterminal += capacity_units
             if self._replica_on_zero_cost_location(info):
+                zero_cost_infos.append(info)
                 zero_cost_count += capacity_units
                 if is_latest:
                     zero_cost_latest += capacity_units
@@ -655,38 +747,59 @@ class Autoscaler:
         self._fill_target = fill_target
         demand_target = self.get_final_target_num_replicas()
         surplus_covered = fill_target - demand_target
-        if surplus_covered <= 0:
-            return decisions
-        # Victim-aware suppression: shelter ONLY scale-downs whose victim
-        # replica sits on a zero-cost location, up to the fill surplus.
-        # Downs targeting paid replicas always pass through -- fill
-        # surplus must never keep a PAID replica alive (the subclass
-        # orders victims newest-first, so a victim-blind prefix keep
-        # could shelter a paid replica indefinitely while repeatedly
-        # killing and relaunching zero-cost ones).
-        id_to_info = {info.replica_id: info for info in replica_infos}
-        # Take the shelter quota from the TAIL of the zero-cost victims:
-        # the subclass emits victims most-preferred-first, so a partial
-        # surplus must shelter the LEAST-preferred ones (e.g. keep the
-        # READY replica serving traffic, not the PROVISIONING one ahead
-        # of it in the list). Two passes so output order is preserved.
-        zero_cost_decision_ids = []
-        for idx, decision in enumerate(decisions):
-            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
-                assert isinstance(decision.target,
-                                  (int, LogicalScaleDownTarget))
-                victim = id_to_info.get(_scale_down_replica_id(decision.target))
-                if (victim is not None and
-                        self._replica_on_zero_cost_location(victim)):
-                    zero_cost_decision_ids.append(idx)
-        suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
-        result: list[AutoscalerDecision] = [
-            decision for idx, decision in enumerate(decisions)
-            if idx not in suppressed_ids
-        ]
+        # Keep this overlay side-effect free for callers that retain the
+        # ordinary decision list for later policy checks.
+        result = list(decisions)
+        exact_shelter = self._exact_card_fill_shelter(zero_cost_infos,
+                                                      fill_target)
+        if surplus_covered > 0 or exact_shelter is not None:
+            # Victim-aware suppression: shelter ONLY scale-downs whose victim
+            # replica sits on a zero-cost location, up to the fill surplus.
+            # Downs targeting paid replicas always pass through -- fill
+            # surplus must never keep a PAID replica alive (the subclass
+            # orders victims newest-first, so a victim-blind prefix keep
+            # could shelter a paid replica indefinitely while repeatedly
+            # killing and relaunching zero-cost ones).
+            id_to_info = {info.replica_id: info for info in replica_infos}
+            # Take the shelter quota from the TAIL of the zero-cost victims:
+            # the subclass emits victims most-preferred-first, so a partial
+            # surplus must shelter the LEAST-preferred ones (e.g. keep the
+            # READY replica serving traffic, not the PROVISIONING one ahead
+            # of it in the list). Two passes so output order is preserved.
+            zero_cost_decisions = []
+            for idx, decision in enumerate(decisions):
+                if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
+                    assert isinstance(decision.target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info.get(
+                        _scale_down_replica_id(decision.target))
+                    if (victim is not None and
+                            self._replica_on_zero_cost_location(victim)):
+                        zero_cost_decisions.append((idx, victim))
+            suppressed_ids: set[int] = set()
+            if exact_shelter is not None:
+                shelter_by_card, replica_cards = exact_shelter
+                remaining_by_card = dict(shelter_by_card)
+                for idx, victim in reversed(zero_cost_decisions):
+                    card = replica_cards[victim.replica_id]
+                    if remaining_by_card.get(card, 0) <= 0:
+                        continue
+                    suppressed_ids.add(idx)
+                    remaining_by_card[card] = max(
+                        0, remaining_by_card[card] -
+                        self._fill_capacity_units(victim))
+            else:
+                suppressed_ids = {
+                    idx for idx, _ in zero_cost_decisions[-surplus_covered:]
+                }
+            result = [
+                decision for idx, decision in enumerate(decisions)
+                if idx not in suppressed_ids
+            ]
         # Launch target: latest-version zero-cost replicas only (see the
-        # version-asymmetry note above), against the latest-only
-        # baseline.
+        # version-asymmetry note above). Fill intent is independent of demand;
+        # the hard aggregate headroom calculation below separately reserves
+        # latest demand and counts every old-version nonterminal row.
         fill_target_launch = min(zero_cost_latest + spendable_free_slots,
                                  self.max_replicas)
         if fill_ceiling_launch is not None:
@@ -697,14 +810,20 @@ class Autoscaler:
             # old-version demand rows must not inflate launches during a
             # rolling update.
             fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
-        num_fill_up = (fill_target_launch -
-                       max(num_latest_nonterminal, demand_target))
+        desired_fill_up = max(0, fill_target_launch - zero_cost_latest)
+        num_old_nonterminal = num_nonterminal - num_latest_nonterminal
+        planned_total = (num_old_nonterminal +
+                         max(num_latest_nonterminal, demand_target))
+        hard_ceiling_headroom = max(0, self.max_replicas - planned_total)
+        num_fill_up = min(desired_fill_up, hard_ceiling_headroom)
         if num_fill_up > 0:
             logger.info(f'Reserved-capacity fill: launch target '
                         f'{fill_target_launch} (latest zero-cost replicas '
                         f'{zero_cost_latest} + spendable free slots '
                         f'{spendable_free_slots}), demand target '
-                        f'{demand_target}; scaling up {num_fill_up} '
+                        f'{demand_target}, planned total {planned_total}, '
+                        f'hard-ceiling headroom {hard_ceiling_headroom}; '
+                        f'scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
             fill_override: dict[str, Any] = {
                 constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
@@ -768,6 +887,12 @@ class Autoscaler:
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
+            'min_replicas_by_accelerator': dict(
+                getattr(self, 'min_replicas_by_accelerator', {})),
+            'target_num_replicas_by_accelerator': dict(
+                getattr(self, 'target_num_replicas_by_accelerator', {})),
+            'demand_target_by_accelerator': dict(
+                getattr(self, 'target_num_replicas_by_accelerator', {})),
         }
         request_timestamps = getattr(self, 'request_timestamps', None)
         request_window_seconds = getattr(self, 'qps_window_size', None)
@@ -938,6 +1063,15 @@ class Autoscaler:
         del location
         return 1.0
 
+    def _cost_rebalance_location_is_compatible(
+        self,
+        incumbent: 'replica_managers.ReplicaInfo',
+        location: spot_placer.Location,
+    ) -> bool:
+        """Whether an economic replacement preserves autoscaler policy."""
+        del incumbent, location
+        return True
+
     def _get_hourly_cost_from_replica_info(
             self, replica_info: 'replica_managers.ReplicaInfo') -> float:
         """Resolve whole-replica hourly cost conservatively."""
@@ -1048,6 +1182,9 @@ class Autoscaler:
             if spot_placer.locations_match_placement(incumbent_location,
                                                      location):
                 continue
+            if not self._cost_rebalance_location_is_compatible(
+                    incumbent, location):
+                continue
             candidate_capacity = self._cost_rebalance_location_capacity(
                 location)
             if candidate_capacity + 1e-9 < incumbent_capacity:
@@ -1081,13 +1218,18 @@ class Autoscaler:
         decisions: list[AutoscalerDecision] = []
 
         # Existing pairs are completed even when a later update disables the
-        # policy.  In that case keep the incumbent and drain the replacement;
-        # otherwise wait for replacement readiness, then strictly drain the
-        # incumbent.  COST_REBALANCE means off-route now, terminate only after
-        # the LB proves zero occupancy.
+        # policy or changes the placement contract. In either case keep the
+        # incumbent and drain the replacement; otherwise wait for replacement
+        # readiness, then strictly drain the incumbent. COST_REBALANCE means
+        # off-route now, terminate only after the LB proves zero occupancy.
         for victim_id, replacement in sorted(pairs.items()):
             victim = by_id[victim_id]
-            if self.cost_rebalance:
+            replacement_location = replacement.get_spot_location()
+            replacement_preserves_policy = (
+                replacement_location is not None and
+                self._cost_rebalance_location_is_compatible(
+                    victim, replacement_location))
+            if self.cost_rebalance and replacement_preserves_policy:
                 if (replacement.is_ready and
                         getattr(victim.status_property, 'sky_down_status',
                                 None) is None):
@@ -1665,6 +1807,15 @@ class _GpuShapeResolverMixin:
                     gpu_count = max(1, int(accelerators[gpu_type]))
                 except (TypeError, ValueError):
                     gpu_count = 1
+        if gpu_type == 'unknown':
+            accelerators = (replica_info.resources_override or
+                            {}).get('accelerators')
+            if isinstance(accelerators, dict) and accelerators:
+                gpu_type = next(iter(accelerators))
+                try:
+                    gpu_count = max(1, int(accelerators[gpu_type]))
+                except (TypeError, ValueError):
+                    gpu_count = 1
         # Cache only a resolved shape of a replica whose launch has finished.
         # While the replica is still provisioning, the cluster record (and
         # thus launched_resources) is rewritten for every failover attempt, so
@@ -1676,6 +1827,211 @@ class _GpuShapeResolverMixin:
             self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
                                                               gpu_count)
         return gpu_type, gpu_count
+
+    def _cost_rebalance_location_is_compatible(
+        self,
+        incumbent: 'replica_managers.ReplicaInfo',
+        location: spot_placer.Location,
+    ) -> bool:
+        """Keep authoritative exact-card targets stable during rebalancing."""
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        if not configured_shapes:
+            return True
+        canonical_by_name = {
+            card.casefold(): (card, count)
+            for card, count in configured_shapes.items()
+        }
+        incumbent_card, incumbent_count = (
+            self._get_gpu_shape_from_replica_info(incumbent))
+        candidate_card, candidate_count = Autoscaler._location_gpu_shape(  # pylint: disable=protected-access
+            location)
+        configured = canonical_by_name.get(candidate_card.casefold())
+        if configured is None:
+            return False
+        canonical_card, configured_count = configured
+        return (incumbent_card.casefold() == canonical_card.casefold() and
+                incumbent_count == configured_count and
+                candidate_count == configured_count)
+
+
+def _allocate_compatibility_target(
+    *,
+    configured_cards: list[str],
+    capacities: dict[str, float],
+    floors: dict[str, int],
+    min_replicas: int,
+    max_replicas: int,
+    demand_profiles: list[tuple[int, tuple[str, ...], float]],
+    fixed_work_by_accelerator: dict[str, float],
+    ready_zero_cost: dict[str, int],
+    ready: dict[str, int],
+    provisioning: dict[str, int],
+    free_reserved: dict[str, int],
+    cold_order: list[str],
+) -> dict[str, int]:
+    """Allocate exact-card work into one bounded per-card target.
+
+    `fixed_work_by_accelerator` is already-running or conservatively unknown
+    work. It cannot move without preemption, so it consumes capacity only on
+    its current card before flexible queued/rejected profiles are considered.
+    `demand_profiles` contains work units, not request counts, which lets the
+    same scarcity/supply allocator serve both QPS and concurrency policies.
+    """
+    demand_epsilon = 1e-9
+    # A logical scale-up wave can deliberately place a ceiling below the
+    # eventual hard floors. Admit those floors incrementally instead of
+    # returning a map whose sum exceeds the actuation fence. The configured
+    # order is the stable tie-break until later waves complete every floor.
+    target: dict[str, int] = {}
+    remaining_floor_budget = max(0, max_replicas)
+    for card in configured_cards:
+        floor = min(max(0, int(floors.get(card.casefold(), 0))),
+                    remaining_floor_budget)
+        target[card] = floor
+        remaining_floor_budget -= floor
+    unused_capacity = {
+        card: target[card] * max(0.0, capacities.get(card, 0.0))
+        for card in configured_cards
+    }
+
+    # Running work is non-preemptive. Pin its target to the card already
+    # serving it before assigning any flexible backlog.
+    for card in configured_cards:
+        remaining = max(0.0, fixed_work_by_accelerator.get(card, 0.0))
+        consumed = min(remaining, unused_capacity.get(card, 0.0))
+        remaining -= consumed
+        unused_capacity[card] = max(0.0,
+                                    unused_capacity.get(card, 0.0) - consumed)
+        capacity = capacities.get(card, 0.0)
+        if capacity <= 0:
+            continue
+        while (remaining > demand_epsilon and
+               sum(target.values()) < max_replicas):
+            target[card] = target.get(card, 0) + 1
+            if capacity > remaining:
+                unused_capacity[card] = (unused_capacity.get(card, 0.0) +
+                                         capacity - remaining)
+                remaining = 0.0
+            else:
+                remaining -= capacity
+
+    cold_rank = {card: index for index, card in enumerate(cold_order)}
+    canonical_by_name = {card.casefold(): card for card in configured_cards}
+    grouped: dict[tuple[int, tuple[str, ...]], float] = {}
+    for priority, raw_compatible, work in demand_profiles:
+        requested = {
+            canonical_by_name[card.casefold()]
+            for card in raw_compatible
+            if card.casefold() in canonical_by_name
+        }
+        # Compatibility is a set. Canonicalize by live paid-card order so
+        # caller list order never becomes a hardware preference.
+        compatible = tuple(card for card in cold_order
+                           if card in requested and card in capacities)
+        if not compatible or work <= demand_epsilon:
+            continue
+        key = (priority, compatible)
+        grouped[key] = grouped.get(key, 0.0) + float(work)
+
+    # Cumulative marginal-supply tiers. Comparing each cumulative count to the
+    # target already assigned consumes every unit exactly once while preserving
+    # ready reserved -> any ready -> provisioning -> free reserved -> cold.
+    planned_by_tier = [dict(ready_zero_cost), dict(ready)]
+    planned_by_tier.append({
+        card: ready.get(card, 0) + provisioning.get(card, 0)
+        for card in configured_cards
+    })
+    planned_by_tier.append({
+        card: (ready.get(card, 0) + provisioning.get(card, 0) +
+               free_reserved.get(card, 0)) for card in configured_cards
+    })
+
+    def fallback_after_next_assignment(
+            compatible: tuple[str, ...]) -> tuple[int, int]:
+        """Return the second-best marginal supply tier for one profile."""
+        options: list[tuple[int, int]] = []
+        for card in compatible:
+            if unused_capacity.get(card, 0.0) > 0:
+                options.append((0, cold_rank[card]))
+            previous_count = target.get(card, 0)
+            for tier_index, tier in enumerate(planned_by_tier, start=1):
+                tier_count = max(previous_count, tier.get(card, 0))
+                # Two copies are sufficient: only the best option is consumed
+                # before the profile's fallback is compared.
+                options.extend([(tier_index, cold_rank[card])] *
+                               min(2, max(0, tier_count - previous_count)))
+                previous_count = tier_count
+            options.append((len(planned_by_tier) + 1, cold_rank[card]))
+        options.sort()
+        if len(options) > 1:
+            return options[1]
+        if options:
+            return options[0]
+        return len(planned_by_tier) + 2, len(cold_order)
+
+    groups_by_priority: dict[int, list[tuple[tuple[str, ...], float]]] = {}
+    for (priority, compatible), work in grouped.items():
+        groups_by_priority.setdefault(priority, []).append((compatible, work))
+    for priority in sorted(groups_by_priority, reverse=True):
+        pending = groups_by_priority[priority]
+        while pending:
+            # Protect the profile whose best non-selected fallback is worse.
+            # Stable list order preserves report/FIFO order on a true tie.
+            fallback_keys = [
+                tuple(-value
+                      for value in fallback_after_next_assignment(compatible))
+                for compatible, _ in pending
+            ]
+            selected_index = min(range(len(pending)),
+                                 key=fallback_keys.__getitem__)
+            compatible, remaining = pending.pop(selected_index)
+            if sum(target.values()) >= max_replicas:
+                continue
+            for card in compatible:
+                consumed = min(remaining, unused_capacity.get(card, 0.0))
+                remaining -= consumed
+                unused_capacity[card] = max(
+                    0.0,
+                    unused_capacity.get(card, 0.0) - consumed)
+                if remaining <= demand_epsilon:
+                    break
+            while (remaining > demand_epsilon and
+                   sum(target.values()) < max_replicas):
+                selected: str | None = None
+                for tier in planned_by_tier:
+                    selected = next(
+                        (card for card in compatible
+                         if tier.get(card, 0) > target.get(card, 0)), None)
+                    if selected is not None:
+                        break
+                if selected is None:
+                    selected = next(
+                        card for card in cold_order if card in compatible)
+                capacity = capacities.get(selected, 0.0)
+                if capacity <= 0:
+                    break
+                target[selected] = target.get(selected, 0) + 1
+                if capacity > remaining:
+                    unused_capacity[selected] = (
+                        unused_capacity.get(selected, 0.0) + capacity -
+                        remaining)
+                    remaining = 0.0
+                else:
+                    remaining -= capacity
+
+    # The aggregate floor is independent from per-card floors. Reuse already
+    # materialized supply before the cheapest deterministic cold fallback.
+    while sum(target.values()) < min_replicas and configured_cards:
+        selected = None
+        for tier in planned_by_tier:
+            selected = next((card for card in configured_cards
+                             if tier.get(card, 0) > target.get(card, 0)), None)
+            if selected is not None:
+                break
+        if selected is None:
+            selected = cold_order[0]
+        target[selected] = target.get(selected, 0) + 1
+    return {card: count for card, count in target.items() if count > 0}
 
 
 class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
@@ -1693,6 +2049,11 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                  spec: 'service_spec.SkyServiceSpec',
                  version: int = constants.INITIAL_VERSION) -> None:
         super().__init__(service_name, spec, version)
+        # Serializes version/catalog publication, demand ingestion, reserved
+        # supply, and decision generation. The controller publishes a retained
+        # QPS autoscaler through update_version_and_accelerator_shapes(), so a
+        # decision can never combine the new QPS dict with the old card catalog.
+        self._instance_state_lock = threading.RLock()
         # Ensure target_qps_per_replica is a dict for instance-aware logic
         assert isinstance(spec.target_qps_per_replica, dict), \
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
@@ -1737,8 +2098,216 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         self._qps_dict_by_version: dict[int, dict[str, float]] = {
             version: spec.target_qps_per_replica
         }
+        self.compatibility_profiles: list[dict[str, Any]] = []
+        # Outstanding queue demand is a last-writer-wins gauge. Unlike arrival
+        # profiles, it must be replaced on every authoritative LB report rather
+        # than accumulated across the QPS window.
+        self.queued_compatibility_profiles: list[dict[str, Any]] = []
+        # False after a catalog transition until a version-matched LB report
+        # replaces every exact-card gauge. Incomplete/old reports may still
+        # refresh aggregate QPS timestamps but cannot re-arm cleared profiles.
+        self._compatibility_demand_complete: bool = False
+        # Controller-owned exact task shapes. target_qps_per_replica keys are
+        # performance profiles, not an authoritative resource shape: a bare
+        # A100 profile can still describe an A100:8 task resource.
+        self.configured_accelerator_shapes: dict[str, int] = {}
+        # Fresh cached physical reserved supply, fed once per controller tick.
+        # This is marginal supply only; ready/provisioning replicas are counted
+        # independently below and must not be double-counted.
+        self.free_reserved_slots_by_accelerator: dict[str, int] = {}
+        configured_cards = self._configured_cards_from_profiles()
+        while (sum(self.target_num_replicas_by_accelerator.values())
+               < self.target_num_replicas and configured_cards):
+            card = configured_cards[0]
+            self.target_num_replicas_by_accelerator[card] = (
+                self.target_num_replicas_by_accelerator.get(card, 0) + 1)
+
+    def set_configured_accelerator_shapes(self, shapes: dict[str, int]) -> None:
+        """Set canonical exact-card GPU counts from active task resources."""
+        with self._instance_state_lock:
+            self._set_configured_accelerator_shapes_locked(shapes)
+
+    def _set_configured_accelerator_shapes_locked(
+            self, shapes: dict[str, int]) -> None:
+        """Set exact-card shapes while holding the instance-state lock."""
+        previous_shapes = self.configured_accelerator_shapes
+        configured_shapes = {
+            str(card): int(count)
+            for card, count in shapes.items()
+            if isinstance(card, str) and card and isinstance(count, int) and
+            not isinstance(count, bool) and count > 0
+        }
+        catalog_changed = (bool(previous_shapes) and
+                           configured_shapes != previous_shapes)
+        self.configured_accelerator_shapes = configured_shapes
+        if catalog_changed or not configured_shapes:
+            self.compatibility_profiles = []
+            self.queued_compatibility_profiles = []
+            self.target_num_replicas_by_accelerator = {}
+            self.free_reserved_slots_by_accelerator = {}
+            self._compatibility_demand_complete = False
+
+    def set_free_reserved_slots_by_accelerator(self, slots: dict[str,
+                                                                 int]) -> None:
+        """Set fresh unmaterialized reserved supply by exact card."""
+        with self._instance_state_lock:
+            self._set_free_reserved_slots_by_accelerator_locked(slots)
+
+    def _set_free_reserved_slots_by_accelerator_locked(
+            self, slots: dict[str, int]) -> None:
+        configured_by_name = {
+            card.casefold(): card
+            for card in self._configured_cards_from_profiles()
+        }
+        normalized: dict[str, int] = {}
+        for raw_card, raw_count in slots.items():
+            card = configured_by_name.get(str(raw_card).casefold())
+            if card is None or isinstance(raw_count, bool):
+                continue
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                normalized[card] = normalized.get(card, 0) + count
+        self.free_reserved_slots_by_accelerator = normalized
+
+    def collect_request_information(
+            self, request_aggregator_info: dict[str, Any]) -> None:
+        with self._instance_state_lock:
+            self._collect_request_information_locked(request_aggregator_info)
+
+    def _collect_request_information_locked(
+            self, request_aggregator_info: dict[str, Any]) -> None:
+        super().collect_request_information(request_aggregator_info)
+        compatibility_complete = request_aggregator_info.get(
+            'compatibility_demand_complete')
+        if compatibility_complete is not True:
+            # Direct/legacy construction without an authoritative catalog
+            # retains the pre-fence test and compatibility behavior. Once the
+            # controller supplies a catalog, only a version-matched complete
+            # report may replace exact-card state.
+            compatibility_complete = ('compatibility_demand_complete'
+                                      not in request_aggregator_info and
+                                      not self.configured_accelerator_shapes)
+        if not compatibility_complete:
+            self._compatibility_demand_complete = False
+            return
+        for profile in request_aggregator_info.get('compatibility_profiles',
+                                                   []):
+            if not isinstance(profile, dict):
+                continue
+            timestamp = profile.get('timestamp')
+            priority = profile.get('priority')
+            accelerators = profile.get('compatible_accelerators')
+            count = profile.get('count', 1)
+            if (not isinstance(timestamp,
+                               (int, float)) or isinstance(timestamp, bool) or
+                    not isinstance(priority, int) or
+                    isinstance(priority, bool) or accelerators is None or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1 or not all(
+                        isinstance(item, str) and item
+                        for item in accelerators)):
+                continue
+            self.compatibility_profiles.append({
+                'timestamp': float(timestamp),
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'count': count,
+            })
+        queued_profiles: list[dict[str, Any]] = []
+        for profile in request_aggregator_info.get(
+                'queued_requests_by_compatibility', []):
+            if not isinstance(profile, dict):
+                continue
+            priority = profile.get('priority')
+            accelerators = profile.get('compatible_accelerators')
+            count = profile.get('count', 1)
+            if (not isinstance(priority, int) or isinstance(priority, bool) or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1 or not all(
+                        isinstance(item, str) and item
+                        for item in accelerators)):
+                continue
+            queued_profiles.append({
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'count': count,
+            })
+        self.queued_compatibility_profiles = queued_profiles
+        self._compatibility_demand_complete = True
+        cutoff = time.time() - self.qps_window_size
+        self.compatibility_profiles = [
+            profile for profile in self.compatibility_profiles
+            if profile['timestamp'] >= cutoff
+        ]
+
+    def _dump_dynamic_states(self) -> dict[str, Any]:
+        """Preserve exact-card demand across an autoscaler replacement."""
+        with self._instance_state_lock:
+            return self._dump_dynamic_states_locked()
+
+    def _dump_dynamic_states_locked(self) -> dict[str, Any]:
+        states = super()._dump_dynamic_states()
+        states['compatibility_profiles'] = [{
+            **profile,
+            'compatible_accelerators': list(profile['compatible_accelerators']),
+        } for profile in self.compatibility_profiles]
+        states['queued_compatibility_profiles'] = [{
+            **profile,
+            'compatible_accelerators': list(profile['compatible_accelerators']),
+        } for profile in self.queued_compatibility_profiles]
+        states['compatibility_demand_complete'] = (
+            self._compatibility_demand_complete)
+        states['configured_accelerator_shapes'] = dict(
+            self.configured_accelerator_shapes)
+        return states
+
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
+        """Restore exact-card arrivals and the replaceable queue gauge."""
+        compatibility_arrivals_present = ('compatibility_profiles'
+                                          in dynamic_states)
+        profiles = dynamic_states.pop('compatibility_profiles', [])
+        queued_profiles = dynamic_states.pop('queued_compatibility_profiles',
+                                             [])
+        compatibility_complete = bool(
+            dynamic_states.pop('compatibility_demand_complete', False))
+        source_shapes = dynamic_states.pop('configured_accelerator_shapes', {})
+        super()._load_dynamic_states(dynamic_states)
+        self.compatibility_profiles = []
+        self.queued_compatibility_profiles = []
+        self.configured_accelerator_shapes = {
+            str(card): int(count)
+            for card, count in source_shapes.items()
+            if isinstance(card, str) and card and isinstance(count, int) and
+            not isinstance(count, bool) and count > 0
+        } if isinstance(source_shapes, dict) else {}
+        # Cross-type dumps from older binaries do not identify the catalog
+        # that admitted their profiles. Preserve aggregate timestamps but fail
+        # closed on exact-card transfer until a fresh report arrives.
+        compatibility_complete = (compatibility_complete and
+                                  compatibility_arrivals_present and
+                                  bool(self.configured_accelerator_shapes))
+        self.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': profiles,
+            'queued_requests_by_compatibility': queued_profiles,
+            'compatibility_demand_complete': compatibility_complete,
+        })
 
     def generate_scaling_decisions(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[AutoscalerDecision]:
+        with self._instance_state_lock:
+            return self._generate_scaling_decisions_locked(
+                replica_infos, active_versions)
+
+    def _generate_scaling_decisions_locked(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         active_versions: list[int],
@@ -1784,6 +2353,51 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
         scaling_decisions: list[AutoscalerDecision] = []
 
+        target_by_card, use_card_targets = (
+            self._actuation_target_by_accelerator(replica_infos))
+        if use_card_targets:
+            replicas_by_card: dict[str, list[replica_managers.ReplicaInfo]] = {}
+            ready_by_card: dict[str, int] = {}
+            for info in latest_nonterminal_replicas:
+                card, _ = self._get_gpu_shape_from_replica_info(info)
+                replicas_by_card.setdefault(card, []).append(info)
+                if info.is_ready:
+                    ready_by_card[card] = ready_by_card.get(card, 0) + 1
+            shortages = {
+                card: max(0, target - len(replicas_by_card.get(card, [])))
+                for card, target in target_by_card.items()
+            }
+            if any(shortages.values()):
+                for card, shortage in shortages.items():
+                    for _ in range(shortage):
+                        scaling_decisions.append(
+                            AutoscalerDecision(
+                                AutoscalerDecisionOperator.SCALE_UP,
+                                target={
+                                    'accelerators': {
+                                        card: self._configured_gpu_count(card)
+                                    }
+                                }))
+                # Graceful non-preemptive transition: provisioning rows count
+                # against duplicate launches, but excess old-card capacity is
+                # retained until every target card is actually READY.
+                return scaling_decisions
+            all_targets_ready = all(
+                ready_by_card.get(card, 0) >= target
+                for card, target in target_by_card.items())
+            if all_targets_ready:
+                for card, replicas in replicas_by_card.items():
+                    excess = max(0, len(replicas) - target_by_card.get(card, 0))
+                    if excess <= 0:
+                        continue
+                    for replica_id in self._select_replicas_to_scale_down_by_qps(
+                            excess, replicas):
+                        scaling_decisions.append(
+                            AutoscalerDecision(
+                                AutoscalerDecisionOperator.SCALE_DOWN,
+                                target=replica_id))
+            return scaling_decisions
+
         # Decide if to scale up or down.
         if target_num_replicas > current_num_replicas:
             for _ in range(target_num_replicas - current_num_replicas):
@@ -1822,94 +2436,327 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
         return scaling_decisions
 
+    def _configured_cards_from_profiles(self) -> list[str]:
+        # A controller-provided task catalog is authoritative. In particular,
+        # recent arrivals from the previous service version must not revive a
+        # card that the active version removed. Direct/unit-test construction
+        # has no task catalog and retains the additive fallbacks below.
+        if self.configured_accelerator_shapes:
+            return list(self.configured_accelerator_shapes)
+        cards: list[str] = []
+        seen: set[str] = set()
+        if isinstance(self.target_qps_per_replica, dict):
+            for key in self.target_qps_per_replica:
+                card = key.partition(':')[0]
+                if card.casefold() not in seen:
+                    cards.append(card)
+                    seen.add(card.casefold())
+        for profile in (self.compatibility_profiles +
+                        self.queued_compatibility_profiles):
+            for card in profile['compatible_accelerators']:
+                if card.casefold() not in seen:
+                    cards.append(card)
+                    seen.add(card.casefold())
+        for card in self.min_replicas_by_accelerator:
+            if card.casefold() not in seen:
+                cards.append(card)
+                seen.add(card.casefold())
+        return cards
+
+    def _actuation_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> tuple[dict[str, int], bool]:
+        """Extend an exact QPS demand target with shaped overprovision."""
+        demand_target = self.target_num_replicas_by_accelerator
+        compatibility_complete = (self._compatibility_demand_complete or
+                                  not self.configured_accelerator_shapes)
+        if (not compatibility_complete or
+                sum(demand_target.values()) != self.target_num_replicas):
+            return {}, False
+        final_target = self.get_final_target_num_replicas()
+        if final_target == self.target_num_replicas:
+            return dict(demand_target), True
+
+        cards = self._configured_cards_from_profiles()
+        ready_zero_cost = {card: 0 for card in cards}
+        ready = {card: 0 for card in cards}
+        provisioning = {card: 0 for card in cards}
+        canonical_by_name = {card.casefold(): card for card in cards}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = canonical_by_name.get(raw_card.casefold())
+            if card is None:
+                continue
+            if info.is_ready:
+                ready[card] += 1
+                if bool(getattr(info, 'is_zero_cost', False)):
+                    ready_zero_cost[card] += 1
+            else:
+                provisioning[card] += 1
+        target = _allocate_compatibility_target(
+            configured_cards=cards,
+            capacities={card: 1.0 for card in cards},
+            floors={},
+            min_replicas=final_target,
+            max_replicas=final_target,
+            demand_profiles=[],
+            fixed_work_by_accelerator={
+                card: float(count) for card, count in demand_target.items()
+            },
+            ready_zero_cost=ready_zero_cost,
+            ready=ready,
+            provisioning=provisioning,
+            free_reserved=self.free_reserved_slots_by_accelerator,
+            cold_order=self._cold_paid_card_order(cards))
+        return target, sum(target.values()) == final_target
+
+    def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
+        """Order cold cards by live paid placement cost when available."""
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return list(configured_cards)
+        canonical_by_name = {card.casefold(): card for card in configured_cards}
+        paid_costs: dict[str, float] = {}
+        try:
+            active_locations = placer.active_locations()
+        except Exception:  # pylint: disable=broad-except
+            return list(configured_cards)
+        for location in active_locations:
+            raw_card, gpu_count = self._location_gpu_shape(location)
+            card = canonical_by_name.get(raw_card.casefold())
+            if (card is None or gpu_count != self._configured_gpu_count(card)):
+                continue
+            try:
+                hourly_cost = float(placer.cost_per_hour(location))
+            except Exception:  # pylint: disable=broad-except
+                continue
+            # Zero-cost supply has its own fresh-capacity tier. It must not
+            # make a saturated reserved-only card look like a cold option.
+            if not math.isfinite(hourly_cost) or hourly_cost <= 0:
+                continue
+            paid_costs[card] = min(hourly_cost,
+                                   paid_costs.get(card, float('inf')))
+        service_order = {
+            card: index for index, card in enumerate(configured_cards)
+        }
+        return sorted(configured_cards,
+                      key=lambda card:
+                      (paid_costs.get(card, float('inf')), service_order[card]))
+
+    def _configured_gpu_count(self, card: str) -> int:
+        """Return the service's unique configured GPU count for a card."""
+        for configured, count in self.configured_accelerator_shapes.items():
+            if configured.casefold() == card.casefold():
+                return count
+        if isinstance(self.target_qps_per_replica, dict):
+            prefix = f'{card.casefold()}:'
+            for key in self.target_qps_per_replica:
+                normalized = key.casefold()
+                if normalized == card.casefold():
+                    return 1
+                if normalized.startswith(prefix):
+                    try:
+                        count = int(normalized[len(prefix):])
+                    except ValueError:
+                        continue
+                    if count > 0:
+                        return count
+        return 1
+
+    def _calculate_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        *,
+        include_exact_profiles: bool = True,
+        fallback_aggregate_qps: float | None = None,
+    ) -> dict[str, int]:
+        """Allocate recent demand to exact cards, priority first."""
+        configured_cards = self._configured_cards_from_profiles()
+        floors_by_name = {
+            card.casefold(): floor
+            for card, floor in self.min_replicas_by_accelerator.items()
+        }
+        capacities = {
+            card: self._get_target_qps_for_gpu_shape(
+                card,
+                self._configured_gpu_count(card),
+                version=self.latest_version) for card in configured_cards
+        }
+        ready_zero_cost: dict[str, int] = {card: 0 for card in configured_cards}
+        ready: dict[str, int] = {card: 0 for card in configured_cards}
+        provisioning: dict[str, int] = {card: 0 for card in configured_cards}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            card, _ = self._get_gpu_shape_from_replica_info(info)
+            if card not in ready:
+                continue
+            if info.is_ready:
+                ready[card] += 1
+                if bool(getattr(info, 'is_zero_cost', False)):
+                    ready_zero_cost[card] += 1
+            else:
+                # Every nonterminal non-ready row is committed future
+                # capacity. It prevents duplicate launches, but the decision
+                # path below does not let it authorize scale-down.
+                provisioning[card] += 1
+
+        cold_order = self._cold_paid_card_order(configured_cards)
+        profiles = ([(int(profile['priority']),
+                      tuple(profile['compatible_accelerators']),
+                      float(profile.get('count', 1)) / self.qps_window_size)
+                     for profile in (self.compatibility_profiles +
+                                     self.queued_compatibility_profiles)]
+                    if include_exact_profiles else [])
+        if fallback_aggregate_qps is not None and fallback_aggregate_qps > 0:
+            # Missing/incomplete exact telemetry means every configured card
+            # is compatible. Preserve aggregate demand and let the shared
+            # supply-aware allocator compose it with hard per-card floors.
+            profiles.append(
+                (0, tuple(configured_cards), fallback_aggregate_qps))
+        return _allocate_compatibility_target(
+            configured_cards=configured_cards,
+            capacities=capacities,
+            floors=floors_by_name,
+            min_replicas=self.min_replicas,
+            max_replicas=self.max_replicas,
+            demand_profiles=profiles,
+            fixed_work_by_accelerator={},
+            ready_zero_cost=ready_zero_cost,
+            ready=ready,
+            provisioning=provisioning,
+            free_reserved=self.free_reserved_slots_by_accelerator,
+            cold_order=cold_order)
+
     def _set_target_num_replicas_with_instance_aware_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
         """Set target_num_replicas using instance-aware logic."""
         assert isinstance(self.target_qps_per_replica,
                           dict), 'Expected dict for instance-aware logic'
-        target_qps_dict = self.target_qps_per_replica
-
         num_requests_per_second = len(
             self.request_timestamps) / self.qps_window_size
-
-        # target_num_replicas counts LATEST-version replicas only: the
-        # scale-up/down decisions in _generate_scaling_decisions compare
-        # it against the latest-version population, and during a rolling
-        # update old-version replicas are transitional capacity handled
-        # by the capacity-aware outdated drain. Counting them here made
-        # the two consumers disagree — 100 old + 1 new replica with a
-        # whole-fleet count target of 102 enqueued 101 new launches.
-        latest_capacities = []
-        for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
-                continue
-            capacity = self._get_target_qps_for_gpu_shape(
-                *self._get_gpu_shape_from_replica_info(info),
-                version=info.version)
-            if capacity > 0:
-                latest_capacities.append(capacity)
-        latest_capacities.sort(reverse=True)
-
-        # Pack demand onto the existing latest replicas (largest first),
-        # then size any remaining demand with the best capacity estimate:
-        # the largest LIVE capacity when available — raw max(dict values)
-        # undercounts multi-GPU replicas declared via per-GPU keys (with
-        # {'L4': 0.1} and L4:4 replicas, 0.4 excess QPS would add 4
-        # replicas instead of 1) — falling back to the dict max for an
-        # empty or unresolvable latest fleet so scale-from-zero services
-        # (min_replicas=0) are not stuck at zero with requests pending.
-        # If the estimate is optimistic (the next launch lands a smaller
-        # shape), the next tick simply adds more — brief under-provision
-        # beats a multiple-x over-launch.
-        raw_target_num = 0
-        covered_qps = 0.0
-        for capacity in latest_capacities:
-            raw_target_num += 1
-            covered_qps += capacity
-            if covered_qps > num_requests_per_second:
-                break
-        if covered_qps <= num_requests_per_second:
-            remaining_qps = num_requests_per_second - covered_qps
-            estimated_qps = (latest_capacities[0] if latest_capacities else 0.0)
-            if estimated_qps <= 0:
-                estimated_qps = max(target_qps_dict.values())
-            if estimated_qps > 0 and remaining_qps > 0:
-                raw_target_num += math.ceil(remaining_qps / estimated_qps)
-
-        target_num_replicas = self._clip_target_num_replicas(raw_target_num)
+        candidate_target_by_accelerator: dict[str, int] | None = None
+        latest_capacities: list[float] = []
+        configured_accelerator_shapes = getattr(
+            self, 'configured_accelerator_shapes', {})
+        has_exact_profiles = bool(
+            getattr(self, 'compatibility_profiles', []) or
+            getattr(self, 'queued_compatibility_profiles', []))
+        exact_profiles_available = (
+            has_exact_profiles and
+            (getattr(self, '_compatibility_demand_complete', False) or
+             not configured_accelerator_shapes))
+        exact_arrival_qps = 0.0
+        if exact_profiles_available:
+            exact_arrival_qps = (sum(
+                float(profile.get('count', 1))
+                for profile in getattr(self, 'compatibility_profiles', [])) /
+                                 self.qps_window_size)
+        # Completeness describes the current report and its replaceable
+        # gauges. It cannot retroactively attribute aggregate arrivals from an
+        # earlier incomplete report that are still inside the QPS window.
+        # Preserve that unmatched remainder as all-configured-card demand.
+        aggregate_fallback_qps = max(
+            0.0, num_requests_per_second - exact_arrival_qps)
+        if (configured_accelerator_shapes or exact_profiles_available or
+                getattr(self, 'min_replicas_by_accelerator', {})):
+            candidate_target_by_accelerator = (
+                self._calculate_target_by_accelerator(
+                    replica_infos,
+                    include_exact_profiles=exact_profiles_available,
+                    fallback_aggregate_qps=aggregate_fallback_qps))
+            target_num_replicas = self._clip_target_num_replicas(
+                sum(candidate_target_by_accelerator.values()))
+        else:
+            # Compatibility telemetry is additive and versioned. Preserve the
+            # pre-feature aggregate algorithm for an old LB rather than
+            # inventing card assignments from missing data.
+            target_qps_dict = self.target_qps_per_replica
+            for info in replica_infos:
+                if info.is_terminal or info.version != self.latest_version:
+                    continue
+                capacity = self._get_target_qps_for_gpu_shape(
+                    *self._get_gpu_shape_from_replica_info(info),
+                    version=info.version)
+                if capacity > 0:
+                    latest_capacities.append(capacity)
+            latest_capacities.sort(reverse=True)
+            raw_target_num = 0
+            covered_qps = 0.0
+            for capacity in latest_capacities:
+                raw_target_num += 1
+                covered_qps += capacity
+                if covered_qps > num_requests_per_second:
+                    break
+            if covered_qps <= num_requests_per_second:
+                remaining_qps = num_requests_per_second - covered_qps
+                estimated_qps = (latest_capacities[0]
+                                 if latest_capacities else 0.0)
+                if estimated_qps <= 0:
+                    estimated_qps = max(target_qps_dict.values())
+                if estimated_qps > 0 and remaining_qps > 0:
+                    raw_target_num += math.ceil(remaining_qps / estimated_qps)
+            raw_target_num = max(
+                raw_target_num,
+                sum(getattr(self, 'min_replicas_by_accelerator', {}).values()))
+            target_num_replicas = self._clip_target_num_replicas(raw_target_num)
         logger.info(f'Instance-aware autoscaling: '
                     f'requests/s: {num_requests_per_second}, '
                     f'latest-version capacities: {latest_capacities}, '
+                    'target by accelerator: '
+                    f'{candidate_target_by_accelerator}, '
                     f'target replicas (latest version): '
                     f'{target_num_replicas}')
 
         # Apply hysteresis logic
         old_target_num_replicas = self.target_num_replicas
 
+        target_map_changed = (candidate_target_by_accelerator is not None and
+                              candidate_target_by_accelerator != getattr(
+                                  self, 'target_num_replicas_by_accelerator',
+                                  {}))
+        candidate_target_map = candidate_target_by_accelerator or {}
+        apply_target = False
         if self._snap_target_on_next_recompute:
             # First recompute after an update: apply directly (the base
             # class's post-update snap semantics, but shape-aware).
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
             self.downscale_counter = 0
-            self.target_num_replicas = target_num_replicas
+            apply_target = True
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
-            self.target_num_replicas = target_num_replicas
-        elif target_num_replicas > self.target_num_replicas:
+            apply_target = True
+        elif (target_num_replicas > self.target_num_replicas or
+              (target_map_changed and any(
+                  candidate_target_map.get(card, 0) > getattr(
+                      self, 'target_num_replicas_by_accelerator', {}).get(
+                          card, 0) for card in candidate_target_map))):
             self.upscale_counter += 1
             self.downscale_counter = 0
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
-                self.target_num_replicas = target_num_replicas
-        elif target_num_replicas < self.target_num_replicas:
+                apply_target = True
+        elif (target_num_replicas < self.target_num_replicas or
+              target_map_changed):
             self.downscale_counter += 1
             self.upscale_counter = 0
             if self.downscale_counter >= self.scale_down_threshold:
                 self.downscale_counter = 0
-                self.target_num_replicas = target_num_replicas
+                apply_target = True
         else:
             self.upscale_counter = self.downscale_counter = 0
+        if apply_target:
+            self.target_num_replicas = target_num_replicas
+            # Aggregate fallback deliberately has no exact-card assignment.
+            # Clear an older compatibility map so status and the decision path
+            # cannot reuse a stale shape target after the gauge becomes empty
+            # or an old LB stops publishing compatibility telemetry.
+            self.target_num_replicas_by_accelerator = dict(
+                candidate_target_by_accelerator or {})
 
         logger.info(
             f'Instance-aware: Old target number of replicas: '
@@ -1946,6 +2793,28 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         ]
         if not old_nonterminal:
             return []
+        actuation_target, exact_target_complete = (
+            self._actuation_target_by_accelerator(replica_infos))
+        if exact_target_complete:
+            canonical_by_name = {
+                card.casefold(): card for card in actuation_target
+            }
+            ready_latest_by_card = {card: 0 for card in actuation_target}
+            for info in replica_infos:
+                if info.version != self.latest_version or not info.is_ready:
+                    continue
+                raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                card = canonical_by_name.get(raw_card.casefold())
+                if card is not None:
+                    ready_latest_by_card[card] += 1
+            if any(
+                    ready_latest_by_card.get(card, 0) < target
+                    for card, target in actuation_target.items()):
+                # The latest fleet may satisfy the aggregate count entirely
+                # with the wrong card. Launch the exact replacement first;
+                # retaining all old replicas for one more tick is the only
+                # non-preemptive rollout choice.
+                return []
         num_ready_latest = 0
         ready_latest_capacity = 0.0
         for info in replica_infos:
@@ -2204,6 +3073,21 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
+        with self._instance_state_lock:
+            self._update_version_locked(version, spec, update_mode)
+
+    def update_version_and_accelerator_shapes(
+            self, version: int, spec: 'service_spec.SkyServiceSpec',
+            update_mode: serve_utils.UpdateMode,
+            accelerator_shapes: dict[str, int]) -> None:
+        """Atomically publish a QPS version and its exact-card catalog."""
+        with self._instance_state_lock:
+            self._update_version_locked(version, spec, update_mode)
+            self._set_configured_accelerator_shapes_locked(accelerator_shapes)
+
+    def _update_version_locked(self, version: int,
+                               spec: 'service_spec.SkyServiceSpec',
+                               update_mode: serve_utils.UpdateMode) -> None:
         # Ensure it's a dict and re-assign using setattr to avoid typing.
         # Must happen BEFORE super().update_version: the base class
         # recomputes target_num_replicas via _calculate_target_num_replicas,
@@ -2362,12 +3246,28 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # one-wave replacement incident state.
         self._degraded_capacity_since_by_replica_id: dict[int, float] = {}
         self._logical_state_lock = threading.RLock()
-        self._last_logical_target_state: tuple[int, int, int] | None = None
+        self._last_logical_target_state: (
+            tuple[int, int, int] |
+            tuple[int, int, int, tuple[tuple[str, int], ...],
+                  tuple[tuple[str, int], ...]] | None) = None
         self._gpu_shape_cache: dict[int, tuple[str, int]] = {}
         # Backs the cost-descending victim tiebreak (shed paid spot
         # before zero-cost reserved capacity); pruned with the shape
         # cache each tick.
         self._replica_cost_cache: dict[int, float] = {}
+        # Replaceable exact-card gauges shipped with the authoritative
+        # concurrency report. Running work is attributed separately from the
+        # per-replica in-flight map at decision time, so it remains pinned to
+        # the card already serving it.
+        # Windowed arrival profiles are retained only for a later switch to
+        # QPS autoscaling. Concurrency sizing continues to use aggregate
+        # arrival timestamps solely as its stale-signal scale-up floor.
+        self.compatibility_profiles: list[dict[str, Any]] = []
+        self.queued_compatibility_profiles: list[dict[str, Any]] = []
+        self.rejected_compatibility_profiles: list[dict[str, Any]] = []
+        self.configured_accelerator_shapes: dict[str, int] = {}
+        self.free_reserved_slots_by_accelerator: dict[str, int] = {}
+        self._compatibility_demand_complete: bool = False
         # version -> that version's per-GPU knob. A live replica's
         # capacity is a property of the spec it was launched under: after
         # an update that raises the knob (1 -> 2), sizing old-version
@@ -2398,6 +3298,141 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # the old target during that wait: doing so makes the autoscaler issue
         # scale-down and scale-up intents for opposite demand snapshots.
         self._upscale_pending: bool = False
+        if (self.replica_unit == 'logical' and
+                self.max_scale_up_rate_percentage is not None):
+            # A cold logical service must enter through the configured slot
+            # wave even when its aggregate or per-card floor is larger than
+            # one wave. A rebuilt controller remains fail-closed at zero until
+            # the first complete fresh report, then reconstructs live
+            # committed capacity before applying this same limiter.
+            self.target_num_replicas = 0
+            self.target_num_replicas_by_accelerator = {}
+
+    def set_configured_accelerator_shapes(self, shapes: dict[str, int]) -> None:
+        """Set the active version's authoritative exact-card shapes."""
+        with self._logical_state_lock:
+            self._set_configured_accelerator_shapes_locked(shapes)
+
+    def _set_configured_accelerator_shapes_locked(
+            self, shapes: dict[str, int]) -> None:
+        """Set exact-card shapes while holding the decision-state lock."""
+        previous_shapes = self.configured_accelerator_shapes
+        configured_shapes = {
+            str(card): int(count)
+            for card, count in shapes.items()
+            if isinstance(card, str) and card and isinstance(count, int) and
+            not isinstance(count, bool) and count > 0
+        }
+        catalog_changed = (bool(previous_shapes) and
+                           configured_shapes != previous_shapes)
+        self.configured_accelerator_shapes = configured_shapes
+        if catalog_changed:
+            # Compatibility gauges describe the catalog under which the LB
+            # admitted them. Never reinterpret an A100-only waiter as H100
+            # demand, or an A100:1 target as A100:8 capacity, across an atomic
+            # task-catalog update. The next complete report re-establishes all
+            # replaceable gauges under the new routing version.
+            self.compatibility_profiles = []
+            self.queued_compatibility_profiles = []
+            self.rejected_compatibility_profiles = []
+            self._compatibility_demand_complete = False
+        if not self.configured_accelerator_shapes:
+            self.target_num_replicas_by_accelerator = {}
+            self.compatibility_profiles = []
+            self.queued_compatibility_profiles = []
+            self.rejected_compatibility_profiles = []
+            self.free_reserved_slots_by_accelerator = {}
+            self._compatibility_demand_complete = False
+            return
+        floors = {
+            card.casefold(): floor
+            for card, floor in self.min_replicas_by_accelerator.items()
+        }
+        canonical_target: dict[str, int] = {}
+        remaining = self.target_num_replicas
+        for card in self.configured_accelerator_shapes:
+            floor = min(remaining, int(floors.get(card.casefold(), 0)))
+            if floor > 0:
+                canonical_target[card] = floor
+                remaining -= floor
+        first = next(iter(self.configured_accelerator_shapes))
+        while sum(canonical_target.values()) < self.target_num_replicas:
+            canonical_target[first] = canonical_target.get(first, 0) + 1
+        self.target_num_replicas_by_accelerator = canonical_target
+
+    def set_free_reserved_slots_by_accelerator(self, slots: dict[str,
+                                                                 int]) -> None:
+        """Set fresh unmaterialized reserved supply by exact card."""
+        configured_by_name = {
+            card.casefold(): card
+            for card in self._configured_cards_from_profiles()
+        }
+        normalized: dict[str, int] = {}
+        for raw_card, raw_count in slots.items():
+            card = configured_by_name.get(str(raw_card).casefold())
+            if card is None or isinstance(raw_count, bool):
+                continue
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                normalized[card] = normalized.get(card, 0) + count
+        self.free_reserved_slots_by_accelerator = normalized
+
+    def _configured_cards_from_profiles(self) -> list[str]:
+        if self.configured_accelerator_shapes:
+            return list(self.configured_accelerator_shapes)
+        cards: list[str] = []
+        seen: set[str] = set()
+        for profile in (self.queued_compatibility_profiles +
+                        self.rejected_compatibility_profiles):
+            for card in profile['compatible_accelerators']:
+                if card.casefold() not in seen:
+                    cards.append(card)
+                    seen.add(card.casefold())
+        for card in self.min_replicas_by_accelerator:
+            if card.casefold() not in seen:
+                cards.append(card)
+                seen.add(card.casefold())
+        return cards
+
+    def _configured_gpu_count(self, card: str) -> int:
+        for configured, count in self.configured_accelerator_shapes.items():
+            if configured.casefold() == card.casefold():
+                return count
+        return 1
+
+    def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
+        """Order cold cards by live paid placement cost when available."""
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return list(configured_cards)
+        canonical_by_name = {card.casefold(): card for card in configured_cards}
+        paid_costs: dict[str, float] = {}
+        try:
+            active_locations = placer.active_locations()
+        except Exception:  # pylint: disable=broad-except
+            return list(configured_cards)
+        for location in active_locations:
+            raw_card, gpu_count = self._location_gpu_shape(location)
+            card = canonical_by_name.get(raw_card.casefold())
+            if (card is None or gpu_count != self._configured_gpu_count(card)):
+                continue
+            try:
+                hourly_cost = float(placer.cost_per_hour(location))
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if not math.isfinite(hourly_cost) or hourly_cost <= 0:
+                continue
+            paid_costs[card] = min(hourly_cost,
+                                   paid_costs.get(card, float('inf')))
+        service_order = {
+            card: index for index, card in enumerate(configured_cards)
+        }
+        return sorted(configured_cards,
+                      key=lambda card:
+                      (paid_costs.get(card, float('inf')), service_order[card]))
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
@@ -2436,7 +3471,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return self._reconcile_generation
 
     @property
-    def logical_target_state(self) -> tuple[int, int, int] | None:
+    def logical_target_state(
+        self,
+    ) -> (tuple[int, int, int] | tuple[int, int, int, tuple[tuple[
+            str, int], ...], tuple[tuple[str, int], ...]] | None):
         """Version, report generation, and target from the last full tick."""
         with self._logical_state_lock:
             return self._last_logical_target_state
@@ -2512,6 +3550,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         index = bisect.bisect_left(self.request_timestamps,
                                    current_time - self.qps_window_size)
         self.request_timestamps = self.request_timestamps[index:]
+        self.compatibility_profiles = [
+            profile for profile in self.compatibility_profiles
+            if profile['timestamp'] >= current_time - self.qps_window_size
+        ]
 
         in_flight = request_aggregator_info.get('in_flight_by_replica_id')
         if in_flight is None:
@@ -2520,6 +3562,23 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # ages out on its own; overwriting it with nothing would
             # discard a still-fresh signal.
             return
+        compatibility_complete = (
+            bool(self.configured_accelerator_shapes) and
+            request_aggregator_info.get('compatibility_demand_complete')
+            is True)
+        if compatibility_complete:
+            self.compatibility_profiles.extend(
+                self._parse_compatibility_arrivals(
+                    request_aggregator_info.get('compatibility_profiles', [])))
+            self.queued_compatibility_profiles = (
+                self._parse_compatibility_gauge(
+                    request_aggregator_info.get(
+                        'queued_requests_by_compatibility', [])))
+            self.rejected_compatibility_profiles = (
+                self._parse_compatibility_gauge(request_aggregator_info.get(
+                    'rejected_requests_by_compatibility', []),
+                                                include_recent_count=True))
+        self._compatibility_demand_complete = compatibility_complete
         # Normalize keys/values: the controller builds this dict
         # in-process today, but a defensive int() keeps us safe if it is
         # ever rebuilt from a JSON round-trip (string keys).
@@ -2648,6 +3707,75 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     f'requests in the last {self.qps_window_size}s: '
                     f'{len(self.request_timestamps)}')
 
+    @staticmethod
+    def _parse_compatibility_arrivals(
+            raw_profiles: Any) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        if not isinstance(raw_profiles, list):
+            return profiles
+        for raw in raw_profiles:
+            if not isinstance(raw, dict):
+                continue
+            timestamp = raw.get('timestamp')
+            priority = raw.get('priority')
+            accelerators = raw.get('compatible_accelerators')
+            count = raw.get('count', 1)
+            if (not isinstance(timestamp,
+                               (int, float)) or isinstance(timestamp, bool) or
+                    not math.isfinite(timestamp) or timestamp < 0 or
+                    not isinstance(priority, int) or
+                    isinstance(priority, bool) or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not all(
+                        isinstance(card, str) and card for card in accelerators)
+                    or not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1):
+                continue
+            profiles.append({
+                'timestamp': float(timestamp),
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'count': count,
+            })
+        return profiles
+
+    @staticmethod
+    def _parse_compatibility_gauge(
+        raw_profiles: Any,
+        *,
+        include_recent_count: bool = False,
+    ) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        if not isinstance(raw_profiles, list):
+            return profiles
+        for raw in raw_profiles:
+            if not isinstance(raw, dict):
+                continue
+            priority = raw.get('priority')
+            accelerators = raw.get('compatible_accelerators')
+            count = raw.get('count', 1)
+            recent_count = raw.get('recent_count')
+            if (not isinstance(priority, int) or isinstance(priority, bool) or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not all(
+                        isinstance(card, str) and card for card in accelerators)
+                    or not isinstance(count, int) or isinstance(count, bool) or
+                    count < 1):
+                continue
+            profile: dict[str, Any] = {
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'count': count,
+            }
+            if include_recent_count:
+                if (not isinstance(recent_count, int) or
+                        isinstance(recent_count, bool) or recent_count < 0 or
+                        recent_count > count):
+                    continue
+                profile['recent_count'] = recent_count
+            profiles.append(profile)
+        return profiles
+
     def _get_knob_for_version(self, version: int) -> float:
         """The per-GPU knob a given service version was launched under.
 
@@ -2768,6 +3896,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return (self.target_concurrency_per_replica *
                 self.target_utilization_percentage / 100.0)
 
+    def _clip_concurrency_demand_target(self, target: int) -> int:
+        """Clip demand, allowing a logical wave to approach floors."""
+        if (self.replica_unit == 'logical' and
+                self.max_scale_up_rate_percentage is not None):
+            return max(0, min(self.max_replicas, target))
+        return self._clip_target_num_replicas(target)
+
     def _priority_timeout(self, priority: int) -> float | None:
         timeout = self._queue_timeout_seconds
         for min_priority, threshold_timeout in self._queue_timeout_thresholds:
@@ -2850,7 +3985,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> int:
-        """Latest-version planned slots not already leaving the fleet."""
+        """Latest-version planned slots, from every launch origin."""
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
@@ -2858,22 +3993,54 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             (not info.is_terminal and info.version == self.latest_version and
              getattr(info.status_property, 'is_scale_down', False) is not True))
 
+    def _latest_demand_owned_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Latest-version planned slots whose launch origin was demand.
+
+        ``reserved_fill`` is launch-origin attribution, not placement-cost
+        provenance. A demand launch remains demand-owned when it lands on a
+        zero-cost location. Legacy rows missing the additive flag default to
+        demand-owned, which is the conservative compatibility direction.
+        """
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if (not info.is_terminal and info.version == self.latest_version and
+                getattr(info.status_property, 'is_scale_down', False)
+                is not True and not getattr(info, 'reserved_fill', False)))
+
     def _limit_logical_scale_up(
         self,
         raw_target: int,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> int:
         """Bound one demand-driven target increase to a configured wave."""
+        budget = self._logical_scale_up_budget(replica_infos)
+        if budget is None:
+            return raw_target
+        if budget == 0:
+            return self.target_num_replicas
+        committed = self._latest_committed_logical_capacity(replica_infos)
+        return max(self.target_num_replicas, min(raw_target,
+                                                 committed + budget))
+
+    def _logical_scale_up_budget(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int | None:
+        """Return this tick's slot budget, zero in cooldown, or no limit."""
         if (self.replica_unit != 'logical' or
                 self.max_scale_up_rate_percentage is None):
-            return raw_target
+            return None
         assert self.scale_up_rate_min_replicas is not None
         assert self.scale_up_rate_period_seconds is not None
         now = time.time()
         if (self._last_scale_up_wave_at is not None and
                 now - self._last_scale_up_wave_at
                 < self.scale_up_rate_period_seconds):
-            return self.target_num_replicas
+            return 0
         committed = self._latest_committed_logical_capacity(replica_infos)
         rate_percentage = self.max_scale_up_rate_percentage
         min_replicas = self.scale_up_rate_min_replicas
@@ -2884,8 +4051,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             min_replicas = self.adaptive_scale_up['scale_up_rate_min_replicas']
         assert rate_percentage is not None
         assert min_replicas is not None
-        step = max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
-        return max(self.target_num_replicas, min(raw_target, committed + step))
+        return max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
 
     def _adopt_scale_up_target(
         self,
@@ -2916,7 +4082,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     ) -> int:
         if self.replica_unit != 'logical':
             return raw_target
-        committed = self._latest_committed_logical_capacity(replica_infos)
+        committed = self._latest_demand_owned_logical_capacity(replica_infos)
         allowance = max(
             1,
             math.ceil(committed * self.max_scale_down_rate_percentage / 100.0))
@@ -2939,6 +4105,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 info.status in provisioning_statuses and getattr(
                     info.status_property, 'is_scale_down', False) is not True))
 
+    def _provisioning_demand_owned_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Demand-owned subset of provisioning logical capacity."""
+        provisioning_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+        }
+        return sum(
+            self._committed_capacity(info)
+            for info in replica_infos
+            if (not info.is_terminal and info.version == self.latest_version and
+                info.status in provisioning_statuses and
+                getattr(info.status_property, 'is_scale_down', False)
+                is not True and not getattr(info, 'reserved_fill', False)))
+
     def _adopt_scale_down_target(
         self,
         raw_target: int,
@@ -2949,7 +4133,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return
         self.target_num_replicas = self._limit_logical_scale_down(
             raw_target, replica_infos)
-        provisioning = self._provisioning_logical_capacity(replica_infos)
+        provisioning = self._provisioning_demand_owned_logical_capacity(
+            replica_infos)
         allowance = (max(
             1,
             math.ceil(provisioning * self.max_scale_down_rate_percentage /
@@ -3070,6 +4255,322 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._weighted_queue_work + self._rejected_concurrency +
             unknown_floor)
 
+    def _fixed_concurrency_work_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> tuple[dict[str, float], bool]:
+        """Attribute running and unknown work to its non-preemptible card."""
+        assert self._in_flight_by_replica_id is not None
+        infos_by_id = {
+            info.replica_id: info
+            for info in replica_infos
+            if not info.is_terminal
+        }
+        configured_by_name = {
+            card.casefold(): card
+            for card in self._configured_cards_from_profiles()
+        }
+        fixed: dict[str, float] = {}
+        complete = True
+
+        def add(replica_id: int, work: float, destination: dict[str,
+                                                                float]) -> None:
+            nonlocal complete
+            info = infos_by_id.get(replica_id)
+            if info is None:
+                complete = False
+                return
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = configured_by_name.get(raw_card.casefold())
+            if card is None:
+                complete = False
+                return
+            destination[card] = destination.get(card, 0.0) + max(0.0, work)
+
+        for replica_id, count in self._in_flight_by_replica_id.items():
+            add(replica_id, float(count), fixed)
+
+        original_unknown: dict[str, float] = {}
+        replacement_unknown: dict[str, float] = {}
+        for replica_id in self._unknown_in_flight_replica_ids:
+            info = infos_by_id.get(replica_id)
+            if info is None:
+                complete = False
+                continue
+            destination = (replacement_unknown if getattr(
+                info, 'unknown_capacity_replacement', False) is True else
+                           original_unknown)
+            add(replica_id, self._replica_capacity(info), destination)
+        # Mirror _outstanding_work(): an uncertain bounded replacement wave
+        # overlaps its original, so only the larger side contributes.
+        unknown = (replacement_unknown if sum(replacement_unknown.values())
+                   > sum(original_unknown.values()) else original_unknown)
+        for card, work in unknown.items():
+            fixed[card] = fixed.get(card, 0.0) + work
+        return fixed, complete
+
+    def _rejected_compatibility_work(
+            self) -> list[tuple[int, tuple[str, ...], float]]:
+        """Distribute aggregate rejection work without changing its total."""
+        raw: list[tuple[int, tuple[str, ...], float]] = []
+        for profile in self.rejected_compatibility_profiles:
+            count = int(profile['count'])
+            if (self.replica_unit != 'logical' or
+                    self.expected_request_duration_seconds is None):
+                work = float(count)
+            else:
+                duration = self.expected_request_duration_seconds
+                retained = (count * duration /
+                            constants.LB_REJECT_WINDOW_SECONDS)
+                recent = (int(profile.get('recent_count', 0)) * duration /
+                          self.qps_window_size)
+                work = max(retained, recent)
+            raw.append((int(profile['priority']),
+                        tuple(profile['compatible_accelerators']), work))
+        aggregate = self._rejected_work()
+        raw_total = sum(work for _, _, work in raw)
+        if raw_total <= 0:
+            return []
+        scale = aggregate / raw_total
+        return [(priority, compatible, work * scale)
+                for priority, compatible, work in raw]
+
+    def _calculate_concurrency_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        *,
+        target_ceiling: int | None = None,
+    ) -> tuple[dict[str, int], bool]:
+        """Allocate the concurrency target in physical or logical units."""
+        configured_cards = self._configured_cards_from_profiles()
+        if not configured_cards:
+            return {}, False
+        if self.replica_unit == 'logical':
+            capacity_per_card = {
+                card: self._effective_logical_capacity_per_gpu()
+                for card in configured_cards
+            }
+        else:
+            capacity_per_card = {
+                card: (self.target_concurrency_per_replica *
+                       self._configured_gpu_count(card)
+                      ) for card in configured_cards
+            }
+        ready_zero_cost = {card: 0 for card in configured_cards}
+        ready = {card: 0 for card in configured_cards}
+        provisioning = {card: 0 for card in configured_cards}
+        canonical_by_name = {card.casefold(): card for card in configured_cards}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = canonical_by_name.get(raw_card.casefold())
+            if card is None:
+                continue
+            width = (max(1, int(self._replica_capacity(info)))
+                     if self.replica_unit == 'logical' else 1)
+            if info.is_ready:
+                ready[card] += width
+                if bool(getattr(info, 'is_zero_cost', False)):
+                    ready_zero_cost[card] += width
+            else:
+                provisioning[card] += width
+
+        profiles = [(int(profile['priority']),
+                     tuple(profile['compatible_accelerators']),
+                     float(profile['count']))
+                    for profile in self.queued_compatibility_profiles]
+        queue_profile_total = sum(work for _, _, work in profiles)
+        default_compatible = tuple(configured_cards)
+        if self._queue_depth > queue_profile_total:
+            profiles.append(
+                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
+                 self._queue_depth - queue_profile_total))
+        rejected_profiles = self._rejected_compatibility_work()
+        profiles.extend(rejected_profiles)
+        rejected_profile_total = sum(work for _, _, work in rejected_profiles)
+        rejected_total = self._rejected_work()
+        if rejected_total > rejected_profile_total:
+            profiles.append(
+                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
+                 rejected_total - rejected_profile_total))
+        fixed, attribution_complete = (
+            self._fixed_concurrency_work_by_accelerator(replica_infos))
+        floors = {
+            card.casefold(): int(floor)
+            for card, floor in self.min_replicas_by_accelerator.items()
+        }
+        free_reserved = dict(self.free_reserved_slots_by_accelerator)
+        if self.replica_unit == 'logical':
+            free_reserved = {
+                card: count * self._configured_gpu_count(card)
+                for card, count in free_reserved.items()
+            }
+        ceiling = (self.max_replicas if target_ceiling is None else min(
+            self.max_replicas, target_ceiling))
+        target = _allocate_compatibility_target(
+            configured_cards=configured_cards,
+            capacities=capacity_per_card,
+            floors=floors,
+            min_replicas=min(self.min_replicas, ceiling),
+            max_replicas=ceiling,
+            demand_profiles=profiles,
+            fixed_work_by_accelerator=fixed,
+            ready_zero_cost=ready_zero_cost,
+            ready=ready,
+            provisioning=provisioning,
+            free_reserved=free_reserved,
+            cold_order=self._cold_paid_card_order(configured_cards))
+        return target, attribution_complete
+
+    def _logical_committed_capacity_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> dict[str, int]:
+        """Return latest-version committed logical slots by exact card."""
+        configured_by_name = {
+            card.casefold(): card
+            for card in self._configured_cards_from_profiles()
+        }
+        committed: dict[str, int] = {}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = configured_by_name.get(raw_card.casefold())
+            if card is None:
+                continue
+            committed[card] = (committed.get(card, 0) +
+                               self._committed_capacity(info))
+        return committed
+
+    def _limit_logical_card_transition(
+        self,
+        desired: dict[str, int],
+        previous: dict[str, int],
+        previous_target: int,
+        target: int,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        wave_budget: int | None,
+    ) -> tuple[dict[str, int], int]:
+        """Move an exact-card target without bypassing slot wave limits.
+
+        A card migration keeps the aggregate demand target constant, so the
+        aggregate wave limiter cannot see it. Limit positive per-card deltas
+        explicitly, retaining the corresponding old-card target until the new
+        slots are authorized. The actuation path separately waits for those
+        slots to become ready before retiring the old card.
+        """
+        if wave_budget is None and sum(desired.values()) == target:
+            return desired, 0
+        cards = self._configured_cards_from_profiles()
+        if sum(previous.values()) == previous_target:
+            current = {
+                card: max(0, int(previous.get(card, 0))) for card in cards
+            }
+        else:
+            # Rebuild a conservative transition baseline after a controller
+            # restart, when the in-memory card target is not durable. Existing
+            # committed slots are preferred, bounded by the adopted aggregate.
+            current = {card: 0 for card in cards}
+            remaining = max(0, previous_target)
+            committed = self._logical_committed_capacity_by_accelerator(
+                replica_infos)
+            for card in cards:
+                kept = min(remaining, committed.get(card, 0))
+                current[card] = kept
+                remaining -= kept
+            if remaining > 0 and cards:
+                fallback = self._cold_paid_card_order(cards)[0]
+                current[fallback] += remaining
+
+        additions_left = (sum(
+            max(0,
+                desired.get(card, 0) - current.get(card, 0))
+            for card in cards) if wave_budget is None else max(0, wave_budget))
+        added = 0
+        for card in cards:
+            increase = max(0, desired.get(card, 0) - current.get(card, 0))
+            accepted = min(increase, additions_left)
+            current[card] = current.get(card, 0) + accepted
+            additions_left -= accepted
+            added += accepted
+
+        # A target-map reduction is only an intent. The decision generator
+        # still proves replacement readiness and per-card coverage before it
+        # emits any idle victim, so balancing the map here is non-preemptive.
+        excess = max(0, sum(current.values()) - target)
+        for card in reversed(cards):
+            removable = max(0, current.get(card, 0) - desired.get(card, 0))
+            removed = min(excess, removable)
+            current[card] -= removed
+            excess -= removed
+            if excess == 0:
+                break
+
+        limited = {card: count for card, count in current.items() if count > 0}
+        if sum(limited.values()) != target:
+            # Defensive fail closed. A valid aggregate wave always leaves
+            # enough positive desired deltas to reach its own target.
+            return previous, 0
+        return limited, added
+
+    def _actuation_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> tuple[dict[str, int], bool]:
+        """Return a shaped target including the generic overprovision count."""
+        demand_target = self.target_num_replicas_by_accelerator
+        if (not self._compatibility_demand_complete or
+                sum(demand_target.values()) != self.target_num_replicas):
+            return {}, False
+        final_target = self.get_final_target_num_replicas()
+        if final_target == self.target_num_replicas:
+            return dict(demand_target), True
+
+        cards = self._configured_cards_from_profiles()
+        ready_zero_cost = {card: 0 for card in cards}
+        ready = {card: 0 for card in cards}
+        provisioning = {card: 0 for card in cards}
+        canonical_by_name = {card.casefold(): card for card in cards}
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = canonical_by_name.get(raw_card.casefold())
+            if card is None:
+                continue
+            width = (max(1, int(self._replica_capacity(info)))
+                     if self.replica_unit == 'logical' else 1)
+            if info.is_ready:
+                ready[card] += width
+                if bool(getattr(info, 'is_zero_cost', False)):
+                    ready_zero_cost[card] += width
+            else:
+                provisioning[card] += width
+        free_reserved = dict(self.free_reserved_slots_by_accelerator)
+        if self.replica_unit == 'logical':
+            free_reserved = {
+                card: count * self._configured_gpu_count(card)
+                for card, count in free_reserved.items()
+            }
+        target = _allocate_compatibility_target(
+            configured_cards=cards,
+            capacities={card: 1.0 for card in cards},
+            floors={},
+            min_replicas=final_target,
+            max_replicas=final_target,
+            demand_profiles=[],
+            fixed_work_by_accelerator={
+                card: float(count) for card, count in demand_target.items()
+            },
+            ready_zero_cost=ready_zero_cost,
+            ready=ready,
+            provisioning=provisioning,
+            free_reserved=free_reserved,
+            cold_order=self._cold_paid_card_order(cards))
+        return target, sum(target.values()) == final_target
+
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
         """Recompute target_num_replicas for this tick.
@@ -3139,6 +4640,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             f'target at {self.target_num_replicas}.')
             return
 
+        if (self.configured_accelerator_shapes and
+                not self._compatibility_demand_complete):
+            # Mixed controller/LB rollout: aggregate gauges are fresh, but a
+            # card assignment is not. Keep the prior target and leave the
+            # one-shot restart fence armed. This prevents both an unshaped
+            # launch and a card-blind downscale until the new active LB has
+            # reported every replaceable compatibility gauge.
+            logger.info(
+                'Concurrency compatibility gauges incomplete: '
+                'holding exact-card target at %s.',
+                self.target_num_replicas_by_accelerator)
+            return
+
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
             raw_target_num = math.ceil(outstanding / best_capacity)
@@ -3160,23 +4674,79 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if best_capacity > 0:
                     raw_target_num += math.ceil(remaining / best_capacity)
 
-        target_num_replicas = self._clip_target_num_replicas(raw_target_num)
+        candidate_target_by_accelerator: dict[str, int] | None = None
+        if self._compatibility_demand_complete:
+            candidate, attribution_complete = (
+                self._calculate_concurrency_target_by_accelerator(replica_infos)
+            )
+            if attribution_complete:
+                candidate_target_by_accelerator = candidate
+                # Compatibility constraints can require a different physical
+                # packing than the aggregate best-capacity estimate. Logical
+                # mode has uniform slot capacity and therefore remains equal.
+                raw_target_num = sum(candidate.values())
+
+        target_num_replicas = self._clip_concurrency_demand_target(
+            raw_target_num)
         self._raw_target_num_replicas = target_num_replicas
         if (self.replica_unit == 'logical' and
                 self._snap_target_on_next_recompute):
             # The adopted target is controller-local and rebuilds at
-            # min_replicas, while the latest-version fleet may already be much
-            # larger. Re-establish that committed fleet as the actuation
-            # baseline once, before applying hysteresis and the downscale limit.
+            # min_replicas, while the latest-version demand-owned fleet may
+            # already be much larger. Re-establish that traffic fleet as the
+            # actuation baseline once, before applying hysteresis and the
+            # downscale limit. Fill-origin rows remain independently protected
+            # by the reserved-capacity overlay; including them here would turn
+            # opportunistic supply into paid replacement demand.
             # Otherwise the first fresh report after a restart can publish a
             # tiny target and retire the whole live fleet in one tick. Do not
             # repeat this after the one-shot snap: an adopted downscale target
             # must remain below committed capacity while retirement catches up.
-            committed = self._latest_committed_logical_capacity(replica_infos)
+            committed = self._latest_demand_owned_logical_capacity(
+                replica_infos)
             self.target_num_replicas = max(
                 self.target_num_replicas,
-                self._clip_target_num_replicas(committed))
+                self._clip_concurrency_demand_target(committed))
         old_target_num_replicas = self.target_num_replicas
+        old_target_by_accelerator = dict(
+            self.target_num_replicas_by_accelerator)
+        logical_wave_budget = self._logical_scale_up_budget(replica_infos)
+        if (self.replica_unit == 'logical' and
+                candidate_target_by_accelerator is not None and
+                sum(old_target_by_accelerator.values())
+                != old_target_num_replicas):
+            # A rebuilt controller reconstructs the aggregate safety target
+            # from committed capacity, while its process-local exact-card map
+            # starts empty. Seed a map that explains that held aggregate
+            # before comparing card deltas. Otherwise the first non-empty
+            # candidate looks like a card increase on every tick: the
+            # scale-up branch repeatedly resets downscale hysteresis, but its
+            # lower aggregate cannot replace the held restart target, leaving
+            # exact-card actuation disabled indefinitely.
+            recovered_map, recovered_card_slots = (
+                self._limit_logical_card_transition(
+                    candidate_target_by_accelerator, old_target_by_accelerator,
+                    old_target_num_replicas, old_target_num_replicas,
+                    replica_infos, logical_wave_budget))
+            if sum(recovered_map.values()) == old_target_num_replicas:
+                self.target_num_replicas_by_accelerator = recovered_map
+                old_target_by_accelerator = dict(recovered_map)
+                if (recovered_card_slots > 0 and
+                        self.max_scale_up_rate_percentage is not None):
+                    self._last_scale_up_wave_at = time.time()
+                    assert logical_wave_budget is not None
+                    logical_wave_budget = max(
+                        0, logical_wave_budget - recovered_card_slots)
+        target_map_changed = (candidate_target_by_accelerator is not None and
+                              candidate_target_by_accelerator
+                              != old_target_by_accelerator)
+        target_map_increases = False
+        if target_map_changed and candidate_target_by_accelerator is not None:
+            target_map_increases = any(
+                candidate_target_by_accelerator.get(card, 0) >
+                old_target_by_accelerator.get(card, 0)
+                for card in candidate_target_by_accelerator)
+        apply_target = False
 
         if self._snap_target_on_next_recompute:
             # First recompute with fresh data after construction or an update:
@@ -3190,18 +4760,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._downscale_veto_streak = 0
             if target_num_replicas >= self.target_num_replicas:
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
+                apply_target = True
             else:
                 if self._downscale_hysteresis_elapsed():
                     if not self._consume_downscale_pressure_veto():
                         self._reset_downscale_hysteresis()
                         self._adopt_scale_down_target(target_num_replicas,
                                                       replica_infos)
+                        apply_target = True
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
             self._reset_downscale_hysteresis()
             self._downscale_veto_streak = 0
             self._adopt_scale_up_target(target_num_replicas, replica_infos)
-        elif target_num_replicas > self.target_num_replicas:
+            apply_target = True
+        elif (target_num_replicas > self.target_num_replicas or
+              target_map_increases):
             self.upscale_counter += 1
             self._reset_downscale_hysteresis()
             # A rising raw target ends the downscale episode: the next
@@ -3210,19 +4784,46 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
-        elif target_num_replicas < self.target_num_replicas:
+                apply_target = True
+        elif (target_num_replicas < self.target_num_replicas or
+              target_map_changed):
             self.upscale_counter = 0
             if self._downscale_hysteresis_elapsed():
                 if not self._consume_downscale_pressure_veto():
                     self._reset_downscale_hysteresis()
                     self._adopt_scale_down_target(target_num_replicas,
                                                   replica_infos)
+                    apply_target = True
         else:
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
             self._downscale_veto_streak = 0
 
-        self._upscale_pending = (target_num_replicas > self.target_num_replicas)
+        if apply_target and candidate_target_by_accelerator is not None:
+            adopted_map, attribution_complete = (
+                self._calculate_concurrency_target_by_accelerator(
+                    replica_infos, target_ceiling=self.target_num_replicas))
+            if attribution_complete and self.replica_unit == 'logical':
+                adopted_map, added_card_slots = (
+                    self._limit_logical_card_transition(
+                        adopted_map, old_target_by_accelerator,
+                        old_target_num_replicas, self.target_num_replicas,
+                        replica_infos, logical_wave_budget))
+            else:
+                added_card_slots = 0
+            if (attribution_complete and
+                    sum(adopted_map.values()) == self.target_num_replicas):
+                self.target_num_replicas_by_accelerator = adopted_map
+                if (added_card_slots > 0 and
+                        self.max_scale_up_rate_percentage is not None):
+                    self._last_scale_up_wave_at = time.time()
+
+        self._upscale_pending = (
+            target_num_replicas > self.target_num_replicas or
+            (candidate_target_by_accelerator is not None and any(
+                candidate_target_by_accelerator.get(card, 0) >
+                self.target_num_replicas_by_accelerator.get(card, 0)
+                for card in candidate_target_by_accelerator)))
 
         if self.replica_unit == 'logical':
             downscale_status = (
@@ -3238,6 +4839,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             f'Old target number of replicas: {old_target_num_replicas}. '
             f'Current target number of replicas: {target_num_replicas}. '
             f'Final target number of replicas: {self.target_num_replicas}. '
+            f'Target by accelerator: '
+            f'{self.target_num_replicas_by_accelerator}. '
             f'Upscale counter: {self.upscale_counter}/'
             f'{self.scale_up_threshold}. '
             f'{downscale_status}')
@@ -3285,9 +4888,27 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 return decisions
             fenced: list[AutoscalerDecision] = []
             target = self.get_final_target_num_replicas()
-            self._last_logical_target_state = (self.latest_version,
-                                               self._reconcile_generation,
-                                               target)
+            target_by_card, use_card_targets = (
+                self._actuation_target_by_accelerator(replica_infos))
+            target_by_card_state = (tuple(target_by_card.items())
+                                    if use_card_targets else ())
+            shape_state = (tuple(self.configured_accelerator_shapes.items())
+                           if use_card_targets else ())
+            if self.configured_accelerator_shapes and not use_card_targets:
+                # An authoritative exact-card catalog without a complete
+                # compatibility report cannot safely authorize aggregate-only
+                # retirement. None tells the controller to revoke any target
+                # published by an earlier complete generation.
+                self._last_logical_target_state = None
+            elif use_card_targets:
+                self._last_logical_target_state = (self.latest_version,
+                                                   self._reconcile_generation,
+                                                   target, target_by_card_state,
+                                                   shape_state)
+            else:
+                self._last_logical_target_state = (self.latest_version,
+                                                   self._reconcile_generation,
+                                                   target)
             for decision in decisions:
                 if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN
                         and isinstance(decision.target, int)):
@@ -3299,7 +4920,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             version=self.latest_version,
                             reconcile_generation=self._reconcile_generation,
                             target_capacity=target,
-                            replica_id=decision.target),
+                            replica_id=decision.target,
+                            target_capacity_by_accelerator=(
+                                target_by_card_state),
+                            accelerator_shapes=shape_state),
                         reason=decision.reason)
                 fenced.append(decision)
             return fenced
@@ -3318,6 +4942,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                        update_mode: serve_utils.UpdateMode) -> None:
         with self._logical_state_lock:
             self._update_version_locked(version, spec, update_mode)
+
+    def update_version_and_accelerator_shapes(
+            self, version: int, spec: 'service_spec.SkyServiceSpec',
+            update_mode: serve_utils.UpdateMode,
+            accelerator_shapes: dict[str, int]) -> None:
+        """Atomically publish a version and its exact-card policy state."""
+        with self._logical_state_lock:
+            self._update_version_locked(version, spec, update_mode)
+            self._set_configured_accelerator_shapes_locked(accelerator_shapes)
 
     def _update_version_locked(self, version: int,
                                spec: 'service_spec.SkyServiceSpec',
@@ -3369,9 +5002,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # intent.  The new version has no committed capacity yet, so
             # carrying that target across the update would let its first
             # reconciliation bypass the scale-up wave and launch the whole
-            # inherited target from zero.  Start at the new minimum; the next
-            # fresh or stale recompute authorizes at most one configured wave.
-            self.target_num_replicas = self.min_replicas
+            # inherited target from zero. Start from a cold zero baseline; the
+            # next fresh or stale recompute authorizes at most one configured
+            # wave, including any aggregate or per-card floor.
+            self.target_num_replicas = 0
+            self.target_num_replicas_by_accelerator = {}
         self._snap_target_on_next_recompute = True
         self._last_logical_target_state = None
 
@@ -3396,6 +5031,33 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         if not self._fresh_for_tick():
             return []
+        target_by_card, use_card_targets = (
+            self._actuation_target_by_accelerator(replica_infos))
+        if use_card_targets:
+            canonical_by_name = {
+                card.casefold(): card
+                for card in self._configured_cards_from_profiles()
+            }
+            ready_latest_by_card = {card: 0 for card in target_by_card}
+            for info in replica_infos:
+                if info.version != self.latest_version or not info.is_ready:
+                    continue
+                raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                card = canonical_by_name.get(raw_card.casefold())
+                if card is None:
+                    continue
+                width = (self._ready_capacity(info)
+                         if self.replica_unit == 'logical' else 1)
+                ready_latest_by_card[card] = (
+                    ready_latest_by_card.get(card, 0) + width)
+            if any(
+                    ready_latest_by_card.get(card, 0) < target
+                    for card, target in target_by_card.items()):
+                logger.info(
+                    'Concurrency rolling drain waiting for '
+                    'latest-version exact-card coverage: ready=%s, '
+                    'target=%s.', ready_latest_by_card, target_by_card)
+                return []
         if (self.replica_unit == 'logical' and
                 self.update_mode == serve_utils.UpdateMode.ROLLING):
             old_nonterminal = [
@@ -3562,6 +5224,77 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         scaling_decisions: list[AutoscalerDecision] = []
         target_num_replicas = self.get_final_target_num_replicas()
         current_num_replicas = len(latest_nonterminal_replicas)
+        target_by_card, use_card_targets = (
+            self._actuation_target_by_accelerator(replica_infos))
+        if use_card_targets:
+            replicas_by_card: dict[str, list[replica_managers.ReplicaInfo]] = {}
+            ready_by_card: dict[str, int] = {}
+            canonical_by_name = {
+                card.casefold(): card
+                for card in self._configured_cards_from_profiles()
+            }
+            for info in latest_nonterminal_replicas:
+                raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                card = canonical_by_name.get(raw_card.casefold())
+                if card is None:
+                    continue
+                replicas_by_card.setdefault(card, []).append(info)
+                if info.is_ready:
+                    ready_by_card[card] = ready_by_card.get(card, 0) + 1
+            shortages = {
+                card: max(0, target - len(replicas_by_card.get(card, [])))
+                for card, target in target_by_card.items()
+            }
+            if any(shortages.values()):
+                for card, shortage in shortages.items():
+                    for _ in range(shortage):
+                        scaling_decisions.append(
+                            AutoscalerDecision(
+                                AutoscalerDecisionOperator.SCALE_UP,
+                                target={
+                                    'accelerators': {
+                                        card: self._configured_gpu_count(card)
+                                    }
+                                }))
+                # Do not retire excess old-card capacity until every target
+                # card is actually ready. This is a non-preemptive migration.
+                return scaling_decisions
+            if not self._compatibility_demand_complete:
+                return scaling_decisions
+            if not self._fresh_for_tick():
+                logger.info('Concurrency autoscaler signal-stale: '
+                            'suppressing exact-card scale-down decisions.')
+                return scaling_decisions
+            if self._upscale_pending:
+                logger.info(
+                    'Concurrency autoscaler suppressing exact-card '
+                    'scale-down while an upscale is pending hysteresis.')
+                return scaling_decisions
+            all_targets_ready = all(
+                ready_by_card.get(card, 0) >= target
+                for card, target in target_by_card.items())
+            if all_targets_ready:
+                for card, replicas in replicas_by_card.items():
+                    excess = max(0, len(replicas) - target_by_card.get(card, 0))
+                    if excess <= 0:
+                        continue
+                    eligible = [
+                        info for info in replicas
+                        if not self._replica_is_busy(info)
+                    ]
+                    scaling_decisions.extend(
+                        _generate_scale_down_decisions(
+                            self._select_victims_capacity_and_cost_aware(
+                                min(excess, len(eligible)), eligible)))
+            return scaling_decisions
+
+        if self.configured_accelerator_shapes:
+            # A compatibility-capable service must never fall back to an
+            # unshaped launch or card-blind retirement while a mixed-version
+            # report leaves the per-card target incomplete.
+            logger.info('Concurrency exact-card target is incomplete; '
+                        'suppressing card-blind scaling decisions.')
+            return scaling_decisions
 
         if current_num_replicas < target_num_replicas:
             scaling_decisions.extend(
@@ -3618,10 +5351,34 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     ) -> list[AutoscalerDecision]:
         """Generate one shaped scale target or capacity-safe retirements."""
         target = self.get_final_target_num_replicas()
+        target_by_card, use_card_targets = (
+            self._actuation_target_by_accelerator(latest_nonterminal_replicas))
+        if self.configured_accelerator_shapes and not use_card_targets:
+            logger.info('Logical concurrency exact-card target is incomplete; '
+                        'suppressing card-blind scaling decisions.')
+            return []
+        canonical_by_name = {
+            card.casefold(): card
+            for card in (self.configured_accelerator_shapes or target_by_card)
+        }
+
+        def _card(info: 'replica_managers.ReplicaInfo') -> str | None:
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            return canonical_by_name.get(raw_card.casefold())
+
         committed = sum(
             self._committed_capacity(info)
             for info in latest_nonterminal_replicas)
-        if committed < target:
+        committed_by_card: dict[str, int] = {}
+        for info in latest_nonterminal_replicas:
+            card = _card(info)
+            if card is not None:
+                committed_by_card[card] = (committed_by_card.get(card, 0) +
+                                           self._committed_capacity(info))
+        card_shortage = (use_card_targets and any(
+            committed_by_card.get(card, 0) < card_target
+            for card, card_target in target_by_card.items()))
+        if committed < target or card_shortage:
             replace_unknown_replica_ids = tuple(
                 sorted(info.replica_id
                        for info in latest_nonterminal_replicas
@@ -3636,10 +5393,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         version=self.latest_version,
                         reconcile_generation=self._reconcile_generation,
                         target_capacity=target,
+                        target_capacity_by_accelerator=tuple(
+                            target_by_card.items()) if use_card_targets else (),
+                        accelerator_shapes=tuple(
+                            self.configured_accelerator_shapes.items())
+                        if use_card_targets else (),
                         replace_unknown_replica_ids=replace_unknown_replica_ids)
                 )
             ]
-        if not self._fresh_for_tick() or self._upscale_pending:
+        if (not self._fresh_for_tick() or self._upscale_pending or
+            (use_card_targets and not self._compatibility_demand_complete)):
             return []
 
         status_order = serve_state.ReplicaStatus.scale_down_decision_order()
@@ -3665,21 +5428,39 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         remaining_committed = committed
         remaining_ready = sum(
             self._ready_capacity(info) for info in latest_nonterminal_replicas)
+        remaining_ready_by_card: dict[str, int] = {}
+        for info in latest_nonterminal_replicas:
+            card = _card(info)
+            if card is not None:
+                remaining_ready_by_card[card] = (
+                    remaining_ready_by_card.get(card, 0) +
+                    self._ready_capacity(info))
+        remaining_committed_by_card = dict(committed_by_card)
         provisioning_statuses = {
             serve_state.ReplicaStatus.PENDING,
             serve_state.ReplicaStatus.PROVISIONING,
             serve_state.ReplicaStatus.STARTING,
         }
-        remaining_pending = sum(
+        remaining_demand_pending = sum(
             self._committed_capacity(info)
             for info in latest_nonterminal_replicas
-            if info.status in provisioning_statuses)
+            if (info.status in provisioning_statuses and
+                not getattr(info, 'reserved_fill', False)))
         decisions: list[AutoscalerDecision] = []
         for info in candidates:
+            card = _card(info)
+            if use_card_targets and card is None:
+                continue
+            card_target = target_by_card.get(card, 0) if card is not None else 0
+            remaining_card_committed = (remaining_committed_by_card.get(
+                card, 0) if card is not None else 0)
+            remaining_card_ready = (remaining_ready_by_card.get(card, 0)
+                                    if card is not None else 0)
             committed_width = self._committed_capacity(info)
-            if (info.status in provisioning_statuses and
+            demand_owned = not getattr(info, 'reserved_fill', False)
+            if (info.status in provisioning_statuses and demand_owned and
                     self._pending_retention_floor is not None and
-                    remaining_pending - committed_width
+                    remaining_demand_pending - committed_width
                     < self._pending_retention_floor):
                 # The frozen episode budget is measured in logical slots. A
                 # multi-slot victim that would overspend is conservatively
@@ -3697,15 +5478,30 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     if (remaining_ready < target or
                             remaining_committed - committed_width < target):
                         continue
+                    if (use_card_targets and
+                            remaining_card_committed - committed_width
+                            < card_target):
+                        continue
                 else:
-                    if remaining_ready - ready_width < target:
+                    if (remaining_ready - ready_width < target or
+                        (use_card_targets and
+                         remaining_card_ready - ready_width < card_target)):
                         continue
                     remaining_ready -= ready_width
+                    if card is not None:
+                        remaining_ready_by_card[card] = (
+                            remaining_ready_by_card.get(card, 0) - ready_width)
             elif remaining_committed - committed_width < target:
                 continue
+            elif (use_card_targets and
+                  remaining_card_committed - committed_width < card_target):
+                continue
             remaining_committed -= committed_width
-            if info.status in provisioning_statuses:
-                remaining_pending -= committed_width
+            if card is not None:
+                remaining_committed_by_card[card] = (
+                    remaining_committed_by_card.get(card, 0) - committed_width)
+            if info.status in provisioning_statuses and demand_owned:
+                remaining_demand_pending -= committed_width
             decisions.append(
                 AutoscalerDecision(
                     AutoscalerDecisionOperator.SCALE_DOWN,
@@ -3713,9 +5509,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         version=self.latest_version,
                         reconcile_generation=self._reconcile_generation,
                         target_capacity=target,
-                        replica_id=info.replica_id)))
+                        replica_id=info.replica_id,
+                        target_capacity_by_accelerator=(tuple(
+                            target_by_card.items()) if use_card_targets else
+                                                        ()),
+                        accelerator_shapes=(tuple(
+                            self.configured_accelerator_shapes.items())
+                                            if use_card_targets else ()))))
         self._pending_budget_spent = max(
-            0, self._pending_capacity_at_adoption - remaining_pending)
+            0, self._pending_capacity_at_adoption - remaining_demand_pending)
         return decisions
 
     def _select_victims_capacity_and_cost_aware(
@@ -3759,6 +5561,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def info(self) -> dict[str, Any]:
         info = super().info()
+        if not self.has_recomputed_with_fresh_data():
+            info['target_num_replicas_by_accelerator'] = {}
+            info['demand_target_by_accelerator'] = {}
         in_flight_total = (sum(self._in_flight_by_replica_id.values()) if
                            self._in_flight_by_replica_id is not None else None)
         report_age = (time.time() - self._report_received_at
@@ -3808,6 +5613,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'unknown_in_flight_replicas': len(
                 self._unknown_in_flight_replica_ids),
             'report_age_seconds': report_age,
+            'compatibility_demand_complete':
+                self._compatibility_demand_complete,
         })
         return info
 
@@ -3816,6 +5623,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # update_service (NOT on controller restart). The received-at
         # time is absolute, so a report that crosses the swap simply
         # reads as stale once it exceeds the staleness threshold.
+        with self._logical_state_lock:
+            return self._dump_dynamic_states_locked()
+
+    def _dump_dynamic_states_locked(self) -> dict[str, Any]:
         return {
             'request_timestamps': self.request_timestamps,
             'in_flight_by_replica_id': self._in_flight_by_replica_id,
@@ -3849,6 +5660,28 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'degraded_capacity_since_by_replica_id':
                 self._degraded_capacity_since_by_replica_id,
             'last_scale_up_wave_at': self._last_scale_up_wave_at,
+            # Always present, including when empty. A QPS replacement uses
+            # presence as proof that the source binary could preserve exact
+            # arrival constraints; older dumps fail closed on this field.
+            'compatibility_profiles': [{
+                **profile,
+                'compatible_accelerators': list(
+                    profile['compatible_accelerators']),
+            } for profile in self.compatibility_profiles],
+            'queued_compatibility_profiles': [{
+                **profile,
+                'compatible_accelerators': list(
+                    profile['compatible_accelerators']),
+            } for profile in self.queued_compatibility_profiles],
+            'rejected_compatibility_profiles': [{
+                **profile,
+                'compatible_accelerators': list(
+                    profile['compatible_accelerators']),
+            } for profile in self.rejected_compatibility_profiles],
+            'compatibility_demand_complete':
+                self._compatibility_demand_complete,
+            'configured_accelerator_shapes': dict(
+                self.configured_accelerator_shapes),
         }
 
     def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
@@ -3856,6 +5689,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # change the autoscaler class; e.g. RequestRateAutoscaler only
         # dumps request_timestamps): missing keys keep the stale-start
         # defaults.
+        compatibility_arrivals_present = ('compatibility_profiles'
+                                          in dynamic_states)
+        if compatibility_arrivals_present:
+            self.compatibility_profiles = self._parse_compatibility_arrivals(
+                dynamic_states.pop('compatibility_profiles'))
         if 'request_timestamps' in dynamic_states:
             self.request_timestamps = dynamic_states.pop('request_timestamps')
         if 'in_flight_by_replica_id' in dynamic_states:
@@ -3871,6 +5709,34 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if 'rejected_in_recent_window' in dynamic_states:
             self._rejected_in_recent_window = dynamic_states.pop(
                 'rejected_in_recent_window')
+        if 'queued_compatibility_profiles' in dynamic_states:
+            self.queued_compatibility_profiles = (
+                self._parse_compatibility_gauge(
+                    dynamic_states.pop('queued_compatibility_profiles')))
+        if 'rejected_compatibility_profiles' in dynamic_states:
+            self.rejected_compatibility_profiles = (
+                self._parse_compatibility_gauge(
+                    dynamic_states.pop('rejected_compatibility_profiles'),
+                    include_recent_count=True))
+        if 'compatibility_demand_complete' in dynamic_states:
+            self._compatibility_demand_complete = bool(
+                dynamic_states.pop('compatibility_demand_complete'))
+        if 'configured_accelerator_shapes' in dynamic_states:
+            source_shapes = dynamic_states.pop('configured_accelerator_shapes')
+            if isinstance(source_shapes, dict):
+                self.configured_accelerator_shapes = {
+                    str(card): int(count)
+                    for card, count in source_shapes.items()
+                    if isinstance(card, str) and card and
+                    isinstance(count, int) and not isinstance(count, bool) and
+                    count > 0
+                }
+        if (not self.configured_accelerator_shapes or
+                not compatibility_arrivals_present):
+            self.compatibility_profiles = []
+            self.queued_compatibility_profiles = []
+            self.rejected_compatibility_profiles = []
+            self._compatibility_demand_complete = False
         for field in ('rejected_in_window_by_priority',
                       'rejected_in_recent_window_by_priority',
                       'unique_job_arrivals_60s', 'unique_job_arrivals_300s',

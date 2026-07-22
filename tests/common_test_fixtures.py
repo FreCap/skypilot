@@ -587,7 +587,9 @@ def mock_aws_backend(monkeypatch):
 
     def mock_post_provision_runtime_setup(cloud_name, cluster_name,
                                           cluster_yaml, provision_record,
-                                          custom_resource, log_dir):
+                                          custom_resource, log_dir,
+                                          existing_cluster_hash):
+        del existing_cluster_hash
         # Get region from the provision record
         region = provision_record.region
 

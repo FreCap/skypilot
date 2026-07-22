@@ -354,6 +354,14 @@ class TestMigrationChainPG:
                     'serve_autoscaler_history',
                     'serve_placement_events',
                 }.issubset(tables), tables
+                autoscaler_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'serve_autoscaler_history')
+                }
+                assert {
+                    'accelerator_breakdown',
+                    'accelerator_breakdown_observed_at',
+                }.issubset(autoscaler_columns)
                 service_columns = {
                     column['name']
                     for column in inspector.get_columns('services')
@@ -428,7 +436,7 @@ class TestMigrationChainPG:
             engine.dispose()
 
     @pytest.mark.parametrize('preview_workspace_016', [False, True])
-    def test_revision_021_reconciles_conflicting_revision_016_layouts(
+    def test_revision_022_reconciles_conflicting_revision_016_layouts(
             self, pg_server, preview_workspace_016):
         """Both pre-merge revision 016 schemas converge on PostgreSQL."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
@@ -573,7 +581,7 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
-    def test_revision_021_repairs_preview_revision_018_collision(
+    def test_revision_022_repairs_preview_revision_018_collision(
             self, pg_server):
         """A preview DB stamped 018 gains the current 018 placement table."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
@@ -610,6 +618,60 @@ class TestMigrationChainPG:
                         'SELECT version_num FROM '
                         'alembic_version_serve_state_db')).scalar_one()
             assert version == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_022_repairs_preview_revision_021_collision(
+            self, pg_server):
+        """A preview DB stamped 021 gains canonical revision 021 columns."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '020')
+            with engine.begin() as connection:
+                # The former feature revision 021 persisted workspace but did
+                # not contain the exact-accelerator columns now owned by the
+                # canonical revision 021. Remove metadata-created copies and
+                # stamp 021 to reproduce that deployed preview state.
+                connection.execute(
+                    sqlalchemy.text(
+                        'ALTER TABLE serve_autoscaler_history DROP COLUMN IF '
+                        'EXISTS accelerator_breakdown_observed_at'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'ALTER TABLE serve_autoscaler_history DROP COLUMN IF '
+                        'EXISTS accelerator_breakdown'))
+                connection.execute(
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '021'"))
+
+            before_columns = {
+                column['name'] for column in sqlalchemy.inspect(
+                    engine).get_columns('serve_autoscaler_history')
+            }
+            assert 'accelerator_breakdown' not in before_columns
+            assert 'accelerator_breakdown_observed_at' not in before_columns
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            after_columns = {
+                column['name'] for column in sqlalchemy.inspect(
+                    engine).get_columns('serve_autoscaler_history')
+            }
+            assert {
+                'accelerator_breakdown',
+                'accelerator_breakdown_observed_at',
+            } <= after_columns
+            with engine.connect() as connection:
+                version = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert version == '022'
         finally:
             engine.dispose()
 
@@ -650,7 +712,11 @@ class TestLbCutoverAuthorityPG:
             4,
             2,
             in_flight={'http://replica': 1},
-            unknown_in_flight_urls=('http://unknown',))
+            unknown_in_flight_urls=('http://unknown',),
+            compatibility_profiles=(lb_ha.CompatibilityDemand(
+                50, ('A100',), 2, 10.0),),
+            queued_compatibility_profiles=(lb_ha.CompatibilityDemand(
+                50, ('A100',), 3),))
         assert serve_state.record_lb_active_demand_snapshot(
             'ha-service', 'incarnation', owner, 11, lb_ha.LbSlot.A, 1,
             demand_snapshot)
@@ -1043,6 +1109,38 @@ class TestServeStatusHistoryPG:
             'total_capacity': 12,
             'peak_in_flight': 2,
             'peak_queue_depth': 1,
+            'accelerator_breakdown': {
+                'configured_accelerators': ['A100', 'A100-80GB'],
+                'min_replicas': {
+                    'A100-80GB': 1
+                },
+                'demand_target': {
+                    'A100': 2,
+                    'A100-80GB': 3
+                },
+                'ready_capacity': {
+                    'A100': 2,
+                    'A100-80GB': 2
+                },
+                'provisioning_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 2
+                },
+                'total_capacity': {
+                    'A100': 4,
+                    'A100-80GB': 8
+                },
+                'zero_cost_ready_capacity': {
+                    'A100': 1
+                },
+                'fill_target': {
+                    'A100': 5,
+                    'A100-80GB': 5
+                },
+                'free_reserved_slots': {
+                    'A100': 2
+                },
+            },
         }
         assert serve_history.record_autoscaler_snapshot('svc',
                                                         'hash-a',
@@ -1051,35 +1149,45 @@ class TestServeStatusHistoryPG:
                                                         **base) == 1
         # An older observation cannot replace state, but its peaks remain
         # meaningful for the minute.
-        serve_history.record_autoscaler_snapshot('svc',
-                                                 'hash-a',
-                                                 'a' * 32,
-                                                 timestamp=timestamp - 1,
-                                                 **{
-                                                     **base,
-                                                     'demand_target': 2,
-                                                     'capacity_target': 2,
-                                                     'ready_capacity': 2,
-                                                     'provisioning_capacity': 0,
-                                                     'total_capacity': 2,
-                                                     'peak_in_flight': 5,
-                                                     'peak_queue_depth': 4,
-                                                 })
-        serve_history.record_autoscaler_snapshot('svc',
-                                                 'hash-a',
-                                                 'b' * 32,
-                                                 timestamp=timestamp + 20,
-                                                 **{
-                                                     **base,
-                                                     'version': 2,
-                                                     'demand_target': 6,
-                                                     'capacity_target': 12,
-                                                     'ready_capacity': 8,
-                                                     'provisioning_capacity': 2,
-                                                     'total_capacity': 14,
-                                                     'peak_in_flight': 3,
-                                                     'peak_queue_depth': 7,
-                                                 })
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'a' * 32,
+            timestamp=timestamp - 1,
+            **{
+                **base,
+                'demand_target': 2,
+                'capacity_target': 2,
+                'ready_capacity': 2,
+                'provisioning_capacity': 0,
+                'total_capacity': 2,
+                'peak_in_flight': 5,
+                'peak_queue_depth': 4,
+                'accelerator_breakdown': None,
+            })
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'b' * 32,
+            timestamp=timestamp + 20,
+            **{
+                **base,
+                'version': 2,
+                'demand_target': 6,
+                'capacity_target': 12,
+                'ready_capacity': 8,
+                'provisioning_capacity': 2,
+                'total_capacity': 14,
+                'peak_in_flight': 3,
+                'peak_queue_depth': 7,
+                'accelerator_breakdown': {
+                    **base['accelerator_breakdown'],
+                    'demand_target': {
+                        'A100': 3,
+                        'A100-80GB': 3,
+                    },
+                },
+            })
 
         history = serve_history.get_status_history('svc',
                                                    timestamp=timestamp + 21)
@@ -1096,7 +1204,82 @@ class TestServeStatusHistoryPG:
             'total_capacity': 14,
             'peak_in_flight': 5,
             'peak_queue_depth': 7,
+            'accelerator_breakdown': {
+                'version': 1,
+                'configured_accelerators': ['A100', 'A100-80GB'],
+                'min_replicas': {
+                    'A100': 0,
+                    'A100-80GB': 1
+                },
+                'demand_target': {
+                    'A100': 3,
+                    'A100-80GB': 3
+                },
+                'ready_capacity': {
+                    'A100': 2,
+                    'A100-80GB': 2
+                },
+                'provisioning_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 2
+                },
+                'total_capacity': {
+                    'A100': 4,
+                    'A100-80GB': 8
+                },
+                'zero_cost_ready_capacity': {
+                    'A100': 1,
+                    'A100-80GB': 0
+                },
+                'fill_target': {
+                    'A100': 5,
+                    'A100-80GB': 5
+                },
+                'free_reserved_slots': {
+                    'A100': 2,
+                    'A100-80GB': 0
+                },
+            },
         }]
+
+        # An old rolling-upgrade writer can win an equal-timestamp upsert while
+        # knowing only aggregate columns. Timestamp equality alone must not
+        # make the prior exact-card map look coherent with its new aggregate.
+        table = serve_history.serve_autoscaler_history_table
+        equal_observed_at = datetime.datetime.fromtimestamp(
+            timestamp + 20, datetime.timezone.utc)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).values(
+                    observed_at=equal_observed_at,
+                    controller_session_id='c' * 32,
+                    demand_target=4,
+                    capacity_target=9,
+                    ready_capacity=7,
+                    provisioning_capacity=1,
+                    total_capacity=11).where(table.c.service_name == 'svc',
+                                             table.c.service_hash == 'hash-a'))
+        equal_mixed = serve_history.get_status_history('svc',
+                                                       timestamp=timestamp +
+                                                       20.5)
+        equal_sample = equal_mixed['autoscaler_samples'][0]
+        assert equal_sample['demand_target'] == 4
+        assert equal_sample['accelerator_breakdown'] is None
+
+        # A rolling-upgrade writer that knows only aggregate columns may
+        # advance observed_at without touching the new JSONB column. The
+        # timestamp fence must hide that stale card assignment.
+        newer_observed_at = datetime.datetime.fromtimestamp(
+            timestamp + 21, datetime.timezone.utc)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).values(
+                    observed_at=newer_observed_at).where(
+                        table.c.service_name == 'svc',
+                        table.c.service_hash == 'hash-a'))
+        mixed = serve_history.get_status_history('svc',
+                                                 timestamp=timestamp + 22)
+        assert mixed['autoscaler_samples'][0]['accelerator_breakdown'] is None
 
     def test_mixed_reporter_rejection_history_is_not_false_zero(
             self, history_engine):

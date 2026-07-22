@@ -23,6 +23,21 @@ DEFAULT_JOB_EVENT_RETENTION_HOURS = 30 * 24.0
 JOB_EVENT_DAEMON_INTERVAL_SECONDS = 3600
 
 
+def _normalize_timestamp(
+        timestamp: datetime.datetime | None = None) -> datetime.datetime:
+    """Return a UTC-aware timestamp for managed job event persistence.
+
+    Migration 010 interprets legacy naive job-event timestamps as UTC. Keep the
+    same contract for explicit timestamps while ensuring new timestamps carry
+    their timezone through PostgreSQL's ``TIMESTAMP WITH TIME ZONE`` binding.
+    """
+    if timestamp is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=datetime.timezone.utc)
+    return timestamp.astimezone(datetime.timezone.utc)
+
+
 def add_job_event(job_id: int,
                   task_id: int | None,
                   new_status: ManagedJobStatus,
@@ -39,8 +54,7 @@ def add_job_event(job_id: int,
         reason: A description of why the event occurred.
         timestamp: The timestamp of the event. If None, uses current time.
     """
-    if timestamp is None:
-        timestamp = datetime.datetime.now()
+    timestamp = _normalize_timestamp(timestamp)
 
     status_value = new_status.value
 
@@ -87,8 +101,7 @@ async def add_job_event_async(
         code: Optional error category code for failures.
         timestamp: The timestamp of the event. If None, uses current time.
     """
-    if timestamp is None:
-        timestamp = datetime.datetime.now()
+    timestamp = _normalize_timestamp(timestamp)
 
     status_value = new_status.value
 
@@ -230,8 +243,8 @@ async def cleanup_job_events_with_retention_async(
         retention_hours: Number of hours to retain job events.
     """
     engine = await _db_manager.get_async_engine()
-    cutoff_time = datetime.datetime.now() - datetime.timedelta(
-        hours=retention_hours)
+    cutoff_time = (datetime.datetime.now(datetime.timezone.utc) -
+                   datetime.timedelta(hours=retention_hours))
 
     async with sql_async.AsyncSession(engine) as session:
         result = await session.execute(
@@ -253,7 +266,7 @@ async def job_event_retention_daemon():
                 DEFAULT_JOB_EVENT_RETENTION_HOURS)
         except asyncio.CancelledError:
             logger.info('Job event retention daemon cancelled')
-            break
+            raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error running job event retention daemon: {e}')
 

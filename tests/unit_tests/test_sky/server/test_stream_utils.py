@@ -235,3 +235,58 @@ async def test_terminal_status_drains_final_write(tmp_path: pathlib.Path,
         ]
 
     assert ''.join(chunks) == 'old\nfinal\n'
+
+
+@pytest.mark.asyncio
+async def test_request_gc_ends_stream_after_buffered_output(
+        tmp_path: pathlib.Path, monkeypatch):
+    log_path = tmp_path / 'request.log'
+    log_path.write_text('complete output\n', encoding='utf-8')
+
+    async def missing_status(_request_id):
+        return None
+
+    monkeypatch.setattr(stream_utils.requests_lib, 'get_request_status_async',
+                        missing_status)
+    async with aiofiles.open(log_path, 'rb') as log_file:
+        chunks = [
+            chunk async for chunk in stream_utils._tail_log_file(
+                log_file,
+                request_id='garbage-collected-request',
+                follow=True,
+                polling_interval=0,
+                log_path=log_path)
+        ]
+
+    assert ''.join(chunks) == 'complete output\n'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_gc_ends_stream_without_retry_metadata(
+        tmp_path: pathlib.Path, monkeypatch):
+    log_path = tmp_path / 'request.log'
+    log_path.write_text('cancelled output\n', encoding='utf-8')
+
+    async def cancelled_status(_request_id):
+        return types.SimpleNamespace(
+            status=stream_utils.requests_lib.RequestStatus.CANCELLED)
+
+    async def missing_request(_request_id, fields=None):
+        del fields
+        return None
+
+    monkeypatch.setattr(stream_utils.requests_lib, 'get_request_status_async',
+                        cancelled_status)
+    monkeypatch.setattr(stream_utils.requests_lib, 'get_request_async',
+                        missing_request)
+    async with aiofiles.open(log_path, 'rb') as log_file:
+        chunks = [
+            chunk async for chunk in stream_utils._tail_log_file(
+                log_file,
+                request_id='garbage-collected-request',
+                follow=True,
+                polling_interval=0,
+                log_path=log_path)
+        ]
+
+    assert ''.join(chunks) == 'cancelled output\n'

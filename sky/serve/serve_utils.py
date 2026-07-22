@@ -497,6 +497,8 @@ class RequestTimestamp(RequestsAggregator):
         # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
         self.timestamps: collections.deque[float] = collections.deque(
             maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
+        self.compatibility_profiles: collections.deque[dict[str, Any]] = (
+            collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
         # Exact arrival counters are reported independently from the lossy,
         # bounded raw timestamp batch used by autoscaling. Counts remain in
         # memory through the current hour so another request in an already
@@ -511,9 +513,19 @@ class RequestTimestamp(RequestsAggregator):
 
     def add(self, request: 'fastapi.Request') -> None:
         """Add a request to the request aggregator."""
-        del request  # unused
         timestamp = time.time()
         self.timestamps.append(timestamp)
+        compatible = getattr(request, '_skyserve_compatible_accelerators', None)
+        self.compatibility_profiles.append({
+            'timestamp': timestamp,
+            'priority': int(
+                getattr(request, '_skyserve_request_priority',
+                        constants.LB_REQUEST_PRIORITY_MIN)),
+            # None distinguishes a legacy omitted-catalog request from an
+            # explicit canonical set; an empty list is never valid.
+            'compatible_accelerators':
+                (list(compatible) if compatible is not None else None),
+        })
         bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
         bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
         self._request_history[bucket_start] = (
@@ -534,6 +546,7 @@ class RequestTimestamp(RequestsAggregator):
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
@@ -626,6 +639,7 @@ class RequestTimestamp(RequestsAggregator):
         """Take the current timestamps, leaving later arrivals untouched."""
         batch = self.to_dict()
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         return batch
 
     def restore(self, batch: dict[str, Any]) -> None:
@@ -636,16 +650,49 @@ class RequestTimestamp(RequestsAggregator):
         retained.
         """
         drained = batch.get('timestamps', [])
-        if not drained:
+        drained_profiles = batch.get('compatibility_profiles', [])
+        if not drained and not drained_profiles:
             return
         current = list(self.timestamps)
+        current_profiles = list(self.compatibility_profiles)
         self.timestamps.clear()
+        self.compatibility_profiles.clear()
         self.timestamps.extend(drained)
         self.timestamps.extend(current)
+        self.compatibility_profiles.extend(drained_profiles)
+        self.compatibility_profiles.extend(current_profiles)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the aggregator to a dict."""
-        return {'timestamps': list(self.timestamps)}
+        grouped_profiles: dict[tuple[int, frozenset[str]], dict[str, Any]] = {}
+        for profile in self.compatibility_profiles:
+            accelerators = profile.get('compatible_accelerators')
+            priority = profile.get('priority')
+            timestamp = profile.get('timestamp')
+            count = profile.get('count', 1)
+            if (not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(priority, int) or
+                    not isinstance(timestamp, (int, float)) or
+                    not isinstance(count, int) or count < 1):
+                # Legacy omitted-catalog samples remain visible to aggregate
+                # timestamp scaling but cannot be safely assigned to a card.
+                continue
+            key = (priority, frozenset(accelerators))
+            grouped = grouped_profiles.get(key)
+            if grouped is None:
+                grouped_profiles[key] = {
+                    'timestamp': timestamp,
+                    'priority': priority,
+                    'compatible_accelerators': list(accelerators),
+                    'count': count,
+                }
+            else:
+                grouped['timestamp'] = max(grouped['timestamp'], timestamp)
+                grouped['count'] += count
+        return {
+            'timestamps': list(self.timestamps),
+            'compatibility_profiles': list(grouped_profiles.values()),
+        }
 
     def __repr__(self) -> str:
         return f'RequestTimestamp(timestamps={list(self.timestamps)})'
@@ -2069,6 +2116,17 @@ def _get_service_status(
             record['target_num_replicas'] = autoscaler_info[
                 'target_num_replicas']
             request_field_map = {
+                'min_replicas_by_accelerator': 'min_replicas_by_accelerator',
+                'target_num_replicas_by_accelerator': 'target_num_replicas_by_accelerator',
+                'demand_target_by_accelerator': 'demand_target_by_accelerator',
+                'ready_replicas_by_accelerator': 'ready_replicas_by_accelerator',
+                'provisioning_replicas_by_accelerator': 'provisioning_replicas_by_accelerator',
+                'total_replicas_by_accelerator': 'total_replicas_by_accelerator',
+                'zero_cost_ready_replicas_by_accelerator': 'zero_cost_ready_replicas_by_accelerator',
+                'fill_target_by_accelerator': 'fill_target_by_accelerator',
+                'free_reserved_slots_by_accelerator': 'free_reserved_slots_by_accelerator',
+                'fill_target': 'fill_target',
+                'fill_free_slots': 'fill_free_slots',
                 'recent_request_count': 'recent_request_count',
                 'request_window_seconds': 'request_window_seconds',
                 'requests_per_second': 'requests_per_second',
@@ -2258,21 +2316,22 @@ def get_service_status_pickled(
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         statuses = list(ex.map(_run_in_context, service_names))
-    for status in statuses:
+    live_statuses = sorted(
+        (status for status in statuses if status is not None),
+        key=lambda status: status['name'])
+    for status in live_statuses:
         # The rendered YAML carries plaintext secrets (replicas need it
         # launchable), so it never leaves the controller for services:
         # clients get the redacted `service_yaml` instead. Pools keep it
         # because the batch coordinator and worker-count updates parse
         # `yaml_content`/`pool_yaml` back into a launchable task.
-        if status is not None and not status.get('pool'):
+        if not status.get('pool'):
             status.pop('yaml_content', None)
-    service_statuses: list[dict[str, str]] = [{
+    return [{
         k: base64.b64encode(pickle.dumps(v)).decode('utf-8')
         for k, v in s.items()
     }
-                                              for s in statuses
-                                              if s is not None]
-    return sorted(service_statuses, key=lambda x: x['name'])
+            for s in live_statuses]
 
 
 # TODO (kyuds): remove when serve codegen is removed
@@ -2345,6 +2404,13 @@ def get_ready_replicas(
     ]
 
 
+def _get_pool_cluster_records(
+    replicas: list['replica_managers.ReplicaInfo']
+) -> dict[str, dict[str, Any] | None]:
+    return global_user_state.get_clusters_from_names(
+        [replica_info.cluster_name for replica_info in replicas])
+
+
 def _task_fits(task_resources: 'resources_lib.Resources',
                free_resources: 'resources_lib.Resources') -> bool:
     """Check if the task resources fit in the free resources."""
@@ -2370,7 +2436,8 @@ def _is_empty_resource(resource: 'resources_lib.Resources') -> bool:
 
 def get_free_worker_resources(
     pool: str,
-    replicas: list['replica_managers.ReplicaInfo'] | None = None
+    replicas: list['replica_managers.ReplicaInfo'] | None = None,
+    cluster_records: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
@@ -2378,6 +2445,9 @@ def get_free_worker_resources(
         pool: Pool name (service name)
         replicas: Optional replica snapshot to reuse; fetched from the state
             store when not provided.
+        cluster_records: Optional cluster-table snapshot keyed by worker name.
+            When provided, the free-resource walk reuses it instead of issuing
+            a second batched cluster read.
 
     Returns:
         Dictionary mapping cluster_name (worker) to free Resources object (or
@@ -2397,8 +2467,8 @@ def get_free_worker_resources(
     # Snapshot every worker's cluster record in one batched read; the
     # per-replica ``handle()`` fallback would issue one cluster-table read
     # per worker on every scheduling attempt.
-    cluster_records = global_user_state.get_clusters_from_names(
-        [replica_info.cluster_name for replica_info in replicas])
+    if cluster_records is None:
+        cluster_records = _get_pool_cluster_records(replicas)
     for replica_info in replicas:
         cluster_name = replica_info.cluster_name
 
@@ -2499,9 +2569,13 @@ def get_next_cluster_name(
                           not _is_empty_resource(task_resources_list[0]))
 
         free_resources = None
+        cluster_records = None
         if resource_aware:
-            free_resources = get_free_worker_resources(service_name,
-                                                       replicas=replicas)
+            cluster_records = _get_pool_cluster_records(replicas)
+            free_resources = get_free_worker_resources(
+                service_name,
+                replicas=replicas,
+                cluster_records=cluster_records)
             logger.debug(f'Free resources: {free_resources!r}')
             resource_aware = free_resources is not None
         if resource_aware and free_resources is not None:
@@ -2587,7 +2661,12 @@ def get_next_cluster_name(
                                                    replica_info.cluster_name)
 
         # Set infrastructure info for sorting/filtering
-        handle = replica_info.handle()
+        if cluster_records is None:
+            handle = replica_info.handle()
+        else:
+            cluster_record = cluster_records.get(replica_info.cluster_name)
+            handle = (None if cluster_record is None else
+                      replica_info.handle(cluster_record))
         if handle is not None and handle.launched_resources is not None:
             lr = handle.launched_resources
             managed_job_state.set_job_infra(

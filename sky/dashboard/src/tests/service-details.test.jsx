@@ -23,6 +23,7 @@ jest.mock('@/lib/cache', () => ({
 import dashboardCache from '@/lib/cache';
 import { getServices } from '@/data/connectors/services';
 import {
+  AcceleratorCapacityCard,
   getReplicaPlacementBreakdown,
   ReplicaPlacementCard,
   ReplicasCard,
@@ -30,6 +31,50 @@ import {
   sortReplicas,
   useServiceDetails,
 } from '@/pages/services/[service]';
+
+describe('AcceleratorCapacityCard', () => {
+  it('renders exact cards and separates demand floors from reserved supply', () => {
+    render(
+      <AcceleratorCapacityCard
+        serviceData={{
+          fillTarget: 4,
+          freeReservedSlots: 2,
+          acceleratorCapacity: [
+            {
+              card: 'A100',
+              ready: 1,
+              provisioning: 2,
+              total: 3,
+              demandTarget: 3,
+              hardFloor: 1,
+              zeroCostReady: 1,
+              fillTarget: null,
+              freeReserved: null,
+            },
+            {
+              card: 'A100-80GB',
+              ready: 2,
+              provisioning: 0,
+              total: 2,
+              demandTarget: 2,
+              hardFloor: 2,
+              zeroCostReady: 0,
+              fillTarget: null,
+              freeReserved: null,
+            },
+          ],
+        }}
+      />
+    );
+
+    expect(screen.getByText('A100')).toBeInTheDocument();
+    expect(screen.getByText('A100-80GB')).toBeInTheDocument();
+    expect(screen.getByText('Aggregate fill target: 4')).toBeInTheDocument();
+    expect(
+      screen.getByText('Aggregate free reserved slots: 2')
+    ).toBeInTheDocument();
+  });
+});
 
 function deferred() {
   let resolve;
@@ -43,7 +88,142 @@ function deferred() {
 
 describe('useServiceDetails stale-response fencing', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('coalesces concurrent forced refreshes for the same service', async () => {
+    const refreshedSummary = deferred();
+    const refreshedFull = deferred();
+    const duplicateSummary = deferred();
+    const duplicateFull = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: [] }],
+      });
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('initial-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => refreshedSummary.promise)
+      .mockImplementationOnce(() => refreshedFull.promise)
+      .mockImplementationOnce(() => duplicateSummary.promise)
+      .mockImplementationOnce(() => duplicateFull.promise);
+
+    let firstRefresh;
+    let secondRefresh;
+    act(() => {
+      firstRefresh = result.current.refreshData();
+      secondRefresh = result.current.refreshData();
+    });
+
+    expect(secondRefresh).toBe(firstRefresh);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(getServices);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      refreshedSummary.resolve({
+        services: [{ name: 'svc', status: 'fresh-summary', summaryOnly: true }],
+      });
+      refreshedFull.resolve({
+        services: [{ name: 'svc', status: 'fresh-full', replicas: ['new'] }],
+      });
+      duplicateSummary.resolve({
+        services: [
+          { name: 'svc', status: 'duplicate-summary', summaryOnly: true },
+        ],
+      });
+      duplicateFull.resolve({
+        services: [
+          { name: 'svc', status: 'duplicate-full', replicas: ['old'] },
+        ],
+      });
+      await Promise.all([firstRefresh, secondRefresh]);
+    });
+
+    expect(result.current.serviceData.status).toBe('fresh-full');
+    expect(result.current.serviceData.replicas).toEqual(['new']);
+  });
+
+  it('releases refresh ownership after both service reads fail', async () => {
+    const failedSummary = deferred();
+    const failedFull = deferred();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: [] }],
+      });
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('initial-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => failedSummary.promise)
+      .mockImplementationOnce(() => failedFull.promise);
+    let failedRefresh;
+    let duplicateRefresh;
+    act(() => {
+      failedRefresh = result.current.refreshData();
+      duplicateRefresh = result.current.refreshData();
+    });
+
+    expect(duplicateRefresh).toBe(failedRefresh);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      failedSummary.reject(new Error('summary unavailable'));
+      failedFull.reject(new Error('replicas unavailable'));
+      await Promise.all([failedRefresh, duplicateRefresh]);
+    });
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'recovered-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'recovered-full', replicas: [] }],
+      });
+
+    let recoveredRefresh;
+    act(() => {
+      recoveredRefresh = result.current.refreshData();
+    });
+
+    expect(recoveredRefresh).not.toBe(failedRefresh);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+
+    await act(async () => {
+      await recoveredRefresh;
+    });
+    expect(result.current.serviceData.status).toBe('recovered-full');
   });
 
   it('ignores an earlier refresh cycle that resolves after a manual refresh', async () => {
@@ -230,6 +410,199 @@ describe('useServiceDetails stale-response fencing', () => {
       }
       jest.useRealTimers();
     }
+  });
+
+  it('does not start a history poll while manual refresh already owns service history', async () => {
+    jest.useFakeTimers();
+    const refreshedSummary = deferred();
+    const refreshedFull = deferred();
+    let mounted = true;
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY' }],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY', replicas: [] }],
+      });
+
+    const { result, unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      dashboardCache.get
+        .mockImplementationOnce(() => refreshedSummary.promise)
+        .mockImplementationOnce(() => refreshedFull.promise);
+
+      let refreshPromise;
+      act(() => {
+        refreshPromise = result.current.refreshData();
+      });
+
+      expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+
+      // The manual refresh already owns the service summary request that
+      // carries replica history, so the timer must not start a duplicate poll.
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      await act(async () => {
+        refreshedSummary.resolve({
+          services: [
+            {
+              name: 'svc',
+              status: 'READY',
+              replicaHistory: { currentReadyReplicas: 2 },
+            },
+          ],
+        });
+        refreshedFull.resolve({
+          services: [{ name: 'svc', status: 'READY', replicas: ['r1'] }],
+        });
+        await refreshPromise;
+      });
+
+      dashboardCache.get.mockResolvedValueOnce({
+        services: [
+          {
+            name: 'svc',
+            replicaHistory: { currentReadyReplicas: 3 },
+          },
+        ],
+      });
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not reuse an old refresh owner after leaving and returning to a service', async () => {
+    const oldSummary = deferred();
+    const oldFull = deferred();
+    const newSummary = deferred();
+    const newFull = deferred();
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'svc-a-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'svc-a-full', replicas: ['a0'] }],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ serviceName }) => useServiceDetails({ serviceName }),
+      { initialProps: { serviceName: 'svc-a' } }
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('svc-a-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => oldSummary.promise)
+      .mockImplementationOnce(() => oldFull.promise);
+    let oldRefreshPromise;
+    act(() => {
+      oldRefreshPromise = result.current.refreshData();
+    });
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-b', status: 'svc-b-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-b', status: 'svc-b-full', replicas: ['b0'] }],
+      });
+    rerender({ serviceName: 'svc-b' });
+    await waitFor(() => expect(result.current.serviceData.name).toBe('svc-b'));
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'svc-a-return-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'svc-a-return-full', replicas: ['a1'] },
+        ],
+      });
+    rerender({ serviceName: 'svc-a' });
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('svc-a-return-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => newSummary.promise)
+      .mockImplementationOnce(() => newFull.promise);
+    let newRefreshPromise;
+    act(() => {
+      newRefreshPromise = result.current.refreshData();
+    });
+
+    expect(newRefreshPromise).not.toBe(oldRefreshPromise);
+    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      newSummary.resolve({
+        services: [
+          { name: 'svc-a', status: 'svc-a-new-summary', summaryOnly: true },
+        ],
+      });
+      newFull.resolve({
+        services: [
+          { name: 'svc-a', status: 'svc-a-new-full', replicas: ['a2'] },
+        ],
+      });
+      await newRefreshPromise;
+    });
+
+    expect(result.current.serviceData.status).toBe('svc-a-new-full');
+
+    await act(async () => {
+      oldSummary.resolve({
+        services: [
+          { name: 'svc-a', status: 'svc-a-old-summary', summaryOnly: true },
+        ],
+      });
+      oldFull.resolve({
+        services: [
+          { name: 'svc-a', status: 'svc-a-old-full', replicas: ['old'] },
+        ],
+      });
+      await oldRefreshPromise;
+    });
+
+    expect(result.current.serviceData.status).toBe('svc-a-new-full');
+    expect(result.current.serviceData.replicas).toEqual(['a2']);
   });
 });
 

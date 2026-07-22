@@ -34,6 +34,101 @@ from sky.skylet import constants
 from sky.utils import context_utils
 
 
+def _make_server_config(
+        queue_backend: server_config.QueueBackend
+) -> server_config.ServerConfig:
+    worker_config = server_config.WorkerConfig(garanteed_parallelism=1,
+                                               burstable_parallelism=0,
+                                               num_db_connections_per_worker=0)
+    return server_config.ServerConfig(num_server_workers=1,
+                                      long_worker_config=worker_config,
+                                      short_worker_config=worker_config,
+                                      num_db_connections_per_worker=0,
+                                      queue_backend=queue_backend)
+
+
+def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+
+    assert executor.queue_base.get_registered_queue_backend_factory() is None
+    assert isinstance(executor.queue_base.get_queue_backend_factory(),
+                      executor.queue_base.MultiprocessingQueueFactory)
+
+    registered_factory = mock.MagicMock()
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory',
+                        registered_factory)
+
+    assert (executor.queue_base.get_registered_queue_backend_factory()
+            is registered_factory)
+    assert executor.queue_base.get_queue_backend_factory() is registered_factory
+
+
+@pytest.mark.parametrize(
+    ('queue_backend', 'expected_factory_name', 'unexpected_factory_name'), [
+        (server_config.QueueBackend.LOCAL, 'LocalQueueFactory',
+         'MultiprocessingQueueFactory'),
+        (server_config.QueueBackend.MULTIPROCESSING,
+         'MultiprocessingQueueFactory', 'LocalQueueFactory'),
+    ])
+def test_start_honors_configured_queue_backend(monkeypatch, queue_backend,
+                                               expected_factory_name,
+                                               unexpected_factory_name):
+    factory = mock.MagicMock()
+    factory.start.return_value = None
+    expected_factory = mock.MagicMock(return_value=factory)
+    unexpected_factory = mock.MagicMock()
+    worker = mock.MagicMock()
+    worker_constructor = mock.MagicMock(return_value=worker)
+
+    monkeypatch.setattr(executor.queue_base,
+                        'get_registered_queue_backend_factory', lambda: None)
+    monkeypatch.setattr(executor.queue_base, expected_factory_name,
+                        expected_factory)
+    monkeypatch.setattr(executor.queue_base, unexpected_factory_name,
+                        unexpected_factory)
+    monkeypatch.setattr(executor, 'RequestWorker', worker_constructor)
+    monkeypatch.setattr(executor, '_queue_factory', None)
+
+    queue_server, workers = executor.start(_make_server_config(queue_backend))
+
+    assert queue_server is None
+    assert getattr(executor, '_queue_factory') is factory
+    assert workers == [worker, worker]
+    expected_factory.assert_called_once_with()
+    unexpected_factory.assert_not_called()
+    factory.start.assert_called_once_with()
+    assert worker_constructor.call_count == 2
+    assert worker.run_in_background.call_count == 2
+
+
+def test_start_prefers_registered_queue_backend(monkeypatch):
+    queue_server = mock.sentinel.queue_server
+    registered_factory = mock.MagicMock()
+    registered_factory.start.return_value = queue_server
+    local_factory = mock.MagicMock()
+    multiprocessing_factory = mock.MagicMock()
+    worker = mock.MagicMock()
+
+    monkeypatch.setattr(executor.queue_base,
+                        'get_registered_queue_backend_factory',
+                        lambda: registered_factory)
+    monkeypatch.setattr(executor.queue_base, 'LocalQueueFactory', local_factory)
+    monkeypatch.setattr(executor.queue_base, 'MultiprocessingQueueFactory',
+                        multiprocessing_factory)
+    monkeypatch.setattr(executor, 'RequestWorker',
+                        mock.MagicMock(return_value=worker))
+    monkeypatch.setattr(executor, '_queue_factory', None)
+
+    result, _ = executor.start(
+        _make_server_config(server_config.QueueBackend.LOCAL))
+
+    assert result is queue_server
+    assert getattr(executor, '_queue_factory') is registered_factory
+    local_factory.assert_not_called()
+    multiprocessing_factory.assert_not_called()
+    registered_factory.start.assert_called_once_with()
+
+
 def test_worker_preserves_executor_construction_error(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.LONG,
@@ -159,6 +254,11 @@ def slow_entrypoint():
     return 'success'
 
 
+async def _wait_for_threading_event(event: threading.Event) -> None:
+    while not event.is_set():
+        await asyncio.sleep(0.01)
+
+
 _MANAGED_IMAGE_LOG_SECRET = 'synthetic-provider-secret'
 
 
@@ -246,8 +346,7 @@ def test_managed_image_marker_search_is_cycle_safe_and_bounded(
 
 
 @pytest.mark.asyncio
-async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
-        isolated_database):
+async def test_execute_request_coroutine_ctx_cancelled_on_cancellation():
     """Test that context is always cancelled when execute_request_coroutine
     is cancelled."""
     _SLOW_ENTRYPOINT_STARTED.clear()
@@ -264,24 +363,38 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         entrypoint=slow_entrypoint,
         request_body=payloads.RequestBody(),
     )
-    await requests_lib.create_if_not_exists_async(request)
 
     # Mock the context and its methods
     mock_ctx = mock.Mock()
     mock_ctx.vars = {}
     mock_ctx.is_canceled.return_value = False
     mock_ctx.cancel.side_effect = _SLOW_ENTRYPOINT_RELEASE.set
+    mock_set_cancelled = mock.AsyncMock()
 
     with mock.patch('sky.utils.context.initialize'), \
-         mock.patch('sky.utils.context.get', return_value=mock_ctx):
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(requests_lib, 'update_status_async',
+                           new_callable=mock.AsyncMock), \
+         mock.patch.object(requests_lib, 'get_request_log_storage_usage',
+                           return_value=mock.Mock(hard_free_bytes=1024)), \
+         mock.patch.object(requests_lib, 'get_request_status_async',
+                           new_callable=mock.AsyncMock,
+                           return_value=requests_lib.StatusWithMsg(
+                               requests_lib.RequestStatus.RUNNING)), \
+         mock.patch.object(requests_lib, 'set_request_cancelled_async',
+                           mock_set_cancelled):
 
         task = executor.execute_request_in_coroutine(request)
 
-        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_STARTED.wait, 1)
+        await asyncio.wait_for(
+            _wait_for_threading_event(_SLOW_ENTRYPOINT_STARTED), timeout=1)
         await task.cancel()
-        assert await asyncio.to_thread(_SLOW_ENTRYPOINT_FINISHED.wait, 1)
+        await asyncio.wait_for(
+            _wait_for_threading_event(_SLOW_ENTRYPOINT_FINISHED), timeout=1)
         # Verify the context is actually cancelled
         mock_ctx.cancel.assert_called()
+        mock_set_cancelled.assert_awaited_once_with(request.request_id)
+        assert task.task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -738,6 +851,15 @@ def _retryable_error_entrypoint():
                                              retry_wait_seconds=0)
 
 
+def _cancelled_retryable_error_entrypoint():
+    with requests_lib.update_request('test-cancelled-retryable') as request:
+        assert request is not None
+        request.status = requests_lib.RequestStatus.CANCELLED
+    raise exceptions.ExecutionRetryableError('Cancelled before retry handoff',
+                                             hint='This must not retry',
+                                             retry_wait_seconds=0)
+
+
 def _general_error_entrypoint():
     raise ValueError('Simulated error')
 
@@ -767,6 +889,13 @@ def _dummy_entrypoint_for_retry_test():
             'expected_exception': exceptions.ExecutionRetryableError,
         },
         id='retryable_error'),
+    pytest.param(
+        {
+            'request_id': 'test-cancelled-retryable',
+            'entrypoint': _cancelled_retryable_error_entrypoint,
+            'expected_exception': None,
+        },
+        id='cancelled_retryable_error'),
     pytest.param(
         {
             'request_id': 'test-error',
@@ -1098,6 +1227,36 @@ def test_pause_dropped_when_wait_returns_false(pause_harness):
     assert pause_harness.queue_items == []
 
 
+def test_pause_does_not_resurrect_cancelled_request(pause_harness):
+    """A cancellation committed before retry handoff remains terminal."""
+    with requests_lib.update_request(pause_harness.request_id) as request:
+        assert request is not None
+        request.status = requests_lib.RequestStatus.CANCELLED
+    condition = _RecordingCondition(verdict=True)
+
+    pause_harness.run(condition)
+
+    assert not condition.calls
+    assert pause_harness.queue_items == []
+    request = requests_lib.get_request(pause_harness.request_id,
+                                       fields=['status'])
+    assert request is not None
+    assert request.status == requests_lib.RequestStatus.CANCELLED
+
+
+def test_pause_drops_request_removed_before_retry(pause_harness):
+    """Request retention may remove a terminal row before retry handoff."""
+    asyncio.run(
+        requests_lib._delete_requests(  # pylint: disable=protected-access
+            [pause_harness.request_id]))
+    condition = _RecordingCondition(verdict=True)
+
+    pause_harness.run(condition)
+
+    assert not condition.calls
+    assert pause_harness.queue_items == []
+
+
 def test_pause_base_condition_does_fixed_fallback_wait(pause_harness):
     """The base ContinueCondition just waits the fallback, then reschedules."""
     condition = continue_condition_lib.ContinueCondition()
@@ -1129,6 +1288,33 @@ def test_pause_base_condition_dropped_if_cancelled_during_wait(
     pause_harness.run(continue_condition_lib.ContinueCondition())
 
     assert pause_harness.queue_items == []
+
+
+def test_retry_dropped_if_cancelled_during_backoff(pause_harness, monkeypatch):
+    """A fixed-backoff retry cannot resurrect a concurrent cancellation."""
+
+    def cancel_on_sleep(seconds):
+        pause_harness.sleep_calls.append(seconds)
+        with requests_lib.update_request(pause_harness.request_id) as request:
+            assert request is not None
+            request.status = requests_lib.RequestStatus.CANCELLED
+
+    monkeypatch.setattr('time.sleep', cancel_on_sleep)
+    retryable_error = exceptions.ExecutionRetryableError('Transient failure',
+                                                         hint='Retry after 30s',
+                                                         retry_wait_seconds=30)
+    fut = concurrent.futures.Future()
+    fut.set_exception(retryable_error)
+    request_element = (pause_harness.request_id, False, True)
+
+    pause_harness.worker.handle_task_result(fut, request_element)
+
+    assert pause_harness.sleep_calls == [30]
+    assert pause_harness.queue_items == []
+    request = requests_lib.get_request(pause_harness.request_id,
+                                       fields=['status'])
+    assert request is not None
+    assert request.status == requests_lib.RequestStatus.CANCELLED
 
 
 def test_pause_marks_executor_free_before_wait(pause_harness, monkeypatch):

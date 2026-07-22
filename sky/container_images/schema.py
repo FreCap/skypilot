@@ -1,7 +1,7 @@
 """PostgreSQL schema for managed container image distribution.
 
 The image control plane deliberately owns a small, closed set of tables.  This
-module is the runtime SQLAlchemy description of those tables.  Migration 023 is
+module is the runtime SQLAlchemy description of those tables.  Migration 024 is
 kept literal and independent from this metadata so an unrelated runtime import
 cannot change an already-reviewed database migration.
 """

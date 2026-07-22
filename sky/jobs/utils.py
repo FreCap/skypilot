@@ -32,6 +32,7 @@ from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.jobs import constants as managed_job_constants
+from sky.jobs import controller_log_stream
 from sky.jobs import debug_dump as managed_job_debug_dump
 from sky.jobs import managed_job_codegen
 from sky.jobs import queue_utils as managed_job_queue_utils
@@ -1649,12 +1650,9 @@ def stream_logs_by_id(job_id: int,
             cluster_name = None
             job_id_to_tail = None
             if task_id is not None:
-                pool = managed_job_state.get_pool_from_job_id(job_id)
-                if pool is not None:
-                    cluster_name, job_id_to_tail = (
-                        managed_job_state.get_pool_submit_info(job_id))
-                else:
-                    task_name = managed_job_state.get_task_name(job_id, task_id)
+                pool, cluster_name, job_id_to_tail, task_name = (
+                    managed_job_state.get_log_stream_context(job_id, task_id))
+                if pool is None and task_name is not None:
                     cluster_name = generate_managed_job_cluster_name(
                         task_name, job_id)
                 if cluster_name is not None:
@@ -1912,131 +1910,16 @@ def stream_logs(job_id: int | None,
             return 'No managed job found.', exceptions.JobExitCode.NOT_FOUND
 
     if controller:
-        if job_id is None:
-            assert job_name is not None
-            managed_jobs, _ = managed_job_state.get_managed_jobs_with_filters(
-                name_match=job_name, fields=['job_id', 'job_name', 'status'])
-            # We manually filter the jobs by name, instead of using
-            # get_nonterminal_job_ids_by_name, as with `controller=True`, we
-            # should be able to show the logs for jobs in terminal states.
-            managed_job_ids: set[int] = {
-                job['job_id']
-                for job in managed_jobs
-                if job['job_name'] == job_name
-            }
-            if not managed_job_ids:
-                return (f'No managed job found with name {job_name!r}.',
-                        exceptions.JobExitCode.NOT_FOUND)
-            if len(managed_job_ids) > 1:
-                job_ids_str = ', '.join(
-                    str(job_id) for job_id in managed_job_ids)
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        f'Multiple managed jobs found with name {job_name!r} '
-                        f'(Job IDs: {job_ids_str}). Please specify the job_id '
-                        'instead.')
-            job_id = managed_job_ids.pop()
-        assert job_id is not None, (job_id, job_name)
-
-        controller_log_path = controller_log_file_for_job(job_id)
-        job_status = None
-
-        # Wait for the log file to be written
-        while not os.path.exists(controller_log_path):
-            if not follow:
-                # Assume that the log file hasn't been written yet. Since we
-                # aren't following, just return.
-                return '', exceptions.JobExitCode.SUCCEEDED
-
-            job_status = managed_job_state.get_status(job_id)
-            if job_status is None:
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(f'Job {job_id} not found.')
-            if job_status.is_terminal():
-                # Don't keep waiting. If the log file is not created by this
-                # point, it never will be. This job may have been submitted
-                # using an old version that did not create the log file, so this
-                # is not considered an exceptional case.
-                return '', exceptions.JobExitCode.from_managed_job_status(
-                    job_status)
-
-            time.sleep(log_lib.SKY_LOG_WAITING_GAP_SECONDS)
-
-        # This code is based on log_lib.tail_logs. We can't use that code
-        # exactly because state works differently between managed jobs and
-        # normal jobs.
-        offset_arg = (tail_offset
-                      if tail_offset is not None and tail_offset > 0 else 0)
-        # Phase 1: emit the historical window. For tail!=None we use a
-        # backward-seek read so cost is O(tail) instead of O(file_size);
-        # otherwise stream the whole file (this is the legacy `tail=None`
-        # behavior used by `sky jobs logs --controller`).
-        end_pos = 0
-        if tail is not None:
-            assert tail > 0
-            tail_lines, end_pos = log_lib.tail_lines_from_end(
-                controller_log_path, tail, offset_arg)
-            for line in tail_lines:
-                if _is_relayed_status_payload_line(line):
-                    continue
-                print(line, end='')
-            print(end='', flush=True)
-        else:
-            with open(controller_log_path, newline='', encoding='utf-8') as f:
-                for line in f:
-                    if _is_relayed_status_payload_line(line):
-                        continue
-                    print(line, end='')
-                end_pos = f.tell()
-                print(end='', flush=True)
-
-        # Phase 2: optionally follow new bytes from where the tail read
-        # stopped. Reopen so the prior file handle (which may have been
-        # binary in the seek branch) doesn't leak.
-        if follow:
-            with open(controller_log_path, newline='', encoding='utf-8') as f:
-                f.seek(end_pos)
-                while True:
-                    # Print all new lines, if there are any.
-                    line = f.readline()
-                    while line is not None and line != '':
-                        if not _is_relayed_status_payload_line(line):
-                            print(line, end='')
-                        line = f.readline()
-
-                    # Flush.
-                    print(end='', flush=True)
-
-                    # Check if the job if finished.
-                    # TODO(cooperc): The controller can still be
-                    # cleaning up if job is in a terminal status
-                    # (e.g. SUCCEEDED). We want to follow those logs
-                    # too. Use DONE instead?
-                    job_status = managed_job_state.get_status(job_id)
-                    assert job_status is not None, (job_id, job_name)
-                    if job_status.is_terminal():
-                        break
-
-                    time.sleep(log_lib.SKY_LOG_TAILING_GAP_SECONDS)
-
-                # Wait for final logs to be written.
-                time.sleep(1 + log_lib.SKY_LOG_TAILING_GAP_SECONDS)
-
-                # Print any remaining logs including incomplete line.
-                remaining = f.read()
-                if remaining:
-                    print(''.join(
-                        line for line in remaining.splitlines(keepends=True)
-                        if not _is_relayed_status_payload_line(line)),
-                          end='',
-                          flush=True)
-
-        if follow:
-            return ux_utils.finishing_message(
-                f'Job finished (status: {job_status}).'
-            ), exceptions.JobExitCode.from_managed_job_status(job_status)
-
-        return '', exceptions.JobExitCode.SUCCEEDED
+        return controller_log_stream.stream_controller_logs(
+            job_id,
+            job_name,
+            follow,
+            tail,
+            tail_offset,
+            controller_log_file_for_job_func=controller_log_file_for_job,
+            is_relayed_status_payload_line_func=(
+                _is_relayed_status_payload_line),
+        )
 
     if job_id is None:
         assert job_name is not None

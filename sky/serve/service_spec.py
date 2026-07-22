@@ -41,6 +41,7 @@ class SkyServiceSpec:
         # are explicitly backfilled to False in __setstate__ below.
         lb_high_availability: bool = True,
         max_replicas: int | None = None,
+        min_replicas_by_accelerator: dict[str, int] | None = None,
         num_overprovision: int | None = None,
         ports: str | None = None,
         target_qps_per_replica: float | dict[str, float] | None = None,
@@ -130,6 +131,45 @@ class SkyServiceSpec:
                                  'equal to min_replicas. Found: '
                                  f'min_replicas={min_replicas}, '
                                  f'max_replicas={max_replicas}')
+
+        accelerator_floors = dict(min_replicas_by_accelerator or {})
+        normalized_floor_names: set[str] = set()
+        for accelerator, floor in accelerator_floors.items():
+            normalized = accelerator.casefold()
+            if normalized in normalized_floor_names:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'min_replicas_by_accelerator contains duplicate exact '
+                        f'accelerator names ignoring case: {accelerator!r}.')
+            normalized_floor_names.add(normalized)
+            if isinstance(floor,
+                          bool) or not isinstance(floor, int) or floor < 0:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'min_replicas_by_accelerator values must be integers '
+                        f'>= 0. Got {accelerator!r}: {floor!r}.')
+        effective_max = max_replicas if max_replicas is not None else min_replicas
+        if sum(accelerator_floors.values()) > effective_max:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'The sum of min_replicas_by_accelerator must not exceed '
+                    f'max_replicas ({effective_max}). Got: '
+                    f'{sum(accelerator_floors.values())}.')
+        if (accelerator_floors and
+                not isinstance(target_qps_per_replica, dict) and
+                target_concurrency_per_replica is None):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'min_replicas_by_accelerator requires either dict type '
+                    'target_qps_per_replica or '
+                    'target_concurrency_per_replica so SkyServe can size and '
+                    'launch each exact accelerator independently.')
+        if (accelerator_floors and
+                load_balancing_policy != 'instance_aware_least_load'):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'min_replicas_by_accelerator requires '
+                    'load_balancing_policy: instance_aware_least_load.')
 
         # The two demand knobs select different autoscalers (request-rate vs
         # concurrency); allowing both would make the sizing model ambiguous.
@@ -604,6 +644,7 @@ class SkyServiceSpec:
             graceful_drain_async_occupancy)
         self._min_replicas: int = min_replicas
         self._max_replicas: int | None = max_replicas
+        self._min_replicas_by_accelerator = accelerator_floors
         self._num_overprovision: int | None = num_overprovision
         self._ports: str | None = ports
         self._target_qps_per_replica: float | dict[
@@ -673,6 +714,7 @@ class SkyServiceSpec:
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
+        state.setdefault('_min_replicas_by_accelerator', {})
         state.setdefault('_target_utilization_percentage', None)
         state.setdefault('_expected_request_duration_seconds', None)
         state.setdefault('_max_scale_up_rate_percentage', None)
@@ -889,6 +931,7 @@ class SkyServiceSpec:
                 min_replicas = (pool_min_workers if pool_min_workers is not None
                                 else min_replicas)
             service_config['min_replicas'] = min_replicas
+            service_config['min_replicas_by_accelerator'] = None
             service_config['max_replicas'] = pool_max_workers
             service_config['upscale_delay_seconds'] = pool_upscale_delay
             service_config['downscale_delay_seconds'] = pool_downscale_delay
@@ -906,6 +949,8 @@ class SkyServiceSpec:
             service_config['cost_rebalance'] = None
         else:
             service_config['min_replicas'] = policy_section['min_replicas']
+            service_config['min_replicas_by_accelerator'] = policy_section.get(
+                'min_replicas_by_accelerator', None)
             service_config['max_replicas'] = policy_section.get(
                 'max_replicas', None)
             service_config['num_overprovision'] = policy_section.get(
@@ -948,6 +993,15 @@ class SkyServiceSpec:
         target_concurrency_per_replica = service_config.get(
             'target_concurrency_per_replica', None)
         load_balancing_policy = service_config['load_balancing_policy']
+        accelerator_floors = service_config.get(
+            'min_replicas_by_accelerator') or {}
+
+        if (accelerator_floors and
+                load_balancing_policy != 'instance_aware_least_load'):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'min_replicas_by_accelerator requires '
+                    'load_balancing_policy: instance_aware_least_load.')
 
         if isinstance(target_qps_per_replica, dict):
             if load_balancing_policy != 'instance_aware_least_load':
@@ -1109,6 +1163,10 @@ class SkyServiceSpec:
                             self.lb_high_availability)
         add_if_not_none('readiness_probe', 'headers', self._readiness_headers)
         add_if_not_none('replica_policy', 'min_replicas', self.min_replicas)
+        add_if_not_none('replica_policy',
+                        'min_replicas_by_accelerator',
+                        self.min_replicas_by_accelerator,
+                        no_empty=True)
         add_if_not_none('replica_policy', 'max_replicas', self.max_replicas)
         add_if_not_none('replica_policy', 'num_overprovision',
                         self.num_overprovision)
@@ -1314,6 +1372,10 @@ class SkyServiceSpec:
     @property
     def min_replicas(self) -> int:
         return self._min_replicas
+
+    @property
+    def min_replicas_by_accelerator(self) -> dict[str, int]:
+        return dict(self._min_replicas_by_accelerator)
 
     @property
     def max_replicas(self) -> int | None:
@@ -1548,6 +1610,9 @@ class SkyServiceSpec:
                 'graceful_drain_async_occupancy',
                 self._graceful_drain_async_occupancy),
             min_replicas=override.pop('min_replicas', self._min_replicas),
+            min_replicas_by_accelerator=override.pop(
+                'min_replicas_by_accelerator',
+                self._min_replicas_by_accelerator),
             max_replicas=override.pop('max_replicas', self._max_replicas),
             num_overprovision=override.pop('num_overprovision',
                                            self._num_overprovision),

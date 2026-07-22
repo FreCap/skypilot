@@ -922,7 +922,7 @@ ownership.
 Central image state is PostgreSQL-only. Local and controller databases retain
 their existing SQLite support.
 
-Migration 023 is a literal additive migration. It does not import live ORM
+Migration 024 is a literal additive migration. It does not import live ORM
 metadata. It creates only:
 
 ```text
@@ -1043,7 +1043,7 @@ cluster deletion already owns the central consumer row before it locks the image
 watermark and demand. This is the executable ownership contract for the
 component split.
 
-Migration 023 is run under a PostgreSQL migration-scoped advisory lock, not a
+Migration 024 is run under a PostgreSQL migration-scoped advisory lock, not a
 runtime control-plane lock. The downgrade itself can inspect only database state.
 It requires every operational image table to be empty and the catalog table to
 contain exactly the expected singleton authority row, then drops the singleton
@@ -1051,7 +1051,14 @@ with the schema. Draining all 023 processes, removing profile configuration,
 revoking controller/canary credentials, and running the bounded teardown command
 that empties operational rows are separately verified operator preconditions.
 Normal rollback never downgrades. Because the feature has not shipped, there is
-no compatibility reason to preserve the earlier branch-only schema.
+no compatibility reason to preserve image-plane state during an explicit
+downgrade, while upgrade continuity for preview deployments remains required.
+
+The shared auth-session migration merged first at revision 023, which was also
+the revision used by managed-image preview deployments. Revision 024 therefore
+creates the literal `auth_sessions` predecessor table when it is absent and
+adopts an already-complete preview image schema instead of replaying its DDL.
+Partial image schemas fail closed. Downgrade 024 never drops `auth_sessions`.
 
 ## Registry profiles
 
@@ -1910,7 +1917,7 @@ CLI or Dashboard locates such a publication for explicit retry.
 
 1. Merge literal schema, typed API, worker images, UI, Terraform, and tests with
    the image feature and managed profiles disabled.
-2. Run migration 023 once in a Helm migration Job. The Job holds the PostgreSQL
+2. Run migration 024 once in a Helm migration Job. The Job holds the PostgreSQL
    migration advisory lock. Helm API pods run in `verify` mode, which refuses to
    start below 023 but never races to upgrade. Local single-server development
    may retain `auto` mode under the same PostgreSQL lock.
@@ -1977,8 +1984,8 @@ drained and every image table is empty; it is never part of Helm rollback.
 ### Required verification
 
 - real PostgreSQL migration, concurrency, lease, retry, and downgrade tests;
-- fresh-through-023 and literal 022-to-023 schema equivalence, concurrent
-  migration-lock, and mixed-022/023 feature-disabled tests;
+- fresh-through-024 and literal 023-to-024 schema equivalence, concurrent
+  migration-lock, and mixed-023/024 feature-disabled tests;
 - old-server/new-client and new-server/old-client feature-gate tests;
 - API 61/62 behavior across launch/exec, jobs, Serve up/update, pools, nested DAGs,
   resource alternatives, forged private fields, and request config overrides;
@@ -2137,7 +2144,7 @@ EC2 and EKS plans reject every unqualified helper, principal, instance profile,
 node selector, or extra field. Error-marker traversal is bounded and cycle-safe,
 multi-row request termination locks deterministically, and both copy and
 lifecycle workers can resume bounded publication fanout. It also reconciles the
-Serve migration chain at revision 021, regenerates the Helm schema, restores
+Serve migration chain at revision 022, regenerates the Helm schema, restores
 immutable YAML fixtures, removes the duplicate test-module basename, and
 updates Python 3.14 static-analysis contracts. Activation remains disabled until
 the resulting exact head passes every operational gate.

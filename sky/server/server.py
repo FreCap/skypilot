@@ -1,3 +1,4 @@
+# pyright: reportOptionalMemberAccess=error
 """SkyPilot API Server exposing RESTful APIs."""
 
 import argparse
@@ -25,7 +26,6 @@ from fastapi import exception_handlers as fastapi_exception_handlers
 from fastapi import exceptions as fastapi_exceptions
 from fastapi.middleware import cors
 import starlette.background
-import starlette.middleware.base
 import uvloop
 
 import sky
@@ -58,12 +58,12 @@ from sky.server import clean_env as clean_env_module
 from sky.server import common
 from sky.server import config as server_config
 from sky.server import constants as server_constants
+from sky.server import core_middleware
 from sky.server import csp_utils
 from sky.server import daemons
 from sky.server import dashboard as dashboard_app
 from sky.server import file_mount_uploads
 from sky.server import metrics
-from sky.server import middleware_utils
 from sky.server import plugins
 from sky.server import ssh_proxy
 from sky.server import state
@@ -175,16 +175,20 @@ for _dashboard_symbol in (
     _dashboard_symbol.__module__ = __name__
 # pylint: enable=protected-access
 
+RequestIDMiddleware = core_middleware.RequestIDMiddleware
+SecurityHeadersMiddleware = core_middleware.SecurityHeadersMiddleware
+GracefulShutdownMiddleware = core_middleware.GracefulShutdownMiddleware
+APIVersionMiddleware = core_middleware.APIVersionMiddleware
 
-class RequestIDMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
-    """Middleware to add a request ID to each request."""
-
-    async def dispatch(self, request: fastapi.Request, call_next):
-        request_id = requests_lib.get_new_request_id()
-        request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers['X-Skypilot-Request-ID'] = request_id
-        return response
+# Preserve historical import and pickle identities for the stable server
+# facade. The aliases are the exact classes registered with FastAPI.
+for _core_middleware_symbol in (
+        RequestIDMiddleware,
+        SecurityHeadersMiddleware,
+        GracefulShutdownMiddleware,
+        APIVersionMiddleware,
+):
+    _core_middleware_symbol.__module__ = __name__
 
 
 def _cleanup_download_tmp_once() -> None:
@@ -324,130 +328,6 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
         # event loop (process).
         _spawn_lifespan_task(loop_lag_monitor(asyncio.get_running_loop()))
     yield
-
-
-class SecurityHeadersMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
-    """Middleware to add security headers to all HTTP responses.
-
-    Adds Content-Security-Policy and other security headers to mitigate
-    XSS, clickjacking, and content-type sniffing attacks.
-
-    Reference: OWASP A02:2025 - Security Misconfiguration (CWE-1021).
-    """
-
-    # Content-Security-Policy directives:
-    # - default-src 'self': Only allow resources from the same origin
-    # - script-src: For HTML responses a per-request nonce is used
-    #   ('nonce-<value>') so inline scripts are allowed only when they
-    #   carry the matching nonce attribute.  Non-HTML responses get a
-    #   strict 'self'-only policy (no inline allowance needed).
-    # - style-src: Uses 'unsafe-inline' because CSS-in-JS libraries
-    #   (Emotion, react-remove-scroll-bar) dynamically create <style>
-    #   elements that cannot easily carry nonces.  CSS cannot execute
-    #   scripts, so the risk is negligible.
-    # - font-src 'self': Only allow same-origin fonts
-    # - connect-src 'self' https://usage-v3.skypilot.co
-    #   http://localhost:* http://127.0.0.1:*:
-    #   Allow same-origin fetch/XHR/WebSocket, analytics traffic via the
-    #   usage-v3 reverse proxy, and localhost connections needed by the
-    #   /token page's legacy auth callback flow (the page's JavaScript
-    #   POSTs the auth token to a local HTTP server started by the CLI
-    #   on localhost)
-    # - worker-src 'self' blob:: Allow same-origin workers and blob
-    #   workers (needed for analytics).
-    # - frame-src 'self': Allow same-origin iframes (for Grafana panels)
-    # - img-src 'self' data:: Allow same-origin images and data URIs
-    # - object-src 'none': Block all plugin content (Flash, Java, etc.)
-    # - base-uri 'self': Restrict <base> element to same origin
-    # - form-action 'self': Restrict form submissions to same origin
-    # - frame-ancestors 'self': Prevent clickjacking via framing
-    _CSP_TEMPLATE = ('default-src \'self\'; '
-                     'script-src {script_src} '
-                     'https://usage-v3.skypilot.co; '
-                     'style-src \'self\' \'unsafe-inline\'; '
-                     'font-src \'self\'; '
-                     'connect-src \'self\' https://usage-v3.skypilot.co '
-                     'http://localhost:* http://127.0.0.1:*; '
-                     'worker-src \'self\' blob:; '
-                     'frame-src \'self\'; '
-                     'img-src \'self\' data:; '
-                     'object-src \'none\'; '
-                     'base-uri \'self\'; '
-                     'form-action \'self\'; '
-                     'frame-ancestors \'self\'')
-
-    async def dispatch(self, request: fastapi.Request, call_next):
-        response = await call_next(request)
-        # Endpoints that serve HTML set request.state.csp_nonce so the
-        # CSP header can reference the nonce that was injected into the
-        # HTML body.  Non-HTML responses get a strict policy with no
-        # inline allowance.
-        nonce = getattr(request.state, 'csp_nonce', None)
-        if nonce:
-            script_src = f'\'self\' \'nonce-{nonce}\''
-        else:
-            script_src = '\'self\''
-        csp = self._CSP_TEMPLATE.format(script_src=script_src)
-        response.headers['Content-Security-Policy'] = csp
-        # X-Frame-Options for legacy browsers that don't support CSP
-        # frame-ancestors directive.
-        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-        response.headers['X-Content-Type-Options'] = 'nosniff'
-        response.headers['Referrer-Policy'] = (
-            'strict-origin-when-cross-origin')
-        response.headers['Permissions-Policy'] = (
-            'camera=(), microphone=(), geolocation=()')
-        return response
-
-
-@middleware_utils.websocket_aware
-class GracefulShutdownMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
-    """Middleware to control requests when server is shutting down."""
-
-    async def dispatch(self, request: fastapi.Request, call_next):
-        if state.get_block_requests():
-            # Allow /api/ paths to continue, which are critical to operate
-            # on-going requests but will not submit new requests.
-            if not request.url.path.startswith('/api/'):
-                # Client will retry on 503 error.
-                return fastapi.responses.JSONResponse(
-                    status_code=503,
-                    content={
-                        'detail': 'Server is shutting down, '
-                                  'please try again later.'
-                    })
-
-        return await call_next(request)
-
-
-@middleware_utils.websocket_aware
-class APIVersionMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
-    """Middleware to add API version to the request."""
-
-    async def dispatch(self, request: fastapi.Request, call_next):
-        version_info = versions.check_compatibility_at_server(request.headers)
-        # Bypass version handling for backward compatibility with clients prior
-        # to v0.11.0, the client will check the version in the body of
-        # /api/health response and hint an upgrade.
-        # TODO(aylei): remove this after v0.13.0 is released.
-        if version_info is None:
-            return await call_next(request)
-        if version_info.error is None:
-            versions.set_remote_api_version(version_info.api_version)
-            versions.set_remote_version(version_info.version)
-            response = await call_next(request)
-        else:
-            response = fastapi.responses.JSONResponse(
-                status_code=400,
-                content={
-                    'error': common.ApiServerStatus.VERSION_MISMATCH.value,
-                    'message': version_info.error,
-                })
-        response.headers[server_constants.API_VERSION_HEADER] = str(
-            server_constants.API_VERSION)
-        response.headers[server_constants.VERSION_HEADER] = \
-            versions.get_local_readable_version()
-        return response
 
 
 app = fastapi.FastAPI(prefix='/api/v1', debug=True, lifespan=lifespan)
@@ -644,6 +524,26 @@ async def token(request: fastapi.Request,
         })
 
 
+async def _poll_auth_session(code_verifier: str) -> str | None:
+    """Consume an auth session without losing it to caller cancellation."""
+    store = auth_sessions.auth_session_store
+    poll_task = asyncio.create_task(
+        asyncio.to_thread(store.poll_session, code_verifier))
+    try:
+        return await asyncio.shield(poll_task)
+    except asyncio.CancelledError:
+        try:
+            auth_token = await poll_task
+            if auth_token is not None:
+                code_challenge = common_utils.compute_code_challenge(
+                    code_verifier)
+                await asyncio.to_thread(store.restore_session, code_challenge,
+                                        auth_token)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception('Failed to restore a cancelled auth session poll')
+        raise
+
+
 @app.get('/api/v1/auth/token')
 async def poll_auth_token(
         code_verifier: str | None = None) -> fastapi.responses.Response:
@@ -662,7 +562,9 @@ async def poll_auth_token(
         raise fastapi.HTTPException(status_code=400,
                                     detail='code_verifier is required')
 
-    auth_token = auth_sessions.auth_session_store.poll_session(code_verifier)
+    # The auth session store performs a synchronous DB transaction. Keep CLI
+    # polling from blocking unrelated API requests on this worker's event loop.
+    auth_token = await _poll_auth_session(code_verifier)
 
     if auth_token is None:
         raise fastapi.HTTPException(status_code=404, detail='Session not found')
@@ -703,7 +605,10 @@ async def authorize_auth_session(
     auth_token = _generate_auth_token(request)
 
     # Create the session with the token
-    auth_sessions.auth_session_store.create_session(code_challenge, auth_token)
+    # Session creation is a synchronous DB transaction and can wait on another
+    # worker, so run it outside the request event loop.
+    await asyncio.to_thread(auth_sessions.auth_session_store.create_session,
+                            code_challenge, auth_token)
 
     return fastapi.responses.JSONResponse(content={'status': 'authorized'},
                                           headers={'Cache-Control': 'no-store'})
@@ -1647,6 +1552,11 @@ async def api_get(request_id: str) -> payloads.RequestPayload:
         # Back off: 10ms -> 20ms -> 40ms -> 80ms -> 100ms (cap)
         poll_interval = min(poll_interval * 2, 0.1)
     request_task = await requests_lib.get_request_async(request_id)
+    if request_task is None:
+        # Request retention can delete an old terminal row after the status
+        # poll above and before this full-row fetch.
+        raise fastapi.HTTPException(status_code=404,
+                                    detail=f'Request {request_id!r} not found')
     # TODO(aylei): refine this, /api/get will not be retried and this is
     # meaningless to retry. It is the original request that should be retried.
     if request_task.should_retry:

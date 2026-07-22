@@ -162,6 +162,60 @@ class LogicalReconcileSnapshot:
     received_at: float
 
 
+LogicalAcceleratorState = tuple[tuple[str, int], ...]
+LogicalTargetState = (tuple[int, int, int] |
+                      tuple[int, int, int, LogicalAcceleratorState,
+                            LogicalAcceleratorState])
+
+
+def _logical_target_state_components(
+    state: LogicalTargetState | None,
+) -> tuple[int, int, int, LogicalAcceleratorState,
+           LogicalAcceleratorState] | None:
+    """Validate and expand legacy or exact-card logical target state."""
+    if not isinstance(state, tuple) or len(state) not in (3, 5):
+        return None
+    version, generation, target_capacity = state[:3]
+    if (type(version) is not int or type(generation) is not int or
+            generation < 0 or type(target_capacity) is not int or
+            target_capacity < 0):
+        return None
+    if len(state) == 3:
+        return version, generation, target_capacity, (), ()
+
+    def _validated_items(raw: Any, *,
+                         allow_zero: bool) -> LogicalAcceleratorState | None:
+        if not isinstance(raw, tuple):
+            return None
+        normalized: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for item in raw:
+            if (not isinstance(item, tuple) or len(item) != 2 or
+                    not isinstance(item[0], str) or not item[0] or
+                    type(item[1]) is not int or
+                    item[1] < (0 if allow_zero else 1)):
+                return None
+            folded = item[0].casefold()
+            if folded in seen:
+                return None
+            seen.add(folded)
+            if item[1] > 0 or not allow_zero:
+                normalized.append((item[0], item[1]))
+        return tuple(normalized)
+
+    target_by_card = _validated_items(state[3], allow_zero=True)
+    shapes = _validated_items(state[4], allow_zero=False)
+    if target_by_card is None or shapes is None:
+        return None
+    target_names = {card.casefold() for card, _ in target_by_card}
+    shape_names = {card.casefold() for card, _ in shapes}
+    if (sum(value for _, value in target_by_card) != target_capacity or
+            target_names - shape_names or
+        (target_capacity > 0 and not target_by_card)):
+        return None
+    return version, generation, target_capacity, target_by_card, shapes
+
+
 def _remove_nonmaterial_replica_config_metadata(config: dict[str, Any]) -> None:
     """Ignore generated metadata that cannot affect a running replica.
 
@@ -1081,7 +1135,10 @@ class ReplicaInfo:
     # rows so a persistent telemetry outage cannot recursively replace them.
     # Version 10 records that a pre-activation physical bridge has published
     # a load-balancer-verified logical width.
-    _VERSION = 10
+    # Version 11 persists placement-cost provenance independently from the
+    # reserved_fill launch reason. Demand launches can also land on free
+    # reserved capacity and must receive the same routing preference.
+    _VERSION = 11
 
     def __init__(self,
                  replica_id: int,
@@ -1138,6 +1195,9 @@ class ReplicaInfo:
         # (prior_reserved_fill) -- otherwise the replacement row would
         # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
+        # Placement-cost provenance, not launch intent. True means the
+        # replica occupies capacity the placer classifies as zero cost.
+        self.is_zero_cost: bool = False
         # Incumbent id this replica was launched to replace economically.
         # None for ordinary demand/fill launches.
         self.cost_rebalance_for_replica_id: int | None = None
@@ -1189,6 +1249,7 @@ class ReplicaInfo:
             'logical_bridge_capacity_verified': bool(
                 getattr(self, 'logical_bridge_capacity_verified', False)),
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
+            'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
             'status_property': {
@@ -1266,6 +1327,7 @@ class ReplicaInfo:
         replica.logical_bridge_capacity_verified = bool(
             state.get('logical_bridge_capacity_verified', False))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
+        replica.is_zero_cost = bool(state.get('is_zero_cost', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.status_property = ReplicaStatusProperty(
@@ -1641,6 +1703,12 @@ class ReplicaInfo:
             # direction for a live fleet crossing the upgrade.
             self.reserved_fill = False
 
+        if version < 11:
+            # Old rows do not contain authoritative cost provenance. False is
+            # conservative: it preserves correctness and only forgoes the new
+            # economic tie-break until natural replacement.
+            self.is_zero_cost = False
+
         state.setdefault('cost_rebalance_for_replica_id', None)
 
         if version < 7:
@@ -1720,7 +1788,7 @@ class ReplicaManager:
         # target remains authoritative while newer LB capacity reports arrive;
         # only a capacity report older than the target publication blocks
         # logical actuation.
-        self._logical_target: tuple[int, int, int] | None = None
+        self._logical_target: LogicalTargetState | None = None
         header_keys = None
         if spec.readiness_headers is not None:
             header_keys = list(spec.readiness_headers.keys())
@@ -1780,17 +1848,42 @@ class ReplicaManager:
                 unknown_replica_ids=frozenset(unknown_replica_ids),
                 received_at=time.monotonic())
 
-    def publish_logical_target(self, version: int, generation: int,
-                               target_capacity: int) -> None:
+    def publish_logical_target(
+            self,
+            version: int,
+            generation: int,
+            target_capacity: int,
+            target_capacity_by_accelerator: LogicalAcceleratorState = (),
+            accelerator_shapes: LogicalAcceleratorState = (),
+    ) -> None:
         """Publish the target computed from an exact reconcile generation."""
         with self._logical_state_lock:
-            self._logical_target = (version, generation, target_capacity)
+            candidate: LogicalTargetState
+            if target_capacity_by_accelerator or accelerator_shapes:
+                candidate = (version, generation, target_capacity,
+                             target_capacity_by_accelerator, accelerator_shapes)
+            else:
+                candidate = (version, generation, target_capacity)
+            if _logical_target_state_components(candidate) is None:
+                logger.warning('Discarding malformed published logical target '
+                               f'{candidate!r}.')
+                self._logical_target = None
+                return
+            self._logical_target = candidate
+
+    def invalidate_logical_target(self) -> None:
+        """Revoke authority for pending logical-capacity retirements."""
+        with self._logical_state_lock:
+            self._logical_target = None
 
     def _logical_target_fence_holds(
             self,
             version: int,
             decision_generation: int,
             target_capacity: int,
+            target_capacity_by_accelerator: LogicalAcceleratorState |
+        None = None,
+            accelerator_shapes: LogicalAcceleratorState | None = None,
             require_exact_generation: bool = False) -> bool:
         """Whether a logical target intent is still authorized.
 
@@ -1802,6 +1895,18 @@ class ReplicaManager:
         newer decision tick.
         """
         snapshot = self._logical_reconcile_snapshot
+        target_state = _logical_target_state_components(self._logical_target)
+        if target_state is None:
+            return False
+        (target_version, target_generation, current_target,
+         current_target_by_card, current_shapes) = target_state
+        expected_target_by_card = target_capacity_by_accelerator or ()
+        expected_shapes = accelerator_shapes or ()
+        if ((current_target_by_card or current_shapes) and
+            (target_capacity_by_accelerator is None or
+             accelerator_shapes is None)):
+            # An aggregate-only caller cannot act on an exact-card target.
+            return False
         pending_version = getattr(self, '_pending_version', None)
         generation_matches = (snapshot is not None and
                               (snapshot.generation == decision_generation
@@ -1812,8 +1917,29 @@ class ReplicaManager:
                 self._logical_snapshot_is_fresh(snapshot) and
                 self.latest_version == version and
                 (pending_version is None or pending_version <= version) and
-                self._logical_target == (version, decision_generation,
-                                         target_capacity))
+                (target_version, target_generation, current_target)
+                == (version, decision_generation, target_capacity) and
+                current_target_by_card == expected_target_by_card and
+                current_shapes == expected_shapes)
+
+    def _logical_reconcile_fence_holds(
+        self,
+        fence: LogicalTargetState,
+        *,
+        require_exact_generation: bool = False,
+    ) -> bool:
+        components = _logical_target_state_components(fence)
+        if components is None:
+            return False
+        version, generation, target, target_by_card, shapes = components
+        exact = len(fence) == 5
+        return self._logical_target_fence_holds(
+            version,
+            generation,
+            target,
+            target_by_card if exact else None,
+            shapes if exact else None,
+            require_exact_generation=require_exact_generation)
 
     @staticmethod
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
@@ -1852,8 +1978,15 @@ class ReplicaManager:
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
 
-    def scale_up_to_logical_capacity(self, target_capacity: int, version: int,
-                                     reconcile_generation: int) -> None:
+    def scale_up_to_logical_capacity(
+        self,
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        replace_unknown_replica_ids: tuple[int, ...] = (),
+        target_capacity_by_accelerator: dict[str, int] | None = None,
+        accelerator_shapes: dict[str, int] | None = None,
+    ) -> None:
         """Persist complete backend shapes until target capacity is covered."""
         raise NotImplementedError
 
@@ -1871,14 +2004,27 @@ class ReplicaManager:
         """Scale down replica with replica_id."""
         raise NotImplementedError
 
-    def scale_down_logically(self, replica_id: int, target_capacity: int,
-                             version: int, reconcile_generation: int) -> None:
+    def scale_down_logically(
+        self,
+        replica_id: int,
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        target_capacity_by_accelerator: LogicalAcceleratorState = (),
+        accelerator_shapes: LogicalAcceleratorState = ()
+    ) -> None:
         """Retire one backend only if the logical coverage fence still holds."""
         raise NotImplementedError
 
-    def scale_down_logically_batch(self, replica_ids: list[int],
-                                   target_capacity: int, version: int,
-                                   reconcile_generation: int) -> None:
+    def scale_down_logically_batch(
+        self,
+        replica_ids: list[int],
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        target_capacity_by_accelerator: LogicalAcceleratorState = (),
+        accelerator_shapes: LogicalAcceleratorState = ()
+    ) -> None:
         """Retire logical backends selected from one reconcile generation.
 
         Subclasses may override to amortize synchronization and fleet reads.
@@ -1886,7 +2032,9 @@ class ReplicaManager:
         """
         for replica_id in replica_ids:
             self.scale_down_logically(replica_id, target_capacity, version,
-                                      reconcile_generation)
+                                      reconcile_generation,
+                                      target_capacity_by_accelerator,
+                                      accelerator_shapes)
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
@@ -2398,6 +2546,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'recovering_existing_replica': True,
                     'prior_reserved_fill': bool(
                         getattr(replica_info, 'reserved_fill', False)),
+                    'prior_is_zero_cost': bool(
+                        getattr(replica_info, 'is_zero_cost', False)),
                     'prior_planned_capacity': prior_planned_capacity,
                     'prior_unknown_capacity_replacement': bool(
                         getattr(replica_info, 'unknown_capacity_replacement',
@@ -2614,6 +2764,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
+        prior_is_zero_cost: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_planned_capacity: int | None = None,
         prior_unknown_capacity_replacement: bool = False,
@@ -2621,7 +2772,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         recovering_existing_replica: bool = False,
-        logical_reconcile_fence: tuple[int, int, int] | None = None,
+        logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
@@ -2636,6 +2787,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         from the persisted override; OR-ing the prior flag in keeps a
         recovered fill replica counted as arbitrated (ceiling-governed)
         capacity instead of silently converting it to demand.
+
+        prior_is_zero_cost: placement-cost provenance of a recovery row. The
+        recovered exact pin remains on the same capacity, so preserve it even
+        if the current placer snapshot is temporarily unavailable.
 
         recovering_existing_replica: the replica already has a durable row
         and cluster identity. Reuse an exact persisted placement instead of
@@ -2777,6 +2932,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             # conflict with the spot placer's selection.
             if resources_override is None:
                 resources_override = {}
+            allowed_locations = self._locations_for_accelerator_override(
+                resources_override)
+            allowed_location_kwargs: dict[str, Any] = (
+                {} if allowed_locations is None else {
+                    'allowed_locations': allowed_locations
+                })
+            if (resources_override.get('accelerators') and
+                    not allowed_locations):
+                raise ValueError(
+                    'No active placement location matches exact accelerator '
+                    f'override {resources_override["accelerators"]!r}.')
             if existing_replica_infos is None:
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
@@ -2819,7 +2985,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # aborted fill launch leaks nothing and the autoscaler
                 # simply retries on a later tick as capacity frees.
                 zero_cost_location = (
-                    self._spot_placer.select_next_zero_cost_location())
+                    self._spot_placer.select_next_zero_cost_location(
+                        allowed_locations=allowed_locations))
                 if zero_cost_location is None:
                     self._log_fill_skip(
                         'no ACTIVE zero-cost location available')
@@ -2831,11 +2998,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # preferring the zero-cost tier.  The placer falls back to
                 # zero-cost when no paid candidate exists.
                 location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True, **allowed_location_kwargs)
                 if (zero_cost_demand_budget is not None and
                         location in self._spot_placer.zero_cost_locations()):
                     budgeted_location = self._select_budgeted_zero_cost_location(
-                        zero_cost_demand_budget)
+                        zero_cost_demand_budget, allowed_locations)
                     if budgeted_location is None:
                         logger.info('Deferring demand launch because the '
                                     'shared zero-cost GPU budget is exhausted '
@@ -2844,10 +3011,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     location = budgeted_location
             elif zero_cost_demand_budget is not None:
                 location = self._select_budgeted_zero_cost_location(
-                    zero_cost_demand_budget)
+                    zero_cost_demand_budget, allowed_locations)
                 if location is None:
                     location = self._spot_placer.select_next_location(
-                        skip_zero_cost_preference=True)
+                        skip_zero_cost_preference=True,
+                        **allowed_location_kwargs)
                     if location in self._spot_placer.zero_cost_locations():
                         # A successful zero (or an exhausted speculative
                         # allowance) is authoritative. If no paid candidate is
@@ -2860,9 +3028,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             elif self._demand_should_skip_saturated_zero_cost(
                     existing_replica_infos):
                 location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True, **allowed_location_kwargs)
             else:
-                location = self._spot_placer.select_next_location()
+                location = self._spot_placer.select_next_location(
+                    **allowed_location_kwargs)
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
@@ -2894,12 +3063,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # this location below) never sees the error.
                 retry_until_up = False
         if logical_reconcile_fence is not None:
-            fence_version, fence_generation, fence_target = (
-                logical_reconcile_fence)
-            if not self._logical_target_fence_holds(
-                    fence_version,
-                    fence_generation,
-                    fence_target,
+            if not self._logical_reconcile_fence_holds(
+                    logical_reconcile_fence,
                     require_exact_generation=(
                         logical_reconcile_fence_requires_exact_generation)):
                 logger.info('Logical launch selection was superseded before '
@@ -2968,18 +3133,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
+        is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
+        if not is_zero_cost and self._spot_placer is not None:
+            candidates = self._spot_placer.zero_cost_locations()
+            if isinstance(candidates, (list, tuple, set, frozenset)):
+                is_zero_cost = location in candidates
+        info.is_zero_cost = is_zero_cost
         info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
         logical_state_guard = (self._logical_state_lock
                                if logical_reconcile_fence is not None else
                                contextlib.nullcontext())
         with logical_state_guard:
             if logical_reconcile_fence is not None:
-                fence_version, fence_generation, fence_target = (
-                    logical_reconcile_fence)
-                if not self._logical_target_fence_holds(
-                        fence_version,
-                        fence_generation,
-                        fence_target,
+                if not self._logical_reconcile_fence_holds(
+                        logical_reconcile_fence,
                         require_exact_generation=(
                             logical_reconcile_fence_requires_exact_generation)):
                     logger.info('Logical launch was superseded at its final '
@@ -3069,12 +3236,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         return holdings >= grant
 
     def _select_budgeted_zero_cost_location(
-            self, budget: _ZeroCostDemandBudget) -> spot_placer.Location | None:
+        self,
+        budget: _ZeroCostDemandBudget,
+        allowed_locations: set[spot_placer.Location] | None = None,
+    ) -> spot_placer.Location | None:
         """Reserve and select one location from a measured batch budget."""
         if self._spot_placer is None:
             return None
         allowed = set()
         for location in self._spot_placer.zero_cost_locations():
+            if (allowed_locations is not None and
+                    location not in allowed_locations):
+                continue
             pool_key = _zero_cost_pool_key(location)
             if pool_key is None:
                 continue
@@ -3105,6 +3278,27 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert remaining >= debit, (location, budget)
         budget.remaining_by_pool[pool_key] = remaining - debit
         return location
+
+    def _locations_for_accelerator_override(
+        self,
+        resources_override: dict[str, Any],
+    ) -> set[spot_placer.Location] | None:
+        """Restrict a targeted launch to one exact accelerator shape."""
+        if self._spot_placer is None:
+            return None
+        requested = resources_override.get('accelerators')
+        if not isinstance(requested, dict) or not requested:
+            return None
+        requested_shape = {
+            str(name).casefold(): count for name, count in requested.items()
+        }
+        return {
+            location for location in self._spot_placer.active_locations()
+            if isinstance(location.accelerators, dict) and {
+                str(name).casefold(): count
+                for name, count in location.accelerators.items()
+            } == requested_shape
+        }
 
     def _build_zero_cost_demand_budget(
         self,
@@ -3292,7 +3486,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         used_replica_ids: set[int],
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
-        logical_reconcile_fence: tuple[int, int, int] | None = None,
+        logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
     ) -> bool:
@@ -3445,7 +3639,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         target_capacity: int,
         version: int,
         reconcile_generation: int,
-        replace_unknown_replica_ids: tuple[int, ...] = ()
+        replace_unknown_replica_ids: tuple[int, ...] = (),
+        target_capacity_by_accelerator: dict[str, int] | None = None,
+        accelerator_shapes: dict[str, int] | None = None,
     ) -> None:
         """Plan and persist complete backend shapes up to a logical target.
 
@@ -3457,8 +3653,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale target sent to a physical '
                                'replica service.')
-        if not self._logical_target_fence_holds(version, reconcile_generation,
-                                                target_capacity):
+        target_by_accelerator_state = (tuple(
+            (str(card), int(value))
+            for card, value in target_capacity_by_accelerator.items())
+                                       if target_capacity_by_accelerator
+                                       is not None else None)
+        accelerator_shape_state = (tuple(
+            (str(card), int(value))
+            for card, value in accelerator_shapes.items())
+                                   if accelerator_shapes is not None else None)
+        if not self._logical_target_fence_holds(
+                version, reconcile_generation, target_capacity,
+                target_by_accelerator_state, accelerator_shape_state):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
@@ -3476,25 +3682,42 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if replica_id in snapshot.unknown_replica_ids)
 
         if not self._uses_shared_zero_cost_demand_budget():
-            self._scale_up_to_logical_capacity_locked(
-                target_capacity, version, reconcile_generation, snapshot,
-                replace_unknown_replica_ids)
+            if target_capacity_by_accelerator is None:
+                self._scale_up_to_logical_capacity_locked(
+                    target_capacity, version, reconcile_generation, snapshot,
+                    replace_unknown_replica_ids)
+            else:
+                self._scale_up_to_logical_capacity_locked(
+                    target_capacity, version, reconcile_generation, snapshot,
+                    replace_unknown_replica_ids, target_capacity_by_accelerator,
+                    accelerator_shapes)
             return
         try:
             lock = locks.get_lock(
                 serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
             with lock.acquire(blocking=False):
-                self._scale_up_to_logical_capacity_locked(
-                    target_capacity, version, reconcile_generation, snapshot,
-                    replace_unknown_replica_ids)
+                if target_capacity_by_accelerator is None:
+                    self._scale_up_to_logical_capacity_locked(
+                        target_capacity, version, reconcile_generation,
+                        snapshot, replace_unknown_replica_ids)
+                else:
+                    self._scale_up_to_logical_capacity_locked(
+                        target_capacity, version, reconcile_generation,
+                        snapshot, replace_unknown_replica_ids,
+                        target_capacity_by_accelerator, accelerator_shapes)
         except locks.LockTimeout:
             logger.info('Deferring logical scale-up because another service '
                         'is reserving shared zero-cost capacity.')
 
     def _scale_up_to_logical_capacity_locked(
-            self, target_capacity: int, version: int, reconcile_generation: int,
+            self,
+            target_capacity: int,
+            version: int,
+            reconcile_generation: int,
             snapshot: LogicalReconcileSnapshot,
-            replace_unknown_replica_ids: tuple[int, ...]) -> None:
+            replace_unknown_replica_ids: tuple[int, ...],
+            target_capacity_by_accelerator: dict[str, int] | None = None,
+            accelerator_shapes: dict[str, int] | None = None) -> None:
         """Persist complete shapes while the global demand lock is held."""
 
         uses_shared_capacity = self._uses_shared_zero_cost_demand_budget()
@@ -3507,6 +3730,43 @@ class SkyPilotReplicaManager(ReplicaManager):
             existing_replica_infos = serve_state.get_replica_infos(
                 self._service_name)
         used_replica_ids = {info.replica_id for info in existing_replica_infos}
+        card_targets = dict(target_capacity_by_accelerator or {})
+        shapes = dict(accelerator_shapes or {})
+        card_target_state: LogicalAcceleratorState | None = (
+            tuple(
+                (str(card), int(value)) for card, value in card_targets.items())
+            if target_capacity_by_accelerator is not None else None)
+        shape_state: LogicalAcceleratorState | None = (tuple(
+            (str(card), int(value)) for card, value in shapes.items())
+                                                       if accelerator_shapes
+                                                       is not None else None)
+        if card_targets:
+            if (sum(card_targets.values()) != target_capacity or
+                    set(card_targets) - set(shapes)):
+                logger.warning('Discarding malformed logical exact-card '
+                               f'target: total={target_capacity}, '
+                               f'by_card={card_targets}, shapes={shapes}.')
+                return
+            canonical_by_name = {card.casefold(): card for card in card_targets}
+        else:
+            canonical_by_name = {}
+
+        def _replica_card(info: ReplicaInfo) -> str | None:
+            accelerators = None
+            location = info.get_spot_location()
+            if location is not None:
+                accelerators = location.accelerators
+            if not accelerators:
+                accelerators = (getattr(info, 'resources_override', None) or
+                                {}).get('accelerators')
+            if not accelerators:
+                resources = getattr(getattr(info, 'handle', None),
+                                    'launched_resources', None)
+                accelerators = getattr(resources, 'accelerators', None)
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                return None
+            raw_card = next(iter(accelerators))
+            return canonical_by_name.get(str(raw_card).casefold())
 
         def _committed_capacity(
                 capacity_snapshot: LogicalReconcileSnapshot) -> int:
@@ -3541,7 +3801,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                     committed += planned
             return committed
 
+        def _committed_by_card(
+                capacity_snapshot: LogicalReconcileSnapshot) -> dict[str, int]:
+            if not card_targets:
+                return {}
+            committed_by_card = {card: 0 for card in card_targets}
+            for info in existing_replica_infos:
+                if (info.is_terminal or info.version != version or getattr(
+                        info.status_property, 'is_scale_down', False) is True or
+                        info.replica_id in replace_unknown_replica_ids):
+                    continue
+                card = _replica_card(info)
+                if card is None:
+                    continue
+                planned = int(getattr(info, 'planned_capacity', 1))
+                observed = capacity_snapshot.observed_slots_by_replica_id.get(
+                    info.replica_id)
+                if (info.is_ready and observed is not None and info.replica_id
+                        not in capacity_snapshot.unknown_replica_ids):
+                    if (observed <= 0 and getattr(
+                            info, 'unknown_capacity_replacement', False)):
+                        width = planned
+                    else:
+                        width = min(planned, max(0, observed))
+                else:
+                    width = planned
+                committed_by_card[card] += width
+            return committed_by_card
+
         committed = _committed_capacity(snapshot)
+        committed_by_card = _committed_by_card(snapshot)
         zero_cost_demand_budget = None
         if infos_by_service is not None:
             capacity_replica_infos = [
@@ -3549,13 +3838,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             ]
             zero_cost_demand_budget = self._build_zero_cost_demand_budget(
                 existing_replica_infos, [None],
-                demand_count_override=target_capacity - committed,
+                demand_count_override=max(
+                    target_capacity - committed,
+                    sum(
+                        max(0, card_target - committed_by_card.get(card, 0))
+                        for card, card_target in card_targets.items())),
                 capacity_replica_infos=capacity_replica_infos)
         while True:
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
                     target_capacity,
+                    card_target_state,
+                    shape_state,
                     require_exact_generation=bool(replace_unknown_replica_ids)):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
@@ -3563,7 +3858,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             current_snapshot = self._logical_reconcile_snapshot
             assert current_snapshot is not None
             committed = _committed_capacity(current_snapshot)
-            if committed >= target_capacity:
+            committed_by_card = _committed_by_card(current_snapshot)
+            selected_card = next(
+                (card for card, card_target in card_targets.items()
+                 if committed_by_card.get(card, 0) < card_target), None)
+            if committed >= target_capacity and selected_card is None:
                 break
             before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
@@ -3571,13 +3870,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
                     'logical_reconcile_fence_requires_exact_generation'] = True
+            resources_override = None
+            if selected_card is not None:
+                resources_override = {
+                    'accelerators': {
+                        selected_card: shapes[selected_card]
+                    }
+                }
             launched = self._scale_up_one_locked(
-                None,
+                resources_override,
                 used_replica_ids,
                 existing_replica_infos,
                 zero_cost_demand_budget,
-                logical_reconcile_fence=(version, reconcile_generation,
-                                         target_capacity),
+                logical_reconcile_fence=((version, reconcile_generation,
+                                          target_capacity, card_target_state or
+                                          (), shape_state or ())
+                                         if card_target_state is not None or
+                                         shape_state is not None else
+                                         (version, reconcile_generation,
+                                          target_capacity)),
                 **launch_kwargs)
             if not launched or len(existing_replica_infos) == before:
                 logger.info('Logical scale-up made no placement progress; '
@@ -4166,7 +4477,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if controller_epoch != self._logical_controller_epoch:
             return 'abort'
         snapshot = self._logical_reconcile_snapshot
-        target_state = self._logical_target
+        target_state = _logical_target_state_components(self._logical_target)
         if (snapshot is None or snapshot.generation < selection_generation or
                 target_state is None):
             return 'wait'
@@ -4181,7 +4492,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # update can hand it to the new version's recovery fence; aborting
             # here would advertise every pending retirement again.
             return 'wait'
-        target_version, target_generation, current_target = target_state
+        (target_version, target_generation, current_target,
+         target_by_accelerator, accelerator_shapes) = target_state
         if target_version != version:
             return 'abort'
         if snapshot.generation < target_generation:
@@ -4198,7 +4510,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         excluded_ids = {info.replica_id}
         ready_capacity = self._logical_ready_capacity(replica_infos, snapshot,
                                                       version, excluded_ids)
-        if ready_capacity < current_target:
+        ready_by_accelerator = (self._logical_ready_capacity_by_accelerator(
+            replica_infos, snapshot, version, excluded_ids, accelerator_shapes)
+                                if accelerator_shapes else {})
+        ready_covers_target = (ready_capacity >= current_target and
+                               self._logical_card_capacity_covers(
+                                   ready_by_accelerator, target_by_accelerator))
+        if not ready_covers_target:
             return 'abort'
         if (require_victim_idle and
                 not self._logical_retirement_victim_is_idle(info, snapshot)):
@@ -4231,6 +4549,84 @@ class SkyPilotReplicaManager(ReplicaManager):
             ready_capacity += min(
                 int(getattr(candidate, 'planned_capacity', 1)), observed)
         return ready_capacity
+
+    @staticmethod
+    def _logical_replica_accelerator(
+        info: ReplicaInfo,
+        accelerator_shapes: LogicalAcceleratorState,
+        *,
+        require_configured_shape: bool,
+    ) -> str | None:
+        """Resolve one exact configured card without family matching."""
+        canonical = {
+            card.casefold(): (card, count) for card, count in accelerator_shapes
+        }
+        accelerators = None
+        location = info.get_spot_location()
+        if location is not None:
+            accelerators = location.accelerators
+        if not accelerators:
+            accelerators = (getattr(info, 'resources_override', None) or
+                            {}).get('accelerators')
+        if not isinstance(accelerators, dict) or len(accelerators) != 1:
+            return None
+        raw_card, raw_count = next(iter(accelerators.items()))
+        configured = canonical.get(str(raw_card).casefold())
+        if configured is None:
+            return None
+        card, configured_count = configured
+        if require_configured_shape:
+            try:
+                count = int(raw_count)
+                planned = int(getattr(info, 'planned_capacity', 1))
+            except (TypeError, ValueError):
+                return None
+            if count != configured_count or planned != configured_count:
+                return None
+        return card
+
+    @classmethod
+    def _logical_ready_capacity_by_accelerator(
+        cls,
+        replica_infos: list[ReplicaInfo],
+        snapshot: LogicalReconcileSnapshot,
+        version: int,
+        excluded_replica_ids: set[int] | frozenset[int],
+        accelerator_shapes: LogicalAcceleratorState,
+    ) -> dict[str, int]:
+        """Return fresh ready capacity grouped by exact configured card."""
+        ready = {card: 0 for card, _ in accelerator_shapes}
+        for candidate in replica_infos:
+            if (candidate.replica_id in excluded_replica_ids or
+                    candidate.is_terminal or not candidate.is_ready or
+                    getattr(candidate.status_property, 'is_scale_down',
+                            False) is True or candidate.version > version):
+                continue
+            card = cls._logical_replica_accelerator(
+                candidate,
+                accelerator_shapes,
+                require_configured_shape=(candidate.version == version))
+            if card is None:
+                continue
+            if candidate.version < version:
+                ready[card] += 1
+                continue
+            observed = snapshot.observed_slots_by_replica_id.get(
+                candidate.replica_id)
+            if (observed is None or
+                    candidate.replica_id in snapshot.unknown_replica_ids):
+                continue
+            ready[card] += min(int(getattr(candidate, 'planned_capacity', 1)),
+                               observed)
+        return ready
+
+    @staticmethod
+    def _logical_card_capacity_covers(
+            capacity: dict[str, int],
+            target_by_accelerator: LogicalAcceleratorState) -> bool:
+        return all(
+            capacity.get(card, 0) >= target
+            for card, target in target_by_accelerator)
 
     def _logical_retirement_victim_is_idle(
             self, info: ReplicaInfo,
@@ -4416,12 +4812,14 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             with self._logical_state_lock:
                 snapshot = self._logical_reconcile_snapshot
-                target_state = self._logical_target
+                target_state = _logical_target_state_components(
+                    self._logical_target)
                 if (snapshot is None or target_state is None or
                         not self._logical_snapshot_is_fresh(snapshot) or
                         snapshot.version != self.latest_version):
                     continue
-                target_version, target_generation, current_target = target_state
+                (target_version, target_generation, current_target, _,
+                 _) = target_state
                 if (target_version != self.latest_version or
                         snapshot.generation < target_generation):
                     continue
@@ -4540,7 +4938,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         with self._logical_state_lock:
             snapshot = self._logical_reconcile_snapshot
-            target_state = self._logical_target
+            target_state = _logical_target_state_components(
+                self._logical_target)
             if (snapshot is None or target_state is None or
                     not self._logical_snapshot_is_fresh(snapshot) or
                     snapshot.version != self.latest_version):
@@ -4556,7 +4955,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         time.monotonic() +
                         _LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS)
                 return
-            target_version, target_generation, current_target = target_state
+            (target_version, target_generation, current_target,
+             target_by_accelerator, accelerator_shapes) = target_state
             if (target_version != self.latest_version or
                     snapshot.generation < target_generation):
                 if self._logical_retirement_recovery_timed_out():
@@ -4605,8 +5005,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             ready_capacity = self._logical_ready_capacity(
                 replica_infos, snapshot, self.latest_version,
                 frozenset(recovering_ids))
-            if ready_capacity < current_target:
-                shortfall = current_target - ready_capacity
+            ready_by_accelerator = (self._logical_ready_capacity_by_accelerator(
+                replica_infos, snapshot, self.latest_version,
+                frozenset(recovering_ids), accelerator_shapes)
+                                    if accelerator_shapes else {})
+            shortfall_by_accelerator = {
+                card: max(0, target - ready_by_accelerator.get(card, 0))
+                for card, target in target_by_accelerator
+            }
+            if (ready_capacity < current_target or
+                    any(shortfall_by_accelerator.values())):
+                shortfall = max(0, current_target - ready_capacity)
                 reactivated_capacity = 0
                 reactivated_count = 0
                 # Prefer current-version victims because their immutable
@@ -4624,15 +5033,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._logical_retirement_reactivation_generation = (
                     snapshot.generation)
                 for info in ordered_candidates:
+                    candidate_capacity = (self._logical_planned_capacity(info)
+                                          if info.version == self.latest_version
+                                          else 1)
+                    card: str | None = None
+                    if target_by_accelerator:
+                        card = self._logical_replica_accelerator(
+                            info,
+                            accelerator_shapes,
+                            require_configured_shape=(
+                                info.version == self.latest_version))
+                        if (card is None or
+                                shortfall_by_accelerator.get(card, 0) <= 0):
+                            continue
                     self._abort_logical_retirement(
                         info,
                         'current ready capacity is below the recovered target')
                     recovering_ids.discard(info.replica_id)
-                    reactivated_capacity += (
-                        self._logical_planned_capacity(info)
-                        if info.version == self.latest_version else 1)
+                    reactivated_capacity += candidate_capacity
+                    if target_by_accelerator:
+                        assert card is not None
+                        shortfall_by_accelerator[card] = max(
+                            0,
+                            shortfall_by_accelerator[card] - candidate_capacity)
                     reactivated_count += 1
-                    if (reactivated_capacity >= shortfall or
+                    aggregate_covered = (ready_capacity + reactivated_capacity
+                                         >= current_target)
+                    cards_covered = not any(shortfall_by_accelerator.values())
+                    if ((aggregate_covered and cards_covered) or
                             reactivated_count >=
                             _LOGICAL_RETIREMENT_RECOVERY_MAX_REACTIVATIONS_PER_GENERATION
                        ):
@@ -4642,7 +5070,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'Reactivated {reactivated_count} recovered logical '
                         f'retirements ({reactivated_capacity} conservative '
                         'slots) '
-                        f'to cover a {shortfall}-slot ready-capacity shortfall; '
+                        f'to cover a {shortfall}-slot aggregate and '
+                        f'exact-card ready-capacity shortfalls '
+                        f'{shortfall_by_accelerator}; '
                         'waiting for a newer observed-capacity generation.')
                 self._clear_logical_retirement_recovery_if_done()
                 return
@@ -5016,15 +5446,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 purge=purge,
                                 in_flight_drain_cap_seconds=drain_cap)
 
-    def scale_down_logically(self, replica_id: int, target_capacity: int,
-                             version: int, reconcile_generation: int) -> None:
+    def scale_down_logically(
+        self,
+        replica_id: int,
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        target_capacity_by_accelerator: LogicalAcceleratorState = (),
+        accelerator_shapes: LogicalAcceleratorState = ()
+    ) -> None:
         self.scale_down_logically_batch([replica_id], target_capacity, version,
-                                        reconcile_generation)
+                                        reconcile_generation,
+                                        target_capacity_by_accelerator,
+                                        accelerator_shapes)
 
     @with_lock
-    def scale_down_logically_batch(self, replica_ids: list[int],
-                                   target_capacity: int, version: int,
-                                   reconcile_generation: int) -> None:
+    def scale_down_logically_batch(
+        self,
+        replica_ids: list[int],
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        target_capacity_by_accelerator: LogicalAcceleratorState = (),
+        accelerator_shapes: LogicalAcceleratorState = ()
+    ) -> None:
         """Accept one logical retirement wave from one fleet snapshot."""
         if not replica_ids:
             return
@@ -5033,7 +5478,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                'replica service.')
         with self._logical_state_lock:
             if not self._logical_target_fence_holds(
-                    version, reconcile_generation, target_capacity):
+                    version, reconcile_generation, target_capacity,
+                    target_capacity_by_accelerator, accelerator_shapes):
                 logger.info(
                     'Discarding stale logical scale-down batch for version '
                     f'{version}, generation {reconcile_generation}, target '
@@ -5049,7 +5495,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             infos_by_id = {info.replica_id: info for info in replica_infos}
             ready_capacity = 0
             committed_capacity = 0
-            capacity_by_id: dict[int, tuple[int, int]] = {}
+            ready_by_accelerator = {card: 0 for card, _ in accelerator_shapes}
+            committed_by_accelerator = {
+                card: 0 for card, _ in accelerator_shapes
+            }
+            capacity_by_id: dict[int, tuple[int, int, str | None]] = {}
             for candidate in replica_infos:
                 committed_width = 0
                 ready_width = 0
@@ -5075,10 +5525,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # conservative coverage floor at the final manager fence.
                     committed_width = 1
                     ready_width = 1
+                card = None
+                if contributes and accelerator_shapes:
+                    card = self._logical_replica_accelerator(
+                        candidate,
+                        accelerator_shapes,
+                        require_configured_shape=(candidate.version == version))
                 ready_capacity += ready_width
                 committed_capacity += committed_width
+                if card is not None:
+                    ready_by_accelerator[card] += ready_width
+                    committed_by_accelerator[card] += committed_width
                 capacity_by_id[candidate.replica_id] = (committed_width,
-                                                        ready_width)
+                                                        ready_width, card)
 
             accepted = 0
             seen_ids: set[int] = set()
@@ -5091,13 +5550,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                         info.status_property, 'is_scale_down', False) is True):
                     continue
 
-                committed_width, ready_width = capacity_by_id.get(
-                    replica_id, (0, 0))
+                committed_width, ready_width, card = capacity_by_id.get(
+                    replica_id, (0, 0, None))
+                if (accelerator_shapes and card is None and
+                        info.version >= version):
+                    continue
                 has_served = (info.status_property.first_ready_time is not None
                               and info.status_property.first_ready_time >= 0)
                 if not has_served:
                     victim_width = committed_width
-                    if committed_capacity - victim_width < target_capacity:
+                    committed_after = committed_capacity - victim_width
+                    card_committed_after = dict(committed_by_accelerator)
+                    if card is not None:
+                        card_committed_after[card] -= committed_width
+                    if (committed_after < target_capacity or
+                            not self._logical_card_capacity_covers(
+                                card_committed_after,
+                                target_capacity_by_accelerator)):
                         continue
                     self._terminate_replica(replica_id,
                                             sync_down_logs=False,
@@ -5115,7 +5584,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                             replica_id)
                         if observed is None:
                             continue
-                    if ready_capacity - victim_ready_width < target_capacity:
+                    ready_after = ready_capacity - victim_ready_width
+                    card_ready_after = dict(ready_by_accelerator)
+                    if card is not None:
+                        card_ready_after[card] -= victim_ready_width
+                    if (ready_after < target_capacity or
+                            not self._logical_card_capacity_covers(
+                                card_ready_after,
+                                target_capacity_by_accelerator)):
                         continue
                     self._defer_scale_down_until_idle(
                         replica_id,
@@ -5128,6 +5604,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # the next autoscaler tick retries under a fresh fence.
                 committed_capacity -= committed_width
                 ready_capacity -= ready_width
+                if card is not None:
+                    committed_by_accelerator[card] -= committed_width
+                    ready_by_accelerator[card] -= ready_width
                 accepted += 1
 
             logger.info(
@@ -5465,7 +5944,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         location = resolved_location
                     if (location is not None and
                         (location in failed_spot_locations or
-                         not self._spot_placer.is_active_location(location))):
+                         not self._spot_placer.is_launch_admissible(
+                             location,
+                             selected_at=getattr(info, 'created_at', None)))):
                         # This exact placement failed after the batch was
                         # queued but before this thread was admitted. Drop the
                         # never-started row so the autoscaler replans it on the

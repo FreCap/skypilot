@@ -339,6 +339,31 @@ def test_large_ready_set_is_not_emitted_to_info_logs():
     info.assert_not_called()
 
 
+def test_queue_demand_capability_negotiates_and_downgrades():
+    lb = _make_lb()
+    routing_spec = {
+        'load_balancing_policy_name': 'least_load',
+        'stream_timeout_seconds': 90,
+    }
+    _run_one_sync(
+        lb, {
+            'replica_info': {},
+            'num_ready_replicas': 0,
+            'routing_spec': routing_spec,
+            'queued_compatibility_demand_supported': True,
+        })
+    assert lb._queued_compatibility_demand_supported is True
+
+    # Missing means an older controller, including a rollback after a new
+    # controller had already enabled the gauge-only path.
+    _run_one_sync(lb, {
+        'replica_info': {},
+        'num_ready_replicas': 0,
+        'routing_spec': routing_spec,
+    })
+    assert lb._queued_compatibility_demand_supported is False
+
+
 def test_request_routing_does_not_emit_per_attempt_logs():
     policy = lb_policies.RoundRobinPolicy()
     policy.set_ready_replicas(['http://replica:8080'])
@@ -360,9 +385,12 @@ class TestSyncOnceEmptyMapWiring:
         lb = _make_lb()
         urls = ['http://a:8080', 'http://b:8080']
         lb._apply_routing_spec({
-            'load_balancing_policy_name': 'least_load',
+            'load_balancing_policy_name': 'instance_aware_least_load',
+            'request_accelerator_compatibility_version': 1,
+            'configured_accelerators': ['A100'],
             'stream_timeout_seconds': 90,
         })
+        lb._routing_version = 1
         lb._load_balancing_policy.set_ready_replicas(urls)
         lb._ready = True
         _run_one_sync(
@@ -370,14 +398,21 @@ class TestSyncOnceEmptyMapWiring:
                 'replica_info': {},
                 'num_ready_replicas': 2,
                 'routing_spec': {
-                    'load_balancing_policy_name': 'least_load',
+                    'load_balancing_policy_name': 'instance_aware_least_load',
+                    'request_accelerator_compatibility_version': 1,
+                    'configured_accelerators': ['H100'],
                     'stream_timeout_seconds': 90,
                 },
+                'service_version': 2,
             })
         # Spurious empty sync: the healthy set survives...
         assert set(lb._load_balancing_policy.ready_replicas) == set(urls)
         # ...and the LB still marks itself synced.
         assert lb._ready is True
+        # The response was not applied as a coherent route/catalog snapshot,
+        # so its version cannot be echoed on the next demand report.
+        assert lb._routing_version == 1
+        assert lb._configured_accelerators == ('A100',)
 
     def test_empty_map_authoritative_zero_blanks_set(self):
         lb = _make_lb()

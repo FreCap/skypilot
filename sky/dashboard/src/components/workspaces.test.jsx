@@ -11,12 +11,14 @@ import { Workspaces } from '@/components/workspaces';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
 import {
+  deleteWorkspace,
   getEnabledCloudsBatch,
   getWorkspaces,
 } from '@/data/connectors/workspaces';
 import { apiClient, getCurrentUserRole } from '@/data/connectors/client';
 import cachePreloader from '@/lib/cache-preloader';
 import dashboardCache from '@/lib/cache';
+import { REFRESH_INTERVALS } from '@/lib/config';
 
 const mockRouterPush = jest.fn();
 
@@ -111,6 +113,10 @@ describe('Workspaces request lifecycle', () => {
       name: 'Admin',
       id: 'admin-id',
     });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('runs exactly one aggregation sweep on mount', async () => {
@@ -308,7 +314,188 @@ describe('Workspaces request lifecycle', () => {
     expect(callsFor(getWorkspaces)).toHaveLength(3);
   });
 
+  it('reuses one in-flight interval refresh instead of starting a second sweep', async () => {
+    jest.useFakeTimers();
+    const intervalRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall >= 2) return intervalRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+
+    dashboardCache.get.mockClear();
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(1));
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    expect(callsFor(getWorkspaces)).toHaveLength(1);
+
+    await act(async () => {
+      intervalRefresh.resolve({ alpha: {} });
+      await intervalRefresh.promise;
+    });
+  });
+
+  it('supersedes an in-flight interval sweep after deleting a workspace', async () => {
+    jest.useFakeTimers();
+    const intervalRefresh = deferred();
+    const postDeleteRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall === 2) return intervalRefresh.promise;
+        return postDeleteRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    deleteWorkspace.mockResolvedValue(undefined);
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+
+    fireEvent.click(screen.getByTitle('Delete workspace'));
+    await screen.findByText('Delete Workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith('alpha'));
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(3));
+
+    await act(async () => {
+      postDeleteRefresh.resolve({});
+      intervalRefresh.resolve({ alpha: {} });
+      await Promise.all([postDeleteRefresh.promise, intervalRefresh.promise]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText('alpha')).not.toBeInTheDocument()
+    );
+  });
+
+  it('keeps manual refresh ownership when an interval tick fires', async () => {
+    jest.useFakeTimers();
+    const manualRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall >= 2) return manualRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    apiClient.fetch.mockResolvedValue({});
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+
+    fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+
+    const refreshButton = screen.getByText('Refresh').closest('button');
+    expect(refreshButton).toBeDisabled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    expect(callsFor(getWorkspaces)).toHaveLength(2);
+    expect(refreshButton).toBeDisabled();
+
+    await act(async () => {
+      manualRefresh.resolve({ alpha: {} });
+      await manualRefresh.promise;
+    });
+
+    await waitFor(() => expect(refreshButton).toBeEnabled());
+  });
+
+  it('does not let an interval tick supersede a pending manual health check', async () => {
+    jest.useFakeTimers();
+    const healthCheck = deferred();
+    installSuccessfulFetches();
+    apiClient.fetch.mockReturnValue(healthCheck.promise);
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+    dashboardCache.get.mockClear();
+
+    fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
+    await waitFor(() => expect(apiClient.fetch).toHaveBeenCalledTimes(1));
+    const refreshButton = screen.getByText('Refresh').closest('button');
+    expect(refreshButton).toBeDisabled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    expect(callsFor(getWorkspaces)).toHaveLength(0);
+    expect(refreshButton).toBeDisabled();
+
+    await act(async () => {
+      healthCheck.resolve({});
+      await healthCheck.promise;
+    });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(1));
+    await waitFor(() => expect(refreshButton).toBeEnabled());
+
+    dashboardCache.get.mockClear();
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(1));
+  });
+
   it('clears loading state when the current manual refresh fails', async () => {
+    jest.useFakeTimers();
     installSuccessfulFetches();
     const consoleError = jest
       .spyOn(console, 'error')
@@ -335,6 +522,13 @@ describe('Workspaces request lifecycle', () => {
       'Error fetching workspace data:',
       expect.any(Error)
     );
+
+    dashboardCache.get.mockClear();
+    await act(async () => {
+      jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+      await Promise.resolve();
+    });
+    expect(callsFor(getWorkspaces)).toHaveLength(1);
     consoleError.mockRestore();
   });
 });

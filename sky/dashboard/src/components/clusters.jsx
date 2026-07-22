@@ -33,12 +33,7 @@ import {
   TableBody,
   TableCell,
 } from '@/components/ui/table';
-import {
-  getClusters,
-  getClusterHistory,
-  useClusterData,
-} from '@/data/connectors/clusters';
-import { getWorkspaces } from '@/data/connectors/workspaces';
+import { getClusterHistory, useClusterData } from '@/data/connectors/clusters';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, Brackets } from 'lucide-react';
 import { relativeTime } from '@/components/utils';
@@ -152,6 +147,7 @@ export function useClustersPageData({
   const [preloadingComplete, setPreloadingComplete] = useState(false);
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   const runPreload = useCallback(
     async ({ force = false, refreshTable = false } = {}) => {
@@ -187,16 +183,39 @@ export function useClustersPageData({
     runPreload();
     return () => {
       requestVersionRef.current += 1;
+      refreshInFlightRef.current = null;
     };
   }, [runPreload]);
 
   const handleRefresh = useCallback(() => {
-    dashboardCache.invalidate(getClusters);
-    dashboardCache.invalidate(getWorkspaces);
+    const refreshScope = showHistory ? `history:${historyDays}` : 'active';
+    const refreshOwner = refreshInFlightRef.current;
+    if (refreshOwner !== null) {
+      if (refreshOwner.scope !== refreshScope) {
+        if (showHistory) {
+          dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
+        }
+        refreshOwner.scope = refreshScope;
+      }
+      return refreshOwner.promise;
+    }
     if (showHistory) {
       dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
     }
-    return runPreload({ force: true, refreshTable: true });
+    const nextRefreshOwner = {
+      promise: null,
+      scope: refreshScope,
+    };
+    nextRefreshOwner.promise = runPreload({
+      force: true,
+      refreshTable: true,
+    }).finally(() => {
+      if (refreshInFlightRef.current === nextRefreshOwner) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = nextRefreshOwner;
+    return nextRefreshOwner.promise;
   }, [historyDays, runPreload, showHistory]);
 
   return { preloadingComplete, lastFetchedTime, handleRefresh };
