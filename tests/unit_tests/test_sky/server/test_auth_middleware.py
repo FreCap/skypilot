@@ -1,14 +1,20 @@
 """Characterization tests for API server authentication middleware."""
 
+import asyncio
 import base64
 import hashlib
 import json
 import pickle
+import threading
 from unittest import mock
+
+import fastapi
+import pytest
 
 from sky.server import config as server_config
 from sky.server import server
 from sky.server.auth import middleware as auth_middleware
+from sky.server.auth import user_registration
 from sky.utils import common_utils
 
 # The legacy server import surface intentionally exposes these helpers.
@@ -79,3 +85,66 @@ def test_generate_auth_token_preserves_anonymous_user(monkeypatch):
         'user': None,
         'cookies': {},
     }
+
+
+@pytest.mark.asyncio
+async def test_auth_proxy_finishes_new_user_role_after_cancellation(
+        monkeypatch):
+    proxy_config = server_config.ExternalProxyConfig(
+        enabled=True,
+        header_name='X-Auth-Request-Email',
+        header_format='plaintext')
+    monkeypatch.setattr(auth_middleware.server_config,
+                        'load_external_proxy_config', lambda: proxy_config)
+    middleware = auth_middleware.AuthProxyMiddleware(
+        app=mock.AsyncMock()).middleware
+    request = mock.Mock(spec=fastapi.Request)
+    request.headers = {'X-Auth-Request-Email': 'user@example.com'}
+    request.state = mock.Mock()
+    request.state.auth_user = None
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    role_assigned = threading.Event()
+
+    def add_or_update_user(user):
+        del user
+        worker_started.set()
+        assert release_worker.wait(timeout=5)
+        return True
+
+    def add_user_if_not_exists(user_id):
+        del user_id
+        role_assigned.set()
+
+    monkeypatch.setattr(user_registration.global_user_state,
+                        'add_or_update_user', add_or_update_user)
+    monkeypatch.setattr(user_registration.permission.permission_service,
+                        'add_user_if_not_exists', add_user_if_not_exists)
+    call_next = mock.AsyncMock(return_value=fastapi.Response(status_code=204))
+
+    dispatch_task = asyncio.create_task(middleware.dispatch(request, call_next))
+    assert await asyncio.to_thread(worker_started.wait, 5)
+    dispatch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch_task
+    release_worker.set()
+
+    assert await asyncio.to_thread(role_assigned.wait, 5)
+    call_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_user_registration_preserves_existing_user_role(monkeypatch):
+    user = mock.Mock(id='existing-user')
+    add_or_update_user = mock.Mock(return_value=False)
+    add_user_if_not_exists = mock.Mock()
+    monkeypatch.setattr(user_registration.global_user_state,
+                        'add_or_update_user', add_or_update_user)
+    monkeypatch.setattr(user_registration.permission.permission_service,
+                        'add_user_if_not_exists', add_user_if_not_exists)
+
+    await user_registration.add_or_update_user_with_default_role(user)
+
+    add_or_update_user.assert_called_once_with(user)
+    add_user_if_not_exists.assert_not_called()

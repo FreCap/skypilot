@@ -1916,9 +1916,12 @@ def _deterministic_cluster_yaml_hash(tmp_yaml_path: str) -> str:
     return config_hash.hexdigest()
 
 
-def get_docker_user(ip: str, cluster_config_file: str) -> str:
+def get_docker_user(ip: str,
+                    cluster_config_file: str,
+                    ssh_credentials: dict[str, Any] | None = None) -> str:
     """Find docker container username."""
-    ssh_credentials = ssh_credential_from_yaml(cluster_config_file)
+    if ssh_credentials is None:
+        ssh_credentials = ssh_credential_from_yaml(cluster_config_file)
     runner = command_runner.SSHCommandRunner(node=(ip, 22), **ssh_credentials)
     container_name = constants.DEFAULT_DOCKER_CONTAINER_NAME
     whoami_returncode, whoami_stdout, whoami_stderr = runner.run(
@@ -1957,15 +1960,22 @@ def wait_until_ray_cluster_ready(
         return False, None  # failed
 
     config = global_user_state.get_cluster_yaml_dict(cluster_config_file)
+    ssh_credentials = ssh_credential_from_yaml(cluster_config_file,
+                                               config=config)
 
     docker_user = None
     if 'docker' in config:
-        docker_user = get_docker_user(head_ip, cluster_config_file)
+        docker_user = get_docker_user(head_ip,
+                                      cluster_config_file,
+                                      ssh_credentials=ssh_credentials)
+        ssh_credentials = {
+            **ssh_credentials,
+            'docker_user': docker_user,
+        }
 
     if num_nodes <= 1:
         return True, docker_user
 
-    ssh_credentials = ssh_credential_from_yaml(cluster_config_file, docker_user)
     last_nodes_so_far = 0
     progress_deadline: float | None = None
     if nodes_launching_progress_timeout is not None:
@@ -2057,6 +2067,7 @@ def ssh_credential_from_yaml(
     cluster_yaml: str | None,
     docker_user: str | None = None,
     ssh_user: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Returns ssh_user, ssh_private_key and ssh_control name.
 
@@ -2065,10 +2076,12 @@ def ssh_credential_from_yaml(
         docker_user: when using custom docker image, use this user to ssh into
             the docker container.
         ssh_user: override the ssh_user in the cluster yaml.
+        config: optional parsed cluster YAML to reuse instead of re-reading it.
     """
-    if cluster_yaml is None:
+    if config is None and cluster_yaml is None:
         return dict()
-    config = global_user_state.get_cluster_yaml_dict(cluster_yaml)
+    if config is None:
+        config = global_user_state.get_cluster_yaml_dict(cluster_yaml)
     auth_section = config['auth']
     if ssh_user is None:
         ssh_user = auth_section['ssh_user'].strip()
