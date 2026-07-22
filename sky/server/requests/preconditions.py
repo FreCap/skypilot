@@ -66,11 +66,20 @@ class Precondition(abc.ABC):
         Use ``create_task(precondition.wait_async(...))`` to run it in the
         background without blocking the caller.
         """
-        met = await self
-        if met and on_condition_met is not None:
-            result = on_condition_met()
-            if inspect.isawaitable(result):
-                await result
+        try:
+            met = await self
+            if met and on_condition_met is not None:
+                result = on_condition_met()
+                if inspect.isawaitable(result):
+                    await result
+        except (Exception, SystemExit, KeyboardInterrupt) as e:  # pylint: disable=broad-except
+            await self._fail_request(e)
+
+    async def _fail_request(
+            self, error: Exception | SystemExit | KeyboardInterrupt) -> None:
+        await api_requests.set_request_failed_async(self.request_id, error)
+        logger.info(f'Request {self.request_id} failed due to '
+                    f'{common_utils.format_exception(error)}')
 
     @abc.abstractmethod
     async def check(self) -> tuple[bool, str | None]:
@@ -131,9 +140,7 @@ class Precondition(abc.ABC):
                         self.request_id, status_msg)
                     last_status_msg = status_msg
             except (Exception, SystemExit, KeyboardInterrupt) as e:  # pylint: disable=broad-except
-                await api_requests.set_request_failed_async(self.request_id, e)
-                logger.info(f'Request {self.request_id} failed due to '
-                            f'{common_utils.format_exception(e)}')
+                await self._fail_request(e)
                 return False
 
             await asyncio.sleep(self.check_interval)
