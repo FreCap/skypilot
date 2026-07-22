@@ -645,6 +645,7 @@ export function useClusterData(options = {}) {
   const [isServerPagination, setIsServerPagination] = useState(false);
   const isInitialMount = useRef(true);
   const requestVersionRef = useRef(0);
+  const refreshInFlightRef = useRef(null);
 
   // Reset to page 1 when filters change, but skip on initial mount
   // so the page number read from the URL isn't overwritten.
@@ -769,43 +770,92 @@ export function useClusterData(options = {}) {
     [showHistory, historyDays, page, limit]
   );
 
-  /**
-   * Main fetch function - chooses server or client path
-   */
-  const fetchData = useCallback(async () => {
-    const requestVersion = requestVersionRef.current + 1;
-    requestVersionRef.current = requestVersion;
-    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
-    setLoading(true);
-    setError(null);
+  // This callback's dependency set covers every request input (including the
+  // client-side subset), so its identity is the stable request context token.
+  const requestContext = fetchServerSide;
 
-    try {
-      if (isPaginationPluginAvailable()) {
-        await fetchServerSide(isCurrentRequest);
-      } else {
-        await fetchClientSide(isCurrentRequest);
-      }
-    } catch (fetchError) {
-      if (isCurrentRequest()) {
-        console.error('[useClusterData] Error fetching clusters:', fetchError);
-        setError(fetchError);
-        setData([]);
-        setFullData([]);
-      }
-    } finally {
-      if (isCurrentRequest()) {
-        setLoading(false);
-      }
+  const startFetch = useCallback(
+    (kind) => {
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+      setLoading(true);
+      setError(null);
+
+      let refreshPromise;
+      refreshPromise = (async () => {
+        try {
+          if (isPaginationPluginAvailable()) {
+            await fetchServerSide(isCurrentRequest);
+          } else {
+            await fetchClientSide(isCurrentRequest);
+          }
+        } catch (fetchError) {
+          if (isCurrentRequest()) {
+            console.error(
+              '[useClusterData] Error fetching clusters:',
+              fetchError
+            );
+            setError(fetchError);
+            setData([]);
+            setFullData([]);
+          }
+        } finally {
+          if (isCurrentRequest()) {
+            setLoading(false);
+          }
+        }
+      })().finally(() => {
+        if (refreshInFlightRef.current?.promise === refreshPromise) {
+          refreshInFlightRef.current = null;
+        }
+      });
+      refreshInFlightRef.current = {
+        context: requestContext,
+        kind,
+        promise: refreshPromise,
+      };
+      return refreshPromise;
+    },
+    [fetchServerSide, fetchClientSide, requestContext]
+  );
+
+  /**
+   * Automatic loads and interval ticks never supersede current work for the
+   * same context. This bounds pending hook continuations during slow reads.
+   */
+  const fetchData = useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.context === requestContext) {
+      return inFlight.promise;
     }
-  }, [fetchServerSide, fetchClientSide]);
+    return startFetch('automatic');
+  }, [requestContext, startFetch]);
+
+  /**
+   * The first explicit refresh supersedes an automatic load, preserving the
+   * user's request for a newer snapshot. Further explicit callers reuse that
+   * manual owner until it settles.
+   */
+  const refreshData = useCallback(() => {
+    const inFlight = refreshInFlightRef.current;
+    if (inFlight?.context === requestContext && inFlight.kind === 'manual') {
+      return inFlight.promise;
+    }
+    return startFetch('manual');
+  }, [requestContext, startFetch]);
 
   // Fetch data on mount and when dependencies change
   useEffect(() => {
     fetchData();
     return () => {
       requestVersionRef.current += 1;
+      if (refreshInFlightRef.current?.context === requestContext) {
+        refreshInFlightRef.current = null;
+      }
     };
-  }, [fetchData]);
+  }, [fetchData, requestContext]);
 
   // Auto-refresh
   useEffect(() => {
@@ -845,7 +895,7 @@ export function useClusterData(options = {}) {
     // Other
     loading,
     error,
-    refresh: fetchData,
+    refresh: refreshData,
     isServerPagination,
   };
 }

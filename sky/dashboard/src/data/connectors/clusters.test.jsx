@@ -289,8 +289,112 @@ describe('useClusterData request ownership', () => {
   });
 
   afterEach(() => {
+    jest.useRealTimers();
     delete window.__skyPaginationFetch;
     jest.restoreAllMocks();
+  });
+
+  it('coalesces manual refreshes and overdue ticks for one context', async () => {
+    jest.useFakeTimers();
+    const initialRequest = deferred();
+    dashboardCache.get.mockImplementation(() => initialRequest.promise);
+
+    const { result } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    let firstRefresh;
+    let secondRefresh;
+    act(() => {
+      firstRefresh = result.current.refresh();
+      secondRefresh = result.current.refresh();
+      jest.advanceTimersByTime(3000);
+    });
+
+    expect(firstRefresh).toBe(secondRefresh);
+    // The first explicit refresh deliberately supersedes the automatic mount
+    // load. Its duplicate and all overdue interval ticks reuse that owner.
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      initialRequest.resolve([{ cluster: 'cluster-a' }]);
+      await firstRefresh;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'cluster-a', isHistorical: false },
+    ]);
+  });
+
+  it('reacquires refresh ownership after the current request fails', async () => {
+    jest.useFakeTimers();
+    const failedRequest = deferred();
+    const recoveredRequest = deferred();
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    dashboardCache.get
+      .mockImplementationOnce(() => failedRequest.promise)
+      .mockImplementationOnce(() => recoveredRequest.promise);
+
+    const { result } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      failedRequest.reject(new Error('cluster list unavailable'));
+      await failedRequest.promise.catch(() => {});
+    });
+    expect(result.current.loading).toBe(false);
+
+    act(() => jest.advanceTimersByTime(1000));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      recoveredRequest.resolve([{ cluster: 'cluster-b' }]);
+      await recoveredRequest.promise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'cluster-b', isHistorical: false },
+    ]);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an old completion clear the new page owner', async () => {
+    jest.useFakeTimers();
+    const firstPage = deferred();
+    const secondPage = deferred();
+    dashboardCache.get
+      .mockImplementationOnce(() => firstPage.promise)
+      .mockImplementationOnce(() => secondPage.promise);
+
+    const { result } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.setPage(2));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      firstPage.resolve([{ cluster: 'stale-page-1' }]);
+      await firstPage.promise;
+    });
+
+    act(() => jest.advanceTimersByTime(1000));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondPage.resolve([{ cluster: 'fresh-page-2' }]);
+      await secondPage.promise;
+    });
+    for (let i = 0; i < 4; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('keeps the latest server page and suppresses a stale prefetch', async () => {

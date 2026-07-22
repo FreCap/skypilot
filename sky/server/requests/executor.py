@@ -364,17 +364,34 @@ class RequestWorker:
             # Happens when the worker process dies unexpectedly, e.g. OOM
             # killed.
             request_id, _, retryable = request_element
-            # Ensure the request status.
-            api_requests.set_request_failed(request_id, e)
             logger.error(
                 f'Request {request_id} failed to get processed '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
-            if retryable:
-                # If the request is retryable and disrupted by broken
-                # process pool, reschedule it immediately to get it
-                # retried in the new process pool.
-                queue = _get_queue(self.schedule_type)
-                queue.put(request_element)
+            if not retryable:
+                api_requests.set_request_failed(request_id, e)
+                return
+            # A retry must remain in an executable state. Marking it FAILED
+            # before queueing makes the next execution wrapper reject it at
+            # try_mark_running(), so the apparent retry is a no-op. Serialize
+            # the transition with cancellation and leave WAITING recoverable
+            # if the API server exits before queue.put(). PENDING is possible
+            # when the worker died before the wrapper marked the row RUNNING.
+            with api_requests.update_request(request_id) as request_task:
+                if (request_task is None or request_task.status
+                        not in (api_requests.RequestStatus.PENDING,
+                                api_requests.RequestStatus.RUNNING)):
+                    logger.info(
+                        f'Dropping broken-pool retry for request {request_id}: '
+                        'request is gone or no longer executable')
+                    return
+                request_task.status = api_requests.RequestStatus.WAITING
+                request_task.pid = None
+                request_task.status_msg = (
+                    'Worker process exited unexpectedly; retrying')
+            # BurstableExecutor replaces the broken guaranteed pool on the
+            # next submission, so reschedule immediately.
+            queue = _get_queue(self.schedule_type)
+            queue.put(request_element)
         except exceptions.ExecutionRetryableError as e:
             request_id, _, _ = request_element
             # Clamp to avoid ValueError from time.sleep() on a negative wait.

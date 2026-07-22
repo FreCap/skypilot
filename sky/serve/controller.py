@@ -1949,14 +1949,15 @@ class SkyServeController:
         - provisioning_replicas: latest-version, nonterminal, not-yet-
           ready replicas (capacity that will serve soon; lets the data
           plane hold spill decisions for capacity already on the way).
-        - target_num_replicas: the autoscaler's current target. While the
-          autoscaler's target may still be the rebuilt-blind minimum,
-          report max(target, latest nonterminal count) instead: a routine
-          controller restart must not tell the platform a live fleet
-          wants to shrink. The floor keys on has_recomputed_with_fresh_
-          data(), not has_fresh_demand_report(): the sync handler feeds
-          the report BEFORE building this hint, so the very first
-          post-restart sync is already "fresh" while the target stays
+        - target_num_replicas: the autoscaler's current demand target. While
+          the autoscaler's target may still be the rebuilt-blind minimum,
+          report max(target, latest demand-owned nonterminal count) instead:
+          a routine controller restart must not tell the platform the traffic
+          fleet wants to shrink, while reserved fill must not delay spill or
+          backfill as if it were paid demand intent. The floor keys on
+          has_recomputed_with_fresh_data(), not has_fresh_demand_report(): the
+          sync handler feeds the report BEFORE building this hint, so the very
+          first post-restart sync is already "fresh" while the target stays
           min_replicas until the autoscaler thread's next decision tick
           consumes the snap.
         - max_replicas: the configured autoscaling ceiling. It changes only
@@ -1965,7 +1966,7 @@ class SkyServeController:
         """
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
-        num_latest_nonterminal = 0
+        num_latest_demand_nonterminal = 0
         logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
         if logical_versions is None:
             logical_versions = {latest_version} if logical else set()
@@ -1976,12 +1977,18 @@ class SkyServeController:
                                     'is_scale_down', False) is True):
                 continue
             width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
-            num_latest_nonterminal += width
+            # reserved_fill is launch-origin attribution. The dedicated
+            # ready/provisioning fields still describe all usable capacity,
+            # but opportunistic fill cannot raise this traffic-intent floor.
+            # Legacy rows missing the additive flag remain demand-owned,
+            # matching the autoscaler's restart baseline.
+            if not getattr(info, 'reserved_fill', False):
+                num_latest_demand_nonterminal += width
             if not info.is_ready:
                 num_provisioning += width
         target = self._autoscaler.get_final_target_num_replicas()
         if not self._autoscaler.has_recomputed_with_fresh_data():
-            target = max(target, num_latest_nonterminal)
+            target = max(target, num_latest_demand_nonterminal)
         hint: dict[str, Any] = {
             'replica_unit': ('logical_slot' if logical else 'physical_backend'),
             'provisioning_replicas': num_provisioning,
