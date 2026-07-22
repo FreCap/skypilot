@@ -2074,3 +2074,30 @@ def test_worker_health_http_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         assert error.value.code == 503
     finally:
         health_server.stop()
+
+
+def test_lifecycle_main_verifies_all_databases_before_advertising_health(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    health = mock.Mock()
+    health_server = mock.Mock()
+    service = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.database_migrations,
+                        'initialize_central_databases',
+                        lambda: calls.append('databases'))
+    monkeypatch.setattr(
+        lifecycle_worker_service.worker_health, 'WorkerHealth',
+        mock.Mock(side_effect=lambda *_args, **_kwargs:
+                  (calls.append('health') or health)))
+    monkeypatch.setattr(lifecycle_worker_service.worker_health, 'HealthServer',
+                        mock.Mock(return_value=health_server))
+    monkeypatch.setattr(lifecycle_worker_service, 'LifecycleWorkerService',
+                        mock.Mock(return_value=service))
+    monkeypatch.setattr(lifecycle_worker_service.signal, 'signal', mock.Mock())
+
+    lifecycle_worker_service.main()
+
+    assert calls == ['databases', 'health']
+    health_server.start.assert_called_once_with()
+    service.run_forever.assert_called_once_with()
+    health_server.stop.assert_called_once_with()

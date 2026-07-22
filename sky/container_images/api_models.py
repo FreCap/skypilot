@@ -197,15 +197,21 @@ class SourceView(_ApiModel):
     created_at: int
 
     @classmethod
-    def from_record(cls, record: catalog_state.SourceRecord) -> SourceView:
+    def from_record(cls,
+                    record: catalog_state.SourceRecord,
+                    *,
+                    reveal_source_auth: bool = True) -> SourceView:
         value = record.__dict__.copy()
         value.pop('workspace')
+        if not reveal_source_auth:
+            value['source_auth_binding_id'] = None
+            value['source_auth_fingerprint'] = None
         return cls(**value)
 
 
 class PublicationView(_ApiModel):
     id: str
-    operation_id: str
+    operation_id: str | None
     profile_revision_id: str
     requested_release: str
     published_release: str | None
@@ -227,7 +233,9 @@ class PublicationView(_ApiModel):
 
     @classmethod
     def from_record(cls,
-                    record: catalog_state.PublicationRecord) -> PublicationView:
+                    record: catalog_state.PublicationRecord,
+                    *,
+                    reveal_source_auth: bool = True) -> PublicationView:
         return cls(id=record.id,
                    operation_id=record.operation_id,
                    profile_revision_id=record.profile_revision_id,
@@ -237,8 +245,10 @@ class PublicationView(_ApiModel):
                    source_ref=record.source_ref,
                    source_root_digest=record.source_root_digest,
                    requested_platform=record.requested_platform,
-                   source_auth_binding_id=record.source_auth_binding_id,
-                   source_auth_fingerprint=record.source_auth_fingerprint,
+                   source_auth_binding_id=(record.source_auth_binding_id
+                                           if reveal_source_auth else None),
+                   source_auth_fingerprint=(record.source_auth_fingerprint
+                                            if reveal_source_auth else None),
                    state=record.state.value,
                    attempt_count=record.attempt_count,
                    next_retry_at=record.next_retry_at,

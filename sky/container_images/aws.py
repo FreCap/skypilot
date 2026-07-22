@@ -333,8 +333,8 @@ def ingest_terraform_qualification(
     if manifest.schema_version != 1:
         raise ValueError(
             'Qualification manifest schema version is unsupported.')
-    authority = catalog_state.get_catalog_authority_id(create=False)
-    if authority is None or manifest.catalog_authority != authority:
+    authority = catalog_state.get_catalog_authority_id()
+    if manifest.catalog_authority != authority:
         raise ValueError('Qualification manifest belongs to another catalog.')
     profile, policy = image_config.resolve_profile(manifest.profile,
                                                    manifest.workspace)

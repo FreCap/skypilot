@@ -189,6 +189,14 @@ Create the name of the service account to use
 {{- end -}}
 {{- end -}}
 
+{{/* Length-safe, identity-stable RBAC name for one source credential. */}}
+{{- define "skypilot.imageSourceRbacName" -}}
+{{- $base := include "skypilot.fullname" .root | trunc 42 | trimSuffix "-" -}}
+{{- $identity := printf "%s/%s" .namespace .name -}}
+{{- $hash := sha256sum $identity | trunc 12 -}}
+{{- printf "%s-img-src-%s" $base $hash | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "skypilot.imageLifecycleWorkerServiceAccountName" -}}
 {{- if .Values.imageLifecycleWorker.serviceAccount.name -}}
 {{ .Values.imageLifecycleWorker.serviceAccount.name }}

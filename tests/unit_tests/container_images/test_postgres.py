@@ -41,6 +41,9 @@ from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_lease
+from sky.jobs import state_storage
+from sky.serve import serve_state
+from sky.skylet import constants
 from sky.utils.db import migration_utils
 
 _POSTGRES_REQUIRED = os.environ.get(
@@ -106,9 +109,29 @@ def image_database(postgres_engine, monkeypatch: pytest.MonkeyPatch):
         connection.exec_driver_sql('CREATE SCHEMA public')
     schema.metadata.create_all(postgres_engine)
     monkeypatch.setattr(catalog_state, 'engine', lambda: postgres_engine)
+    with postgres_engine.begin() as connection:
+        connection.execute(schema.catalog.insert().values(
+            id='authority',
+            authority_id='00000000-0000-4000-8000-000000000001',
+            created_at=1))
     authority = catalog_state.get_catalog_authority_id()
     assert authority is not None
     return postgres_engine
+
+
+@pytest.mark.parametrize('mutation', [
+    'DELETE FROM container_image_catalog',
+    "UPDATE container_image_catalog SET authority_id = 'invalid'",
+    ("INSERT INTO container_image_catalog (id, authority_id, created_at) "
+     "VALUES ('extra', '00000000-0000-4000-8000-000000000002', 1)"),
+])
+def test_catalog_authority_fails_closed_without_runtime_repair(
+        image_database, mutation: str) -> None:
+    with image_database.begin() as connection:
+        connection.exec_driver_sql(mutation)
+
+    with pytest.raises(RuntimeError, match='missing or malformed'):
+        catalog_state.get_catalog_authority_id()
 
 
 def _activate_profile(
@@ -1912,7 +1935,7 @@ def _warming_demand(
     now: int = 50,
 ) -> demand_state.DemandRecord:
     assert publication_record.image_id is not None
-    authority = catalog_state.get_catalog_authority_id(create=False)
+    authority = catalog_state.get_catalog_authority_id()
     assert authority is not None
     target = next(target for target in (profile.canonical,) + profile.targets
                   if target.target_fingerprint == location.target_fingerprint)
@@ -2092,7 +2115,7 @@ def test_demand_fences_eviction_until_two_terminal_observations(
         image_database, monkeypatch, profile)
     west = profile.targets[0]
     demand = _warming_demand(active, publication_record, regional, profile)
-    authority = catalog_state.get_catalog_authority_id(create=False)
+    authority = catalog_state.get_catalog_authority_id()
     assert authority is not None and publication_record.image_id is not None
     replay = transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
@@ -3725,7 +3748,7 @@ def test_deleted_owner_rejects_legacy_generation_creation(
     active, publication_record, _, regional = _ready_regional(
         image_database, monkeypatch, profile)
     assert publication_record.image_id is not None
-    authority = catalog_state.get_catalog_authority_id(create=False)
+    authority = catalog_state.get_catalog_authority_id()
     assert authority is not None
     owner = 'legacy-cluster'
     placement = {
@@ -4559,11 +4582,17 @@ def test_failed_canonical_reap_waits_for_reservation_expiry_and_exact_absence(
     assert topology_state.list_failed_canonical_reap_candidates() == []
 
     reservation_expiry = 31 + 30 * 24 * 60 * 60 + 1
-    # The publish operation expires at the same horizon, but its retained
-    # publication still owns it through a foreign key until record retention.
+    # The operation expires independently while the retained publication keeps
+    # serving as durable release history with a nullable audit link.
     catalog_state.compact_terminal_records(now=reservation_expiry)
     assert catalog_state.get_operation(publication_record.operation_id,
-                                       'research') is not None
+                                       'research') is None
+    with image_database.connect() as connection:
+        operation_id = connection.execute(
+            sqlalchemy.select(schema.publications.c.operation_id).where(
+                schema.publications.c.id ==
+                publication_record.id)).scalar_one()
+    assert operation_id is None
     candidates = topology_state.list_failed_canonical_reap_candidates()
     assert [candidate.id for candidate in candidates] == [failed.id]
     assert not topology_state.reap_failed_canonical_reservation(
@@ -4724,6 +4753,18 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
                        100 + series, 1000000 + series
                 FROM generate_series(1, 20000) AS series
             """), {'authority_id': authority_id})
+        connection.execute(schema.operations.insert().values(
+            id='catalog-expired-operation',
+            authority_id=authority_id,
+            scope='research',
+            actor_hash='1' * 64,
+            kind='PUBLISH',
+            idempotency_key='catalog-expired-operation-key',
+            request_hash='2' * 64,
+            state=models.ImageOperationState.SUCCEEDED.value,
+            created_at=1,
+            updated_at=1,
+            terminal_expires_at=1))
         connection.execute(
             sqlalchemy.text("""
                 INSERT INTO container_image_sources (
@@ -4827,7 +4868,8 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
             created_at=1,
             updated_at=1))
         for table in ('container_image_publications', 'container_image_sources',
-                      'container_image_locations'):
+                      'container_image_locations',
+                      'container_image_operations'):
             connection.execute(sqlalchemy.text(f'ANALYZE {table}'))
 
     statements: list[str] = []
@@ -4968,6 +5010,20 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
                 'shard_id': regional.shard_id,
                 'runtime_digest': _OTHER_DIGEST,
             }).scalars().all()
+        operation_expiry_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_operations
+                WHERE terminal_expires_at <= 100
+                ORDER BY terminal_expires_at, id
+                LIMIT 500 FOR UPDATE SKIP LOCKED
+            """)).scalars().all()
+        operation_link_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE operation_id = 'catalog-scale-operation-10000'
+            """)).scalars().all()
     assert 'ix_container_image_publications_active_image' in str(
         publication_plan)
     assert 'ix_container_image_sources_image' in str(source_plan)
@@ -4987,6 +5043,34 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
     assert 'ix_container_image_publications_fanout' in str(fanout_plan)
     assert ('ix_container_image_locations_inventory_digest'
             in str(inventory_digest_plan))
+    assert 'ix_container_image_operations_expiry' in str(operation_expiry_plan)
+    assert ('ix_container_image_publications_operation'
+            in str(operation_link_plan))
+
+    compaction_statements: list[str] = []
+
+    def record_compaction(_connection, _cursor, statement, _parameters,
+                          _context, _executemany) -> None:
+        compaction_statements.append(statement)
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            record_compaction)
+    try:
+        deleted_publications, deleted_operations = (
+            catalog_state.compact_terminal_records(now=100, batch_size=500))
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                record_compaction)
+    assert deleted_publications == 1
+    assert deleted_operations == 1
+    operation_claims = [
+        statement for statement in compaction_statements
+        if 'FROM container_image_operations' in statement and
+        'FOR UPDATE' in statement
+    ]
+    assert len(operation_claims) == 1
+    assert 'EXISTS' not in operation_claims[0].upper()
+    assert 'container_image_publications' not in operation_claims[0]
 
 
 def test_operational_profile_readiness_excludes_unbounded_history_and_uses_indexes(
@@ -5103,9 +5187,11 @@ def test_profile_staging_reads_constant_rows_with_large_retained_history(
             sqlalchemy.text('ANALYZE container_image_profile_revisions'))
 
     returned_rows = []
+    statements: list[str] = []
 
     def record_rows(_connection, cursor, statement, _parameters, _context,
                     _executemany):
+        statements.append(statement)
         if statement.lstrip().upper().startswith(('SELECT', 'WITH')):
             returned_rows.append(cursor.rowcount)
 
@@ -5128,6 +5214,8 @@ def test_profile_staging_reads_constant_rows_with_large_retained_history(
     assert staged.desired_generation == 20001
     assert returned_rows
     assert max(returned_rows) <= 1
+    assert all('container_image_publications' not in statement
+               for statement in statements)
     with image_database.connect() as connection:
         generation_plan = connection.execute(
             sqlalchemy.text("""
@@ -5143,16 +5231,16 @@ def test_profile_staging_reads_constant_rows_with_large_retained_history(
                 WHERE workspace = 'research' AND profile = 'mutation-scale'
                   AND revision = 20001
             """)).scalars().all()
-        active_plan = connection.execute(
+        custody_plan = connection.execute(
             sqlalchemy.text("""
                 EXPLAIN (COSTS OFF)
-                SELECT id FROM container_image_profile_revisions
+                SELECT physical_manifest_hash
+                FROM container_image_profile_custody
                 WHERE workspace = 'research' AND profile = 'mutation-scale'
-                  AND state = 'ACTIVE'
             """)).scalars().all()
     assert 'uq_container_image_profile_generation' in str(generation_plan)
     assert 'uq_container_image_profile_revision' in str(revision_plan)
-    assert 'uq_container_image_profile_active' in str(active_plan)
+    assert 'container_image_profile_custody_pkey' in str(custody_plan)
 
 
 def test_profile_staging_is_serialized_by_transaction_advisory_lock(
@@ -5205,6 +5293,92 @@ def test_profile_staging_is_serialized_by_transaction_advisory_lock(
            ].count(models.ImageProfileState.QUALIFYING) == 1
     assert [revision.state for revision in revisions
            ].count(models.ImageProfileState.SUPERSEDED) == 1
+
+
+def test_canonical_ready_takes_profile_lock_and_permanently_fences_custody(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, location = _publish_and_bind(profile)
+    claim = topology_state.claim_next_location(worker_id='copy-1',
+                                               lease_seconds=60,
+                                               workspace='research',
+                                               now=30)
+    assert claim is not None and claim.id == location.id
+    assert claim.lease_token is not None
+    assert topology_state.transition_location_to_verifying(claim.id,
+                                                           claim.lease_token,
+                                                           now=31)
+    lock_key = json.dumps(['research', profile.name], separators=(',', ':'))
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(transactions.converge_canonical,
+                                     location_id=claim.id,
+                                     lease_token=claim.lease_token,
+                                     ready=True,
+                                     now=32)
+            time.sleep(0.2)
+            assert not future.done()
+            lock_transaction.commit()
+            ready = future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    assert ready.state == models.ImageLocationState.READY
+    with image_database.connect() as connection:
+        custody = connection.execute(
+            sqlalchemy.select(schema.profile_custody).where(
+                schema.profile_custody.c.workspace == 'research',
+                schema.profile_custody.c.profile ==
+                profile.name)).mappings().one()
+    assert custody['physical_manifest_hash'] == profile.physical_manifest_hash
+
+    changed = dataclasses.replace(
+        profile,
+        revision=profile.revision + 1,
+        canonical=dataclasses.replace(
+            profile.canonical,
+            repository_prefix='skypilot/images/changed-canonical'))
+    with pytest.raises(topology_state.CanonicalCustodyChangeError,
+                       match='cannot change'):
+        _stage_candidate_profile(changed, now=40)
+
+
+def test_profile_activation_rechecks_existing_custody_marker(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, location = _publish_and_bind(profile)
+    _complete_location(location, now=30)
+    candidate_profile = _policy_profile(profile)
+    candidate = _stage_candidate_profile(candidate_profile, now=40)
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == candidate.id).values(
+                physical_manifest_hash='f' * 64,
+                terraform_hash='e' * 64,
+                attestations_hash='d' * 64))
+
+    with pytest.raises(topology_state.CanonicalCustodyChangeError,
+                       match='cannot activate'):
+        transactions.activate_profile(
+            profile_revision_id=candidate.id,
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            expected_terraform_hash='e' * 64,
+            expected_attestations_hash='d' * 64,
+            required_attestations={},
+            now=41)
 
 
 def test_profile_activation_reads_constant_profile_rows_with_large_history(
@@ -5390,7 +5564,7 @@ def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
                                  workspace='research',
                                  actor_hash='7' * 64,
                                  idempotency_key='queued-source-inspection-key')
-    authority = catalog_state.get_catalog_authority_id(create=False)
+    authority = catalog_state.get_catalog_authority_id()
     assert authority is not None
     target = profile.targets[0]
     future = 10_000_000_000
@@ -5861,7 +6035,9 @@ def test_regular_migration_mode_rejects_unversioned_empty_schema(
     fresh_schema = f'image_migration_regular_{uuid.uuid4().hex}'
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
-    fresh_engine = _schema_engine(postgres_engine, fresh_schema)
+    fresh_url = postgres_engine.url.update_query_dict(
+        {'options': f'-csearch_path={fresh_schema}'})
+    fresh_engine = sqlalchemy.create_engine(fresh_url)
     try:
         with pytest.raises(RuntimeError, match='explicitly use bootstrap mode'):
             migration_utils.safe_alembic_upgrade(
@@ -5903,6 +6079,43 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             ).scalar_one() == '024'
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
+    finally:
+        fresh_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
+
+
+def test_bootstrap_mode_migrates_all_central_schemas_in_one_shared_schema(
+        postgres_engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh_schema = f'all_central_fresh_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
+    fresh_url = postgres_engine.url.update_query_dict(
+        {'options': f'-csearch_path={fresh_schema}'})
+    fresh_engine = sqlalchemy.create_engine(fresh_url)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'bootstrap')
+    try:
+        global_user_state.create_table(fresh_engine)
+        serve_state.create_table(fresh_engine)
+        state_storage.create_table(fresh_engine)
+
+        with fresh_engine.connect() as connection:
+            revisions = {
+                table: connection.execute(
+                    sqlalchemy.text(f'SELECT version_num FROM {table}')
+                ).scalar_one() for table in (
+                    'alembic_version_state_db',
+                    'alembic_version_serve_state_db',
+                    'alembic_version_spot_jobs_db',
+                )
+            }
+        assert revisions == {
+            'alembic_version_state_db':
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+            'alembic_version_serve_state_db': migration_utils.SERVE_VERSION,
+            'alembic_version_spot_jobs_db': migration_utils.SPOT_JOBS_VERSION,
+        }
     finally:
         fresh_engine.dispose()
         with postgres_engine.begin() as connection:
@@ -6041,6 +6254,167 @@ def test_migration_024_adopts_preview_missing_known_additive_indexes(
                             for _, table_name in compatible_indexes
                             for item in inspector.get_indexes(table_name)}
         assert set(compatible_indexes) <= restored_indexes
+        assert sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
+    finally:
+        preview_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {preview_schema} CASCADE')
+
+
+def test_migration_024_adopts_old_preview_custody_and_operation_link(
+        postgres_engine) -> None:
+    preview_schema = f'image_preview_old_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {preview_schema}')
+    preview_engine = _schema_engine(postgres_engine, preview_schema)
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    try:
+        with preview_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+        _migration_call(preview_engine, migration_024.upgrade)
+        with preview_engine.begin() as connection:
+            connection.execute(schema.profile_revisions.insert().values(
+                id='preview-profile-revision',
+                workspace='research',
+                profile='preview-profile',
+                revision=1,
+                desired_generation=1,
+                state=models.ImageProfileState.ACTIVE.value,
+                config_hash='config-hash',
+                config_json='{}',
+                physical_manifest_hash='physical-manifest-hash',
+                created_at=1,
+                updated_at=1))
+            connection.execute(schema.operations.insert().values(
+                id='preview-operation',
+                authority_id='00000000-0000-4000-8000-000000000001',
+                scope='research',
+                actor_hash='1' * 64,
+                kind='PUBLISH',
+                idempotency_key='preview-operation-key',
+                request_hash='2' * 64,
+                state=models.ImageOperationState.SUCCEEDED.value,
+                created_at=1,
+                updated_at=1,
+                terminal_expires_at=100))
+            connection.execute(schema.images.insert().values(
+                id='preview-image',
+                workspace='research',
+                runtime_digest=_DIGEST,
+                platform='linux/amd64',
+                config_digest=_CONFIG_DIGEST,
+                manifest_media_type=_MANIFEST_MEDIA_TYPE,
+                manifest_size_bytes=1,
+                declared_size_bytes=1,
+                creator_user_hash='1' * 64,
+                producer_kind='external_oci',
+                created_at=1,
+                updated_at=1))
+            connection.execute(schema.sources.insert().values(
+                id='preview-source',
+                workspace='research',
+                image_id='preview-image',
+                source_ref=_SOURCE,
+                source_root_digest=_DIGEST,
+                source_root_media_type=_MANIFEST_MEDIA_TYPE,
+                requested_platform='linux/amd64',
+                selected_child_digest=_DIGEST,
+                created_at=1))
+            connection.execute(schema.registry_shards.insert().values(
+                id='preview-shard',
+                workspace='research',
+                profile='preview-profile',
+                profile_revision_id='preview-profile-revision',
+                target_id='canonical',
+                provider='aws',
+                partition='aws',
+                account='123456789012',
+                region='us-east-1',
+                shard_generation=0,
+                shard_index=0,
+                target_fingerprint='target-fingerprint',
+                physical_fingerprint='physical-fingerprint',
+                eviction_enabled=False,
+                registry='123456789012.dkr.ecr.us-east-1.amazonaws.com',
+                repository_name='skypilot/images/s00',
+                repository_arn='arn:aws:ecr:us-east-1:123456789012:repository/x',
+                max_manifests=100,
+                max_declared_bytes=1000,
+                max_in_flight=1,
+                state=models.ImageShardState.READY.value,
+                created_at=1,
+                updated_at=1))
+            connection.execute(schema.locations.insert().values(
+                id='preview-location',
+                workspace='research',
+                image_id='preview-image',
+                shard_id='preview-shard',
+                target_fingerprint='target-fingerprint',
+                physical_fingerprint='physical-fingerprint',
+                runtime_digest=_DIGEST,
+                canonical=True,
+                target_ref=f'example.invalid/image@{_DIGEST}',
+                state=models.ImageLocationState.READY.value,
+                reserved_declared_bytes=1,
+                created_at=1,
+                updated_at=1))
+            connection.execute(schema.publications.insert().values(
+                id='preview-publication',
+                workspace='research',
+                operation_id='preview-operation',
+                profile_revision_id='preview-profile-revision',
+                requested_release='preview-release',
+                reservation_active=True,
+                source_ref=_SOURCE,
+                source_root_digest=_DIGEST,
+                requested_platform='linux/amd64',
+                state=models.ImagePublicationState.READY.value,
+                image_id='preview-image',
+                source_id='preview-source',
+                canonical_location_id='preview-location',
+                created_at=1,
+                updated_at=2))
+            connection.exec_driver_sql('DROP TABLE auth_sessions')
+            connection.exec_driver_sql(
+                'DROP TABLE container_image_profile_custody')
+            connection.exec_driver_sql(
+                'DROP INDEX ix_container_image_publications_operation')
+            connection.exec_driver_sql(
+                'ALTER TABLE container_image_publications DROP CONSTRAINT '
+                'container_image_publications_operation_id_fkey')
+            connection.exec_driver_sql(
+                'ALTER TABLE container_image_publications ALTER COLUMN '
+                'operation_id SET NOT NULL')
+            connection.exec_driver_sql(
+                'ALTER TABLE container_image_publications ADD CONSTRAINT '
+                'container_image_publications_operation_id_fkey FOREIGN KEY '
+                '(operation_id) REFERENCES container_image_operations(id)')
+
+        _migration_call(preview_engine, migration_024.upgrade)
+
+        inspector = sqlalchemy.inspect(preview_engine)
+        operation_column = next(
+            column
+            for column in inspector.get_columns('container_image_publications')
+            if column['name'] == 'operation_id')
+        operation_fk = next(
+            foreign_key for foreign_key in inspector.get_foreign_keys(
+                'container_image_publications')
+            if foreign_key['constrained_columns'] == ['operation_id'])
+        assert operation_column['nullable']
+        assert operation_fk['options']['ondelete'] == 'SET NULL'
+        with preview_engine.connect() as connection:
+            custody = connection.execute(
+                sqlalchemy.text(
+                    'SELECT workspace, profile, physical_manifest_hash, '
+                    'first_profile_revision_id, acquired_at FROM '
+                    'container_image_profile_custody')).one()
+        assert tuple(custody) == ('research', 'preview-profile',
+                                  'physical-manifest-hash',
+                                  'preview-profile-revision', 2)
         assert sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
     finally:
         preview_engine.dispose()

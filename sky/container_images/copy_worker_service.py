@@ -180,8 +180,7 @@ def _source_reader(
                     role_arn=binding.authority,
                     external_id=binding.external_id,
                     session_name=f'sky-img-source-{uuid.uuid4().hex[:16]}',
-                    catalog_tag=(catalog_state.get_catalog_authority_id() or
-                                 'unknown'),
+                    catalog_tag=catalog_state.get_catalog_authority_id(),
                     profile_tag=profile_name),
                 region=match.group('region'),
                 account=match.group('account'),
@@ -310,7 +309,7 @@ def _aws_role(binding: models.RegistryAccessBinding,
         role_arn=binding.authority,
         external_id=binding.external_id,
         session_name=f'sky-img-copy-{uuid.uuid4().hex[:16]}',
-        catalog_tag=catalog_state.get_catalog_authority_id() or 'unknown',
+        catalog_tag=catalog_state.get_catalog_authority_id(),
         profile_tag=profile.name)
 
 

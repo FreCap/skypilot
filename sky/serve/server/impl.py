@@ -756,7 +756,6 @@ def _up_impl_body(task: 'task_lib.Task',
         }
         catalog_authority = (
             container_image_catalog_state.get_catalog_authority_id())
-        assert catalog_authority is not None
         vars_to_fill['controller_envs'][
             constants.CONTAINER_IMAGE_CATALOG_AUTHORITY_ENV_VAR] = (
                 catalog_authority)

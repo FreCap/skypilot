@@ -97,7 +97,7 @@ class SourceRecord:
 class PublicationRecord:
     id: str
     workspace: str
-    operation_id: str
+    operation_id: str | None
     profile_revision_id: str
     requested_release: str
     reservation_active: bool
@@ -200,7 +200,8 @@ def _publication(row: sqlalchemy.engine.RowMapping) -> PublicationRecord:
     return PublicationRecord(
         id=str(row['id']),
         workspace=str(row['workspace']),
-        operation_id=str(row['operation_id']),
+        operation_id=(str(row['operation_id'])
+                      if row['operation_id'] is not None else None),
         profile_revision_id=str(row['profile_revision_id']),
         requested_release=str(row['requested_release']),
         reservation_active=bool(row['reservation_active']),
@@ -225,26 +226,26 @@ def _publication(row: sqlalchemy.engine.RowMapping) -> PublicationRecord:
     )
 
 
-def get_catalog_authority_id(*, create: bool = True) -> str | None:
+def get_catalog_authority_id() -> str:
+    """Returns the migration-owned catalog authority or fails closed."""
     table = schema.catalog
     with orm.Session(engine()) as session:
-        row = session.execute(
-            sqlalchemy.select(table.c.authority_id).where(
-                table.c.id == _CATALOG_ROW_ID)).scalar_one_or_none()
-        if row is not None or not create:
-            return str(row) if row is not None else None
-        authority = str(uuid.uuid4())
-        session.execute(
-            postgresql.insert(table).values(
-                id=_CATALOG_ROW_ID,
-                authority_id=authority,
-                created_at=int(time.time())).on_conflict_do_nothing(
-                    index_elements=[table.c.id]))
-        session.commit()
-        return str(
-            session.execute(
-                sqlalchemy.select(table.c.authority_id).where(
-                    table.c.id == _CATALOG_ROW_ID)).scalar_one())
+        rows = session.execute(
+            sqlalchemy.select(table).limit(2)).mappings().all()
+    valid = (len(rows) == 1 and str(rows[0]['id']) == _CATALOG_ROW_ID and
+             isinstance(rows[0]['created_at'], int) and
+             int(rows[0]['created_at']) > 0)
+    authority = str(rows[0]['authority_id']) if len(rows) == 1 else ''
+    if valid:
+        try:
+            uuid.UUID(authority)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise RuntimeError(
+            'Managed image catalog authority is missing or malformed. Run '
+            'the central database migration before serving image traffic.')
+    return authority
 
 
 def begin_operation(session: orm.Session,
@@ -291,7 +292,10 @@ def begin_operation(session: orm.Session,
     return _operation(row), created
 
 
-def get_operation(operation_id: str, scope: str) -> OperationRecord | None:
+def get_operation(operation_id: str | None,
+                  scope: str) -> OperationRecord | None:
+    if operation_id is None:
+        return None
     table = schema.operations
     with orm.Session(engine()) as session:
         row = session.execute(
@@ -1087,12 +1091,10 @@ def compact_terminal_records(*,
                 publications.c.id.in_(deletable_publications))).rowcount
         deletable_operations = session.execute(
             sqlalchemy.select(operations.c.id).where(
-                operations.c.terminal_expires_at <= current,
-                ~sqlalchemy.exists().where(
-                    publications.c.operation_id == operations.c.id)).order_by(
-                        operations.c.terminal_expires_at,
-                        operations.c.id).limit(batch_size).with_for_update(
-                            skip_locked=True)).scalars().all()
+                operations.c.terminal_expires_at <= current).order_by(
+                    operations.c.terminal_expires_at,
+                    operations.c.id).limit(batch_size).with_for_update(
+                        skip_locked=True)).scalars().all()
         deleted_operations = 0
         if deletable_operations:
             deleted_operations = session.execute(operations.delete().where(

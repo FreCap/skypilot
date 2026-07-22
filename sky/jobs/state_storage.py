@@ -27,9 +27,12 @@ def create_table(engine: sqlalchemy.engine.Engine):
             # If the database is locked, it is OK to continue, as the WAL mode
             # is not critical and is likely to be enabled by other processes.
 
-    migration_utils.safe_alembic_upgrade(engine,
-                                         migration_utils.SPOT_JOBS_DB_NAME,
-                                         migration_utils.SPOT_JOBS_VERSION)
+    migration_utils.safe_alembic_upgrade(
+        engine,
+        migration_utils.SPOT_JOBS_DB_NAME,
+        migration_utils.SPOT_JOBS_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 db_manager = db_utils.DatabaseManager('spot_jobs', create_table)
+initialize_and_get_db = db_manager.get_engine

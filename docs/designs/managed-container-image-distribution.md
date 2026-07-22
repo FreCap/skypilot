@@ -989,6 +989,7 @@ metadata. It creates only:
 ```text
 container_image_catalog
 container_image_profile_revisions
+container_image_profile_custody
 container_image_operations
 container_images
 container_image_sources
@@ -1002,6 +1003,10 @@ container_image_workers
 ```
 
 The catalog singleton contains only a stable authority UUID and creation time.
+Migration/bootstrap is its sole creator. Runtime reads require exactly the
+fixed singleton row, a valid UUID, and a positive creation time; missing,
+additional, or malformed authority state fails closed instead of silently
+creating a new realm identity.
 There is no forced RLS policy, API-version GUC, runtime-wide advisory lock,
 global configuration apply ledger, realm generation, dynamic repository
 creation, catalog projection, or facet table in v0. A physical shard row is the
@@ -1018,6 +1023,10 @@ Important constraints include:
   bounded request hash, `PENDING|RUNNING|SUCCEEDED|FAILED` state, result
   projection, and 30-day terminal expiry, with a lease/child/teardown tuple only
   for RUNNING PROFILE_CANARY;
+- one permanent custody row per `(workspace, profile)`, written atomically with
+  the first READY publication and carrying the immutable physical-manifest hash
+  plus its first profile revision. Profile staging and activation use this
+  primary-key probe rather than joining retained revisions and publications;
 - unique `(workspace, requested_release)` while
   `reservation_active`, retained forever for READY publications and expiring
   after 30 days for unretried FAILED publications;
@@ -1026,6 +1035,10 @@ Important constraints include:
   generated `inspection_claimable_at` only for unbound PENDING or INSPECTING,
   and the collision behavior above; canonical location is null only before
   source inspection and becomes immutable when bound;
+- a nullable publication-to-operation audit link with `ON DELETE SET NULL` and
+  a reverse index. Terminal operations compact directly from their expiry index
+  after 30 days even when a successful publication is retained forever; the
+  retained publication simply stops linking to the expired operation;
 - release lookup is an indexed projection of READY publications and returns no
   reservation or failed row;
 - workspace publication recovery uses `(workspace, created_at, id)` for its
@@ -1327,12 +1340,20 @@ Semantic changes require a higher explicit revision. Existing durable pull plans
 remain valid while their exact target and auth contract remains usable. In one
 transaction, config reload acquires a transaction-scoped PostgreSQL advisory
 lock keyed by workspace and profile, reads only an exact idempotency candidate,
-the indexed ACTIVE row, and an indexed scalar maximum desired generation, marks
-an older unfinished desired revision SUPERSEDED, and stages the new revision as
-QUALIFYING. Activation acquires the same lock, reads only the exact desired row
-and indexed ACTIVE row, and updates those rows directly. Neither mutation
-materializes retained profile history. It never makes provider calls or blocks
-deployment.
+the primary-key custody marker, and an indexed scalar maximum desired
+generation, marks an older unfinished desired revision SUPERSEDED, and stages
+the new revision as QUALIFYING. Activation acquires the same lock, reads only
+the exact desired row, indexed ACTIVE row, and custody marker, and updates those
+rows directly. Neither mutation materializes retained profile or publication
+history. It never makes provider calls or blocks deployment.
+
+Canonical READY commit, reconciliation, and retry acquire the same profile
+advisory lock before their shard and location locks, then insert the custody
+marker and re-prove its physical-manifest hash in the publication transaction.
+This closes READY-versus-stage races without reversing the profile-before-shard
+lock order. If staging wins immediately before the first READY commit, later
+activation rechecks the newly committed marker and rejects an incompatible
+candidate. The marker is permanent even after operational history compaction.
 
 Qualification is a bounded aggregation of revision-scoped, secret-free
 attestations, not one powerful worker assuming every identity:
@@ -2007,6 +2028,15 @@ artifact indexes. `publications_truncated`, `sources_truncated`, and
 `locations_truncated` mark partial summaries; the UI labels them as partial and
 uses the paginated artifact endpoints for complete detail.
 
+Catalog and detail reads remain available to workspace readers, but source and
+publication projections reveal credential-binding names and fingerprints only
+to callers with the workspace publish capability. Other readers receive null
+for those fields. Full profile history and its Terraform, role, repository, and
+attestation evidence is administrator-only, like worker and readiness state.
+Authorization and workspace resolution happen before object lookup, and the
+Dashboard treats redacted binding fields as absent rather than rendering an
+identifier placeholder.
+
 Readiness first selects at most 1,001 shards, excludes any boundary target group
 that could be partial, and projects at most the first 100 complete
 profile/target/account/region groups. One fixed PostgreSQL statement serves all
@@ -2052,21 +2082,25 @@ CLI or Dashboard locates such a publication for explicit retry.
 
 1. Merge literal schema, typed API, worker images, UI, Terraform, and tests with
    the image feature and managed profiles disabled.
-2. Run migration 024 once in a revision-scoped Helm Kubernetes Job. It is a
+2. Run the global-state, Serve, and managed-jobs Alembic heads once in a
+   revision-scoped Helm Kubernetes Job. It is a
    normal chart resource rather than a hook, so chart-managed database Secrets
    exist before it starts and Helm adds no hook wait to deployment latency. API
-   pods start concurrently in `verify` mode, refuse to serve below 024, and
-   become ready after the Job commits. For a nonempty database below 023, first
+   pods start concurrently in `verify` mode, refuse to serve unless all three
+   central schemas are current, and become ready after the Job commits. The
+   lifecycle worker performs the same eager three-schema verification before
+   advertising health. For a nonempty global-state database below 023, first
    deploy revision 023 and drain every older binary; the 024 Job refuses that
    unsafe starting state. A fresh isolated database must explicitly set
    `databaseMigration.bootstrapFreshSchema: true`; the resulting `bootstrap`
    mode checks every schema-owned relation, sequence, type, and routine, not
    only tables. The default `upgrade` mode refuses every unversioned schema,
    including an empty one. From revision 023 onward, the Job and transitional
-   `auto` pods share the same cross-host PostgreSQL advisory lock, so only one
-   Alembic process can mutate the schema. API replicas and every enabled image
-   worker run in `verify` mode while the Job owns migration; a worker can never
-   win startup and perform the Job's DDL. Disabling
+   `auto` pods share the same per-schema cross-host PostgreSQL advisory locks,
+   so only one Alembic process can mutate each schema. Global state, Serve, and
+   managed jobs all honor the same migration mode. API replicas and every
+   enabled image worker run in `verify` mode while the Job owns migration; a
+   worker can never win startup and perform the Job's DDL. Disabling
    `databaseMigration` explicitly puts both API and workers in the lock-protected
    `auto` fallback for local or operator-owned migration workflows.
    Database CA or client-certificate volumes are declared once through the
@@ -2077,6 +2111,9 @@ CLI or Dashboard locates such a publication for explicit retry.
    volumes are not leaked into its narrower identity. Helm rendering fails on
    duplicate or chart-reserved environment names, volume names, or mount paths
    across each produced Pod instead of emitting a manifest Kubernetes rejects.
+   Source-secret Roles and RoleBindings reserve their suffix before truncation
+   and include a stable namespace/secret hash, so valid long release names
+   cannot collapse distinct grants onto one Kubernetes object.
    Ordinary request completion checks the central database dialect before
    issuing a cluster-image terminal hint. A local SQLite API therefore performs
    no managed-image query and emits no PostgreSQL-only warning when the feature
@@ -2171,12 +2208,14 @@ drained and every image table is empty; it is never part of Helm rollback.
   unchanged direct OCI behavior on other runtimes;
 - `terraform fmt -check`, `terraform validate`, and plans for one and multiple
   regions with fixed shards;
-- Helm rendering that forces API and all image workers to `verify` while the
-  migration Job is enabled, restores `auto` only when it is disabled, defaults
-  the Job to `upgrade`, emits `bootstrap` only for an explicit isolated-fresh
-  flag, rejects reserved and duplicate environment, volume, and mount-path
-  collisions, excludes API-only inputs from the Job, and mounts shared database
-  TLS material into every database consumer;
+- Helm rendering that migrates global state, Serve, and managed jobs in the
+  Job, forces API and all image workers to `verify` while the Job is enabled,
+  restores `auto` only when it is disabled, defaults the Job to `upgrade`, emits
+  `bootstrap` only for an explicit isolated-fresh flag, rejects reserved and
+  duplicate environment, volume, and mount-path collisions, excludes API-only
+  inputs from the Job, mounts shared database TLS material into every database
+  consumer, and keeps two same-namespace source-secret grants distinct under a
+  63-character fullname;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
@@ -2203,15 +2242,17 @@ drained and every image table is empty; it is never part of Helm rollback.
   KMS grant, protected destroy, empty import, desired-generation fencing, and
   old-revision drain tests;
 - policy-only profile revision location reuse and physical-layout-change
-  rejection after first release;
+  rejection after first release, including a constant-row custody marker plan,
+  READY-versus-stage interleavings, and activation revalidation;
 - one-million-row resumable inventory, exact missing confirmation, durable cursor,
   batched token grants, hot/cold target no-starvation, throttling, count/byte
   ceilings, and empty failed-reservation reclamation tests;
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, inventory claims and runtime-digest matches,
   readiness, live/terminal demand pages, expired reservations, canonical
-  publication fan-out, worker cleanup, and state-filtered history use their
-  exact indexes with large terminal or idle populations present;
+  publication fan-out, terminal operation compaction, worker cleanup, and
+  state-filtered history use their exact indexes with large terminal or idle
+  populations present;
 - staged-migration tests proving that tables, views, materialized views,
   sequences, user-defined types, and routines each make an unversioned target
   schema nonempty and block revision 024 before DDL, while a separate empty
@@ -2227,6 +2268,8 @@ drained and every image table is empty; it is never part of Helm rollback.
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;
+- endpoint-level viewer, publisher, and administrator tests proving source-auth
+  redaction, profile-history denial, and full publisher/admin projections;
 - demand aggregation/tombstone/orphan tests for cluster, job recovery, Serve
   version-target, controller loss, supersede, generation watermark,
   interrupted terminal confirmation, one-shot request-terminal proof preserved
@@ -2706,3 +2749,19 @@ mutation with per-profile advisory locks and indexed scalar reads, and advances
 the migration fixtures through the current Serve revision. The acceptance
 streak remains zero until the repaired immutable head passes CI and both
 reviewers accept it.
+
+Restarted paired final-acceptance round 1 at
+`8628e97db3fc797ab2c577374364c37a1a4f511e` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the streak. Codex proved that the Helm Job migrated only
+global state while Serve and managed jobs still executed DDL from ordinary
+processes; workspace readers received source-binding and infrastructure
+attestation metadata; profile staging used an unbounded retained-history join;
+terminal operation compaction lacked a reverse publication index; long Helm
+fullnames collapsed distinct source-secret RBAC objects; and runtime silently
+replaced a missing catalog authority. This revision gives all central schemas
+one migration-mode contract, applies capability-sensitive read projections and
+an administrator profile-history gate, introduces an atomic permanent profile
+custody marker, makes publication audit links nullable with indexed
+`ON DELETE SET NULL` compaction, hashes length-safe RBAC names, and makes the
+catalog singleton migration-owned and runtime fail-closed. The acceptance
+streak remains zero until both reviewers accept one immutable repaired head.

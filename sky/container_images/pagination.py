@@ -18,9 +18,7 @@ class InvalidCursorError(ValueError):
 
 
 def _key() -> bytes:
-    authority = catalog_state.get_catalog_authority_id(create=False)
-    if authority is None:
-        raise InvalidCursorError('Image catalog authority is unavailable.')
+    authority = catalog_state.get_catalog_authority_id()
     return hashlib.sha256(
         f'skypilot-image-cursor:{authority}'.encode()).digest()
 

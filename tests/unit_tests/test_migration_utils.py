@@ -7,6 +7,8 @@ import pytest
 import sqlalchemy
 
 from sky import global_user_state
+from sky.jobs import state_storage
+from sky.serve import serve_state
 from sky.server import database_migrations
 from sky.skylet import constants
 from sky.utils.db import migration_utils
@@ -31,8 +33,7 @@ def test_safe_alembic_verify_mode_never_enters_upgrade_path() -> None:
 def test_safe_alembic_rejects_unknown_migration_mode() -> None:
     with pytest.raises(ValueError, match='Invalid database migration mode'):
         migration_utils.safe_alembic_upgrade(
-            mock.Mock(), 'state_db', '024',
-            mode='unsafe')  # type: ignore[arg-type]
+            mock.Mock(), 'state_db', '024', mode='unsafe')
 
 
 def test_global_state_create_table_uses_configured_migration_mode(
@@ -51,25 +52,60 @@ def test_global_state_create_table_uses_configured_migration_mode(
     engine.dispose()
 
 
+@pytest.mark.parametrize(('create_table', 'database_name', 'version'), [
+    (serve_state.create_table, migration_utils.SERVE_DB_NAME,
+     migration_utils.SERVE_VERSION),
+    (state_storage.create_table, migration_utils.SPOT_JOBS_DB_NAME,
+     migration_utils.SPOT_JOBS_VERSION),
+])
+def test_companion_create_table_uses_configured_migration_mode(
+        monkeypatch: pytest.MonkeyPatch, create_table, database_name: str,
+        version: str) -> None:
+    engine = sqlalchemy.create_engine('sqlite://')
+    upgrade = mock.Mock()
+    monkeypatch.setattr(migration_utils, 'safe_alembic_upgrade', upgrade)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+
+    create_table(engine)
+
+    upgrade.assert_called_once_with(engine,
+                                    database_name,
+                                    version,
+                                    mode='verify')
+    engine.dispose()
+
+
 def test_database_migration_entrypoint_forces_upgrade_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = mock.Mock()
+    initialize_serve = mock.Mock()
+    initialize_jobs = mock.Mock()
     monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
     monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
 
     database_migrations.main()
 
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'upgrade'
     initialize.assert_called_once_with()
+    initialize_serve.assert_called_once_with()
+    initialize_jobs.assert_called_once_with()
 
 
 def test_database_migration_entrypoint_preserves_explicit_bootstrap_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = mock.Mock()
+    initialize_serve = mock.Mock()
+    initialize_jobs = mock.Mock()
     monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
     monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'bootstrap')
 
     database_migrations.main()
 
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'bootstrap'
     initialize.assert_called_once_with()
+    initialize_serve.assert_called_once_with()
+    initialize_jobs.assert_called_once_with()

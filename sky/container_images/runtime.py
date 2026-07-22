@@ -631,9 +631,7 @@ def resolve_for_placement(resources: resources_lib.Resources,
     if (direct_fallback_resources is not None and
             location.state != models.ImageLocationState.READY):
         return direct_fallback_resources
-    authority_id = catalog_state.get_catalog_authority_id(create=False)
-    if authority_id is None:
-        raise ValueError('CATALOG_AUTHORITY_UNAVAILABLE')
+    authority_id = catalog_state.get_catalog_authority_id()
     placement_payload: dict[str, typing.Any] = {
         'provider': placement.provider,
         'region': placement.region,

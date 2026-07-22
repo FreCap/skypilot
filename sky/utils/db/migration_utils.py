@@ -4,7 +4,7 @@ import contextlib
 import logging
 import os
 import threading
-from typing import Literal
+from typing import cast, Literal
 
 from alembic import command as alembic_command
 from alembic.config import Config
@@ -30,6 +30,14 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 _alembic_thread_lock = threading.Lock()
 
 MigrationMode = Literal['auto', 'upgrade', 'bootstrap', 'verify']
+
+
+def configured_migration_mode() -> MigrationMode:
+    """Returns the process-wide central database migration ownership mode."""
+    return cast(
+        MigrationMode,
+        os.environ.get(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'auto'))
+
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
 GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions

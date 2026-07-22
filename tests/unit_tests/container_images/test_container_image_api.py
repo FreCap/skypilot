@@ -55,6 +55,52 @@ def _artifact() -> catalog_state.ArtifactRecord:
         updated_at=11)
 
 
+def _source(
+        artifact: catalog_state.ArtifactRecord) -> catalog_state.SourceRecord:
+    return catalog_state.SourceRecord(
+        id=str(uuid.uuid4()),
+        workspace='research',
+        image_id=artifact.id,
+        source_ref=SOURCE,
+        source_root_digest=DIGEST,
+        source_root_media_type='application/vnd.oci.image.manifest.v1+json',
+        requested_platform='linux/amd64',
+        selected_child_digest=DIGEST,
+        source_auth_binding_id='source-binding',
+        source_auth_fingerprint='source-fingerprint',
+        created_at=10)
+
+
+def _publication_with_auth(
+        artifact: catalog_state.ArtifactRecord
+) -> catalog_state.PublicationRecord:
+    return catalog_state.PublicationRecord(
+        id=str(uuid.uuid4()),
+        workspace='research',
+        operation_id=str(uuid.uuid4()),
+        profile_revision_id=str(uuid.uuid4()),
+        requested_release='boltz-l4',
+        reservation_active=True,
+        source_ref=SOURCE,
+        source_root_digest=DIGEST,
+        requested_platform='linux/amd64',
+        source_auth_binding_id='source-binding',
+        source_auth_fingerprint='source-fingerprint',
+        state=models.ImagePublicationState.READY,
+        inspection_lease_token=None,
+        inspection_lease_expires_at=None,
+        attempt_count=1,
+        next_retry_at=None,
+        error_code=None,
+        image_id=artifact.id,
+        source_id=str(uuid.uuid4()),
+        canonical_location_id=str(uuid.uuid4()),
+        reservation_expires_at=None,
+        record_expires_at=None,
+        created_at=10,
+        updated_at=11)
+
+
 def _operation(
         *,
         result: dict[str, Any] | None = None) -> catalog_state.OperationRecord:
@@ -141,9 +187,8 @@ def test_operation_view_never_returns_single_use_canary_nonce() -> None:
 def test_cursor_is_signed_and_bound_to_workspace_scope_and_filters(
         monkeypatch: pytest.MonkeyPatch) -> None:
     authority = str(uuid.uuid4())
-    monkeypatch.setattr(pagination.catalog_state,
-                        'get_catalog_authority_id',
-                        lambda create=False: authority)
+    monkeypatch.setattr(pagination.catalog_state, 'get_catalog_authority_id',
+                        lambda: authority)
     filters = {'state': 'READY'}
     cursor = pagination.encode(scope='catalog',
                                workspace='research',
@@ -194,6 +239,78 @@ def test_publish_authorization_is_role_and_workspace_scoped(
         lambda _: models.WorkspaceImagePolicy(publishers=('publisher-1',)))
     assert server._can_publish(  # pylint: disable=protected-access
         _request(user_id), 'research') is allowed
+
+
+def test_viewer_catalog_reads_redact_source_credential_bindings(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact = _artifact()
+    publication_record = _publication_with_auth(artifact)
+    source_record = _source(artifact)
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    monkeypatch.setattr(server, '_can_publish',
+                        lambda _request, _workspace: False)
+    monkeypatch.setattr(server.catalog_state, 'list_workspace_publications',
+                        lambda *_args, **_kwargs: [publication_record])
+    publication_page = server.list_workspace_publications(_request(), limit=50)
+    assert publication_page.items[0]['source_auth_binding_id'] is None
+    assert publication_page.items[0]['source_auth_fingerprint'] is None
+
+    monkeypatch.setattr(
+        server, '_artifact_collection_context', lambda *_args, **_kwargs:
+        ('research', 50, None, {
+            'image_id': artifact.id
+        }))
+    monkeypatch.setattr(server.catalog_state, 'list_sources',
+                        lambda *_args, **_kwargs: [source_record])
+    source_page = server.list_sources(artifact.id, _request(), limit=50)
+    assert source_page.items[0]['source_auth_binding_id'] is None
+    assert source_page.items[0]['source_auth_fingerprint'] is None
+    monkeypatch.setattr(server.catalog_state, 'list_publications',
+                        lambda *_args, **_kwargs: [publication_record])
+    artifact_publications = server.list_publications(artifact.id,
+                                                     _request(),
+                                                     limit=50)
+    assert artifact_publications.items[0]['source_auth_binding_id'] is None
+    assert artifact_publications.items[0]['source_auth_fingerprint'] is None
+
+
+def test_publisher_catalog_reads_reveal_source_credential_bindings(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact = _artifact()
+    publication_record = _publication_with_auth(artifact)
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    monkeypatch.setattr(server, '_can_publish',
+                        lambda _request, _workspace: True)
+    monkeypatch.setattr(server.catalog_state, 'list_workspace_publications',
+                        lambda *_args, **_kwargs: [publication_record])
+
+    page = server.list_workspace_publications(_request(), limit=50)
+
+    assert page.items[0]['source_auth_binding_id'] == 'source-binding'
+    assert page.items[0]['source_auth_fingerprint'] == 'source-fingerprint'
+
+
+def test_profile_history_requires_admin_before_workspace_or_database_access(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    denied = fastapi.HTTPException(status_code=403,
+                                   detail={'code': 'PERMISSION_DENIED'})
+    require_admin = mock.Mock(side_effect=denied)
+    resolve_workspace = mock.Mock()
+    history = mock.Mock()
+    monkeypatch.setattr(server, '_require_admin', require_admin)
+    monkeypatch.setattr(server, '_resolve_workspace', resolve_workspace)
+    monkeypatch.setattr(server.topology_state, 'list_profile_revision_history',
+                        history)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        server.list_profiles(_request(), workspace='research')
+
+    assert error.value.status_code == 403
+    require_admin.assert_called_once()
+    resolve_workspace.assert_not_called()
+    history.assert_not_called()
 
 
 def test_publication_route_authorizes_before_mutating_and_returns_direct_result(
@@ -285,9 +402,10 @@ def test_profile_history_api_is_keyset_paginated_and_query_bounded(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     authority = str(uuid.uuid4())
-    monkeypatch.setattr(pagination.catalog_state,
-                        'get_catalog_authority_id',
-                        lambda create=False: authority)
+    monkeypatch.setattr(pagination.catalog_state, 'get_catalog_authority_id',
+                        lambda: authority)
+    require_admin = mock.Mock()
+    monkeypatch.setattr(server, '_require_admin', require_admin)
     monkeypatch.setattr(server, '_resolve_workspace',
                         lambda request, requested: 'research')
     records = [
@@ -304,6 +422,7 @@ def test_profile_history_api_is_keyset_paginated_and_query_bounded(
 
     assert len(page.items) == 2
     assert page.next_cursor is not None
+    require_admin.assert_called_once()
     history.assert_called_once_with('research', limit=3, after=None)
     after = pagination.decode(page.next_cursor,
                               scope='profiles',
@@ -325,9 +444,8 @@ def test_profile_history_api_is_keyset_paginated_and_query_bounded(
 def test_catalog_page_is_bounded_and_cursor_is_last_returned_item(
         monkeypatch: pytest.MonkeyPatch) -> None:
     authority = str(uuid.uuid4())
-    monkeypatch.setattr(pagination.catalog_state,
-                        'get_catalog_authority_id',
-                        lambda create=False: authority)
+    monkeypatch.setattr(pagination.catalog_state, 'get_catalog_authority_id',
+                        lambda: authority)
     records = [
         dataclasses.replace(_artifact(), created_at=index) for index in range(3)
     ]

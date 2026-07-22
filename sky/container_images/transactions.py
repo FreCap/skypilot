@@ -70,6 +70,26 @@ def _lock_profile(
     return row
 
 
+def _lock_canonical_profile(session: orm.Session,
+                            location_id: str) -> tuple[str, str] | None:
+    """Acquires the profile advisory lock before shard and location locks."""
+    locations = schema.locations
+    shards = schema.registry_shards
+    snapshot = session.execute(
+        sqlalchemy.select(shards.c.workspace, shards.c.profile).select_from(
+            locations.join(shards, shards.c.id == locations.c.shard_id)).where(
+                locations.c.id == location_id,
+                locations.c.canonical.is_(True))).first()
+    if snapshot is None:
+        return None
+    workspace = str(snapshot.workspace)
+    profile = str(snapshot.profile)
+    topology_state.lock_profile_mutation_in_session(session,
+                                                    workspace=workspace,
+                                                    profile=profile)
+    return workspace, profile
+
+
 def _select_and_lock_shard(
         session: orm.Session, *, workspace: str, profile: str, target_id: str,
         runtime_digest: str,
@@ -658,7 +678,8 @@ def _finish_location(session: orm.Session, *, location_id: str,
 def _project_dependent_publications(session: orm.Session,
                                     location: sqlalchemy.engine.RowMapping, *,
                                     ready: bool, error_code: str | None,
-                                    now: int) -> int:
+                                    now: int,
+                                    profile_key: tuple[str, str] | None) -> int:
     publications = schema.publications
     operations = schema.operations
     rows = session.execute(
@@ -670,6 +691,19 @@ def _project_dependent_publications(session: orm.Session,
                 skip_locked=True)).mappings().all()
     for row in rows:
         if ready:
+            if profile_key is None:
+                raise RuntimeError(
+                    'Canonical custody lock is missing for READY projection.')
+            revision = session.execute(
+                sqlalchemy.select(schema.profile_revisions).where(
+                    schema.profile_revisions.c.id ==
+                    row['profile_revision_id'])).mappings().one()
+            topology_state.record_profile_custody_in_session(
+                session,
+                revision,
+                expected_workspace=profile_key[0],
+                expected_profile=profile_key[1],
+                now=now)
             publication_state = models.ImagePublicationState.READY.value
             publication_values = {
                 'state': publication_state,
@@ -696,9 +730,11 @@ def _project_dependent_publications(session: orm.Session,
             operation_error = error_code
         session.execute(publications.update().where(
             publications.c.id == row['id']).values(**publication_values))
+        operation_matches = [operations.c.result_id == row['id']]
+        if row['operation_id'] is not None:
+            operation_matches.append(operations.c.id == row['operation_id'])
         session.execute(operations.update().where(
-            sqlalchemy.or_(operations.c.id == row['operation_id'],
-                           operations.c.result_id == row['id']),
+            sqlalchemy.or_(*operation_matches),
             operations.c.state.in_([
                 models.ImageOperationState.PENDING.value,
                 models.ImageOperationState.RUNNING.value,
@@ -731,6 +767,8 @@ def converge_canonical(*,
     """Commits canonical result and release projections in one transaction."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        profile_key = (_lock_canonical_profile(session, location_id)
+                       if ready else None)
         location = _finish_location(session,
                                     location_id=location_id,
                                     lease_token=lease_token,
@@ -744,7 +782,8 @@ def converge_canonical(*,
                                             location,
                                             ready=ready,
                                             error_code=error_code,
-                                            now=current)
+                                            now=current,
+                                            profile_key=profile_key)
         return topology_state._location(  # pylint: disable=protected-access
             location)
 
@@ -755,6 +794,7 @@ def reconcile_canonical_publications(location_id: str,
     """Resumes bounded publication fanout without provider I/O."""
     current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        profile_key = _lock_canonical_profile(session, location_id)
         location = session.execute(
             sqlalchemy.select(schema.locations).where(
                 schema.locations.c.id == location_id,
@@ -769,7 +809,8 @@ def reconcile_canonical_publications(location_id: str,
             ready=str(
                 location['state']) == models.ImageLocationState.READY.value,
             error_code=location['error_code'],
-            now=current)
+            now=current,
+            profile_key=profile_key)
 
 
 def reconcile_pending_canonical_publications(limit: int = 100) -> int:
@@ -815,6 +856,9 @@ def retry_publication(
                 publications.c.workspace == workspace)).mappings().first()
         if optimistic is None:
             raise ValueError('IMAGE_PUBLICATION_NOT_FOUND')
+        revision = topology_state.lock_profile_custody_for_revision_in_session(
+            session, str(optimistic['profile_revision_id']))
+        profile_key = (str(revision['workspace']), str(revision['profile']))
         location = None
         shard = None
         if optimistic['canonical_location_id'] is not None:
@@ -861,6 +905,18 @@ def retry_publication(
                 now=current)
         ready = (location is not None and str(location['state'])
                  == models.ImageLocationState.READY.value)
+        if ready:
+            if (shard is None or str(shard['workspace']) != profile_key[0] or
+                    str(shard['profile']) != profile_key[1]):
+                raise topology_state.CanonicalCustodyChangeError(
+                    'A canonical location cannot project releases across '
+                    'profiles.')
+            topology_state.record_profile_custody_in_session(
+                session,
+                revision,
+                expected_workspace=profile_key[0],
+                expected_profile=profile_key[1],
+                now=current)
         publication_state = (models.ImagePublicationState.READY.value if ready
                              else models.ImagePublicationState.PENDING.value)
         updated = session.execute(publications.update().where(
@@ -1220,6 +1276,16 @@ def activate_profile(
                 != expected_attestations_hash):
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer matches the desired revision.')
+        custody = session.execute(
+            sqlalchemy.select(schema.profile_custody).where(
+                schema.profile_custody.c.workspace == desired['workspace'],
+                schema.profile_custody.c.profile ==
+                desired['profile'])).mappings().first()
+        if (custody is not None and str(custody['physical_manifest_hash'])
+                != str(desired['physical_manifest_hash'])):
+            raise topology_state.CanonicalCustodyChangeError(
+                'V0 cannot activate a physical manifest after another '
+                'manifest acquired canonical custody.')
         active_rows = session.execute(
             sqlalchemy.select(table.c.id).where(
                 table.c.workspace == desired['workspace'],

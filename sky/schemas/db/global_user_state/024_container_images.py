@@ -26,6 +26,7 @@ _MIGRATION_LOCK = 'skypilot:global-user-state:024:container-images'
 _TABLE_NAMES = (
     'container_image_catalog',
     'container_image_profile_revisions',
+    'container_image_profile_custody',
     'container_image_operations',
     'container_images',
     'container_image_sources',
@@ -48,6 +49,7 @@ _DROP_TABLE_NAMES = (
     'container_image_sources',
     'container_images',
     'container_image_operations',
+    'container_image_profile_custody',
     'container_image_profile_revisions',
     'container_image_catalog',
 )
@@ -69,6 +71,8 @@ _PREVIEW_COMPATIBLE_INDEXES = (
     ('ix_container_image_publications_fanout', 'container_image_publications',
      ('canonical_location_id',
       'id'), "state = 'PENDING' AND canonical_location_id IS NOT NULL"),
+    ('ix_container_image_publications_operation',
+     'container_image_publications', ('operation_id',), None),
     ('ix_container_image_publications_workspace_state_history',
      'container_image_publications', ('workspace', 'state', 'created_at',
                                       'id'), None),
@@ -307,6 +311,132 @@ def _qualified_name(bind: sqlalchemy.engine.Connection, schema_name: str,
             f'{preparer.quote(table_name)}')
 
 
+def _upgrade_preview_publication_operation_link(
+        bind: sqlalchemy.engine.Connection, schema_name: str) -> None:
+    """Converges only the shipped preview FK shape to bounded retention."""
+    inspector = sqlalchemy.inspect(bind)
+    columns = {
+        column['name']: column
+        for column in inspector.get_columns('container_image_publications',
+                                            schema=schema_name)
+    }
+    matching = [
+        foreign_key for foreign_key in inspector.get_foreign_keys(
+            'container_image_publications', schema=schema_name)
+        if foreign_key.get('constrained_columns') == ['operation_id']
+    ]
+    if len(matching) != 1 or 'operation_id' not in columns:
+        return
+    foreign_key = matching[0]
+    ondelete = str(foreign_key.get('options', {}).get('ondelete', '')).upper()
+    nullable = bool(columns['operation_id']['nullable'])
+    if nullable and ondelete == 'SET NULL':
+        return
+    old_shape = (not nullable and not ondelete and
+                 foreign_key.get('referred_table')
+                 == 'container_image_operations' and
+                 foreign_key.get('referred_columns') == ['id'] and
+                 foreign_key.get('name') is not None)
+    if not old_shape:
+        return
+    constraint_name = str(foreign_key['name'])
+    op.drop_constraint(constraint_name,
+                       'container_image_publications',
+                       schema=schema_name,
+                       type_='foreignkey')
+    op.alter_column('container_image_publications',
+                    'operation_id',
+                    schema=schema_name,
+                    existing_type=sqlalchemy.Text(),
+                    nullable=True)
+    op.create_foreign_key(constraint_name,
+                          'container_image_publications',
+                          'container_image_operations', ['operation_id'],
+                          ['id'],
+                          source_schema=schema_name,
+                          ondelete='SET NULL')
+
+
+def _backfill_and_validate_profile_custody(bind: sqlalchemy.engine.Connection,
+                                           schema_name: str) -> None:
+    """Adopts READY preview history into one immutable custody row per key."""
+    publications = _qualified_name(bind, schema_name,
+                                   'container_image_publications')
+    revisions = _qualified_name(bind, schema_name,
+                                'container_image_profile_revisions')
+    custody = _qualified_name(bind, schema_name,
+                              'container_image_profile_custody')
+    conflict = bind.execute(
+        sqlalchemy.text(f"""
+            SELECT revision.workspace, revision.profile
+            FROM {publications} AS publication
+            JOIN {revisions} AS revision
+              ON revision.id = publication.profile_revision_id
+            WHERE publication.state = 'READY'
+            GROUP BY revision.workspace, revision.profile
+            HAVING count(DISTINCT revision.physical_manifest_hash) > 1
+            LIMIT 1
+        """)).first()
+    if conflict is not None:
+        raise RuntimeError(
+            'Migration 024 preview adoption found conflicting canonical '
+            'physical custody in READY publication history.')
+    bind.execute(
+        sqlalchemy.text(f"""
+            INSERT INTO {custody} (
+                workspace, profile, physical_manifest_hash,
+                first_profile_revision_id, acquired_at
+            )
+            SELECT first_ready.workspace, first_ready.profile,
+                   first_ready.physical_manifest_hash,
+                   first_ready.profile_revision_id, first_ready.acquired_at
+            FROM (
+                SELECT DISTINCT ON (revision.workspace, revision.profile)
+                       revision.workspace, revision.profile,
+                       revision.physical_manifest_hash,
+                       revision.id AS profile_revision_id,
+                       publication.updated_at AS acquired_at
+                FROM {publications} AS publication
+                JOIN {revisions} AS revision
+                  ON revision.id = publication.profile_revision_id
+                WHERE publication.state = 'READY'
+                ORDER BY revision.workspace, revision.profile,
+                         publication.updated_at, publication.id
+            ) AS first_ready
+            ON CONFLICT (workspace, profile) DO NOTHING
+        """))
+    mismatch = bind.execute(
+        sqlalchemy.text(f"""
+            SELECT 1
+            FROM {publications} AS publication
+            JOIN {revisions} AS revision
+              ON revision.id = publication.profile_revision_id
+            JOIN {custody} AS marker
+              ON marker.workspace = revision.workspace
+             AND marker.profile = revision.profile
+            WHERE publication.state = 'READY'
+              AND marker.physical_manifest_hash <>
+                  revision.physical_manifest_hash
+            LIMIT 1
+        """)).first()
+    invalid_marker = bind.execute(
+        sqlalchemy.text(f"""
+            SELECT 1
+            FROM {custody} AS marker
+            JOIN {revisions} AS revision
+              ON revision.id = marker.first_profile_revision_id
+            WHERE marker.workspace <> revision.workspace
+               OR marker.profile <> revision.profile
+               OR marker.physical_manifest_hash <>
+                  revision.physical_manifest_hash
+            LIMIT 1
+        """)).first()
+    if mismatch is not None or invalid_marker is not None:
+        raise RuntimeError(
+            'Migration 024 preview adoption found an invalid canonical '
+            'profile custody marker.')
+
+
 def _validate_catalog_singleton(bind: sqlalchemy.engine.Connection,
                                 schema_name: str) -> None:
     catalog_name = _qualified_name(bind, schema_name, 'container_image_catalog')
@@ -389,6 +519,24 @@ def _ensure_preview_compatible_indexes(bind: sqlalchemy.engine.Connection,
                         schema=schema_name,
                         postgresql_where=(sqlalchemy.text(predicate)
                                           if predicate is not None else None))
+
+
+def _create_profile_custody_table(schema_name: str | None = None) -> None:
+    op.create_table(
+        'container_image_profile_custody',
+        sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('profile', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('physical_manifest_hash',
+                          sqlalchemy.Text,
+                          nullable=False),
+        sqlalchemy.Column(
+            'first_profile_revision_id',
+            sqlalchemy.Text,
+            sqlalchemy.ForeignKey('container_image_profile_revisions.id'),
+            nullable=False),
+        sqlalchemy.Column('acquired_at', sqlalchemy.BigInteger, nullable=False),
+        schema=schema_name,
+    )
 
 
 def _create_tables() -> None:
@@ -476,6 +624,8 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_profile_history',
                     'container_image_profile_revisions',
                     ['workspace', 'created_at', 'id'])
+
+    _create_profile_custody_table()
 
     op.create_table(
         'container_image_operations',
@@ -892,10 +1042,9 @@ def _create_tables() -> None:
         sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
         sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
         sqlalchemy.Column(
-            'operation_id',
-            sqlalchemy.Text,
-            sqlalchemy.ForeignKey('container_image_operations.id'),
-            nullable=False),
+            'operation_id', sqlalchemy.Text,
+            sqlalchemy.ForeignKey('container_image_operations.id',
+                                  ondelete='SET NULL')),
         sqlalchemy.Column(
             'profile_revision_id',
             sqlalchemy.Text,
@@ -983,6 +1132,8 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_publications_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'])
+    op.create_index('ix_container_image_publications_operation',
+                    'container_image_publications', ['operation_id'])
     op.create_index(_PUBLICATION_HISTORY_INDEX, 'container_image_publications',
                     ['workspace', 'created_at', 'id'])
     op.create_index('ix_container_image_publications_workspace_state_history',
@@ -1219,7 +1370,11 @@ def upgrade():
     if existing_image_tables:
         missing_tables = set(_TABLE_NAMES).difference(existing_image_tables)
         unexpected_tables = existing_image_tables.difference(_TABLE_NAMES)
-        if missing_tables or unexpected_tables:
+        preview_missing_custody = missing_tables == {
+            'container_image_profile_custody'
+        }
+        if (missing_tables and
+                not preview_missing_custody) or unexpected_tables:
             details = []
             if missing_tables:
                 details.append('missing tables: ' +
@@ -1234,7 +1389,11 @@ def upgrade():
         # already applied this exact image schema. Compare it with a temporary
         # reference built from this migration's literal DDL before adopting it.
         # Revision 024 then creates the base revision 023 auth table above.
+        if preview_missing_custody:
+            _create_profile_custody_table(str(schema_name))
+        _upgrade_preview_publication_operation_link(bind, str(schema_name))
         _ensure_preview_compatible_indexes(bind, str(schema_name))
+        _backfill_and_validate_profile_custody(bind, str(schema_name))
         _validate_preview_schema(bind, str(schema_name))
         return
     _create_tables()

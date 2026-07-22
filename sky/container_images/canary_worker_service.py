@@ -177,7 +177,7 @@ def _canary_role(
         role_arn=authority.authority,
         external_id=authority.external_id,
         session_name=f'sky-img-canary-{uuid.uuid4().hex[:12]}',
-        catalog_tag=catalog_state.get_catalog_authority_id() or 'unknown',
+        catalog_tag=catalog_state.get_catalog_authority_id(),
         profile_tag=profile.name)
 
 
@@ -377,8 +377,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                         'Value': operation.id,
                     }, {
                         'Key': 'SkyPilotCatalog',
-                        'Value': catalog_state.get_catalog_authority_id()
-                                 or 'unknown',
+                        'Value': catalog_state.get_catalog_authority_id(),
                     }, {
                         'Key': 'SkyPilotProfile',
                         'Value': profile.name,

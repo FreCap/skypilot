@@ -522,13 +522,15 @@ def list_workspace_publications(
                                                         after=after,
                                                         state=publication_state,
                                                         release=release)
+    reveal_source_auth = _can_publish(request, resolved)
     return _page(records,
                  limit=limit,
                  scope='workspace_publications',
                  workspace=resolved,
                  filters=filters,
                  key=lambda item: (item.created_at, item.id),
-                 view=api_models.PublicationView.from_record)
+                 view=lambda item: api_models.PublicationView.from_record(
+                     item, reveal_source_auth=reveal_source_auth))
 
 
 @router.get('/artifacts/{image_id}')
@@ -596,13 +598,15 @@ def list_sources(image_id: str,
                                          resolved,
                                          limit=limit + 1,
                                          after=after)
+    reveal_source_auth = _can_publish(request, resolved)
     return _page(records,
                  limit=limit,
                  scope='sources',
                  workspace=resolved,
                  filters=filters,
                  key=lambda item: (item.created_at, item.id),
-                 view=api_models.SourceView.from_record)
+                 view=lambda item: api_models.SourceView.from_record(
+                     item, reveal_source_auth=reveal_source_auth))
 
 
 @router.get('/artifacts/{image_id}/publications',
@@ -618,13 +622,15 @@ def list_publications(image_id: str,
                                               resolved,
                                               limit=limit + 1,
                                               after=after)
+    reveal_source_auth = _can_publish(request, resolved)
     return _page(records,
                  limit=limit,
                  scope='publications',
                  workspace=resolved,
                  filters=filters,
                  key=lambda item: (item.created_at, item.id),
-                 view=api_models.PublicationView.from_record)
+                 view=lambda item: api_models.PublicationView.from_record(
+                     item, reveal_source_auth=reveal_source_auth))
 
 
 @router.get('/artifacts/{image_id}/locations', response_model=api_models.Page)
@@ -700,6 +706,7 @@ def list_profiles(request: fastapi.Request,
                   workspace: str | None = None,
                   limit: int = 50,
                   cursor: str | None = None) -> api_models.Page:
+    _require_admin(request)
     resolved = _resolve_workspace(request, workspace)
     limit = _limit(limit)
     filters: dict[str, Any] = {}

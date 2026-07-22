@@ -356,8 +356,11 @@ def create_table(engine: sqlalchemy.engine.Engine):
             # If the database is locked, it is OK to continue, as the WAL mode
             # is not critical and is likely to be enabled by other processes.
 
-    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         migration_utils.SERVE_VERSION)
+    migration_utils.safe_alembic_upgrade(
+        engine,
+        migration_utils.SERVE_DB_NAME,
+        migration_utils.SERVE_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 def claim_service_lifecycle_epoch(service_name: str,

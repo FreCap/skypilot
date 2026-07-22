@@ -109,6 +109,21 @@ profile_revisions = sqlalchemy.Table(
                      'created_at', 'id'),
 )
 
+profile_custody = sqlalchemy.Table(
+    'container_image_profile_custody',
+    metadata,
+    sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('profile', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('physical_manifest_hash', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column(
+        'first_profile_revision_id',
+        sqlalchemy.Text,
+        sqlalchemy.ForeignKey('container_image_profile_revisions.id'),
+        nullable=False),
+    sqlalchemy.Column('acquired_at', sqlalchemy.BigInteger, nullable=False),
+)
+
 operations = sqlalchemy.Table(
     'container_image_operations',
     metadata,
@@ -495,10 +510,10 @@ publications = sqlalchemy.Table(
     metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('operation_id',
-                      sqlalchemy.Text,
-                      sqlalchemy.ForeignKey('container_image_operations.id'),
-                      nullable=False),
+    sqlalchemy.Column(
+        'operation_id', sqlalchemy.Text,
+        sqlalchemy.ForeignKey('container_image_operations.id',
+                              ondelete='SET NULL')),
     sqlalchemy.Column(
         'profile_revision_id',
         sqlalchemy.Text,
@@ -582,6 +597,8 @@ publications = sqlalchemy.Table(
             "state = 'PENDING' AND canonical_location_id IS NOT NULL")),
     sqlalchemy.Index('ix_container_image_publications_image', 'image_id',
                      'created_at', 'id'),
+    sqlalchemy.Index('ix_container_image_publications_operation',
+                     'operation_id'),
     sqlalchemy.Index('ix_container_image_publications_workspace_history',
                      'workspace', 'created_at', 'id'),
     sqlalchemy.Index('ix_container_image_publications_workspace_state_history',

@@ -324,6 +324,53 @@ def lock_profile_mutation_in_session(session: orm.Session, *, workspace: str,
         {'key': f'skypilot:container-image-profile:{lock_key}'})
 
 
+def lock_profile_custody_for_revision_in_session(
+        session: orm.Session,
+        profile_revision_id: str) -> sqlalchemy.engine.RowMapping:
+    """Locks the immutable custody key before any shard or location row."""
+    revision = session.execute(
+        sqlalchemy.select(schema.profile_revisions).where(
+            schema.profile_revisions.c.id ==
+            profile_revision_id)).mappings().first()
+    if revision is None:
+        raise StaleProfileRevisionError(
+            'The image profile revision no longer exists.')
+    lock_profile_mutation_in_session(session,
+                                     workspace=str(revision['workspace']),
+                                     profile=str(revision['profile']))
+    return revision
+
+
+def record_profile_custody_in_session(session: orm.Session,
+                                      revision: sqlalchemy.engine.RowMapping, *,
+                                      expected_workspace: str,
+                                      expected_profile: str, now: int) -> None:
+    """Records or revalidates immutable physical custody under its lock."""
+    workspace = str(revision['workspace'])
+    profile = str(revision['profile'])
+    physical_manifest_hash = str(revision['physical_manifest_hash'])
+    if workspace != expected_workspace or profile != expected_profile:
+        raise CanonicalCustodyChangeError(
+            'A canonical location cannot project releases across profiles.')
+    table = schema.profile_custody
+    session.execute(
+        postgresql.insert(table).values(
+            workspace=workspace,
+            profile=profile,
+            physical_manifest_hash=physical_manifest_hash,
+            first_profile_revision_id=str(revision['id']),
+            acquired_at=now).on_conflict_do_nothing(
+                index_elements=[table.c.workspace, table.c.profile]))
+    custody = session.execute(
+        sqlalchemy.select(table).where(
+            table.c.workspace == workspace,
+            table.c.profile == profile)).mappings().one()
+    if str(custody['physical_manifest_hash']) != physical_manifest_hash:
+        raise CanonicalCustodyChangeError(
+            'V0 cannot change the canonical physical manifest after a '
+            'release is published.')
+
+
 def stage_profile_revision(*,
                            workspace: str,
                            profile: str,
@@ -361,22 +408,13 @@ def stage_profile_revision(*,
                     models.ImageProfileState.ACTIVE.value)):
             return _profile(candidate)
 
-        ready_exists = session.execute(
-            sqlalchemy.select(sqlalchemy.literal(True)).select_from(
-                schema.publications.join(
-                    table,
-                    schema.publications.c.profile_revision_id == table.c.id)).
-            where(
-                table.c.workspace == workspace, table.c.profile == profile,
-                schema.publications.c.state ==
-                models.ImagePublicationState.READY.value).limit(1)).first()
-        active = session.execute(
-            sqlalchemy.select(table).where(
-                table.c.workspace == workspace, table.c.profile == profile,
-                table.c.state == models.ImageProfileState.ACTIVE.value).
-            with_for_update()).mappings().first()
-        if (ready_exists is not None and active is not None and str(
-                active['physical_manifest_hash']) != physical_manifest_hash):
+        custody = session.execute(
+            sqlalchemy.select(schema.profile_custody).where(
+                schema.profile_custody.c.workspace == workspace,
+                schema.profile_custody.c.profile ==
+                profile)).mappings().first()
+        if (custody is not None and str(custody['physical_manifest_hash'])
+                != physical_manifest_hash):
             raise CanonicalCustodyChangeError(
                 'V0 cannot change the canonical physical manifest after a '
                 'release is published.')

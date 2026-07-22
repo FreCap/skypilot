@@ -63,6 +63,7 @@ from sky.server import core_middleware
 from sky.server import csp_utils
 from sky.server import daemons
 from sky.server import dashboard as dashboard_app
+from sky.server import database_migrations
 from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
@@ -2366,11 +2367,11 @@ if __name__ == '__main__':
     # that it is shown only when the API server is started.
     usage_lib.maybe_show_privacy_policy()
 
-    # Initialize global user state db
+    # Initialize and verify every central Alembic schema before serving.
     db_utils.set_max_connections(1)
-    logger.info('Initializing database engine')
-    global_user_state.initialize_and_get_db()
-    logger.info('Database engine initialized')
+    logger.info('Initializing database engines')
+    database_migrations.initialize_central_databases()
+    logger.info('Database engines initialized')
     # Initialize request db, recovering request state from the previous
     # server run (or wiping it if recovery is disabled or fails). Returns
     # whether the recovery transitions actually ran and completed; only then

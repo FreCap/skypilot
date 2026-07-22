@@ -28,6 +28,7 @@ from sky.container_images import worker_health
 from sky.container_images import worker_lease
 from sky.jobs import state as managed_job_state
 from sky.serve import serve_state
+from sky.server import database_migrations
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _READBACK_ATTEMPTS = 3
@@ -60,7 +61,7 @@ def _lifecycle_role(
         role_arn=binding.authority,
         external_id=binding.external_id,
         session_name=f'sky-img-lifecycle-{uuid.uuid4().hex[:12]}',
-        catalog_tag=catalog_state.get_catalog_authority_id() or 'unknown',
+        catalog_tag=catalog_state.get_catalog_authority_id(),
         profile_tag=profile.name)
 
 
@@ -637,6 +638,9 @@ def main() -> None:
                        str(8 * 7 * 24 * 60 * 60)))
     if max_in_flight <= 0 or retention_seconds <= 0:
         raise ValueError('Image worker limits must be positive.')
+    # This worker reconciles global image state with Serve and managed-job
+    # terminal state. Verify all three schemas before advertising liveness.
+    database_migrations.initialize_central_databases()
     health = worker_health.WorkerHealth(
         'lifecycle',
         liveness_deadline_seconds=int(
