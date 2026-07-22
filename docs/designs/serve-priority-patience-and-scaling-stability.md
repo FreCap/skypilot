@@ -30,6 +30,19 @@ hold an obsolete target for up to roughly fifteen minutes. This design now
 defines each veto as one decision-tick deferral after the original elapsed
 proof, without resetting that proof.
 
+A later live burst on SkyPilot `1.1.686` exposed a separate interaction
+between aggregate hysteresis and exact-card placement. Demand raised the
+adopted aggregate target from 202 to 340. When raw aggregate demand later fell
+to 209, its compatibility mix shifted from L4 toward A100 and A100-80GB. The
+autoscaler classified any positive per-card delta as scale-up, reset the
+aggregate five-minute timer to zero, and retained 340 while launching
+replacement cards. A changing card mix can repeat this even though aggregate
+demand remains lower. The design now separates aggregate target state from
+exact-card migration in both compatibility-aware autoscalers. Logical
+concurrency retains its bounded, non-preemptive migration. Instance-aware
+request-rate scaling retains its existing observation-count hysteresis while
+classifying aggregate direction independently from card direction.
+
 The numerical production policy is an initial operating point, not a permanent
 default recommendation for every service. Future tuning must follow the
 [SkyServe autoscaling simulation runbook](serve-autoscaling-simulation.md) and
@@ -41,7 +54,7 @@ supply traces.
 SkyServe already supports strict request priority, concurrency-native logical
 autoscaling, deduplicated rejected-job pressure, bounded scale-up waves, a
 wall-clock downscale delay, and a configurable whole-fleet scale-down limit.
-Those controls still leave four gaps for bursty one-request-per-GPU services:
+Those controls still leave five gaps for bursty one-request-per-GPU services:
 
 1. One queue timeout applies to every priority. A short timeout spills all
    traffic before slow GPU capacity can start, while a long timeout makes every
@@ -56,6 +69,10 @@ Those controls still leave four gaps for bursty one-request-per-GPU services:
    under harmless trickle traffic. Even a bounded two-veto policy can turn a
    configured five-minute delay into roughly fifteen minutes, leaving adopted
    demand far above raw demand.
+5. A compatibility-mix change can contain a positive per-card delta while its
+   aggregate target is lower. Treating that reshuffle as aggregate scale-up
+   restarts the complete downscale proof and lets card churn pin an obsolete
+   total target indefinitely.
 
 The production incident on 2026-07-20 demonstrated the third gap. The service
 had 124 ready logical slots and 109 provisioning slots. Its adopted target fell
@@ -75,6 +92,8 @@ limit was respected, but more than 90 percent of pending capacity was lost.
 - Accelerate scale-up under sustained pressure while retaining time pacing.
 - Prevent fresh demand from racing a downscale decision.
 - Bound pressure vetoes so the protection cannot starve downscale forever.
+- Let exact-card coverage migrate without restarting lower aggregate demand
+  proof or bypassing scale-up wave limits.
 - Apply the configured downscale percentage independently to committed capacity
   and to the provisioning cohort.
 - Preserve scalar-only specs and mixed old/new controller and load-balancer
@@ -343,14 +362,72 @@ of recomputes whose raw target stays below the adopted target). The latch is
 magnitude-blind, so under trickle traffic a tiny positive delta can re-arm it
 nearly every decision tick. After the cap, the already elapsed delay accepts
 the lower target. Genuine rising pressure raises the raw target and takes the
-upscale branch, which ends the episode and refreshes the veto budget; an
-exact-card target increase has the same effect. An accepted downscale, an equal
-target, a stale tick, and a version update also reset the streak. Worst case
-the cap adds two controller decision intervals, not two additional downscale
-windows, preserving protection at the moment pressure begins without turning
-five minutes into fifteen. This is a logical tick bound, not a strict
-wall-clock bound, because one large-fleet reconciliation tick can take longer
-than its nominal interval.
+upscale branch, which ends the episode and refreshes the veto budget. A
+per-card increase ends the aggregate downscale episode only when the scalar raw
+target is at least the adopted scalar target. A pure card reshuffle under a
+lower scalar target does not. An accepted downscale, an equal aggregate target,
+a stale tick, and a version update also reset the streak. Worst case the cap
+adds two controller decision intervals, not two additional downscale windows,
+preserving protection at the moment pressure begins without turning five
+minutes into fifteen. This is a logical tick bound, not a strict wall-clock
+bound, because one large-fleet reconciliation tick can take longer than its
+nominal interval.
+
+Aggregate hysteresis and exact-card transition use separate decisions:
+
+```text
+aggregate_up = raw_scalar_target > adopted_scalar_target
+aggregate_down = raw_scalar_target < adopted_scalar_target
+card_increase = any(raw_card_target[c] > adopted_card_target[c])
+```
+
+This classification applies to both instance-aware request-rate scaling and
+logical concurrency scaling. The request-rate path keeps its established
+decision-count thresholds: lower aggregate demand always advances the
+downscale counter even when one card rises, while an equal aggregate with a
+positive card delta advances the upscale counter. It publishes the candidate
+scalar and card map together only after the corresponding counter matures.
+This path has no logical wave configuration, so this change does not invent
+one or alter its existing pacing contract.
+
+`aggregate_up` keeps the current behavior: reset downscale proof, apply the
+aggregate wave bound, then publish a card map whose sum equals the newly
+adopted scalar target. When the aggregate target is equal, `card_increase` may
+start or continue a bounded non-preemptive card migration, and it ends any
+lower-demand episode because aggregate demand is no longer lower.
+
+For logical concurrency, when `aggregate_down` is true, card increases do not
+enter the aggregate upscale branch and do not reset `_downscale_started_at`,
+the pressure-veto streak, or the frozen lower-demand proof. Before the delay
+expires, the autoscaler may still move the adopted card map toward
+compatibility demand at the unchanged adopted scalar ceiling. Positive card
+deltas consume the same per-card wave budget and period as every other logical
+exact-card migration. The map must continue to sum to the held aggregate
+target, and old-card reductions are only intent: existing exact-card readiness
+and rolling-drain fences prevent retirement until replacement coverage is
+ready.
+
+Once aggregate hysteresis accepts a lower target, the existing whole-fleet and
+pending-cohort 50 percent limits choose the new scalar target. The allocator
+then recomputes the card map at that lower ceiling. This accepted aggregate
+downscale is authoritative even if the compatibility mix still contains
+positive deltas relative to the old map. Any required positive card movement
+remains wave-bounded; it cannot raise the scalar target back to the old held
+value. If complete compatibility evidence cannot produce a map summing to the
+new scalar ceiling, the controller keeps the prior safe card map and does not
+guess placement or retire incompatible capacity.
+
+Logical victim selection enforces the accepted card map before spending either
+downscale allowance. For each candidate it maintains remaining committed and
+ready capacity by exact card. It may retire a replica only if the remainder
+still covers both the scalar target and that card's target. The pending-cohort
+allowance is only an upper bound on cancellation, not permission to violate
+the card floor. Therefore newly launched replacement-card PENDING,
+PROVISIONING, or STARTING replicas are skipped when removing them would fall
+below the recomputed card target; negative-delta old-card capacity is retired
+instead when idle and otherwise eligible. No old-card READY capacity is
+retired until replacement-card ready coverage satisfies the existing rolling
+drain fence.
 
 Every complete, non-handoff-floored report is compared with the immediately
 preceding eligible baseline and then becomes the new baseline, even when no
@@ -518,13 +595,22 @@ free capacity cannot make an incrementally paid fleet appear underutilized.
   floors and fragmentation that may exceed the aggregate floor, max-replica
   clipping, wave-ceiling maps that sum to the adopted scalar target, unchanged
   stale and mixed-version behavior, saturation, retry-deduplicated counts,
-  adaptive
-  activation and expiry, HA-floor pressure exclusion, unchanged pacing,
+  adaptive activation and expiry, HA-floor pressure exclusion, unchanged pacing,
   delta-only downscale veto, preservation of elapsed proof across at most two
   vetoed decision ticks, coalescing of multiple pre-decision pressure reports,
   explicit status reporting of the fixed veto budget, and an independent
   provisioning cancellation budget that stays frozen across reconciliation
-  ticks.
+  ticks. A production regression test starts at aggregate target 340, changes
+  compatibility mix while raw aggregate demand remains 209, and proves the
+  original five-minute start time survives while bounded card migration may
+  proceed. A second test advances past five minutes and proves aggregate
+  downscale is accepted under the 50 percent cap even though the desired card
+  map still has positive per-card deltas. A victim-selection regression proves
+  required replacement-card pending replicas survive while negative-delta
+  old-card capacity is selected under both scalar and pending-cohort limits.
+- Instance-aware request-rate tests prove a lower aggregate target advances the
+  downscale counter despite positive per-card deltas, while an equal aggregate
+  card migration retains the existing upscale-counter behavior.
 - Existing focused request-queue, concurrency-autoscaler, LB sync, HA,
   controller, logical reconciliation, and status tests pass.
 - Run formatter, mypy, pylint, Ruff, and the broader Serve unit-test slice.

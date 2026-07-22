@@ -3,6 +3,7 @@ from collections.abc import Callable
 import concurrent.futures
 import logging
 import multiprocessing
+from multiprocessing import connection as multiprocessing_connection
 import threading
 import time
 
@@ -71,14 +72,15 @@ class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
 
 
 # Define the worker function outside of the class to avoid pickling self
-def _disposable_worker(fn, initializer, initargs, result_queue, args, kwargs):
+def _disposable_worker(fn, initializer, initargs, result_connection, args,
+                       kwargs):
     """The worker function that is used to run the task.
 
     Args:
         fn: The function to run.
         initializer: The initializer function to run before running the task.
         initargs: The arguments to pass to the initializer function.
-        result_queue: The queue to put the result and exception into.
+        result_connection: The connection to send the result or exception to.
         args: The arguments to pass to the function.
         kwargs: The keyword arguments to pass to the function.
     """
@@ -86,9 +88,14 @@ def _disposable_worker(fn, initializer, initargs, result_queue, args, kwargs):
         if initializer is not None:
             initializer(*initargs)
         result = fn(*args, **kwargs)
-        result_queue.put(result)
+        # Connection.send() serializes synchronously, unlike Queue.put(). This
+        # lets an unserializable result be reported as an exception instead of
+        # being silently dropped by a background queue feeder thread.
+        result_connection.send(result)
     except BaseException as e:  # pylint: disable=broad-except
-        result_queue.put(e)
+        result_connection.send(e)
+    finally:
+        result_connection.close()
 
 
 class DisposableExecutor:
@@ -109,68 +116,132 @@ class DisposableExecutor:
         self.workers: dict[int, multiprocessing.Process] = {}
         self._shutdown: bool = False
         self._lock: threading.Lock = threading.Lock()
+        self._start_condition = threading.Condition(self._lock)
+        self._starting_workers: int = 0
         self._initializer: Callable | None = initializer
         self._initargs: tuple = initargs
 
-    def _monitor_worker(self, process: multiprocessing.Process,
-                        future: concurrent.futures.Future,
-                        result_queue: multiprocessing.Queue) -> None:
+    def _monitor_worker(
+            self, process: multiprocessing.Process,
+            future: concurrent.futures.Future,
+            result_connection: multiprocessing_connection.Connection) -> None:
         """Monitor the worker process and cleanup when it's done."""
+        result = None
+        receive_error = None
         try:
-            process.join()
-            if not future.cancelled():
-                try:
-                    # Get result from the queue if process completed
-                    if not result_queue.empty():
-                        result = result_queue.get(block=False)
-                        if isinstance(result, BaseException):
-                            future.set_exception(result)
-                        else:
-                            future.set_result(result)
-                    else:
-                        # Process ended but no result
-                        future.set_result(None)
-                except (multiprocessing.TimeoutError, BrokenPipeError,
-                        EOFError) as e:
-                    future.set_exception(e)
+            # Drain the pipe before joining. A worker sending a result larger
+            # than the OS pipe buffer cannot exit until the parent reads it.
+            try:
+                result = result_connection.recv()
+            except BaseException as e:  # pylint: disable=broad-except  # noqa: ASYNC103
+                receive_error = e
+            try:
+                process.join()
+            except BaseException as e:  # pylint: disable=broad-except  # noqa: ASYNC103
+                if receive_error is None:
+                    receive_error = e
         finally:
+            result_connection.close()
             if process.pid:
                 with self._lock:
                     if process.pid in self.workers:
                         del self.workers[process.pid]
 
+        # Release the worker slot before making completion visible to callers.
+        if future.cancelled():
+            return
+        if receive_error is not None:
+            worker_error = concurrent.futures.process.BrokenProcessPool(
+                f'Disposable worker process {process.pid} exited without '
+                f'returning a result (exit code {process.exitcode})')
+            worker_error.__cause__ = receive_error
+            future.set_exception(worker_error)
+        elif isinstance(result, Exception):
+            future.set_exception(result)
+        elif isinstance(result, BaseException):
+            termination_error = RuntimeError(
+                'Disposable worker task terminated with '
+                f'{type(result).__name__}: {result}')
+            termination_error.__cause__ = result
+            future.set_exception(termination_error)
+        else:
+            future.set_result(result)
+
     def submit(self, fn, *args, **kwargs) -> concurrent.futures.Future:
         """Submit a task for execution and return a Future."""
         future: concurrent.futures.Future = concurrent.futures.Future()
 
-        if self._shutdown:
-            raise RuntimeError('Cannot submit task after executor is shutdown')
-
-        with self._lock:
+        with self._start_condition:
+            if self._shutdown:
+                raise RuntimeError(
+                    'Cannot submit task after executor is shutdown')
             if (self.max_workers is not None and
-                    len(self.workers) >= self.max_workers):
+                    len(self.workers) + self._starting_workers
+                    >= self.max_workers):
                 raise exceptions.ExecutionPoolFullError(
                     'Maximum workers reached')
+            # Reserve capacity before releasing the lock for process startup.
+            # Otherwise concurrent submissions can all observe the same free
+            # slot while none of their processes has a PID yet.
+            self._starting_workers += 1
 
-        result_queue: multiprocessing.Queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=_disposable_worker,
-                                          args=(fn, self._initializer,
-                                                self._initargs, result_queue,
-                                                args, kwargs))
-        process.daemon = True
-        process.start()
+        result_connection = None
+        worker_result_connection = None
+        process = None
+        reservation_released = False
+        try:
+            result_connection, worker_result_connection = multiprocessing.Pipe(
+                duplex=False)
+            process = multiprocessing.Process(
+                target=_disposable_worker,
+                args=(fn, self._initializer, self._initargs,
+                      worker_result_connection, args, kwargs))
+            process.daemon = True
+            process.start()
+            worker_result_connection.close()
+            worker_result_connection = None
 
-        with self._lock:
-            pid = process.pid or 0
-            if pid == 0:
-                raise RuntimeError('Failed to start process')
-            self.workers[pid] = process
+            with self._start_condition:
+                pid = process.pid
+                if pid is None:
+                    raise RuntimeError('Failed to start process')
+                self.workers[pid] = process
+                self._starting_workers -= 1
+                reservation_released = True
+                self._start_condition.notify_all()
+        except BaseException:
+            try:
+                if result_connection is not None:
+                    result_connection.close()
+                if worker_result_connection is not None:
+                    worker_result_connection.close()
+                if process is not None and process.pid is not None:
+                    process.terminate()
+                    process.join()
+            finally:
+                with self._start_condition:
+                    if not reservation_released:
+                        self._starting_workers -= 1
+                        self._start_condition.notify_all()
+            raise
+        assert result_connection is not None
+        assert process is not None
 
         # Start monitor thread to cleanup the worker process when it's done
         monitor_thread = threading.Thread(target=self._monitor_worker,
-                                          args=(process, future, result_queue),
+                                          args=(process, future,
+                                                result_connection),
                                           daemon=True)
-        monitor_thread.start()
+        try:
+            monitor_thread.start()
+        except BaseException:
+            result_connection.close()
+            process_pid = process.pid
+            assert process_pid is not None
+            with self._lock:
+                self.workers.pop(process_pid, None)
+            subprocess_utils.kill_process_with_grace_period(process)
+            raise
 
         return future
 
@@ -179,16 +250,22 @@ class DisposableExecutor:
         if self.max_workers is None:
             return True
         with self._lock:
-            return len(self.workers) < self.max_workers
+            return (len(self.workers) + self._starting_workers
+                    < self.max_workers)
 
     def shutdown(self):
         """Shutdown the executor."""
-        with self._lock:
+        with self._start_condition:
             self._shutdown = True
+            # A process between the capacity check and PID registration is not
+            # yet present in self.workers. Wait for every accepted submission
+            # to register so the shutdown snapshot cannot miss it.
+            self._start_condition.wait_for(lambda: self._starting_workers == 0)
+            workers = list(self.workers.values())
         subprocess_utils.run_in_parallel(
             subprocess_utils.kill_process_with_grace_period,
-            list(self.workers.values()),  # Convert dict values to list
-            num_threads=len(self.workers))
+            workers,
+            num_threads=len(workers))
 
 
 class BurstableExecutor:
