@@ -691,6 +691,16 @@ class SpotPlacer:
     def active_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
 
+    def known_locations(self) -> list[Location]:
+        """Return every configured location, regardless of retry status.
+
+        Card-level cold placement order must remain stable while a location is
+        temporarily benched. Callers may inspect nominal cached costs through
+        cost_per_hour(), but launch selection must still use active_locations()
+        or select_next_location().
+        """
+        return list(self.location2status)
+
     def placement_snapshot(
             self,
             limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS) -> dict[str, Any]:

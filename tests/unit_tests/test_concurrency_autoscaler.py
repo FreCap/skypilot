@@ -1139,6 +1139,273 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
 
+    def test_retiring_warm_card_does_not_authorize_paid_replacement(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(max_replicas=2,
+                                      replica_unit='logical',
+                                      upscale_delay_seconds=4 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        a100 = _replica(2, card='A100', planned_capacity=1)
+        replicas = [l4, a100]
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, replicas), [])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+
+        # Model an operator retirement or reclaimed warm slot. The adopted
+        # map intentionally remains behind one extra upscale observation, but
+        # that stale A100 assignment must not become an A100 cold launch.
+        a100.status_property.is_scale_down = True
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
+
+        # A completed drain can delete the A100 row before the normal card-map
+        # hysteresis adopts L4. The next tick must retain the L4 cold fence.
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=3)
+        decisions = _decisions(autoscaler, [l4])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
+
+    def test_retiring_warm_card_can_be_replaced_for_constrained_demand(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(max_replicas=1,
+                                      replica_unit='logical',
+                                      upscale_delay_seconds=2 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100 = _replica(1, card='A100', planned_capacity=1)
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, [a100]), [])
+
+        a100.status_property.is_scale_down = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, [a100])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
+
+    def test_reclaimed_floor_card_uses_returned_reserved_slot(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(max_replicas=2,
+                                      replica_unit='logical',
+                                      min_replicas_by_accelerator={'A100': 1},
+                                      upscale_delay_seconds=4 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        a100 = _replica(2, card='A100', planned_capacity=1)
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, [l4, a100]), [])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+
+        # After the A100 row is deleted, the returned reserved slot backs the
+        # A100 floor. Reconciliation must request that exact zero-cost slot,
+        # not move the floor or duplicate flexible demand onto L4.
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 1})
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+        decisions = _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {
+                'L4': 1,
+                'A100': 1,
+            })
+
+    def test_floor_claims_reserved_slot_before_fill(self):
+        autoscaler = _make_autoscaler(max_replicas=1,
+                                      replica_unit='logical',
+                                      min_replicas_by_accelerator={'A100': 1},
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        now = time.time()
+        reserved_key = {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                'A100': 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        }
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 1})
+        for _ in range(2):
+            autoscaler.collect_reserved_capacity(1, [reserved_key], now)
+        _report(autoscaler,
+                in_flight={},
+                observed_slots={},
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertIsInstance(decisions[0].target,
+                              autoscalers.LogicalScaleTarget)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
+
+    def test_preempted_logical_card_does_not_suppress_replacement(self):
+        autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        preempted = _replica(1, card='A100', planned_capacity=1)
+        preempted.status_property.preempted = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [preempted])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
+
+    def test_preempted_physical_card_does_not_suppress_replacement(self):
+        autoscaler = _make_autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        preempted = _replica(1, card='A100')
+        preempted.status_property.preempted = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [preempted])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(decisions[0].target, {'accelerators': {'A100': 1}})
+
+    def test_partial_nominal_prices_preserve_service_order(self):
+        autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.known_locations.return_value = [l4_location, a100_location]
+        placer.cost_per_hour.side_effect = (lambda location: float('inf')
+                                            if location is l4_location else 2.0)
+        autoscaler.set_spot_placer(placer)
+        _report(autoscaler,
+                in_flight={},
+                observed_slots={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 1})
+
     def test_rejection_profiles_preserve_aggregate_duration_math(self):
         autoscaler = _make_autoscaler(knob=1,
                                       max_replicas=100,
@@ -2329,6 +2596,32 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                                                target_capacity=8,
                                                replica_id=1))
 
+    def test_retiring_cost_rebalance_replacement_cannot_drain_incumbent(self):
+        for retiring_field in ('preempted', 'is_scale_down'):
+            with self.subTest(retiring_field=retiring_field):
+                autoscaler = _make_autoscaler(knob=1,
+                                              max_replicas=20,
+                                              replica_unit='logical')
+                autoscaler.cost_rebalance = True
+                victim = _replica(1, gpu_count=8, planned_capacity=8)
+                replacement = _replica(2, gpu_count=8, planned_capacity=8)
+                replacement.cost_rebalance_for_replica_id = 1
+                victim.status_property.sky_down_status = None
+                replacement.status_property.sky_down_status = None
+                setattr(replacement.status_property, retiring_field, True)
+
+                with mock.patch.object(autoscaler,
+                                       '_cost_rebalance_location_is_compatible',
+                                       return_value=True):
+                    decisions = autoscaler._generate_cost_rebalance_decisions(
+                        [victim, replacement], [])
+
+                self.assertNotIn(1, [
+                    decision.target
+                    for decision in decisions
+                    if isinstance(decision.target, int)
+                ])
+
     def test_cost_rebalance_cross_card_pair_retires_replacement(self):
         autoscaler = _make_autoscaler(knob=1,
                                       min_replicas=1,
@@ -2819,6 +3112,18 @@ class TestRollingDrain(unittest.TestCase):
             old + [new_ready], [1, 2])
         self.assertEqual(sorted(retired), [1, 2, 3])
 
+    def test_preempted_latest_physical_replica_cannot_cover_rolling_drain(self):
+        autoscaler = self._mid_update(target=1)
+        old = _replica(1, version=1)
+        preempted = _replica(2, version=2)
+        preempted.status_property.preempted = True
+        _report(autoscaler, in_flight={1: 0, 2: 0})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [old, preempted], [1, 2])
+
+        self.assertEqual(retired, [])
+
     def test_terminal_branch_never_retires_busy_old_replicas(self):
         # Enough ready latest replicas is NOT a license to abort
         # in-progress hour-long jobs: busy old replicas (including
@@ -2914,6 +3219,25 @@ class TestRollingDrain(unittest.TestCase):
         self.assertEqual(len(retired), 5)
         self.assertTrue(
             set(retired).issubset({info.replica_id for info in old}))
+
+    def test_preempted_latest_logical_capacity_cannot_cover_rolling_drain(self):
+        autoscaler = self._logical_mid_update(target=5, raw_target=5)
+        old = [_replica(i, version=1) for i in range(1, 6)]
+        preempted = _replica(101, version=2, planned_capacity=5)
+        preempted.status_property.preempted = True
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [*old, preempted], [1, 2])
+
+        self.assertEqual(retired, [])
 
     def test_logical_blue_green_waits_for_complete_latest_target(self):
         autoscaler = self._logical_mid_update(
