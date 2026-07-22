@@ -3430,6 +3430,7 @@ class TestLbSyncBlockingReadsOffLoop:
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint', 'request_history_accepted',
+            'response_time_history_accepted',
             'queued_compatibility_demand_supported', 'service_version'
         }
         assert body['queued_compatibility_demand_supported'] is True
@@ -3654,7 +3655,10 @@ class TestLbSyncOwnershipFences:
                     request_data))
 
         assert response.status_code == 200
-        assert json.loads(response.body) == {'request_history_accepted': True}
+        assert json.loads(response.body) == {
+            'request_history_accepted': True,
+            'response_time_history_accepted': True,
+        }
         persist.assert_awaited_once_with(request_data)
         ctrl._ingest_load_balancer_report.assert_not_awaited()  # pylint: disable=protected-access
 
