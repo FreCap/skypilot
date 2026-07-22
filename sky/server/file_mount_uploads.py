@@ -1,7 +1,6 @@
 """File-mount upload routes and blob lifecycle helpers."""
 
 import asyncio
-import datetime
 import os
 import pathlib
 import re
@@ -29,10 +28,10 @@ logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
 
 # Default expiration time for upload ids before cleanup.
-_DEFAULT_UPLOAD_EXPIRATION_TIME = datetime.timedelta(hours=1)
+_DEFAULT_UPLOAD_EXPIRATION_SECONDS = 60 * 60
 # Key: (upload_id, user_hash), Value: the time when the upload id needs to be
-# cleaned up.
-upload_ids_to_cleanup: dict[tuple[str, str], datetime.datetime] = {}
+# cleaned up, measured on the process-local monotonic clock.
+upload_ids_to_cleanup: dict[tuple[str, str], float] = {}
 
 
 async def cleanup_upload_ids():
@@ -41,7 +40,7 @@ async def cleanup_upload_ids():
     # is to prevent stale chunks taking up space on the API server.
     while True:
         await asyncio.sleep(3600)
-        current_time = datetime.datetime.now()
+        current_time = time.monotonic()
         # We use list() to avoid modifying the dict while iterating over it.
         upload_ids_to_cleanup_list = list(upload_ids_to_cleanup.items())
         for (upload_id, user_hash), expire_time in upload_ids_to_cleanup_list:
@@ -275,8 +274,8 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
     # Add only validated upload ids to the cleanup list. The cleanup daemon
     # uses this value as a path component when removing expired uploads.
     upload_ids_to_cleanup[(upload_id,
-                           user_hash)] = (datetime.datetime.now() +
-                                          _DEFAULT_UPLOAD_EXPIRATION_TIME)
+                           user_hash)] = (time.monotonic() +
+                                          _DEFAULT_UPLOAD_EXPIRATION_SECONDS)
 
     base_dir = await _prepare_client_mount_dir(user_hash, request)
     missing_chunks = await _receive_and_assemble_chunks(
