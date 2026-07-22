@@ -1,6 +1,6 @@
 # SkyServe exact-accelerator compatibility, priority, and per-card capacity plan
 
-_Created: 2026-07-19. Updated: 2026-07-21._
+_Created: 2026-07-19. Updated: 2026-07-22._
 
 ## Decision summary
 
@@ -12,7 +12,14 @@ Scheduling and scaling follow these rules:
 2. Numeric request priority remains the primary queue order (`high = 50`, `low = 20` in boltz-platform).
 3. At equal numeric priority, make a supply-aware assignment that maximizes immediate admissions and protects the request with the worst realistic fallback; FIFO breaks a true fallback tie. Raw compatibility-set size is not a sufficient ordering rule.
 4. A request uses already-ready compatible capacity before causing a scale-up, even if that ready capacity is a larger card. Among otherwise-valid ready assignments, prefer reserved/zero-cost replicas before paid replicas so paid capacity can become idle and scale down.
-5. A healthy provisioning replica is committed future capacity, not a routable slot: count it against the target to avoid a duplicate launch. For demand still unmet after ready and committed capacity, launch into a free compatible reserved-capacity slot, then cold-start the cheapest compatible paid card.
+5. A healthy, non-retiring provisioning replica is committed future capacity,
+   not a routable slot: count it against the target to avoid a duplicate
+   launch. For demand still unmet after ready and committed capacity, launch
+   into a free compatible reserved-capacity slot, then cold-start the cheapest
+   compatible paid card. A retained per-card target is not authority to replace
+   disappeared warm capacity on that same card: every cold launch must still be
+   justified by the current compatibility profiles, floors, pinned work, and
+   supply snapshot.
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
 7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. With reserved fill enabled, every fresh broker-granted slot is launched independently of demand while total live and planned capacity remains below the hard `max_replicas` ceiling. The UI shows all three signals.
 8. `A100` and `A100-80GB` are distinct identifiers in validation, queue indexes, metrics, APIs, placement, tests, and UI. Matching may be case-insensitive, but it must never use family, prefix, regex, or memory-suffix normalization.
@@ -252,6 +259,43 @@ An unordered `resources.any_of` service keeps legacy aggregate behavior rather
 than turning hash iteration into a cold-card policy.
 
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
+
+The adopted per-card map and the cold-launch map have different safety roles.
+The adopted map retains ready capacity and controls graceful retirement through
+the existing card-migration and aggregate downscale hysteresis. Before emitting
+any exact-card scale-up, a fresh and complete control tick recomputes the
+desired card placement at the already-adopted aggregate target from the current
+compatibility profiles, hard floors, non-retiring pinned work, and current
+supply. The actuation map keeps the adopted card map except for generic
+overprovision slots and the subset of adopted slots whose backing replicas are
+already retiring or preempted. Only that subset may move toward the recomputed
+placement immediately. Healthy same-total card migrations continue to obey the
+existing hysteresis and logical scale-up wave limits. This revalidation does
+not increase the adopted aggregate target and does not accelerate retirement.
+It only prevents a disappearing warm card assignment from becoming a cold
+same-card replacement order.
+
+Rows already marked for scale-down are excluded from ready/provisioning supply
+in that cold-launch recomputation. Work still draining on such a row remains in
+the aggregate outstanding-work safety total, but it does not pin replacement
+capacity to the retiring row's card. The replacement portion is allocated by
+the current request compatibility sets. Consequently:
+
+- losing an idle or retiring reserved A100 that had served default-all or
+  `L4/A100` work shifts any replacement shortfall to L4 when L4 is the cheapest
+  compatible paid card;
+- an A100-only hard floor, running request on a non-retiring A100, or current
+  A100-only queued demand can still authorize an A100 cold launch;
+- an already-ready compatible A100 remains eligible for routing and avoids an
+  unnecessary L4 launch, including when it is reserved capacity;
+- stale or incomplete compatibility telemetry authorizes neither a guessed
+  card migration nor a cold launch.
+
+This cold-launch map is also the logical replica-manager reconciliation fence
+for that scale-up decision. While it differs from the adopted retirement map,
+the autoscaler suppresses retirement. After normal hysteresis adopts the new
+card assignment, scale-down again uses the adopted map and the existing
+idle/graceful-drain proofs.
 
 This is why an already-ready reserved A100 may serve flexible L4/A100/H100 work, while an empty fleet normally cold-starts the cheaper L4. When an A100-only request later arrives, no running flexible request is interrupted. At equal priority it owns the next A100 admission opportunity, and its demand increases the A100 target if capacity is otherwise occupied.
 
@@ -740,6 +784,16 @@ Production checks:
 - `A100` traffic never reaches `A100-80GB`, and vice versa, unless both are explicitly in the compatibility set.
 - Card-specific queue depth, target, floor, fill, free reserved slots, and actual replica counts reconcile in API metrics and UI.
 - Removing demand causes graceful per-card scale-down; reserved physical capacity or configured fill remains clearly reported as extra supply.
+- Retire one ready reserved A100 while default-all or `L4/A100` demand remains.
+  Confirm the cold-launch target moves the missing slot to L4 immediately and
+  no paid A100 replacement is created. Repeat with A100-only demand and confirm
+  that A100 remains a valid cold target.
+- Replay representative traffic with measured per-request service times and
+  per-card startup distributions. Low-priority requests must complete queue
+  admission before their 600-second timeout, default-all/L4-compatible traffic
+  must create zero paid A100-or-larger cold launches, and paid-card busy time
+  should converge toward 80 percent over stable-demand windows rather than
+  leaving a large idle paid tail.
 
 ## Failure handling and invariants
 
@@ -791,3 +845,12 @@ resources, one with distinct per-card QPS targets and one with
 - boltz-platform typecheck/lint/unit suites for compute types, routing, placement, SkyPilot provider, and retries pass using the repository's `mise` environment.
 - The exact deployed SkyPilot release advertises capability version 1 before platform explicit subsets are enabled.
 - Production observability can distinguish demand, hard floors, active reserved fill, and unconsumed reserved supply per exact accelerator.
+- A held or recovering per-card target cannot cold-replace lost warm A100-or-
+  larger capacity for traffic that is also compatible with a cheaper paid
+  card. Production has no GCP A100 spot replicas for the current default-all
+  workload after the bounded graceful drain.
+- Backtesting reports queue-timeout rate, per-priority wait distributions,
+  paid utilization by exact card, cold launches by exact card, and cost. For
+  the current workload it shows no low-priority timeout at 600 seconds, no
+  paid A100-or-larger cold launch, and stable-window paid utilization centered
+  near the 80 percent operating objective.

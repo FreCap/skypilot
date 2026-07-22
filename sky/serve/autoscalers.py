@@ -2034,6 +2034,67 @@ def _allocate_compatibility_target(
     return {card: count for card, count in target.items() if count > 0}
 
 
+def _replica_is_retiring_card_supply(
+        replica_info: 'replica_managers.ReplicaInfo') -> bool:
+    """Whether a row must not authorize replacement on its current card."""
+    status = replica_info.status_property
+    return (getattr(status, 'is_scale_down', False) is True or
+            getattr(status, 'preempted', False) is True)
+
+
+def _revalidate_retiring_card_targets(
+    *,
+    adopted_target: dict[str, int],
+    desired_target: dict[str, int],
+    retiring_capacity: dict[str, int],
+    configured_cards: list[str],
+    final_target: int,
+) -> dict[str, int]:
+    """Reassign only adopted slots whose backing card is retiring.
+
+    The normal target-adoption path owns card migrations and their hysteresis
+    or wave limits. Actuation may nevertheless need to replace a row that is
+    already retiring or preempted. In that case, move at most the retiring
+    capacity toward the freshly computed placement. Generic overprovision is
+    added from the fresh placement as before.
+    """
+    if sum(desired_target.values()) != final_target:
+        return {}
+    target = {
+        card: max(0, int(adopted_target.get(card, 0)))
+        for card in configured_cards
+    }
+
+    def fill_toward_desired(count: int) -> int:
+        for card in configured_cards:
+            if count <= 0:
+                break
+            deficit = max(0, desired_target.get(card, 0) - target[card])
+            added = min(count, deficit)
+            target[card] += added
+            count -= added
+        return count
+
+    # get_final_target_num_replicas() can add generic overprovision above the
+    # adopted demand target. Shape those extra slots with current supply.
+    remaining = final_target - sum(target.values())
+    if remaining < 0 or fill_toward_desired(remaining) != 0:
+        return {}
+
+    reassigned = 0
+    for card in configured_cards:
+        # A retiring row only authorizes a move when the current desired map
+        # actually wants fewer slots on this source card. Constrained demand
+        # therefore continues to replace A100 with A100.
+        removable = min(max(0, int(retiring_capacity.get(card, 0))),
+                        max(0, target[card] - desired_target.get(card, 0)))
+        target[card] -= removable
+        reassigned += removable
+    if fill_toward_desired(reassigned) != 0:
+        return {}
+    return {card: count for card, count in target.items() if count > 0}
+
+
 class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                                          RequestRateAutoscaler):
     """Instance-aware RequestRateAutoscaler:
@@ -2359,6 +2420,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             replicas_by_card: dict[str, list[replica_managers.ReplicaInfo]] = {}
             ready_by_card: dict[str, int] = {}
             for info in latest_nonterminal_replicas:
+                if _replica_is_retiring_card_supply(info):
+                    continue
                 card, _ = self._get_gpu_shape_from_replica_info(info)
                 replicas_by_card.setdefault(card, []).append(info)
                 if info.is_ready:
@@ -2467,50 +2530,50 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> tuple[dict[str, int], bool]:
-        """Extend an exact QPS demand target with shaped overprovision."""
+        """Revalidate exact QPS cold launches at the adopted total target."""
         demand_target = self.target_num_replicas_by_accelerator
         compatibility_complete = (self._compatibility_demand_complete or
                                   not self.configured_accelerator_shapes)
         if (not compatibility_complete or
                 sum(demand_target.values()) != self.target_num_replicas):
             return {}, False
+        has_exact_profiles = bool(self.compatibility_profiles or
+                                  self.queued_compatibility_profiles)
+        exact_profiles_available = (has_exact_profiles and
+                                    (self._compatibility_demand_complete or
+                                     not self.configured_accelerator_shapes))
+        exact_arrival_qps = 0.0
+        if exact_profiles_available:
+            exact_arrival_qps = (sum(
+                float(profile.get('count', 1))
+                for profile in self.compatibility_profiles) /
+                                 self.qps_window_size)
+        aggregate_qps = len(self.request_timestamps) / self.qps_window_size
+        aggregate_fallback_qps = max(0.0, aggregate_qps - exact_arrival_qps)
         final_target = self.get_final_target_num_replicas()
-        if final_target == self.target_num_replicas:
-            return dict(demand_target), True
-
+        desired_target = self._calculate_target_by_accelerator(
+            replica_infos,
+            include_exact_profiles=exact_profiles_available,
+            fallback_aggregate_qps=aggregate_fallback_qps,
+            min_replicas_override=final_target,
+            max_replicas_override=final_target)
         cards = self._configured_cards_from_profiles()
-        ready_zero_cost = {card: 0 for card in cards}
-        ready = {card: 0 for card in cards}
-        provisioning = {card: 0 for card in cards}
         canonical_by_name = {card.casefold(): card for card in cards}
+        retiring_capacity = {card: 0 for card in cards}
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    not _replica_is_retiring_card_supply(info)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
-            if card is None:
-                continue
-            if info.is_ready:
-                ready[card] += 1
-                if bool(getattr(info, 'is_zero_cost', False)):
-                    ready_zero_cost[card] += 1
-            else:
-                provisioning[card] += 1
-        target = _allocate_compatibility_target(
+            if card is not None:
+                retiring_capacity[card] += 1
+        target = _revalidate_retiring_card_targets(
+            adopted_target=demand_target,
+            desired_target=desired_target,
+            retiring_capacity=retiring_capacity,
             configured_cards=cards,
-            capacities={card: 1.0 for card in cards},
-            floors={},
-            min_replicas=final_target,
-            max_replicas=final_target,
-            demand_profiles=[],
-            fixed_work_by_accelerator={
-                card: float(count) for card, count in demand_target.items()
-            },
-            ready_zero_cost=ready_zero_cost,
-            ready=ready,
-            provisioning=provisioning,
-            free_reserved=self.free_reserved_slots_by_accelerator,
-            cold_order=self._cold_paid_card_order(cards))
+            final_target=final_target)
         return target, sum(target.values()) == final_target
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
@@ -2572,6 +2635,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         *,
         include_exact_profiles: bool = True,
         fallback_aggregate_qps: float | None = None,
+        min_replicas_override: int | None = None,
+        max_replicas_override: int | None = None,
     ) -> dict[str, int]:
         """Allocate recent demand to exact cards, priority first."""
         configured_cards = self._configured_cards_from_profiles()
@@ -2589,7 +2654,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         ready: dict[str, int] = {card: 0 for card in configured_cards}
         provisioning: dict[str, int] = {card: 0 for card in configured_cards}
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    _replica_is_retiring_card_supply(info)):
                 continue
             card, _ = self._get_gpu_shape_from_replica_info(info)
             if card not in ready:
@@ -2621,8 +2687,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             configured_cards=configured_cards,
             capacities=capacities,
             floors=floors_by_name,
-            min_replicas=self.min_replicas,
-            max_replicas=self.max_replicas,
+            min_replicas=(self.min_replicas if min_replicas_override is None
+                          else min_replicas_override),
+            max_replicas=(self.max_replicas if max_replicas_override is None
+                          else max_replicas_override),
             demand_profiles=profiles,
             fixed_work_by_accelerator={},
             ready_zero_cost=ready_zero_cost,
@@ -4280,6 +4348,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if info is None:
                 complete = False
                 return
+            if _replica_is_retiring_card_supply(info):
+                # The row remains in aggregate outstanding work until its
+                # bounded drain completes, but replacing that work on the
+                # retiring row's exact card would turn a graceful retirement
+                # into a cold same-card relaunch.
+                return
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = configured_by_name.get(raw_card.casefold())
             if card is None:
@@ -4340,6 +4414,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         replica_infos: list['replica_managers.ReplicaInfo'],
         *,
         target_ceiling: int | None = None,
+        min_replicas_override: int | None = None,
     ) -> tuple[dict[str, int], bool]:
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
@@ -4361,7 +4436,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         provisioning = {card: 0 for card in configured_cards}
         canonical_by_name = {card.casefold(): card for card in configured_cards}
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    _replica_is_retiring_card_supply(info)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
@@ -4412,7 +4488,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             configured_cards=configured_cards,
             capacities=capacity_per_card,
             floors=floors,
-            min_replicas=min(self.min_replicas, ceiling),
+            min_replicas=min(
+                self.min_replicas if min_replicas_override is None else
+                min_replicas_override, ceiling),
             max_replicas=ceiling,
             demand_profiles=profiles,
             fixed_work_by_accelerator=fixed,
@@ -4519,22 +4597,23 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> tuple[dict[str, int], bool]:
-        """Return a shaped target including the generic overprovision count."""
+        """Revalidate logical cold launches at the adopted total target."""
         demand_target = self.target_num_replicas_by_accelerator
         if (not self._compatibility_demand_complete or
                 sum(demand_target.values()) != self.target_num_replicas):
             return {}, False
         final_target = self.get_final_target_num_replicas()
-        if final_target == self.target_num_replicas:
-            return dict(demand_target), True
-
+        desired_target, attribution_complete = (
+            self._calculate_concurrency_target_by_accelerator(
+                replica_infos,
+                target_ceiling=final_target,
+                min_replicas_override=final_target))
         cards = self._configured_cards_from_profiles()
-        ready_zero_cost = {card: 0 for card in cards}
-        ready = {card: 0 for card in cards}
-        provisioning = {card: 0 for card in cards}
         canonical_by_name = {card.casefold(): card for card in cards}
+        retiring_capacity = {card: 0 for card in cards}
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    not _replica_is_retiring_card_supply(info)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
@@ -4542,34 +4621,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 continue
             width = (max(1, int(self._replica_capacity(info)))
                      if self.replica_unit == 'logical' else 1)
-            if info.is_ready:
-                ready[card] += width
-                if bool(getattr(info, 'is_zero_cost', False)):
-                    ready_zero_cost[card] += width
-            else:
-                provisioning[card] += width
-        free_reserved = dict(self.free_reserved_slots_by_accelerator)
-        if self.replica_unit == 'logical':
-            free_reserved = {
-                card: count * self._configured_gpu_count(card)
-                for card, count in free_reserved.items()
-            }
-        target = _allocate_compatibility_target(
+            retiring_capacity[card] += width
+        target = _revalidate_retiring_card_targets(
+            adopted_target=demand_target,
+            desired_target=desired_target,
+            retiring_capacity=retiring_capacity,
             configured_cards=cards,
-            capacities={card: 1.0 for card in cards},
-            floors={},
-            min_replicas=final_target,
-            max_replicas=final_target,
-            demand_profiles=[],
-            fixed_work_by_accelerator={
-                card: float(count) for card, count in demand_target.items()
-            },
-            ready_zero_cost=ready_zero_cost,
-            ready=ready,
-            provisioning=provisioning,
-            free_reserved=free_reserved,
-            cold_order=self._cold_paid_card_order(cards))
-        return target, sum(target.values()) == final_target
+            final_target=final_target)
+        return (target, attribution_complete and
+                sum(target.values()) == final_target)
 
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
@@ -5234,6 +5294,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 for card in self._configured_cards_from_profiles()
             }
             for info in latest_nonterminal_replicas:
+                if _replica_is_retiring_card_supply(info):
+                    continue
                 raw_card, _ = self._get_gpu_shape_from_replica_info(info)
                 card = canonical_by_name.get(raw_card.casefold())
                 if card is None:

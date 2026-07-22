@@ -1186,7 +1186,9 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
               max_replicas=4,
               floors=None,
               num_overprovision=None,
-              reserved_capacity_fill=False):
+              reserved_capacity_fill=False,
+              upscale_delay_seconds=0,
+              downscale_delay_seconds=0):
         return types.SimpleNamespace(
             min_replicas=0,
             min_replicas_by_accelerator=floors or {},
@@ -1197,8 +1199,8 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
                 'A100': 1.0,
                 'H100': 1.0,
             },
-            upscale_delay_seconds=0,
-            downscale_delay_seconds=0,
+            upscale_delay_seconds=upscale_delay_seconds,
+            downscale_delay_seconds=downscale_delay_seconds,
             reserved_capacity_fill=reserved_capacity_fill)
 
     def _autoscaler(self, **kwargs):
@@ -1251,6 +1253,35 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
+
+    def test_qps_retiring_warm_card_cold_replacement_uses_cheapest_card(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = self._autoscaler(max_replicas=1,
+                                      upscale_delay_seconds=2 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        now = time.time()
+        autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
+        autoscaler.request_timestamps = [now] * 60
+        autoscaler._compatibility_demand_complete = True
+        a100 = self._replica(1, 'A100', zero_cost=True)
+
+        self.assertEqual(autoscaler.generate_scaling_decisions([a100], [1]), [])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
+        a100.status_property.is_scale_down = True
+        decisions = autoscaler.generate_scaling_decisions([a100], [1])
+
+        # Hysteresis keeps the adopted retirement map on A100 for one more
+        # observation, but the cold-launch fence must already move to L4.
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual([decision.target for decision in decisions], [{
+            'accelerators': {
+                'L4': 1
+            }
+        }])
 
     def test_free_reserved_card_beats_cold_paid_card_for_flexible_demand(self):
         autoscaler = self._autoscaler(max_replicas=1)

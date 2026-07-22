@@ -1139,6 +1139,100 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
 
+    def test_retiring_warm_card_does_not_authorize_paid_replacement(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(max_replicas=2,
+                                      replica_unit='logical',
+                                      upscale_delay_seconds=2 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        a100 = _replica(2, card='A100', planned_capacity=1)
+        replicas = [l4, a100]
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, replicas), [])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+
+        # Model an operator retirement or reclaimed warm slot. The adopted
+        # map intentionally remains behind one extra upscale observation, but
+        # that stale A100 assignment must not become an A100 cold launch.
+        a100.status_property.is_scale_down = True
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                observed_slots={
+                    1: 1,
+                    2: 1
+                },
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
+
+    def test_retiring_warm_card_can_be_replaced_for_constrained_demand(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(max_replicas=1,
+                                      replica_unit='logical',
+                                      upscale_delay_seconds=2 * interval,
+                                      downscale_delay_seconds=300)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100 = _replica(1, card='A100', planned_capacity=1)
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, [a100]), [])
+
+        a100.status_property.is_scale_down = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, [a100])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator),
+            {'A100': 1})
+
     def test_rejection_profiles_preserve_aggregate_duration_math(self):
         autoscaler = _make_autoscaler(knob=1,
                                       max_replicas=100,
