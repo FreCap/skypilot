@@ -150,6 +150,23 @@ const formatSubmittedTime = (timestamp) => {
   return <TimestampWithTooltip date={date} />;
 };
 
+const mergeSortedValues = (...valueLists) =>
+  Array.from(
+    new Set(
+      valueLists.flatMap((values) =>
+        Array.isArray(values) ? values.filter(Boolean) : []
+      )
+    )
+  ).sort();
+
+const normalizeUserDirectory = (usersData) =>
+  Array.isArray(usersData)
+    ? mergeSortedValues(usersData.map((user) => user.username))
+    : [];
+
+const normalizeWorkspaceDirectory = (workspacesData) =>
+  workspacesData ? Object.keys(workspacesData).sort() : [];
+
 export function useManagedJobsPageData() {
   const [, setLoading] = useState(false);
   const [poolsLoading, setPoolsLoading] = useState(true); // Start as true for initial load
@@ -495,6 +512,8 @@ export function ManagedJobsTable({
   // filter wins; see effectiveUserMatch in fetchData).
   const [userScope, setUserScope] = useState('mine');
   const [currentUser, setCurrentUser] = useState(null);
+  const [directoryUsers, setDirectoryUsers] = useState([]);
+  const [directoryWorkspaces, setDirectoryWorkspaces] = useState([]);
   // True once the /users/role lookup has resolved (with a real user, with
   // the 'local'/anonymous sentinel, or by erroring out). Used to gate the
   // initial fetch so we never make the expensive unscoped Everyone request
@@ -509,6 +528,7 @@ export function ManagedJobsTable({
   const isMobile = useMobile();
   // Guards multiple concurrent fetches: only latest response should commit
   const requestSeqRef = useRef(0);
+  const directoryRequestVersionRef = useRef(0);
 
   // Sync page/pageSize to URL query params.
   // Use window.history.replaceState instead of router.replace to avoid
@@ -954,12 +974,7 @@ export function ManagedJobsTable({
     });
   }, []);
 
-  // Populate valueList for filter dropdown
-  useEffect(() => {
-    if (!setValueList) {
-      return;
-    }
-
+  const localValueList = React.useMemo(() => {
     const names = new Set();
     const users = new Set();
     const workspaces = new Set();
@@ -1008,34 +1023,76 @@ export function ManagedJobsTable({
       });
     }
 
-    setValueList({
+    return {
       name: Array.from(names).sort(),
       user: Array.from(users).sort(),
       workspace: Array.from(workspaces).sort(),
       pool: Array.from(pools).sort(),
       labels: Array.from(labels).sort(),
-    });
+    };
+  }, [data, poolsData]);
 
-    // Fetch full users/workspaces from cache (preloaded by cache-preloader).
-    // dashboardCache.get() returns cached data if fresh, or re-fetches if
-    // expired. Updates only user/workspace to avoid blocking other fields.
-    Promise.all([
+  const mergedValueList = React.useMemo(
+    () => ({
+      ...localValueList,
+      user: mergeSortedValues(localValueList.user, directoryUsers),
+      workspace: mergeSortedValues(
+        localValueList.workspace,
+        directoryWorkspaces
+      ),
+    }),
+    [directoryUsers, directoryWorkspaces, localValueList]
+  );
+
+  useEffect(() => {
+    if (!setValueList) {
+      return;
+    }
+    setValueList(mergedValueList);
+  }, [mergedValueList, setValueList]);
+
+  useEffect(() => {
+    if (!setValueList || !preloadingComplete) {
+      return undefined;
+    }
+
+    const requestVersion = directoryRequestVersionRef.current + 1;
+    directoryRequestVersionRef.current = requestVersion;
+    let cancelled = false;
+    const ownsRequest = () =>
+      !cancelled && directoryRequestVersionRef.current === requestVersion;
+
+    void Promise.allSettled([
       dashboardCache.get(getUsers, []),
       dashboardCache.get(getWorkspaces, []),
-    ]).then(([usersData, workspacesData]) => {
-      setValueList((prev) => ({
-        ...prev,
-        user: usersData
-          ? [
-              ...new Set(usersData.map((u) => u.username).filter(Boolean)),
-            ].sort()
-          : prev.user,
-        workspace: workspacesData
-          ? Object.keys(workspacesData).sort()
-          : prev.workspace,
-      }));
+    ]).then(([usersResult, workspacesResult]) => {
+      if (!ownsRequest()) {
+        return;
+      }
+      if (usersResult.status === 'fulfilled') {
+        setDirectoryUsers(normalizeUserDirectory(usersResult.value));
+      } else {
+        console.error('Error fetching jobs filter users:', usersResult.reason);
+      }
+      if (workspacesResult.status === 'fulfilled') {
+        setDirectoryWorkspaces(
+          normalizeWorkspaceDirectory(workspacesResult.value)
+        );
+      } else {
+        console.error(
+          'Error fetching jobs filter workspaces:',
+          workspacesResult.reason
+        );
+      }
     });
-  }, [data, poolsData, setValueList]);
+
+    return () => {
+      cancelled = true;
+      if (directoryRequestVersionRef.current === requestVersion) {
+        directoryRequestVersionRef.current += 1;
+      }
+    };
+  }, [preloadingComplete, setValueList]);
 
   const requestSort = React.useCallback(
     (key) => {
