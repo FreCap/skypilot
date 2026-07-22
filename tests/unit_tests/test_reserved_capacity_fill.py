@@ -1169,6 +1169,7 @@ class TestDemandLaunchBudget(unittest.TestCase):
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [location]
+        placer.active_locations.return_value = [location]
         placer.select_next_location.return_value = location
         manager = _make_manager(placer)
         budget = replica_managers._ZeroCostDemandBudget(

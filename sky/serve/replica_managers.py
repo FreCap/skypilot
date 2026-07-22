@@ -106,6 +106,17 @@ _MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
 # measurement blackout, keep only a few probes per ACTIVE zero-cost shape.
 # Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
+# Paid demand uses the same small-probe default, but its scope is one exact
+# placer Location rather than one shared zero-cost pool. Keep the override
+# internal to the controller so operators can tune feedback parallelism without
+# changing the service API.
+_PAID_LOCATION_LAUNCH_WINDOW_DEFAULT = 4
+_PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW')
+_PAID_LOCATION_UNRESOLVED_STATUSES = frozenset({
+    serve_state.ReplicaStatus.PENDING,
+    serve_state.ReplicaStatus.PROVISIONING,
+})
 
 # Sentinel for to_info_dict's pre-fetched cluster_record
 # parameters. We can't use None because None is a legitimate value (it means
@@ -117,6 +128,28 @@ _NOT_PROVIDED: Any = object()
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
 _REPLICA_URL_NOT_PROVIDED: Any = object()
+
+
+@functools.cache
+def _parse_paid_location_launch_window(raw_value: str | None) -> int:
+    """Parse one distinct paid-location launch-window override."""
+    if raw_value is None:
+        return _PAID_LOCATION_LAUNCH_WINDOW_DEFAULT
+    try:
+        value = int(raw_value)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning(
+            f'Invalid {_PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR} value '
+            f'{raw_value!r}; using {_PAID_LOCATION_LAUNCH_WINDOW_DEFAULT}.')
+        return _PAID_LOCATION_LAUNCH_WINDOW_DEFAULT
+    return value
+
+
+def _paid_location_launch_window() -> int:
+    return _parse_paid_location_launch_window(
+        os.environ.get(_PAID_LOCATION_LAUNCH_WINDOW_ENV_VAR))
 
 
 def load_task_with_service_spec(
@@ -148,6 +181,13 @@ class _ZeroCostDemandBudget:
 
     remaining_by_pool: dict[tuple[str, str], int]
     measured_by_pool: dict[tuple[str, str], int | None]
+
+
+@dataclasses.dataclass
+class _PaidLocationLaunchBudget:
+    """One scale-up wave's remaining probes by exact paid location."""
+
+    remaining_by_location: dict[spot_placer.Location, int]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2791,6 +2831,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_version: int | None = None,
         prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
+        paid_location_launch_budget: _PaidLocationLaunchBudget | None = None,
         recovering_existing_replica: bool = False,
         logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
@@ -2828,6 +2869,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         logical_reconcile_fence_requires_exact_generation: keep bounded
         unknown-capacity replacement tied to the exact outage observation.
+
+        paid_location_launch_budget: mutable per-wave allowance for fresh paid
+        placement. Recovery and pinned replacements bypass fresh selection.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -2894,6 +2938,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     launch_spec)
         retry_until_up = True
         location = None
+        debit_paid_location_launch_budget = False
         recovered_location = None
         if recovering_existing_replica and self._spot_placer is not None:
             # A persisted row already owns a cluster name and may own live
@@ -3012,46 +3057,77 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
-            elif self._demand_should_skip_zero_cost(existing_replica_infos):
-                # The broker grant or speculative-probe budget says this
-                # demand launch should compete on paid capacity instead of
-                # preferring the zero-cost tier.  The placer falls back to
-                # zero-cost when no paid candidate exists.
-                location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True, **allowed_location_kwargs)
-                if (zero_cost_demand_budget is not None and
-                        location in self._spot_placer.zero_cost_locations()):
-                    budgeted_location = self._select_budgeted_zero_cost_location(
-                        zero_cost_demand_budget, allowed_locations)
-                    if budgeted_location is None:
-                        logger.info('Deferring demand launch because the '
-                                    'shared zero-cost GPU budget is exhausted '
-                                    'and no paid location is active.')
-                        return False
-                    location = budgeted_location
-            elif zero_cost_demand_budget is not None:
-                location = self._select_budgeted_zero_cost_location(
-                    zero_cost_demand_budget, allowed_locations)
-                if location is None:
-                    location = self._spot_placer.select_next_location(
+            else:
+                if paid_location_launch_budget is None:
+                    paid_location_launch_budget = (
+                        self._build_paid_location_launch_budget(
+                            existing_replica_infos))
+                assert paid_location_launch_budget is not None
+                if self._demand_should_skip_zero_cost(existing_replica_infos):
+                    # The broker grant or speculative-probe budget says this
+                    # demand launch should compete on paid capacity instead of
+                    # preferring the zero-cost tier.  The placer falls back to
+                    # zero-cost when no paid candidate exists.
+                    location = self._select_with_paid_location_budget(
+                        paid_location_launch_budget,
                         skip_zero_cost_preference=True,
                         **allowed_location_kwargs)
-                    if location in self._spot_placer.zero_cost_locations():
-                        # A successful zero (or an exhausted speculative
-                        # allowance) is authoritative. If no paid candidate is
-                        # active, defer instead of falling through into the
-                        # same saturated research pool.
-                        logger.info('Deferring demand launch because the '
-                                    'shared zero-cost GPU budget is exhausted '
-                                    'and no paid location is active.')
+                    if location is None:
+                        logger.info(
+                            'Deferring demand launch because every active paid '
+                            'location is awaiting launch feedback.')
                         return False
-            elif self._demand_should_skip_saturated_zero_cost(
-                    existing_replica_infos):
-                location = self._spot_placer.select_next_location(
-                    skip_zero_cost_preference=True, **allowed_location_kwargs)
-            else:
-                location = self._spot_placer.select_next_location(
-                    **allowed_location_kwargs)
+                    if (zero_cost_demand_budget is not None and location
+                            in self._spot_placer.zero_cost_locations()):
+                        budgeted_location = (
+                            self._select_budgeted_zero_cost_location(
+                                zero_cost_demand_budget, allowed_locations))
+                        if budgeted_location is None:
+                            logger.info(
+                                'Deferring demand launch because the shared '
+                                'zero-cost GPU budget is exhausted and no '
+                                'paid location is active.')
+                            return False
+                        location = budgeted_location
+                elif zero_cost_demand_budget is not None:
+                    location = self._select_budgeted_zero_cost_location(
+                        zero_cost_demand_budget, allowed_locations)
+                    if location is None:
+                        location = self._select_with_paid_location_budget(
+                            paid_location_launch_budget,
+                            skip_zero_cost_preference=True,
+                            **allowed_location_kwargs)
+                        if location is None:
+                            logger.info(
+                                'Deferring demand launch because every active '
+                                'paid location is awaiting launch feedback.')
+                            return False
+                        if location in self._spot_placer.zero_cost_locations():
+                            # A successful zero (or an exhausted speculative
+                            # allowance) is authoritative. If no paid candidate
+                            # is active, defer instead of falling through into
+                            # the same saturated research pool.
+                            logger.info(
+                                'Deferring demand launch because the shared '
+                                'zero-cost GPU budget is exhausted and no '
+                                'paid location is active.')
+                            return False
+                elif self._demand_should_skip_saturated_zero_cost(
+                        existing_replica_infos):
+                    location = self._select_with_paid_location_budget(
+                        paid_location_launch_budget,
+                        skip_zero_cost_preference=True,
+                        **allowed_location_kwargs)
+                else:
+                    location = self._select_with_paid_location_budget(
+                        paid_location_launch_budget, **allowed_location_kwargs)
+            if location is None:
+                logger.info('Deferring demand launch because every active paid '
+                            'location is awaiting launch feedback.')
+                return False
+            debit_paid_location_launch_budget = (
+                paid_location_launch_budget is not None and
+                location in paid_location_launch_budget.remaining_by_location)
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
@@ -3197,6 +3273,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return False
             else:
                 self._persist_replica(replica_id, info)
+            if debit_paid_location_launch_budget:
+                self._debit_paid_location_launch_budget(
+                    paid_location_launch_budget, location)
             if info.unknown_capacity_replacement:
                 replacement_ids = getattr(self,
                                           '_unknown_capacity_replacement_ids',
@@ -3301,6 +3380,88 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert remaining >= debit, (location, budget)
         budget.remaining_by_pool[pool_key] = remaining - debit
         return location
+
+    def _build_paid_location_launch_budget(
+        self, existing_replica_infos: list['ReplicaInfo']
+    ) -> _PaidLocationLaunchBudget | None:
+        """Reconstruct remaining paid probes from one durable fleet snapshot."""
+        if self._spot_placer is None:
+            return None
+        zero_cost = set(self._spot_placer.zero_cost_locations())
+        window = _paid_location_launch_window()
+        remaining = {
+            location: window
+            for location in self._spot_placer.active_locations()
+            if location not in zero_cost
+        }
+        for info in existing_replica_infos:
+            if info.status not in _PAID_LOCATION_UNRESOLVED_STATUSES:
+                continue
+            replica_location = info.get_spot_location()
+            if replica_location is None:
+                continue
+            location = self._spot_placer.resolve_location(replica_location)
+            if location not in remaining:
+                continue
+            remaining[location] = max(0, remaining[location] - 1)
+        logger.debug('Paid location launch budget: '
+                     f'window={window}, remaining={remaining}.')
+        return _PaidLocationLaunchBudget(remaining)
+
+    def _select_with_paid_location_budget(
+        self,
+        budget: _PaidLocationLaunchBudget,
+        *,
+        skip_zero_cost_preference: bool = False,
+        allowed_locations: set[spot_placer.Location] | None = None,
+    ) -> spot_placer.Location | None:
+        """Select cheapest eligible capacity without exceeding paid probes."""
+        assert self._spot_placer is not None
+        active = [
+            location for location in self._spot_placer.active_locations()
+            if allowed_locations is None or location in allowed_locations
+        ]
+        if not active:
+            # Preserve the placer's existing no-active-location error. Exact
+            # accelerator mismatches are rejected before this helper is called.
+            selection_kwargs: dict[str, Any] = {}
+            if skip_zero_cost_preference:
+                selection_kwargs['skip_zero_cost_preference'] = True
+            if allowed_locations is not None:
+                selection_kwargs['allowed_locations'] = set()
+            return self._spot_placer.select_next_location(**selection_kwargs)
+        zero_cost = set(self._spot_placer.zero_cost_locations())
+        active_paid = [
+            location for location in active if location not in zero_cost
+        ]
+        available_paid = {
+            location for location in active_paid
+            if budget.remaining_by_location.get(location, 0) > 0
+        }
+        if (skip_zero_cost_preference and active_paid and not available_paid):
+            # Paid capacity exists but is waiting for launch feedback. Do not
+            # turn cohort saturation into a fallback that exceeds a zero-cost
+            # broker grant.
+            return None
+        candidates = available_paid | {
+            location for location in active if location in zero_cost
+        }
+        if not candidates:
+            return None
+        return self._spot_placer.select_next_location(
+            skip_zero_cost_preference=skip_zero_cost_preference,
+            allowed_locations=candidates)
+
+    @staticmethod
+    def _debit_paid_location_launch_budget(
+            budget: _PaidLocationLaunchBudget | None,
+            location: spot_placer.Location | None) -> None:
+        """Debit a successfully persisted paid placement."""
+        if budget is None or location not in budget.remaining_by_location:
+            return
+        remaining = budget.remaining_by_location[location]
+        assert remaining > 0, (location, budget)
+        budget.remaining_by_location[location] = remaining - 1
 
     def _locations_for_accelerator_override(
         self,
@@ -3509,6 +3670,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         used_replica_ids: set[int],
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
+        paid_location_launch_budget: _PaidLocationLaunchBudget | None = None,
         logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
@@ -3545,6 +3707,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if zero_cost_demand_budget is not None:
                 launch_kwargs['zero_cost_demand_budget'] = (
                     zero_cost_demand_budget)
+            if paid_location_launch_budget is not None:
+                launch_kwargs['paid_location_launch_budget'] = (
+                    paid_location_launch_budget)
             if logical_reconcile_fence is not None:
                 launch_kwargs['logical_reconcile_fence'] = (
                     logical_reconcile_fence)
@@ -3644,6 +3809,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 existing_replica_infos,
                 resources_overrides,
                 capacity_replica_infos=capacity_replica_infos)
+        paid_location_launch_budget = None
+        if existing_replica_infos is not None:
+            paid_location_launch_budget = (
+                self._build_paid_location_launch_budget(existing_replica_infos))
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -3652,9 +3821,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
+            scale_up_kwargs: dict[str, Any] = {}
+            if paid_location_launch_budget is not None:
+                scale_up_kwargs['paid_location_launch_budget'] = (
+                    paid_location_launch_budget)
             self._scale_up_one_locked(resources_override, used_replica_ids,
                                       existing_replica_infos,
-                                      zero_cost_demand_budget)
+                                      zero_cost_demand_budget,
+                                      **scale_up_kwargs)
 
     @with_lock
     def scale_up_to_logical_capacity(
@@ -3867,6 +4041,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         max(0, card_target - committed_by_card.get(card, 0))
                         for card, card_target in card_targets.items())),
                 capacity_replica_infos=capacity_replica_infos)
+        paid_location_launch_budget = self._build_paid_location_launch_budget(
+            existing_replica_infos)
+        deferred_cards: set[str] = set()
         while True:
             if not self._logical_target_fence_holds(
                     version,
@@ -3882,13 +4059,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert current_snapshot is not None
             committed = _committed_capacity(current_snapshot)
             committed_by_card = _committed_by_card(current_snapshot)
-            selected_card = next(
-                (card for card, card_target in card_targets.items()
-                 if committed_by_card.get(card, 0) < card_target), None)
-            if committed >= target_capacity and selected_card is None:
+            selected_card = None
+            if card_targets:
+                selected_card = next(
+                    (card for card, card_target in card_targets.items()
+                     if card not in deferred_cards and
+                     committed_by_card.get(card, 0) < card_target), None)
+                if selected_card is None:
+                    break
+            elif committed >= target_capacity:
                 break
             before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
+            if paid_location_launch_budget is not None:
+                launch_kwargs['paid_location_launch_budget'] = (
+                    paid_location_launch_budget)
             if replace_unknown_replica_ids:
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
@@ -3914,6 +4099,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                           target_capacity)),
                 **launch_kwargs)
             if not launched or len(existing_replica_infos) == before:
+                if selected_card is not None:
+                    deferred_cards.add(selected_card)
+                    logger.info('Deferring logical exact-card target '
+                                f'{selected_card} after no placement progress; '
+                                'continuing with other card targets in this '
+                                'tick.')
+                    continue
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
