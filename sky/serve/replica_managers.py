@@ -130,7 +130,7 @@ _NOT_PROVIDED: Any = object()
 _REPLICA_URL_NOT_PROVIDED: Any = object()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _parse_paid_location_launch_window(raw_value: str | None) -> int:
     """Parse one distinct paid-location launch-window override."""
     if raw_value is None:
