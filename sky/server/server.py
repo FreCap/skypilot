@@ -87,6 +87,7 @@ from sky.users import permission
 from sky.users import rbac
 from sky.users import server as users_rest
 from sky.utils import admin_policy_utils
+from sky.utils import asyncio_utils
 from sky.utils import common as common_lib
 from sky.utils import common_utils
 from sky.utils import context
@@ -475,6 +476,18 @@ async def token(request: fastapi.Request,
         })
 
 
+@asyncio_utils.shield
+async def _restore_cancelled_auth_session_poll(
+        store: auth_sessions.AuthSessionStore,
+        poll_task: asyncio.Task[str | None], code_verifier: str) -> None:
+    """Restore a consumed token even if cancellation repeats."""
+    auth_token = await poll_task
+    if auth_token is not None:
+        code_challenge = common_utils.compute_code_challenge(code_verifier)
+        await asyncio.to_thread(store.restore_session, code_challenge,
+                                auth_token)
+
+
 async def _poll_auth_session(code_verifier: str) -> str | None:
     """Consume an auth session without losing it to caller cancellation."""
     store = auth_sessions.auth_session_store
@@ -484,12 +497,8 @@ async def _poll_auth_session(code_verifier: str) -> str | None:
         return await asyncio.shield(poll_task)
     except asyncio.CancelledError:
         try:
-            auth_token = await poll_task
-            if auth_token is not None:
-                code_challenge = common_utils.compute_code_challenge(
-                    code_verifier)
-                await asyncio.to_thread(store.restore_session, code_challenge,
-                                        auth_token)
+            await _restore_cancelled_auth_session_poll(store, poll_task,
+                                                       code_verifier)
         except Exception:  # pylint: disable=broad-except
             logger.exception('Failed to restore a cancelled auth session poll')
         raise
