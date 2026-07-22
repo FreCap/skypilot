@@ -67,6 +67,7 @@ request and infrastructure traces may be sensitive:
 serve-sim-<service>-<UTC timestamp>/
   provenance.json
   skyserve.json
+  duration.json
   requests.csv
   supply.csv
   scenarios.yaml
@@ -198,6 +199,13 @@ The SkyServe minute history does not contain duration, priority, queue wait, or
 retry lineage. Export a privacy-safe trace from the caller or request metrics
 system with this logical schema:
 
+The proposed SkyPilot-owned
+[per-card request duration history](serve-per-card-duration-history.md) was
+dropped because the model runtime already emits a more accurate completion-path
+distribution. Use that aggregate for service time, and retain the caller-side
+trace for priority, retry lineage, provider spill, and logical outcomes. Never
+join aggregate metric counts to request rows as if they were one-to-one.
+
 ```text
 arrival_ts,job_id_hash,retry_group_hash,priority,duration_seconds,
 terminal_outcome,provider,accelerator,workload_class
@@ -237,6 +245,43 @@ If only minute counts exist, generate at least three within-minute traces:
 - one instantaneous burst per minute.
 
 Report all three. Do not call the uniform result observed request timing.
+
+### Export model-handler duration by card
+
+For Boltz model deployments, use the existing Datadog distributions:
+
+```text
+boltz.prediction.duration  # milliseconds around handle_request
+boltz.prediction.count     # completed handler invocations
+```
+
+Filter both queries to the exact `env`, `service`, `boltz.model.name`,
+`boltz.workload`, `boltz.machine.type`, `boltz.gpu.type`, and
+`boltz.compute.provider` population. Use identical UTC bounds and completion
+guard bands for both metrics. Export the raw responses and a normalized
+`duration.json` with counts, sums, means, percentiles, query strings, bounds,
+release identity, unknown-dimension fractions, and checksums.
+
+Compute each whole-window mean as:
+
+```text
+sum(boltz.prediction.duration) / sum(boltz.prediction.count) / 1000
+```
+
+Do not average per-replica averages or percentile time-series points. When
+Datadog percentile indexing is enabled, query whole-window p50, p90, p95, and
+p99 by the same stable card and workload dimensions. Use the mean as the
+offered-arrival service-time estimate, and use percentiles only as sensitivity
+and tail-risk scenarios.
+
+Use an earlier interval for calibration and a later chronological interval for
+evaluation. Freeze every duration coefficient and policy candidate before the
+holdout replay. Record runtime releases that intersect either interval because
+the query intentionally excludes high-cardinality version and replica tags.
+
+Cross-check `boltz.prediction.count` against SkyServe and caller counts. It
+includes handler exceptions, excludes SkyServe rejections, and must never be
+added to the SkyServe arrival trace as independent demand.
 
 ### Export capacity and placement supply
 
@@ -545,6 +590,69 @@ Use the freshest 24 hours for rapid iteration only. Before choosing a policy:
 
 A candidate should not be selected if it wins only on the calibration window,
 only with uniform arrivals, or only with 100 percent launch success.
+
+### Production-observable policy check
+
+Before recommending an online policy, rerun it after replacing every
+request-level value unavailable to the controller with its deployable proxy.
+In particular, SkyServe does not know the sampled duration of a queued request
+or the remaining duration of an in-flight request. A paid-capacity gate may
+use queue depth, in-flight count, deduplicated offered arrivals, retained
+rejections, configured expected duration, ready and provisioning capacity,
+zero-cost attribution, and the configured startup estimate. It must not use
+future arrivals, exact queued runtimes, or exact residual runtimes.
+
+Treat queueing, recent rejection, or ready-capacity saturation as a fail-open
+signal for any speculative paid-launch guard. Recheck the candidate with 0,
+50, 80, and 100 percent of observed reserved capacity and with both nominal
+and degraded paid-launch success. A policy that saves cost only with the full
+research reserve is a service-specific configuration candidate, not a safe
+general autoscaler default.
+
+The 2026-07-22 `boltz-l4-fleet` replay is an example of why this check matters.
+Its 624-minute overlap contained 47,658 requests, a 166-slot observed research
+reserve, a 513-second median L4 request-to-ready startup, and a 199-second
+median billed warmup. The replay compared least-load dispatch, paid-first
+dispatch, aggregate paid-work gates, upstream queue signals, minimum paid
+capacity, and utilization targets. After removing unavailable request-runtime
+oracles:
+
+- a separate aggregate paid-work gate was effectively neutral at the existing
+  90 percent target once saturation fail-open behavior made it safe;
+- moving the service target from 90 to 95 percent produced nearly all of the
+  useful savings, about 15 percent fewer paid slot-hours with the full reserve,
+  zero rejections, and a 200-second maximum low-priority wait;
+- at 80 percent of the observed reserve, the 95 percent target kept maximum
+  wait below 274 seconds and spilled at most 110 of 47,658 requests in the
+  conservative 66 percent launch-success sensitivity;
+- an abrupt 50 percent reserve loss at the observed 640-request/minute peak,
+  combined with 558-second p95 or 618-second p99 L4 startup and 66 percent
+  launch success, kept low-priority wait below 353 seconds and injected
+  high-priority wait below 5 seconds. The queue drained, and no scale-down or
+  provisioning cancellation occurred while it was non-empty;
+- paid-first dispatch increased the utilization percentage but also increased
+  paid slot-hours because the slower paid L4 handled work that faster reserved
+  cards could have completed; and
+- no least-load policy reached 80 percent billed-startup-inclusive paid
+  utilization. The service should optimize paid slot-hours and queue/spill
+  bounds instead of gaming that ratio.
+
+The selected service-specific rollout therefore changes only the utilization
+target. It keeps the existing 20-second upscale observation, 20 percent
+one-minute normal ramp, adaptive pressure ramp, 300-second downscale delay,
+50 percent downscale cap, retained rejection pressure, reserved fill, and
+least-load dispatch. The Datadog duration distribution remains offline
+calibration input, never an online control dependency.
+
+Complete reserve loss is an accepted disaster mode rather than a 95-percent
+target regression. With paid startup near or above the 600-second low-priority
+patience, both the 90- and 95-percent policies spill thousands of requests,
+then drain the queue. Do not add an unbounded rule that forbids provisioning
+cancellation whenever any queue or retained rejection exists: after requests
+spill, that can ratchet obsolete paid launches indefinitely. A future churn
+test should instead detect cancellation followed by a replacement launch
+within one startup window. Fix confirmed non-disaster churn with a bounded
+cancellation cooldown or remaining-useful-work guard.
 
 ## Selection and rollout report
 

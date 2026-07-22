@@ -453,15 +453,18 @@ export function useClusterDetails({ cluster }) {
         }
         if (data.length > 0) {
           setClusterData(data[0]); // Assuming getClusters returns an array
-          return data[0]; // Return the data for use in fetchClusterJobData
+          return {
+            kind: 'found',
+            cluster: data[0],
+          };
         }
         console.error('No cluster data found for cluster:', cluster);
-        return null;
+        return { kind: 'missing' };
       } catch (error) {
         if (isCurrentRequest()) {
           console.error('Error fetching cluster data:', error);
         }
-        return null;
+        return { kind: 'error' };
       } finally {
         if (isCurrentRequest()) {
           setLoadingClusterData(false);
@@ -522,23 +525,27 @@ export function useClusterDetails({ cluster }) {
       // The jobs request cannot start until the cluster workspace is known, but
       // its loading state belongs to this request chain immediately.
       setLoadingClusterJobData(true);
-      const clusterInfo = await fetchClusterData(clusterRequestVersion);
+      const clusterRead = await fetchClusterData(clusterRequestVersion);
       if (clusterJobsRequestVersionRef.current !== clusterJobsRequestVersion) {
         return;
       }
-      if (clusterInfo) {
+      if (clusterRead?.kind === 'found') {
         if (invalidateJobs) {
           dashboardCache.invalidate(getClusterJobs, [
             {
               clusterName: cluster,
-              workspace: clusterInfo.workspace || 'default',
+              workspace: clusterRead.cluster.workspace || 'default',
             },
           ]);
         }
         await fetchClusterJobData(
-          clusterInfo.workspace,
+          clusterRead.cluster.workspace,
           clusterJobsRequestVersion
         );
+      } else if (clusterRead?.kind === 'missing') {
+        setClusterData(null);
+        setClusterJobData(null);
+        setLoadingClusterJobData(false);
       } else if (
         clusterJobsRequestVersionRef.current === clusterJobsRequestVersion
       ) {
