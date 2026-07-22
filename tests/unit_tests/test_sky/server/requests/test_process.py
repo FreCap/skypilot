@@ -117,6 +117,58 @@ def test_pool_executor():
         executor.shutdown()
 
 
+def test_pool_executor_releases_capacity_when_submit_fails(monkeypatch):
+    """A rejected task must not consume reusable-pool capacity."""
+    executor = PoolExecutor(max_workers=1)
+    original_submit = concurrent.futures.ProcessPoolExecutor.submit
+
+    def fail_submit(*_args, **_kwargs):
+        raise concurrent.futures.process.BrokenProcessPool('submit failed')
+
+    try:
+        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'submit',
+                            fail_submit)
+        with pytest.raises(concurrent.futures.process.BrokenProcessPool,
+                           match='submit failed'):
+            executor.submit(dummy_task)
+        assert executor.running.get() == 0
+        assert executor.has_idle_workers()
+
+        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'submit',
+                            original_submit)
+        assert executor.submit(dummy_task).result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_pool_executor_shutdown_is_idempotent():
+    """Repeated shutdown calls must remain safe."""
+    executor = PoolExecutor(max_workers=1)
+    executor.shutdown()
+    executor.shutdown()
+
+
+def test_pool_executor_forwards_cancel_futures(monkeypatch):
+    """The custom shutdown must preserve the standard cancellation option."""
+    executor = PoolExecutor(max_workers=1)
+    shutdown_calls = []
+    original_shutdown = concurrent.futures.ProcessPoolExecutor.shutdown
+
+    def record_shutdown(_executor, wait=True, *, cancel_futures=False):
+        shutdown_calls.append((wait, cancel_futures))
+
+    try:
+        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'shutdown',
+                            record_shutdown)
+        executor.shutdown(cancel_futures=True)
+    finally:
+        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'shutdown',
+                            original_shutdown)
+        executor.shutdown()
+
+    assert shutdown_calls == [(False, True)]
+
+
 def test_disposable_executor():
     """Test DisposableExecutor functionality."""
     executor = DisposableExecutor(max_workers=2)
