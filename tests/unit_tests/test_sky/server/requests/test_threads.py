@@ -22,6 +22,11 @@ def failing_task():
     raise ValueError('Task failed')
 
 
+def exiting_task():
+    """A task that exits its worker thread."""
+    raise SystemExit('Task exited')
+
+
 def blocking_task(release_event: threading.Event):
     """A task that blocks until release_event is set."""
     release_event.wait(timeout=5)
@@ -58,6 +63,21 @@ def test_on_demand_executor_exception_propagation():
         assert executor.running.get() == 0
     finally:
         executor.shutdown()
+
+
+def test_on_demand_executor_base_exception_completes_future():
+    executor = OnDemandThreadExecutor(name='test', max_workers=1)
+    try:
+        fut = executor.submit(exiting_task)
+        expected = 'task terminated with SystemExit: Task exited'
+        with pytest.raises(RuntimeError, match=expected) as exc_info:
+            fut.result(timeout=5)
+    finally:
+        executor.shutdown()
+
+    assert isinstance(exc_info.value.__cause__, SystemExit)
+    assert executor.running.get() == 0
+    assert not executor._threads
 
 
 def test_on_demand_executor_concurrency_limit():
