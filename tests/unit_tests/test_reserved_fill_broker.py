@@ -144,6 +144,36 @@ class TestEntitlements:
         claims = {'a': _claim(floor=10), 'b': _claim()}
         assert broker.compute_entitlements(20, claims) == {'a': 15, 'b': 5}
 
+    def test_floor_holder_lends_remainder_to_preferred_borrowers(self):
+        # Production policy: Boltz keeps ten warm reserved slots while the
+        # equal-priority preferred borrowers split the realistic-size
+        # remainder. Boltz keeps a positive fallback weight so the pool stays
+        # work-conserving when the borrowers cannot materialize their shares.
+        claims = {
+            'boltz': _claim(floor=10, weight=100),
+            'opendde': _claim(weight=1_000_000),
+            'protenix': _claim(weight=1_000_000),
+        }
+        assert broker.compute_entitlements(100, claims) == {
+            'boltz': 10,
+            'opendde': 45,
+            'protenix': 45,
+        }
+
+        claims['opendde'] = _claim(weight=1_000_000, effective_cap=30)
+        assert broker.compute_entitlements(100, claims) == {
+            'boltz': 10,
+            'opendde': 30,
+            'protenix': 60,
+        }
+
+        claims['protenix'] = _claim(weight=1_000_000, effective_cap=20)
+        assert broker.compute_entitlements(100, claims) == {
+            'boltz': 50,
+            'opendde': 30,
+            'protenix': 20,
+        }
+
     def test_floors_over_capacity_scaled_proportionally(self):
         claims = {'a': _claim(floor=10), 'b': _claim(floor=30)}
         assert broker.compute_entitlements(20, claims) == {'a': 5, 'b': 15}

@@ -1208,6 +1208,81 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(len(scale_downs), 2)
         self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
+    def test_logical_rolling_update_uses_old_exact_card_evidence(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      min_replicas=1,
+                                      max_replicas=64,
+                                      replica_unit='logical',
+                                      reserved_capacity_fill=True)
+        catalog = {
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.set_configured_accelerator_shapes(catalog)
+        now = time.time()
+        old = [_replica(i, card='L4', version=1) for i in range(1, 58)]
+        for info in old:
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+        in_flight = {info.replica_id: 1 for info in old}
+        observed_slots = {info.replica_id: 1 for info in old}
+        _report(autoscaler,
+                in_flight=in_flight,
+                observed_slots=observed_slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, old), [])
+        self.assertEqual(autoscaler.target_num_replicas, 57)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 57})
+
+        autoscaler.update_version_and_accelerator_shapes(
+            2,
+            _spec(knob=1,
+                  min_replicas=1,
+                  max_replicas=64,
+                  replica_unit='logical',
+                  reserved_capacity_fill=True), serve_utils.UpdateMode.ROLLING,
+            catalog)
+        reserved_keys = [{
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                card: 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        } for card in ('A100', 'A100-80GB')]
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 7})
+        for _ in range(2):
+            autoscaler.collect_reserved_capacity(7, reserved_keys, now, grant=7)
+        _report(autoscaler,
+                in_flight=in_flight,
+                observed_slots=observed_slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, old, active_versions=(1,))
+
+        self.assertEqual(_scale_downs(decisions), [])
+        scale_ups = _scale_ups(decisions)
+        self.assertEqual(len(scale_ups), 1)
+        self.assertEqual(
+            scale_ups[0].target,
+            autoscalers.LogicalScaleTarget(
+                version=2,
+                reconcile_generation=2,
+                target_capacity=57,
+                target_capacity_by_accelerator=(('L4', 57),),
+                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
+        self.assertEqual(autoscaler.info()['fill_target'], 7)
+
     def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
         autoscaler = _make_autoscaler(max_replicas=20,
                                       reserved_capacity_fill=True)

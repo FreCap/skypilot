@@ -5817,7 +5817,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         if self.replica_unit == 'logical':
             return self._generate_logical_scaling_decisions(
-                latest_nonterminal_replicas)
+                replica_infos, latest_nonterminal_replicas)
 
         scaling_decisions: list[AutoscalerDecision] = []
         self.cold_launch_authority_by_accelerator = {}
@@ -5953,13 +5953,21 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _generate_logical_scaling_decisions(
         self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
         latest_nonterminal_replicas: list['replica_managers.ReplicaInfo'],
     ) -> list[AutoscalerDecision]:
-        """Generate one shaped scale target or capacity-safe retirements."""
+        """Generate one shaped scale target or capacity-safe retirements.
+
+        Exact-card revalidation needs the complete active fleet so running
+        work on an old version remains attributable during a rolling update.
+        Committed and ready capacity below stays latest-version-only: old
+        replicas prove the transition shape but never satisfy its launch
+        target.
+        """
         target = self.get_final_target_num_replicas()
         self.cold_launch_authority_by_accelerator = {}
         target_by_card, use_card_targets = (
-            self._actuation_target_by_accelerator(latest_nonterminal_replicas))
+            self._actuation_target_by_accelerator(replica_infos))
         if self.configured_accelerator_shapes and not use_card_targets:
             logger.info('Logical concurrency exact-card target is incomplete; '
                         'suppressing card-blind scaling decisions.')
