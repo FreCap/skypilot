@@ -113,7 +113,15 @@ spec:
         imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCopyWorker.imagePullPolicy }}
         command: ["tini", "--", "python", "-m", "sky.container_images.copy_worker_service"]
         env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageCopyWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.imageCopyWorker.extraEnvs }}
@@ -137,6 +145,8 @@ spec:
           value: {{ .Values.imageCopyWorker.healthPort | quote }}
         - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
           value: {{ .Values.imageCopyWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
         - name: SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST
           value: {{ toJson .Values.imageCopyWorker.sourceCredentialSecrets | quote }}
         {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
@@ -193,6 +203,9 @@ spec:
           mountPath: /var/skypilot/image-qualification
           readOnly: true
         {{- end }}
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
       - name: skypilot-config
         configMap:
@@ -201,6 +214,9 @@ spec:
       - name: qualification-manifests
         configMap:
           name: {{ .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+      {{- end }}
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
       {{- with .Values.imageCopyWorker.nodeSelector }}
       nodeSelector:
@@ -277,7 +293,15 @@ spec:
         imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageLifecycleWorker.imagePullPolicy }}
         command: ["tini", "--", "python", "-m", "sky.container_images.lifecycle_worker_service"]
         env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageLifecycleWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.imageLifecycleWorker.extraEnvs }}
@@ -303,6 +327,8 @@ spec:
           value: {{ .Values.imageLifecycleWorker.livenessDeadlineSeconds | quote }}
         - name: SKYPILOT_IMAGE_RETENTION_SECONDS
           value: {{ .Values.imageLifecycleWorker.retentionSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
         {{- if .Values.apiService.dbConnectionSecretName }}
         - name: SKYPILOT_DB_CONNECTION_URI
           valueFrom:
@@ -348,10 +374,16 @@ spec:
         - name: skypilot-config
           mountPath: /var/skypilot/config
           readOnly: true
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
       {{- with .Values.imageLifecycleWorker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -427,7 +459,15 @@ spec:
         imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCanaryWorker.imagePullPolicy }}
         command: ["tini", "--", "python", "-m", "sky.container_images.canary_worker_service"]
         env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageCanaryWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.imageCanaryWorker.extraEnvs }}
@@ -451,6 +491,8 @@ spec:
           value: {{ .Values.imageCanaryWorker.healthPort | quote }}
         - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
           value: {{ .Values.imageCanaryWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
         {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
         - name: KUBECONFIG
           value: /var/skypilot/kubeconfig/config
@@ -505,6 +547,9 @@ spec:
           mountPath: /var/skypilot/kubeconfig
           readOnly: true
         {{- end }}
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
       - name: skypilot-config
         configMap:
@@ -513,6 +558,9 @@ spec:
       - name: kubeconfig
         secret:
           secretName: {{ .Values.imageCanaryWorker.kubeconfigSecretName }}
+      {{- end }}
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
       {{- with .Values.imageCanaryWorker.nodeSelector }}
       nodeSelector:

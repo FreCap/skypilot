@@ -5630,6 +5630,43 @@ def test_migration_job_rejects_nonempty_predecessor_below_023_without_ddl(
                 f'DROP SCHEMA IF EXISTS {unsafe_schema} CASCADE')
 
 
+@pytest.mark.parametrize('ddl', [
+    'CREATE VIEW orphan_view AS SELECT 1 AS value',
+    'CREATE MATERIALIZED VIEW orphan_materialized_view AS SELECT 1 AS value',
+    'CREATE SEQUENCE orphan_sequence',
+    "CREATE TYPE orphan_status AS ENUM ('ready')",
+    ('CREATE FUNCTION orphan_function() RETURNS integer '
+     'LANGUAGE SQL AS $$ SELECT 1 $$'),
+])
+def test_migration_job_rejects_every_schema_owned_object_before_ddl(
+        postgres_engine, ddl: str) -> None:
+    unsafe_schema = f'image_migration_object_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {unsafe_schema}')
+    unsafe_engine = _schema_engine(postgres_engine, unsafe_schema)
+    try:
+        with unsafe_engine.begin() as connection:
+            connection.exec_driver_sql(ddl)
+
+        with pytest.raises(RuntimeError,
+                           match='staged upgrade through revision'):
+            migration_utils.safe_alembic_upgrade(
+                unsafe_engine,
+                migration_utils.GLOBAL_USER_STATE_DB_NAME,
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+                mode='upgrade')
+
+        inspector = sqlalchemy.inspect(unsafe_engine)
+        assert not inspector.has_table('alembic_version_state_db')
+        assert not inspector.has_table('container_image_catalog')
+        assert not inspector.has_table('auth_sessions')
+    finally:
+        unsafe_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {unsafe_schema} CASCADE')
+
+
 def test_migration_job_allows_genuinely_empty_database_to_upgrade_directly(
         postgres_engine) -> None:
     fresh_schema = f'image_migration_fresh_{uuid.uuid4().hex}'

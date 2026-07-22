@@ -264,6 +264,18 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Environment and files required by every central PostgreSQL client. Use these
+# for private CA bundles, client certificates, or shared libpq settings instead
+# of apiService.extra* so the migration Job and managed image workers receive
+# the same connection material without receiving unrelated API-only volumes.
+databaseConnection:
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
 # API replicas verify the resulting revision and never execute deployment DDL.
 # The Job is a regular Helm resource, so chart-managed database Secrets exist

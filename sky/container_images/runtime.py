@@ -44,6 +44,8 @@ class _MetadataResolution:
     """Provider-free eligibility result cached during optimization."""
     resources: resources_lib.Resources
     direct: bool
+    managed_resources: resources_lib.Resources | None = None
+    direct_fallback_resources: resources_lib.Resources | None = None
     profile: models.ManagedRegistryProfile | None = None
     policy: models.WorkspaceImagePolicy | None = None
     active: topology_state.ProfileRevisionRecord | None = None
@@ -455,14 +457,25 @@ def _resolve_metadata(
                                         target=target,
                                         location=location)):
         raise ValueError('IMAGE_DEMAND_TARGET_MISMATCH')
+    managed_ready = (location is not None and
+                     location.state == models.ImageLocationState.READY)
+    direct_fallback = (_direct_fallback_allowed(policy, image) and
+                       current_demand is None)
+    eligible_resources = prepared
     locality_rank = 0
-    if (policy.locality == models.Locality.PREFER and current_demand is None and
-        (location is None or
-         location.state != models.ImageLocationState.READY)):
+    if direct_fallback and not managed_ready:
+        # Keep the executable direct candidate byte-for-byte identical. The
+        # qualified AMI belongs only to a READY managed route.
+        eligible_resources = resources
+        locality_rank = 1
+    elif (policy.locality == models.Locality.PREFER and
+          current_demand is None and not managed_ready):
         locality_rank = 2
     return _MetadataResolution(
-        resources=prepared,
+        resources=eligible_resources,
         direct=False,
+        managed_resources=prepared,
+        direct_fallback_resources=(resources if direct_fallback else None),
         profile=profile,
         policy=policy,
         active=active,
@@ -567,6 +580,8 @@ def resolve_for_placement(resources: resources_lib.Resources,
     with consumers.use(consumer):
         metadata = _resolve_metadata(resources, placement, workspace)
     resources = metadata.resources
+    managed_resources = metadata.managed_resources or resources
+    direct_fallback_resources = metadata.direct_fallback_resources
     if metadata.direct:
         return resources
     assert image is not None
@@ -578,7 +593,6 @@ def resolve_for_placement(resources: resources_lib.Resources,
     assert metadata.target is not None
     assert metadata.binding is not None
     profile = metadata.profile
-    policy = metadata.policy
     active = metadata.active
     artifact = metadata.artifact
     publication = metadata.publication
@@ -593,8 +607,12 @@ def resolve_for_placement(resources: resources_lib.Resources,
         if not ensure:
             return resources
         if target is profile.canonical:
+            if direct_fallback_resources is not None:
+                return direct_fallback_resources
             raise ValueError('ARTIFACT_NOT_READY')
         if publication.canonical_location_id is None:
+            if direct_fallback_resources is not None:
+                return direct_fallback_resources
             raise ValueError('ARTIFACT_NOT_READY')
         location = transactions.reserve_regional_location(
             image_id=artifact.id,
@@ -610,11 +628,9 @@ def resolve_for_placement(resources: resources_lib.Resources,
     location = _readmit_location_for_demand(location,
                                             workspace,
                                             retry_failed=is_new_demand)
-    if (policy.mode == models.WorkspaceImageMode.MANAGED_PREFERRED and
-            policy.locality == models.Locality.PREFER and
-            image.ref is not None and metadata.current_demand is None and
+    if (direct_fallback_resources is not None and
             location.state != models.ImageLocationState.READY):
-        return resources
+        return direct_fallback_resources
     authority_id = catalog_state.get_catalog_authority_id(create=False)
     if authority_id is None:
         raise ValueError('CATALOG_AUTHORITY_UNAVAILABLE')
@@ -673,9 +689,17 @@ def resolve_for_placement(resources: resources_lib.Resources,
             pull_plan=pull_plan)
     except transactions.DemandLocationNotReadyError as e:
         # The metadata snapshot predates demand creation. An eviction can win
-        # the location lock in between; the durable demand then requeues that
-        # location, so this attempt remains warming rather than a generic
-        # resolution failure.
+        # the location lock in between. Managed-preferred terminalizes the new
+        # demand before using its original direct path; strict managed demand
+        # remains warming so the durable worker can requeue the location.
+        if direct_fallback_resources is not None:
+            if e.state in (models.ImageLocationState.FAILED,
+                           models.ImageLocationState.QUARANTINED):
+                demand_state.fail_and_supersede_demand(
+                    demand.id, e.error_code or 'IMAGE_PREPARATION_FAILED')
+            else:
+                demand_state.supersede_demand(demand.id, workspace)
+            return direct_fallback_resources
         if e.state in (models.ImageLocationState.FAILED,
                        models.ImageLocationState.QUARANTINED):
             demand_state.fail_and_supersede_demand(
@@ -703,6 +727,6 @@ def resolve_for_placement(resources: resources_lib.Resources,
         runtime_principal=runtime_principal,
         instance_profile=instance_profile,
         kubernetes_node_selector=kubernetes_node_selector)
-    return resources.copy(_resolved_container_image=resolved,
-                          _docker_login_config=_managed_login(
-                              target, placement))
+    return managed_resources.copy(_resolved_container_image=resolved,
+                                  _docker_login_config=_managed_login(
+                                      target, placement))

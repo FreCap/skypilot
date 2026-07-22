@@ -482,6 +482,162 @@ def test_managed_preferred_stale_route_preserves_direct_digest_path(
     assert result.resolved_container_image is None
 
 
+def test_managed_preferred_warming_route_preserves_original_aws_candidate(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    warming = _location(profile, models.ImageLocationState.PENDING)
+    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        lambda **_kwargs: warming)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+    placement = models.Placement(provider='aws',
+                                 region='us-west-2',
+                                 backend='aws_vm',
+                                 platform='linux/amd64')
+
+    metadata = runtime._resolve_metadata(resources, placement, 'research')
+
+    assert metadata.resources is resources
+    assert metadata.locality_rank == 1
+    assert metadata.direct_fallback_resources is resources
+    assert metadata.managed_resources is not None
+    assert metadata.managed_resources is not resources
+    assert metadata.managed_resources.image_id == {
+        'us-west-2': 'ami-0fedcba9876543210'
+    }
+
+    resolved = runtime.resolve_for_placement(resources,
+                                             placement,
+                                             workspace='research',
+                                             consumer_kind='cluster',
+                                             consumer_owner='cluster',
+                                             controller_epoch='cluster:request',
+                                             controller_sequence=None,
+                                             allow_epoch_advance=False)
+    assert resolved is resources
+    assert resolved.image_id is None
+    assert resolved.resolved_container_image is None
+
+
+def test_managed_preferred_readmitted_ready_route_applies_qualified_ami(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    missing = _location(profile, models.ImageLocationState.MISSING)
+    ready = dataclasses.replace(missing,
+                                state=models.ImageLocationState.READY,
+                                last_verified_at=1000)
+    demand = _demand(profile)
+    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        lambda **_kwargs: missing)
+    monkeypatch.setattr(runtime.topology_state, 'retry_location',
+                        lambda _location_id, _workspace: ready)
+    monkeypatch.setattr(runtime.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: _AUTHORITY_ID)
+    monkeypatch.setattr(runtime.transactions,
+                        'create_warming_demand_for_controller_epoch',
+                        lambda **_kwargs: demand)
+    monkeypatch.setattr(
+        runtime.transactions, 'commit_ready_demand', lambda **kwargs:
+        dataclasses.replace(demand,
+                            state=models.ImageDemandState.READY,
+                            pull_plan=kwargs['pull_plan']))
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+
+    resolved = runtime.resolve_for_placement(resources,
+                                             models.Placement(
+                                                 provider='aws',
+                                                 region='us-west-2',
+                                                 backend='aws_vm',
+                                                 platform='linux/amd64'),
+                                             workspace='research',
+                                             consumer_kind='cluster',
+                                             consumer_owner='cluster',
+                                             controller_epoch='cluster:request',
+                                             controller_sequence=None,
+                                             allow_epoch_advance=False)
+
+    assert resolved is not resources
+    assert resolved.image_id == {'us-west-2': 'ami-0fedcba9876543210'}
+    assert resolved.resolved_container_image is not None
+    assert resolved.resolved_container_image.reference == ready.target_ref
+
+
+@pytest.mark.parametrize('changed_state', [
+    models.ImageLocationState.EVICTING,
+    models.ImageLocationState.FAILED,
+])
+def test_managed_preferred_locked_readiness_loss_returns_direct_resources(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        changed_state: models.ImageLocationState) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    location = _location(profile, models.ImageLocationState.READY)
+    demand = _demand(profile)
+    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        lambda **_kwargs: location)
+    monkeypatch.setattr(runtime.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: _AUTHORITY_ID)
+    monkeypatch.setattr(runtime.transactions,
+                        'create_warming_demand_for_controller_epoch',
+                        lambda **_kwargs: demand)
+    monkeypatch.setattr(
+        runtime.transactions, 'commit_ready_demand',
+        mock.Mock(side_effect=transactions.DemandLocationNotReadyError(
+            changed_state, 'materialization_failed')))
+    supersede = mock.Mock(return_value=True)
+    fail = mock.Mock(return_value=True)
+    monkeypatch.setattr(runtime.demand_state, 'supersede_demand', supersede)
+    monkeypatch.setattr(runtime.demand_state, 'fail_and_supersede_demand', fail)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+
+    resolved = runtime.resolve_for_placement(resources,
+                                             models.Placement(
+                                                 provider='aws',
+                                                 region='us-west-2',
+                                                 backend='aws_vm',
+                                                 platform='linux/amd64'),
+                                             workspace='research',
+                                             consumer_kind='cluster',
+                                             consumer_owner='cluster',
+                                             controller_epoch='cluster:request',
+                                             controller_sequence=None,
+                                             allow_epoch_advance=False)
+
+    assert resolved is resources
+    if changed_state == models.ImageLocationState.FAILED:
+        fail.assert_called_once_with(demand.id, 'materialization_failed')
+        supersede.assert_not_called()
+    else:
+        supersede.assert_called_once_with(demand.id, 'research')
+        fail.assert_not_called()
+
+
 @pytest.mark.parametrize('provider', ['gcp', 'nebius', 'kubernetes', 'ssh'])
 def test_unsupported_runtime_keeps_exact_ref_direct_before_managed_policy(
         monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
@@ -656,6 +812,30 @@ def test_exact_host_image_mismatch_is_rejected_before_demand_mutation(
                          platform='linux/amd64',
                          host_image_id='ami-unqualified'), 'research') is None
     mutate.assert_not_called()
+
+
+def test_ordinary_resources_bypass_image_resolution_before_cloud_access(
+) -> None:
+
+    class OrdinaryResources:
+        container_image = None
+
+        @property
+        def cloud(self) -> Any:
+            raise AssertionError('ordinary resource cloud was accessed')
+
+    resources = OrdinaryResources()
+
+    resolved = cloud_vm_ray_backend._resolve_container_image_for_placement(
+        resources,  # type: ignore[arg-type]
+        consumer_kind='cluster',
+        consumer_owner='ordinary-cluster',
+        controller_epoch='cluster:request',
+        controller_sequence=None,
+        allow_epoch_advance=False,
+        consumer_metadata={})
+
+    assert resolved is resources
 
 
 def test_one_thousand_service_replicas_share_one_version_target_owner(

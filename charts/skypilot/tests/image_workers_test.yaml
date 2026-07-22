@@ -1,0 +1,186 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: image_workers_test
+templates:
+  - templates/image-workers.yaml
+tests:
+  - it: should verify migrations and mount shared database connection material
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      databaseConnection.extraVolumes:
+        - name: db-ca
+          secret:
+            secretName: db-ca
+      databaseConnection.extraVolumeMounts:
+        - name: db-ca
+          mountPath: /etc/db
+          readOnly: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - isKind:
+          of: Deployment
+        documentIndex: 0
+      - isKind:
+          of: Deployment
+        documentIndex: 1
+      - isKind:
+          of: Deployment
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: db-ca
+            mountPath: /etc/db
+            readOnly: true
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: db-ca
+            mountPath: /etc/db
+            readOnly: true
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: db-ca
+            mountPath: /etc/db
+            readOnly: true
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: db-ca
+            secret:
+              secretName: db-ca
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: db-ca
+            secret:
+              secretName: db-ca
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: db-ca
+            secret:
+              secretName: db-ca
+        documentIndex: 2
+
+  - it: should use auto migration ownership only when the migration job is disabled
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.enabled: false
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: auto
+
+  - it: should reject a shared database migration ownership override
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: auto
+    asserts:
+      - failedTemplate:
+          errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject a copy worker migration ownership override
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      imageCopyWorker.extraEnvs:
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: auto
+    asserts:
+      - failedTemplate:
+          errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject a lifecycle worker migration ownership override
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+      imageLifecycleWorker.extraEnvs:
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: auto
+    asserts:
+      - failedTemplate:
+          errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject a canary worker migration ownership override
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+      imageCanaryWorker.extraEnvs:
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: auto
+    asserts:
+      - failedTemplate:
+          errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"

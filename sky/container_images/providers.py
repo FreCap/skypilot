@@ -403,18 +403,17 @@ class RegistryV2Source:
         return self.read_manifest(self.digest, max_bytes=max_bytes)
 
     def read_blob(self, descriptor: oci.OciDescriptor) -> Iterable[bytes]:
-        response = self._request('GET',
-                                 self._url(f'blobs/{descriptor.digest}'),
-                                 stream=True,
-                                 allow_blob_redirect=True)
 
         def chunks() -> Iterator[bytes]:
+            response = self._request('GET',
+                                     self._url(f'blobs/{descriptor.digest}'),
+                                     stream=True,
+                                     allow_blob_redirect=True)
             try:
-                for chunk in iter_fenced_response_chunks(
-                        response,
-                        chunk_size=1024 * 1024,
-                        provider_fence=self._provider_fence):
-                    yield chunk
+                yield from iter_fenced_response_chunks(
+                    response,
+                    chunk_size=1024 * 1024,
+                    provider_fence=self._provider_fence)
             finally:
                 response.close()
 

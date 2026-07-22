@@ -967,15 +967,14 @@ class EcrRepository:
         return download
 
     def read_blob(self, descriptor: oci.OciDescriptor) -> Iterable[bytes]:
-        download = self._download_response(descriptor.digest)
 
         def chunks() -> Iterator[bytes]:
+            download = self._download_response(descriptor.digest)
             try:
-                for chunk in providers.iter_fenced_response_chunks(
-                        download,
-                        chunk_size=1024 * 1024,
-                        provider_fence=self._provider_fence):
-                    yield chunk
+                yield from providers.iter_fenced_response_chunks(
+                    download,
+                    chunk_size=1024 * 1024,
+                    provider_fence=self._provider_fence)
             finally:
                 download.close()
 

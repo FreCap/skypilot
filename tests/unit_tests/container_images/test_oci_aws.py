@@ -16,6 +16,7 @@ import pytest
 from sky.container_images import aws
 from sky.container_images import models
 from sky.container_images import oci
+from sky.container_images import providers
 
 _MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json'
 _INDEX_MEDIA_TYPE = 'application/vnd.oci.image.index.v1+json'
@@ -528,6 +529,59 @@ def test_upload_failure_explicitly_closes_acquired_source_stream() -> None:
             descriptor, lambda: chunks, threading.Event())
 
     assert chunks.closed
+
+
+def test_upload_initiation_failure_never_opens_registry_source_response(
+) -> None:
+    payload = b'payload'
+    descriptor = oci.OciDescriptor(
+        media_type='application/octet-stream',
+        digest=f'sha256:{hashlib.sha256(payload).hexdigest()}',
+        size=len(payload))
+    source = providers.RegistryV2Source(
+        f'registry.example/repository/image@{descriptor.digest}', lambda: None)
+    request = mock.Mock(side_effect=AssertionError('source response opened'))
+    destination_client = mock.Mock()
+    destination_client.initiate_layer_upload.side_effect = _AwsError(
+        'AccessDeniedException')
+    destination = aws.EcrRepository(destination_client, 'skypilot/images/shard')
+    destination._layers_present = (  # pylint: disable=protected-access
+        lambda _digests: {
+            descriptor.digest: False
+        })
+
+    with mock.patch.object(source, '_request', request), pytest.raises(
+            _AwsError, match='AccessDeniedException'):
+        destination._upload_layer(  # pylint: disable=protected-access
+            descriptor, lambda: source.read_blob(descriptor), threading.Event())
+
+    request.assert_not_called()
+
+
+def test_upload_initiation_failure_never_opens_ecr_source_response() -> None:
+    payload = b'payload'
+    descriptor = oci.OciDescriptor(
+        media_type='application/octet-stream',
+        digest=f'sha256:{hashlib.sha256(payload).hexdigest()}',
+        size=len(payload))
+    source = aws.EcrRepository(mock.Mock(), 'source/repository')
+    download = mock.Mock(side_effect=AssertionError('source response opened'))
+    destination_client = mock.Mock()
+    destination_client.initiate_layer_upload.side_effect = _AwsError(
+        'AccessDeniedException')
+    destination = aws.EcrRepository(destination_client, 'skypilot/images/shard')
+    destination._layers_present = (  # pylint: disable=protected-access
+        lambda _digests: {
+            descriptor.digest: False
+        })
+
+    with mock.patch.object(source, '_download_response',
+                           download), pytest.raises(
+                               _AwsError, match='AccessDeniedException'):
+        destination._upload_layer(  # pylint: disable=protected-access
+            descriptor, lambda: source.read_blob(descriptor), threading.Event())
+
+    download.assert_not_called()
 
 
 @pytest.mark.parametrize('error', [

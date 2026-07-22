@@ -201,8 +201,7 @@ def _validate_global_user_state_upgrade_start(
     if (current_revision is not None and int(current_revision)
             >= int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
         return
-    table_names = sqlalchemy.inspect(engine).get_table_names()
-    if current_revision is None and not table_names:
+    if current_revision is None and _postgres_effective_schema_is_empty(engine):
         return
     observed = current_revision or 'uninitialized nonempty schema'
     raise RuntimeError(
@@ -211,6 +210,65 @@ def _validate_global_user_state_upgrade_start(
         f'{GLOBAL_USER_STATE_JOB_MINIMUM_REVISION} before the migration job can '
         'run. Drain older API binaries, complete that predecessor migration, '
         'then retry the job.')
+
+
+def _postgres_effective_schema_is_empty(
+        engine: sqlalchemy.engine.Engine) -> bool:
+    """Proves the connection's target schema owns no user objects."""
+    query = sqlalchemy.text("""
+        WITH target AS (
+            SELECT oid
+            FROM pg_catalog.pg_namespace
+            WHERE nspname = current_schema()
+        ), owned_object AS (
+            SELECT 1 FROM pg_catalog.pg_class, target
+            WHERE relnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_type, target
+            WHERE typnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_proc, target
+            WHERE pronamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_operator, target
+            WHERE oprnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_collation, target
+            WHERE collnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_conversion, target
+            WHERE connamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opclass, target
+            WHERE opcnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opfamily, target
+            WHERE opfnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_config, target
+            WHERE cfgnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_dict, target
+            WHERE dictnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_parser, target
+            WHERE prsnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_template, target
+            WHERE tmplnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_statistic_ext, target
+            WHERE stxnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_extension, target
+            WHERE extnamespace = target.oid
+        )
+        SELECT current_schema(), EXISTS (SELECT 1 FROM owned_object)
+    """)
+    with engine.connect() as connection:
+        schema_name, has_objects = connection.execute(query).one()
+    # A search path with no valid target schema is not a provably empty target.
+    return schema_name is not None and not bool(has_objects)
 
 
 def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,

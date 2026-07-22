@@ -163,6 +163,8 @@ def _resolve_container_image_for_placement(
     ensure: bool = True,
 ) -> resources_lib.Resources:
     """Pins a managed image after optimization and before provisioning."""
+    if resources.container_image is None:
+        return resources
     cloud = resources.cloud
     assert cloud is not None, resources
     assert resources.region is not None, resources

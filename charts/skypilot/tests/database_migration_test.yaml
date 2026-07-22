@@ -125,6 +125,39 @@ tests:
             secret:
               secretName: db-ca
 
+  - it: should receive shared database connection settings
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      databaseConnection.extraVolumes:
+        - name: shared-db-ca
+          secret:
+            secretName: shared-db-ca
+      databaseConnection.extraVolumeMounts:
+        - name: shared-db-ca
+          mountPath: /etc/shared-db
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: shared-db-ca
+            mountPath: /etc/shared-db
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: shared-db-ca
+            secret:
+              secretName: shared-db-ca
+
   - it: should be absent without an external database
     asserts:
       - hasDocuments:

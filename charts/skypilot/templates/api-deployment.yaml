@@ -118,13 +118,16 @@ spec:
         {{- /* Detect whether POD_IP is already declared in extraEnvs (e.g. */ -}}
         {{- /* injected by a downstream chart) so we don't emit duplicates. */ -}}
         {{- $podIpInExtraEnvs := false }}
-        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
         {{- if eq .name "POD_IP" }}{{- $podIpInExtraEnvs = true }}{{- end }}
         {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
         {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
         {{- end }}
         {{- end }}
         {{- with $.Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.apiService.extraEnvs }}
@@ -554,6 +557,9 @@ spec:
           mountPath: /etc/skypilot/serve-auth/lb-data-plane
           readOnly: true
         {{- end }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- if .Values.apiService.extraVolumeMounts }}
         {{- toYaml .Values.apiService.extraVolumeMounts | nindent 8 }}
@@ -1004,6 +1010,9 @@ spec:
               - key: {{ $lbDataPlaneKey | quote }}
                 path: tokens
       {{- end }}
+      {{- end }}
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
       {{- if .Values.apiService.extraVolumes }}
       {{- toYaml .Values.apiService.extraVolumes | nindent 6 }}

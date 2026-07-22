@@ -319,6 +319,10 @@ may restrict `allowed_profiles` and choose:
   a known artifact location warms; or
 - `direct` or absence of image policy: preserve direct behavior.
 
+Resources without `container_image` bypass this subsystem before cloud or
+Kubernetes classification. Enabling the code therefore cannot add an image
+precondition to an ordinary launch or dry run.
+
 Locality is `prefer`, `require`, or `canonical` only for managed selection. On a
 placement with a supported managed runtime binding, `distribution: direct` is
 allowed under `direct` or `managed_preferred`, never under `managed_required`.
@@ -332,6 +336,16 @@ In a `direct` workspace these unsupported candidates keep the ordinary direct
 locality rank, so enabling this code does not bias a multicloud optimization
 toward AWS. Under a managed policy they form the direct fallback class behind a
 READY qualified managed route.
+An AWS `managed_preferred` candidate whose managed location is not READY joins
+that same direct fallback class. Its optimizer candidate and eventual direct
+launch retain the exact original resources, including the original host-image
+selection. The qualified AMI and runtime binding are applied only if the
+managed location is READY by the final locked resolution. A direct GCP or
+generic-Kubernetes alternative therefore does not incorrectly eliminate an
+equally executable AWS direct fallback, and a warming managed attempt cannot
+mutate the host AMI of the direct path. If readiness is lost while the final
+pull plan is being committed, the new managed demand is superseded and that
+same launch resumes with the original direct resources.
 Kubernetes is classified as managed EKS only when its exact selected context is
 declared by an active EKS binding and that binding qualifies the cluster ARN,
 node role, namespace, and node selector. A Kubernetes placement is never
@@ -558,8 +572,11 @@ An ECR destination claim executes this fenced algorithm:
    read-only. The exact durable lease is re-proved before and after credential
    resolution and every HTTP request, immediately before advancing each streamed
    response iterator, and immediately after that blocking advance returns. A
-   source stream is acquired only after the final destination-exists check and is
-   explicitly closed on every early return and exception. Lease loss closes the
+   source stream is acquired lazily on its first iterator advance, only after
+   the final destination-exists check and destination upload initiation, and is
+   explicitly closed on every early return and exception. Closing a stream that
+   was never advanced has no response to release; the implementation never
+   relies on generator finalization to own an eagerly opened response. Lease loss closes the
    response immediately; destination authority cannot be acquired after that
    source work loses its lease. The terminal `StopIteration` advance is fenced
    after it returns too, before completed source bytes can drive a destination
@@ -764,8 +781,10 @@ cannot publish a pull plan after supersession.
 
 With `managed_preferred` plus `locality: prefer`, the exact request-supplied
 digest can be used immediately if its pull authentication is valid for the
-placement. Release-only and artifact-only selectors never infer or expose a
-source fallback.
+placement. A non-READY managed route remains eligible as that original direct
+candidate at the same fallback locality rank as another provider's direct
+candidate. Only a READY managed route outranks it. Release-only and
+artifact-only selectors never infer or expose a source fallback.
 
 The runtime commits a secret-free pull plan only after a READY route is selected.
 `transactions.commit_ready_demand()` locks the artifact before the location,
@@ -1128,12 +1147,15 @@ added transactionally, a malformed same-name index still fails exact comparison,
 and every adoption write rolls back with any other drift.
 
 The revision-024 Helm Job cannot coordinate with an old binary whose migration
-path predates the PostgreSQL advisory lock. It therefore permits a fresh empty
-database or a database already at revision 023 or later, and fails without DDL
-when a nonempty database is unversioned or below 023. Operators first stage such
-a deployment through revision 023, drain binaries older than 023, and only then
-run the 024 Job. New Job and `auto` processes share the advisory lock once every
-participant is at least revision 023.
+path predates the PostgreSQL advisory lock. It therefore permits a genuinely
+empty effective PostgreSQL schema or a database already at revision 023 or
+later, and fails without DDL when the effective schema is unversioned or below
+023 and owns any relation, view, materialized view, sequence, user type, or
+routine. Emptiness is proved from PostgreSQL catalogs for the exact schema
+selected by the connection search path; a table-only inspector is insufficient.
+Operators first stage a nonempty deployment through revision 023, drain binaries
+older than 023, and only then run the 024 Job. New Job and `auto` processes share
+the advisory lock once every participant is at least revision 023.
 
 ## Registry profiles
 
@@ -2025,11 +2047,20 @@ CLI or Dashboard locates such a publication for explicit retry.
    pods start concurrently in `verify` mode, refuse to serve below 024, and
    become ready after the Job commits. For a nonempty database below 023, first
    deploy revision 023 and drain every older binary; the 024 Job refuses that
-   unsafe starting state. From revision 023 onward, the Job and transitional
-   `auto` pods share the same cross-host PostgreSQL advisory lock, so only one
-   Alembic process can mutate the schema. A genuinely empty database may upgrade
-   directly. Disabling `databaseMigration` explicitly keeps the lock-protected
+   unsafe starting state. The empty-schema exception checks every schema-owned
+   relation, sequence, type, and routine, not only tables. From revision 023
+   onward, the Job and transitional `auto` pods share the same cross-host
+   PostgreSQL advisory lock, so only one Alembic process can mutate the schema.
+   A genuinely empty effective schema may upgrade directly. API replicas and
+   every enabled image worker run in `verify` mode while the Job owns migration;
+   a worker can never win startup and perform the Job's DDL. Disabling
+   `databaseMigration` explicitly puts both API and workers in the lock-protected
    `auto` fallback for local or operator-owned migration workflows.
+   Database CA or client-certificate volumes are declared once through the
+   chart's shared `databaseConnection.extraVolumes` and
+   `databaseConnection.extraVolumeMounts` values. The API, migration Job, and
+   all image workers mount that exact set. API-only extra volumes are not leaked
+   into the narrower worker identities.
    Ordinary request completion checks the central database dialect before
    issuing a cluster-image terminal hint. A local SQLite API therefore performs
    no managed-image query and emits no PostgreSQL-only warning when the feature
@@ -2109,6 +2140,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   resource alternatives, forged private fields, and request config overrides;
 - scalar/object parsing, every selector combination, explicit opt-in/defaults,
   allowlists, direct restrictions, and byte-for-byte legacy `image_id` tests;
+- ordinary Kubernetes launches and dry runs with no `container_image`, plus
+  multicloud optimizer parity proving a warming AWS preferred route retains its
+  original direct resources and rank beside GCP or generic Kubernetes;
 - AWS integration plus mocked canonical-read, canonical-delete-denial,
   regional-delete, identity-policy, repository-policy, and
   permissions-boundary tests via
@@ -2119,6 +2153,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   unchanged direct OCI behavior on other runtimes;
 - `terraform fmt -check`, `terraform validate`, and plans for one and multiple
   regions with fixed shards;
+- Helm rendering that forces API and all image workers to `verify` while the
+  migration Job is enabled, restores `auto` only when it is disabled, rejects
+  environment overrides, and mounts shared database TLS material into every
+  database consumer;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
@@ -2128,7 +2166,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   token/manifest size ceilings, pre/post-request lease fencing, and lease loss
   during both generic registry and signed ECR chunk streaming, including loss
   immediately before a blocking iterator advance and destination-race paths
-  that never acquire or leak a source response;
+  that never acquire or leak a source response, plus upload-initiation failures
+  proved against both production readers before their first iterator advance;
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
@@ -2152,6 +2191,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   readiness, live/terminal demand pages, expired reservations, canonical
   publication fan-out, worker cleanup, and state-filtered history use their
   exact indexes with large terminal or idle populations present;
+- staged-migration tests proving that tables, views, materialized views,
+  sequences, user-defined types, and routines each make an unversioned target
+  schema nonempty and block revision 024 before DDL, while a separate empty
+  search-path schema upgrades directly;
 - workspace-publication history and operational-profile readiness scale fixtures
   proving the former uses its `(workspace, created_at, id)` keyset index and the
   latter uses both ACTIVE and QUALIFYING partial indexes despite more than 1,001

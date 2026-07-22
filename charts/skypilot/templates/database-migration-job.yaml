@@ -47,12 +47,15 @@ spec:
         resources:
           {{- toYaml .Values.databaseMigration.resources | nindent 10 }}
         env:
-        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
         {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
         {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
         {{- end }}
         {{- end }}
         {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.apiService.extraEnvs }}
@@ -73,13 +76,23 @@ spec:
               name: {{ $fullName }}-db-connection
               key: connection_string
         {{- end }}
-        {{- with .Values.apiService.extraVolumeMounts }}
+        {{- if or .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts }}
         volumeMounts:
+          {{- with .Values.databaseConnection.extraVolumeMounts }}
           {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- with .Values.apiService.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
         {{- end }}
-      {{- with .Values.apiService.extraVolumes }}
+      {{- if or .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes }}
       volumes:
+        {{- with .Values.databaseConnection.extraVolumes }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.apiService.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       {{- include "skypilot.apiPodScheduling" . }}
 {{- end }}

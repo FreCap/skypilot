@@ -105,6 +105,39 @@ tests:
             name: GLOBAL_ENV
             value: global
 
+  - it: should receive shared database connection settings
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      databaseConnection.extraVolumes:
+        - name: db-ca
+          secret:
+            secretName: db-ca
+      databaseConnection.extraVolumeMounts:
+        - name: db-ca
+          mountPath: /etc/db
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: db-ca
+            mountPath: /etc/db
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: db-ca
+            secret:
+              secretName: db-ca
+
   - it: should prefix gcp credentials init container image with the global registry override
     set:
       global.imageRegistry: registry.example.com/custom

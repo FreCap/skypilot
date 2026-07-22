@@ -283,6 +283,33 @@ def test_managed_image_locality_wins_across_resource_alternatives():
     assert launchable[warming_request] == []
 
 
+def test_managed_image_direct_fallback_keeps_equal_rank_clouds():
+    """A warming AWS fallback remains beside another direct cloud."""
+    image = mock.sentinel.container_image
+    aws_request = mock.Mock(container_image=image)
+    gcp_request = mock.Mock(container_image=image)
+    strict_request = mock.Mock(container_image=image)
+    aws_direct_fallback = mock.Mock()
+    gcp_direct = mock.Mock()
+    strict_warming = mock.Mock()
+    launchable = {
+        aws_request: [aws_direct_fallback],
+        gcp_request: [gcp_direct],
+        strict_request: [strict_warming],
+    }
+
+    optimizer_candidate_generation._filter_managed_image_locality(  # pylint: disable=protected-access
+        launchable, {
+            aws_direct_fallback: 1,
+            gcp_direct: 1,
+            strict_warming: 2,
+        })
+
+    assert launchable[aws_request] == [aws_direct_fallback]
+    assert launchable[gcp_request] == [gcp_direct]
+    assert launchable[strict_request] == []
+
+
 @pytest.mark.parametrize(
     ('declared_eks', 'provider', 'backend'),
     ((True, 'aws', 'aws_eks'), (False, 'kubernetes', 'direct')))
