@@ -146,6 +146,12 @@ LB_REQUEST_HISTORY_MAX_BUCKETS = (
 # clients keep this budget during mixed-version rollouts.
 UPDATE_SERVICE_TIMEOUT_SECONDS = 600
 
+# Replica termination waits for the fleet-wide replica-manager lock before it
+# durably schedules teardown. Large-fleet recovery and probe rounds can hold
+# that lock for minutes, so this destructive operation needs its own explicit
+# acceptance budget instead of the generic 10-second controller/RPC timeout.
+TERMINATE_REPLICA_TIMEOUT_SECONDS = 600
+
 # The time interval in seconds for load balancer to sync with controller. Every
 # time the load balancer syncs with controller, it will update all available
 # replica ips for each service, also send the number of requests in last query

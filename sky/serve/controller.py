@@ -139,6 +139,52 @@ def _get_replica_info_for_termination(
     return replica_info
 
 
+def _terminate_replica_sync(service_name: str,
+                            replica_manager: replica_managers.ReplicaManager,
+                            replica_id: int, purge: bool) -> fastapi.Response:
+    """Durably schedule one replica teardown off the controller event loop."""
+    replica_info = _get_replica_info_for_termination(service_name, replica_id)
+    replica_status = replica_info.status
+
+    if replica_status == serve_state.ReplicaStatus.SHUTTING_DOWN:
+        return responses.JSONResponse(
+            status_code=409,
+            content={
+                'message':
+                    f'Replica {replica_id} of service {service_name!r} is '
+                    'already in the process of terminating. Skip terminating '
+                    'now.'
+            })
+
+    if (replica_status in serve_state.ReplicaStatus.failed_statuses() and
+            not purge):
+        return responses.JSONResponse(
+            status_code=409,
+            content={
+                'message': f'{colorama.Fore.YELLOW}Replica {replica_id} of '
+                           f'service {service_name!r} is in failed status '
+                           f'({replica_info.status}). Skipping its termination '
+                           'as it could lead to a resource leak. '
+                           f'(Use `sky serve down {service_name!r} '
+                           f'--replica-id {replica_id} --purge` to forcefully '
+                           f'terminate the replica.){colorama.Style.RESET_ALL}'
+            })
+
+    # This may wait behind a fleet-wide recovery/probe/placement lock. Keep it
+    # on the executor thread, but do not acknowledge until scale_down() has
+    # durably scheduled the owner-fenced teardown.
+    replica_manager.scale_down(replica_id, purge=purge)
+
+    action = 'terminated' if not purge else 'purged'
+    message = (f'{colorama.Fore.GREEN}Replica {replica_id} of service '
+               f'{service_name!r} is scheduled to be '
+               f'{action}.{colorama.Style.RESET_ALL}\n'
+               f'Please use {ux_utils.BOLD}sky serve status '
+               f'{service_name}{ux_utils.RESET_BOLD} '
+               f'to check the latest status.')
+    return responses.JSONResponse(status_code=200, content={'message': message})
+
+
 def _read_declared_submitted_yaml(request_data: dict[str, Any],
                                   service_name: str, version: int,
                                   resource_scope: str | None) -> str | None:
@@ -3364,55 +3410,37 @@ class SkyServeController:
                 },
                                               status_code=500)
 
+        terminate_replica_lock = asyncio.Lock()
+
         @self._app.post(
             '/controller/terminate_replica',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
             replica_id, purge = await _read_terminate_replica_payload(request)
-            replica_info = _get_replica_info_for_termination(
-                self._service_name, replica_id)
-            replica_status = replica_info.status
-
-            if replica_status == serve_state.ReplicaStatus.SHUTTING_DOWN:
-                return responses.JSONResponse(
-                    status_code=409,
-                    content={
-                        'message':
-                            f'Replica {replica_id} of service '
-                            f'{self._service_name!r} is already in the process '
-                            f'of terminating. Skip terminating now.'
-                    })
-
-            if (replica_status in serve_state.ReplicaStatus.failed_statuses()
-                    and not purge):
-                return responses.JSONResponse(
-                    status_code=409,
-                    content={
-                        'message': f'{colorama.Fore.YELLOW}Replica '
-                                   f'{replica_id} of service '
-                                   f'{self._service_name!r} is in failed '
-                                   f'status ({replica_info.status}). '
-                                   f'Skipping its termination as it could '
-                                   f'lead to a resource leak. '
-                                   f'(Use `sky serve down '
-                                   f'{self._service_name!r} --replica-id '
-                                   f'{replica_id} --purge` to '
-                                   'forcefully terminate the replica.)'
-                                   f'{colorama.Style.RESET_ALL}'
-                    })
-
-            self._replica_manager.scale_down(replica_id, purge=purge)
-
-            action = 'terminated' if not purge else 'purged'
-            message = (f'{colorama.Fore.GREEN}Replica {replica_id} of service '
-                       f'{self._service_name!r} is scheduled to be '
-                       f'{action}.{colorama.Style.RESET_ALL}\n'
-                       f'Please use {ux_utils.BOLD}sky serve status '
-                       f'{self._service_name}{ux_utils.RESET_BOLD} '
-                       f'to check the latest status.')
-            return responses.JSONResponse(status_code=200,
-                                          content={'message': message})
+            # Preserve the route's prior serialized validation semantics while
+            # letting health and LB sync proceed during manager-lock waits.
+            async with terminate_replica_lock:
+                loop = asyncio.get_running_loop()
+                terminate = functools.partial(_terminate_replica_sync,
+                                              self._service_name,
+                                              self._replica_manager, replica_id,
+                                              purge)
+                operation = loop.run_in_executor(None, terminate)
+                try:
+                    return await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    # Executor work cannot be cancelled after it starts. Keep
+                    # duplicate admission serialized until its durable outcome
+                    # is known, even if the caller disconnects meanwhile.
+                    try:
+                        await operation
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Replica termination failed after its request '
+                            f'was cancelled: {common_utils.format_exception(e)}'
+                        )
+                    raise
 
         @self._app.exception_handler(Exception)
         async def validation_exception_handler(

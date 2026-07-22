@@ -1830,13 +1830,16 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
                 f'Replica {replica_id} for service {service_name} does not '
                 'exist.')
 
-    resp = _post_to_controller_with_retry(service_name,
-                                          service_status['hash'],
-                                          '/controller/terminate_replica',
-                                          json={
-                                              'replica_id': replica_id,
-                                              'purge': purge,
-                                          })
+    resp = _post_to_controller_with_retry(
+        service_name,
+        service_status['hash'],
+        '/controller/terminate_replica',
+        json={
+            'replica_id': replica_id,
+            'purge': purge,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.TERMINATE_REPLICA_TIMEOUT_SECONDS))
 
     try:
         body = resp.json()

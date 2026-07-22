@@ -172,7 +172,8 @@ class RpcRunner:
                                                       purge=purge)
         response = backend_utils.invoke_skylet_with_retries(
             lambda: backends.SkyletClient(handle.get_grpc_channel()
-                                         ).terminate_replica(request))
+                                         ).terminate_replica(request),
+            max_attempts=1)
         return response.message
 
     @classmethod
