@@ -105,6 +105,11 @@ const ACCELERATOR_HISTORY_FIELDS = [
   ['free_reserved_slots', 'freeReservedSlots'],
 ];
 
+const OPTIONAL_ACCELERATOR_HISTORY_FIELDS = [
+  ['warm_retention_target', 'warmRetentionTarget'],
+  ['cold_launch_authority', 'coldLaunchAuthority'],
+];
+
 export function normalizeAcceleratorBreakdown(value) {
   if (!value || typeof value !== 'object' || value.version !== 1) return null;
   const cards = value.configured_accelerators;
@@ -120,6 +125,20 @@ export function normalizeAcceleratorBreakdown(value) {
   const normalized = { configuredAccelerators: [...cards] };
   for (const [source, target] of ACCELERATOR_HISTORY_FIELDS) {
     const raw = value[source];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const counts = {};
+    for (const card of cards) {
+      const count = Number(raw[card]);
+      if (!Number.isInteger(count) || count < 0) return null;
+      counts[card] = count;
+    }
+    normalized[target] = counts;
+  }
+  for (const [source, target] of OPTIONAL_ACCELERATOR_HISTORY_FIELDS) {
+    const raw = value[source];
+    if (raw === undefined) {
+      continue;
+    }
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const counts = {};
     for (const card of cards) {
@@ -420,6 +439,12 @@ export function normalizeService(record) {
       record.demand_target_by_accelerator ??
         record.target_num_replicas_by_accelerator
     ),
+    warmRetentionTarget: normalizeAcceleratorCountMap(
+      record.warm_retention_target_by_accelerator
+    ),
+    coldLaunchAuthority: normalizeAcceleratorCountMap(
+      record.cold_launch_authority_by_accelerator
+    ),
     ready: normalizeAcceleratorCountMap(record.ready_replicas_by_accelerator),
     provisioning: normalizeAcceleratorCountMap(
       record.provisioning_replicas_by_accelerator
@@ -449,6 +474,18 @@ export function normalizeService(record) {
     provisioning: acceleratorMaps.provisioning[card] || 0,
     total: acceleratorMaps.total[card] || 0,
     demandTarget: acceleratorMaps.demandTarget[card] || 0,
+    warmRetentionTarget: Object.hasOwn(
+      acceleratorMaps.warmRetentionTarget,
+      card
+    )
+      ? acceleratorMaps.warmRetentionTarget[card]
+      : null,
+    coldLaunchAuthority: Object.hasOwn(
+      acceleratorMaps.coldLaunchAuthority,
+      card
+    )
+      ? acceleratorMaps.coldLaunchAuthority[card]
+      : null,
     hardFloor: acceleratorMaps.hardFloor[card] || 0,
     zeroCostReady: acceleratorMaps.zeroCostReady[card] || 0,
     fillTarget: Object.hasOwn(acceleratorMaps.fillTarget, card)

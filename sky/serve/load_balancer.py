@@ -2652,6 +2652,10 @@ class SkyServeLoadBalancer:
             'demand_target_by_accelerator': hint.get(
                 'demand_target_by_accelerator',
                 hint.get('target_num_replicas_by_accelerator', {})),
+            'warm_retention_target_by_accelerator': hint.get(
+                'warm_retention_target_by_accelerator', {}),
+            'cold_launch_authority_by_accelerator': hint.get(
+                'cold_launch_authority_by_accelerator', {}),
             'ready_replicas_by_accelerator': hint.get(
                 'ready_replicas_by_accelerator', {}),
             'provisioning_replicas_by_accelerator': hint.get(

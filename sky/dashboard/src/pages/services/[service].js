@@ -473,8 +473,9 @@ export function AcceleratorCapacityCard({ serviceData }) {
         <div>
           <h3 className="text-lg font-semibold">Capacity by exact card</h3>
           <p className="mt-1 text-sm text-gray-500">
-            Demand targets and hard floors are independent from reserved-fill
-            capacity. A100 and A100-80GB are always separate rows.
+            Serving target can retain work already running on a card. Only
+            cold-launch authority requests incremental exact-card capacity.
+            Reserved-fill capacity remains independent.
           </p>
         </div>
         {(serviceData.fillTarget != null ||
@@ -498,7 +499,9 @@ export function AcceleratorCapacityCard({ serviceData }) {
             <TableHead className="text-right">Ready</TableHead>
             <TableHead className="text-right">Provisioning</TableHead>
             <TableHead className="text-right">Total</TableHead>
-            <TableHead className="text-right">Demand target</TableHead>
+            <TableHead className="text-right">Serving target</TableHead>
+            <TableHead className="text-right">Warm retention</TableHead>
+            <TableHead className="text-right">Cold-launch authority</TableHead>
             <TableHead className="text-right">Hard floor</TableHead>
             <TableHead className="text-right">Zero-cost ready</TableHead>
             <TableHead className="text-right">Fill target</TableHead>
@@ -513,6 +516,12 @@ export function AcceleratorCapacityCard({ serviceData }) {
               <TableCell className="text-right">{row.provisioning}</TableCell>
               <TableCell className="text-right">{row.total}</TableCell>
               <TableCell className="text-right">{row.demandTarget}</TableCell>
+              <TableCell className="text-right">
+                {row.warmRetentionTarget ?? 'n/a'}
+              </TableCell>
+              <TableCell className="text-right">
+                {row.coldLaunchAuthority ?? 'n/a'}
+              </TableCell>
               <TableCell className="text-right">{row.hardFloor}</TableCell>
               <TableCell className="text-right">{row.zeroCostReady}</TableCell>
               <TableCell className="text-right">

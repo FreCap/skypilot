@@ -9,7 +9,9 @@ import {
 } from '@/components/serve-history-range';
 
 const SERVING_SERIES = [
-  ['Traffic target by card', 'demandTarget', 'rgb(234, 88, 12)', [7, 4]],
+  ['Serving target by card', 'demandTarget', 'rgb(234, 88, 12)', [7, 4]],
+  ['Warm retention', 'warmRetentionTarget', 'rgb(168, 85, 247)', [4, 3]],
+  ['Cold-launch authority', 'coldLaunchAuthority', 'rgb(220, 38, 38)', [2, 2]],
   ['Ready capacity', 'readyCapacity', 'rgb(22, 163, 74)', []],
   ['Provisioning capacity', 'provisioningCapacity', 'rgb(8, 145, 178)', [2, 3]],
   [
@@ -71,7 +73,7 @@ export function buildAcceleratorHistoryView(history, range) {
               const breakdown =
                 byTimestamp.get(timestamp)?.acceleratorBreakdown;
               return breakdown?.configuredAccelerators.includes(card)
-                ? breakdown[field][card]
+                ? (breakdown[field]?.[card] ?? null)
                 : null;
             }),
           ])
@@ -107,8 +109,10 @@ export function AcceleratorHistoryCard({
         <div>
           <h3 className="text-lg font-semibold">Exact accelerator history</h3>
           <div className="text-sm text-gray-500">
-            Per-card allocation and supply. Flexible queued requests remain in
-            aggregate demand pressure until the autoscaler assigns a card
+            Serving target includes work retained on an already-running exact
+            card. Cold-launch authority is the incremental shortage allowed to
+            request new capacity. Flexible queued requests remain aggregate
+            until the autoscaler assigns a card
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>
