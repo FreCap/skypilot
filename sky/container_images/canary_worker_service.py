@@ -378,6 +378,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'SubnetId': subnet_values[index],
                 'MinCount': 1,
                 'MaxCount': 1,
+                'InstanceInitiatedShutdownBehavior': 'terminate',
                 'UserData': _ec2_user_data(reference, payload['nonce'],
                                            payload['timeout_seconds']),
                 'TagSpecifications': [{

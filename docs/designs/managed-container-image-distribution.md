@@ -568,9 +568,11 @@ provider settling proves repeated absence. EC2 cleanup follows the known child
 through `shutting-down` to `terminated`; EKS cleanup accounts for a timed-out
 create that becomes visible after the first delete. A persisted child also
 remains reclaimable if its immutable contract cannot be reloaded, because no
-terminal transition may substitute for provider teardown. Other operation
-kinds project their publication, location, or profile work and carry no
-provider lease.
+terminal transition may substitute for provider teardown; an incompatible
+worker rotates that expired queue row without clearing its child identity so a
+compatible worker or rollback can reclaim it. EC2 canaries set guest-initiated
+shutdown behavior to terminate, not stop. Other operation kinds project their
+publication, location, or profile work and carry no provider lease.
 
 Canary intent creation locks the desired profile row and reserves its conservative
 worst-case cost in a UTC daily window before committing the operation. Concurrent

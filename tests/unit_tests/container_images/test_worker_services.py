@@ -867,6 +867,7 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
     assert ec2.run_instances.call_args_list[0].kwargs == (
         ec2.run_instances.call_args_list[1].kwargs)
     launch = ec2.run_instances.call_args.kwargs
+    assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
     assert launch['SecurityGroupIds'] == list(
         dict(binding.canary_security_groups)[target.region])
     assert {item['ResourceType'] for item in launch['TagSpecifications']

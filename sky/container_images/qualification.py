@@ -314,6 +314,21 @@ def claim_canary(
                     claim_time = catalog_state.database_epoch(session, now=now)
             except (TypeError, ValueError,
                     topology_state.StaleProfileRevisionError) as error:
+                if (operation.state == models.ImageOperationState.RUNNING and
+                        operation.child_launch_id is not None):
+                    # A future or rolled-back worker may still understand the
+                    # immutable child contract. Keep its durable owner and
+                    # rotate the poison row behind other runnable canaries.
+                    clock = catalog_state.database_epoch_expression(now=now)
+                    session.execute(table.update().where(
+                        table.c.id == operation.id, table.c.state ==
+                        models.ImageOperationState.RUNNING.value,
+                        table.c.lease_token == operation.lease_token,
+                        table.c.child_launch_id == operation.child_launch_id,
+                        table.c.lease_expires_at.is_not(None),
+                        table.c.lease_expires_at
+                        <= clock).values(updated_at=clock))
+                    continue
                 error_code = ('CANARY_DAILY_COST_LIMIT'
                               if str(error) == 'CANARY_DAILY_COST_LIMIT' else
                               'QUALIFICATION_FAILED')

@@ -409,6 +409,38 @@ def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
     assert qualification.fail_canary(successor, 'CANARY_FAILED', now=111)
 
 
+def test_incompatible_worker_preserves_persisted_canary_child(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    operation = _request_ec2_canary(
+        monkeypatch, profile, idempotency_key='canary-future-contract-key')
+    claimed = qualification.claim_canary(worker_id='worker-a',
+                                         lease_seconds=10,
+                                         now=100)
+    assert claimed is not None and claimed.lease_token is not None
+    child_id = f'ec2:{profile.targets[0].region}:{claimed.id}'
+    assert qualification.attach_canary_child(claimed.id,
+                                             claimed.lease_token,
+                                             child_id,
+                                             now=101)
+    with image_database.begin() as connection:
+        connection.execute(schema.operations.update().where(
+            schema.operations.c.id == operation.id).values(
+                result_json=json.dumps({'future_contract': 2})))
+
+    assert qualification.claim_canary(worker_id='worker-b',
+                                      lease_seconds=10,
+                                      now=110) is None
+
+    preserved = catalog_state.get_operation(operation.id, 'research')
+    assert preserved is not None
+    assert preserved.state == models.ImageOperationState.RUNNING
+    assert preserved.child_launch_id == child_id
+    assert preserved.lease_token == claimed.lease_token
+    assert preserved.updated_at == 110
+
+
 def test_canary_terminal_fence_rechecks_database_clock_after_blocking_lock(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
