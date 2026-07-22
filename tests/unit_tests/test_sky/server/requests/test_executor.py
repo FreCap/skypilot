@@ -807,6 +807,129 @@ async def test_stdout_stderr_restoration(mock_fd_operations, test_case):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('initial_status', [
+    requests_lib.RequestStatus.PENDING,
+    requests_lib.RequestStatus.RUNNING,
+])
+async def test_request_worker_retries_after_broken_process_pool(
+        isolated_database, monkeypatch, initial_status):
+    """A retryable pool crash must leave the request executable."""
+    request_id = f'test-broken-pool-retry-{initial_status.value.lower()}'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=initial_status,
+        created_at=time.time(),
+        user_id='test-user',
+        pid=(123
+             if initial_status == requests_lib.RequestStatus.RUNNING else None),
+        retryable=True,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+
+    queue_items = []
+    request_queue = mock.Mock()
+    request_queue.put.side_effect = queue_items.append
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    pool_error = concurrent.futures.process.BrokenProcessPool('worker died')
+    fut = concurrent.futures.Future()
+    fut.set_exception(pool_error)
+    request_element = (request_id, False, True)
+
+    worker.handle_task_result(fut, request_element)
+
+    updated = requests_lib.get_request(request_id,
+                                       fields=['status', 'pid', 'status_msg'])
+    assert updated is not None
+    assert updated.status == requests_lib.RequestStatus.WAITING
+    assert updated.pid is None
+    assert updated.status_msg is not None
+    assert queue_items == [request_element]
+    # Model the next worker dequeue. The retry must pass the same atomic gate
+    # used by _request_execution_wrapper instead of being rejected as terminal.
+    assert requests_lib.try_mark_running(request_id, pid=456)
+
+
+@pytest.mark.asyncio
+async def test_request_worker_fails_nonretryable_broken_pool_request(
+        isolated_database, monkeypatch):
+    request_id = 'test-broken-pool-nonretryable'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.RUNNING,
+        created_at=time.time(),
+        user_id='test-user',
+        retryable=False,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+
+    request_queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    fut = concurrent.futures.Future()
+    fut.set_exception(
+        concurrent.futures.process.BrokenProcessPool('worker died'))
+
+    worker.handle_task_result(fut, (request_id, False, False))
+
+    updated = requests_lib.get_request(request_id, fields=['status', 'error'])
+    assert updated is not None
+    assert updated.status == requests_lib.RequestStatus.FAILED
+    assert updated.get_error() is not None
+    request_queue.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_worker_does_not_requeue_cancelled_broken_pool_request(
+        isolated_database, monkeypatch):
+    """Cancellation must win over a concurrent broken-pool callback."""
+    request_id = 'test-broken-pool-cancelled'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.CANCELLED,
+        created_at=time.time(),
+        user_id='test-user',
+        retryable=True,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+
+    request_queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    fut = concurrent.futures.Future()
+    fut.set_exception(
+        concurrent.futures.process.BrokenProcessPool('worker died'))
+
+    worker.handle_task_result(fut, (request_id, False, True))
+
+    updated = requests_lib.get_request(request_id, fields=['status'])
+    assert updated is not None
+    assert updated.status == requests_lib.RequestStatus.CANCELLED
+    request_queue.put.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_request_worker_retry_execution_retryable_error(
         isolated_database, monkeypatch):
     """Test that RequestWorker retries requests when ExecutionRetryableError is raised."""
