@@ -106,9 +106,9 @@ def _disposable_worker(fn, initializer, initargs, result_connection, args,
         # Connection.send() serializes synchronously, unlike Queue.put(). This
         # lets an unserializable result be reported as an exception instead of
         # being silently dropped by a background queue feeder thread.
-        result_connection.send(result)
+        result_connection.send((True, result))
     except BaseException as e:  # pylint: disable=broad-except
-        result_connection.send(e)
+        result_connection.send((False, e))
     finally:
         result_connection.close()
 
@@ -141,13 +141,19 @@ class DisposableExecutor:
             future: concurrent.futures.Future,
             result_connection: multiprocessing_connection.Connection) -> None:
         """Monitor the worker process and cleanup when it's done."""
+        succeeded = False
         result = None
         receive_error = None
         try:
             # Drain the pipe before joining. A worker sending a result larger
             # than the OS pipe buffer cannot exit until the parent reads it.
             try:
-                result = result_connection.recv()
+                payload = result_connection.recv()
+                if (not isinstance(payload, tuple) or len(payload) != 2 or
+                        not isinstance(payload[0], bool)):
+                    raise RuntimeError(
+                        'Disposable worker returned an invalid result envelope')
+                succeeded, result = payload
             except BaseException as e:  # pylint: disable=broad-except  # noqa: ASYNC103
                 receive_error = e
             try:
@@ -171,6 +177,8 @@ class DisposableExecutor:
                 f'returning a result (exit code {process.exitcode})')
             worker_error.__cause__ = receive_error
             future.set_exception(worker_error)
+        elif succeeded:
+            future.set_result(result)
         elif isinstance(result, Exception):
             future.set_exception(result)
         elif isinstance(result, BaseException):
@@ -180,7 +188,9 @@ class DisposableExecutor:
             termination_error.__cause__ = result
             future.set_exception(termination_error)
         else:
-            future.set_result(result)
+            future.set_exception(
+                concurrent.futures.process.BrokenProcessPool(
+                    'Disposable worker returned an invalid failure payload'))
 
     def submit(self, fn, *args, **kwargs) -> concurrent.futures.Future:
         """Submit a task for execution and return a Future."""
@@ -241,6 +251,10 @@ class DisposableExecutor:
             raise
         assert result_connection is not None
         assert process is not None
+        # The process is already executing and cannot be cancelled through the
+        # Future. Publish RUNNING before returning the Future so cancel() does
+        # not claim that it stopped work which will continue in the child.
+        assert future.set_running_or_notify_cancel()
 
         # Start monitor thread to cleanup the worker process when it's done
         monitor_thread = threading.Thread(target=self._monitor_worker,

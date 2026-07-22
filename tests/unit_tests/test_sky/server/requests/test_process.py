@@ -26,6 +26,11 @@ def failing_task():
     raise ValueError('Task failed')
 
 
+def exception_result_task():
+    """Return an exception object as ordinary task data."""
+    return ValueError('task data')
+
+
 def abruptly_exiting_task():
     """A task that exits its disposable worker before returning a result."""
     os._exit(7)
@@ -250,6 +255,8 @@ def test_disposable_executor():
         # Test with failing task
         failed_fut = executor.submit(failing_task)
         concurrent.futures.wait([failed_fut])
+        with pytest.raises(ValueError, match='Task failed'):
+            failed_fut.result()
         assert verify_workers_cleanup(
             executor), "Failed task worker not cleaned up"
         assert executor.has_idle_workers()  # Worker should be cleaned up
@@ -265,6 +272,29 @@ def test_disposable_executor_reports_worker_exit():
         with pytest.raises(concurrent.futures.process.BrokenProcessPool,
                            match='exit code 7'):
             future.result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_returns_exception_object():
+    """An exception-shaped return value must not become a task failure."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        result = executor.submit(exception_result_task).result(timeout=20)
+        assert isinstance(result, ValueError)
+        assert str(result) == 'task data'
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_marks_started_future_running():
+    """A started process must not expose a cancellable pending future."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(dummy_task, sleep_time=1)
+        assert future.running()
+        assert not future.cancel()
+        assert future.result(timeout=20)
     finally:
         executor.shutdown()
 
