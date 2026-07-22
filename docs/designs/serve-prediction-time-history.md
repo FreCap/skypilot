@@ -110,13 +110,17 @@ async terminal status  -> processing_time_ms       -> reported duration
 ## Load-balancer aggregation
 
 Request JSON action parsing reuses the body already cached for proxying. It
-does not retain model input after the request ends. Synchronous timing is scoped
-to the final accepted upstream attempt. For async status, the existing raw-body
-stream is forwarded unchanged while a bounded copy is retained for terminal
-JSON parsing. A body over the fixed parsing cap is forwarded but not parsed or
-recorded. A response with non-identity content encoding is also forwarded but
-not parsed, because observability must not alter or decompress the proxy's raw
-response stream. The established Boltz async-status response is uncompressed.
+does not retain model input after the request ends. A nonempty stable-job
+header classifies a platform-held async submission without parsing its body.
+For header-free direct callers, only JSON bodies up to 64 KiB are inspected for
+the small established action envelope; larger bodies are treated as
+synchronous. Synchronous timing is scoped to the final accepted upstream
+attempt. For async status, the existing raw-body stream is forwarded unchanged
+while a bounded copy is retained for terminal JSON parsing. A body over the
+fixed parsing cap is forwarded but not parsed or recorded. A response with
+non-identity content encoding is also forwarded but not parsed, because
+observability must not alter or decompress the proxy's raw response stream.
+The established Boltz async-status response is uncompressed.
 
 The load balancer keeps a bounded dictionary keyed by observation-minute epoch.
 Each value contains two fixed-length integer arrays, `succeeded` and `failed`.
@@ -219,7 +223,10 @@ time.
 
 ## Cost model
 
-A synchronous terminal upstream response performs two monotonic-clock reads, a
+The stable-job header short-circuits async action detection. Header-free JSON
+requests only parse action envelopes up to 64 KiB, bounding event-loop work;
+larger bodies are never parsed for observability. After classification, a
+synchronous terminal upstream response performs two monotonic-clock reads, a
 fixed-bound lookup, and one integer increment. Async terminal parsing copies at
 most a small bounded status response and maintains a bounded request-ID set.
 No model input, result, exact duration, route, or identifier is persisted.

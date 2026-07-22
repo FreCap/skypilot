@@ -188,6 +188,11 @@ LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS = (
 LB_PREDICTION_TIME_OUTCOMES = ('succeeded', 'failed')
 LB_PREDICTION_TIME_BUCKET_COUNT = (
     len(LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS) + 1)
+# Header-free async protocol actions use small JSON envelopes. Bound action
+# detection so observability never parses a model-sized input on the LB event
+# loop. Platform-held async submissions are identified by their stable job
+# header and do not inspect the body at all.
+LB_ASYNC_ACTION_BODY_MAX_BYTES = 64 * 1024
 # Terminal async status bodies are small JSON objects. Forward larger bodies
 # unchanged, but do not retain them for observability parsing.
 LB_ASYNC_STATUS_BODY_MAX_BYTES = 64 * 1024

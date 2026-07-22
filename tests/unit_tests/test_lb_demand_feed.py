@@ -5,7 +5,7 @@ The LB reports outstanding work to the controller as GAUGES
 alongside the existing timestamp aggregator, and caches the
 controller's capacity_hint for /_lb/capacity readers.
 """
-# pylint: disable=protected-access
+# pylint: disable=protected-access,use-implicit-booleaness-not-comparison
 import asyncio
 import time
 from unittest import mock
@@ -280,7 +280,7 @@ def test_async_request_contract_marks_replica_capable_before_dispatch():
     response = fastapi.responses.Response(status_code=202)
     request = _request()
     request.headers = {'content-type': 'application/json'}
-    request.json = mock.AsyncMock(return_value={'action': 'async_predict'})
+    request.body = mock.AsyncMock(return_value=b'{"action":"async_predict"}')
 
     async def _fake_proxy(selected_url, forwarded_request):
         assert selected_url == url

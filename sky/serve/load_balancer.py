@@ -2149,7 +2149,9 @@ class SkyServeLoadBalancer:
             return True
         return await self._request_action(request) == _ASYNC_ACTION_PREDICT
 
-    async def _request_action(self, request: fastapi.Request) -> str | None:
+    async def _request_action(self,
+                              request: fastapi.Request,
+                              body: bytes | None = None) -> str | None:
         """Return and cache the established JSON async action, if present."""
         request_state = vars(request)
         if _REQUEST_ACTION_ATTR in request_state:
@@ -2158,19 +2160,23 @@ class SkyServeLoadBalancer:
         content_type = request.headers.get('content-type', '')
         if 'application/json' in content_type.lower():
             try:
-                bounded_body = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
-                if bounded_body is not None:
-                    payload = json.loads(bounded_body)
-                elif self._request_queue_config is None:
-                    # Preserve the established Request.json() contract for
-                    # direct callers. Starlette caches the body, so the later
-                    # proxy read can forward the same bytes unchanged.
-                    payload = await request.json()
-                else:
-                    payload = json.loads(await self._request_body(request))
-                if isinstance(payload, dict) and isinstance(
-                        payload.get('action'), str):
-                    action = payload['action']
+                content_length = request.headers.get('content-length')
+                if (content_length is not None and int(content_length)
+                        > constants.LB_ASYNC_ACTION_BODY_MAX_BYTES):
+                    request_state[_REQUEST_ACTION_ATTR] = None
+                    return None
+            except ValueError:
+                pass
+            try:
+                if body is None:
+                    bounded_body = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
+                    body = (bounded_body if bounded_body is not None else await
+                            self._request_body(request))
+                if len(body) <= constants.LB_ASYNC_ACTION_BODY_MAX_BYTES:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict) and isinstance(
+                            payload.get('action'), str):
+                        action = payload['action']
             except (UnicodeDecodeError, ValueError, TypeError):
                 pass
         request_state[_REQUEST_ACTION_ATTR] = action
@@ -3992,9 +3998,13 @@ class SkyServeLoadBalancer:
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             request_body = await self._request_body(request)
-            request_action = await self._request_action(request)
-            is_async_request = (self._request_has_stable_job_id(request) or
-                                request_action in _ASYNC_ACTIONS)
+            if self._request_has_stable_job_id(request):
+                request_action = None
+                is_async_request = True
+            else:
+                request_action = await self._request_action(
+                    request, request_body)
+                is_async_request = request_action in _ASYNC_ACTIONS
             proxy_request = client.build_request(
                 request.method,
                 worker_url,

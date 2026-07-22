@@ -695,6 +695,43 @@ def test_async_prediction_status_uses_reported_time_and_deduplicates(
     assert sum(counts['succeeded']) + sum(counts['failed']) == 2
 
 
+def test_request_action_skips_oversized_json_without_parsing(monkeypatch):
+    lb = _make_lb()
+    body = b'x' * (constants.LB_ASYNC_ACTION_BODY_MAX_BYTES + 1)
+    delivered = False
+
+    async def _receive():
+        nonlocal delivered
+        if delivered:
+            return {'type': 'http.disconnect'}
+        delivered = True
+        return {
+            'type': 'http.request',
+            'body': body,
+            'more_body': False,
+        }
+
+    request = fastapi.Request(
+        {
+            'type': 'http',
+            'method': 'POST',
+            'scheme': 'http',
+            'server': ('load-balancer', 80),
+            'path': '/predict',
+            'raw_path': b'/predict',
+            'query_string': b'',
+            'headers': [
+                (b'content-type', b'application/json'),
+                (b'content-length', str(len(body)).encode()),
+            ],
+        }, _receive)
+    monkeypatch.setattr(load_balancer.json, 'loads',
+                        lambda _: pytest.fail('oversized body was parsed'))
+
+    assert _run(lb._request_action(request)) is None
+    assert _run(request.body()) == body
+
+
 def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
 
     async def _run_test():
