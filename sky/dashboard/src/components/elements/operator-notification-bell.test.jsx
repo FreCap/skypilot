@@ -215,4 +215,38 @@ describe('OperatorNotificationBell', () => {
       })
     ).toBeInTheDocument();
   });
+
+  it('does not republish locally acknowledged notifications after a stale poll', async () => {
+    jest.useFakeTimers();
+    getOperatorNotifications
+      .mockReset()
+      .mockResolvedValueOnce(unread)
+      .mockResolvedValueOnce(unread);
+
+    render(<OperatorNotificationBell role="admin" />);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'Operator notifications: 1 unread',
+      })
+    );
+
+    await waitFor(() =>
+      expect(acknowledgeOperatorNotifications).toHaveBeenCalledWith(7)
+    );
+    await screen.findByRole('button', {
+      name: 'Operator notifications: 0 unread',
+    });
+
+    await act(async () => {
+      jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS);
+      await Promise.resolve();
+    });
+
+    expect(getOperatorNotifications).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByRole('button', {
+        name: 'Operator notifications: 0 unread',
+      })
+    ).toBeInTheDocument();
+  });
 });

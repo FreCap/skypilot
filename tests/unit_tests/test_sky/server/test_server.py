@@ -709,6 +709,39 @@ async def test_upload_rejects_invalid_id_before_cleanup_registration(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_cleanup_uses_monotonic_deadline(tmp_path):
+    upload_id = 'sky-2026-07-22-00-00-00-000000-1234abcd'
+    cleanup_key = (upload_id, 'user')
+    cleanup_registry = {}
+    mount_dir = tmp_path / 'user' / 'file_mounts'
+
+    with mock.patch.object(file_mount_uploads, 'upload_ids_to_cleanup',
+                           cleanup_registry), \
+         mock.patch.object(file_mount_uploads.time,
+                           'monotonic', side_effect=[100.0, 3701.0]), \
+         mock.patch.object(file_mount_uploads,
+                           '_prepare_client_mount_dir',
+                           new=mock.AsyncMock(return_value=mount_dir)), \
+         mock.patch.object(file_mount_uploads,
+                           '_receive_and_assemble_chunks',
+                           new=mock.AsyncMock(return_value=None)), \
+         mock.patch.object(file_mount_uploads.common,
+                           'API_SERVER_CLIENT_DIR', tmp_path), \
+         mock.patch.object(
+             file_mount_uploads.asyncio,
+             'sleep',
+             new=mock.AsyncMock(side_effect=[None, asyncio.CancelledError()])):
+        await server.upload_zip_file(types.SimpleNamespace(), 'user', upload_id,
+                                     0, 1)
+        assert cleanup_registry[cleanup_key] == 3700.0
+
+        with pytest.raises(asyncio.CancelledError):
+            await file_mount_uploads.cleanup_upload_ids()
+
+    assert cleanup_key not in cleanup_registry
+
+
+@pytest.mark.asyncio
 async def test_upload_blob_publishes_extracted_content(tmp_path):
     blob_id = 'b' * 64
 
