@@ -51,6 +51,67 @@ _DROP_TABLE_NAMES = (
     'container_image_profile_revisions',
     'container_image_catalog',
 )
+_CLUSTER_BINDING_COLUMN_NAMES = (
+    'container_image_binding_known',
+    'container_image_consumer_kind',
+    'container_image_consumer_owner',
+)
+
+_SCHEMA_SHAPE_QUERIES = {
+    'columns': """SELECT table_name, column_name, ordinal_position,
+                         data_type, udt_schema, udt_name, is_nullable,
+                         column_default, is_generated, generation_expression,
+                         is_identity, identity_generation, collation_name,
+                         character_maximum_length, numeric_precision,
+                         numeric_scale
+                  FROM information_schema.columns
+                  WHERE table_schema = :schema
+                    AND table_name = ANY(CAST(:table_names AS TEXT[]))
+                  ORDER BY table_name, ordinal_position""",
+    'constraints': """SELECT relation.relname, constraint_row.conname,
+                             constraint_row.contype,
+                             constraint_row.convalidated,
+                             constraint_row.condeferrable,
+                             constraint_row.condeferred,
+                             pg_get_constraintdef(constraint_row.oid, false)
+                      FROM pg_constraint AS constraint_row
+                      JOIN pg_class AS relation
+                        ON relation.oid = constraint_row.conrelid
+                      JOIN pg_namespace AS namespace
+                        ON namespace.oid = relation.relnamespace
+                      WHERE namespace.nspname = :schema
+                        AND relation.relname = ANY(
+                            CAST(:table_names AS TEXT[]))
+                      ORDER BY relation.relname, constraint_row.conname""",
+    'indexes': """SELECT table_relation.relname, index_relation.relname,
+                         index_row.indisunique, index_row.indisprimary,
+                         index_row.indisvalid, index_row.indisready,
+                         index_row.indislive,
+                         pg_get_indexdef(index_relation.oid, 0, false)
+                  FROM pg_index AS index_row
+                  JOIN pg_class AS table_relation
+                    ON table_relation.oid = index_row.indrelid
+                  JOIN pg_class AS index_relation
+                    ON index_relation.oid = index_row.indexrelid
+                  JOIN pg_namespace AS namespace
+                    ON namespace.oid = table_relation.relnamespace
+                  WHERE namespace.nspname = :schema
+                    AND table_relation.relname = ANY(
+                        CAST(:table_names AS TEXT[]))
+                  ORDER BY table_relation.relname, index_relation.relname""",
+}
+
+_CLUSTER_BINDING_SHAPE_QUERY = """SELECT column_name, data_type, udt_schema,
+                         udt_name, is_nullable, column_default, is_generated,
+                         generation_expression, is_identity,
+                         identity_generation, collation_name,
+                         character_maximum_length, numeric_precision,
+                         numeric_scale
+                  FROM information_schema.columns
+                  WHERE table_schema = :schema
+                    AND table_name = 'clusters'
+                    AND column_name = ANY(CAST(:column_names AS TEXT[]))
+                  ORDER BY column_name"""
 
 
 def _lock_migration() -> None:
@@ -97,6 +158,177 @@ def _drop_cluster_binding_columns() -> None:
                                             'container_image_consumer_kind')
     db_utils.drop_column_from_table_alembic('clusters',
                                             'container_image_binding_known')
+
+
+def _cluster_binding_shape(
+    bind: sqlalchemy.engine.Connection,
+    schema_name: str,
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row) for row in bind.execute(
+            sqlalchemy.text(_CLUSTER_BINDING_SHAPE_QUERY), {
+                'schema': schema_name,
+                'column_names': list(_CLUSTER_BINDING_COLUMN_NAMES),
+            }).all())
+
+
+def _validate_cluster_binding_columns(bind: sqlalchemy.engine.Connection,
+                                      schema_name: str) -> None:
+    """Compares adopted cluster columns with the migration's literal DDL."""
+    actual = _cluster_binding_shape(bind, schema_name)
+    original_search_path = bind.execute(
+        sqlalchemy.text("SELECT current_setting('search_path')")).scalar_one()
+    reference_schema = None
+    try:
+        bind.execute(
+            sqlalchemy.text(
+                "SELECT set_config('search_path', 'pg_temp', true)"))
+        bind.exec_driver_sql('CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+        _add_cluster_binding_columns(bind)
+        reference_schema = bind.execute(
+            sqlalchemy.text("""SELECT namespace.nspname
+                 FROM pg_namespace AS namespace
+                 WHERE namespace.oid = pg_my_temp_schema()""")).scalar_one()
+        expected = _cluster_binding_shape(bind, str(reference_schema))
+    finally:
+        bind.execute(
+            sqlalchemy.text("SELECT set_config('search_path', :path, true)"),
+            {'path': original_search_path})
+        if reference_schema is not None:
+            qualified = _qualified_name(bind, str(reference_schema), 'clusters')
+            bind.exec_driver_sql(f'DROP TABLE IF EXISTS {qualified} CASCADE')
+    if expected != actual:
+        raise RuntimeError(
+            'Migration 024 found structurally incompatible cluster binding '
+            f'columns: expected={expected!r}; actual={actual!r}.')
+
+
+def _normalize_schema_reference(value: object, schema_name: str) -> object:
+    if not isinstance(value, str):
+        return value
+    quoted_schema = f'"{schema_name.replace(chr(34), chr(34) * 2)}"'
+    normalized = value.replace(f'{quoted_schema}.',
+                               '<schema>.').replace(f'{schema_name}.',
+                                                    '<schema>.')
+    if schema_name.startswith('pg_temp_'):
+        normalized = normalized.replace('"pg_temp".', '<schema>.').replace(
+            'pg_temp.', '<schema>.')
+    return normalized
+
+
+def _schema_shape(
+    bind: sqlalchemy.engine.Connection,
+    schema_name: str,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    params = {
+        'schema': schema_name,
+        'table_names': list(_TABLE_NAMES),
+    }
+    return {
+        section: tuple(
+            tuple(
+                _normalize_schema_reference(value, schema_name)
+                for value in row)
+            for row in bind.execute(sqlalchemy.text(query), params).all()
+        ) for section, query in _SCHEMA_SHAPE_QUERIES.items()
+    }
+
+
+def _schema_mismatch_details(
+    expected: dict[str, tuple[tuple[object, ...], ...]],
+    actual: dict[str, tuple[tuple[object, ...], ...]],
+) -> str:
+    details = []
+    for section in _SCHEMA_SHAPE_QUERIES:
+        expected_rows = {tuple(row[:2]): row for row in expected[section]}
+        actual_rows = {tuple(row[:2]): row for row in actual[section]}
+        missing = sorted(set(expected_rows).difference(actual_rows))
+        unexpected = sorted(set(actual_rows).difference(expected_rows))
+        changed = sorted(
+            key for key in set(expected_rows).intersection(actual_rows)
+            if expected_rows[key] != actual_rows[key])
+        parts = []
+        for label, keys in (('missing', missing), ('unexpected', unexpected),
+                            ('changed', changed)):
+            if keys:
+                rendered = ','.join(
+                    '.'.join(str(value) for value in key) for key in keys)
+                parts.append(f'{label}={rendered}')
+        if changed:
+            first = changed[0]
+            parts.append(f'first_changed_expected={expected_rows[first]!r}')
+            parts.append(f'first_changed_actual={actual_rows[first]!r}')
+        if parts:
+            details.append(f'{section}[{"; ".join(parts)}]')
+    return '; '.join(details)
+
+
+def _qualified_name(bind: sqlalchemy.engine.Connection, schema_name: str,
+                    table_name: str) -> str:
+    preparer = bind.dialect.identifier_preparer
+    return (f'{preparer.quote_schema(schema_name)}.'
+            f'{preparer.quote(table_name)}')
+
+
+def _validate_catalog_singleton(bind: sqlalchemy.engine.Connection,
+                                schema_name: str) -> None:
+    catalog_name = _qualified_name(bind, schema_name, 'container_image_catalog')
+    rows = bind.execute(
+        sqlalchemy.text(
+            f'SELECT id, authority_id, created_at FROM {catalog_name}')).all()
+    valid = (len(rows) == 1 and rows[0][0] == _CATALOG_ROW_ID and
+             bool(rows[0][1]) and isinstance(rows[0][2], int) and
+             rows[0][2] > 0)
+    if valid:
+        try:
+            uuid.UUID(str(rows[0][1]))
+        except ValueError:
+            valid = False
+    if not valid:
+        raise RuntimeError(
+            'Migration 024 preview adoption requires exactly one catalog '
+            'authority row with the expected ID, a UUID authority, and a '
+            'positive creation time.')
+
+
+def _drop_reference_tables(bind: sqlalchemy.engine.Connection,
+                           schema_name: str) -> None:
+    for table_name in _DROP_TABLE_NAMES:
+        qualified = _qualified_name(bind, schema_name, table_name)
+        bind.exec_driver_sql(f'DROP TABLE IF EXISTS {qualified} CASCADE')
+
+
+def _validate_preview_schema(bind: sqlalchemy.engine.Connection,
+                             schema_name: str) -> None:
+    """Compares preview state with this migration's literal PostgreSQL DDL."""
+    actual = _schema_shape(bind, schema_name)
+    original_search_path = bind.execute(
+        sqlalchemy.text("SELECT current_setting('search_path')")).scalar_one()
+    reference_schema = None
+    try:
+        bind.execute(
+            sqlalchemy.text(
+                "SELECT set_config('search_path', 'pg_temp', true)"))
+        # Unqualified CREATE TABLE in pg_temp creates transaction-local
+        # temporary tables. This needs no database-level CREATE SCHEMA grant.
+        _create_tables()
+        reference_schema = bind.execute(
+            sqlalchemy.text("""SELECT namespace.nspname
+                 FROM pg_namespace AS namespace
+                 WHERE namespace.oid = pg_my_temp_schema()""")).scalar_one()
+        expected = _schema_shape(bind, str(reference_schema))
+    finally:
+        bind.execute(
+            sqlalchemy.text("SELECT set_config('search_path', :path, true)"),
+            {'path': original_search_path})
+        if reference_schema is not None:
+            _drop_reference_tables(bind, str(reference_schema))
+    mismatch = _schema_mismatch_details(expected, actual)
+    if mismatch:
+        raise RuntimeError(
+            'Migration 024 found structurally incompatible managed image '
+            f'preview state: {mismatch}.')
+    _validate_catalog_singleton(bind, schema_name)
 
 
 def _create_tables() -> None:
@@ -863,18 +1095,36 @@ def upgrade():
     _add_cluster_binding_columns(bind)
     if not is_postgres:
         return
+    schema_name = bind.execute(
+        sqlalchemy.text('SELECT current_schema()')).scalar_one_or_none()
+    if not schema_name:
+        raise RuntimeError(
+            'Migration 024 could not identify the managed image schema.')
+    _validate_cluster_binding_columns(bind, str(schema_name))
     existing_tables = set(sqlalchemy.inspect(bind).get_table_names())
-    existing_image_tables = existing_tables.intersection(_TABLE_NAMES)
+    existing_image_tables = {
+        table_name for table_name in existing_tables
+        if table_name.startswith('container_image')
+    }
     if existing_image_tables:
         missing_tables = set(_TABLE_NAMES).difference(existing_image_tables)
-        if missing_tables:
-            missing = ', '.join(sorted(missing_tables))
+        unexpected_tables = existing_image_tables.difference(_TABLE_NAMES)
+        if missing_tables or unexpected_tables:
+            details = []
+            if missing_tables:
+                details.append('missing tables: ' +
+                               ', '.join(sorted(missing_tables)))
+            if unexpected_tables:
+                details.append('unexpected tables: ' +
+                               ', '.join(sorted(unexpected_tables)))
             raise RuntimeError(
-                'Migration 024 found incomplete managed image state; missing '
-                f'tables: {missing}.')
+                'Migration 024 found incomplete managed image state; ' +
+                '; '.join(details) + '.')
         # A preview database stamped with the former image revision 023 has
-        # already applied this exact image schema. Revision 024 adopts it after
-        # creating the base revision 023 auth table above.
+        # already applied this exact image schema. Compare it with a temporary
+        # reference built from this migration's literal DDL before adopting it.
+        # Revision 024 then creates the base revision 023 auth table above.
+        _validate_preview_schema(bind, str(schema_name))
         return
     _create_tables()
     bind.execute(

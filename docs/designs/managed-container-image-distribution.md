@@ -1058,7 +1058,18 @@ The shared auth-session migration merged first at revision 023, which was also
 the revision used by managed-image preview deployments. Revision 024 therefore
 creates the literal `auth_sessions` predecessor table when it is absent and
 adopts an already-complete preview image schema instead of replaying its DDL.
-Partial image schemas fail closed. Downgrade 024 never drops `auth_sessions`.
+Before adoption, it creates the same literal image DDL in the connection's
+transaction-local `pg_temp` namespace and compares the exact owned table set,
+column order/types/nullability/defaults/generated expressions, constraints and
+validation flags, foreign keys, and complete index definitions and validity
+flags on the same PostgreSQL server. The same literal-reference check covers
+the type, nullability, and default of the three adopted cluster-binding
+columns. It also requires exactly one catalog row with the fixed singleton ID,
+a UUID authority, and a positive creation time. The reference tables are
+discarded before adoption. This imports no live ORM metadata and requires no
+database-level `CREATE SCHEMA` grant. Missing, extra, or structurally different
+preview state fails closed in the migration transaction. Downgrade 024 never
+drops `auth_sessions`.
 
 ## Registry profiles
 
@@ -1989,8 +2000,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 ### Required verification
 
 - real PostgreSQL migration, concurrency, lease, retry, and downgrade tests;
-- fresh-through-024 and literal 023-to-024 schema equivalence, concurrent
-  migration-lock, and mixed-023/024 feature-disabled tests;
+- fresh-through-024 and literal 023-to-024 exact schema equivalence, preview
+  adoption rejection for table, column, default, generated-expression,
+  cluster-binding-column, constraint, foreign-key, index, and catalog-singleton
+  drift, concurrent migration-lock, and mixed-023/024 feature-disabled tests;
 - old-server/new-client and new-server/old-client feature-gate tests;
 - API 61/62 behavior across launch/exec, jobs, Serve up/update, pools, nested DAGs,
   resource alternatives, forged private fields, and request config overrides;
@@ -2467,3 +2480,15 @@ addresses before convergence. Fable also observed an exact-head AWS adaptor
 memory check failure. The public image SDK facade is now lazy, and a clean
 subprocess regression test prevents its client and API model graph from loading
 during ordinary `import sky`.
+
+The parallel final-acceptance attempt at
+`24431c27d9e4201aba906c561715d6d440b1bbbe` was halted with the streak at zero
+when an independent Codex round returned `RESHAPE`. It proved that revision 024
+treated the presence of all owned table names as an exact preview schema without
+checking columns, constraints, generated expressions, indexes, or catalog data.
+This revision adds the transaction-local literal `pg_temp` comparison and UUID
+singleton proof described above. Real PostgreSQL mutation tests retain every
+table name while independently changing a column type, named check constraint,
+named index, and generated expression; further cases cover missing and extra
+tables, changed cluster-binding columns, and invalid or non-singleton catalog
+state. Each case must fail atomically before preview adoption.

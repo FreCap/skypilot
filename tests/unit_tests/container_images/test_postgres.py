@@ -4851,7 +4851,11 @@ def _schema_shape(engine: sqlalchemy.engine.Engine,
     with engine.connect() as connection:
         columns = connection.execute(
             sqlalchemy.text("""SELECT table_name, column_name, ordinal_position,
-                          data_type, udt_name, is_nullable, column_default
+                          data_type, udt_schema, udt_name, is_nullable,
+                          column_default, is_generated, generation_expression,
+                          is_identity, identity_generation, collation_name,
+                          character_maximum_length, numeric_precision,
+                          numeric_scale
                    FROM information_schema.columns
                    WHERE table_schema = :schema
                      AND table_name LIKE 'container_image%'
@@ -4860,7 +4864,9 @@ def _schema_shape(engine: sqlalchemy.engine.Engine,
             }).all()
         constraints = connection.execute(
             sqlalchemy.text("""SELECT relation.relname, constraint_row.conname,
-                          constraint_row.contype,
+                          constraint_row.contype, constraint_row.convalidated,
+                          constraint_row.condeferrable,
+                          constraint_row.condeferred,
                           pg_get_constraintdef(constraint_row.oid, true)
                    FROM pg_constraint AS constraint_row
                    JOIN pg_class AS relation
@@ -4873,20 +4879,36 @@ def _schema_shape(engine: sqlalchemy.engine.Engine,
                 'schema': schema_name
             }).all()
         indexes = connection.execute(
-            sqlalchemy.text("""SELECT tablename, indexname, indexdef
-                   FROM pg_indexes
-                   WHERE schemaname = :schema
-                     AND tablename LIKE 'container_image%'
-                   ORDER BY tablename, indexname"""), {
+            sqlalchemy.text("""SELECT table_relation.relname,
+                          index_relation.relname, index_row.indisunique,
+                          index_row.indisprimary, index_row.indisvalid,
+                          index_row.indisready, index_row.indislive,
+                          pg_get_indexdef(index_relation.oid, 0, false)
+                   FROM pg_index AS index_row
+                   JOIN pg_class AS table_relation
+                     ON table_relation.oid = index_row.indrelid
+                   JOIN pg_class AS index_relation
+                     ON index_relation.oid = index_row.indexrelid
+                   JOIN pg_namespace AS namespace
+                     ON namespace.oid = table_relation.relnamespace
+                   WHERE namespace.nspname = :schema
+                     AND table_relation.relname LIKE 'container_image%'
+                   ORDER BY table_relation.relname,
+                            index_relation.relname"""), {
                 'schema': schema_name
             }).all()
-    normalized_indexes = [(table, name,
-                           definition.replace(f'{schema_name}.', '<schema>.'))
-                          for table, name, definition in indexes]
+
+    def normalize(row: Any) -> tuple[Any, ...]:
+        quoted_schema = f'"{schema_name}"'
+        return tuple(
+            value.replace(f'{quoted_schema}.', '<schema>.').
+            replace(f'{schema_name}.', '<schema>.'
+                   ) if isinstance(value, str) else value for value in row)
+
     return {
-        'columns': [tuple(row) for row in columns],
-        'constraints': [tuple(row) for row in constraints],
-        'indexes': normalized_indexes,
+        'columns': [normalize(row) for row in columns],
+        'constraints': [normalize(row) for row in constraints],
+        'indexes': [normalize(row) for row in indexes],
     }
 
 
@@ -4977,6 +4999,104 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
                 f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
             connection.exec_driver_sql(
                 f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
+
+
+@pytest.mark.parametrize(('mutations', 'expected_error'), [
+    pytest.param(("ALTER TABLE container_images ALTER COLUMN builder_version "
+                  "TYPE VARCHAR(64)",),
+                 'structurally incompatible.*columns',
+                 id='changed-column-type'),
+    pytest.param(('ALTER TABLE container_image_workers ALTER COLUMN in_flight '
+                  'SET DEFAULT 1',),
+                 'structurally incompatible.*columns',
+                 id='changed-column-default'),
+    pytest.param(('ALTER TABLE clusters ALTER COLUMN '
+                  'container_image_binding_known TYPE BIGINT',),
+                 'structurally incompatible cluster binding columns',
+                 id='changed-cluster-binding-column-type'),
+    pytest.param(('ALTER TABLE clusters ALTER COLUMN '
+                  'container_image_binding_known SET DEFAULT 1',),
+                 'structurally incompatible cluster binding columns',
+                 id='changed-cluster-binding-column-default'),
+    pytest.param(('ALTER TABLE container_images DROP CONSTRAINT '
+                  'ck_container_images_nonnegative_sizes',
+                  'ALTER TABLE container_images ADD CONSTRAINT '
+                  'ck_container_images_nonnegative_sizes CHECK '
+                  '(manifest_size_bytes >= -1 AND declared_size_bytes >= 0)'),
+                 'structurally incompatible.*constraints',
+                 id='changed-check-constraint'),
+    pytest.param(('ALTER TABLE container_image_workers DROP CONSTRAINT '
+                  'container_image_workers_grant_budget_id_fkey',
+                  'ALTER TABLE container_image_workers ADD CONSTRAINT '
+                  'container_image_workers_grant_budget_id_fkey FOREIGN KEY '
+                  '(grant_budget_id) REFERENCES '
+                  'container_image_provider_budgets(id) ON DELETE CASCADE'),
+                 'structurally incompatible.*constraints',
+                 id='changed-foreign-key'),
+    pytest.param(('DROP INDEX ix_container_images_workspace_created',
+                  'CREATE INDEX ix_container_images_workspace_created '
+                  'ON container_images (workspace, id)'),
+                 'structurally incompatible.*indexes',
+                 id='changed-index-definition'),
+    pytest.param(
+        ('ALTER TABLE container_image_locations DROP COLUMN '
+         'copy_claimable_at CASCADE',
+         'ALTER TABLE container_image_locations ADD COLUMN '
+         'copy_claimable_at BIGINT GENERATED ALWAYS AS '
+         "(CASE WHEN state = 'PENDING' THEN updated_at ELSE NULL END) "
+         'STORED', 'CREATE INDEX ix_container_image_locations_copy_pending ON '
+         'container_image_locations (shard_id, copy_claimable_at, id) '
+         "WHERE state = 'PENDING'",
+         'CREATE INDEX ix_container_image_locations_copy_recovery ON '
+         'container_image_locations (shard_id, copy_claimable_at, id) '
+         "WHERE state IN ('COPYING', 'VERIFYING')"),
+        'structurally incompatible.*columns',
+        id='changed-generated-expression'),
+    pytest.param(('DROP TABLE container_image_workers',),
+                 'incomplete managed image state; missing tables',
+                 id='missing-table'),
+    pytest.param(('CREATE TABLE container_image_preview_legacy (id TEXT)',),
+                 'incomplete managed image state; unexpected tables',
+                 id='unexpected-table'),
+    pytest.param(
+        ("UPDATE container_image_catalog SET authority_id = 'invalid'",),
+        'requires exactly one catalog authority row',
+        id='invalid-authority-uuid'),
+    pytest.param(("INSERT INTO container_image_catalog "
+                  "(id, authority_id, created_at) VALUES "
+                  "('extra', '00000000-0000-4000-8000-000000000002', 1)",),
+                 'requires exactly one catalog authority row',
+                 id='extra-catalog-row'),
+])
+def test_migration_024_preview_adoption_requires_exact_schema(
+        postgres_engine, mutations: tuple[str, ...],
+        expected_error: str) -> None:
+    preview_schema = f'image_preview_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {preview_schema}')
+    preview_engine = _schema_engine(postgres_engine, preview_schema)
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    try:
+        with preview_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+        _migration_call(preview_engine, migration_024.upgrade)
+        with preview_engine.begin() as connection:
+            connection.exec_driver_sql('DROP TABLE auth_sessions')
+            for statement in mutations:
+                connection.exec_driver_sql(statement)
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            _migration_call(preview_engine, migration_024.upgrade)
+        # The failed adoption transaction must not leave the predecessor table
+        # or other migration writes behind.
+        assert not sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
+    finally:
+        preview_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {preview_schema} CASCADE')
 
 
 def test_migration_024_adds_auth_and_cluster_binding_columns_to_sqlite(
