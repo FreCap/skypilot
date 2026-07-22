@@ -283,6 +283,29 @@ def test_managed_image_locality_wins_across_resource_alternatives():
     assert launchable[warming_request] == []
 
 
+@pytest.mark.parametrize(
+    ('declared_eks', 'provider', 'backend'),
+    ((True, 'aws', 'aws_eks'), (False, 'kubernetes', 'direct')))
+def test_kubernetes_image_placement_requires_declared_eks_context(
+        declared_eks, provider, backend):
+    resource = types.SimpleNamespace(cloud=clouds.Kubernetes(),
+                                     region='boltz-west',
+                                     container_image=mock.sentinel.image,
+                                     instance_type=None,
+                                     image_id=None)
+    with mock.patch.object(
+            optimizer_candidate_generation.container_image_config,
+            'is_declared_managed_eks_context',
+            return_value=declared_eks) as classify:
+        placement = optimizer_candidate_generation._managed_image_placement(  # pylint: disable=protected-access
+            resource, 'research')
+
+    assert placement.provider == provider
+    assert placement.backend == backend
+    classify.assert_called_once_with(mock.sentinel.image, 'boltz-west',
+                                     'research')
+
+
 def _optimize_ordered_task_with_mock_launchable(dag, launchable_call_indexes):
     fill_calls = []
 

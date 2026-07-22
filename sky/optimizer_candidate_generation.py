@@ -15,6 +15,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.clouds import cloud as sky_cloud
+from sky.container_images import config as container_image_config
 from sky.container_images import models as container_image_models
 from sky.container_images import runtime as container_image_runtime
 from sky.skylet import constants as skylet_constants
@@ -30,7 +31,9 @@ _PerCloudCandidates = dict[clouds.Cloud, list[resources_lib.Resources]]
 
 
 def _managed_image_placement(
-        resources: resources_lib.Resources) -> container_image_models.Placement:
+    resources: resources_lib.Resources,
+    workspace: str,
+) -> container_image_models.Placement:
     cloud = resources.cloud
     assert cloud is not None, resources
     assert resources.region is not None, resources
@@ -38,8 +41,15 @@ def _managed_image_placement(
         provider = 'aws'
         backend = 'aws_vm'
     elif isinstance(cloud, clouds.Kubernetes):
-        provider = 'aws'
-        backend = 'aws_eks'
+        image = resources.container_image
+        assert image is not None, resources
+        if container_image_config.is_declared_managed_eks_context(
+                image, resources.region, workspace):
+            provider = 'aws'
+            backend = 'aws_eks'
+        else:
+            provider = 'kubernetes'
+            backend = 'direct'
     else:
         provider = str(cloud).lower()
         backend = 'direct'
@@ -72,7 +82,7 @@ def _prepare_managed_image_candidates(
                  skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
     prepared = []
     for candidate in candidates:
-        placement = _managed_image_placement(candidate)
+        placement = _managed_image_placement(candidate, workspace)
         result = container_image_runtime.prepare_metadata_only_with_rank(
             candidate, placement, workspace, cache)
         if result is not None:

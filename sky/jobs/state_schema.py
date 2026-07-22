@@ -67,6 +67,8 @@ spot_table = sqlalchemy.Table(
     # the underlying job lifecycle. NULL means "no override".
     sqlalchemy.Column('status_override', sqlalchemy.Text, server_default=None),
 )
+sqlalchemy.Index('ix_spot_job_task', spot_table.c.spot_job_id,
+                 spot_table.c.task_id)
 
 job_info_table = sqlalchemy.Table(
     'job_info',

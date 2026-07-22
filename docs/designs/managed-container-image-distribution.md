@@ -319,9 +319,23 @@ may restrict `allowed_profiles` and choose:
   a known artifact location warms; or
 - `direct` or absence of image policy: preserve direct behavior.
 
-Locality is `prefer`, `require`, or `canonical` only for managed selection.
-`distribution: direct` is allowed under `direct` or `managed_preferred`, never
-under `managed_required`.
+Locality is `prefer`, `require`, or `canonical` only for managed selection. On a
+placement with a supported managed runtime binding, `distribution: direct` is
+allowed under `direct` or `managed_preferred`, never under `managed_required`.
+
+Managed policy applies only after the selected placement is proven to use a
+supported managed runtime binding. An exact request-supplied digest `ref` on
+GCP, Nebius, generic Kubernetes, or another unsupported runtime keeps direct OCI
+behavior even when the workspace is `managed_required`; a `release` or
+`artifact_id` selector still fails closed because it has no direct identity.
+In a `direct` workspace these unsupported candidates keep the ordinary direct
+locality rank, so enabling this code does not bias a multicloud optimization
+toward AWS. Under a managed policy they form the direct fallback class behind a
+READY qualified managed route.
+Kubernetes is classified as managed EKS only when its exact selected context is
+declared by an active EKS binding and that binding qualifies the cluster ARN,
+node role, namespace, and node selector. A Kubernetes placement is never
+inferred to be EKS merely because it uses the Kubernetes cloud abstraction.
 
 The workspace opt-in is explicit configuration, not task YAML:
 
@@ -542,9 +556,14 @@ An ECR destination claim executes this fenced algorithm:
    acquiring destination authority. The lease heartbeat is active before source
    credential acquisition or network reads. Generic OCI inspection remains
    read-only. The exact durable lease is re-proved before and after credential
-   resolution and every HTTP request, and before each streamed response chunk
-   leaves the adapter. Lease loss closes the response immediately; destination
-   authority cannot be acquired after that source work loses its lease. Managed
+   resolution and every HTTP request, immediately before advancing each streamed
+   response iterator, and immediately after that blocking advance returns. A
+   source stream is acquired only after the final destination-exists check and is
+   explicitly closed on every early return and exception. Lease loss closes the
+   response immediately; destination authority cannot be acquired after that
+   source work loses its lease. The terminal `StopIteration` advance is fenced
+   after it returns too, before completed source bytes can drive a destination
+   write. Managed
    regional-source ECR credential acquisition, SDK calls, signed download-URL
    issuance, and each downloaded chunk are synchronously fenced by the exact
    lease. Both generic registry and signed ECR downloads use the same no-proxy,
@@ -628,6 +647,8 @@ binds the selected cluster and node pool to the attestation instead of proving
 one fortuitously scheduled canary node. `managed_required` fails closed on a
 mismatch, while
 `managed_preferred` may use only its otherwise-authorized direct digest path.
+An unbound Kubernetes context is a generic Kubernetes placement and may use only
+an exact direct digest ref; managed release or artifact selectors cannot use it.
 
 Before optimization, the execution path derives one restart-stable logical
 consumer identity and loads its current live demand from PostgreSQL. A live
@@ -1028,6 +1049,16 @@ claim transaction. Completion validates the applicable random lease token after
 acquiring the row lock and reading the current clock. Terminal publication
 history, idle shards, and future inventory epochs are absent from these hot
 claim indexes rather than filtered after a global sort.
+Operational reads follow the same rule. ACTIVE/QUALIFYING profile readiness,
+live and terminal demand pages, expired reservations, canonical publication
+fan-out, worker heartbeat cleanup, and state-filtered workspace publication
+history each use an exact partial or composite index matching their predicate
+and ordering. Inventory matching has a shard-and-runtime-digest lookup index.
+Cross-state pages use one matching partial index for the precise state set or a
+fixed number of per-state indexed heads followed by an in-memory bounded merge;
+they never sort the full table to return a bounded page. Canonical completion
+drives fan-out from indexed PENDING publications rather than globally scanning
+READY locations.
 Global eviction discovery orders the oldest eligible location per shard, then
 locks the shard itself with `SKIP LOCKED` before selecting its location. A busy
 oldest shard therefore cannot stop independent shards, while the shard-before-
@@ -1090,11 +1121,19 @@ a UUID authority, and a positive creation time. The reference tables are
 discarded before adoption. This imports no live ORM metadata and requires no
 database-level `CREATE SCHEMA` grant. Missing, extra, or structurally different
 preview state fails closed in the migration transaction. Downgrade 024 never
-drops `auth_sessions`. Preview builds predated the workspace-publication history
-index; adoption may create only that exact known-safe index before comparison.
-A missing index is added transactionally, a malformed same-name index still
-fails exact comparison, and every adoption write rolls back with any other
-drift.
+drops `auth_sessions`. Preview builds predated a fixed allowlist of read-only
+performance indexes introduced before release. Adoption may create only those
+literal known-safe indexes before comparison. A missing allowlisted index is
+added transactionally, a malformed same-name index still fails exact comparison,
+and every adoption write rolls back with any other drift.
+
+The revision-024 Helm Job cannot coordinate with an old binary whose migration
+path predates the PostgreSQL advisory lock. It therefore permits a fresh empty
+database or a database already at revision 023 or later, and fails without DDL
+when a nonempty database is unversioned or below 023. Operators first stage such
+a deployment through revision 023, drain binaries older than 023, and only then
+run the 024 Job. New Job and `auto` processes share the advisory lock once every
+participant is at least revision 023.
 
 ## Registry profiles
 
@@ -1984,11 +2023,17 @@ CLI or Dashboard locates such a publication for explicit retry.
    normal chart resource rather than a hook, so chart-managed database Secrets
    exist before it starts and Helm adds no hook wait to deployment latency. API
    pods start concurrently in `verify` mode, refuse to serve below 024, and
-   become ready after the Job commits. The Job and transitional old `auto` pods
-   share the same cross-host PostgreSQL advisory lock, so only one Alembic
-   process can mutate the schema. Disabling `databaseMigration` explicitly keeps
-   the lock-protected `auto` fallback for local or operator-owned migration
-   workflows.
+   become ready after the Job commits. For a nonempty database below 023, first
+   deploy revision 023 and drain every older binary; the 024 Job refuses that
+   unsafe starting state. From revision 023 onward, the Job and transitional
+   `auto` pods share the same cross-host PostgreSQL advisory lock, so only one
+   Alembic process can mutate the schema. A genuinely empty database may upgrade
+   directly. Disabling `databaseMigration` explicitly keeps the lock-protected
+   `auto` fallback for local or operator-owned migration workflows.
+   Ordinary request completion checks the central database dialect before
+   issuing a cluster-image terminal hint. A local SQLite API therefore performs
+   no managed-image query and emits no PostgreSQL-only warning when the feature
+   is unavailable.
 3. While old 023 API replicas still serve traffic, confirm they ignore the
    additive 024 tables. Roll every API replica to the new binary, then prove no
    old pod remains before feature activation.
@@ -2029,6 +2074,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   causes cloud or region failover.
 - `IMAGE_WARMING` survives API and controller restart with the same consumer
   generation, profile revision, target, and location.
+- Terminal job-task and Serve-version reconciliation issues exact bounded tuple
+  lookups; unrelated task, version, or replica history is never loaded and
+  filtered in Python.
 - Copy crashes before and after manifest publication converge to one verified
   digest.
 - At 1,000 replicas and eight GPUs per node, copy cardinality equals requested
@@ -2078,7 +2126,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   off-authority bearer realms, private and chained redirects, disabled token
   redirects, absent proxy inheritance, credential non-forwarding, streamed
   token/manifest size ceilings, pre/post-request lease fencing, and lease loss
-  during both generic registry and signed ECR chunk streaming;
+  during both generic registry and signed ECR chunk streaming, including loss
+  immediately before a blocking iterator advance and destination-race paths
+  that never acquire or leak a source response;
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
@@ -2098,8 +2148,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   batched token grants, hot/cold target no-starvation, throttling, count/byte
   ceilings, and empty failed-reservation reclamation tests;
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
-  inspection, copy-shard dispatch, and inventory claims use their exact partial
-  due-time indexes with large terminal or idle populations present;
+  inspection, copy-shard dispatch, inventory claims and runtime-digest matches,
+  readiness, live/terminal demand pages, expired reservations, canonical
+  publication fan-out, worker cleanup, and state-filtered history use their
+  exact indexes with large terminal or idle populations present;
 - workspace-publication history and operational-profile readiness scale fixtures
   proving the former uses its `(workspace, created_at, id)` keyset index and the
   latter uses both ACTIVE and QUALIFYING partial indexes despite more than 1,001
@@ -2116,7 +2168,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   interrupted terminal confirmation, one-shot request-terminal proof preserved
   across the pre-24-hour rotation, INIT-versus-reconciliation absent-row
   serialization, authoritative owner retirement, compaction, and unreachable
-  consumer stores;
+  consumer stores, plus query-shape and plan evidence that exact bounded job-task
+  and Serve-version tuples do not read unrelated history;
 - single AMD64 manifest, selected AMD64 index child, ambiguous/wrong platform,
   nested index, artifact, nondistributable/foreign layer, external URL, config
   platform, raw-byte digest, and size-bound reject-before-write tests;

@@ -33,14 +33,15 @@ MigrationMode = Literal['auto', 'upgrade', 'verify']
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
 GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions
+GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
-SPOT_JOBS_VERSION = '024'  # index shared managed-job API tokens
+SPOT_JOBS_VERSION = '025'  # exact managed-job task identity lookups
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '022'  # service workspace after exact-accelerator history
+SERVE_VERSION = '023'  # exact service-version replica lookups
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
@@ -101,6 +102,21 @@ def get_alembic_config(engine: sqlalchemy.engine.Engine,
     return alembic_cfg
 
 
+def get_current_alembic_revision(
+    engine: sqlalchemy.engine.Engine,
+    section: str,
+    alembic_ini_path: str | None = None,
+) -> str | None:
+    """Returns the current revision without creating or mutating schema."""
+    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
+    version_table = alembic_config.get_section_option(
+        alembic_config.config_ini_section, 'version_table', 'alembic_version')
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(
+            connection, opts={'version_table': version_table})
+        return context.get_current_revision()
+
+
 def needs_upgrade(engine: sqlalchemy.engine.Engine,
                   section: str,
                   target_revision: str,
@@ -114,17 +130,8 @@ def needs_upgrade(engine: sqlalchemy.engine.Engine,
         target_revision: Target revision to upgrade to (e.g., '001').
         alembic_ini_path: Optional path to a custom alembic.ini file.
     """
-    current_rev = None
-
-    # get alembic config for the given section
-    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
-    version_table = alembic_config.get_section_option(
-        alembic_config.config_ini_section, 'version_table', 'alembic_version')
-
-    with engine.connect() as connection:
-        context = migration.MigrationContext.configure(
-            connection, opts={'version_table': version_table})
-        current_rev = context.get_current_revision()
+    current_rev = get_current_alembic_revision(engine, section,
+                                               alembic_ini_path)
 
     target_rev_num = int(target_revision)
     if current_rev is None:
@@ -149,13 +156,8 @@ def verify_alembic_revision(engine: sqlalchemy.engine.Engine,
                             target_revision: str,
                             alembic_ini_path: str | None = None) -> None:
     """Refuses startup until another process has applied the target revision."""
-    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
-    version_table = alembic_config.get_section_option(
-        alembic_config.config_ini_section, 'version_table', 'alembic_version')
-    with engine.connect() as connection:
-        context = migration.MigrationContext.configure(
-            connection, opts={'version_table': version_table})
-        current_revision = context.get_current_revision()
+    current_revision = get_current_alembic_revision(engine, section,
+                                                    alembic_ini_path)
     if current_revision is None or int(current_revision) < int(target_revision):
         observed = current_revision or 'uninitialized'
         raise RuntimeError(
@@ -181,6 +183,34 @@ def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
             connection.execute(
                 sqlalchemy.text('SELECT pg_advisory_unlock(hashtext(:name))'),
                 {'name': lock_name})
+
+
+def _validate_global_user_state_upgrade_start(
+    engine: sqlalchemy.engine.Engine,
+    section: str,
+    target_revision: str,
+    alembic_ini_path: str | None,
+) -> None:
+    """Prevents revision 024 racing migration code that predates its lock."""
+    if (engine.dialect.name != 'postgresql' or
+            section != GLOBAL_USER_STATE_DB_NAME or
+            int(target_revision) < int(GLOBAL_USER_STATE_VERSION)):
+        return
+    current_revision = get_current_alembic_revision(engine, section,
+                                                    alembic_ini_path)
+    if (current_revision is not None and int(current_revision)
+            >= int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
+        return
+    table_names = sqlalchemy.inspect(engine).get_table_names()
+    if current_revision is None and not table_names:
+        return
+    observed = current_revision or 'uninitialized nonempty schema'
+    raise RuntimeError(
+        f'{section} database is at revision {observed}. Revision '
+        f'{target_revision} requires a staged upgrade through revision '
+        f'{GLOBAL_USER_STATE_JOB_MINIMUM_REVISION} before the migration job can '
+        'run. Drain older API binaries, complete that predecessor migration, '
+        'then retry the job.')
 
 
 def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
@@ -224,4 +254,6 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
                     # the same migration while this process was waiting.
                     if needs_upgrade(engine, section, target_revision,
                                      alembic_ini_path):
+                        _validate_global_user_state_upgrade_start(
+                            engine, section, target_revision, alembic_ini_path)
                         alembic_command.upgrade(alembic_config, target_revision)

@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 import dataclasses
 import enum
+import functools
 import hashlib
 import json
 import threading
@@ -970,9 +971,10 @@ class EcrRepository:
 
         def chunks() -> Iterator[bytes]:
             try:
-                self._fence()
-                for chunk in download.iter_content(chunk_size=1024 * 1024):
-                    self._fence()
+                for chunk in providers.iter_fenced_response_chunks(
+                        download,
+                        chunk_size=1024 * 1024,
+                        provider_fence=self._provider_fence):
                     yield chunk
             finally:
                 download.close()
@@ -987,9 +989,10 @@ class EcrRepository:
         download = self._download_response(descriptor.digest)
         payload = bytearray()
         try:
-            self._fence()
-            for chunk in download.iter_content(chunk_size=1024 * 1024):
-                self._fence()
+            for chunk in providers.iter_fenced_response_chunks(
+                    download,
+                    chunk_size=1024 * 1024,
+                    provider_fence=self._provider_fence):
                 payload.extend(chunk)
                 if len(payload) > max_bytes:
                     raise ValueError(
@@ -1056,61 +1059,68 @@ class EcrRepository:
             raise ValueError('OCI source blob bytes do not match descriptor.')
 
     def _upload_layer(self, descriptor: oci.OciDescriptor,
-                      chunks: Iterable[bytes],
+                      read_chunks: Callable[[], Iterable[bytes]],
                       cancel_event: threading.Event) -> None:
         if self._layers_present([descriptor.digest])[descriptor.digest]:
             return
+        chunks = read_chunks()
         try:
-            initiated = self._client.initiate_layer_upload(
-                repositoryName=self.repository_name)
-        except Exception as error:  # pylint: disable=broad-except
-            _classify(error)
-            raise AssertionError('unreachable') from error
-        upload_id = initiated['uploadId']
-        part = bytearray()
-        offset = 0
-
-        def upload(payload: bytes) -> None:
-            nonlocal offset
-            if not payload:
-                return
+            initiated: dict[str, Any] = {}
             try:
-                self._client.upload_layer_part(
+                initiated = self._client.initiate_layer_upload(
+                    repositoryName=self.repository_name)
+            except Exception as error:  # pylint: disable=broad-except
+                _classify(error)
+                raise AssertionError('unreachable') from error
+            upload_id = initiated['uploadId']
+            part = bytearray()
+            offset = 0
+
+            def upload(payload: bytes) -> None:
+                nonlocal offset
+                if not payload:
+                    return
+                try:
+                    self._client.upload_layer_part(
+                        repositoryName=self.repository_name,
+                        uploadId=upload_id,
+                        partFirstByte=offset,
+                        partLastByte=offset + len(payload) - 1,
+                        layerPartBlob=payload)
+                except Exception as error:  # pylint: disable=broad-except
+                    try:
+                        _classify(error)
+                    except AmbiguousProviderOutcomeError:
+                        if self._layers_present([descriptor.digest
+                                                ])[descriptor.digest]:
+                            return
+                        raise
+                offset += len(payload)
+
+            try:
+                for chunk in self._verified_chunks(chunks, descriptor,
+                                                   cancel_event):
+                    part.extend(chunk)
+                    while len(part) >= _UPLOAD_PART_BYTES:
+                        payload = bytes(part[:_UPLOAD_PART_BYTES])
+                        del part[:_UPLOAD_PART_BYTES]
+                        upload(payload)
+                upload(bytes(part))
+                self._client.complete_layer_upload(
                     repositoryName=self.repository_name,
                     uploadId=upload_id,
-                    partFirstByte=offset,
-                    partLastByte=offset + len(payload) - 1,
-                    layerPartBlob=payload)
+                    layerDigests=[descriptor.digest])
             except Exception as error:  # pylint: disable=broad-except
-                try:
-                    _classify(error)
-                except AmbiguousProviderOutcomeError:
-                    if self._layers_present([descriptor.digest
-                                            ])[descriptor.digest]:
-                        return
-                    raise
-            offset += len(payload)
-
-        try:
-            for chunk in self._verified_chunks(chunks, descriptor,
-                                               cancel_event):
-                part.extend(chunk)
-                while len(part) >= _UPLOAD_PART_BYTES:
-                    payload = bytes(part[:_UPLOAD_PART_BYTES])
-                    del part[:_UPLOAD_PART_BYTES]
-                    upload(payload)
-            upload(bytes(part))
-            self._client.complete_layer_upload(
-                repositoryName=self.repository_name,
-                uploadId=upload_id,
-                layerDigests=[descriptor.digest])
-        except Exception as error:  # pylint: disable=broad-except
-            if self._layers_present([descriptor.digest])[descriptor.digest]:
-                return
-            _classify(error)
-        if not self._layers_present([descriptor.digest])[descriptor.digest]:
-            raise DestinationContentMismatchError(
-                'ECR layer upload completed without exact layer presence.')
+                if self._layers_present([descriptor.digest])[descriptor.digest]:
+                    return
+                _classify(error)
+            if not self._layers_present([descriptor.digest])[descriptor.digest]:
+                raise DestinationContentMismatchError(
+                    'ECR layer upload completed without exact layer presence.')
+        finally:
+            close = getattr(chunks, 'close', None)
+            if callable(close):
+                close()
 
     def copy_graph(
         self,
@@ -1125,7 +1135,8 @@ class EcrRepository:
         present = self._layers_present(item.digest for item in descriptors)
         for descriptor in descriptors:
             if not present[descriptor.digest]:
-                self._upload_layer(descriptor, read_blob(descriptor),
+                self._upload_layer(descriptor,
+                                   functools.partial(read_blob, descriptor),
                                    cancel_event)
         try:
             self._client.put_image(

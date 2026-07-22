@@ -1665,6 +1665,10 @@ def _set_value_free_exception_stacktrace(e: BaseException) -> None:
 def _mark_container_image_request_terminal(request_id: str) -> None:
     """Best-effort image-fence observation after request state is durable."""
     try:
+        database = global_user_state.initialize_and_get_db()
+        if (database.dialect.name
+                != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            return
         # Importing at module load would create requests -> demand_state ->
         # global_user_state -> server initialization recursion.
         # pylint: disable=import-outside-toplevel

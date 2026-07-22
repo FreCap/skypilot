@@ -29,6 +29,36 @@ requests = adaptor_common.LazyImport(
     import_error_message='Container image workers require requests.')
 
 
+def iter_fenced_response_chunks(
+    response: Any,
+    *,
+    chunk_size: int,
+    provider_fence: Callable[[], None] | None,
+) -> Iterator[bytes]:
+    """Fences immediately around every potentially blocking iterator advance."""
+    if provider_fence is not None:
+        provider_fence()
+    iterator = iter(response.iter_content(chunk_size=chunk_size))
+    try:
+        while True:
+            if provider_fence is not None:
+                provider_fence()
+            chunk = b''
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                if provider_fence is not None:
+                    provider_fence()
+                return
+            if provider_fence is not None:
+                provider_fence()
+            yield chunk
+    finally:
+        close = getattr(iterator, 'close', None)
+        if callable(close):
+            close()
+
+
 def _require_public_network_address(value: str) -> None:
     """Rejects every address that is not globally routable public space."""
     try:
@@ -77,11 +107,9 @@ def _read_bounded_response(
             if declared_length > max_bytes:
                 raise ValueError(f'{subject} exceeds the size limit.')
         payload = bytearray()
-        if provider_fence is not None:
-            provider_fence()
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if provider_fence is not None:
-                provider_fence()
+        for chunk in iter_fenced_response_chunks(response,
+                                                 chunk_size=64 * 1024,
+                                                 provider_fence=provider_fence):
             payload.extend(chunk)
             if len(payload) > max_bytes:
                 raise ValueError(f'{subject} exceeds the size limit.')
@@ -382,9 +410,10 @@ class RegistryV2Source:
 
         def chunks() -> Iterator[bytes]:
             try:
-                self._fence()
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    self._fence()
+                for chunk in iter_fenced_response_chunks(
+                        response,
+                        chunk_size=1024 * 1024,
+                        provider_fence=self._provider_fence):
                     yield chunk
             finally:
                 response.close()
@@ -399,9 +428,10 @@ class RegistryV2Source:
                                  allow_blob_redirect=True)
         payload = bytearray()
         try:
-            self._fence()
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                self._fence()
+            for chunk in iter_fenced_response_chunks(
+                    response,
+                    chunk_size=1024 * 1024,
+                    provider_fence=self._provider_fence):
                 payload.extend(chunk)
                 if len(payload) > max_bytes:
                     raise ValueError(

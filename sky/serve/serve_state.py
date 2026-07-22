@@ -34,6 +34,7 @@ if typing.TYPE_CHECKING:
 replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
 
 Base = declarative.declarative_base()
+_TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 # === Database schema ===
 services_table = sqlalchemy.Table(
@@ -144,6 +145,8 @@ replicas_table = sqlalchemy.Table(
 )
 sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
                  replicas_table.c.status)
+sqlalchemy.Index('replicas_service_version_idx', replicas_table.c.service_name,
+                 replicas_table.c.version)
 
 version_specs_table = sqlalchemy.Table(
     'version_specs',
@@ -1706,25 +1709,47 @@ def get_service_version_terminal_states(
     if len(identities) > 1000:
         raise ValueError('Service-version terminal-state batch is too large.')
     names = sorted({identity[0] for identity in identities})
+    version_identities = sorted({
+        (identity[0], identity[1]) for identity in identities
+    })
     engine = _db_manager.get_engine()
+    service_rows = []
+    version_rows = []
+    replica_rows = []
     with orm.Session(engine) as session:
-        service_rows = session.execute(
-            sqlalchemy.select(
-                services_table.c.name,
-                services_table.c.hash,
-                services_table.c.status,
-                services_table.c.current_version,
-                services_table.c.active_versions,
-            ).where(services_table.c.name.in_(names))).mappings().all()
-        version_rows = session.execute(
-            sqlalchemy.select(
+        for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            name_batch = names[start:start +
+                               _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            service_rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        services_table.c.name,
+                        services_table.c.hash,
+                        services_table.c.status,
+                        services_table.c.current_version,
+                        services_table.c.active_versions,
+                    ).where(services_table.c.name.in_(
+                        name_batch))).mappings().all())
+        for start in range(0, len(version_identities),
+                           _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            version_batch = version_identities[
+                start:start + _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            exact_versions = sqlalchemy.tuple_(
                 version_specs_table.c.service_name,
-                version_specs_table.c.version).where(
-                    version_specs_table.c.service_name.in_(names))).all()
-        replica_rows = session.execute(
-            sqlalchemy.select(
-                replicas_table.c.service_name, replicas_table.c.version).where(
-                    replicas_table.c.service_name.in_(names))).all()
+                version_specs_table.c.version).in_(version_batch)
+            version_rows.extend(
+                session.execute(
+                    sqlalchemy.select(version_specs_table.c.service_name,
+                                      version_specs_table.c.version).where(
+                                          exact_versions)).all())
+            exact_replicas = sqlalchemy.tuple_(
+                replicas_table.c.service_name,
+                replicas_table.c.version).in_(version_batch)
+            replica_rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        replicas_table.c.service_name,
+                        replicas_table.c.version).where(exact_replicas)).all())
     services = {str(row['name']): row for row in service_rows}
     versions = {(str(row[0]), int(row[1])) for row in version_rows}
     replicas = {(str(row[0]), int(row[1])) for row in replica_rows}

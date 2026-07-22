@@ -471,6 +471,65 @@ def test_ecr_copy_and_delete_converge_only_on_exact_digest() -> None:
                                  threading.Event()) == aws.CopyOutcome.AMBIGUOUS
 
 
+def test_copy_destination_race_does_not_acquire_source_stream() -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    client = mock.Mock()
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+    repository.verify_graph = mock.Mock(return_value=False)
+    presence_calls = 0
+
+    def layers_present(digests) -> dict[str, bool]:
+        nonlocal presence_calls
+        presence_calls += 1
+        values = list(digests)
+        return {digest: presence_calls > 1 for digest in values}
+
+    repository._layers_present = (  # pylint: disable=protected-access
+        layers_present)
+    read_blob = mock.Mock(side_effect=AssertionError('source stream acquired'))
+
+    assert (repository.copy_graph(graph, read_blob,
+                                  threading.Event()) == aws.CopyOutcome.WRITTEN)
+    read_blob.assert_not_called()
+    client.put_image.assert_called_once()
+
+
+def test_upload_failure_explicitly_closes_acquired_source_stream() -> None:
+
+    class CloseableChunks:
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __iter__(self):
+            return iter((b'payload',))
+
+        def close(self) -> None:
+            self.closed = True
+
+    payload = b'payload'
+    descriptor = oci.OciDescriptor(
+        media_type='application/octet-stream',
+        digest=f'sha256:{hashlib.sha256(payload).hexdigest()}',
+        size=len(payload))
+    client = mock.Mock()
+    client.initiate_layer_upload.side_effect = _AwsError(
+        'AccessDeniedException')
+    repository = aws.EcrRepository(client, 'skypilot/images/shard')
+    repository._layers_present = (  # pylint: disable=protected-access
+        lambda _digests: {
+            descriptor.digest: False
+        })
+    chunks = CloseableChunks()
+
+    with pytest.raises(_AwsError, match='AccessDeniedException'):
+        repository._upload_layer(  # pylint: disable=protected-access
+            descriptor, lambda: chunks, threading.Event())
+
+    assert chunks.closed
+
+
 @pytest.mark.parametrize('error', [
     TimeoutError('read timeout'),
     ConnectionError('connection reset'),

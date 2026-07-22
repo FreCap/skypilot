@@ -158,6 +158,39 @@ async def test_image_recovery_generation_tracks_durable_recovery_epoch(
         await state.get_image_recovery_generation_async(404, 0)
 
 
+def test_job_task_terminal_lookup_uses_only_exact_index_keys(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': 42,
+            'task_id': task_id,
+            'task_name': f'task-{task_id}',
+            'status': (ManagedJobStatus.SUCCEEDED.value
+                       if task_id == 1999 else ManagedJobStatus.RUNNING.value),
+        } for task_id in range(2000)])
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context,
+               _executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', record)
+    try:
+        result = state.get_job_task_terminal_states([(42, 1999), (42, 3000)])
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', record)
+
+    assert result == {(42, 1999): True}
+    assert len(statements) == 1
+    assert '(spot.spot_job_id, spot.task_id) IN (VALUES' in statements[0]
+    indexes = {
+        index['name']: index['column_names']
+        for index in sqlalchemy.inspect(engine).get_indexes('spot')
+    }
+    assert indexes['ix_spot_job_task'] == ['spot_job_id', 'task_id']
+
+
 @pytest.mark.asyncio
 async def test_get_statuses_async_batches_latest_task_semantics(
         _mock_managed_jobs_db_conn):

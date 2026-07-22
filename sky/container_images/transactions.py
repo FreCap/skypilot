@@ -780,18 +780,19 @@ def reconcile_pending_canonical_publications(limit: int = 100) -> int:
     publications = schema.publications
     with orm.Session(catalog_state.engine()) as session:
         location_ids = session.execute(
-            sqlalchemy.select(locations.c.id).where(
-                locations.c.canonical.is_(True),
-                locations.c.state.in_([
-                    models.ImageLocationState.READY.value,
-                    models.ImageLocationState.FAILED.value,
-                ]),
-                sqlalchemy.exists().where(
-                    publications.c.canonical_location_id == locations.c.id,
+            sqlalchemy.select(publications.c.canonical_location_id).join(
+                locations,
+                locations.c.id == publications.c.canonical_location_id).where(
                     publications.c.state ==
-                    models.ImagePublicationState.PENDING.value)).order_by(
-                        locations.c.updated_at,
-                        locations.c.id).limit(limit)).scalars().all()
+                    models.ImagePublicationState.PENDING.value,
+                    publications.c.canonical_location_id.is_not(None),
+                    locations.c.canonical.is_(True),
+                    locations.c.state.in_([
+                        models.ImageLocationState.READY.value,
+                        models.ImageLocationState.FAILED.value,
+                    ])).distinct().order_by(
+                        publications.c.canonical_location_id).limit(
+                            limit)).scalars().all()
     return sum(
         reconcile_canonical_publications(location_id)
         for location_id in location_ids)

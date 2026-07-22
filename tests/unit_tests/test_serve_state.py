@@ -518,6 +518,13 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
     }
     assert 'logical_replica_semantics' in service_columns
     assert 'demand_capacity_observations' in inspector.get_table_names()
+    indexes = {
+        index['name']: index['column_names']
+        for index in inspector.get_indexes('replicas')
+    }
+    assert indexes['replicas_service_version_idx'] == [
+        'service_name', 'version'
+    ]
 
 
 def test_elected_version_migration_backfills_latest_committed_version(
@@ -613,6 +620,51 @@ def test_submitted_version_yaml_migration_adds_nullable_column(
         for column in sqlalchemy.inspect(engine).get_columns('version_specs')
     }
     assert 'submitted_yaml_content' in columns
+
+
+def test_service_version_terminal_lookup_uses_only_exact_history_keys(
+        _mock_serve_db):
+    engine = _mock_serve_db
+    assert _add_minimal_service('svc-terminal',
+                                service_hash='incarnation-a') is True
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc-terminal',
+            'version': version,
+            'spec': pickle.dumps(None),
+            'yaml_content': f'yaml: v{version}',
+        } for version in range(2, 2001)])
+        connection.execute(serve_state.replicas_table.insert(), [{
+            'service_name': 'svc-terminal',
+            'replica_id': replica,
+            'replica_info': b'opaque',
+            'version': replica + 1,
+        } for replica in range(1, 2000)])
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context,
+               _executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', record)
+    try:
+        result = serve_state.get_service_version_terminal_states([
+            ('svc-terminal', 2000, 'incarnation-a'),
+            ('missing-service', 1, 'missing-incarnation'),
+        ])
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', record)
+
+    assert result == {
+        ('svc-terminal', 2000, 'incarnation-a'): False,
+        ('missing-service', 1, 'missing-incarnation'): True,
+    }
+    assert len(statements) == 3
+    assert any('(version_specs.service_name, version_specs.version) IN (VALUES'
+               in statement for statement in statements)
+    assert any(
+        '(replicas.service_name, replicas.version) IN (VALUES' in statement
+        for statement in statements)
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):

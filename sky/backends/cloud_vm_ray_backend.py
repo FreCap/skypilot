@@ -49,6 +49,7 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
+from sky.container_images import config as container_image_config
 from sky.container_images import consumers as container_image_consumers
 from sky.container_images import errors as container_image_errors
 from sky.container_images import models as container_image_models
@@ -165,14 +166,21 @@ def _resolve_container_image_for_placement(
     cloud = resources.cloud
     assert cloud is not None, resources
     assert resources.region is not None, resources
+    workspace = (skypilot_config.get_active_workspace() or
+                 constants.SKYPILOT_DEFAULT_WORKSPACE)
     if isinstance(cloud, clouds.AWS):
         provider = 'aws'
         backend = 'aws_vm'
     elif isinstance(cloud, clouds.Kubernetes):
-        # A managed profile may select this context only when its immutable
-        # EKS context/cluster/node-role tuple is active and qualified.
-        provider = 'aws'
-        backend = 'aws_eks'
+        image = resources.container_image
+        assert image is not None, resources
+        if container_image_config.is_declared_managed_eks_context(
+                image, resources.region, workspace):
+            provider = 'aws'
+            backend = 'aws_eks'
+        else:
+            provider = 'kubernetes'
+            backend = 'direct'
     else:
         provider = str(cloud).lower()
         backend = 'direct'
@@ -195,8 +203,6 @@ def _resolve_container_image_for_placement(
         backend=backend,
         platform=runtime_platform,
         host_image_id=(configured_host_image))
-    workspace = (skypilot_config.get_active_workspace() or
-                 constants.SKYPILOT_DEFAULT_WORKSPACE)
     try:
         return container_image_runtime.resolve_for_placement(
             resources,

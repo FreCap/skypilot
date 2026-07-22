@@ -41,6 +41,7 @@ from sky.container_images import schema
 from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_lease
+from sky.utils.db import migration_utils
 
 _POSTGRES_REQUIRED = os.environ.get(
     'SKYPILOT_REQUIRE_CONTAINER_IMAGE_POSTGRES') == '1'
@@ -2210,7 +2211,7 @@ def test_cluster_request_terminal_lookup_is_index_bounded(
         connection.execute(sqlalchemy.text('ANALYZE container_image_demands'))
         plan = connection.execute(
             sqlalchemy.text("""
-                EXPLAIN (COSTS OFF)
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
                 SELECT id
                 FROM container_image_demands
                 WHERE consumer_kind = 'cluster'
@@ -2219,7 +2220,37 @@ def test_cluster_request_terminal_lookup_is_index_bounded(
                   AND state IN ('WARMING', 'READY', 'FAILED')
                 FOR UPDATE
             """)).scalars().all()
+        reconciliation_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_demands
+                WHERE state IN ('WARMING', 'READY', 'FAILED')
+                  AND updated_at <= 100
+                ORDER BY updated_at, id
+                LIMIT 500
+            """)).scalars().all()
+        compaction_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT demand.id
+                FROM container_image_demands AS demand
+                JOIN container_image_consumer_watermarks AS watermark
+                  ON watermark.workspace = demand.workspace
+                 AND watermark.consumer_kind = demand.consumer_kind
+                 AND watermark.consumer_owner = demand.consumer_owner
+                WHERE demand.state IN ('SUPERSEDED', 'RELEASED')
+                  AND demand.expires_at <= 100
+                  AND watermark.owner_deleted_at IS NOT NULL
+                  AND demand.consumer_generation
+                      <= watermark.max_terminal_generation
+                ORDER BY demand.expires_at, demand.id
+                LIMIT 500
+            """)).scalars().all()
     assert 'ix_container_image_demands_cluster_request' in str(plan)
+    assert ('ix_container_image_demands_reconciliation_queue'
+            in str(reconciliation_plan))
+    assert ('ix_container_image_demands_compaction_queue'
+            in str(compaction_plan))
 
     assert demand_state.mark_cluster_request_terminal('request-target',
                                                       now=100) == 1
@@ -4760,6 +4791,41 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
                 'runtime_digest': _DIGEST,
                 'canonical_location_id': canonical.id,
             })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_publications (
+                    id, workspace, operation_id, profile_revision_id,
+                    requested_release, reservation_active, source_ref,
+                    source_root_digest, requested_platform, state,
+                    reservation_expires_at, record_expires_at,
+                    created_at, updated_at
+                )
+                SELECT 'catalog-expiring-publication-' || series, 'research',
+                       'catalog-scale-operation-' || series,
+                       :profile_revision_id,
+                       'catalog-expiring-release-' || series, TRUE,
+                       :source_ref, :runtime_digest, 'linux/amd64', 'FAILED',
+                       series, 1000000 + series, 100 + series, 100 + series
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'profile_revision_id': active.id,
+                'source_ref': _OTHER_SOURCE,
+                'runtime_digest': _OTHER_DIGEST,
+            })
+        connection.execute(schema.publications.insert().values(
+            id='catalog-terminal-publication',
+            workspace='research',
+            operation_id='catalog-scale-operation-1',
+            profile_revision_id=active.id,
+            requested_release='catalog-terminal-release',
+            reservation_active=False,
+            source_ref=_OTHER_SOURCE,
+            source_root_digest=_OTHER_DIGEST,
+            requested_platform='linux/amd64',
+            state=models.ImagePublicationState.FAILED.value,
+            record_expires_at=1,
+            created_at=1,
+            updated_at=1))
         for table in ('container_image_publications', 'container_image_sources',
                       'container_image_locations'):
             connection.execute(sqlalchemy.text(f'ANALYZE {table}'))
@@ -4832,12 +4898,95 @@ def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
                 ORDER BY created_at DESC, id DESC
                 LIMIT 51
             """)).scalars().all()
+        workspace_state_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE workspace = 'research' AND state = 'READY'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 51
+            """)).scalars().all()
+        workspace_release_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE workspace = 'research'
+                  AND requested_release = 'catalog-scale-release-10000'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 51
+            """)).scalars().all()
+        ready_history_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE image_id = :image_id AND state = 'READY'
+                  AND reservation_active IS TRUE
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 51
+            """), {
+                'image_id': publication_record.image_id
+            }).scalars().all()
+        failed_expiry_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE state = 'FAILED' AND reservation_active IS TRUE
+                  AND reservation_expires_at <= 100
+                ORDER BY reservation_expires_at, id
+                LIMIT 500 FOR UPDATE SKIP LOCKED
+            """)).scalars().all()
+        terminal_expiry_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_publications
+                WHERE reservation_active IS FALSE
+                  AND record_expires_at <= 100
+                ORDER BY record_expires_at, id
+                LIMIT 500 FOR UPDATE SKIP LOCKED
+            """)).scalars().all()
+        fanout_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT DISTINCT publication.canonical_location_id
+                FROM container_image_publications AS publication
+                JOIN container_image_locations AS location
+                  ON location.id = publication.canonical_location_id
+                WHERE publication.state = 'PENDING'
+                  AND publication.canonical_location_id IS NOT NULL
+                  AND location.canonical IS TRUE
+                  AND location.state IN ('READY', 'FAILED')
+                ORDER BY publication.canonical_location_id
+                LIMIT 100
+            """)).scalars().all()
+        inventory_digest_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_locations
+                WHERE shard_id = :shard_id
+                  AND runtime_digest = :runtime_digest
+            """), {
+                'shard_id': regional.shard_id,
+                'runtime_digest': _OTHER_DIGEST,
+            }).scalars().all()
     assert 'ix_container_image_publications_active_image' in str(
         publication_plan)
     assert 'ix_container_image_sources_image' in str(source_plan)
     assert 'ix_container_image_locations_artifact' in str(location_plan)
     assert ('ix_container_image_publications_workspace_history'
             in str(workspace_history_plan))
+    assert ('ix_container_image_publications_workspace_state_history'
+            in str(workspace_state_plan))
+    assert ('ix_container_image_publications_workspace_release_history'
+            in str(workspace_release_plan))
+    assert ('ix_container_image_publications_ready_history'
+            in str(ready_history_plan))
+    assert ('ix_container_image_publications_failed_reservation_expiry'
+            in str(failed_expiry_plan))
+    assert ('ix_container_image_publications_terminal_expiry'
+            in str(terminal_expiry_plan))
+    assert 'ix_container_image_publications_fanout' in str(fanout_plan)
+    assert ('ix_container_image_locations_inventory_digest'
+            in str(inventory_digest_plan))
 
 
 def test_operational_profile_readiness_excludes_unbounded_history_and_uses_indexes(
@@ -4910,8 +5059,18 @@ def test_operational_profile_readiness_excludes_unbounded_history_and_uses_index
                 ORDER BY profile, state, id
                 LIMIT 1001
             """)).scalars().all()
+        qualification_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_profile_revisions
+                WHERE state IN ('QUALIFYING', 'ACTIVE')
+                ORDER BY updated_at, id
+                LIMIT 100
+            """)).scalars().all()
     assert 'uq_container_image_profile_active' in str(plan)
     assert 'uq_container_image_profile_desired' in str(plan)
+    assert ('ix_container_image_profile_qualification_queue'
+            in str(qualification_plan))
 
 
 def test_profile_history_is_keyset_paginated_and_indexed_at_scale(
@@ -4978,6 +5137,58 @@ def test_profile_history_is_keyset_paginated_and_indexed_at_scale(
             }).scalars().all()
     assert 'ix_container_image_profile_history' in str(plan)
     assert 'uq_container_image_profile_active' in str(active_plan)
+
+
+def test_worker_pages_and_cleanup_are_keyset_bounded_and_indexed_at_scale(
+        image_database) -> None:
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_workers (
+                    id, kind, version, started_at, heartbeat_at,
+                    in_flight, max_in_flight, grant_tokens_milli
+                )
+                SELECT md5('scale-worker-' || series::text), 'COPY', 'test',
+                       series, series / 4, 0, 4, 0
+                FROM generate_series(1, 20000) AS series
+            """))
+        connection.execute(sqlalchemy.text('ANALYZE container_image_workers'))
+
+    first = topology_state.list_workers(limit=51)
+    assert len(first) == 51
+    first_keys = [(record.heartbeat_at, record.id) for record in first]
+    assert first_keys == sorted(first_keys, reverse=True)
+    after = first_keys[-1]
+    second = topology_state.list_workers(limit=51, after=after)
+    second_keys = [(record.heartbeat_at, record.id) for record in second]
+    assert len(second) == 51
+    assert second_keys == sorted(second_keys, reverse=True)
+    assert all(key < after for key in second_keys)
+    assert {record.id for record in first
+           }.isdisjoint(record.id for record in second)
+
+    with image_database.connect() as connection:
+        list_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_workers
+                WHERE (heartbeat_at, id) < (:heartbeat_at, :id)
+                ORDER BY heartbeat_at DESC, id DESC
+                LIMIT 51
+            """), {
+                'heartbeat_at': after[0],
+                'id': after[1],
+            }).scalars().all()
+        cleanup_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                SELECT id FROM container_image_workers
+                WHERE heartbeat_at < 1000
+                ORDER BY heartbeat_at, id
+                LIMIT 500 FOR UPDATE SKIP LOCKED
+            """)).scalars().all()
+    assert 'ix_container_image_workers_heartbeat' in str(list_plan)
+    assert 'ix_container_image_workers_heartbeat' in str(cleanup_plan)
 
 
 def test_hot_claim_queues_use_exact_partial_indexes_at_scale(
@@ -5373,6 +5584,81 @@ finally:
                 f'DROP SCHEMA IF EXISTS {race_schema} CASCADE')
 
 
+@pytest.mark.parametrize('revision', ['022', None])
+def test_migration_job_rejects_nonempty_predecessor_below_023_without_ddl(
+        postgres_engine, revision: str | None) -> None:
+    unsafe_schema = f'image_migration_unsafe_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {unsafe_schema}')
+    unsafe_engine = _schema_engine(postgres_engine, unsafe_schema)
+    try:
+        with unsafe_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+            if revision is not None:
+                connection.exec_driver_sql(
+                    'CREATE TABLE alembic_version_state_db '
+                    '(version_num VARCHAR(32) PRIMARY KEY)')
+                connection.execute(
+                    sqlalchemy.text(
+                        'INSERT INTO alembic_version_state_db VALUES (:revision)'
+                    ), {'revision': revision})
+
+        with pytest.raises(RuntimeError,
+                           match='staged upgrade through revision'):
+            migration_utils.safe_alembic_upgrade(
+                unsafe_engine,
+                migration_utils.GLOBAL_USER_STATE_DB_NAME,
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+                mode='upgrade')
+
+        inspector = sqlalchemy.inspect(unsafe_engine)
+        assert not inspector.has_table('auth_sessions')
+        assert not inspector.has_table('container_image_catalog')
+        assert {column['name'] for column in inspector.get_columns('clusters')
+               } == {'name'}
+        if revision is not None:
+            with unsafe_engine.connect() as connection:
+                assert connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM alembic_version_state_db')
+                ).scalar_one() == revision
+    finally:
+        unsafe_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {unsafe_schema} CASCADE')
+
+
+def test_migration_job_allows_genuinely_empty_database_to_upgrade_directly(
+        postgres_engine) -> None:
+    fresh_schema = f'image_migration_fresh_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
+    fresh_url = postgres_engine.url.update_query_dict(
+        {'options': f'-csearch_path={fresh_schema}'})
+    fresh_engine = sqlalchemy.create_engine(fresh_url)
+    try:
+        migration_utils.safe_alembic_upgrade(
+            fresh_engine,
+            migration_utils.GLOBAL_USER_STATE_DB_NAME,
+            migration_utils.GLOBAL_USER_STATE_VERSION,
+            mode='upgrade')
+
+        with fresh_engine.connect() as connection:
+            assert connection.execute(
+                sqlalchemy.text(
+                    'SELECT version_num FROM alembic_version_state_db')
+            ).scalar_one() == '024'
+        assert sqlalchemy.inspect(fresh_engine).has_table(
+            'container_image_catalog')
+    finally:
+        fresh_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
+
+
 @pytest.mark.parametrize(('mutations', 'expected_error'), [
     pytest.param(("ALTER TABLE container_images ALTER COLUMN builder_version "
                   "TYPE VARCHAR(64)",),
@@ -5477,7 +5763,7 @@ def test_migration_024_preview_adoption_requires_exact_schema(
                 f'DROP SCHEMA IF EXISTS {preview_schema} CASCADE')
 
 
-def test_migration_024_adopts_preview_missing_known_history_index(
+def test_migration_024_adopts_preview_missing_known_additive_indexes(
         postgres_engine) -> None:
     preview_schema = f'image_preview_{uuid.uuid4().hex}'
     with postgres_engine.begin() as connection:
@@ -5490,20 +5776,20 @@ def test_migration_024_adopts_preview_missing_known_history_index(
             connection.exec_driver_sql(
                 'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
         _migration_call(preview_engine, migration_024.upgrade)
+        compatible_indexes = tuple((name, table_name) for name, table_name, _, _
+                                   in migration_024._PREVIEW_COMPATIBLE_INDEXES)
         with preview_engine.begin() as connection:
             connection.exec_driver_sql('DROP TABLE auth_sessions')
-            connection.exec_driver_sql(
-                'DROP INDEX '
-                'ix_container_image_publications_workspace_history')
+            for index_name, _ in compatible_indexes:
+                connection.exec_driver_sql(f'DROP INDEX {index_name}')
 
         _migration_call(preview_engine, migration_024.upgrade)
 
-        index_names = {
-            item['name'] for item in sqlalchemy.inspect(
-                preview_engine).get_indexes('container_image_publications')
-        }
-        assert ('ix_container_image_publications_workspace_history'
-                in index_names)
+        inspector = sqlalchemy.inspect(preview_engine)
+        restored_indexes = {(item['name'], table_name)
+                            for _, table_name in compatible_indexes
+                            for item in inspector.get_indexes(table_name)}
+        assert set(compatible_indexes) <= restored_indexes
         assert sqlalchemy.inspect(preview_engine).has_table('auth_sessions')
     finally:
         preview_engine.dispose()

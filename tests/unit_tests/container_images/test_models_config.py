@@ -151,6 +151,17 @@ def test_workspace_policy_selection_and_allowlist(
         config.resolve_profile_name('unapproved-profile', 'research')
 
 
+def test_only_declared_kubernetes_context_is_classified_as_managed_eks(
+        monkeypatch: pytest.MonkeyPatch, config_reader) -> None:
+    monkeypatch.setattr(config.skypilot_config, 'get_nested', config_reader)
+    image = models.ContainerImage(ref=SOURCE)
+
+    assert config.is_declared_managed_eks_context(image, 'boltz-west',
+                                                  'research')
+    assert not config.is_declared_managed_eks_context(image, 'generic-context',
+                                                      'research')
+
+
 def test_list_workspace_policies_preserves_retention_opt_out(
         monkeypatch: pytest.MonkeyPatch, config_reader) -> None:
 

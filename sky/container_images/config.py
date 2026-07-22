@@ -393,6 +393,44 @@ def resolve_profile(
     return _profile_from_config(name, value, access_bindings()), policy
 
 
+def is_declared_managed_eks_context(image: models.ContainerImage, context: str,
+                                    workspace: str) -> bool:
+    """Returns whether the selected profile explicitly binds this EKS context.
+
+    This is configuration-only candidate classification. Runtime resolution
+    still requires the exact active revision and fresh qualification evidence.
+    """
+    policy = get_workspace_policy(workspace)
+    selected = image.distribution
+    if selected == DIRECT_PROFILE:
+        return False
+    if selected is None and policy.mode in (
+            models.WorkspaceImageMode.MANAGED_PREFERRED,
+            models.WorkspaceImageMode.MANAGED_REQUIRED):
+        selected = policy.default_profile or skypilot_config.get_nested(
+            ('container_registries', 'default_profile'), default_value=None)
+    if selected is None:
+        return False
+    selected = models.validate_control_plane_identifier(
+        selected, 'Container image distribution')
+    if policy.allowed_profiles and selected not in policy.allowed_profiles:
+        raise ValueError(
+            f'Registry profile {selected!r} is not allowed in this workspace.')
+    value = skypilot_config.get_nested(
+        ('container_registries', 'profiles', selected), default_value=None)
+    if value is None:
+        raise ValueError(f'Registry profile {selected!r} is not configured.')
+    profile = _profile_from_config(selected, value, access_bindings())
+    for target in (profile.canonical,) + profile.targets:
+        binding_id = target.runtime_binding('aws_eks')
+        if binding_id is None:
+            continue
+        if any(cluster.context == context
+               for cluster in profile.bindings[binding_id].qualified_clusters):
+            return True
+    return False
+
+
 def configured_profiles() -> tuple[models.ManagedRegistryProfile, ...]:
     values = skypilot_config.get_nested(('container_registries', 'profiles'),
                                         default_value={})

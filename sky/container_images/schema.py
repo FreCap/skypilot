@@ -100,6 +100,11 @@ profile_revisions = sqlalchemy.Table(
                      postgresql_where=sqlalchemy.text("state = 'ACTIVE'")),
     sqlalchemy.Index('ix_container_image_profile_state', 'state', 'updated_at',
                      'id'),
+    sqlalchemy.Index(
+        'ix_container_image_profile_qualification_queue',
+        'updated_at',
+        'id',
+        postgresql_where=sqlalchemy.text("state IN ('QUALIFYING', 'ACTIVE')")),
     sqlalchemy.Index('ix_container_image_profile_history', 'workspace',
                      'created_at', 'id'),
 )
@@ -458,6 +463,8 @@ locations = sqlalchemy.Table(
         postgresql_where=sqlalchemy.text("state IN ('COPYING', 'VERIFYING')")),
     sqlalchemy.Index('ix_container_image_locations_shard_readiness', 'shard_id',
                      'state', 'updated_at', 'id'),
+    sqlalchemy.Index('ix_container_image_locations_inventory_digest',
+                     'shard_id', 'runtime_digest'),
     sqlalchemy.Index('ix_container_image_locations_inventory_confirmation',
                      'shard_id',
                      'last_verified_at',
@@ -567,10 +574,21 @@ publications = sqlalchemy.Table(
                          'inspection_claimable_at IS NOT NULL')),
     sqlalchemy.Index('ix_container_image_publications_canonical_queue',
                      'canonical_location_id', 'state', 'id'),
+    sqlalchemy.Index(
+        'ix_container_image_publications_fanout',
+        'canonical_location_id',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state = 'PENDING' AND canonical_location_id IS NOT NULL")),
     sqlalchemy.Index('ix_container_image_publications_image', 'image_id',
                      'created_at', 'id'),
     sqlalchemy.Index('ix_container_image_publications_workspace_history',
                      'workspace', 'created_at', 'id'),
+    sqlalchemy.Index('ix_container_image_publications_workspace_state_history',
+                     'workspace', 'state', 'created_at', 'id'),
+    sqlalchemy.Index(
+        'ix_container_image_publications_workspace_release_history',
+        'workspace', 'requested_release', 'created_at', 'id'),
     sqlalchemy.Index('ix_container_image_publications_active_image',
                      'image_id',
                      'created_at',
@@ -587,6 +605,24 @@ publications = sqlalchemy.Table(
         'record_expires_at',
         'id',
         postgresql_where=sqlalchemy.text('record_expires_at IS NOT NULL')),
+    sqlalchemy.Index(
+        'ix_container_image_publications_failed_reservation_expiry',
+        'reservation_expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state = 'FAILED' AND reservation_active IS TRUE")),
+    sqlalchemy.Index(
+        'ix_container_image_publications_terminal_expiry',
+        'record_expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            'reservation_active IS FALSE AND record_expires_at IS NOT NULL')),
+    sqlalchemy.Index('ix_container_image_publications_ready_history',
+                     'image_id',
+                     'updated_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text(
+                         "state = 'READY' AND reservation_active IS TRUE")),
 )
 
 demands = sqlalchemy.Table(
@@ -677,6 +713,17 @@ demands = sqlalchemy.Table(
                      'id',
                      postgresql_where=sqlalchemy.text(
                          "state IN ('WARMING', 'READY', 'FAILED')")),
+    sqlalchemy.Index('ix_container_image_demands_reconciliation_queue',
+                     'updated_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text(
+                         "state IN ('WARMING', 'READY', 'FAILED')")),
+    sqlalchemy.Index(
+        'ix_container_image_demands_compaction_queue',
+        'expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state IN ('SUPERSEDED', 'RELEASED') AND expires_at IS NOT NULL")),
 )
 
 consumer_watermarks = sqlalchemy.Table(
@@ -747,6 +794,8 @@ workers = sqlalchemy.Table(
         name='ck_container_image_worker_grant'),
     sqlalchemy.Index('ix_container_image_workers_kind_heartbeat', 'kind',
                      'heartbeat_at', 'id'),
+    sqlalchemy.Index('ix_container_image_workers_heartbeat', 'heartbeat_at',
+                     'id'),
 )
 
 TABLES = (

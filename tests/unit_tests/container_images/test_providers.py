@@ -144,6 +144,81 @@ def test_source_reader_fences_each_streamed_blob_chunk_and_closes_on_loss(
     response.close.assert_called_once_with()
 
 
+def test_stream_fence_failure_prevents_the_next_blocking_read() -> None:
+
+    class CountingIterator:
+        """Records whether a lease fence prevented iterator advancement."""
+
+        def __init__(self) -> None:
+            self.next_calls = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> bytes:
+            self.next_calls += 1
+            return f'chunk-{self.next_calls}'.encode()
+
+        def close(self) -> None:
+            self.closed = True
+
+    iterator = CountingIterator()
+    response = mock.Mock()
+    response.iter_content.return_value = iterator
+    fence_calls = 0
+
+    def fence() -> None:
+        nonlocal fence_calls
+        fence_calls += 1
+        # Initial setup, pre-read, and post-read checks succeed. Lease loss at
+        # the next pre-read fence must prevent the iterator from advancing.
+        if fence_calls == 4:
+            raise RuntimeError('lease lost before blocking read')
+
+    chunks = providers.iter_fenced_response_chunks(response,
+                                                   chunk_size=1024,
+                                                   provider_fence=fence)
+    assert next(chunks) == b'chunk-1'
+    with pytest.raises(RuntimeError, match='before blocking read'):
+        next(chunks)
+
+    assert iterator.next_calls == 1
+    assert iterator.closed
+
+
+def test_stream_fences_after_terminal_iterator_advance() -> None:
+
+    class EmptyIterator:
+        """Records the terminal iterator advance and explicit close."""
+
+        def __init__(self) -> None:
+            self.next_calls = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> bytes:
+            self.next_calls += 1
+            raise StopIteration
+
+        def close(self) -> None:
+            self.closed = True
+
+    iterator = EmptyIterator()
+    response = mock.Mock()
+    response.iter_content.return_value = iterator
+    fence = mock.Mock()
+
+    assert not list(
+        providers.iter_fenced_response_chunks(
+            response, chunk_size=1024, provider_fence=fence))
+    assert iterator.next_calls == 1
+    assert iterator.closed
+    assert fence.call_count == 3
+
+
 def test_basic_credentials_cannot_cross_to_bearer_realm() -> None:
     source = providers.RegistryV2Source(
         f'registry.example/repository/image@{_DIGEST}',

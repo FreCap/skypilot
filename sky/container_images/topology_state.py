@@ -2323,7 +2323,7 @@ def list_workers(*,
             sqlalchemy.tuple_(schema.workers.c.heartbeat_at,
                               schema.workers.c.id) < after)
     statement = statement.order_by(schema.workers.c.heartbeat_at.desc(),
-                                   schema.workers.c.id).limit(limit)
+                                   schema.workers.c.id.desc()).limit(limit)
     with orm.Session(catalog_state.engine()) as session:
         rows = session.execute(statement).mappings().all()
     return [_worker(row) for row in rows]

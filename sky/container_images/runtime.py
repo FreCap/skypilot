@@ -219,6 +219,17 @@ def _direct_fallback_allowed(policy: models.WorkspaceImagePolicy,
             policy.locality == models.Locality.PREFER and image.ref is not None)
 
 
+def _unsupported_direct_locality_rank(image: models.ContainerImage,
+                                      workspace: str) -> int:
+    """Keeps direct-mode multicloud candidates in the same locality class."""
+    if image.distribution == config.DIRECT_PROFILE:
+        return 0
+    if image.distribution is not None:
+        return 1
+    policy = config.get_workspace_policy(workspace)
+    return int(policy.mode != models.WorkspaceImageMode.DIRECT)
+
+
 def _current_consumer_demand(
     workspace: str,
     placement: models.Placement,
@@ -313,6 +324,16 @@ def _resolve_metadata(
     if (image is None or resources.container_image_from_legacy_image_id or
             resources.resolved_container_image is not None):
         return _MetadataResolution(resources=resources, direct=True)
+    if (placement.provider.lower() != 'aws' or
+            placement.backend not in ('aws_vm', 'aws_eks')):
+        if (image.ref is not None and image.release is None and
+                image.artifact_id is None):
+            return _MetadataResolution(
+                resources=resources,
+                direct=True,
+                locality_rank=(_unsupported_direct_locality_rank(
+                    image, workspace)))
+        raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
     current_demand = _current_consumer_demand(workspace, placement, cache)
     if current_demand is not None:
         policy_key = ('workspace_policy', workspace)

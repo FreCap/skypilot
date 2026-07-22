@@ -48,6 +48,7 @@ _DB_RETRY_TIMES = 30
 
 # Bound parameters per token upsert while keeping all chunks in one transaction.
 _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
+_TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 # Keep the historical schema facade for migrations and external callers.
 Base = state_schema.Base
@@ -2190,18 +2191,23 @@ def get_job_task_terminal_states(
         return {}
     if len(identities) > 1000:
         raise ValueError('Managed-job terminal-state batch is too large.')
-    job_ids = sorted({identity[0] for identity in identities})
-    wanted = set(identities)
+    wanted = sorted(set(identities))
     engine = _db_manager.get_engine()
+    rows = []
     with orm.Session(engine) as session:
-        rows = session.execute(
-            sqlalchemy.select(spot_table.c.spot_job_id, spot_table.c.task_id,
-                              spot_table.c.status).where(
-                                  spot_table.c.spot_job_id.in_(job_ids))).all()
+        for start in range(0, len(wanted), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            batch = wanted[start:start + _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        spot_table.c.spot_job_id, spot_table.c.task_id,
+                        spot_table.c.status).where(
+                            sqlalchemy.tuple_(
+                                spot_table.c.spot_job_id,
+                                spot_table.c.task_id).in_(batch))).all())
     return {
         (int(row[0]), int(row[1])): ManagedJobStatus(row[2]).is_terminal()
         for row in rows
-        if (int(row[0]), int(row[1])) in wanted
     }
 
 

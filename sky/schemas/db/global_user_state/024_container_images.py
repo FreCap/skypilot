@@ -58,6 +58,41 @@ _CLUSTER_BINDING_COLUMN_NAMES = (
 )
 _PUBLICATION_HISTORY_INDEX = (
     'ix_container_image_publications_workspace_history')
+_PREVIEW_COMPATIBLE_INDEXES = (
+    (_PUBLICATION_HISTORY_INDEX, 'container_image_publications',
+     ('workspace', 'created_at', 'id'), None),
+    ('ix_container_image_profile_qualification_queue',
+     'container_image_profile_revisions', ('updated_at', 'id'),
+     "state IN ('QUALIFYING', 'ACTIVE')"),
+    ('ix_container_image_locations_inventory_digest',
+     'container_image_locations', ('shard_id', 'runtime_digest'), None),
+    ('ix_container_image_publications_fanout', 'container_image_publications',
+     ('canonical_location_id',
+      'id'), "state = 'PENDING' AND canonical_location_id IS NOT NULL"),
+    ('ix_container_image_publications_workspace_state_history',
+     'container_image_publications', ('workspace', 'state', 'created_at',
+                                      'id'), None),
+    ('ix_container_image_publications_workspace_release_history',
+     'container_image_publications', ('workspace', 'requested_release',
+                                      'created_at', 'id'), None),
+    ('ix_container_image_publications_failed_reservation_expiry',
+     'container_image_publications', ('reservation_expires_at', 'id'),
+     "state = 'FAILED' AND reservation_active IS TRUE"),
+    ('ix_container_image_publications_terminal_expiry',
+     'container_image_publications', ('record_expires_at', 'id'),
+     'reservation_active IS FALSE AND record_expires_at IS NOT NULL'),
+    ('ix_container_image_publications_ready_history',
+     'container_image_publications', ('image_id', 'updated_at', 'id'),
+     "state = 'READY' AND reservation_active IS TRUE"),
+    ('ix_container_image_demands_reconciliation_queue',
+     'container_image_demands', ('updated_at', 'id'),
+     "state IN ('WARMING', 'READY', 'FAILED')"),
+    ('ix_container_image_demands_compaction_queue', 'container_image_demands',
+     ('expires_at',
+      'id'), "state IN ('SUPERSEDED', 'RELEASED') AND expires_at IS NOT NULL"),
+    ('ix_container_image_workers_heartbeat', 'container_image_workers',
+     ('heartbeat_at', 'id'), None),
+)
 
 _SCHEMA_SHAPE_QUERIES = {
     'columns': """SELECT table_name, column_name, ordinal_position,
@@ -336,16 +371,24 @@ def _validate_preview_schema(bind: sqlalchemy.engine.Connection,
 def _ensure_preview_compatible_indexes(bind: sqlalchemy.engine.Connection,
                                        schema_name: str) -> None:
     """Adds only known post-preview indexes before exact shape validation."""
-    existing_indexes = sqlalchemy.inspect(bind).get_indexes(
-        'container_image_publications', schema=schema_name)
-    if any(index['name'] == _PUBLICATION_HISTORY_INDEX
-           for index in existing_indexes):
-        # Exact shape validation below rejects a same-name malformed index.
-        return
-    op.create_index(_PUBLICATION_HISTORY_INDEX,
-                    'container_image_publications',
-                    ['workspace', 'created_at', 'id'],
-                    schema=schema_name)
+    inspector = sqlalchemy.inspect(bind)
+    existing_by_table = {
+        table_name: {
+            index['name']
+            for index in inspector.get_indexes(table_name, schema=schema_name)
+        } for table_name in
+        {definition[1] for definition in _PREVIEW_COMPATIBLE_INDEXES}
+    }
+    for name, table_name, columns, predicate in _PREVIEW_COMPATIBLE_INDEXES:
+        if name in existing_by_table[table_name]:
+            # Exact shape validation below rejects a same-name malformed index.
+            continue
+        op.create_index(name,
+                        table_name,
+                        list(columns),
+                        schema=schema_name,
+                        postgresql_where=(sqlalchemy.text(predicate)
+                                          if predicate is not None else None))
 
 
 def _create_tables() -> None:
@@ -426,6 +469,10 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_profile_state',
                     'container_image_profile_revisions',
                     ['state', 'updated_at', 'id'])
+    op.create_index(
+        'ix_container_image_profile_qualification_queue',
+        'container_image_profile_revisions', ['updated_at', 'id'],
+        postgresql_where=sqlalchemy.text("state IN ('QUALIFYING', 'ACTIVE')"))
     op.create_index('ix_container_image_profile_history',
                     'container_image_profile_revisions',
                     ['workspace', 'created_at', 'id'])
@@ -813,6 +860,8 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_locations_shard_readiness',
                     'container_image_locations',
                     ['shard_id', 'state', 'updated_at', 'id'])
+    op.create_index('ix_container_image_locations_inventory_digest',
+                    'container_image_locations', ['shard_id', 'runtime_digest'])
     op.create_index(
         'ix_container_image_locations_inventory_confirmation',
         'container_image_locations',
@@ -926,11 +975,22 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_publications_canonical_queue',
                     'container_image_publications',
                     ['canonical_location_id', 'state', 'id'])
+    op.create_index(
+        'ix_container_image_publications_fanout',
+        'container_image_publications', ['canonical_location_id', 'id'],
+        postgresql_where=sqlalchemy.text(
+            "state = 'PENDING' AND canonical_location_id IS NOT NULL"))
     op.create_index('ix_container_image_publications_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'])
     op.create_index(_PUBLICATION_HISTORY_INDEX, 'container_image_publications',
                     ['workspace', 'created_at', 'id'])
+    op.create_index('ix_container_image_publications_workspace_state_history',
+                    'container_image_publications',
+                    ['workspace', 'state', 'created_at', 'id'])
+    op.create_index('ix_container_image_publications_workspace_release_history',
+                    'container_image_publications',
+                    ['workspace', 'requested_release', 'created_at', 'id'])
     op.create_index('ix_container_image_publications_active_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'],
@@ -944,6 +1004,21 @@ def _create_tables() -> None:
         'ix_container_image_publications_expiry',
         'container_image_publications', ['record_expires_at', 'id'],
         postgresql_where=sqlalchemy.text('record_expires_at IS NOT NULL'))
+    op.create_index('ix_container_image_publications_failed_reservation_expiry',
+                    'container_image_publications',
+                    ['reservation_expires_at', 'id'],
+                    postgresql_where=sqlalchemy.text(
+                        "state = 'FAILED' AND reservation_active IS TRUE"))
+    op.create_index(
+        'ix_container_image_publications_terminal_expiry',
+        'container_image_publications', ['record_expires_at', 'id'],
+        postgresql_where=sqlalchemy.text(
+            'reservation_active IS FALSE AND record_expires_at IS NOT NULL'))
+    op.create_index('ix_container_image_publications_ready_history',
+                    'container_image_publications',
+                    ['image_id', 'updated_at', 'id'],
+                    postgresql_where=sqlalchemy.text(
+                        "state = 'READY' AND reservation_active IS TRUE"))
 
     op.create_table(
         'container_image_demands',
@@ -1036,6 +1111,15 @@ def _create_tables() -> None:
                     'container_image_demands', ['state', 'updated_at', 'id'],
                     postgresql_where=sqlalchemy.text(
                         "state IN ('WARMING', 'READY', 'FAILED')"))
+    op.create_index('ix_container_image_demands_reconciliation_queue',
+                    'container_image_demands', ['updated_at', 'id'],
+                    postgresql_where=sqlalchemy.text(
+                        "state IN ('WARMING', 'READY', 'FAILED')"))
+    op.create_index(
+        'ix_container_image_demands_compaction_queue',
+        'container_image_demands', ['expires_at', 'id'],
+        postgresql_where=sqlalchemy.text(
+            "state IN ('SUPERSEDED', 'RELEASED') AND expires_at IS NOT NULL"))
 
     op.create_table(
         'container_image_consumer_watermarks',
@@ -1106,6 +1190,8 @@ def _create_tables() -> None:
     )
     op.create_index('ix_container_image_workers_kind_heartbeat',
                     'container_image_workers', ['kind', 'heartbeat_at', 'id'])
+    op.create_index('ix_container_image_workers_heartbeat',
+                    'container_image_workers', ['heartbeat_at', 'id'])
 
 
 def upgrade():

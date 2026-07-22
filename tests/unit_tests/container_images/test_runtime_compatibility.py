@@ -27,6 +27,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import serve_utils
 from sky.server import versions
 from sky.server.requests import payloads
+from sky.server.requests import requests as api_requests
 from sky.utils import dag_utils
 
 DIGEST = 'sha256:' + 'a' * 64
@@ -479,6 +480,85 @@ def test_managed_preferred_stale_route_preserves_direct_digest_path(
                                            allow_epoch_advance=False)
     assert result is resources
     assert result.resolved_container_image is None
+
+
+@pytest.mark.parametrize('provider', ['gcp', 'nebius', 'kubernetes', 'ssh'])
+def test_unsupported_runtime_keeps_exact_ref_direct_before_managed_policy(
+        monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
+    resolve_profile = mock.Mock(
+        side_effect=AssertionError('managed policy was consulted'))
+    demand_lookup = mock.Mock(
+        side_effect=AssertionError('managed demand was consulted'))
+    monkeypatch.setattr(runtime.config, 'resolve_profile', resolve_profile)
+    monkeypatch.setattr(runtime.demand_state,
+                        'get_current_demand_for_controller_epoch',
+                        demand_lookup)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution='gpu-production'))
+
+    resolution = runtime._resolve_metadata(
+        resources,
+        models.Placement(provider=provider,
+                         region='runtime-region',
+                         backend='direct',
+                         platform='linux/amd64'), 'research')
+
+    assert resolution.direct
+    assert resolution.locality_rank == 1
+    resolve_profile.assert_not_called()
+    demand_lookup.assert_not_called()
+
+
+def test_unsupported_runtime_preserves_direct_mode_locality_rank(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = models.WorkspaceImagePolicy(mode=models.WorkspaceImageMode.DIRECT,
+                                         locality=models.Locality.PREFER)
+    monkeypatch.setattr(runtime.config, 'get_workspace_policy',
+                        lambda _workspace: policy)
+    resources = _FakeResources(models.ContainerImage(ref=SOURCE))
+
+    resolution = runtime._resolve_metadata(
+        resources,
+        models.Placement(provider='gcp',
+                         region='us-central1',
+                         backend='direct',
+                         platform='linux/amd64'), 'research')
+
+    assert resolution.direct
+    assert resolution.locality_rank == 0
+
+
+def test_request_terminal_hint_is_silent_on_sqlite() -> None:
+    database = mock.Mock()
+    database.dialect.name = 'sqlite'
+    with mock.patch.object(api_requests.global_user_state,
+                           'initialize_and_get_db',
+                           return_value=database), mock.patch(
+                               'sky.container_images.demand_state.'
+                               'mark_cluster_request_terminal') as terminal:
+        api_requests._mark_container_image_request_terminal('ordinary-request')
+
+    terminal.assert_not_called()
+
+
+@pytest.mark.parametrize('image', [
+    models.ContainerImage(release='boltz-l4'),
+    models.ContainerImage(artifact_id=_ARTIFACT_ID)
+])
+def test_unsupported_runtime_rejects_managed_only_selectors_before_catalog(
+        monkeypatch: pytest.MonkeyPatch, image: models.ContainerImage) -> None:
+    published = mock.Mock(side_effect=AssertionError('catalog was consulted'))
+    monkeypatch.setattr(runtime, '_published_identity', published)
+
+    with pytest.raises(ValueError, match='IMAGE_LOCALITY_UNSUPPORTED'):
+        runtime._resolve_metadata(
+            _FakeResources(image),
+            models.Placement(provider='nebius',
+                             region='eu-north1',
+                             backend='direct',
+                             platform='linux/amd64'), 'research')
+
+    published.assert_not_called()
 
 
 def test_live_demand_replays_its_retired_immutable_profile_snapshot(
