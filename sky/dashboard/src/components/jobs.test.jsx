@@ -20,6 +20,7 @@ import {
 } from '@/components/jobs';
 import * as jobDomain from '@/components/job-domain';
 import * as jobsFacade from '@/components/jobs';
+import { REFRESH_INTERVAL } from '@/components/utils';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
@@ -97,6 +98,10 @@ const deferred = () => {
 };
 
 describe('managed jobs page initialization', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   it('performs one preload sweep for one mount', async () => {
     render(<ManagedJobs />);
 
@@ -111,7 +116,7 @@ describe('managed jobs page initialization', () => {
       dashboardCache.get.mock.calls.filter(
         ([fetcher]) => fetcher === getPoolStatus
       )
-    ).toHaveLength(2); // One page snapshot plus the PoolsTable's own read.
+    ).toHaveLength(1);
   });
 
   it('renders the pool row contract from the pool snapshot', async () => {
@@ -198,18 +203,19 @@ describe('managed jobs page initialization', () => {
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
     const refreshJobs = jest.fn();
-    const refreshPools = jest.fn();
     result.current.jobsRefreshRef.current = refreshJobs;
-    result.current.poolsRefreshRef.current = refreshPools;
 
-    act(() => result.current.handleRefresh());
+    let refreshPromise;
+    await act(async () => {
+      refreshPromise = result.current.handleRefresh();
+      await Promise.resolve();
+    });
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
     expect(refreshJobs).toHaveBeenCalledTimes(1);
-    expect(refreshPools).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       refreshedPools.resolve({ pools: [{ name: 'fresh-pool' }] });
-      await refreshedPools.promise;
+      await Promise.all([refreshedPools.promise, refreshPromise]);
     });
     expect(result.current.poolsData).toEqual([{ name: 'fresh-pool' }]);
     expect(result.current.poolsLoading).toBe(false);
@@ -239,11 +245,15 @@ describe('managed jobs page initialization', () => {
     const { result } = renderHook(() => useManagedJobsPageData());
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
-    act(() => result.current.handleRefresh());
+    let refreshPromise;
+    await act(async () => {
+      refreshPromise = result.current.handleRefresh();
+      await Promise.resolve();
+    });
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
     await act(async () => {
       refreshedPools.resolve({ pools: [{ name: 'fresh-pool' }] });
-      await refreshedPools.promise;
+      await Promise.all([refreshedPools.promise, refreshPromise]);
     });
     await act(async () => {
       initialPools.reject(new Error('stale pool failure'));
@@ -267,16 +277,15 @@ describe('managed jobs page initialization', () => {
       if (fetcher !== getPoolStatus) return Promise.resolve([]);
       poolRequestCount += 1;
       if (poolRequestCount === 1) return initialPoolRequestA.promise;
-      if (poolRequestCount === 2) return initialPoolRequestB.promise;
       return refreshedPools.promise;
     });
     render(<ManagedJobs />);
 
-    await waitFor(() => expect(poolRequestCount).toBe(2));
+    await waitFor(() => expect(poolRequestCount).toBe(1));
     const refreshButton = screen.getByRole('button', { name: 'Refresh' });
     await waitFor(() => expect(refreshButton).toBeEnabled());
     fireEvent.click(refreshButton);
-    await waitFor(() => expect(poolRequestCount).toBe(4));
+    await waitFor(() => expect(poolRequestCount).toBe(2));
 
     await act(async () => {
       refreshedPools.resolve({
@@ -290,13 +299,7 @@ describe('managed jobs page initialization', () => {
       initialPoolRequestA.resolve({
         pools: [{ name: 'stale-pool', replica_info: [] }],
       });
-      initialPoolRequestB.resolve({
-        pools: [{ name: 'stale-pool', replica_info: [] }],
-      });
-      await Promise.all([
-        initialPoolRequestA.promise,
-        initialPoolRequestB.promise,
-      ]);
+      await initialPoolRequestA.promise;
     });
 
     await waitFor(() => {
@@ -321,13 +324,12 @@ describe('managed jobs page initialization', () => {
       expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
     });
     const refreshJobs = jest.fn();
-    const refreshPools = jest.fn();
     result.current.jobsRefreshRef.current = refreshJobs;
-    result.current.poolsRefreshRef.current = refreshPools;
 
-    act(() => {
+    await act(async () => {
       result.current.handleRefresh();
       result.current.handleRefresh();
+      await Promise.resolve();
     });
 
     expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(2);
@@ -336,7 +338,6 @@ describe('managed jobs page initialization', () => {
     });
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
     expect(refreshJobs).not.toHaveBeenCalled();
-    expect(refreshPools).not.toHaveBeenCalled();
 
     await act(async () => {
       forcedPreload.resolve();
@@ -344,7 +345,6 @@ describe('managed jobs page initialization', () => {
     });
 
     expect(refreshJobs).toHaveBeenCalledTimes(1);
-    expect(refreshPools).toHaveBeenCalledTimes(1);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
@@ -370,9 +370,10 @@ describe('managed jobs page initialization', () => {
       expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
     });
 
-    act(() => {
+    await act(async () => {
       result.current.handleRefresh();
       result.current.handleRefresh();
+      await Promise.resolve();
     });
 
     expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(2, 'jobs', {
@@ -385,8 +386,9 @@ describe('managed jobs page initialization', () => {
       await firstForcedPools.promise.catch(() => {});
     });
 
-    act(() => {
+    await act(async () => {
       result.current.handleRefresh();
+      await Promise.resolve();
     });
 
     expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(3, 'jobs', {
@@ -404,6 +406,62 @@ describe('managed jobs page initialization', () => {
       expect.objectContaining({ message: 'pool snapshot unavailable' })
     );
     consoleError.mockRestore();
+  });
+
+  it('lets manual refresh supersede a pending interval poll and blocks overlapping polls', async () => {
+    jest.useFakeTimers();
+    const automaticPools = deferred();
+    const manualPools = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockImplementationOnce(() => automaticPools.promise)
+      .mockImplementationOnce(() => manualPools.promise)
+      .mockResolvedValueOnce({ pools: [{ name: 'post-manual-pool' }] });
+
+    const { result, unmount } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(REFRESH_INTERVAL);
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      result.current.handleRefresh();
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    act(() => {
+      jest.advanceTimersByTime(REFRESH_INTERVAL * 2);
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      manualPools.resolve({ pools: [{ name: 'manual-pool' }] });
+      await manualPools.promise;
+    });
+    expect(result.current.poolsData).toEqual([{ name: 'manual-pool' }]);
+
+    await act(async () => {
+      automaticPools.resolve({ pools: [{ name: 'stale-pool' }] });
+      await automaticPools.promise;
+    });
+    expect(result.current.poolsData).toEqual([{ name: 'manual-pool' }]);
+
+    act(() => {
+      jest.advanceTimersByTime(REFRESH_INTERVAL);
+    });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'post-manual-pool' }]);
+    });
+
+    unmount();
+    jest.useRealTimers();
   });
 });
 
