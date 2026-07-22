@@ -275,6 +275,81 @@ describe('useClusterDetails request ownership', () => {
       { clusterName: 'cluster-a', workspace: 'workspace-a' },
     ]);
   });
+
+  it('clears stale cluster state when a same-route refresh confirms the cluster is gone', async () => {
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
+      .mockResolvedValueOnce([]);
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+    expect(result.current.clusterData.name).toBe('cluster-a');
+    expect(result.current.clusterJobData).toEqual([
+      { id: 1, cluster: 'cluster-a' },
+    ]);
+
+    await act(async () => {
+      await result.current.refreshData();
+    });
+
+    expect(result.current.clusterData).toBeNull();
+    expect(result.current.clusterJobData).toBeNull();
+    expect(result.current.clusterDetailsLoading).toBe(false);
+    expect(result.current.clusterJobsLoading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(3, getClusters, [
+      { clusterNames: ['cluster-a'] },
+    ]);
+    expect(consoleError).toHaveBeenCalledWith(
+      'No cluster data found for cluster:',
+      'cluster-a'
+    );
+    consoleError.mockRestore();
+  });
+
+  it('preserves the current cluster state when the refresh cluster read fails', async () => {
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
+      .mockRejectedValueOnce(new Error('cluster read failed'));
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+    expect(result.current.clusterData.name).toBe('cluster-a');
+    expect(result.current.clusterJobData).toEqual([
+      { id: 1, cluster: 'cluster-a' },
+    ]);
+
+    await act(async () => {
+      await result.current.refreshData();
+    });
+
+    expect(result.current.clusterData.name).toBe('cluster-a');
+    expect(result.current.clusterJobData).toEqual([
+      { id: 1, cluster: 'cluster-a' },
+    ]);
+    expect(result.current.clusterDetailsLoading).toBe(false);
+    expect(result.current.clusterJobsLoading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+    expect(consoleError).toHaveBeenCalledWith(
+      'Error fetching cluster data:',
+      expect.objectContaining({ message: 'cluster read failed' })
+    );
+    consoleError.mockRestore();
+  });
 });
 
 describe('useClusterData request ownership', () => {
