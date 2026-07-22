@@ -1850,7 +1850,15 @@ class JobController:
                 terminate_one(task_id, async_task, delay_secs))
 
         # Run all terminations in parallel
-        await asyncio.gather(*termination_coros, return_exceptions=True)
+        termination_results = await asyncio.gather(*termination_coros,
+                                                   return_exceptions=True)
+        for result in termination_results:
+            if isinstance(result, BaseException):
+                # Wait for every independent auxiliary cleanup before
+                # surfacing a failed state transition. Silently returning here
+                # can leave the affected task nonterminal after its monitor and
+                # cluster have already been stopped.
+                raise result
 
     async def _cleanup_job_group_clusters(
             self, cluster_names: list[str | None]) -> None:

@@ -35,6 +35,30 @@ class TestControllerUnresponsiveGrace:
     def test_healthy_child_has_no_unresponsive_deadline(self):
         assert not service._live_child_unresponsive_too_long(None, 10_000.0)
 
+    def test_live_child_health_miss_is_graced_with_healthy_data_plane(self):
+        assert service._controller_health_miss_is_graced(
+            controller_responding=False,
+            controller_needs_respawn=False,
+            external_lb_healthy=True)
+
+    def test_health_miss_is_not_graced_after_respawn_deadline(self):
+        assert not service._controller_health_miss_is_graced(
+            controller_responding=False,
+            controller_needs_respawn=True,
+            external_lb_healthy=True)
+
+    def test_health_miss_does_not_hide_external_lb_failure(self):
+        assert not service._controller_health_miss_is_graced(
+            controller_responding=False,
+            controller_needs_respawn=False,
+            external_lb_healthy=False)
+
+    def test_healthy_child_does_not_need_grace(self):
+        assert not service._controller_health_miss_is_graced(
+            controller_responding=True,
+            controller_needs_respawn=False,
+            external_lb_healthy=True)
+
 
 class TestControllerHealth:
 
