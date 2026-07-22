@@ -138,6 +138,32 @@ LB_REQUEST_HISTORY_BUCKET_SECONDS = 60
 LB_REQUEST_HISTORY_WINDOW_SECONDS = 60 * 60
 LB_REQUEST_HISTORY_MAX_BUCKETS = (
     LB_REQUEST_HISTORY_WINDOW_SECONDS // LB_REQUEST_HISTORY_BUCKET_SECONDS + 1)
+# Full SkyServe HTTP completion-time histogram. Bounds are deliberately fixed
+# and coarse: the product needs minute-level distributions, not exact
+# per-request durations. The final implicit bucket contains values above one
+# hour. Changing these values requires a new histogram version because stored
+# arrays are interpreted by index.
+LB_RESPONSE_TIME_HISTOGRAM_VERSION = 1
+LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS = (
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1200.0,
+    1800.0,
+    3600.0,
+)
+LB_RESPONSE_TIME_STATUS_CLASSES = ('1xx', '2xx', '3xx', '4xx', '5xx')
+LB_RESPONSE_TIME_BUCKET_COUNT = (
+    len(LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS) + 1)
 
 # [boltz fork] Compatibility time budget for controllers predating the
 # commit-then-reconcile update protocol. Their handler can wait on the

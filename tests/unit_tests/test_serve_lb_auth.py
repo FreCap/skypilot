@@ -553,6 +553,35 @@ def test_stack_streaming_response_passes_through(monkeypatch):
     assert client.get('/stream').status_code == 401
 
 
+def test_response_time_stack_includes_auth_and_excludes_operations(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    lb._app.add_middleware(load_balancer._InboundAuthMiddleware)
+    lb._app.add_middleware(load_balancer._ResponseTimeMiddleware,
+                           aggregator=lb._request_aggregator)
+
+    async def _predict():
+        return {'ok': True}
+
+    async def _health():
+        return {'ok': True}
+
+    lb._app.add_api_route('/predict', _predict, methods=['GET'])
+    lb._app.add_api_route('/_lb/health', _health, methods=['GET'])
+    client = TestClient(lb._app)
+
+    assert client.get('/predict',
+                      headers=_edge_auth('s3cret')).status_code == 200
+    assert client.get('/predict').status_code == 401
+    assert client.get('/_lb/health').status_code == 200
+
+    bucket = lb._request_aggregator.response_time_history_snapshot(
+    )['buckets'][0]
+    assert sum(bucket['status_class_counts']['2xx']) == 1
+    assert sum(bucket['status_class_counts']['4xx']) == 1
+
+
 def test_request_aggregator_is_bounded():
     # Regression: retaining the batch across a failed sync must not grow without
     # bound. The aggregator keeps at most LB_REQUEST_TIMESTAMP_CAP samples.
@@ -632,6 +661,42 @@ def test_rejection_history_is_acknowledged_independently(monkeypatch):
         'request_count': 1,
         'rejected_count': 2,
     }]
+
+
+def test_response_time_history_uses_fixed_status_histograms(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    agg = serve_utils.RequestTimestamp()
+
+    agg.add_response_time(0.1, 200)
+    agg.add_response_time(0.11, 204)
+    agg.add_response_time(30.0, 404)
+    agg.add_response_time(3601.0, 503)
+
+    snapshot = agg.response_time_history_snapshot()
+    assert snapshot['bucket_seconds'] == 60
+    assert snapshot['histogram_version'] == 1
+    bucket = snapshot['buckets'][0]
+    assert bucket['bucket_start'] == 120
+    assert bucket['status_class_counts']['2xx'][:2] == [1, 1]
+    assert sum(bucket['status_class_counts']['2xx']) == 2
+    assert bucket['status_class_counts']['4xx'][7] == 1
+    assert bucket['status_class_counts']['5xx'][-1] == 1
+
+    agg.mark_response_time_history_accepted(snapshot)
+    assert agg.response_time_history_snapshot() is None
+
+
+def test_response_time_ack_preserves_completion_during_sync(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    agg = serve_utils.RequestTimestamp()
+    agg.add_response_time(1.0, 200)
+    snapshot = agg.response_time_history_snapshot()
+
+    agg.add_response_time(2.0, 200)
+    agg.mark_response_time_history_accepted(snapshot)
+
+    pending = agg.response_time_history_snapshot()['buckets'][0]
+    assert sum(pending['status_class_counts']['2xx']) == 2
 
 
 def test_terminal_rejection_feeds_exact_history(monkeypatch):
@@ -724,6 +789,28 @@ def test_request_history_requires_independent_controller_ack(monkeypatch):
     assert lb._request_aggregator.request_history_snapshot() is None
 
 
+def test_response_time_history_requires_new_controller_ack(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    lb._request_aggregator.add_response_time(1.0, 200)
+    captured = {}
+
+    _sync_once(monkeypatch, lb, 200, captured)
+
+    assert captured['json']['response_time_history'] is not None
+    assert lb._request_aggregator.response_time_history_snapshot() is not None
+
+    captured = {
+        'response_json': {
+            'replica_info': {},
+            'routing_spec': None,
+            'response_time_history_accepted': True,
+        }
+    }
+    _sync_once(monkeypatch, lb, 200, captured)
+    assert lb._request_aggregator.response_time_history_snapshot() is None
+
+
 def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
     now = [120.0]
     monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
@@ -762,6 +849,7 @@ def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
         '/controller/load_balancer_request_history_sync')
     assert set(captured['json']) == {
         'request_history',
+        'response_time_history',
         'request_history_session_id',
         'lb_session_id',
     }

@@ -30,6 +30,7 @@ from sky.serve import serve_utils
 from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
 from sky.serve.load_balancer_http import _ReleasingStreamingResponse
+from sky.serve.load_balancer_http import _ResponseTimeMiddleware
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -39,6 +40,7 @@ logger = sky_logging.init_logger(__name__)
 _DrainableServer.__module__ = __name__
 _InboundAuthMiddleware.__module__ = __name__
 _ReleasingStreamingResponse.__module__ = __name__
+_ResponseTimeMiddleware.__module__ = __name__
 
 # Per-client in-flight request counter attribute. Attached to the
 # httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
@@ -1872,7 +1874,9 @@ class SkyServeLoadBalancer:
             return
         self._retain_background_task(
             loop.create_task(self._notify_request_queue()))
-        if self._request_aggregator.request_history_snapshot() is not None:
+        if (self._request_aggregator.request_history_snapshot() is not None or
+                self._request_aggregator.response_time_history_snapshot()
+                is not None):
             self._retain_background_task(
                 loop.create_task(self._flush_request_history_on_drain()))
 
@@ -3160,6 +3164,8 @@ class SkyServeLoadBalancer:
             request_batch = self._request_aggregator.drain()
             request_history = (
                 self._request_aggregator.request_history_snapshot())
+            response_time_history = (
+                self._request_aggregator.response_time_history_snapshot())
             request_batch_accepted = False
             sync_payload = {
                 # Catalog/version fence for compatibility gauges. This is the
@@ -3168,6 +3174,7 @@ class SkyServeLoadBalancer:
                 'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
+                'response_time_history': response_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'in_flight': in_flight,
                 'routing_urls': routing_urls,
@@ -3239,6 +3246,10 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        if response_json.get(
+                                'response_time_history_accepted') is True:
+                            self._request_aggregator.mark_response_time_history_accepted(
+                                response_time_history)
                         replica_info = response_json.get('replica_info', {})
                         # Count of READY, active replicas the controller has,
                         # which can exceed len(replica_info) when endpoints are
@@ -3795,13 +3806,16 @@ class SkyServeLoadBalancer:
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
         request_history = self._request_aggregator.request_history_snapshot()
-        if request_history is None:
+        response_time_history = (
+            self._request_aggregator.response_time_history_snapshot())
+        if request_history is None and response_time_history is None:
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
             session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
+                'response_time_history': response_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'lb_session_id': session_id,
             }
@@ -3835,6 +3849,10 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        if response_json.get(
+                                'response_time_history_accepted') is True:
+                            self._request_aggregator.mark_response_time_history_accepted(
+                                response_time_history)
                         return
         except Exception as e:  # pylint: disable=broad-except
             # Shutdown must remain bounded even when the controller, token
@@ -4334,6 +4352,11 @@ class SkyServeLoadBalancer:
         # Pure-ASGI so it wraps the catch-all proxy without buffering streaming
         # responses; exempts the readiness probe by method+path.
         self._app.add_middleware(_InboundAuthMiddleware)
+        # Register after auth so Starlette makes this the outer user
+        # middleware. Authentication failures are customer-visible response
+        # completions too; operational /_lb/* traffic is excluded internally.
+        self._app.add_middleware(_ResponseTimeMiddleware,
+                                 aggregator=self._request_aggregator)
         # Register the readiness route BEFORE the catch-all proxy route so it
         # is matched first (Starlette matches in registration order) instead of
         # being proxied to a replica.

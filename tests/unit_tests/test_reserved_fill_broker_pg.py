@@ -37,6 +37,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 # `broker_engine` defined here instead of the sqlite one).
 import test_reserved_fill_broker as sqlite_suite
 
+from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import placement_history
 from sky.serve import replica_managers
@@ -313,6 +314,7 @@ class TestMigrationChainPG:
                     'demand_capacity_observations',
                     'serve_replica_status_history',
                     'serve_request_activity_history',
+                    'serve_response_time_history',
                     'serve_autoscaler_history',
                     'serve_placement_events',
                 }.issubset(tables), tables
@@ -374,6 +376,18 @@ class TestMigrationChainPG:
                 assert request_columns['rejected_count']['default'] is not None
                 assert request_columns['rejection_count_available'][
                     'default'] is not None
+                response_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'serve_response_time_history')
+                }
+                assert {
+                    'response_count',
+                    'status_1xx_counts',
+                    'status_2xx_counts',
+                    'status_3xx_counts',
+                    'status_4xx_counts',
+                    'status_5xx_counts',
+                }.issubset(response_columns)
                 status_columns = {
                     column['name'] for column in inspector.get_columns(
                         'serve_replica_status_history')
@@ -808,6 +822,108 @@ class TestServeStatusHistoryPG:
         assert not current['request_samples']
         assert current['requests_last_hour'] == 0
 
+    def test_response_time_history_is_idempotent_and_reporter_additive(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+        bucket_count = constants.LB_RESPONSE_TIME_BUCKET_COUNT
+
+        def response_history(successes, errors=0):
+            success_counts = [0] * bucket_count
+            error_counts = [0] * bucket_count
+            success_counts[3] = successes
+            error_counts[7] = errors
+            return {
+                'bucket_seconds': 60,
+                'histogram_version': 1,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'status_class_counts': {
+                        '2xx': success_counts,
+                        '5xx': error_counts,
+                    },
+                }],
+            }
+
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        assert serve_history.record_response_times('svc', 'hash-a',
+                                                   'pod-a:process-a',
+                                                   response_history(3, 1),
+                                                   timestamp) == 1
+        # A stale snapshot cannot decrement the reporter's cumulative arrays.
+        serve_history.record_response_times('svc', 'hash-a', 'pod-a:process-a',
+                                            response_history(2), timestamp + 1)
+        serve_history.record_response_times('svc', 'hash-a', 'pod-a:process-a',
+                                            response_history(5, 2),
+                                            timestamp + 2)
+        # A concurrently active reporter contributes distinct completions.
+        serve_history.record_response_times('svc', 'hash-a', 'pod-b:process-b',
+                                            response_history(7, 3),
+                                            timestamp + 3)
+
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 4)
+        assert history['response_time_histogram_version'] == 1
+        assert history['response_time_bucket_upper_bounds_seconds'] == list(
+            constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS)
+        assert len(history['response_time_samples']) == 1
+        sample = history['response_time_samples'][0]
+        assert sample['timestamp'] == float(bucket_start)
+        assert sample['status_class_counts']['2xx'][3] == 12
+        assert sample['status_class_counts']['5xx'][7] == 5
+
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    serve_state.services_table).values(hash='hash-b'))
+        current = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 5)
+        assert current['service_hash'] == 'hash-b'
+        assert not current['response_time_samples']
+
+    def test_response_time_history_rejects_invalid_array_shape(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+        invalid = {
+            'bucket_seconds': 60,
+            'histogram_version': 1,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'status_class_counts': {
+                    '2xx': [1],
+                },
+            }],
+        }
+        with pytest.raises(ValueError, match='fixed number'):
+            serve_history.record_response_times('svc', 'hash-a', 'reporter',
+                                                invalid, timestamp)
+
+        response_table = serve_history.serve_response_time_history_table
+        valid_zero_counts = [0] * constants.LB_RESPONSE_TIME_BUCKET_COUNT
+        with pytest.raises(sqlalchemy.exc.IntegrityError), history_engine.begin(
+        ) as connection:
+            connection.execute(
+                sqlalchemy.insert(response_table).values(
+                    service_name='svc',
+                    service_hash='hash-a',
+                    reporter_session_id='reporter',
+                    bucket_start=datetime.datetime.fromtimestamp(
+                        bucket_start, datetime.timezone.utc),
+                    observed_at=datetime.datetime.fromtimestamp(
+                        timestamp, datetime.timezone.utc),
+                    response_count=1,
+                    status_1xx_counts=valid_zero_counts,
+                    status_2xx_counts=[1],
+                    status_3xx_counts=valid_zero_counts,
+                    status_4xx_counts=valid_zero_counts,
+                    status_5xx_counts=valid_zero_counts,
+                ))
+
     def test_autoscaler_history_retains_latest_state_and_minute_peaks(
             self, history_engine):
         timestamp = 1784207110.0
@@ -1058,6 +1174,7 @@ class TestServeStatusHistoryPG:
                                                             microsecond=0)
         table = serve_history.serve_replica_status_history_table
         request_table = serve_history.serve_request_activity_history_table
+        response_table = serve_history.serve_response_time_history_table
         autoscaler_table = serve_history.serve_autoscaler_history_table
         with history_engine.begin() as connection:
             connection.execute(
@@ -1085,6 +1202,20 @@ class TestServeStatusHistoryPG:
                     observed_at=old_bucket,
                     request_count=1,
                     rejected_count=0))
+            zero_counts = [0] * constants.LB_RESPONSE_TIME_BUCKET_COUNT
+            connection.execute(
+                sqlalchemy.insert(response_table).values(
+                    service_name='old',
+                    service_hash='old-hash',
+                    reporter_session_id='pod:process',
+                    bucket_start=old_bucket,
+                    observed_at=old_bucket,
+                    response_count=1,
+                    status_1xx_counts=zero_counts,
+                    status_2xx_counts=[1] + zero_counts[1:],
+                    status_3xx_counts=zero_counts,
+                    status_4xx_counts=zero_counts,
+                    status_5xx_counts=zero_counts))
             connection.execute(
                 sqlalchemy.insert(autoscaler_table).values(
                     service_name='old',
@@ -1115,6 +1246,11 @@ class TestServeStatusHistoryPG:
                     sqlalchemy.func.count()  # pylint: disable=not-callable
                 ).select_from(request_table).where(
                     request_table.c.service_name == 'old')).scalar_one() == 0
+            assert connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(response_table).where(
+                    response_table.c.service_name == 'old')).scalar_one() == 0
             assert connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.count()  # pylint: disable=not-callable
