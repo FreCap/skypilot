@@ -20,6 +20,7 @@ from sky.skylet import constants
 from sky.skylet import log_lib
 from sky.utils import common
 from sky.utils import controller_dependency_installation
+from sky.utils import controller_mount_translation
 from sky.utils import controller_utils
 from sky.utils import registry
 
@@ -54,6 +55,20 @@ def test_cloud_dependency_installation_facade_identity():
             _get_cloud_dependencies_installation_commands is function)
     assert function.__module__ == 'sky.utils.controller_utils'
     assert pickle.loads(pickle.dumps(function)) is function
+
+
+@pytest.mark.parametrize('function_name', [
+    'translate_local_file_mounts_to_two_hop',
+    'maybe_translate_local_file_mounts_and_sync_up',
+])
+def test_mount_translation_facade_identity(function_name):
+    facade_function = getattr(controller_utils, function_name)
+    implementation_function = getattr(controller_mount_translation,
+                                      function_name)
+
+    assert implementation_function is facade_function
+    assert facade_function.__module__ == 'sky.utils.controller_utils'
+    assert pickle.loads(pickle.dumps(facade_function)) is facade_function
 
 
 def test_configured_bucket_cleanup_manifest_precedes_upload(tmp_path):
@@ -91,6 +106,49 @@ def test_configured_bucket_cleanup_manifest_precedes_upload(tmp_path):
     assert prepared_storage['_is_sky_managed'] is False
     assert prepared_storage['_force_delete'] is True
     assert prepared_storage['_bucket_sub_path'].startswith('base/')
+
+
+def test_two_hop_mount_translation_preserves_mapping_order():
+    task = task_lib.Task(workdir='/local/workdir',
+                         file_mounts={
+                             '/remote/first': '/local/first',
+                             '/remote/second': '/local/second',
+                         })
+    run_id = 'stable-run'
+    base_path = os.path.join(constants.FILE_MOUNTS_CONTROLLER_TMP_BASE_PATH,
+                             run_id)
+
+    first_hop = controller_utils.translate_local_file_mounts_to_two_hop(
+        task, run_id=run_id)
+
+    assert first_hop == {
+        os.path.join(base_path, '0'): '/local/first',
+        os.path.join(base_path, '1'): '/local/second',
+        os.path.join(base_path, '2'): '/local/workdir',
+    }
+    assert task.workdir is None
+    assert task.file_mounts == {
+        '/remote/first': os.path.join(base_path, '0'),
+        '/remote/second': os.path.join(base_path, '1'),
+        constants.SKY_REMOTE_WORKDIR: os.path.join(base_path, '2'),
+    }
+
+
+@pytest.mark.parametrize('mounts', [
+    {
+        '/remote/path': 's3://bucket/source'
+    },
+    {
+        's3://bucket/destination': '/local/source'
+    },
+])
+def test_two_hop_mount_translation_rejects_cloud_urls(mounts):
+    task = task_lib.Task(file_mounts=mounts)
+
+    with pytest.raises(exceptions.NotSupportedError,
+                       match='no cloud storage is available'):
+        controller_utils.translate_local_file_mounts_to_two_hop(
+            task, run_id='stable-run')
 
 
 @pytest.mark.parametrize(
