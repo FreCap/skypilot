@@ -751,6 +751,51 @@ class TestJobGroupRecovery:
         assert cancelled == {'first', 'second'}
 
     @pytest.mark.asyncio
+    async def test_auxiliary_termination_propagates_state_write_failure(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        job_controller._cleanup_cluster = AsyncMock()
+        monitor_tasks = {
+            task_id: asyncio.create_task(asyncio.Event().wait())
+            for task_id in range(2)
+        }
+        cancelling_calls = []
+        cancelled_calls = []
+
+        async def set_cancelling(*, job_id, callback_func):
+            assert job_id == 42
+            cancelling_calls.append(callback_func)
+            if callback_func == 0:
+                raise RuntimeError('state write failed')
+
+        async def set_cancelled(*, job_id, callback_func):
+            assert job_id == 42
+            cancelled_calls.append(callback_func)
+
+        with patch.object(
+                controller_lib.managed_job_utils,
+                'event_callback_func',
+                side_effect=lambda **kwargs: kwargs['task_id']), patch.object(
+                    controller_lib.managed_job_state,
+                    'set_cancelling_async',
+                    side_effect=set_cancelling), patch.object(
+                        controller_lib.managed_job_state,
+                        'set_cancelled_async',
+                        side_effect=set_cancelled), pytest.raises(
+                            RuntimeError, match='state write failed'):
+            await job_controller._terminate_auxiliary_jobs(
+                mock_dag.tasks[:2],
+                monitor_tasks, ['cluster-0', 'cluster-1'],
+                all_primary_succeeded=False)
+
+        # A failed transition is surfaced only after independent siblings have
+        # finished, so one broken row cannot strand every auxiliary task.
+        assert set(cancelling_calls) == {0, 1}
+        assert cancelled_calls == [1]
+        job_controller._cleanup_cluster.assert_awaited_once_with('cluster-1')
+        assert all(task.done() for task in monitor_tasks.values())
+
+    @pytest.mark.asyncio
     async def test_job_group_launch_propagates_child_cancellation(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
