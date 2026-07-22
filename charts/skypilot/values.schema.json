@@ -476,6 +476,9 @@
                     "type": "integer",
                     "minimum": 0
                 },
+                "bootstrapFreshSchema": {
+                    "type": "boolean"
+                },
                 "enabled": {
                     "type": "boolean"
                 },

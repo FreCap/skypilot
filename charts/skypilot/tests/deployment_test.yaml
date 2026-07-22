@@ -1419,3 +1419,47 @@ tests:
       - lengthEqual:
           path: spec.template.spec.containers[0].env
           count: 11
+
+  - it: should reject duplicate database and API volume names
+    set:
+      databaseConnection.extraVolumes:
+        - name: connection-material
+          secret:
+            secretName: database-material
+      apiService.extraVolumes:
+        - name: connection-material
+          secret:
+            secretName: api-material
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "connection-material" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate database and API mount paths
+    set:
+      databaseConnection.extraVolumeMounts:
+        - name: database-material
+          mountPath: /etc/shared-material
+      apiService.extraVolumeMounts:
+        - name: api-material
+          mountPath: /etc/shared-material
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/etc/shared-material" is duplicated or reserved by the chart'
+
+  - it: should reject an extra volume using a chart-owned API volume name
+    set:
+      apiService.extraVolumes:
+        - name: state-volume
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "state-volume" is duplicated or reserved by the chart'
+
+  - it: should reject an extra mount using a chart-owned API path
+    set:
+      apiService.extraVolumeMounts:
+        - name: unexpected-config
+          mountPath: /var/skypilot/config
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/var/skypilot/config" is duplicated or reserved by the chart'

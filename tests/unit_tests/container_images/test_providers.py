@@ -18,14 +18,39 @@ _DIGEST = 'sha256:' + 'a' * 64
     '127.0.0.1:8443',
     '10.0.0.1:8443',
     '169.254.169.254:443',
+    '224.0.0.1:443',
+    '239.1.2.3:443',
     '[::1]:8443',
     '[fe80::1]:443',
+    '[ff02::1]:443',
+    '[ff0e::1]:443',
 ])
 def test_source_reader_rejects_non_public_literal_authorities(
         authority: str) -> None:
     reference = f'{authority}/example/image@{_DIGEST}'
     with pytest.raises(ValueError, match='network destination is not public'):
         providers.RegistryV2Source(reference, lambda: None)
+
+
+@pytest.mark.parametrize('peer',
+                         ['224.0.0.1', '239.1.2.3', 'ff02::1', 'ff0e::1'])
+def test_source_reader_rejects_multicast_connected_peer_before_tls(
+        monkeypatch: pytest.MonkeyPatch, peer: str) -> None:
+    adapter_type = providers._guarded_https_adapter_type()
+    adapter = adapter_type()
+    pool = adapter.poolmanager.connection_from_url('https://registry.example')
+    connection_type = pool.ConnectionCls
+    base_connection_type = connection_type.__mro__[1]
+    connected_socket = mock.Mock()
+    connected_socket.getpeername.return_value = (peer, 443)
+    monkeypatch.setattr(base_connection_type, '_new_conn',
+                        lambda _self: connected_socket)
+
+    connection = connection_type(host='registry.example')
+    with pytest.raises(ValueError, match='network destination is not public'):
+        connection._new_conn()
+
+    connected_socket.close.assert_called_once_with()
 
 
 def test_source_reader_rejects_rebound_private_peer_before_tls(

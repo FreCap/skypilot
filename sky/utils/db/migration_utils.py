@@ -29,7 +29,7 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 # the same process.
 _alembic_thread_lock = threading.Lock()
 
-MigrationMode = Literal['auto', 'upgrade', 'verify']
+MigrationMode = Literal['auto', 'upgrade', 'bootstrap', 'verify']
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
 GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions
@@ -190,6 +190,7 @@ def _validate_global_user_state_upgrade_start(
     section: str,
     target_revision: str,
     alembic_ini_path: str | None,
+    mode: MigrationMode,
 ) -> None:
     """Prevents revision 024 racing migration code that predates its lock."""
     if (engine.dialect.name != 'postgresql' or
@@ -201,15 +202,19 @@ def _validate_global_user_state_upgrade_start(
     if (current_revision is not None and int(current_revision)
             >= int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
         return
-    if current_revision is None and _postgres_effective_schema_is_empty(engine):
+    if (mode == 'bootstrap' and current_revision is None and
+            _postgres_effective_schema_is_empty(engine)):
         return
     observed = current_revision or 'uninitialized nonempty schema'
+    if current_revision is None and mode != 'bootstrap':
+        observed = 'uninitialized schema'
     raise RuntimeError(
         f'{section} database is at revision {observed}. Revision '
         f'{target_revision} requires a staged upgrade through revision '
         f'{GLOBAL_USER_STATE_JOB_MINIMUM_REVISION} before the migration job can '
         'run. Drain older API binaries, complete that predecessor migration, '
-        'then retry the job.')
+        'then retry the job. For a new isolated empty schema, explicitly use '
+        'bootstrap mode.')
 
 
 def _postgres_effective_schema_is_empty(
@@ -285,11 +290,12 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
         'spot_jobs_db').
         target_revision: Target revision to upgrade to (e.g., '001').
         alembic_ini_path: Optional path to a custom alembic.ini file.
-        mode: ``verify`` performs no DDL. ``auto`` and ``upgrade`` converge the
-            schema; the distinct names make API and migration-job intent
-            explicit in deployment configuration.
+        mode: ``verify`` performs no DDL. ``auto`` and ``upgrade`` converge an
+            initialized schema. ``bootstrap`` additionally permits the central
+            state schema to start from a proven-empty isolated PostgreSQL
+            schema; the distinct names make deployment intent explicit.
     """
-    if mode not in ('auto', 'upgrade', 'verify'):
+    if mode not in ('auto', 'upgrade', 'bootstrap', 'verify'):
         raise ValueError(f'Invalid database migration mode: {mode!r}.')
     # set alembic logger to warning level
     alembic_logger = logging.getLogger('alembic')
@@ -313,5 +319,6 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
                     if needs_upgrade(engine, section, target_revision,
                                      alembic_ini_path):
                         _validate_global_user_state_upgrade_start(
-                            engine, section, target_revision, alembic_ini_path)
+                            engine, section, target_revision, alembic_ini_path,
+                            mode)
                         alembic_command.upgrade(alembic_config, target_revision)

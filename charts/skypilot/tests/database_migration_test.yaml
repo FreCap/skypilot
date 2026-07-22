@@ -53,6 +53,17 @@ tests:
                 name: RELEASE-NAME-db-connection
                 key: connection_string
 
+  - it: should bootstrap only when fresh-schema isolation is explicit
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.bootstrapFreshSchema: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: bootstrap
+
   - it: should preserve the revision suffix within the Kubernetes name limit
     set:
       fullnameOverride: a-very-long-skypilot-release-name-that-fills-the-kubernetes-name-limit
@@ -68,7 +79,7 @@ tests:
           path: spec.template.metadata.labels.app
           value: a-very-long-skypilot-release-name-that-fills-the-db-migration-0
 
-  - it: should inherit image policy scheduling and database TLS mounts
+  - it: should inherit image policy scheduling but exclude API-only inputs
     set:
       global.imageRegistry: registry.example.com/cache
       global.imagePullSecrets:
@@ -81,15 +92,15 @@ tests:
         - key: control
           operator: Exists
       apiService.extraEnvs:
-        - name: PGSSLMODE
-          value: verify-full
+        - name: API_ONLY_SECRET
+          value: must-not-leak
       apiService.extraVolumes:
-        - name: db-ca
+        - name: api-only-secret
           secret:
-            secretName: db-ca
+            secretName: api-only-secret
       apiService.extraVolumeMounts:
-        - name: db-ca
-          mountPath: /etc/db
+        - name: api-only-secret
+          mountPath: /etc/api-only
           readOnly: true
     asserts:
       - equal:
@@ -107,23 +118,15 @@ tests:
           content:
             key: control
             operator: Exists
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
-            name: PGSSLMODE
-            value: verify-full
-      - contains:
+            name: API_ONLY_SECRET
+            value: must-not-leak
+      - isNull:
           path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: db-ca
-            mountPath: /etc/db
-            readOnly: true
-      - contains:
+      - isNull:
           path: spec.template.spec.volumes
-          content:
-            name: db-ca
-            secret:
-              secretName: db-ca
 
   - it: should receive shared database connection settings
     set:
@@ -174,9 +177,58 @@ tests:
   - it: should reject an extra environment override of migration ownership
     set:
       apiService.dbConnectionSecretName: external-db
-      apiService.extraEnvs:
+      databaseConnection.extraEnvs:
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: auto
     asserts:
       - failedTemplate:
           errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject duplicate shared environment names
+    set:
+      apiService.dbConnectionSecretName: external-db
+      global.extraEnvs:
+        - name: PGSSLMODE
+          value: require
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "PGSSLMODE" is duplicated or reserved by the chart'
+
+  - it: should reject the chart-owned database URI environment
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_DB_CONNECTION_URI
+          value: postgresql://unexpected
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_DB_CONNECTION_URI" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate shared volume names
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraVolumes:
+        - name: db-material
+          secret:
+            secretName: first
+        - name: db-material
+          secret:
+            secretName: second
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "db-material" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate shared mount paths
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraVolumeMounts:
+        - name: first-db-material
+          mountPath: /etc/database
+        - name: second-db-material
+          mountPath: /etc/database
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/etc/database" is duplicated or reserved by the chart'

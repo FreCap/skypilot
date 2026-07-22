@@ -1200,13 +1200,15 @@ def activate_profile(
         if optimistic is None:
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer exists.')
-        profile_rows = session.execute(
+        topology_state.lock_profile_mutation_in_session(
+            session,
+            workspace=str(optimistic.workspace),
+            profile=str(optimistic.profile))
+        desired = session.execute(
             sqlalchemy.select(table).where(
                 table.c.workspace == optimistic.workspace,
-                table.c.profile == optimistic.profile).order_by(
-                    table.c.id).with_for_update()).mappings().all()
-        desired = next((row for row in profile_rows
-                        if str(row['id']) == profile_revision_id), None)
+                table.c.profile == optimistic.profile, table.c.id ==
+                profile_revision_id).with_for_update()).mappings().first()
         if desired is None:
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer exists.')
@@ -1218,6 +1220,15 @@ def activate_profile(
                 != expected_attestations_hash):
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer matches the desired revision.')
+        active_rows = session.execute(
+            sqlalchemy.select(table.c.id).where(
+                table.c.workspace == desired['workspace'],
+                table.c.profile == desired['profile'], table.c.state ==
+                models.ImageProfileState.ACTIVE.value).order_by(
+                    table.c.id).limit(2).with_for_update()).mappings().all()
+        if len(active_rows) > 1:
+            raise ValueError('QUALIFICATION_FAILED')
+        active_ids = {str(row['id']) for row in active_rows}
         attestations = json.loads(str(desired['attestations_json']))
         for attestation, max_age_seconds in required_attestations.items():
             evidence = attestations.get(attestation)
@@ -1255,11 +1266,6 @@ def activate_profile(
         if len(shard_rows) != sum(target.shard_count for target in targets):
             raise ValueError('QUALIFICATION_FAILED')
         target_counts = {target.name: 0 for target in targets}
-        active_ids = {
-            str(row['id'])
-            for row in profile_rows
-            if str(row['state']) == models.ImageProfileState.ACTIVE.value
-        }
         for shard in shard_rows:
             target = target_by_name.get(str(shard['target_id']))
             if (target is None or

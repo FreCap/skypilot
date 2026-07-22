@@ -65,7 +65,7 @@ def _require_public_network_address(value: str) -> None:
         address = ipaddress.ip_address(value.split('%', 1)[0])
     except ValueError:
         return
-    if not address.is_global:
+    if not address.is_global or address.is_multicast:
         raise ValueError('OCI source network destination is not public.')
 
 

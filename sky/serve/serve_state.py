@@ -1714,8 +1714,7 @@ def get_service_version_terminal_states(
     })
     engine = _db_manager.get_engine()
     service_rows = []
-    version_rows = []
-    replica_rows = []
+    version_probes = []
     with orm.Session(engine) as session:
         for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
             name_batch = names[start:start +
@@ -1734,25 +1733,33 @@ def get_service_version_terminal_states(
                            _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
             version_batch = version_identities[
                 start:start + _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
-            exact_versions = sqlalchemy.tuple_(
-                version_specs_table.c.service_name,
-                version_specs_table.c.version).in_(version_batch)
-            version_rows.extend(
-                session.execute(
-                    sqlalchemy.select(version_specs_table.c.service_name,
-                                      version_specs_table.c.version).where(
-                                          exact_versions)).all())
-            exact_replicas = sqlalchemy.tuple_(
-                replicas_table.c.service_name,
-                replicas_table.c.version).in_(version_batch)
-            replica_rows.extend(
+            wanted = sqlalchemy.values(
+                sqlalchemy.column('service_name', sqlalchemy.Text),
+                sqlalchemy.column('version', sqlalchemy.Integer),
+            ).data(version_batch).cte('wanted_service_versions')
+            version_exists = sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).where(
+                    version_specs_table.c.service_name == wanted.c.service_name,
+                    version_specs_table.c.version == wanted.c.version))
+            replica_exists = sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).where(
+                    replicas_table.c.service_name == wanted.c.service_name,
+                    replicas_table.c.version == wanted.c.version))
+            version_probes.extend(
                 session.execute(
                     sqlalchemy.select(
-                        replicas_table.c.service_name,
-                        replicas_table.c.version).where(exact_replicas)).all())
+                        wanted.c.service_name,
+                        wanted.c.version,
+                        version_exists.label('version_exists'),
+                        replica_exists.label('replica_exists'),
+                    ).select_from(wanted)).mappings().all())
     services = {str(row['name']): row for row in service_rows}
-    versions = {(str(row[0]), int(row[1])) for row in version_rows}
-    replicas = {(str(row[0]), int(row[1])) for row in replica_rows}
+    versions = {(str(row['service_name']), int(row['version']))
+                for row in version_probes
+                if row['version_exists']}
+    replicas = {(str(row['service_name']), int(row['version']))
+                for row in version_probes
+                if row['replica_exists']}
     result: dict[tuple[str, int, str], bool] = {}
     for identity in identities:
         name, version, service_hash = identity

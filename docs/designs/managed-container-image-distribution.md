@@ -4,7 +4,7 @@ Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 ## Decision
 
@@ -425,8 +425,10 @@ worker accepts only credential-free HTTPS source and redirect URLs, disables
 environment proxy inheritance, rejects localhost and non-public IP literals,
 and checks the actual connected peer immediately after every TCP connection and
 before TLS, HTTP bytes, or credentials. This closes direct private addresses,
-DNS rebinding, bearer realms, and signed-URL redirects over private or link-local
-space. Basic source credentials may authenticate a bearer realm only on the
+DNS rebinding, bearer realms, and signed-URL redirects over private, link-local,
+or multicast IPv4 and IPv6 space. Multicast is rejected explicitly instead of
+depending on Python's version-specific `is_global` classification. Basic source
+credentials may authenticate a bearer realm only on the
 same normalized authority. Token requests never follow redirects. A blob may
 follow at most one public HTTPS redirect without forwarding source
 authorization. Manifest, token, config, and blob inspection bodies are streamed
@@ -1147,15 +1149,20 @@ added transactionally, a malformed same-name index still fails exact comparison,
 and every adoption write rolls back with any other drift.
 
 The revision-024 Helm Job cannot coordinate with an old binary whose migration
-path predates the PostgreSQL advisory lock. It therefore permits a genuinely
-empty effective PostgreSQL schema or a database already at revision 023 or
-later, and fails without DDL when the effective schema is unversioned or below
-023 and owns any relation, view, materialized view, sequence, user type, or
-routine. Emptiness is proved from PostgreSQL catalogs for the exact schema
-selected by the connection search path; a table-only inspector is insufficient.
-Operators first stage a nonempty deployment through revision 023, drain binaries
-older than 023, and only then run the 024 Job. New Job and `auto` processes share
-the advisory lock once every participant is at least revision 023.
+path predates the PostgreSQL advisory lock. Ordinary `auto` and `upgrade` modes
+therefore accept only a database already at revision 023 or later and fail
+without DDL when the effective schema is unversioned or below 023, including an
+empty schema. Operators first stage an existing deployment through revision
+023, drain binaries older than 023, and only then run the 024 Job. A new database
+may opt into the distinct `bootstrap` mode only when the operator has isolated
+that effective schema from every other migration or DDL writer. `bootstrap`
+still proves from PostgreSQL catalogs that the exact schema selected by the
+connection search path owns no relation, view, materialized view, sequence,
+user type, routine, or other user object before starting the migration chain.
+The explicit mode is the isolation assertion; it is never selected by API
+replicas or workers and is not a general empty-schema shortcut. New Job,
+`bootstrap`, and `auto` processes share the advisory lock once every participant
+is at least revision 023.
 
 ## Registry profiles
 
@@ -1318,10 +1325,14 @@ container_registries:
 
 Semantic changes require a higher explicit revision. Existing durable pull plans
 remain valid while their exact target and auth contract remains usable. In one
-transaction, config reload locks the current desired and active rows, increments
-the desired generation, marks an older unfinished desired revision SUPERSEDED,
-and stages the new revision as QUALIFYING. It never makes provider calls or
-blocks deployment.
+transaction, config reload acquires a transaction-scoped PostgreSQL advisory
+lock keyed by workspace and profile, reads only an exact idempotency candidate,
+the indexed ACTIVE row, and an indexed scalar maximum desired generation, marks
+an older unfinished desired revision SUPERSEDED, and stages the new revision as
+QUALIFYING. Activation acquires the same lock, reads only the exact desired row
+and indexed ACTIVE row, and updates those rows directly. Neither mutation
+materializes retained profile history. It never makes provider calls or blocks
+deployment.
 
 Qualification is a bounded aggregation of revision-scoped, secret-free
 attestations, not one powerful worker assuming every identity:
@@ -2047,20 +2058,25 @@ CLI or Dashboard locates such a publication for explicit retry.
    pods start concurrently in `verify` mode, refuse to serve below 024, and
    become ready after the Job commits. For a nonempty database below 023, first
    deploy revision 023 and drain every older binary; the 024 Job refuses that
-   unsafe starting state. The empty-schema exception checks every schema-owned
-   relation, sequence, type, and routine, not only tables. From revision 023
-   onward, the Job and transitional `auto` pods share the same cross-host
-   PostgreSQL advisory lock, so only one Alembic process can mutate the schema.
-   A genuinely empty effective schema may upgrade directly. API replicas and
-   every enabled image worker run in `verify` mode while the Job owns migration;
-   a worker can never win startup and perform the Job's DDL. Disabling
+   unsafe starting state. A fresh isolated database must explicitly set
+   `databaseMigration.bootstrapFreshSchema: true`; the resulting `bootstrap`
+   mode checks every schema-owned relation, sequence, type, and routine, not
+   only tables. The default `upgrade` mode refuses every unversioned schema,
+   including an empty one. From revision 023 onward, the Job and transitional
+   `auto` pods share the same cross-host PostgreSQL advisory lock, so only one
+   Alembic process can mutate the schema. API replicas and every enabled image
+   worker run in `verify` mode while the Job owns migration; a worker can never
+   win startup and perform the Job's DDL. Disabling
    `databaseMigration` explicitly puts both API and workers in the lock-protected
    `auto` fallback for local or operator-owned migration workflows.
    Database CA or client-certificate volumes are declared once through the
    chart's shared `databaseConnection.extraVolumes` and
    `databaseConnection.extraVolumeMounts` values. The API, migration Job, and
-   all image workers mount that exact set. API-only extra volumes are not leaked
-   into the narrower worker identities.
+   all image workers mount that exact set. The migration Job receives global
+   and database-connection inputs only; API-only environments, Secrets, and
+   volumes are not leaked into its narrower identity. Helm rendering fails on
+   duplicate or chart-reserved environment names, volume names, or mount paths
+   across each produced Pod instead of emitting a manifest Kubernetes rejects.
    Ordinary request completion checks the central database dialect before
    issuing a cluster-image terminal hint. A local SQLite API therefore performs
    no managed-image query and emits no PostgreSQL-only warning when the feature
@@ -2106,8 +2122,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - `IMAGE_WARMING` survives API and controller restart with the same consumer
   generation, profile revision, target, and location.
 - Terminal job-task and Serve-version reconciliation issues exact bounded tuple
-  lookups; unrelated task, version, or replica history is never loaded and
-  filtered in Python.
+  lookups; Serve projects the bounded requested tuples through `VALUES` and
+  indexed `EXISTS` probes, returning at most one row per requested identity.
+  Unrelated task, version, or replica history is never loaded and filtered in
+  Python.
 - Copy crashes before and after manifest publication converge to one verified
   digest.
 - At 1,000 replicas and eight GPUs per node, copy cardinality equals requested
@@ -2154,13 +2172,16 @@ drained and every image table is empty; it is never part of Helm rollback.
 - `terraform fmt -check`, `terraform validate`, and plans for one and multiple
   regions with fixed shards;
 - Helm rendering that forces API and all image workers to `verify` while the
-  migration Job is enabled, restores `auto` only when it is disabled, rejects
-  environment overrides, and mounts shared database TLS material into every
-  database consumer;
+  migration Job is enabled, restores `auto` only when it is disabled, defaults
+  the Job to `upgrade`, emits `bootstrap` only for an explicit isolated-fresh
+  flag, rejects reserved and duplicate environment, volume, and mount-path
+  collisions, excludes API-only inputs from the Job, and mounts shared database
+  TLS material into every database consumer;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
-- source-reader tests for private literals, DNS rebinding before TLS bytes,
+- source-reader tests for private and multicast literals, DNS rebinding to
+  private or multicast peers before TLS bytes,
   off-authority bearer realms, private and chained redirects, disabled token
   redirects, absent proxy inheritance, credential non-forwarding, streamed
   token/manifest size ceilings, pre/post-request lease fencing, and lease loss
@@ -2669,3 +2690,19 @@ a single-statement readiness projection over at most 100 preselected complete
 target groups. Hot-artifact index plans, fixed statement counts, many-group
 truncation, and UI lower-bound behavior are executable acceptance proofs before
 the next paired round starts.
+
+Restarted paired final-acceptance round 1 at
+`3b948a565ef0da00c3a7cc5c27f1a872ccc0e471` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the streak. Codex found that the empty-schema migration
+exception was proved on a different connection from Alembic, the migration Job
+inherited API-only inputs and allowed Pod field collisions, Python could classify
+multicast peers as globally routable, Serve returned every matching replica row,
+and profile staging and activation locked all retained revisions. Exact-head CI
+also exposed three stale Serve migration fixtures. This revision replaces the
+general empty-schema exception with explicit isolated `bootstrap` intent,
+isolates and validates every rendered database consumer, rejects multicast,
+uses bounded `VALUES` plus indexed `EXISTS` Serve probes, serializes profile
+mutation with per-profile advisory locks and indexed scalar reads, and advances
+the migration fixtures through the current Serve revision. The acceptance
+streak remains zero until the repaired immutable head passes CI and both
+reviewers accept it.

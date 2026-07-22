@@ -61,3 +61,15 @@ def test_database_migration_entrypoint_forces_upgrade_mode(
 
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'upgrade'
     initialize.assert_called_once_with()
+
+
+def test_database_migration_entrypoint_preserves_explicit_bootstrap_mode(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    initialize = mock.Mock()
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'bootstrap')
+
+    database_migrations.main()
+
+    assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'bootstrap'
+    initialize.assert_called_once_with()

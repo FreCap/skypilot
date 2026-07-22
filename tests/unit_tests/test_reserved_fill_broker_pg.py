@@ -482,6 +482,14 @@ class TestMigrationChainPG:
             sqlalchemy.Column('created_at', sqlalchemy.Float),
             sqlalchemy.Column('created_by', sqlalchemy.Text))
         sqlalchemy.Table(
+            'replicas', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('replica_id',
+                              sqlalchemy.Integer,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer))
+        sqlalchemy.Table(
             'serve_replica_status_history', metadata,
             sqlalchemy.Column('service_name', sqlalchemy.Text,
                               primary_key=True),
@@ -671,7 +679,7 @@ class TestMigrationChainPG:
                     sqlalchemy.text(
                         'SELECT version_num FROM '
                         'alembic_version_serve_state_db')).scalar_one()
-            assert version == '022'
+            assert version == migration_utils.SERVE_VERSION
         finally:
             engine.dispose()
 

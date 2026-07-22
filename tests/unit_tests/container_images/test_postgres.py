@@ -5073,6 +5073,193 @@ def test_operational_profile_readiness_excludes_unbounded_history_and_uses_index
             in str(qualification_plan))
 
 
+def test_profile_staging_reads_constant_rows_with_large_retained_history(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    candidate = dataclasses.replace(profile,
+                                    name='mutation-scale',
+                                    revision=20001)
+    snapshot = json.dumps(candidate.to_snapshot(),
+                          sort_keys=True,
+                          separators=(',', ':'))
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_profile_revisions (
+                    id, workspace, profile, revision, desired_generation,
+                    state, config_hash, config_json, physical_manifest_hash,
+                    created_at, updated_at
+                )
+                SELECT 'mutation-history-' || value, 'research',
+                       'mutation-scale', value, value, 'SUPERSEDED',
+                       :config_hash, :config_json, :physical_manifest_hash,
+                       value, value
+                FROM generate_series(1, 20000) AS value
+            """), {
+                'config_hash': candidate.config_hash,
+                'config_json': snapshot,
+                'physical_manifest_hash': candidate.physical_manifest_hash,
+            })
+        connection.execute(
+            sqlalchemy.text('ANALYZE container_image_profile_revisions'))
+
+    returned_rows = []
+
+    def record_rows(_connection, cursor, statement, _parameters, _context,
+                    _executemany):
+        if statement.lstrip().upper().startswith(('SELECT', 'WITH')):
+            returned_rows.append(cursor.rowcount)
+
+    sqlalchemy.event.listen(image_database, 'after_cursor_execute', record_rows)
+    try:
+        staged = topology_state.stage_profile_revision(
+            workspace='research',
+            profile=candidate.name,
+            revision=candidate.revision,
+            config_hash=candidate.config_hash,
+            config_snapshot=candidate.to_snapshot(),
+            physical_manifest_hash=candidate.physical_manifest_hash,
+            max_daily_canary_microusd=(
+                candidate.qualification.max_daily_canary_microusd),
+            now=20001)
+    finally:
+        sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                record_rows)
+
+    assert staged.desired_generation == 20001
+    assert returned_rows
+    assert max(returned_rows) <= 1
+    with image_database.connect() as connection:
+        generation_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT max(desired_generation)
+                FROM container_image_profile_revisions
+                WHERE workspace = 'research' AND profile = 'mutation-scale'
+            """)).scalars().all()
+        revision_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_profile_revisions
+                WHERE workspace = 'research' AND profile = 'mutation-scale'
+                  AND revision = 20001
+            """)).scalars().all()
+        active_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT id FROM container_image_profile_revisions
+                WHERE workspace = 'research' AND profile = 'mutation-scale'
+                  AND state = 'ACTIVE'
+            """)).scalars().all()
+    assert 'uq_container_image_profile_generation' in str(generation_plan)
+    assert 'uq_container_image_profile_revision' in str(revision_plan)
+    assert 'uq_container_image_profile_active' in str(active_plan)
+
+
+def test_profile_staging_is_serialized_by_transaction_advisory_lock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    first = dataclasses.replace(profile, name='serialized-profile', revision=1)
+    second = dataclasses.replace(profile, name='serialized-profile', revision=2)
+    lock_key = json.dumps(['research', first.name], separators=(',', ':'))
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+    barrier = threading.Barrier(3)
+
+    def stage(candidate: models.ManagedRegistryProfile):
+        barrier.wait(timeout=5)
+        return topology_state.stage_profile_revision(
+            workspace='research',
+            profile=candidate.name,
+            revision=candidate.revision,
+            config_hash=candidate.config_hash,
+            config_snapshot=candidate.to_snapshot(),
+            physical_manifest_hash=candidate.physical_manifest_hash,
+            max_daily_canary_microusd=(
+                candidate.qualification.max_daily_canary_microusd),
+            now=candidate.revision)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(stage, candidate)
+                for candidate in (first, second)
+            ]
+            barrier.wait(timeout=5)
+            time.sleep(0.2)
+            assert not any(future.done() for future in futures)
+            lock_transaction.commit()
+            results = [future.result(timeout=10) for future in futures]
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    assert {result.desired_generation for result in results} == {1, 2}
+    revisions = topology_state.list_profile_revisions(
+        'research', profile='serialized-profile')
+    assert len(revisions) == 2
+    assert [revision.state for revision in revisions
+           ].count(models.ImageProfileState.QUALIFYING) == 1
+    assert [revision.state for revision in revisions
+           ].count(models.ImageProfileState.SUPERSEDED) == 1
+
+
+def test_profile_activation_reads_constant_profile_rows_with_large_history(
+        image_database, profile: models.ManagedRegistryProfile,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    original_activate = transactions.activate_profile
+    profile_row_counts = []
+
+    def activate_with_history(**kwargs):
+        snapshot = json.dumps(profile.to_snapshot(),
+                              sort_keys=True,
+                              separators=(',', ':'))
+        with image_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_profile_revisions (
+                        id, workspace, profile, revision, desired_generation,
+                        state, config_hash, config_json,
+                        physical_manifest_hash, created_at, updated_at
+                    )
+                    SELECT 'activation-history-' || value, 'research',
+                           :profile, value, value, 'SUPERSEDED',
+                           :config_hash, :config_json,
+                           :physical_manifest_hash, value, value
+                    FROM generate_series(2, 20001) AS value
+                """), {
+                    'profile': profile.name,
+                    'config_hash': profile.config_hash,
+                    'config_json': snapshot,
+                    'physical_manifest_hash': profile.physical_manifest_hash,
+                })
+            connection.execute(
+                sqlalchemy.text('ANALYZE container_image_profile_revisions'))
+
+        def record_rows(_connection, cursor, statement, _parameters, _context,
+                        _executemany):
+            if 'container_image_profile_revisions' in statement:
+                profile_row_counts.append(cursor.rowcount)
+
+        sqlalchemy.event.listen(image_database, 'after_cursor_execute',
+                                record_rows)
+        try:
+            return original_activate(**kwargs)
+        finally:
+            sqlalchemy.event.remove(image_database, 'after_cursor_execute',
+                                    record_rows)
+
+    monkeypatch.setattr(transactions, 'activate_profile', activate_with_history)
+    active = _activate_profile(image_database, profile)
+
+    assert active.state == models.ImageProfileState.ACTIVE
+    assert profile_row_counts
+    assert max(profile_row_counts) <= 1
+
+
 def test_profile_history_is_keyset_paginated_and_indexed_at_scale(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     active = _activate_profile(image_database, profile)
@@ -5638,8 +5825,9 @@ def test_migration_job_rejects_nonempty_predecessor_below_023_without_ddl(
     ('CREATE FUNCTION orphan_function() RETURNS integer '
      'LANGUAGE SQL AS $$ SELECT 1 $$'),
 ])
+@pytest.mark.parametrize('mode', ['upgrade', 'bootstrap'])
 def test_migration_job_rejects_every_schema_owned_object_before_ddl(
-        postgres_engine, ddl: str) -> None:
+        postgres_engine, ddl: str, mode: migration_utils.MigrationMode) -> None:
     unsafe_schema = f'image_migration_object_{uuid.uuid4().hex}'
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql(f'CREATE SCHEMA {unsafe_schema}')
@@ -5654,7 +5842,7 @@ def test_migration_job_rejects_every_schema_owned_object_before_ddl(
                 unsafe_engine,
                 migration_utils.GLOBAL_USER_STATE_DB_NAME,
                 migration_utils.GLOBAL_USER_STATE_VERSION,
-                mode='upgrade')
+                mode=mode)
 
         inspector = sqlalchemy.inspect(unsafe_engine)
         assert not inspector.has_table('alembic_version_state_db')
@@ -5667,7 +5855,33 @@ def test_migration_job_rejects_every_schema_owned_object_before_ddl(
                 f'DROP SCHEMA IF EXISTS {unsafe_schema} CASCADE')
 
 
-def test_migration_job_allows_genuinely_empty_database_to_upgrade_directly(
+@pytest.mark.parametrize('mode', ['auto', 'upgrade'])
+def test_regular_migration_mode_rejects_unversioned_empty_schema(
+        postgres_engine, mode: migration_utils.MigrationMode) -> None:
+    fresh_schema = f'image_migration_regular_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
+    fresh_engine = _schema_engine(postgres_engine, fresh_schema)
+    try:
+        with pytest.raises(RuntimeError, match='explicitly use bootstrap mode'):
+            migration_utils.safe_alembic_upgrade(
+                fresh_engine,
+                migration_utils.GLOBAL_USER_STATE_DB_NAME,
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+                mode=mode)
+
+        assert not sqlalchemy.inspect(fresh_engine).has_table(
+            'alembic_version_state_db')
+        assert not sqlalchemy.inspect(fresh_engine).has_table(
+            'container_image_catalog')
+    finally:
+        fresh_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
+
+
+def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
         postgres_engine) -> None:
     fresh_schema = f'image_migration_fresh_{uuid.uuid4().hex}'
     with postgres_engine.begin() as connection:
@@ -5680,7 +5894,7 @@ def test_migration_job_allows_genuinely_empty_database_to_upgrade_directly(
             fresh_engine,
             migration_utils.GLOBAL_USER_STATE_DB_NAME,
             migration_utils.GLOBAL_USER_STATE_VERSION,
-            mode='upgrade')
+            mode='bootstrap')
 
         with fresh_engine.connect() as connection:
             assert connection.execute(

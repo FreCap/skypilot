@@ -659,12 +659,16 @@ def test_service_version_terminal_lookup_uses_only_exact_history_keys(
         ('svc-terminal', 2000, 'incarnation-a'): False,
         ('missing-service', 1, 'missing-incarnation'): True,
     }
-    assert len(statements) == 3
-    assert any('(version_specs.service_name, version_specs.version) IN (VALUES'
-               in statement for statement in statements)
-    assert any(
-        '(replicas.service_name, replicas.version) IN (VALUES' in statement
-        for statement in statements)
+    assert len(statements) == 2
+    probe_statement = next(statement for statement in statements
+                           if 'wanted_service_versions' in statement)
+    assert 'WITH wanted_service_versions(service_name, version) AS' in (
+        probe_statement)
+    assert probe_statement.count('EXISTS (SELECT') == 2
+    assert 'FROM version_specs' in probe_statement
+    assert 'FROM replicas' in probe_statement
+    assert 'SELECT replicas.service_name, replicas.version' not in (
+        probe_statement)
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):

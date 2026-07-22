@@ -184,3 +184,44 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject a shared volume colliding with the copy worker config
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      databaseConnection.extraVolumes:
+        - name: skypilot-config
+          secret:
+            secretName: unexpected
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "skypilot-config" is duplicated or reserved by the chart'
+
+  - it: should reject a shared mount colliding with qualification manifests
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      databaseConnection.extraVolumeMounts:
+        - name: unexpected
+          mountPath: /var/skypilot/image-qualification
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/var/skypilot/image-qualification" is duplicated or reserved by the chart'
+
+  - it: should reject a shared volume colliding with the canary kubeconfig
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+      databaseConnection.extraVolumes:
+        - name: kubeconfig
+          secret:
+            secretName: unexpected
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "kubeconfig" is duplicated or reserved by the chart'

@@ -1,5 +1,6 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
 {{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
@@ -47,22 +48,14 @@ spec:
         resources:
           {{- toYaml .Values.databaseMigration.resources | nindent 10 }}
         env:
-        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.apiService.extraEnvs) }}
-        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
-        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
-        {{- end }}
-        {{- end }}
         {{- with .Values.global.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- with .Values.databaseConnection.extraEnvs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- with .Values.apiService.extraEnvs }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
-          value: upgrade
+          value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
         {{- if .Values.apiService.dbConnectionSecretName }}
         - name: SKYPILOT_DB_CONNECTION_URI
           valueFrom:
@@ -76,21 +69,15 @@ spec:
               name: {{ $fullName }}-db-connection
               key: connection_string
         {{- end }}
-        {{- if or .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts }}
+        {{- if .Values.databaseConnection.extraVolumeMounts }}
         volumeMounts:
           {{- with .Values.databaseConnection.extraVolumeMounts }}
           {{- toYaml . | nindent 10 }}
           {{- end }}
-          {{- with .Values.apiService.extraVolumeMounts }}
-          {{- toYaml . | nindent 10 }}
-          {{- end }}
         {{- end }}
-      {{- if or .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes }}
+      {{- if .Values.databaseConnection.extraVolumes }}
       volumes:
         {{- with .Values.databaseConnection.extraVolumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-        {{- with .Values.apiService.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}

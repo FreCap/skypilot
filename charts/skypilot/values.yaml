@@ -283,6 +283,10 @@ databaseConnection:
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
+  # Allow the migration Job to initialize a new, isolated, empty PostgreSQL
+  # schema. Leave false for every existing database and staged upgrade.
+  # @schema type: [boolean]
+  bootstrapFreshSchema: false
   # @schema type: [integer]; minimum: 0
   backoffLimit: 3
   # @schema type: [integer]; minimum: 1

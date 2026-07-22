@@ -314,6 +314,16 @@ def _provider_budget(row: sqlalchemy.engine.RowMapping) -> ProviderBudgetRecord:
     )
 
 
+def lock_profile_mutation_in_session(session: orm.Session, *, workspace: str,
+                                     profile: str) -> None:
+    """Serializes one profile's bounded staging and activation mutations."""
+    lock_key = json.dumps([workspace, profile], separators=(',', ':'))
+    session.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+
+
 def stage_profile_revision(*,
                            workspace: str,
                            profile: str,
@@ -334,20 +344,22 @@ def stage_profile_revision(*,
         raise ValueError('Registry profile snapshot does not match its hash.')
     table = schema.profile_revisions
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        existing_rows = session.execute(
+        lock_profile_mutation_in_session(session,
+                                         workspace=workspace,
+                                         profile=profile)
+        candidate = session.execute(
             sqlalchemy.select(table).where(
-                table.c.workspace == workspace,
-                table.c.profile == profile).order_by(
-                    table.c.id).with_for_update()).mappings().all()
-        for row in existing_rows:
-            if (int(row['revision']) == revision and
-                    str(row['config_hash']) == config_hash and
-                    str(row['config_json']) == encoded_config and
-                    str(row['physical_manifest_hash']) == physical_manifest_hash
-                    and str(row['state'])
-                    in (models.ImageProfileState.QUALIFYING.value,
-                        models.ImageProfileState.ACTIVE.value)):
-                return _profile(row)
+                table.c.workspace == workspace, table.c.profile == profile,
+                table.c.revision ==
+                revision).with_for_update()).mappings().first()
+        if (candidate is not None and
+                str(candidate['config_hash']) == config_hash and
+                str(candidate['config_json']) == encoded_config and
+                str(candidate['physical_manifest_hash'])
+                == physical_manifest_hash and str(candidate['state'])
+                in (models.ImageProfileState.QUALIFYING.value,
+                    models.ImageProfileState.ACTIVE.value)):
+            return _profile(candidate)
 
         ready_exists = session.execute(
             sqlalchemy.select(sqlalchemy.literal(True)).select_from(
@@ -358,10 +370,11 @@ def stage_profile_revision(*,
                 table.c.workspace == workspace, table.c.profile == profile,
                 schema.publications.c.state ==
                 models.ImagePublicationState.READY.value).limit(1)).first()
-        active = next(
-            (row for row in existing_rows
-             if str(row['state']) == models.ImageProfileState.ACTIVE.value),
-            None)
+        active = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.workspace == workspace, table.c.profile == profile,
+                table.c.state == models.ImageProfileState.ACTIVE.value).
+            with_for_update()).mappings().first()
         if (ready_exists is not None and active is not None and str(
                 active['physical_manifest_hash']) != physical_manifest_hash):
             raise CanonicalCustodyChangeError(
@@ -372,9 +385,13 @@ def stage_profile_revision(*,
             table.c.state == models.ImageProfileState.QUALIFYING.value).values(
                 state=models.ImageProfileState.SUPERSEDED.value,
                 updated_at=current))
-        generation = max(
-            (int(row['desired_generation']) for row in existing_rows),
-            default=0) + 1
+        generation = int(
+            session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.coalesce(
+                        sqlalchemy.func.max(table.c.desired_generation),
+                        0)).where(table.c.workspace == workspace,
+                                  table.c.profile == profile)).scalar_one()) + 1
         row = session.execute(table.insert().values(
             id=str(uuid.uuid4()),
             workspace=workspace,
