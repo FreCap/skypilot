@@ -31,6 +31,8 @@ import aiohttp
 from aiohttp import web
 from multidict import CIMultiDict
 
+from sky.utils import asyncio_utils
+
 _ACTION_CAPACITY = 'async_capacity'
 _ACTION_PREDICT = 'async_predict'
 _ACTION_STATUS = 'async_status'
@@ -312,7 +314,7 @@ class LocalAsyncRouter:
                         # the request. Finish removing both local claims before
                         # propagating cancellation, otherwise the stable ID can
                         # remain blocked as ambiguously owned forever.
-                        await self._release_rejected_request(
+                        await self._complete_rejected_request_release(
                             child_index, token, submitted_id)
                         raise
                     reservation_finalized = True
@@ -663,6 +665,13 @@ class LocalAsyncRouter:
                 owner = self._owners.get(request_id)
                 if owner is not None and owner.child_index == child_index:
                     self._pop_owner(request_id)
+
+    @asyncio_utils.shield
+    async def _complete_rejected_request_release(self, child_index: int,
+                                                 token: int,
+                                                 request_id: Any) -> None:
+        """Finish a rejected request's release through repeated cancellation."""
+        await self._release_rejected_request(child_index, token, request_id)
 
     async def _settle(self, child_index: int, token: int) -> None:
         async with self._state_lock:
