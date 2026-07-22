@@ -251,6 +251,10 @@ class DisposableExecutor:
             raise
         assert result_connection is not None
         assert process is not None
+        # The process is already executing and cannot be cancelled through the
+        # Future. Publish RUNNING before returning the Future so cancel() does
+        # not claim that it stopped work which will continue in the child.
+        assert future.set_running_or_notify_cancel()
 
         # Start monitor thread to cleanup the worker process when it's done
         monitor_thread = threading.Thread(target=self._monitor_worker,
