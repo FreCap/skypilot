@@ -866,6 +866,19 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
     assert ec2.run_instances.call_count == 2
     assert ec2.run_instances.call_args_list[0].kwargs == (
         ec2.run_instances.call_args_list[1].kwargs)
+    launch = ec2.run_instances.call_args.kwargs
+    assert launch['SecurityGroupIds'] == list(
+        dict(binding.canary_security_groups)[target.region])
+    assert {item['ResourceType'] for item in launch['TagSpecifications']
+           } == {'instance', 'volume', 'network-interface'}
+    for specification in launch['TagSpecifications']:
+        assert {
+            tag['Key']: tag['Value'] for tag in specification['Tags']
+        } == {
+            'SkyPilotCanaryOperation': operation.id,
+            'SkyPilotCatalog': 'catalog',
+            'SkyPilotProfile': profile.name,
+        }
     assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
 
 

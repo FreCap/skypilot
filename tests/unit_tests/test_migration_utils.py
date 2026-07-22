@@ -32,8 +32,10 @@ def test_safe_alembic_verify_mode_never_enters_upgrade_path() -> None:
 
 def test_safe_alembic_rejects_unknown_migration_mode() -> None:
     with pytest.raises(ValueError, match='Invalid database migration mode'):
-        migration_utils.safe_alembic_upgrade(
-            mock.Mock(), 'state_db', '024', mode='unsafe')
+        migration_utils.safe_alembic_upgrade(mock.Mock(),
+                                             'state_db',
+                                             '024',
+                                             mode='unsafe')
 
 
 def test_global_state_create_table_uses_configured_migration_mode(

@@ -358,6 +358,16 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         if not instances:
             subnet_values = dict(binding.canary_subnets)[target.region]
             index = int(payload['nonce'][:8], 16) % len(subnet_values)
+            tags = [{
+                'Key': 'SkyPilotCanaryOperation',
+                'Value': operation.id,
+            }, {
+                'Key': 'SkyPilotCatalog',
+                'Value': catalog_state.get_catalog_authority_id(),
+            }, {
+                'Key': 'SkyPilotProfile',
+                'Value': profile.name,
+            }]
             kwargs: dict[str, Any] = {
                 'ClientToken': _ec2_client_token(operation.id),
                 'ImageId': dict(binding.qualified_node_images)[target.region],
@@ -371,23 +381,13 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'UserData': _ec2_user_data(reference, payload['nonce'],
                                            payload['timeout_seconds']),
                 'TagSpecifications': [{
-                    'ResourceType': 'instance',
-                    'Tags': [{
-                        'Key': 'SkyPilotCanaryOperation',
-                        'Value': operation.id,
-                    }, {
-                        'Key': 'SkyPilotCatalog',
-                        'Value': catalog_state.get_catalog_authority_id(),
-                    }, {
-                        'Key': 'SkyPilotProfile',
-                        'Value': profile.name,
-                    }],
-                }],
+                    'ResourceType': resource_type,
+                    'Tags': tags,
+                } for resource_type in ('instance', 'volume',
+                                        'network-interface')],
+                'SecurityGroupIds': list(
+                    dict(binding.canary_security_groups)[target.region]),
             }
-            security_groups = dict(binding.canary_security_groups).get(
-                target.region, ())
-            if security_groups:
-                kwargs['SecurityGroupIds'] = list(security_groups)
             if int(time.time()) >= deadline:
                 raise ValueError('CANARY_TIMEOUT')
             response: dict[str, Any] = {}

@@ -564,8 +564,10 @@ def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
 
     state.create_table(engine)
 
-    upgrade.assert_called_once_with(engine, migration_utils.SPOT_JOBS_DB_NAME,
-                                    '025')
+    upgrade.assert_called_once_with(engine,
+                                    migration_utils.SPOT_JOBS_DB_NAME,
+                                    '025',
+                                    mode='auto')
     assert migration_utils.SPOT_JOBS_VERSION == '025'
     engine.dispose()
 

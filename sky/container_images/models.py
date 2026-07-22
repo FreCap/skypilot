@@ -420,7 +420,7 @@ class RegistryAccessBinding:
                     len(security_group_regions) != len(
                         self.canary_security_groups) or
                     subnet_regions != node_regions or
-                    not security_group_regions <= node_regions):
+                    security_group_regions != node_regions):
                 raise ValueError('EC2 canary network regions must match the '
                                  'qualified regional AMIs.')
             for region, ami in self.qualified_node_images:
@@ -435,7 +435,7 @@ class RegistryAccessBinding:
                             len(subnet) > 128 for subnet in subnets)):
                     raise ValueError('EC2 canary subnets are invalid.')
             for _, security_groups in self.canary_security_groups:
-                if (len(security_groups) > 32 or
+                if (not security_groups or len(security_groups) > 32 or
                         len(security_groups) != len(set(security_groups)) or
                         any(not group.startswith('sg-') or len(group) > 128
                             for group in security_groups)):

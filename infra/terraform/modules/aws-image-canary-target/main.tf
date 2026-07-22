@@ -28,6 +28,10 @@ resource "terraform_data" "validate_contract" {
       condition     = !local.ec2_canary_enabled || length(var.canary_instance_types) > 0
       error_message = "EC2 canaries require at least one exact canary_instance_type."
     }
+    precondition {
+      condition     = !local.ec2_canary_enabled || length(var.security_group_arns) > 0
+      error_message = "EC2 canaries require at least one exact security_group_arn and never use an implicit default security group."
+    }
   }
 }
 
@@ -79,7 +83,7 @@ data "aws_iam_policy_document" "permissions" {
     content {
       sid       = "CreateOnlyCatalogTaggedCanaryResources"
       effect    = "Allow"
-      actions   = ["ec2:RunInstances", "ec2:CreateTags"]
+      actions   = ["ec2:RunInstances"]
       resources = local.instance_resource_arns
 
       condition {
@@ -98,6 +102,22 @@ data "aws_iam_policy_document" "permissions" {
         test     = "StringLike"
         variable = "aws:RequestTag/SkyPilotCanaryOperation"
         values   = ["????????-????-????-????-????????????"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.ec2_canary_enabled ? [1] : []
+    content {
+      sid       = "TagOnlyDuringQualifiedCanaryLaunch"
+      effect    = "Allow"
+      actions   = ["ec2:CreateTags"]
+      resources = local.instance_resource_arns
+
+      condition {
+        test     = "StringEquals"
+        variable = "ec2:CreateAction"
+        values   = ["RunInstances"]
       }
     }
   }

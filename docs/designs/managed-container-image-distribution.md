@@ -308,7 +308,10 @@ Managed selection is explicit:
 3. only a workspace in `managed_preferred` or `managed_required` may use its
    `container_images.default_profile`, then the server default; and
 4. without a managed workspace mode or explicit task profile, a ref keeps direct
-   OCI behavior and release/artifact selectors fail with `PROFILE_NOT_ACTIVE`.
+   OCI behavior and release/artifact selectors fail immediately with
+   `PROFILE_NOT_ACTIVE`, before consumer-demand lookup or any PostgreSQL-only
+   managed-image state access, unless the resolver is replaying an already
+   durable consumer demand whose immutable profile snapshot remains authority.
 
 A server default is therefore a default for opted-in workspaces, not a global
 behavior switch. Profiles are complete atomic objects. Workspace configuration
@@ -322,6 +325,12 @@ may restrict `allowed_profiles` and choose:
 Resources without `container_image` bypass this subsystem before cloud or
 Kubernetes classification. Enabling the code therefore cannot add an image
 precondition to an ordinary launch or dry run.
+
+An exact direct ref is self-contained. It remains usable through the existing
+direct OCI path even when the central database is SQLite, while release and
+artifact selectors never enter that direct path. The resolver rejects those
+managed-only selectors once per request instead of cycling cloud candidates or
+reaching INIT persistence without a runnable container identity.
 
 Locality is `prefer`, `require`, or `canonical` only for managed selection. On a
 placement with a supported managed runtime binding, `distribution: direct` is
@@ -521,6 +530,17 @@ unknown delete outcome is terminal for that physical location because ECR has
 no conditional-delete token. A failed read after a concluded delete is not an
 unknown delete outcome and cannot quarantine the location.
 
+Application wall time is never lease authority. Every mutation that records a
+provider or inspection result after a potentially blocking row or advisory lock
+checks the exact token, state, and expiry in the same SQL mutation using
+PostgreSQL `clock_timestamp()`. Transaction-stable `now()`, statement time, and
+a Python timestamp sampled before lock acquisition are insufficient. This rule
+applies uniformly to publication inspection, canonical and regional copy
+completion, inventory pages and finalization, eviction completion, canary child
+attachment, success, failure, and timeout. Tests may substitute an explicit
+literal epoch, but production finalizers use the database wall clock after the
+wait and roll back every earlier write when the fence fails.
+
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
 and teardown deadline. The canary resource is tagged with operation/profile/
@@ -556,6 +576,19 @@ Canary intent creation locks the desired profile row and reserves its conservati
 worst-case cost in a UTC daily window before committing the operation. Concurrent
 automatic or manual canaries cannot exceed the configured hard cap; increasing
 the cap requires a new profile revision.
+The claim samples the database clock only after taking the profile cost lock,
+so a blocked reservation cannot return an already-expired initial lease or
+charge the previous UTC window.
+
+EC2 canary bindings require at least one explicit security group in every
+qualified AMI region. The worker always sends those groups and applies the
+catalog, operation, and profile tag specifications to the instance, every
+created EBS volume, and every created network interface. The generated IAM role
+authorizes `RunInstances` against the exact AMI, subnet, security groups, and
+created resource classes with the required request tags. A separate
+`ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
+not combined with launch conditions. The role never relies on an implicit VPC
+default security group.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -1891,6 +1924,16 @@ Authorization maps to four explicit capabilities:
 Every lookup checks workspace access before selector resolution. Binding names
 appear only when the caller can use them; credential values never do.
 
+Operation polling is capability-scoped before row lookup. Workspace readers may
+query only `PUBLISH`, `PREPARE`, `RETRY_PUBLICATION`, and `RETRY_LOCATION` rows.
+`PROFILE_QUALIFY` and `PROFILE_CANARY` are administrator-only and are excluded
+from a non-admin query in SQL, so a known UUID is not an authorization bypass.
+Operation responses use a per-kind result-key allowlist. Public kinds expose
+only their publication or location identity and state; administrator profile
+operations expose only the documented qualification or canary projection, with
+the raw canary nonce replaced by its hash. Arbitrary durable `result_json` is
+never copied directly into an API response.
+
 Authorized users can:
 
 - select a workspace;
@@ -2047,6 +2090,12 @@ truncation, so aggregate counts and the table are displayed as lower bounds.
 The query never materializes every durable group, uses no global `array_agg`, and
 does not issue per-group round trips. No dashboard read creates a generic
 request row.
+
+The SDK catalog APIs retain their explicit keyset cursor. The convenience
+`status` command remains bounded to one 100-row page and must disclose a
+non-null next cursor instead of silently presenting the page as complete; users
+then narrow an explicit selector rather than materializing a million-row catalog
+in one client process.
 
 The workspace publication feed is required for recovery, not a duplicate
 catalog. A publication that fails while inspecting its source has no artifact
@@ -2765,3 +2814,21 @@ custody marker, makes publication audit links nullable with indexed
 `ON DELETE SET NULL` compaction, hashes length-safe RBAC names, and makes the
 catalog singleton migration-owned and runtime fail-closed. The acceptance
 streak remains zero until both reviewers accept one immutable repaired head.
+
+Restarted paired final-acceptance round 1 at
+`4b2ec71d408a0254587a3024cf2cde4fae6e8978` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the streak. Codex proved that result finalizers compared
+lease expiry against application time sampled before blocking locks, generic
+operation polling exposed administrator-only canary payloads to workspace
+readers, and the generated EC2 canary role could not authorize the worker's
+instance-only tag request. Exact-head CI also found one YAPF mismatch and one
+stale Jobs migration mock. Fable additionally found direct-mode managed-only
+selectors cycling candidates before their eventual INIT rejection, an
+inconsistent SQLite direct-ref path, and a Dashboard label that rendered a
+redacted binding as public. This revision moves every result fence into the
+post-lock SQL mutation with `clock_timestamp()`, filters operation kinds before
+lookup and allowlists result projections, makes EC2 canary networking and
+tag-on-create authority explicit, rejects managed-only selectors before demand
+lookup, treats redacted bindings as absent, and repairs the exact-head gates.
+The acceptance streak remains zero until both reviewers accept the same new
+immutable head three consecutive times.

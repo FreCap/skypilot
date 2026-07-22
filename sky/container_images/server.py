@@ -332,7 +332,8 @@ def qualify_profile(
             idempotency_key=_idempotency_key(idempotency_key))
         return api_models.MutationResult(
             kind='profile_qualification',
-            operation=api_models.OperationView.from_record(operation),
+            operation=api_models.OperationView.from_record(
+                operation, reveal_admin_result=True),
             profile=api_models.ProfileView.from_record(revision))
     except (RuntimeError, TypeError, ValueError) as error:
         _api_error(error)
@@ -359,7 +360,8 @@ def create_canary(
             idempotency_key=_idempotency_key(idempotency_key))
         return api_models.MutationResult(
             kind='profile_canary',
-            operation=api_models.OperationView.from_record(operation),
+            operation=api_models.OperationView.from_record(
+                operation, reveal_admin_result=True),
             profile=api_models.ProfileView.from_record(revision))
     except (RuntimeError, TypeError, ValueError) as error:
         _api_error(error)
@@ -690,15 +692,21 @@ def get_operation(operation_id: str,
                   request: fastapi.Request,
                   workspace: str | None = None) -> api_models.OperationView:
     resolved = _resolve_workspace(request, workspace)
+    admin = rbac.RoleName.ADMIN.value in _roles(request)
+    allowed_kinds = (catalog_state.ALL_OPERATION_KINDS
+                     if admin else catalog_state.PUBLIC_OPERATION_KINDS)
     try:
         operation_id = models.validate_catalog_id(operation_id,
                                                   'Image operation ID')
-        operation = catalog_state.get_operation(operation_id, resolved)
+        operation = catalog_state.get_operation(operation_id,
+                                                resolved,
+                                                allowed_kinds=allowed_kinds)
     except (RuntimeError, ValueError) as error:
         _api_error(error)
     if operation is None:
         _raise_code('IMAGE_OPERATION_NOT_FOUND')
-    return api_models.OperationView.from_record(operation)
+    return api_models.OperationView.from_record(operation,
+                                                reveal_admin_result=admin)
 
 
 @router.get('/profiles', response_model=api_models.Page)

@@ -697,6 +697,65 @@ def test_request_terminal_hint_is_silent_on_sqlite() -> None:
     terminal.assert_not_called()
 
 
+def test_exact_aws_ref_remains_direct_when_managed_database_is_unavailable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = consumers.ImageConsumerContext(consumer_kind='cluster',
+                                             consumer_owner='cluster',
+                                             controller_epoch='request',
+                                             controller_sequence=None,
+                                             allow_epoch_advance=False,
+                                             metadata={})
+    monkeypatch.setattr(runtime.consumers, 'current', lambda: context)
+    monkeypatch.setattr(
+        runtime.demand_state, 'get_current_demand_for_controller_epoch',
+        mock.Mock(side_effect=catalog_state.ManagedImageDatabaseRequiredError(
+            'Managed container image state requires PostgreSQL.')))
+    policy = models.WorkspaceImagePolicy(mode=models.WorkspaceImageMode.DIRECT)
+    resolve_profile = mock.Mock(return_value=(None, policy))
+    monkeypatch.setattr(runtime.config, 'resolve_profile', resolve_profile)
+    resources = _FakeResources(models.ContainerImage(ref=SOURCE))
+
+    resolution = runtime._resolve_metadata(
+        resources,
+        models.Placement(provider='aws',
+                         region='us-west-2',
+                         backend='aws_vm',
+                         platform='linux/amd64'), 'research')
+
+    assert resolution.direct
+    assert resolution.resources is resources
+    resolve_profile.assert_called_once_with(None, 'research')
+
+
+@pytest.mark.parametrize('image', [
+    models.ContainerImage(release='boltz-l4'),
+    models.ContainerImage(artifact_id=_ARTIFACT_ID),
+])
+def test_unconfigured_aws_managed_only_selector_fails_before_catalog_or_demand(
+        monkeypatch: pytest.MonkeyPatch, image: models.ContainerImage) -> None:
+    demand_lookup = mock.Mock(
+        side_effect=AssertionError('managed demand was consulted'))
+    published = mock.Mock(side_effect=AssertionError('catalog was consulted'))
+    monkeypatch.setattr(runtime.consumers, 'current', lambda: None)
+    monkeypatch.setattr(runtime.demand_state,
+                        'get_current_demand_for_controller_epoch',
+                        demand_lookup)
+    monkeypatch.setattr(runtime.config, 'resolve_profile', lambda *_args:
+                        (None, models.WorkspaceImagePolicy()))
+    monkeypatch.setattr(runtime, '_published_identity', published)
+
+    with pytest.raises(ValueError, match='PROFILE_NOT_ACTIVE'):
+        runtime._resolve_metadata(
+            _FakeResources(image),
+            models.Placement(provider='aws',
+                             region='us-west-2',
+                             backend='aws_vm',
+                             platform='linux/amd64'), 'research')
+
+    demand_lookup.assert_not_called()
+    published.assert_not_called()
+
+
 @pytest.mark.parametrize('image', [
     models.ContainerImage(release='boltz-l4'),
     models.ContainerImage(artifact_id=_ARTIFACT_ID)

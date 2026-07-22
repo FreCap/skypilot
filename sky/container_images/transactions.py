@@ -279,7 +279,6 @@ def bind_inspected_publication(
 ) -> tuple[catalog_state.ArtifactRecord, catalog_state.SourceRecord,
            topology_state.LocationRecord, catalog_state.PublicationRecord]:
     """Binds inspected source evidence and reserves one canonical shard."""
-    current = int(time.time()) if now is None else now
     runtime_digest = models.validate_sha256_digest(runtime_digest,
                                                    'Runtime digest')
     platform = models.validate_oci_platform(platform, 'Runtime platform')
@@ -328,6 +327,7 @@ def bind_inspected_publication(
                 target_id=canonical_target_id,
                 runtime_digest=runtime_digest,
                 declared_size_bytes=declared_size_bytes)
+        write_time = catalog_state.database_epoch(session, now=now)
 
         artifact = _converge_artifact(
             session,
@@ -339,7 +339,7 @@ def bind_inspected_publication(
             manifest_size_bytes=selected_manifest_size_bytes,
             declared_size_bytes=declared_size_bytes,
             creator_user_hash=creator_user_hash,
-            now=current)
+            now=write_time)
         source = _converge_source(
             session,
             workspace=str(optimistic['workspace']),
@@ -351,7 +351,7 @@ def bind_inspected_publication(
             selected_child_digest=runtime_digest,
             source_auth_binding_id=optimistic['source_auth_binding_id'],
             source_auth_fingerprint=optimistic['source_auth_fingerprint'],
-            now=current)
+            now=write_time)
 
         target_ref = _target_reference(shard_row, runtime_digest)
         inserted = session.execute(
@@ -369,8 +369,8 @@ def bind_inspected_publication(
                 state=models.ImageLocationState.PENDING.value,
                 attempt_count=0,
                 reserved_declared_bytes=declared_size_bytes,
-                created_at=current,
-                updated_at=current).on_conflict_do_nothing(index_elements=[
+                created_at=write_time,
+                updated_at=write_time).on_conflict_do_nothing(index_elements=[
                     locations.c.image_id, locations.c.target_fingerprint,
                     locations.c.runtime_digest
                 ]).returning(locations.c.id)).first()
@@ -389,14 +389,14 @@ def bind_inspected_publication(
                     reserved_manifests=shards.c.reserved_manifests + 1,
                     reserved_declared_bytes=(shards.c.reserved_declared_bytes +
                                              declared_size_bytes),
-                    updated_at=current)).rowcount
+                    updated_at=write_time)).rowcount
             if changed != 1:
                 raise topology_state.RegistryCapacityExhaustedError(
                     'REGISTRY_CAPACITY_EXHAUSTED')
             topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
                 session,
                 str(shard_row['id']),
-                now=current)
+                now=write_time)
 
         publication = session.execute(
             sqlalchemy.select(publications).where(
@@ -405,10 +405,10 @@ def bind_inspected_publication(
         if (str(publication['state'])
                 != models.ImagePublicationState.INSPECTING.value or
                 publication['inspection_lease_token'] != inspection_lease_token
-                or publication['inspection_lease_expires_at'] is None or
-                int(publication['inspection_lease_expires_at']) <= current):
+                or publication['inspection_lease_expires_at'] is None):
             raise topology_state.LocationLeaseLostError(
                 'Publication inspection lease was lost.')
+        current = catalog_state.database_epoch(session, now=now)
         release_count = session.execute(
             sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
                              ).select_from(publications).where(
@@ -419,7 +419,12 @@ def bind_inspected_publication(
         if int(release_count) >= max_releases_per_artifact:
             raise ImageLimitExceededError('IMAGE_LIMIT_EXCEEDED')
         publication = session.execute(publications.update().where(
-            publications.c.id == publication_id).values(
+            publications.c.id == publication_id, publications.c.state ==
+            models.ImagePublicationState.INSPECTING.value,
+            publications.c.inspection_lease_token == inspection_lease_token,
+            publications.c.inspection_lease_expires_at.is_not(None),
+            publications.c.inspection_lease_expires_at
+            > catalog_state.database_epoch_expression(now=now)).values(
                 state=models.ImagePublicationState.PENDING.value,
                 inspection_lease_token=None,
                 inspection_lease_expires_at=None,
@@ -428,7 +433,10 @@ def bind_inspected_publication(
                 canonical_location_id=location['id'],
                 next_retry_at=None,
                 error_code=None,
-                updated_at=current).returning(publications)).mappings().one()
+                updated_at=current).returning(publications)).mappings().first()
+        if publication is None:
+            raise topology_state.LocationLeaseLostError(
+                'Publication inspection lease was lost.')
         return (
             catalog_state._artifact(artifact),  # pylint: disable=protected-access
             catalog_state._source(source),  # pylint: disable=protected-access
@@ -601,7 +609,7 @@ def reserve_regional_location(
 def _finish_location(session: orm.Session, *, location_id: str,
                      lease_token: str, ready: bool, error_code: str | None,
                      retry_at: int | None, terminal: bool,
-                     now: int) -> sqlalchemy.engine.RowMapping:
+                     now: int | None) -> sqlalchemy.engine.RowMapping:
     locations = schema.locations
     optimistic = session.execute(
         sqlalchemy.select(
@@ -617,7 +625,7 @@ def _finish_location(session: orm.Session, *, location_id: str,
         sqlalchemy.select(locations).where(
             locations.c.id == location_id).with_for_update()).mappings().one()
     if (row['lease_token'] != lease_token or row['lease_expires_at'] is None or
-            int(row['lease_expires_at']) <= now or str(row['state'])
+            str(row['state'])
             not in (models.ImageLocationState.COPYING.value,
                     models.ImageLocationState.VERIFYING.value)):
         raise topology_state.LocationLeaseLostError(
@@ -628,42 +636,52 @@ def _finish_location(session: orm.Session, *, location_id: str,
         state = models.ImageLocationState.FAILED.value
     else:
         state = models.ImageLocationState.PENDING.value
-    updated = session.execute(
-        locations.update().where(locations.c.id == location_id).values(
+    current = catalog_state.database_epoch(session, now=now)
+    updated = session.execute(locations.update().where(
+        locations.c.id == location_id, locations.c.lease_token == lease_token,
+        locations.c.lease_expires_at.is_not(None), locations.c.lease_expires_at
+        > catalog_state.database_epoch_expression(now=now),
+        locations.c.state.in_([
+            models.ImageLocationState.COPYING.value,
+            models.ImageLocationState.VERIFYING.value,
+        ])).values(
             state=state,
             lease_kind=None,
             lease_token=None,
             lease_expires_at=None,
             next_retry_at=None if ready or terminal else retry_at,
             error_code=error_code,
-            last_verified_at=now if ready else row['last_verified_at'],
-            updated_at=now).returning(locations)).mappings().one()
+            last_verified_at=current if ready else row['last_verified_at'],
+            updated_at=current).returning(locations)).mappings().first()
+    if updated is None:
+        raise topology_state.LocationLeaseLostError(
+            'Location completion lost its fenced lease.')
     session.execute(schema.registry_shards.update().where(
         schema.registry_shards.c.id == row['shard_id'],
         schema.registry_shards.c.in_flight
         > 0).values(in_flight=schema.registry_shards.c.in_flight - 1,
-                    updated_at=now))
+                    updated_at=current))
     topology_state._refresh_shard_copy_queue_in_session(  # pylint: disable=protected-access
         session,
         str(row['shard_id']),
-        now=now)
+        now=current)
     operation_values: dict[str, Any] = {
         'result_json': json.dumps({
             'location_id': location_id,
             'state': state,
         },
                                   sort_keys=True),
-        'updated_at': now,
+        'updated_at': current,
     }
     if ready:
         operation_values.update(
             state=models.ImageOperationState.SUCCEEDED.value,
             error_code=None,
-            terminal_expires_at=now + _OPERATION_RETENTION_SECONDS)
+            terminal_expires_at=current + _OPERATION_RETENTION_SECONDS)
     elif terminal:
         operation_values.update(state=models.ImageOperationState.FAILED.value,
                                 error_code=error_code,
-                                terminal_expires_at=now +
+                                terminal_expires_at=current +
                                 _OPERATION_RETENTION_SECONDS)
     session.execute(schema.operations.update().where(
         schema.operations.c.result_kind == 'location',
@@ -765,7 +783,6 @@ def converge_canonical(*,
                        terminal: bool = True,
                        now: int | None = None) -> topology_state.LocationRecord:
     """Commits canonical result and release projections in one transaction."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         profile_key = (_lock_canonical_profile(session, location_id)
                        if ready else None)
@@ -776,7 +793,8 @@ def converge_canonical(*,
                                     error_code=error_code,
                                     retry_at=retry_at,
                                     terminal=terminal,
-                                    now=current)
+                                    now=now)
+        current = int(location['updated_at'])
         if bool(location['canonical']) and (ready or terminal):
             _project_dependent_publications(session,
                                             location,

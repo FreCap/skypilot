@@ -28,6 +28,18 @@ _FAILED_RESERVATION_SECONDS = 30 * 24 * 60 * 60
 _FAILED_PUBLICATION_RETENTION_SECONDS = 90 * 24 * 60 * 60
 _CATALOG_CHILD_SUMMARY_LIMIT = 10
 
+PUBLIC_OPERATION_KINDS = frozenset({
+    'PUBLISH',
+    'PREPARE',
+    'RETRY_PUBLICATION',
+    'RETRY_LOCATION',
+})
+ADMIN_OPERATION_KINDS = frozenset({
+    'PROFILE_QUALIFY',
+    'PROFILE_CANARY',
+})
+ALL_OPERATION_KINDS = PUBLIC_OPERATION_KINDS | ADMIN_OPERATION_KINDS
+
 
 class IdempotencyKeyReusedError(ValueError):
     """The same operation key was submitted with another request body."""
@@ -35,6 +47,10 @@ class IdempotencyKeyReusedError(ValueError):
 
 class ReleaseConflictError(ValueError):
     """A live immutable release reservation has different identity."""
+
+
+class ManagedImageDatabaseRequiredError(RuntimeError):
+    """Managed image state cannot run without the central PostgreSQL store."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,10 +146,34 @@ class PublicationRecord:
 def engine() -> sqlalchemy.engine.Engine:
     result = global_user_state.initialize_and_get_db()
     if result.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        raise RuntimeError(
+        raise ManagedImageDatabaseRequiredError(
             'Managed container image state requires the central PostgreSQL '
             'database.')
     return result
+
+
+def database_epoch_expression(*, now: int | None = None) -> Any:
+    """Returns the database wall clock used by lease-fenced mutations.
+
+    PostgreSQL transaction and statement timestamps can predate a blocking row
+    lock. ``clock_timestamp()`` is evaluated when the mutation evaluates its
+    fence. An explicit literal keeps deterministic state-machine tests cheap.
+    """
+    if now is not None:
+        return sqlalchemy.literal(now, type_=sqlalchemy.BigInteger())
+    return sqlalchemy.cast(
+        sqlalchemy.func.floor(
+            sqlalchemy.extract('epoch', sqlalchemy.func.clock_timestamp())),
+        sqlalchemy.BigInteger)
+
+
+def database_epoch(session: orm.Session, *, now: int | None = None) -> int:
+    """Reads a fresh database epoch after callers acquire blocking locks."""
+    if now is not None:
+        return now
+    return int(
+        session.execute(sqlalchemy.select(
+            database_epoch_expression())).scalar_one())
 
 
 def _operation(row: sqlalchemy.engine.RowMapping) -> OperationRecord:
@@ -292,17 +332,54 @@ def begin_operation(session: orm.Session,
     return _operation(row), created
 
 
-def get_operation(operation_id: str | None,
-                  scope: str) -> OperationRecord | None:
+def get_operation(
+    operation_id: str | None,
+    scope: str,
+    *,
+    allowed_kinds: frozenset[str] | None = None,
+) -> OperationRecord | None:
     if operation_id is None:
         return None
+    if allowed_kinds is not None and not allowed_kinds:
+        return None
     table = schema.operations
+    predicates = [table.c.id == operation_id, table.c.scope == scope]
+    if allowed_kinds is not None:
+        predicates.append(table.c.kind.in_(sorted(allowed_kinds)))
     with orm.Session(engine()) as session:
         row = session.execute(
-            sqlalchemy.select(table).where(
-                table.c.id == operation_id,
-                table.c.scope == scope)).mappings().first()
+            sqlalchemy.select(table).where(*predicates)).mappings().first()
     return _operation(row) if row is not None else None
+
+
+def _operation_lease_predicates(
+    table: sqlalchemy.Table,
+    *,
+    lease_token: str | None,
+    deadline_expired: bool | None,
+    now: int | None,
+) -> tuple[Any, ...]:
+    if lease_token is None:
+        if deadline_expired is not None:
+            raise ValueError('A canary deadline fence requires a lease token.')
+        return (table.c.state.in_([
+            models.ImageOperationState.PENDING.value,
+            models.ImageOperationState.RUNNING.value,
+        ]),)
+    clock = database_epoch_expression(now=now)
+    predicates: list[Any] = [
+        table.c.kind == 'PROFILE_CANARY',
+        table.c.state == models.ImageOperationState.RUNNING.value,
+        table.c.lease_token == lease_token,
+        table.c.lease_expires_at.is_not(None),
+        table.c.lease_expires_at > clock,
+        table.c.teardown_deadline.is_not(None),
+    ]
+    if deadline_expired is True:
+        predicates.append(table.c.teardown_deadline <= clock)
+    elif deadline_expired is False:
+        predicates.append(table.c.teardown_deadline > clock)
+    return tuple(predicates)
 
 
 def create_or_get_operation(
@@ -374,27 +451,31 @@ def complete_operation(session: orm.Session,
                        result_kind: str,
                        result_id: str,
                        result: dict[str, Any],
+                       lease_token: str | None = None,
+                       deadline_expired: bool | None = None,
                        now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
+    current = database_epoch(session, now=now)
+    table = schema.operations
     row_count = session.execute(schema.operations.update().where(
-        schema.operations.c.id == operation_id,
-        schema.operations.c.state.in_([
-            models.ImageOperationState.PENDING.value,
-            models.ImageOperationState.RUNNING.value,
-        ])).values(state=models.ImageOperationState.SUCCEEDED.value,
-                   result_kind=result_kind,
-                   result_id=result_id,
-                   result_json=json.dumps(result,
-                                          sort_keys=True,
-                                          separators=(',', ':')),
-                   error_code=None,
-                   lease_token=None,
-                   lease_expires_at=None,
-                   child_launch_id=None,
-                   teardown_deadline=None,
-                   updated_at=current,
-                   terminal_expires_at=current +
-                   _OPERATION_RETENTION_SECONDS)).rowcount
+        table.c.id == operation_id,
+        *_operation_lease_predicates(
+            table,
+            lease_token=lease_token,
+            deadline_expired=deadline_expired,
+            now=now)).values(state=models.ImageOperationState.SUCCEEDED.value,
+                             result_kind=result_kind,
+                             result_id=result_id,
+                             result_json=json.dumps(result,
+                                                    sort_keys=True,
+                                                    separators=(',', ':')),
+                             error_code=None,
+                             lease_token=None,
+                             lease_expires_at=None,
+                             child_launch_id=None,
+                             teardown_deadline=None,
+                             updated_at=current,
+                             terminal_expires_at=current +
+                             _OPERATION_RETENTION_SECONDS)).rowcount
     return row_count == 1
 
 
@@ -405,27 +486,31 @@ def fail_operation(session: orm.Session,
                    result_kind: str | None = None,
                    result_id: str | None = None,
                    result: dict[str, Any] | None = None,
+                   lease_token: str | None = None,
+                   deadline_expired: bool | None = None,
                    now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
+    current = database_epoch(session, now=now)
+    table = schema.operations
     row_count = session.execute(schema.operations.update().where(
-        schema.operations.c.id == operation_id,
-        schema.operations.c.state.in_([
-            models.ImageOperationState.PENDING.value,
-            models.ImageOperationState.RUNNING.value,
-        ])).values(state=models.ImageOperationState.FAILED.value,
-                   result_kind=result_kind,
-                   result_id=result_id,
-                   result_json=(json.dumps(
-                       result, sort_keys=True, separators=(',', ':'))
-                                if result is not None else None),
-                   error_code=error_code,
-                   lease_token=None,
-                   lease_expires_at=None,
-                   child_launch_id=None,
-                   teardown_deadline=None,
-                   updated_at=current,
-                   terminal_expires_at=current +
-                   _OPERATION_RETENTION_SECONDS)).rowcount
+        table.c.id == operation_id,
+        *_operation_lease_predicates(
+            table,
+            lease_token=lease_token,
+            deadline_expired=deadline_expired,
+            now=now)).values(state=models.ImageOperationState.FAILED.value,
+                             result_kind=result_kind,
+                             result_id=result_id,
+                             result_json=(json.dumps(
+                                 result, sort_keys=True, separators=(',', ':'))
+                                          if result is not None else None),
+                             error_code=error_code,
+                             lease_token=None,
+                             lease_expires_at=None,
+                             child_launch_id=None,
+                             teardown_deadline=None,
+                             updated_at=current,
+                             terminal_expires_at=current +
+                             _OPERATION_RETENTION_SECONDS)).rowcount
     return row_count == 1
 
 
@@ -605,21 +690,22 @@ def claim_publication_inspection(
         workspace: str | None = None,
         now: int | None = None) -> PublicationRecord | None:
     """Claims one indexed unbound source inspection with a random fence."""
-    current = int(time.time()) if now is None else now
     token = f'{worker_id}:{uuid.uuid4()}'
     table = schema.publications
-    statement = sqlalchemy.select(table.c.id).where(
-        table.c.canonical_location_id.is_(None),
-        table.c.state.in_([
-            models.ImagePublicationState.PENDING.value,
-            models.ImagePublicationState.INSPECTING.value,
-        ]), table.c.inspection_claimable_at <= current)
-    if workspace is not None:
-        statement = statement.where(table.c.workspace == workspace)
-    statement = statement.order_by(
-        table.c.inspection_claimable_at,
-        table.c.id).limit(1).with_for_update(skip_locked=True)
     with orm.Session(engine()) as session, session.begin():
+        current = database_epoch(session, now=now)
+        clock = database_epoch_expression(now=now)
+        statement = sqlalchemy.select(table.c.id).where(
+            table.c.canonical_location_id.is_(None),
+            table.c.state.in_([
+                models.ImagePublicationState.PENDING.value,
+                models.ImagePublicationState.INSPECTING.value,
+            ]), table.c.inspection_claimable_at <= clock)
+        if workspace is not None:
+            statement = statement.where(table.c.workspace == workspace)
+        statement = statement.order_by(
+            table.c.inspection_claimable_at,
+            table.c.id).limit(1).with_for_update(skip_locked=True)
         publication_id = session.execute(statement).scalar_one_or_none()
         if publication_id is None:
             return None
@@ -642,29 +728,30 @@ def fail_publication_inspection(publication_id: str,
                                 retry_at: int | None,
                                 terminal: bool,
                                 now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     table = schema.publications
     state = (models.ImagePublicationState.FAILED.value
              if terminal else models.ImagePublicationState.PENDING.value)
-    values: dict[str, Any] = {
-        'state': state,
-        'inspection_lease_token': None,
-        'inspection_lease_expires_at': None,
-        'next_retry_at': None if terminal else retry_at,
-        'error_code': error_code,
-        'updated_at': current,
-    }
-    if terminal:
-        values.update(
-            reservation_expires_at=current + _FAILED_RESERVATION_SECONDS,
-            record_expires_at=current + _FAILED_PUBLICATION_RETENTION_SECONDS)
     with orm.Session(engine()) as session, session.begin():
+        clock = database_epoch_expression(now=now)
+        values: dict[str, Any] = {
+            'state': state,
+            'inspection_lease_token': None,
+            'inspection_lease_expires_at': None,
+            'next_retry_at': None if terminal else retry_at,
+            'error_code': error_code,
+            'updated_at': clock,
+        }
+        if terminal:
+            values.update(
+                reservation_expires_at=clock + _FAILED_RESERVATION_SECONDS,
+                record_expires_at=clock + _FAILED_PUBLICATION_RETENTION_SECONDS)
         changed = session.execute(table.update().where(
             table.c.id == publication_id,
             table.c.state == models.ImagePublicationState.INSPECTING.value,
             table.c.inspection_lease_token == lease_token,
+            table.c.inspection_lease_expires_at.is_not(None),
             table.c.inspection_lease_expires_at
-            > current).values(**values)).rowcount
+            > clock).values(**values)).rowcount
     return changed == 1
 
 
@@ -673,16 +760,17 @@ def heartbeat_publication_inspection(publication_id: str,
                                      lease_seconds: int,
                                      *,
                                      now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     table = schema.publications
     with orm.Session(engine()) as session, session.begin():
+        clock = database_epoch_expression(now=now)
         changed = session.execute(table.update().where(
             table.c.id == publication_id,
             table.c.state == models.ImagePublicationState.INSPECTING.value,
             table.c.inspection_lease_token == lease_token,
-            table.c.inspection_lease_expires_at > current).values(
-                inspection_lease_expires_at=current + lease_seconds,
-                updated_at=current)).rowcount
+            table.c.inspection_lease_expires_at.is_not(None),
+            table.c.inspection_lease_expires_at
+            > clock).values(inspection_lease_expires_at=clock + lease_seconds,
+                            updated_at=clock)).rowcount
     return changed == 1
 
 

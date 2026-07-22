@@ -281,9 +281,10 @@ def claim_canary(
     """Claims one canary and atomically reserves its worst-case daily cost."""
     if lease_seconds <= 0:
         raise ValueError('Canary lease must be positive.')
-    current = int(time.time()) if now is None else now
     table = schema.operations
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
+        clock = catalog_state.database_epoch_expression(now=now)
         rows = session.execute(
             sqlalchemy.select(table).where(
                 table.c.kind == 'PROFILE_CANARY',
@@ -292,23 +293,25 @@ def claim_canary(
                     sqlalchemy.and_(
                         table.c.state ==
                         models.ImageOperationState.RUNNING.value,
-                        table.c.lease_expires_at <= current))).order_by(
+                        table.c.lease_expires_at <= clock))).order_by(
                             table.c.updated_at,
                             table.c.id).limit(16).with_for_update(
                                 skip_locked=True)).mappings().all()
         for row in rows:
             operation = catalog_state._operation(  # pylint: disable=protected-access
                 row)
+            claim_time = current
             try:
                 payload = canary_payload(operation)
                 if operation.state == models.ImageOperationState.PENDING:
-                    topology_state.reserve_canary_cost(
+                    _, claim_time = topology_state.reserve_canary_cost(
                         session,
                         profile_revision_id=payload['profile_revision_id'],
                         expected_generation=payload['desired_generation'],
-                        utc_day=time.strftime('%Y-%m-%d', time.gmtime(current)),
                         worst_case_microusd=payload['worst_case_microusd'],
-                        now=current)
+                        now=now)
+                else:
+                    claim_time = catalog_state.database_epoch(session, now=now)
             except (TypeError, ValueError,
                     topology_state.StaleProfileRevisionError) as error:
                 error_code = ('CANARY_DAILY_COST_LIMIT'
@@ -320,18 +323,18 @@ def claim_canary(
                                              result_kind='profile_revision',
                                              result_id=operation.result_id,
                                              result=operation.result,
-                                             now=current)
+                                             now=now)
                 continue
             token = f'{worker_id}:{uuid.uuid4()}'
             teardown_deadline = (operation.teardown_deadline or
-                                 current + payload['timeout_seconds'])
+                                 claim_time + payload['timeout_seconds'])
             claimed = session.execute(
                 table.update().where(table.c.id == operation.id).values(
                     state=models.ImageOperationState.RUNNING.value,
                     lease_token=token,
-                    lease_expires_at=current + lease_seconds,
+                    lease_expires_at=claim_time + lease_seconds,
                     teardown_deadline=teardown_deadline,
-                    updated_at=current).returning(table)).mappings().one()
+                    updated_at=claim_time).returning(table)).mappings().one()
             return catalog_state._operation(  # pylint: disable=protected-access
                 claimed)
     return None
@@ -342,8 +345,8 @@ def heartbeat_canary(operation_id: str,
                      lease_seconds: int,
                      *,
                      now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        clock = catalog_state.database_epoch_expression(now=now)
         changed = session.execute(schema.operations.update().where(
             schema.operations.c.id == operation_id,
             schema.operations.c.kind == 'PROFILE_CANARY',
@@ -351,8 +354,8 @@ def heartbeat_canary(operation_id: str,
             models.ImageOperationState.RUNNING.value,
             schema.operations.c.lease_token == lease_token,
             schema.operations.c.lease_expires_at
-            > current).values(lease_expires_at=current + lease_seconds,
-                              updated_at=current)).rowcount
+            > clock).values(lease_expires_at=clock + lease_seconds,
+                            updated_at=clock)).rowcount
     return changed == 1
 
 
@@ -362,7 +365,6 @@ def attach_canary_child(operation_id: str,
                         *,
                         now: int | None = None) -> bool:
     """Persists the provider child before waiting, closing relaunch races."""
-    current = int(time.time()) if now is None else now
     if (not isinstance(child_launch_id, str) or not child_launch_id or
             len(child_launch_id) > 2048 or
             any(character.isspace() for character in child_launch_id)):
@@ -370,24 +372,37 @@ def attach_canary_child(operation_id: str,
     with orm.Session(catalog_state.engine()) as session, session.begin():
         row = session.execute(
             sqlalchemy.select(schema.operations).where(
-                schema.operations.c.id == operation_id,
-                schema.operations.c.kind == 'PROFILE_CANARY',
-                schema.operations.c.state ==
-                models.ImageOperationState.RUNNING.value,
-                schema.operations.c.lease_token == lease_token,
-                schema.operations.c.lease_expires_at
-                > current).with_for_update()).mappings().first()
+                schema.operations.c.id ==
+                operation_id).with_for_update()).mappings().first()
         if row is None:
             return False
-        if row['child_launch_id'] not in (None, child_launch_id):
+        current = catalog_state.database_epoch(session, now=now)
+        live_owner = (str(row['kind']) == 'PROFILE_CANARY' and str(
+            row['state']) == models.ImageOperationState.RUNNING.value and
+                      row['lease_token'] == lease_token and
+                      row['lease_expires_at'] is not None and
+                      int(row['lease_expires_at']) > current)
+        if (live_owner and
+                row['child_launch_id'] not in (None, child_launch_id)):
             raise ValueError('Canary operation already owns another child.')
-        if (row['child_launch_id'] is None and
-                int(row['teardown_deadline']) <= current):
-            return False
-        session.execute(schema.operations.update().where(
-            schema.operations.c.id == operation_id).values(
-                child_launch_id=child_launch_id, updated_at=current))
-    return True
+        clock = catalog_state.database_epoch_expression(now=now)
+        changed = session.execute(schema.operations.update().where(
+            schema.operations.c.id == operation_id,
+            schema.operations.c.kind == 'PROFILE_CANARY',
+            schema.operations.c.state ==
+            models.ImageOperationState.RUNNING.value,
+            schema.operations.c.lease_token == lease_token,
+            schema.operations.c.lease_expires_at.is_not(None),
+            schema.operations.c.lease_expires_at > clock,
+            sqlalchemy.or_(
+                schema.operations.c.child_launch_id == child_launch_id,
+                sqlalchemy.and_(
+                    schema.operations.c.child_launch_id.is_(None),
+                    schema.operations.c.teardown_deadline.is_not(None),
+                    schema.operations.c.teardown_deadline
+                    > clock))).values(child_launch_id=child_launch_id,
+                                      updated_at=clock)).rowcount
+        return changed == 1
 
 
 def complete_canary(operation: catalog_state.OperationRecord,
@@ -395,7 +410,6 @@ def complete_canary(operation: catalog_state.OperationRecord,
                     *,
                     now: int | None = None) -> bool:
     """Atomically records one runtime proof and closes its owned operation."""
-    current = int(time.time()) if now is None else now
     if (operation.lease_token is None or
             evidence.get('teardown_verified') is not True):
         return False
@@ -411,17 +425,27 @@ def complete_canary(operation: catalog_state.OperationRecord,
     key = _runtime_attestation_key(target, payload['backend'], binding,
                                    payload['runtime_id'])
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        owned = session.execute(
+        locked = session.execute(
             sqlalchemy.select(schema.operations.c.id).where(
-                schema.operations.c.id == operation.id,
-                schema.operations.c.kind == 'PROFILE_CANARY',
-                schema.operations.c.state ==
-                models.ImageOperationState.RUNNING.value,
-                schema.operations.c.lease_token == operation.lease_token,
-                schema.operations.c.lease_expires_at > current,
-                schema.operations.c.teardown_deadline
-                > current).with_for_update()).first()
-        if owned is None:
+                schema.operations.c.id ==
+                operation.id).with_for_update()).first()
+        if locked is None:
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        completed = catalog_state.complete_operation(
+            session,
+            operation.id,
+            result_kind='profile_revision',
+            result_id=revision.id,
+            result={
+                **payload,
+                'attestation_key': key,
+                'observed_at': current,
+            },
+            lease_token=operation.lease_token,
+            deadline_expired=False,
+            now=now)
+        if not completed:
             return False
         topology_state.record_profile_attestation_in_session(
             session,
@@ -431,16 +455,7 @@ def complete_canary(operation: catalog_state.OperationRecord,
             expected_generation=payload['desired_generation'],
             expected_config_hash=payload['config_hash'],
             now=current)
-        return catalog_state.complete_operation(session,
-                                                operation.id,
-                                                result_kind='profile_revision',
-                                                result_id=revision.id,
-                                                result={
-                                                    **payload,
-                                                    'attestation_key': key,
-                                                    'observed_at': current,
-                                                },
-                                                now=current)
+        return True
 
 
 def fail_canary(operation: catalog_state.OperationRecord,
@@ -450,21 +465,14 @@ def fail_canary(operation: catalog_state.OperationRecord,
     """Fails only the still-owned canary operation after teardown."""
     if error_code == 'CANARY_TEARDOWN_FAILED':
         raise ValueError('Unverified canary teardown must remain reclaimable.')
-    current = int(time.time()) if now is None else now
     if operation.lease_token is None:
         return False
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        owned = session.execute(
+        locked = session.execute(
             sqlalchemy.select(schema.operations.c.id).where(
-                schema.operations.c.id == operation.id,
-                schema.operations.c.kind == 'PROFILE_CANARY',
-                schema.operations.c.state ==
-                models.ImageOperationState.RUNNING.value,
-                schema.operations.c.lease_token == operation.lease_token,
-                schema.operations.c.lease_expires_at > current,
-                schema.operations.c.teardown_deadline
-                > current).with_for_update()).first()
-        if owned is None:
+                schema.operations.c.id ==
+                operation.id).with_for_update()).first()
+        if locked is None:
             return False
         return catalog_state.fail_operation(session,
                                             operation.id,
@@ -472,7 +480,9 @@ def fail_canary(operation: catalog_state.OperationRecord,
                                             result_kind=operation.result_kind,
                                             result_id=operation.result_id,
                                             result=operation.result,
-                                            now=current)
+                                            lease_token=operation.lease_token,
+                                            deadline_expired=False,
+                                            now=now)
 
 
 def fail_expired_canary(operation: catalog_state.OperationRecord,
@@ -485,21 +495,14 @@ def fail_expired_canary(operation: catalog_state.OperationRecord,
         raise ValueError('Expired canary failure code is invalid.')
     if not teardown_verified:
         raise ValueError('Expired canary teardown must be verified.')
-    current = int(time.time()) if now is None else now
     if operation.lease_token is None:
         return False
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        owned = session.execute(
+        locked = session.execute(
             sqlalchemy.select(schema.operations.c.id).where(
-                schema.operations.c.id == operation.id,
-                schema.operations.c.kind == 'PROFILE_CANARY',
-                schema.operations.c.state ==
-                models.ImageOperationState.RUNNING.value,
-                schema.operations.c.lease_token == operation.lease_token,
-                schema.operations.c.lease_expires_at > current,
-                schema.operations.c.teardown_deadline
-                <= current).with_for_update()).first()
-        if owned is None:
+                schema.operations.c.id ==
+                operation.id).with_for_update()).first()
+        if locked is None:
             return False
         return catalog_state.fail_operation(session,
                                             operation.id,
@@ -507,7 +510,9 @@ def fail_expired_canary(operation: catalog_state.OperationRecord,
                                             result_kind=operation.result_kind,
                                             result_id=operation.result_id,
                                             result=operation.result,
-                                            now=current)
+                                            lease_token=operation.lease_token,
+                                            deadline_expired=True,
+                                            now=now)
 
 
 def schedule_automatic_canaries(*,

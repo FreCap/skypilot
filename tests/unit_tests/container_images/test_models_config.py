@@ -127,6 +127,21 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
         config.parse_profiles(invalid['profiles'], invalid_bindings)
 
 
+@pytest.mark.parametrize('mutation', ['empty', 'missing-region'])
+def test_ec2_canary_binding_requires_explicit_security_groups_in_every_region(
+        registry_config: dict[str, Any], mutation: str) -> None:
+    invalid = copy.deepcopy(registry_config)
+    security_groups = invalid['access_bindings']['aws-vm-pullers'][
+        'canary_security_groups']
+    if mutation == 'empty':
+        security_groups['us-west-2'] = []
+    else:
+        security_groups.pop('us-west-2')
+
+    with pytest.raises(ValueError, match='canary (security groups|network)'):
+        config.parse_access_bindings(invalid['access_bindings'])
+
+
 def test_workspace_policy_defaults_to_unchanged_direct_behavior() -> None:
     policy = config.parse_workspace_policy({})
     assert policy.mode == models.WorkspaceImageMode.DIRECT

@@ -7,6 +7,7 @@ import time
 from typing import Any, TypeVar
 import uuid
 
+from sky import sky_logging
 from sky.container_images import api_models
 from sky.container_images import models
 from sky.server import common as server_common
@@ -17,6 +18,7 @@ from sky.utils import annotations as annotations_lib
 from sky.utils import context
 
 _T = TypeVar('_T', bound=api_models._ApiModel)  # pylint: disable=protected-access
+logger = sky_logging.init_logger(__name__)
 
 
 def _request(method: str,
@@ -197,6 +199,11 @@ def status(selector: str | None = None,
         elif parsed.ref is not None:
             filters['source_ref'] = parsed.ref
     page = catalog(workspace=workspace, limit=100, **filters)
+    if page.next_cursor is not None:
+        logger.warning(
+            'Container image status is limited to the first 100 artifacts. '
+            'Use sky.image.catalog() with its next_cursor or narrow the '
+            'selector to inspect the remaining catalog.')
     result: list[api_models.ArtifactView] = []
     for item in page.items:
         summary = api_models.CatalogArtifactView.model_validate(item)

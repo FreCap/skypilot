@@ -390,8 +390,10 @@ export function ImageDetail() {
                   >
                     <CopyCode value={source.source_ref} />
                     <div className="mt-2 text-xs text-gray-500">
-                      {source.requested_platform} · binding{' '}
-                      {source.source_auth_binding_id || 'public'}
+                      {source.requested_platform}
+                      {source.source_auth_binding_id && (
+                        <> · binding {source.source_auth_binding_id}</>
+                      )}
                     </div>
                   </div>
                 ))}

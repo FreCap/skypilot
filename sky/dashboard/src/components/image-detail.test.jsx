@@ -131,4 +131,45 @@ describe('Image artifact detail', () => {
     expect(prepare).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled();
   });
+
+  it('does not relabel a redacted source binding as public', async () => {
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue({
+      artifact: {
+        id: 'image-1',
+        workspace: 'research',
+        runtime_digest: `sha256:${'a'.repeat(64)}`,
+        platform: 'linux/amd64',
+        producer_kind: 'external_oci',
+        config_digest: `sha256:${'b'.repeat(64)}`,
+        manifest_size_bytes: 100,
+        declared_size_bytes: 1000,
+        created_at: 100,
+        updated_at: 101,
+      },
+      releases: [],
+      sources: [
+        {
+          id: 'source-1',
+          source_ref: `ghcr.io/boltz/runtime@sha256:${'a'.repeat(64)}`,
+          requested_platform: 'linux/amd64',
+          source_auth_binding_id: null,
+        },
+      ],
+      publications: [],
+      locations: [],
+      demands: [],
+      truncated: false,
+    });
+
+    render(<ImageDetail />);
+
+    expect(await screen.findByText('Retained sources')).toBeVisible();
+    expect(screen.getAllByText('linux/amd64').length).toBeGreaterThan(0);
+    expect(screen.queryByText('public')).toBeNull();
+    expect(screen.queryByText(/binding/)).toBeNull();
+  });
 });

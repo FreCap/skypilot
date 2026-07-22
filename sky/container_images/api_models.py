@@ -113,20 +113,70 @@ class OperationView(_ApiModel):
     updated_at: int
 
     @classmethod
-    def from_record(cls,
-                    record: catalog_state.OperationRecord) -> OperationView:
-        result = record.result
-        if isinstance(result, dict) and 'nonce' in result:
-            result = dict(result)
-            nonce = result.pop('nonce')
-            if isinstance(nonce, str):
-                result['nonce_hash'] = hashlib.sha256(
-                    nonce.encode()).hexdigest()
+    def from_record(
+        cls,
+        record: catalog_state.OperationRecord,
+        *,
+        reveal_admin_result: bool = False,
+    ) -> OperationView:
+        result_keys = {
+            'PUBLISH': frozenset(
+                {'publication_id', 'release', 'state', 'image_id'}),
+            'RETRY_PUBLICATION': frozenset(
+                {'publication_id', 'release', 'state', 'image_id'}),
+            'PREPARE': frozenset({'location_id', 'state'}),
+            'RETRY_LOCATION': frozenset({'location_id', 'state'}),
+            'PROFILE_QUALIFY': frozenset(
+                {'profile', 'profile_revision_id', 'state'}),
+            'PROFILE_CANARY': frozenset({
+                'profile_revision_id',
+                'desired_generation',
+                'config_hash',
+                'target',
+                'target_fingerprint',
+                'backend',
+                'binding_id',
+                'binding_fingerprint',
+                'runtime_id',
+                'worst_case_microusd',
+                'timeout_seconds',
+                'attestation_key',
+                'observed_at',
+                'status',
+            }),
+        }
+        result_kinds = {
+            'PUBLISH': frozenset({'publication'}),
+            'RETRY_PUBLICATION': frozenset({'publication'}),
+            'PREPARE': frozenset({'location'}),
+            'RETRY_LOCATION': frozenset({'location'}),
+            'PROFILE_QUALIFY': frozenset({'qualification', 'profile_revision'}),
+            'PROFILE_CANARY': frozenset({'profile_revision'}),
+        }
+        kind_allowed = (record.kind in catalog_state.PUBLIC_OPERATION_KINDS or
+                        (reveal_admin_result and
+                         record.kind in catalog_state.ADMIN_OPERATION_KINDS))
+        result_allowed = (kind_allowed and record.result_kind is not None and
+                          record.result_kind in result_kinds.get(
+                              record.kind, frozenset()))
+        result: dict[str, Any] | None = None
+        if result_allowed and isinstance(record.result, dict):
+            allowed = result_keys.get(record.kind, frozenset())
+            result = {
+                key: record.result[key]
+                for key in allowed
+                if key in record.result
+            }
+            if record.kind == 'PROFILE_CANARY':
+                nonce = record.result.get('nonce')
+                if isinstance(nonce, str):
+                    result['nonce_hash'] = hashlib.sha256(
+                        nonce.encode()).hexdigest()
         return cls(id=record.id,
                    kind=record.kind,
                    state=record.state.value,
-                   result_kind=record.result_kind,
-                   result_id=record.result_id,
+                   result_kind=(record.result_kind if result_allowed else None),
+                   result_id=(record.result_id if result_allowed else None),
                    result=result,
                    error_code=record.error_code,
                    created_at=record.created_at,

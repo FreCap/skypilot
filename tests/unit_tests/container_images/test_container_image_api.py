@@ -101,20 +101,28 @@ def _publication_with_auth(
         updated_at=11)
 
 
-def _operation(
-        *,
-        result: dict[str, Any] | None = None) -> catalog_state.OperationRecord:
+def _operation(*,
+               result: dict[str, Any] | None = None,
+               kind: str = 'PROFILE_CANARY') -> catalog_state.OperationRecord:
+    result_kind = {
+        'PUBLISH': 'publication',
+        'PREPARE': 'location',
+        'RETRY_PUBLICATION': 'publication',
+        'RETRY_LOCATION': 'location',
+        'PROFILE_QUALIFY': 'profile_revision',
+        'PROFILE_CANARY': 'profile_revision',
+    }.get(kind)
     return catalog_state.OperationRecord(
         id=str(uuid.uuid4()),
         authority_id=str(uuid.uuid4()),
         scope='research',
         actor_hash='a' * 64,
-        kind='PROFILE_CANARY',
+        kind=kind,
         idempotency_key='idempotency-key-1',
         request_hash='b' * 64,
         state=models.ImageOperationState.RUNNING,
-        result_kind=None,
-        result_id=None,
+        result_kind=result_kind,
+        result_id=(str(uuid.uuid4()) if result_kind is not None else None),
         result=result,
         error_code=None,
         lease_token=None,
@@ -174,14 +182,84 @@ def test_mutation_models_are_closed_digest_pinned_and_cost_confirmed() -> None:
 
 
 def test_operation_view_never_returns_single_use_canary_nonce() -> None:
-    view = api_models.OperationView.from_record(
-        _operation(result={
+    view = api_models.OperationView.from_record(_operation(
+        result={
             'nonce': 'single-use-secret',
-            'status': 'RUNNING'
-        }))
+            'status': 'RUNNING',
+            'provider_response': 'must-not-be-returned',
+        }),
+                                                reveal_admin_result=True)
     assert view.result is not None
     assert 'nonce' not in view.result
     assert view.result['nonce_hash'] != 'single-use-secret'
+    assert 'provider_response' not in view.result
+
+
+def test_operation_view_hides_admin_and_unknown_result_payloads() -> None:
+    assert api_models.OperationView.from_record(
+        _operation(result={'nonce': 'secret'})).result is None
+    assert api_models.OperationView.from_record(
+        _operation(kind='FUTURE_KIND', result={'secret': 'value'}),
+        reveal_admin_result=True).result is None
+
+
+def test_operation_view_rejects_wrong_result_binding_for_allowed_kind() -> None:
+    operation = dataclasses.replace(_operation(
+        kind='PUBLISH', result={'publication_id': 'publication-1'}),
+                                    result_kind='profile_revision',
+                                    result_id='profile-1')
+
+    view = api_models.OperationView.from_record(operation)
+
+    assert view.result_kind is None
+    assert view.result_id is None
+    assert view.result is None
+
+
+def test_operation_polling_filters_admin_kinds_before_database_lookup(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _operation(result={'nonce': 'single-use-secret'})
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    monkeypatch.setattr(server, '_roles', lambda _request: {'viewer'})
+    lookup = mock.Mock(return_value=None)
+    monkeypatch.setattr(server.catalog_state, 'get_operation', lookup)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        server.get_operation(operation.id, _request(), workspace='research')
+
+    assert error.value.status_code == 404
+    lookup.assert_called_once_with(
+        operation.id,
+        'research',
+        allowed_kinds=catalog_state.PUBLIC_OPERATION_KINDS)
+
+
+def test_admin_operation_polling_returns_only_allowlisted_canary_projection(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _operation(
+        result={
+            'nonce': 'single-use-secret',
+            'runtime_id': 'us-west-2',
+            'provider_response': 'must-not-be-returned',
+        })
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    monkeypatch.setattr(server, '_roles', lambda _request: {'admin'})
+    lookup = mock.Mock(return_value=operation)
+    monkeypatch.setattr(server.catalog_state, 'get_operation', lookup)
+
+    view = server.get_operation(operation.id, _request(), workspace='research')
+
+    assert view.result is not None
+    assert view.result['runtime_id'] == 'us-west-2'
+    assert 'nonce' not in view.result
+    assert 'nonce_hash' in view.result
+    assert 'provider_response' not in view.result
+    lookup.assert_called_once_with(
+        operation.id,
+        'research',
+        allowed_kinds=catalog_state.ALL_OPERATION_KINDS)
 
 
 def test_cursor_is_signed_and_bound_to_workspace_scope_and_filters(
@@ -324,8 +402,7 @@ def test_publication_route_authorizes_before_mutating_and_returns_direct_result(
                         lambda request, requested: 'research')
     monkeypatch.setattr(server, '_require_publisher',
                         lambda request, workspace: None)
-    operation = dataclasses.replace(_operation(),
-                                    kind='PUBLISH',
+    operation = dataclasses.replace(_operation(kind='PUBLISH'),
                                     state=models.ImageOperationState.PENDING)
     publication_record = catalog_state.PublicationRecord(
         id=str(uuid.uuid4()),
@@ -485,6 +562,29 @@ def test_sdk_status_projects_catalog_summary_without_extra_field_failure(
     result = _unwrap(client.status)(workspace='research')
     assert len(result) == 1
     assert result[0].id == artifact.id
+
+
+def test_sdk_status_discloses_bounded_first_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    artifact = _artifact()
+    summary = api_models.CatalogArtifactView.from_summary(
+        artifact, {
+            'releases': [],
+            'distributions': [],
+            'source_refs': [],
+            'targets': [],
+            'location_states': {},
+        })
+    monkeypatch.setattr(
+        client, 'catalog', lambda **kwargs: api_models.Page(
+            items=[summary.model_dump(mode='json')], next_cursor='next-page'))
+    warning = mock.Mock()
+    monkeypatch.setattr(client.logger, 'warning', warning)
+
+    result = _unwrap(client.status)(workspace='research')
+
+    assert [item.id for item in result] == [artifact.id]
+    warning.assert_called_once()
 
 
 def test_router_exposes_only_direct_image_api_contract() -> None:

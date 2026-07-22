@@ -336,7 +336,23 @@ def _resolve_metadata(
                 locality_rank=(_unsupported_direct_locality_rank(
                     image, workspace)))
         raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
-    current_demand = _current_consumer_demand(workspace, placement, cache)
+    try:
+        current_demand = _current_consumer_demand(workspace, placement, cache)
+    except catalog_state.ManagedImageDatabaseRequiredError:
+        # A persisted consumer demand takes precedence when PostgreSQL exists.
+        # Without managed state, only a currently direct exact ref is runnable.
+        profile_key = ('profile', workspace, image.distribution)
+        if profile_key not in cache:
+            cache[profile_key] = config.resolve_profile(image.distribution,
+                                                        workspace)
+        configured_profile, policy = cache[profile_key]
+        if configured_profile is not None:
+            raise
+        if image.ref is None:
+            raise ValueError('PROFILE_NOT_ACTIVE') from None
+        return _MetadataResolution(resources=resources,
+                                   direct=True,
+                                   policy=policy)
     if current_demand is not None:
         policy_key = ('workspace_policy', workspace)
         if policy_key not in cache:
@@ -364,6 +380,8 @@ def _resolve_metadata(
                                                         workspace)
         configured_profile, policy = cache[profile_key]
         if configured_profile is None:
+            if image.ref is None:
+                raise ValueError('PROFILE_NOT_ACTIVE')
             return _MetadataResolution(resources=resources,
                                        direct=True,
                                        policy=policy)
