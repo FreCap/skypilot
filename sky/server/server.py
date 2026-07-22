@@ -1157,24 +1157,38 @@ async def download(download_body: payloads.DownloadBody,
     log_id = str(uuid.uuid4().hex)
     zip_filename = f'folder_{log_id}.zip'
     zip_path = resolved_logs_root / zip_filename
+    archive_abandoned = threading.Event()
+
+    def _remove_abandoned_archive() -> None:
+        with contextlib.suppress(OSError):
+            zip_path.unlink(missing_ok=True)
 
     try:
 
         def _zip_files_and_folders(folder_paths, zip_path):
-            folders = [
-                str(folder_path.expanduser().resolve())
-                for folder_path in folder_paths
-            ]
-            # Check for optional query parameter to control zip entry structure
-            relative = request.query_params.get('relative', 'home')
-            if relative == 'items':
-                # Dashboard-friendly: entries relative to selected folders
-                storage_utils.zip_files_and_folders(folders,
-                                                    zip_path,
-                                                    relative_to_items=True)
-            else:
-                # CLI-friendly (default): entries with full paths for mapping
-                storage_utils.zip_files_and_folders(folders, zip_path)
+            try:
+                folders = [
+                    str(folder_path.expanduser().resolve())
+                    for folder_path in folder_paths
+                ]
+                # Check for optional query parameter to control zip entry
+                # structure.
+                relative = request.query_params.get('relative', 'home')
+                if relative == 'items':
+                    # Dashboard-friendly: entries relative to selected folders
+                    storage_utils.zip_files_and_folders(folders,
+                                                        zip_path,
+                                                        relative_to_items=True)
+                else:
+                    # CLI-friendly (default): entries with full paths for
+                    # mapping.
+                    storage_utils.zip_files_and_folders(folders, zip_path)
+            finally:
+                # Cancelling to_thread() cannot stop this worker. If the
+                # request abandoned its archive, remove it after the writer
+                # closes the file.
+                if archive_abandoned.is_set():
+                    _remove_abandoned_archive()
 
         await asyncio.to_thread(_zip_files_and_folders, folder_paths, zip_path)
 
@@ -1197,7 +1211,15 @@ async def download(download_body: payloads.DownloadBody,
             headers=headers,
             background=starlette.background.BackgroundTask(zip_path.unlink,
                                                            missing_ok=True))
+    except asyncio.CancelledError:
+        archive_abandoned.set()
+        # Also clean here in case the worker finished just before cancellation
+        # was delivered to the awaiting task.
+        _remove_abandoned_archive()
+        raise
     except Exception as e:
+        archive_abandoned.set()
+        _remove_abandoned_archive()
         raise fastapi.HTTPException(status_code=500,
                                     detail=f'Error creating zip file: {str(e)}')
 

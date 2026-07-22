@@ -323,6 +323,157 @@ async def test_download_accepts_canonical_child_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_download_removes_partial_archive_after_failure(tmp_path):
+    """An archive error must not leave its partially written ZIP behind."""
+    user_root = tmp_path / 'user'
+    child = user_root / 'logs'
+    child.mkdir(parents=True)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(child)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+    archive_paths = []
+
+    def fail_archive(folders, zip_path):
+        del folders
+        archive_path = pathlib.Path(zip_path)
+        archive_paths.append(archive_path)
+        archive_path.touch()
+        raise RuntimeError('archive failed')
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=user_root), mock.patch.object(
+                               server.bs,
+                               'get_blob_storage',
+                               return_value=blob_storage), mock.patch.object(
+                                   server.storage_utils,
+                                   'zip_files_and_folders',
+                                   side_effect=fail_archive):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            await server.download(body, request)
+
+    assert exc_info.value.status_code == 500
+    assert len(archive_paths) == 1
+    assert not archive_paths[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_download_removes_archive_completed_after_cancellation(tmp_path):
+    """A ZIP worker finishing after cancellation must remove its output."""
+    user_root = tmp_path / 'user'
+    child = user_root / 'logs'
+    child.mkdir(parents=True)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(child)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+    archive_started = threading.Event()
+    allow_archive = threading.Event()
+    archive_finished = threading.Event()
+    archive_paths = []
+
+    def create_archive(folders, zip_path):
+        del folders
+        archive_path = pathlib.Path(zip_path)
+        archive_paths.append(archive_path)
+        archive_started.set()
+        assert allow_archive.wait(timeout=5)
+        archive_path.touch()
+        archive_finished.set()
+
+    def wait_for_cleanup() -> bool:
+        if not archive_finished.wait(timeout=5):
+            return False
+        deadline = time.monotonic() + 5
+        while archive_paths[0].exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not archive_paths[0].exists()
+
+    with mock.patch.object(server.common,
+                           'api_server_user_logs_dir_prefix',
+                           return_value=user_root), mock.patch.object(
+                               server.bs,
+                               'get_blob_storage',
+                               return_value=blob_storage), mock.patch.object(
+                                   server.storage_utils,
+                                   'zip_files_and_folders',
+                                   side_effect=create_archive):
+        try:
+            download_task = asyncio.create_task(server.download(body, request))
+            assert await asyncio.to_thread(archive_started.wait, 5)
+
+            download_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await download_task
+
+            allow_archive.set()
+            assert await asyncio.to_thread(wait_for_cleanup)
+        finally:
+            allow_archive.set()
+            if archive_started.is_set():
+                assert await asyncio.to_thread(archive_finished.wait, 5)
+
+    assert len(archive_paths) == 1
+
+
+@pytest.mark.asyncio
+async def test_download_removes_archive_if_cancelled_before_await_resumes(
+        tmp_path):
+    """Cancellation must clean a ZIP returned but not claimed by the task."""
+    user_root = tmp_path / 'user'
+    child = user_root / 'logs'
+    child.mkdir(parents=True)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    query_params={})
+    body = server.payloads.DownloadBody(
+        folder_paths=[str(child)],
+        env_vars={constants.USER_ID_ENV_VAR: 'user-id'})
+    blob_storage = mock.Mock()
+    blob_storage.download_tmp_dir.return_value = str(user_root)
+    archive_paths = []
+
+    def create_archive(folders, zip_path):
+        del folders
+        archive_path = pathlib.Path(zip_path)
+        archive_paths.append(archive_path)
+        archive_path.touch()
+
+    async def run_then_cancel_archive(func, *args, **kwargs):
+        result = func(*args, **kwargs)
+        if func.__name__ == '_zip_files_and_folders':
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            current_task.cancel()
+            await asyncio.sleep(0)
+        return result
+
+    with mock.patch.object(
+            server.common,
+            'api_server_user_logs_dir_prefix',
+            return_value=user_root), mock.patch.object(
+                server.bs, 'get_blob_storage',
+                return_value=blob_storage), mock.patch.object(
+                    server.storage_utils,
+                    'zip_files_and_folders',
+                    side_effect=create_archive), mock.patch.object(
+                        server.asyncio,
+                        'to_thread',
+                        side_effect=run_then_cancel_archive):
+        with pytest.raises(asyncio.CancelledError):
+            await server.download(body, request)
+
+    assert len(archive_paths) == 1
+    assert not archive_paths[0].exists()
+
+
+@pytest.mark.asyncio
 async def test_download_uses_authenticated_user_identity(tmp_path):
     """The request body cannot select another user's download directory."""
     authenticated_root = tmp_path / 'authenticated'
