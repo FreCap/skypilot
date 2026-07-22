@@ -791,6 +791,86 @@ async def test_upload_blob_publishes_extracted_content(tmp_path):
             'payload.txt').read_text() == 'payload'
 
 
+@pytest.mark.asyncio
+async def test_upload_blob_cancellation_keeps_lock_until_publish(tmp_path):
+    blob_id = 'c' * 64
+    finalize_started = threading.Event()
+    allow_finalize = threading.Event()
+    finalize_finished = threading.Event()
+    lock_exited = asyncio.Event()
+
+    class _TestBlobStorage:
+        """Minimal blob storage that records publication and lock release."""
+
+        def __init__(self):
+            self.stored = False
+
+        def blobs_dir(self, user_id):
+            return tmp_path / user_id / 'blobs'
+
+        def get_staging_dir(self, user_id, current_blob_id):
+            return self.blobs_dir(user_id) / '.staging' / current_blob_id
+
+        def get_target_dir(self, user_id, current_blob_id):
+            return self.blobs_dir(user_id) / current_blob_id
+
+        @contextlib.asynccontextmanager
+        async def acquire_upload_lock(self, user_id, current_blob_id):
+            del user_id, current_blob_id
+            try:
+                yield
+            finally:
+                lock_exited.set()
+
+        def assemble_on_upload(self):
+            return True
+
+        def extract_on_upload(self):
+            return True
+
+        async def store_blob(self, user_id, current_blob_id, staging_dir):
+            del user_id, current_blob_id, staging_dir
+            self.stored = True
+
+    def _blocking_finalize():
+        finalize_started.set()
+        assert allow_finalize.wait(timeout=5)
+        finalize_finished.set()
+
+    async def _finalize_chunked_upload(**kwargs):
+        del kwargs
+        await asyncio.to_thread(_blocking_finalize)
+
+    storage = _TestBlobStorage()
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None))
+    try:
+        with mock.patch.object(file_mount_uploads.bs,
+                               'get_blob_storage',
+                               return_value=storage), \
+             mock.patch.object(file_mount_uploads,
+                               '_receive_and_assemble_chunks',
+                               new=mock.AsyncMock(return_value=None)), \
+             mock.patch.object(file_mount_uploads,
+                               '_finalize_chunked_upload',
+                               side_effect=_finalize_chunked_upload):
+            upload_task = asyncio.create_task(
+                server.upload_blob(request, 'user', blob_id, 0, 1))
+            assert await asyncio.to_thread(finalize_started.wait, 5)
+
+            upload_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await upload_task
+
+            assert not lock_exited.is_set()
+            allow_finalize.set()
+            await asyncio.wait_for(lock_exited.wait(), timeout=5)
+    finally:
+        allow_finalize.set()
+
+    assert finalize_finished.is_set()
+    assert storage.stored
+
+
 # A deterministic 64-char hex string used as a blob ID in tests.
 _BLOB_HEX = 'a' * 64
 

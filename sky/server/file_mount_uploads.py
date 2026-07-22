@@ -21,6 +21,7 @@ from sky.server import common
 from sky.server.blob import blob_storage as bs
 from sky.server.requests import payloads
 from sky.server.requests import requests as requests_lib
+from sky.utils import asyncio_utils
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -304,6 +305,24 @@ async def check_blob_exists(request: fastapi.Request, user_hash: str,
     return {'exists': exists}
 
 
+@asyncio_utils.shield
+async def _finalize_blob_upload(storage: bs.BlobStorage, user_id: str,
+                                upload_id: str, target_dir: pathlib.Path,
+                                staging_dir: pathlib.Path,
+                                total_chunks: int) -> None:
+    """Finalize and publish a blob without releasing its lock on cancellation."""
+    async with storage.acquire_upload_lock(user_id, upload_id):
+        if await anyio.Path(target_dir).exists():
+            return
+        if storage.assemble_on_upload() or storage.extract_on_upload():
+            await _finalize_chunked_upload(base_dir=staging_dir,
+                                           zip_name='staging',
+                                           total_chunks=total_chunks,
+                                           extract=storage.extract_on_upload())
+        await storage.store_blob(user_id, upload_id, staging_dir)
+        logger.info(f'Uploaded blob: {target_dir}')
+
+
 @router.post('/upload_v2')
 async def upload_blob(request: fastapi.Request, user_hash: str, upload_id: str,
                       chunk_index: int,
@@ -351,19 +370,12 @@ async def upload_blob(request: fastapi.Request, user_hash: str, upload_id: str,
     if result is not None:
         return result
 
-    # All chunks present — finalize and publish under the upload
-    # lock so exactly one caller does the assemble/extract/rename.
-    async with storage.acquire_upload_lock(user_id, upload_id):
-        if target_dir.exists():
-            return payloads.UploadZipFileResponse(
-                status=responses.UploadStatus.COMPLETED.value)
-        if storage.assemble_on_upload() or storage.extract_on_upload():
-            await _finalize_chunked_upload(base_dir=staging_dir,
-                                           zip_name='staging',
-                                           total_chunks=total_chunks,
-                                           extract=storage.extract_on_upload())
-        await storage.store_blob(user_id, upload_id, staging_dir)
-        logger.info(f'Uploaded blob: {target_dir}')
+    # All chunks present: finalize and publish under the upload lock so exactly
+    # one caller does the assemble/extract/rename. Keep the complete critical
+    # section shielded because executor-backed extraction continues running if
+    # the request is cancelled.
+    await _finalize_blob_upload(storage, user_id, upload_id, target_dir,
+                                staging_dir, total_chunks)
     return payloads.UploadZipFileResponse(
         status=responses.UploadStatus.COMPLETED.value)
 

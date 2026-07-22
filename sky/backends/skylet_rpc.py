@@ -73,9 +73,11 @@ def invoke_grpc_streaming(method: Any, *args: Any,
         ctx.unregister_cancel_callback(call.cancel)
 
 
-def invoke_skylet_with_retries(func: Callable[..., T]) -> T:
+def invoke_skylet_with_retries(func: Callable[..., T],
+                               max_attempts: int = 5) -> T:
     """Retry a unary Skylet gRPC request through transient tunnel failures."""
-    max_attempts = 5
+    if max_attempts < 1:
+        raise ValueError('max_attempts must be at least 1.')
     backoff = common_utils.Backoff(initial_backoff=0.5)
     last_exception: Exception | None = None
 

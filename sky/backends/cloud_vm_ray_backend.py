@@ -3812,8 +3812,13 @@ class SkyletClient:
     def terminate_replica(
         self,
         request: 'servev1_pb2.TerminateReplicaRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float |
+        None = (serve_constants.TERMINATE_REPLICA_TIMEOUT_SECONDS + 10)
     ) -> 'servev1_pb2.TerminateReplicaResponse':
+        # The controller acknowledges only after the replica-manager lock has
+        # admitted and durably scheduled teardown. Give that acceptance wait
+        # transport margin instead of preempting it at the generic 10s RPC
+        # deadline.
         return self._serve_stub.TerminateReplica(request, timeout=timeout)
 
     def wait_service_registration(
