@@ -6,6 +6,7 @@ import os
 import re
 import select
 import subprocess
+import threading
 import time
 
 import httpx
@@ -552,13 +553,47 @@ async def send_metrics_request_with_port_forward(
     """
     if stats is None:
         stats = FederationStats()
-    port_forward_process = None
+    port_forward_process: subprocess.Popen | None = None
+    start_state_lock = threading.Lock()
+    start_was_cancelled = False
+    unclaimed_process: subprocess.Popen | None = None
+
+    def _start_port_forward() -> tuple[subprocess.Popen, int]:
+        nonlocal unclaimed_process
+        process, port = start_svc_port_forward(context, namespace, service,
+                                               service_port)
+        with start_state_lock:
+            if start_was_cancelled:
+                stop_after_start = True
+            else:
+                unclaimed_process = process
+                stop_after_start = False
+        if stop_after_start:
+            stop_svc_port_forward(process)
+        return process, port
+
     # monotonic() so durations are immune to wall-clock adjustments.
     try:
         # Start port forward.
         pf_start = time.monotonic()
-        port_forward_process, local_port = await asyncio.to_thread(
-            start_svc_port_forward, context, namespace, service, service_port)
+        start_result: tuple[subprocess.Popen, int] | None = None
+        try:
+            start_result = await asyncio.to_thread(_start_port_forward)
+        except asyncio.CancelledError:
+            # The worker cannot be stopped by cancelling to_thread(). Transfer
+            # cleanup ownership to whichever side sees the process handle.
+            with start_state_lock:
+                start_was_cancelled = True
+                process_to_stop = unclaimed_process
+                unclaimed_process = None
+            if process_to_stop is not None:
+                stop_svc_port_forward(process_to_stop)
+            raise
+        assert start_result is not None
+        port_forward_process, local_port = start_result
+        with start_state_lock:
+            # The event-loop task now owns cleanup in the outer finally block.
+            unclaimed_process = None
         stats.port_forward_seconds = time.monotonic() - pf_start
         record_federation_phase(context, route, 'port_forward',
                                 stats.port_forward_seconds)
