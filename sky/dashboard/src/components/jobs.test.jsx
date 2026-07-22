@@ -470,6 +470,285 @@ describe('managed jobs automatic refresh', () => {
     jest.useRealTimers();
   });
 
+  it('issues one queue fetch for one filter change', async () => {
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue({
+      jobs: [
+        {
+          id: 1,
+          task_id: 0,
+          task_job_id: '1-0',
+          name: 'baseline-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+        },
+      ],
+      total: 1,
+      totalNoFilter: 1,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    });
+
+    const props = {
+      refreshInterval: 5000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      filters: [],
+      onUserFilter: jest.fn(),
+      onRefresh: jest.fn(),
+      poolsData: [],
+      poolsLoading: false,
+      setValueList: jest.fn(),
+      preloadingComplete: true,
+      lastFetchedTime: null,
+    };
+
+    const { rerender } = render(<ManagedJobsTable {...props} />);
+
+    await screen.findByText('baseline-job');
+    await act(async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    jobsCacheManager.getPaginatedJobs.mockClear();
+
+    rerender(
+      <ManagedJobsTable
+        {...props}
+        filters={[{ property: 'name', value: 'alpha' }]}
+      />
+    );
+
+    await waitFor(() =>
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+    );
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allUsers: true,
+        nameMatch: 'alpha',
+        page: 1,
+        limit: 10,
+        userMatch: 'alice',
+      })
+    );
+  });
+
+  it('resets to page 1 before fetching filtered jobs', async () => {
+    const originalUrl = window.location.href;
+    window.history.replaceState(
+      null,
+      '',
+      'http://localhost/jobs?page=2&pageSize=10'
+    );
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue({
+      jobs: [
+        {
+          id: 11,
+          task_id: 0,
+          task_job_id: '11-0',
+          name: 'paged-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+        },
+      ],
+      total: 25,
+      totalNoFilter: 25,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    });
+
+    const props = {
+      refreshInterval: 5000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      filters: [],
+      onUserFilter: jest.fn(),
+      onRefresh: jest.fn(),
+      poolsData: [],
+      poolsLoading: false,
+      setValueList: jest.fn(),
+      preloadingComplete: true,
+      lastFetchedTime: null,
+    };
+
+    try {
+      const { rerender } = render(<ManagedJobsTable {...props} />);
+
+      await screen.findByText('paged-job');
+      await act(async () => {
+        for (let i = 0; i < 5; i += 1) {
+          await Promise.resolve();
+        }
+      });
+
+      jobsCacheManager.getPaginatedJobs.mockClear();
+
+      rerender(
+        <ManagedJobsTable
+          {...props}
+          filters={[{ property: 'name', value: 'alpha' }]}
+        />
+      );
+
+      await waitFor(() =>
+        expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+      );
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledWith(
+        expect.objectContaining({
+          nameMatch: 'alpha',
+          page: 1,
+        })
+      );
+    } finally {
+      window.history.replaceState(null, '', originalUrl);
+    }
+  });
+
+  it('issues one queue fetch for one ownership scope change', async () => {
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue({
+      jobs: [
+        {
+          id: 1,
+          task_id: 0,
+          task_job_id: '1-0',
+          name: 'scope-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+        },
+      ],
+      total: 1,
+      totalNoFilter: 1,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    });
+
+    const props = {
+      refreshInterval: 5000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      filters: [],
+      onUserFilter: jest.fn(),
+      onRefresh: jest.fn(),
+      poolsData: [],
+      poolsLoading: false,
+      setValueList: jest.fn(),
+      preloadingComplete: true,
+      lastFetchedTime: null,
+    };
+
+    render(<ManagedJobsTable {...props} />);
+
+    await screen.findByText('scope-job');
+    await act(async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /RUNNING/i }));
+    await waitFor(() =>
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+    );
+
+    jobsCacheManager.getPaginatedJobs.mockClear();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'All Jobs' }));
+
+    await waitFor(() =>
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+    );
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+    expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allUsers: true,
+        page: 1,
+        userMatch: undefined,
+      })
+    );
+  });
+
+  it('resets to page 1 before fetching after an ownership scope change', async () => {
+    const originalUrl = window.location.href;
+    window.history.replaceState(
+      null,
+      '',
+      'http://localhost/jobs?page=2&pageSize=10'
+    );
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue({
+      jobs: [
+        {
+          id: 11,
+          task_id: 0,
+          task_job_id: '11-0',
+          name: 'paged-scope-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+        },
+      ],
+      total: 25,
+      totalNoFilter: 25,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    });
+
+    const props = {
+      refreshInterval: 5000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      filters: [],
+      onUserFilter: jest.fn(),
+      onRefresh: jest.fn(),
+      poolsData: [],
+      poolsLoading: false,
+      setValueList: jest.fn(),
+      preloadingComplete: true,
+      lastFetchedTime: null,
+    };
+
+    try {
+      render(<ManagedJobsTable {...props} />);
+
+      await screen.findByText('paged-scope-job');
+      await act(async () => {
+        for (let i = 0; i < 5; i += 1) {
+          await Promise.resolve();
+        }
+      });
+
+      jobsCacheManager.getPaginatedJobs.mockClear();
+
+      fireEvent.click(screen.getByRole('tab', { name: 'All Jobs' }));
+
+      await waitFor(() =>
+        expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+      );
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledWith(
+        expect.objectContaining({
+          page: 1,
+          userMatch: undefined,
+        })
+      );
+    } finally {
+      window.history.replaceState(null, '', originalUrl);
+    }
+  });
+
   it('serializes background polls while manual refresh remains live', async () => {
     jest.useFakeTimers();
     getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });

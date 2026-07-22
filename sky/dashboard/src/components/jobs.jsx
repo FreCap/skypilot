@@ -774,10 +774,16 @@ export function ManagedJobsTable({
 
   // Keep a ref to latest fetchData to avoid stale closures in interval
   const fetchDataRef = React.useRef(fetchData);
+  const currentPageRef = React.useRef(currentPage);
   const automaticRefreshRef = React.useRef(null);
+  const pendingPageFetchOptionsRef = React.useRef(null);
+  const pageChangeOriginRef = React.useRef(null);
   React.useEffect(() => {
     fetchDataRef.current = fetchData;
   }, [fetchData]);
+  React.useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
 
   // Prevent duplicate API requests on first load/page refresh
   // Multiple useEffects below would normally all fire on mount with their default values,
@@ -797,7 +803,7 @@ export function ManagedJobsTable({
   React.useEffect(() => {
     if (!isInitialFetch.current) return;
     if (!userResolved) return;
-    fetchData({ includeStatus: true });
+    fetchDataRef.current({ includeStatus: true });
     isInitialFetch.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userResolved]);
@@ -822,33 +828,67 @@ export function ManagedJobsTable({
   // Skip on initial fetch (page defaults to 1)
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
-      fetchData({ includeStatus: false });
+      const pendingOptions = pendingPageFetchOptionsRef.current;
+      pendingPageFetchOptionsRef.current = null;
+      const origin = pageChangeOriginRef.current;
+      pageChangeOriginRef.current = null;
+      if (origin === 'page-reset' && pendingOptions == null) {
+        return;
+      }
+      fetchDataRef.current(pendingOptions ?? { includeStatus: false });
     }
-  }, [currentPage, fetchData, preloadingComplete]);
+  }, [currentPage, preloadingComplete]);
 
   // Fetch on filters or page size changes with status request
   // Skip on initial fetch (filters default to [] and pageSize to 10)
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
-      fetchData({ includeStatus: true });
+      if (currentPageRef.current !== 1) {
+        pendingPageFetchOptionsRef.current = { includeStatus: true };
+        pageChangeOriginRef.current = 'page-reset';
+        setCurrentPage(1);
+        return;
+      }
+      if (pageChangeOriginRef.current === 'page-reset') {
+        pageChangeOriginRef.current = null;
+      }
+      fetchDataRef.current({ includeStatus: true });
     }
-  }, [filters, pageSize, fetchData, preloadingComplete]);
+  }, [filters, pageSize, preloadingComplete]);
 
-  // Fetch on status filter changes (activeTab, selectedStatuses, showAllMode)
-  // Skip on initial fetch (these have default values)
+  // Fetch on status/scope changes (Mine vs Everyone, activeTab,
+  // selectedStatuses, showAllMode). Skip on initial fetch.
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
-      fetchData({ includeStatus: true });
+      if (currentPageRef.current !== 1) {
+        pendingPageFetchOptionsRef.current = { includeStatus: true };
+        pageChangeOriginRef.current = 'page-reset';
+        setCurrentPage(1);
+        return;
+      }
+      if (pageChangeOriginRef.current === 'page-reset') {
+        pageChangeOriginRef.current = null;
+      }
+      fetchDataRef.current({ includeStatus: true });
     }
-  }, [activeTab, selectedStatuses, showAllMode, fetchData, preloadingComplete]);
+  }, [userScope, activeTab, selectedStatuses, showAllMode, preloadingComplete]);
 
   // Fetch on sort config changes for server-side sorting
   // Skip on initial fetch (sortConfig has default value)
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
-      fetchData({ includeStatus: false });
+      if (currentPageRef.current !== 1) {
+        pendingPageFetchOptionsRef.current = { includeStatus: false };
+        pageChangeOriginRef.current = 'page-reset';
+        setCurrentPage(1);
+        return;
+      }
+      if (pageChangeOriginRef.current === 'page-reset') {
+        pageChangeOriginRef.current = null;
+      }
+      fetchDataRef.current({ includeStatus: false });
     }
-  }, [sortConfig, fetchData, preloadingComplete]);
+  }, [sortConfig, preloadingComplete]);
 
   // Use faster refresh when there are running batch jobs with incomplete progress
   const hasRunningBatches = React.useMemo(() => {
@@ -900,21 +940,6 @@ export function ManagedJobsTable({
     };
   }, [effectiveRefreshInterval, hasRunningBatches, preloadingComplete]);
 
-  // Reset to first page when activeTab, filters, pageSize, or sort changes.
-  // Guard with isInitialFetch so the page number read from the URL isn't
-  // overwritten during initialization (filter hydration from URL params
-  // triggers setFilters which would otherwise reset the page).
-  useEffect(() => {
-    if (isInitialFetch.current) return;
-    setCurrentPage(1);
-  }, [activeTab, filters, pageSize, sortConfig]);
-
-  // Reset status filter when activeTab changes
-  useEffect(() => {
-    setSelectedStatuses([]);
-    setShowAllMode(true); // Default to show all mode when changing tabs
-  }, [activeTab]);
-
   // Switch ownership scope (My Jobs vs All Jobs). Resets status narrowing
   // so a status chip selected in one scope (e.g. RUNNING in My Jobs)
   // doesn't carry over and silently empty the table under the new scope.
@@ -924,6 +949,7 @@ export function ManagedJobsTable({
       setUserScope(scope);
       setSelectedStatuses([]);
       setShowAllMode(true);
+      pageChangeOriginRef.current = 'page-reset';
       setCurrentPage(1);
     });
   }, []);
@@ -1333,16 +1359,19 @@ export function ManagedJobsTable({
     }
 
     // Reset to first page when changing status filters
+    pageChangeOriginRef.current = 'page-reset';
     setCurrentPage(1);
   };
 
   // Page navigation handlers
   const goToPreviousPage = () => {
+    pageChangeOriginRef.current = 'pagination';
     setCurrentPage((page) => Math.max(page - 1, 1));
   };
 
   const goToNextPage = () => {
     if (totalPages > 0 && currentPage < totalPages) {
+      pageChangeOriginRef.current = 'pagination';
       setCurrentPage((page) => page + 1);
     }
   };
@@ -1350,6 +1379,7 @@ export function ManagedJobsTable({
   const handlePageSizeChange = (e) => {
     const newSize = parseInt(e.target.value, 10);
     setPageSize(newSize);
+    pageChangeOriginRef.current = 'page-reset';
     setCurrentPage(1); // Reset to first page when changing page size
   };
 
@@ -2112,6 +2142,7 @@ export function ManagedJobsTable({
                     setActiveTab(tab);
                     setSelectedStatuses([]);
                     setShowAllMode(true);
+                    pageChangeOriginRef.current = 'page-reset';
                     setCurrentPage(1);
                   });
                 };
@@ -2480,6 +2511,7 @@ export function ManagedJobsTable({
                                   setUserScope('all');
                                   setSelectedStatuses([]);
                                   setShowAllMode(true);
+                                  pageChangeOriginRef.current = 'page-reset';
                                   setCurrentPage(1);
                                 });
                               }}
@@ -2535,7 +2567,10 @@ export function ManagedJobsTable({
         totalCount={totalCount}
         startIndex={startIndex}
         endIndex={startIndex + groupedJobs.size}
-        onPageChange={setCurrentPage}
+        onPageChange={(page) => {
+          pageChangeOriginRef.current = 'pagination';
+          setCurrentPage(page);
+        }}
         onPreviousPage={goToPreviousPage}
         onNextPage={goToNextPage}
         isPrevDisabled={
