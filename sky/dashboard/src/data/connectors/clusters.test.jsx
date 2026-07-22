@@ -276,6 +276,184 @@ describe('useClusterDetails request ownership', () => {
     ]);
   });
 
+  it('coalesces duplicate full refreshes and releases ownership after success', async () => {
+    const refreshedCluster = deferred();
+    const refreshedJobs = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
+      .mockImplementationOnce(() => refreshedCluster.promise)
+      .mockImplementationOnce(() => refreshedJobs.promise);
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+
+    let firstRefreshPromise;
+    let duplicateRefreshPromise;
+    act(() => {
+      firstRefreshPromise = result.current.refreshData();
+      duplicateRefreshPromise = result.current.refreshData();
+    });
+
+    expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters, [
+      { clusterNames: ['cluster-a'] },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      refreshedCluster.resolve([
+        { name: 'cluster-a', workspace: 'workspace-a', status: 'RUNNING' },
+      ]);
+      await refreshedCluster.promise;
+    });
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+      2,
+      getClusterJobs,
+      [{ clusterName: 'cluster-a', workspace: 'workspace-a' }]
+    );
+
+    await act(async () => {
+      refreshedJobs.resolve([{ id: 2, cluster: 'cluster-a' }]);
+      await Promise.all([firstRefreshPromise, duplicateRefreshPromise]);
+    });
+
+    expect(result.current.clusterData.status).toBe('RUNNING');
+    expect(result.current.clusterJobData).toEqual([
+      { id: 2, cluster: 'cluster-a' },
+    ]);
+    expect(result.current.clusterDetailsLoading).toBe(false);
+    expect(result.current.clusterJobsLoading).toBe(false);
+
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 3, cluster: 'cluster-a' }]);
+    let laterRefreshPromise;
+    act(() => {
+      laterRefreshPromise = result.current.refreshData();
+    });
+    expect(laterRefreshPromise).not.toBe(firstRefreshPromise);
+
+    await act(async () => {
+      await laterRefreshPromise;
+    });
+
+    expect(result.current.clusterJobData).toEqual([
+      { id: 3, cluster: 'cluster-a' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+  });
+
+  it('releases full refresh ownership after a failed refresh', async () => {
+    const failedCluster = deferred();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
+      .mockImplementationOnce(() => failedCluster.promise);
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+
+    let firstRefreshPromise;
+    let duplicateRefreshPromise;
+    act(() => {
+      firstRefreshPromise = result.current.refreshData();
+      duplicateRefreshPromise = result.current.refreshData();
+    });
+
+    expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      failedCluster.reject(new Error('refresh cluster failed'));
+      await Promise.all([firstRefreshPromise, duplicateRefreshPromise]);
+    });
+
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 4, cluster: 'cluster-a' }]);
+    let recoveredRefreshPromise;
+    act(() => {
+      recoveredRefreshPromise = result.current.refreshData();
+    });
+
+    expect(recoveredRefreshPromise).not.toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      await recoveredRefreshPromise;
+    });
+
+    expect(result.current.clusterJobData).toEqual([
+      { id: 4, cluster: 'cluster-a' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+  });
+
+  it('coalesces duplicate job-only refreshes and releases ownership after success', async () => {
+    const refreshedJobs = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
+      .mockImplementationOnce(() => refreshedJobs.promise);
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+
+    let firstRefreshPromise;
+    let duplicateRefreshPromise;
+    act(() => {
+      firstRefreshPromise = result.current.refreshClusterJobsOnly();
+      duplicateRefreshPromise = result.current.refreshClusterJobsOnly();
+    });
+
+    expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusterJobs, [
+      { clusterName: 'cluster-a', workspace: 'workspace-a' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      refreshedJobs.resolve([{ id: 2, cluster: 'cluster-a' }]);
+      await Promise.all([firstRefreshPromise, duplicateRefreshPromise]);
+    });
+
+    expect(result.current.clusterJobData).toEqual([
+      { id: 2, cluster: 'cluster-a' },
+    ]);
+    expect(result.current.clusterJobsLoading).toBe(false);
+
+    dashboardCache.get.mockResolvedValueOnce([{ id: 3, cluster: 'cluster-a' }]);
+    let laterRefreshPromise;
+    act(() => {
+      laterRefreshPromise = result.current.refreshClusterJobsOnly();
+    });
+    expect(laterRefreshPromise).not.toBe(firstRefreshPromise);
+
+    await act(async () => {
+      await laterRefreshPromise;
+    });
+
+    expect(result.current.clusterJobData).toEqual([
+      { id: 3, cluster: 'cluster-a' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+  });
+
   it('clears stale cluster state when a same-route refresh confirms the cluster is gone', async () => {
     const consoleError = jest
       .spyOn(console, 'error')
