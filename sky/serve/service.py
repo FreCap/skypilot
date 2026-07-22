@@ -7,6 +7,7 @@ controller child; it never starts an in-pod load balancer.
 import argparse
 from collections.abc import Callable
 import contextlib
+import dataclasses
 import json
 import multiprocessing
 import os
@@ -725,12 +726,7 @@ def _kill_process(process: multiprocessing.Process | None) -> None:
 _CHILD_FAILURES_BEFORE_FLAG = 3
 _CHILD_RESPAWN_BACKOFF_BASE_SECONDS = 5
 _CHILD_RESPAWN_BACKOFF_CAP_SECONDS = 300
-# A live controller can briefly starve its lightweight health endpoint while a
-# large-fleet autoscaler/prober operation holds the GIL.  Use elapsed time,
-# rather than a count coupled to the probe timeout and loop cadence, before
-# declaring that live process hung.  A process that has actually exited is
-# still respawned immediately via multiprocessing.Process.is_alive().
-_CHILD_UNRESPONSIVE_GRACE_SECONDS = 60
+_DEAD_CHILD_REAP_TIMEOUT_SECONDS = 1
 
 
 def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
@@ -741,11 +737,113 @@ def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
         _CHILD_RESPAWN_BACKOFF_CAP_SECONDS)
 
 
-def _live_child_unresponsive_too_long(unresponsive_since: float | None,
-                                      now: float) -> bool:
-    """Whether a still-alive child has exceeded its health grace period."""
-    return (unresponsive_since is not None and
-            now - unresponsive_since >= _CHILD_UNRESPONSIVE_GRACE_SECONDS)
+@dataclasses.dataclass
+class _ControllerSupervisionBackoff:
+    """Independent retry clocks for degraded status and real child death."""
+
+    degraded_retry_at: float = 0.0
+    respawn_failures: int = 0
+    respawn_retry_at: float = 0.0
+
+    def respawn_is_due(self, service_name: str,
+                       process: multiprocessing.Process | None,
+                       now: float) -> bool:
+        """Whether a confirmed-dead child is due for a respawn attempt."""
+        return (_controller_child_needs_respawn(service_name, process) and
+                now >= self.respawn_retry_at)
+
+    def record_respawn_failure(self, now: float) -> None:
+        self.respawn_failures += 1
+        self.respawn_retry_at = now + _child_respawn_backoff_seconds(
+            self.respawn_failures)
+
+    def record_respawn_success(self) -> None:
+        self.respawn_failures = 0
+        self.respawn_retry_at = 0.0
+
+    def degraded_retry_is_due(self, now: float) -> bool:
+        return now >= self.degraded_retry_at
+
+    def record_degraded_failure(self, now: float,
+                                consecutive_failures: int) -> None:
+        self.degraded_retry_at = now + _child_respawn_backoff_seconds(
+            consecutive_failures)
+
+    def record_healthy(self) -> None:
+        self.degraded_retry_at = 0.0
+
+
+def _controller_child_needs_respawn(
+        service_name: str, process: multiprocessing.Process | None) -> bool:
+    """Whether the controller child has authoritatively exited.
+
+    HTTP health is deliberately excluded. A live controller can starve its
+    lightweight endpoint for minutes while making progress on large-fleet
+    recovery. Treating a health timeout as process death can create two live
+    controller children with the same launch authority.
+    """
+    if process is None:
+        logger.error(
+            f'Controller supervision action=hold_missing_child_handle '
+            f'service={service_name} parent_pid={os.getpid()}: cannot prove '
+            'that a prior child is dead; refusing automatic respawn.')
+        return False
+    try:
+        return not process.is_alive()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Controller supervision action=hold_live_child '
+                     f'service={service_name} parent_pid={os.getpid()} '
+                     f'child_pid={_process_pid_or_none(process)} '
+                     f'liveness=unknown: {common_utils.format_exception(e)}.')
+        return False
+
+
+def _process_pid_or_none(process: multiprocessing.Process | None) -> int | None:
+    """Read a process PID without letting a closed handle break supervision."""
+    if process is None:
+        return None
+    try:
+        return process.pid
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _reap_dead_controller_for_respawn(
+        service_name: str, process: multiprocessing.Process | None) -> bool:
+    """Confirm and reap the prior child before a replacement is spawned.
+
+    Fails closed on liveness, join, or exit-code ambiguity. This helper must be
+    called before spec reload, port selection, process spawn, or DB mutation so
+    a direct caller cannot overlap two children under one parent.
+    """
+    if process is None:
+        logger.error(f'Controller supervision action=defer_dead_respawn '
+                     f'service={service_name} parent_pid={os.getpid()} '
+                     'child_pid=None: a concrete prior child is required.')
+        return False
+    child_pid = _process_pid_or_none(process)
+    try:
+        if process.is_alive():
+            logger.error(
+                f'Controller supervision action=refuse_live_respawn '
+                f'service={service_name} parent_pid={os.getpid()} '
+                f'child_pid={child_pid}: the prior child is still alive.')
+            return False
+        process.join(timeout=_DEAD_CHILD_REAP_TIMEOUT_SECONDS)
+        if process.is_alive() or process.exitcode is None:
+            logger.error(
+                f'Controller supervision action=defer_dead_respawn '
+                f'service={service_name} parent_pid={os.getpid()} '
+                f'child_pid={child_pid}: death/reaping is not confirmed.')
+            return False
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(
+            f'Controller supervision action=defer_dead_respawn '
+            f'service={service_name} parent_pid={os.getpid()} '
+            f'child_pid={child_pid}: failed to confirm/reap the prior child: '
+            f'{common_utils.format_exception(e)}.')
+        return False
+    return True
 
 
 def _controller_health_miss_is_graced(controller_responding: bool,
@@ -875,6 +973,9 @@ def _respawn_controller(
     The external LB continues serving its last routing view while the proxy
     reports 503 during the controller gap.
     """
+    if not _reap_dead_controller_for_respawn(service_name, dead_controller):
+        return None
+
     # Snapshot the latest COMMITTED version + spec so a respawn after
     # /update_service uses the current config.  The parent loop's captured
     # values may be stale after an in-place update, so absence or a DB error
@@ -938,11 +1039,14 @@ def _respawn_controller(
         _kill_process(new_controller)
         return None
 
-    # Controller is up and its new port is authoritative in the DB. Reap the
-    # dead child's leftovers; the proxy picks up the new tuple on the next sync.
-    _kill_process(dead_controller)
-    logger.info(f'Controller for {service_name} respawned on port '
-                f'{controller_port}; the stable proxy now routes to it.')
+    # Controller is up and its new port is authoritative in the DB. The prior
+    # child was confirmed dead and reaped before spawn, so no child overlap was
+    # possible. The proxy picks up the new tuple on the next sync.
+    logger.info(
+        f'Controller supervision action=respawn_dead_child '
+        f'service={service_name} parent_pid={os.getpid()} '
+        f'child_pid={new_controller.pid} controller_port={controller_port}; '
+        'the stable proxy now routes to it.')
     return new_controller, controller_port
 
 
@@ -1668,10 +1772,11 @@ def _start(service_name: str,
         external_lb_ensure_interval_seconds = 60
         own_pid = os.getpid()
         loop_count = 0
-        # Consecutive controller-respawn failures and the earliest time the
-        # next respawn may run.
+        # Degraded-status accounting and dead-child respawn attempts have
+        # independent backoff clocks. External-LB failures must never delay
+        # the first observation of a real controller-child death.
         child_failures = 0
-        child_retry_at = 0.0
+        supervision_backoff = _ControllerSupervisionBackoff()
         controller_unresponsive_since: float | None = None
         # Whether the DB status may need healing on the next confirmed-healthy
         # check. Starts True: an HA-recovered service may carry
@@ -1759,8 +1864,8 @@ def _start(service_name: str,
                 now = time.time()
                 healthy = False
                 controller_responding = False
-                controller_needs_respawn = (controller_process is None or
-                                            not controller_process.is_alive())
+                controller_needs_respawn = _controller_child_needs_respawn(
+                    service_name, controller_process)
                 if not controller_needs_respawn:
                     controller_responding = _controller_child_responding(
                         service_name, service_incarnation, pod_ip,
@@ -1770,11 +1875,26 @@ def _start(service_name: str,
                     else:
                         if controller_unresponsive_since is None:
                             controller_unresponsive_since = now
-                        controller_needs_respawn = (
-                            _live_child_unresponsive_too_long(
-                                controller_unresponsive_since, now))
+                        logger.warning(
+                            f'Controller supervision '
+                            f'action=hold_live_child service={service_name} '
+                            f'parent_pid={own_pid} '
+                            f'child_pid='
+                            f'{_process_pid_or_none(controller_process)} '
+                            f'is_alive=true http_healthy=false '
+                            f'health_miss_age_seconds='
+                            f'{now - controller_unresponsive_since:.1f} '
+                            f'external_lb_healthy={external_lb_healthy}.')
                 if controller_needs_respawn:
-                    if now >= child_retry_at:
+                    if supervision_backoff.respawn_is_due(
+                            service_name, controller_process, now):
+                        logger.warning(
+                            f'Controller supervision '
+                            f'action=respawn_dead_child '
+                            f'service={service_name} parent_pid={own_pid} '
+                            f'child_pid='
+                            f'{_process_pid_or_none(controller_process)} '
+                            f'is_alive=false.')
                         result = _respawn_controller(
                             service_name,
                             controller_host,
@@ -1785,27 +1905,26 @@ def _start(service_name: str,
                             enforce_launch_fence=enforce_launch_fence)
                         if result is not None:
                             controller_process, controller_port = result
+                            supervision_backoff.record_respawn_success()
                             controller_unresponsive_since = None
                             controller_responding = True
                             healthy = external_lb_healthy
                         else:
+                            supervision_backoff.record_respawn_failure(now)
                             child_failures += 1
-                            child_retry_at = (
-                                now +
-                                _child_respawn_backoff_seconds(child_failures))
                 else:
                     healthy = controller_responding and external_lb_healthy
                     health_miss_graced = _controller_health_miss_is_graced(
                         controller_responding, controller_needs_respawn,
                         external_lb_healthy)
                     if (not healthy and not health_miss_graced and
-                            now >= child_retry_at):
+                            supervision_backoff.degraded_retry_is_due(now)):
                         child_failures += 1
-                        child_retry_at = now + _child_respawn_backoff_seconds(
-                            child_failures)
+                        supervision_backoff.record_degraded_failure(
+                            now, child_failures)
                 if healthy:
                     child_failures = 0
-                    child_retry_at = 0.0
+                    supervision_backoff.record_healthy()
                     if needs_status_heal and _heal_service_degraded(
                             service_name, service_incarnation, own_pid, pod_ip):
                         # Only stop retrying once the heal is confirmed; a

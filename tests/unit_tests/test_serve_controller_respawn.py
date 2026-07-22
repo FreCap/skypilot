@@ -15,14 +15,29 @@ _DEFAULT_SNAPSHOT = object()
 
 
 class _FakeProc:
+    """Minimal controllable multiprocessing.Process test double."""
 
-    def __init__(self, alive: bool, pid: int = 100):
+    def __init__(self,
+                 alive: bool,
+                 pid: int = 100,
+                 join_error: Exception | None = None,
+                 events=None):
         self._alive = alive
         self.pid = pid
         self.exitcode = None if alive else 1
+        self.join_error = join_error
+        self.join_calls = []
+        self.events = events
 
     def is_alive(self) -> bool:
         return self._alive
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+        if self.events is not None:
+            self.events.append('join')
+        if self.join_error is not None:
+            raise self.join_error
 
 
 class _DummyLock:
@@ -46,7 +61,8 @@ def _setup(monkeypatch,
            new_controller,
            latest_snapshot=_DEFAULT_SNAPSHOT,
            killed=None,
-           owns_row=True):
+           owns_row=True,
+           events=None):
     monkeypatch.setattr(service.filelock, 'FileLock', _DummyLock)
     monkeypatch.setattr(common_utils, 'find_free_port', lambda unused: _PORT)
     monkeypatch.setattr(serve_state, 'set_service_controller_port_if_owner',
@@ -60,6 +76,8 @@ def _setup(monkeypatch,
 
     def _spawn_controller(unused_name, spec, version, unused_host, port,
                           service_hash, controller_ip, **kwargs):
+        if events is not None:
+            events.append('spawn')
         spawn_calls.append({
             'spec': spec,
             'version': version,
@@ -85,11 +103,13 @@ def _setup(monkeypatch,
 
 
 def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
-    dead = _FakeProc(False, 111)
+    events = []
+    dead = _FakeProc(False, 111, events=events)
     replacement = _FakeProc(True, 333)
     spawn_calls, killed = _setup(monkeypatch,
                                  new_controller=replacement,
-                                 killed=[])
+                                 killed=[],
+                                 events=events)
 
     result = service._respawn_controller('svc',
                                          '127.0.0.1',
@@ -101,7 +121,9 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
     assert spawn_calls[0]['version'] == 1
     assert spawn_calls[0]['port'] == _PORT
     assert spawn_calls[0]['service_hash'] == _HASH
-    assert 111 in killed
+    assert dead.join_calls == [service._DEAD_CHILD_REAP_TIMEOUT_SECONDS]
+    assert events == ['join', 'spawn']
+    assert 111 not in killed
     # There is intentionally no in-pod LB process to restart: the stable API
     # proxy resolves the newly published port on its next request.
 
@@ -191,9 +213,93 @@ def test_respawn_failure_is_contained(monkeypatch):
                                          _FakeProc(False, 111),
                                          service_hash=_HASH)
     assert result is None
-    # The previous dead child is reaped only after a replacement is published;
-    # a failed attempt leaves it for a later retry.
+    # The previous child is joined before any replacement attempt. SIGKILL is
+    # reserved for a replacement that fails or loses ownership.
     assert 111 not in killed
+
+
+def test_respawn_refuses_live_child_before_any_side_effect(monkeypatch):
+    live = _FakeProc(True, 111)
+    spawn_calls, killed = _setup(monkeypatch,
+                                 new_controller=_FakeProc(True, 333),
+                                 killed=[])
+    snapshot_calls = []
+    monkeypatch.setattr(
+        serve_state, 'get_latest_committed_version_spec',
+        lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         live,
+                                         service_hash=_HASH)
+
+    assert result is None
+    assert not live.join_calls
+    assert not snapshot_calls
+    assert not spawn_calls
+    assert not killed
+
+
+def test_respawn_refuses_missing_child_handle_before_any_side_effect(
+        monkeypatch):
+    spawn_calls, killed = _setup(monkeypatch,
+                                 new_controller=_FakeProc(True, 333),
+                                 killed=[])
+    snapshot_calls = []
+    monkeypatch.setattr(
+        serve_state, 'get_latest_committed_version_spec',
+        lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         None,
+                                         service_hash=_HASH)
+
+    assert result is None
+    assert not snapshot_calls
+    assert not spawn_calls
+    assert not killed
+
+
+def test_lb_backoff_does_not_delay_first_dead_child_respawn(monkeypatch):
+    now = 100.0
+    backoff = service._ControllerSupervisionBackoff(degraded_retry_at=now + 300)
+    dead = _FakeProc(False, 111)
+    replacement = _FakeProc(True, 333)
+    spawn_calls, _ = _setup(monkeypatch, new_controller=replacement)
+
+    result = None
+    if backoff.respawn_is_due('svc', dead, now):
+        result = service._respawn_controller('svc',
+                                             '127.0.0.1',
+                                             dead,
+                                             service_hash=_HASH)
+
+    assert backoff.degraded_retry_at > now
+    assert result == (replacement, _PORT)
+    assert len(spawn_calls) == 1
+
+
+def test_respawn_join_failure_is_fail_closed(monkeypatch):
+    dead = _FakeProc(False, 111, join_error=RuntimeError('cannot reap'))
+    spawn_calls, killed = _setup(monkeypatch,
+                                 new_controller=_FakeProc(True, 333),
+                                 killed=[])
+    snapshot_calls = []
+    monkeypatch.setattr(
+        serve_state, 'get_latest_committed_version_spec',
+        lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         dead,
+                                         service_hash=_HASH)
+
+    assert result is None
+    assert dead.join_calls == [service._DEAD_CHILD_REAP_TIMEOUT_SECONDS]
+    assert not snapshot_calls
+    assert not spawn_calls
+    assert not killed
 
 
 def test_respawn_dead_replacement_is_reaped(monkeypatch):

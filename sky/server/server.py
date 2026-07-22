@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import resource
+import selectors
 import shutil
 import socket
 import threading
@@ -2044,17 +2045,56 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
         logger.debug(f'Received PTY master fd {master_fd} for session '
                      f'{session_id}')
 
+        # PTYs are not portable asyncio pipes under uvloop. Keep their blocking
+        # I/O in worker threads, but poll with a stop signal so every operation
+        # is bounded and can be joined before the descriptor is closed.
+        stop_pty_io = threading.Event()
+        pty_io_futures = set()
+
+        def read_from_pty():
+            with selectors.DefaultSelector() as selector:
+                selector.register(master_fd, selectors.EVENT_READ)
+                while not stop_pty_io.is_set():
+                    if selector.select(timeout=0.1):
+                        return os.read(master_fd, 4096)
+            return None
+
+        def write_to_pty(data: bytes) -> None:
+            pending = memoryview(data)
+            with selectors.DefaultSelector() as selector:
+                selector.register(master_fd, selectors.EVENT_WRITE)
+                while pending and not stop_pty_io.is_set():
+                    if not selector.select(timeout=0.1):
+                        continue
+                    written = os.write(master_fd, pending[:4096])
+                    if written == 0:
+                        raise OSError('PTY write returned zero bytes')
+                    pending = pending[written:]
+
+        async def run_pty_io(func, *args):
+            future = loop.run_in_executor(None, func, *args)
+            pty_io_futures.add(future)
+            cancelled = False
+            try:
+                # Preserve the underlying operation when its forwarding task
+                # is cancelled so the handler can join it before closing the
+                # shared PTY descriptor.
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                if not cancelled:
+                    pty_io_futures.discard(future)
+
         # Bridge PTY ↔ websocket bidirectionally
         async def websocket_to_pty():
             """Forward websocket messages to PTY."""
             try:
                 async for message in websocket.iter_bytes():
-                    await loop.run_in_executor(None, os.write, master_fd,
-                                               message)
+                    await run_pty_io(write_to_pty, message)
             except fastapi.WebSocketDisconnect:
                 logger.debug(f'WebSocket disconnected for session {session_id}')
-            except asyncio.CancelledError:
-                pass
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Error in websocket_to_pty: {e}')
 
@@ -2070,18 +2110,17 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
                 while True:
                     data = b''
                     try:
-                        data = await loop.run_in_executor(
-                            None, os.read, master_fd, 4096)
+                        data = await run_pty_io(read_from_pty)
                     except OSError as e:
                         logger.error(f'PTY read error (likely closed): {e}')
                         break
 
+                    if data is None:
+                        break
                     if not data:
                         break
 
                     await websocket.send_bytes(data)
-            except asyncio.CancelledError:
-                pass
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Error in pty_to_websocket: {e}')
             finally:
@@ -2090,7 +2129,23 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
                 except Exception:  # pylint: disable=broad-except
                     pass
 
-        await asyncio.gather(websocket_to_pty(), pty_to_websocket())
+        proxy_tasks = (asyncio.create_task(websocket_to_pty()),
+                       asyncio.create_task(pty_to_websocket()))
+        try:
+            done, _ = await asyncio.wait(proxy_tasks,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            # Signal worker I/O before the first cleanup await so even repeated
+            # parent cancellation cannot leave an executor thread blocked.
+            stop_pty_io.set()
+            for task in proxy_tasks:
+                task.cancel()
+            await asyncio.gather(*proxy_tasks, return_exceptions=True)
+            if pty_io_futures:
+                await asyncio.gather(*tuple(pty_io_futures),
+                                     return_exceptions=True)
 
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Error in SSH interactive auth websocket: {e}')
