@@ -73,7 +73,7 @@ async def test_poll_auth_session_does_not_block_event_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_poll_auth_session_cancellation_restores_consumed_token(
+async def test_poll_auth_session_repeated_cancellation_restores_consumed_token(
         monkeypatch, tmp_path):
     engine = sqlalchemy.create_engine(
         f'sqlite:///{tmp_path / "auth-sessions.db"}',
@@ -88,7 +88,9 @@ async def test_poll_auth_session_cancellation_restores_consumed_token(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    restored = threading.Event()
     original_poll_session = store.poll_session
+    original_restore_session = store.restore_session
 
     def blocking_poll_session(verifier: str) -> str | None:
         started.set()
@@ -98,22 +100,26 @@ async def test_poll_auth_session_cancellation_restores_consumed_token(
         finally:
             finished.set()
 
+    def tracking_restore_session(challenge: str, token: str) -> None:
+        original_restore_session(challenge, token)
+        restored.set()
+
     monkeypatch.setattr(store, 'poll_session', blocking_poll_session)
+    monkeypatch.setattr(store, 'restore_session', tracking_restore_session)
     monkeypatch.setattr(server.auth_sessions, 'auth_session_store', store)
     poll_task = asyncio.create_task(server.poll_auth_token(code_verifier))
     assert await asyncio.to_thread(started.wait, 1)
 
     poll_task.cancel()
+    await asyncio.sleep(0)
+    assert not poll_task.done()
+    poll_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await poll_task
     try:
-        await asyncio.sleep(0)
-        assert not poll_task.done()
-    finally:
         release.set()
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await poll_task
-
         assert await asyncio.to_thread(finished.wait, 1)
+        assert await asyncio.to_thread(restored.wait, 1)
         monkeypatch.setattr(store, 'poll_session', original_poll_session)
         assert await asyncio.to_thread(store.poll_session,
                                        code_verifier) == 'test-token'
