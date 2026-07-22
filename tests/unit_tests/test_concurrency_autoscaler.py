@@ -1955,6 +1955,8 @@ class TestLogicalScalingWaves(unittest.TestCase):
                                'monotonic',
                                return_value=100.0) as clock:
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            started_at = autoscaler._downscale_started_at
+            self.assertIsNotNone(started_at)
             _report(autoscaler,
                     in_flight={replica.replica_id: 0 for replica in replicas},
                     queue_depth=1)
@@ -1963,24 +1965,23 @@ class TestLogicalScalingWaves(unittest.TestCase):
 
             self.assertEqual(autoscaler.target_num_replicas, 100)
             self.assertEqual(autoscaler._downscale_veto_reason, 'queue_depth')
-            self.assertIsNone(autoscaler._downscale_started_at)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+            self.assertEqual(autoscaler._downscale_elapsed_seconds(), 300.0)
+            self.assertEqual(autoscaler.info()['downscale_veto_budget'], 2)
 
             # The unchanged nonzero queue is demand in the target, but it is
-            # not another pressure delta and cannot veto the next quiet window.
+            # not another pressure delta. The already elapsed proof accepts
+            # the next wave without waiting through another 300-second window.
             _report(autoscaler,
                     in_flight={replica.replica_id: 0 for replica in replicas},
                     queue_depth=1)
             clock.return_value = 400.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-            clock.return_value = 680.0
-            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler.target_num_replicas, 50)
 
     def test_trickle_pressure_cannot_starve_downscale_forever(self):
-        """Regression: a tiny positive delta every quiet window must not
-        restart the downscale delay indefinitely (boltz-l4-fleet pinned at
-        144 replicas while the demand target was 3-8)."""
+        """Regression: trickle deltas add at most two decision ticks."""
         autoscaler = self._ramped_autoscaler(
             downscale_delay_seconds=300,
             max_scale_down_rate_percentage=50,
@@ -1994,29 +1995,30 @@ class TestLogicalScalingWaves(unittest.TestCase):
         with mock.patch.object(autoscalers.time,
                                'monotonic',
                                return_value=100.0) as clock:
-            # Window 1: timer starts, a trickle delta latches, veto #1.
+            # The full delay elapses once, then a trickle delta defers tick 1.
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            started_at = autoscaler._downscale_started_at
+            self.assertIsNotNone(started_at)
             _report(autoscaler, in_flight=idle, queue_depth=1)
             clock.return_value = 380.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, 100)
             self.assertEqual(autoscaler._downscale_veto_streak, 1)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+            self.assertEqual(autoscaler._downscale_elapsed_seconds(), 300.0)
 
-            # Window 2: another tiny delta, veto #2 (still within the cap).
-            clock.return_value = 400.0
-            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            # A fresh delta defers tick 2 without restarting the delay.
             _report(autoscaler, in_flight=idle, queue_depth=2)
-            clock.return_value = 700.0
+            clock.return_value = 400.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, 100)
             self.assertEqual(autoscaler._downscale_veto_streak, 2)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+            self.assertEqual(autoscaler._downscale_elapsed_seconds(), 320.0)
 
-            # Window 3: yet another delta, but the cap is exhausted: the
-            # elapsed window must adopt the downscale.
-            clock.return_value = 720.0
-            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            # A third fresh delta cannot defer the accepted wave.
             _report(autoscaler, in_flight=idle, queue_depth=3)
-            clock.return_value = 1020.0
+            clock.return_value = 420.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler.target_num_replicas, 50)
@@ -2039,22 +2041,20 @@ class TestLogicalScalingWaves(unittest.TestCase):
                                    autoscalers.time,
                                    'time',
                                    return_value=1000.0):
-            # Exhaust the veto budget with two trickle windows.
+            # Exhaust the veto budget with two post-delay decision ticks.
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             _report(autoscaler, in_flight=idle, queue_depth=1)
             clock.return_value = 380.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
-            clock.return_value = 400.0
-            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             _report(autoscaler, in_flight=idle, queue_depth=2)
-            clock.return_value = 700.0
+            clock.return_value = 400.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler._downscale_veto_streak, 2)
 
             # Genuine burst: raw target rises above the adopted target and
             # ends the downscale episode, refreshing the budget.
             _report(autoscaler, in_flight=idle, queue_depth=500)
-            clock.return_value = 720.0
+            clock.return_value = 420.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertGreater(autoscaler.target_num_replicas, 100)
             self.assertEqual(autoscaler._downscale_veto_streak, 0)
@@ -2063,13 +2063,46 @@ class TestLogicalScalingWaves(unittest.TestCase):
             # with a latched delta must hold the fleet again.
             adopted = autoscaler.target_num_replicas
             _report(autoscaler, in_flight=idle)
-            clock.return_value = 740.0
+            clock.return_value = 440.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             _report(autoscaler, in_flight=idle, queue_depth=1)
-            clock.return_value = 1040.0
+            clock.return_value = 720.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, adopted)
             self.assertEqual(autoscaler._downscale_veto_streak, 1)
+
+    def test_pressure_reports_coalesce_into_one_tick_deferral(self):
+        autoscaler = self._ramped_autoscaler(
+            downscale_delay_seconds=300,
+            max_scale_down_rate_percentage=50,
+        )
+        replicas = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+        idle = {replica.replica_id: 0 for replica in replicas}
+        _report(autoscaler, in_flight=idle)
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0) as clock:
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            started_at = autoscaler._downscale_started_at
+            _report(autoscaler, in_flight=idle, queue_depth=1)
+            _report(autoscaler, in_flight=idle, queue_depth=2)
+            _report(autoscaler, in_flight=idle, queue_depth=3)
+
+            clock.return_value = 380.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+            self.assertEqual(autoscaler.target_num_replicas, 100)
+            self.assertEqual(autoscaler._downscale_veto_streak, 1)
+            self.assertEqual(autoscaler._downscale_started_at, started_at)
+
+            # Three positive reports coalesced into the consumed boolean
+            # latch. Without another report delta, the next tick downscales.
+            clock.return_value = 400.0
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 50)
 
     def test_stale_arrival_floor_obeys_scale_up_wave(self):
         autoscaler = self._ramped_autoscaler()

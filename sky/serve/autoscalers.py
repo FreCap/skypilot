@@ -32,9 +32,9 @@ _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 # Genuine rising pressure raises the raw target and takes the upscale
 # branch, which ends the episode on its own; the veto only needs to
 # protect against downscaling at the exact moment pressure begins.
-# Bounding it at 2 consecutive full hysteresis windows (worst case
-# ~2x downscale_delay_seconds extra hold) preserves that protection
-# while restoring downscale liveness under trickle traffic.
+# Bounding it at 2 consecutive decision ticks preserves that protection
+# while restoring downscale liveness under trickle traffic. The veto does
+# not restart the already elapsed downscale delay.
 _MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
 
 
@@ -3438,8 +3438,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # (a run of recomputes whose raw target stays below the adopted
         # target). Bounded by _MAX_CONSECUTIVE_DOWNSCALE_VETOES: under
         # trickle traffic a tiny positive delta re-latches pressure nearly
-        # every quiet window, and an unbounded veto would restart the
-        # hysteresis timer forever, starving downscale indefinitely.
+        # every decision tick, and an unbounded veto would defer downscale
+        # forever even after the hysteresis timer elapsed.
         self._downscale_veto_streak: int = 0
         self._pending_retention_floor: int | None = None
         self._pending_capacity_at_adoption: int = 0
@@ -4402,8 +4402,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return False
         if self._downscale_veto_streak >= _MAX_CONSECUTIVE_DOWNSCALE_VETOES:
             # The latch is magnitude-blind: under trickle traffic a tiny
-            # positive delta re-arms it nearly every quiet window, and an
-            # unbounded veto would restart the hysteresis timer forever.
+            # positive delta re-arms it nearly every decision tick, and an
+            # unbounded veto would defer downscale forever.
             # After the cap, let the downscale proceed; a genuine burst
             # raises the raw target and exits the downscale episode via
             # the upscale branch anyway.
@@ -4416,7 +4416,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._downscale_veto_reason = ','.join(self._pressure_reasons)[:128]
         self._pressure_latched = False
         self._pressure_reasons = ()
-        self._reset_downscale_hysteresis()
         return True
 
     def _outstanding_work(
@@ -5824,6 +5823,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'downscale_delay_seconds': self.downscale_delay_seconds,
             'downscale_veto_reason': self._downscale_veto_reason,
             'downscale_veto_streak': self._downscale_veto_streak,
+            'downscale_veto_budget': _MAX_CONSECUTIVE_DOWNSCALE_VETOES,
             'scale_down_allowance': self._last_scale_down_allowance,
             'pending_scale_down_allowance': self._last_pending_allowance,
             'pending_retention_floor': self._pending_retention_floor,
