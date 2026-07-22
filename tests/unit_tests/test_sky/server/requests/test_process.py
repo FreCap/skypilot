@@ -287,6 +287,18 @@ def test_disposable_executor_returns_exception_object():
         executor.shutdown()
 
 
+def test_disposable_executor_marks_started_future_running():
+    """A started process must not expose a cancellable pending future."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(dummy_task, sleep_time=1)
+        assert future.running()
+        assert not future.cancel()
+        assert future.result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
 def test_disposable_executor_contains_terminating_exception():
     """A child BaseException must not terminate the future's caller."""
     executor = DisposableExecutor(max_workers=1)
