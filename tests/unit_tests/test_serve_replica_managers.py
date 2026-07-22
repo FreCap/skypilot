@@ -218,9 +218,11 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr._spot_placer = None
     mgr._pending_version = None
     mgr._uses_logical_replicas = False
+    mgr._logical_exact_accelerator_shapes = {}
     mgr._logical_reconcile_snapshot = None
     mgr._logical_target = None
     mgr._logical_state_lock = threading.RLock()
+    mgr._replica_to_logical_launch_fence = thread_utils.ThreadSafeDict()
     mgr._logical_controller_epoch = 'test-controller-epoch'
     mgr._wait_for_idle_trackers = {}
     mgr._recovering_logical_retirement_ids = set()
@@ -756,6 +758,15 @@ run: echo hi
             tmp_path, [None], pre_launch_guard=lambda: False)
         assert raised is not None
         assert 'ownership was lost' in str(raised)
+        mock_sdk.launch.assert_not_called()
+        mock_terminate.assert_not_called()
+
+    def test_superseded_logical_guard_rejects_first_cloud_mutation(
+            self, tmp_path):
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None], cloud_launch_guard=lambda: False)
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
@@ -2095,6 +2106,62 @@ class TestLaunchOwnershipFence:
             [mock.call(location, selected_at=100.0)] * 3)
         assert persist.call_count == 3
 
+    def test_fresh_exact_target_supersedes_excess_before_thread_start(
+            self, tmp_path):
+        mgr, infos = self._queued_manager([1, 2])
+        mgr._uses_logical_replicas = True
+        mgr._logical_exact_accelerator_shapes = {'L4': 1}
+        fence = (1, 7, 1, (('L4', 1),), (('L4', 1),))
+        mgr._logical_target = fence
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        for replica_id, info in infos.items():
+            info.replica_id = replica_id
+            info.version = 1
+            info.reserved_fill = False
+            info.unknown_capacity_replacement = False
+            info.cost_rebalance_for_replica_id = None
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(mgr,
+                               '_logical_pending_launch_admission',
+                               return_value=(True, fence, {1})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_provision',
+                               return_value=True), \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_persist_replica'):
+            mgr._refresh_thread_pool()
+
+        mgr._launch_thread_pool[1].start.assert_called_once_with()
+        mgr._launch_thread_pool[2].start.assert_not_called()
+        terminate.assert_called_once_with(2,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          in_flight_drain_cap_seconds=0)
+        assert mgr._replica_to_logical_launch_fence[1] == fence
+
     def test_consumed_retry_is_admitted_once(self, tmp_path):
         mgr, infos = self._queued_manager([1])
         launch_thread = mgr._launch_thread_pool[1]
@@ -2909,6 +2976,197 @@ class TestScaleUpBatch:
         assert mgr._pending_version == 7
         mgr.clear_pending_version(7)
         assert mgr._pending_version is None
+
+
+class TestLogicalPendingLaunchAdmission:
+
+    @staticmethod
+    def _info(replica_id,
+              card,
+              status,
+              *,
+              zero_cost=False,
+              reserved_fill=False,
+              created_at=None):
+        info = replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'svc-{replica_id}',
+            replica_port='8080',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                card: 1
+            }},
+            planned_capacity=1)
+        info.created_at = (float(replica_id)
+                           if created_at is None else created_at)
+        info.is_zero_cost = zero_cost
+        info.reserved_fill = reserved_fill
+        if status == replica_managers.serve_state.ReplicaStatus.READY:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            info.status_property.service_ready_now = True
+            info.status_property.first_ready_time = 1.0
+        elif status == replica_managers.serve_state.ReplicaStatus.PROVISIONING:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.RUNNING)
+        else:
+            assert status == replica_managers.serve_state.ReplicaStatus.PENDING
+        assert info.status == status
+        return info
+
+    @staticmethod
+    def _manager(target_by_card):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_exact_accelerator_shapes = {
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        generation = 7
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=generation,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        shapes = (('L4', 1), ('A100', 1), ('A100-80GB', 1))
+        target = sum(target_by_card.values())
+        mgr._logical_target = (1, generation, target,
+                               tuple(target_by_card.items()), shapes)
+        return mgr
+
+    def test_recovered_paid_a100_wave_is_excluded_when_ready_covers_target(
+            self):
+        mgr = self._manager({'L4': 3, 'A100': 2})
+        infos = [
+            self._info(1, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.READY),
+            self._info(2, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.READY),
+            self._info(3, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.READY),
+            self._info(4, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(5, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(6,
+                       'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING,
+                       zero_cost=True,
+                       reserved_fill=True),
+            self._info(7, 'L4',
+                       replica_managers.serve_state.ReplicaStatus.READY),
+            self._info(8, 'L4',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(9, 'L4',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+        ]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos):
+            applicable, fence, authorized = (
+                mgr._logical_pending_launch_admission())
+
+        assert applicable
+        assert fence == mgr._logical_target
+        assert authorized == {6, 8, 9}
+
+    def test_zero_cost_demand_pending_wins_last_target_slot(self):
+        mgr = self._manager({'A100': 4})
+        infos = [
+            self._info(replica_id, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.READY)
+            for replica_id in (1, 2, 3)
+        ]
+        infos.extend([
+            self._info(4,
+                       'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING,
+                       created_at=1.0),
+            self._info(5,
+                       'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING,
+                       zero_cost=True,
+                       created_at=2.0),
+        ])
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos):
+            _, _, authorized = mgr._logical_pending_launch_admission()
+
+        assert authorized == {5}
+
+    def test_a100_variants_have_independent_pending_budgets(self):
+        mgr = self._manager({'A100': 1, 'A100-80GB': 1})
+        infos = [
+            self._info(1, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.READY),
+            self._info(2, 'A100',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+            self._info(3, 'A100-80GB',
+                       replica_managers.serve_state.ReplicaStatus.PENDING),
+        ]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos):
+            _, _, authorized = mgr._logical_pending_launch_admission()
+
+        assert authorized == {3}
+
+    def test_boolean_rebalance_id_cannot_bypass_pending_budget(self):
+        mgr = self._manager({'A100': 1})
+        ready = self._info(1, 'A100',
+                           replica_managers.serve_state.ReplicaStatus.READY)
+        pending = self._info(2, 'A100',
+                             replica_managers.serve_state.ReplicaStatus.PENDING)
+        pending.cost_rebalance_for_replica_id = True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[ready, pending]):
+            _, _, authorized = mgr._logical_pending_launch_admission()
+
+        assert authorized == set()
+
+    def test_incomplete_exact_target_defers_without_reading_fleet(self):
+        mgr = self._manager({'A100': 1})
+        mgr._logical_target = None
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos') as get_infos:
+            applicable, fence, authorized = (
+                mgr._logical_pending_launch_admission())
+
+        assert applicable
+        assert fence is None
+        assert authorized == set()
+        get_infos.assert_not_called()
+
+    def test_final_cloud_guard_rechecks_newly_ready_capacity(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        mgr._replica_to_logical_launch_fence[1] = mgr._logical_target
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert mgr._queued_logical_launch_fence_holds(1)
+
+        ready = self._info(2, 'A100',
+                           replica_managers.serve_state.ReplicaStatus.READY)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate, ready]):
+            assert not mgr._queued_logical_launch_fence_holds(1)
 
 
 class TestLogicalCapacityPlanning:
@@ -7225,6 +7483,84 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
         assert persisted[1].reserved_fill is True
         assert persisted[2].reserved_fill is False
+
+    def test_provisioning_redrive_reenters_current_exact_card_budget(self):
+        """Recovery cannot turn stale PROVISIONING intent into a new launch."""
+        mgr = _make_manager()
+        mgr.yaml_content = 'dummy: yaml'
+        mgr.latest_version = 1
+        mgr._uses_logical_replicas = True
+        mgr._logical_exact_accelerator_shapes = {'A100': 1}
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = {}
+        mgr._replica_to_launch_cancelled = {}
+        interrupted = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        interrupted.resources_override = {'accelerators': {'A100': 1}}
+        interrupted.reserved_fill = False
+        interrupted.is_zero_cost = False
+        interrupted.unknown_capacity_replacement = False
+        interrupted.cost_rebalance_for_replica_id = None
+        persisted: dict[int, replica_managers.ReplicaInfo] = {}
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=False), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils.'
+                 'generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos',
+                 return_value=[interrupted]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'add_or_update_replica',
+                 side_effect=lambda _svc, rid, info: persisted.__setitem__(
+                     rid, info)), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            mgr._recover_replica_operations()
+
+        recovered = persisted[1]
+        assert recovered.status == (
+            replica_managers.serve_state.ReplicaStatus.PENDING)
+
+        ready = replica_managers.ReplicaInfo(
+            replica_id=2,
+            cluster_name='svc-2',
+            replica_port='8080',
+            is_spot=False,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'A100': 1
+            }})
+        ready.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        ready.status_property.service_ready_now = True
+        ready.status_property.first_ready_time = 1.0
+        assert ready.status == replica_managers.serve_state.ReplicaStatus.READY
+
+        fence = (1, 8, 1, (('A100', 1),), (('A100', 1),))
+        mgr._logical_target = fence
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=8,
+                observed_slots_by_replica_id={2: 1},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[ready, recovered]):
+            applicable, target_fence, authorized = (
+                mgr._logical_pending_launch_admission())
+
+        assert applicable
+        assert target_fence == fence
+        assert authorized == set()
 
     def test_reentry_with_enqueued_threads_is_tolerated(self):
         mgr = _make_manager(next_replica_id=1)

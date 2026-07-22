@@ -2073,14 +2073,95 @@ class TestCancelSignalScan:
         manager.job_tasks[7] = task
         (signal_dir / '7').touch()
 
-        with patch('sky.jobs.controller.managed_job_state.get_status_async',
-                   new_callable=AsyncMock) as status_mock:
+        with patch(
+                'sky.jobs.controller.managed_job_state.get_status_async',
+                new_callable=AsyncMock) as point_status_mock, patch(
+                    'sky.jobs.controller.managed_job_state.get_statuses_async',
+                    new_callable=AsyncMock) as batch_status_mock:
             await manager._process_cancel_signals()
 
         task.cancel.assert_called_once()
-        status_mock.assert_not_awaited()
+        point_status_mock.assert_not_awaited()
+        batch_status_mock.assert_not_awaited()
         assert not (signal_dir / '7').exists()
         assert manager._cancel_info[7] == (False, None)
+
+    @pytest.mark.asyncio
+    async def test_owned_cancel_precedes_blocked_orphan_status_read(
+            self, signal_dir):
+        """A stale orphan backlog cannot delay an owned cancellation."""
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        (signal_dir / '1').touch()
+        (signal_dir / '7').touch()
+
+        status_read_started = asyncio.Event()
+        release_status_read = asyncio.Event()
+
+        async def blocked_point_status(_job_id):
+            status_read_started.set()
+            await release_status_read.wait()
+            return managed_job_state.ManagedJobStatus.RUNNING
+
+        async def blocked_batch_status(job_ids):
+            status_read_started.set()
+            await release_status_read.wait()
+            return {
+                job_id: managed_job_state.ManagedJobStatus.RUNNING
+                for job_id in job_ids
+            }
+
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '7']), patch.object(
+                       managed_job_state,
+                       'get_status_async',
+                       side_effect=blocked_point_status), patch.object(
+                           managed_job_state,
+                           'get_statuses_async',
+                           side_effect=blocked_batch_status,
+                           create=True):
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(status_read_started.wait(), timeout=2)
+            try:
+                task.cancel.assert_called_once_with()
+                assert not (signal_dir / '7').exists()
+            finally:
+                release_status_read.set()
+                await scan
+
+    @pytest.mark.asyncio
+    async def test_orphan_statuses_use_one_batch_snapshot(self, signal_dir):
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        for job_id in (5, 6, 7, 8):
+            (signal_dir / str(job_id)).touch()
+
+        batch_status = AsyncMock(
+            return_value={
+                5: managed_job_state.ManagedJobStatus.SUCCEEDED,
+                6: None,
+                8: managed_job_state.ManagedJobStatus.RUNNING,
+            })
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['5', '6', '8', '7']), patch.object(
+                       managed_job_state,
+                       'get_status_async',
+                       new_callable=AsyncMock,
+                       side_effect=AssertionError('point status read')), \
+                patch.object(managed_job_state,
+                             'get_statuses_async',
+                             batch_status,
+                             create=True):
+            await manager._process_cancel_signals()
+
+        task.cancel.assert_called_once_with()
+        batch_status.assert_awaited_once_with([5, 6, 8])
+        assert not (signal_dir / '5').exists()
+        assert not (signal_dir / '6').exists()
+        assert not (signal_dir / '7').exists()
+        assert (signal_dir / '8').exists()
 
     @pytest.mark.asyncio
     async def test_signal_lock_contention_does_not_block_event_loop(
@@ -2145,9 +2226,10 @@ class TestCancelSignalScan:
         manager._cancel_info[5] = (False, None)
         (signal_dir / '5').touch()
 
-        with patch('sky.jobs.controller.managed_job_state.get_status_async',
-                   new_callable=AsyncMock,
-                   return_value=managed_job_state.ManagedJobStatus.SUCCEEDED):
+        with patch(
+                'sky.jobs.controller.managed_job_state.get_statuses_async',
+                new_callable=AsyncMock,
+                return_value={5: managed_job_state.ManagedJobStatus.SUCCEEDED}):
             await manager._process_cancel_signals()
 
         assert not (signal_dir / '5').exists()
@@ -2158,9 +2240,9 @@ class TestCancelSignalScan:
         manager = self._make_manager()
         (signal_dir / '6').touch()
 
-        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+        with patch('sky.jobs.controller.managed_job_state.get_statuses_async',
                    new_callable=AsyncMock,
-                   return_value=None):
+                   return_value={6: None}):
             await manager._process_cancel_signals()
 
         assert not (signal_dir / '6').exists()
@@ -2172,9 +2254,10 @@ class TestCancelSignalScan:
         manager._cancel_info[8] = (True, 30)
         (signal_dir / '8').touch()
 
-        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+        with patch('sky.jobs.controller.managed_job_state.get_statuses_async',
                    new_callable=AsyncMock,
-                   return_value=managed_job_state.ManagedJobStatus.RUNNING):
+                   return_value={8: managed_job_state.ManagedJobStatus.RUNNING
+                                }):
             await manager._process_cancel_signals()
 
         assert (signal_dir / '8').exists()
