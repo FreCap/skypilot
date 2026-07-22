@@ -856,7 +856,8 @@ export function ManagedJobsTable({
     }
   }, [filters, pageSize, preloadingComplete]);
 
-  // Fetch on ownership scope changes (Mine vs Everyone) with status request.
+  // Fetch on status/scope changes (Mine vs Everyone, activeTab,
+  // selectedStatuses, showAllMode). Skip on initial fetch.
   React.useEffect(() => {
     if (!isInitialFetch.current && preloadingComplete) {
       if (currentPageRef.current !== 1) {
@@ -870,18 +871,7 @@ export function ManagedJobsTable({
       }
       fetchDataRef.current({ includeStatus: true });
     }
-  }, [userScope, preloadingComplete]);
-
-  // Fetch on status filter changes (activeTab, selectedStatuses, showAllMode)
-  // Skip on initial fetch (these have default values)
-  React.useEffect(() => {
-    if (!isInitialFetch.current && preloadingComplete) {
-      if (pageChangeOriginRef.current === 'page-reset') {
-        pageChangeOriginRef.current = null;
-      }
-      fetchDataRef.current({ includeStatus: true });
-    }
-  }, [activeTab, selectedStatuses, showAllMode, preloadingComplete]);
+  }, [userScope, activeTab, selectedStatuses, showAllMode, preloadingComplete]);
 
   // Fetch on sort config changes for server-side sorting
   // Skip on initial fetch (sortConfig has default value)
