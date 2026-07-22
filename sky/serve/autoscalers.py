@@ -2941,18 +2941,32 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
             apply_target = True
-        elif (target_num_replicas > self.target_num_replicas or
-              (target_map_changed and any(
-                  candidate_target_map.get(card, 0) > getattr(
-                      self, 'target_num_replicas_by_accelerator', {}).get(
-                          card, 0) for card in candidate_target_map))):
+        elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
             self.downscale_counter = 0
             if self.upscale_counter >= self.scale_up_threshold:
                 self.upscale_counter = 0
                 apply_target = True
-        elif (target_num_replicas < self.target_num_replicas or
-              target_map_changed):
+        elif target_num_replicas < self.target_num_replicas:
+            self.downscale_counter += 1
+            self.upscale_counter = 0
+            if self.downscale_counter >= self.scale_down_threshold:
+                self.downscale_counter = 0
+                apply_target = True
+        elif (target_map_changed and any(
+                candidate_target_map.get(card, 0) > getattr(
+                    self, 'target_num_replicas_by_accelerator', {}).get(
+                        card, 0) for card in candidate_target_map)):
+            # A same-size exact-card migration is an upscale for hysteresis
+            # purposes. A LOWER aggregate target is handled by the branch
+            # above even when its card mix contains a positive delta: card
+            # churn must not restart aggregate downscale proof indefinitely.
+            self.upscale_counter += 1
+            self.downscale_counter = 0
+            if self.upscale_counter >= self.scale_up_threshold:
+                self.upscale_counter = 0
+                apply_target = True
+        elif target_map_changed:
             self.downscale_counter += 1
             self.upscale_counter = 0
             if self.downscale_counter >= self.scale_down_threshold:
@@ -5060,6 +5074,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 old_target_by_accelerator.get(card, 0)
                 for card in candidate_target_by_accelerator)
         apply_target = False
+        apply_card_transition = False
 
         if self._snap_target_on_next_recompute:
             # First recompute with fresh data after construction or an update:
@@ -5087,8 +5102,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._downscale_veto_streak = 0
             self._adopt_scale_up_target(target_num_replicas, replica_infos)
             apply_target = True
-        elif (target_num_replicas > self.target_num_replicas or
-              target_map_increases):
+        elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
             self._reset_downscale_hysteresis()
             # A rising raw target ends the downscale episode: the next
@@ -5098,8 +5112,36 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self.upscale_counter = 0
                 self._adopt_scale_up_target(target_num_replicas, replica_infos)
                 apply_target = True
-        elif (target_num_replicas < self.target_num_replicas or
-              target_map_changed):
+        elif target_num_replicas < self.target_num_replicas:
+            # Aggregate and exact-card directions are independent. A lower
+            # aggregate target must continue its elapsed proof even if the
+            # compatibility mix asks for more of one card. The card migration
+            # may still advance under the normal upscale observation and wave
+            # bounds while the aggregate target remains held.
+            if target_map_increases:
+                self.upscale_counter += 1
+                if self.upscale_counter >= self.scale_up_threshold:
+                    self.upscale_counter = 0
+                    apply_card_transition = True
+            else:
+                self.upscale_counter = 0
+            if self._downscale_hysteresis_elapsed():
+                if not self._consume_downscale_pressure_veto():
+                    self._reset_downscale_hysteresis()
+                    self._adopt_scale_down_target(target_num_replicas,
+                                                  replica_infos)
+                    apply_target = True
+        elif target_map_increases:
+            # A same-size migration is still an upscale. It ends any prior
+            # lower-demand episode, but never changes the aggregate target.
+            self.upscale_counter += 1
+            self._reset_downscale_hysteresis()
+            self._downscale_veto_streak = 0
+            if self.upscale_counter >= self.scale_up_threshold:
+                self.upscale_counter = 0
+                self._adopt_scale_up_target(target_num_replicas, replica_infos)
+                apply_target = True
+        elif target_map_changed:
             self.upscale_counter = 0
             if self._downscale_hysteresis_elapsed():
                 if not self._consume_downscale_pressure_veto():
@@ -5112,7 +5154,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._reset_downscale_hysteresis()
             self._downscale_veto_streak = 0
 
-        if apply_target and candidate_target_by_accelerator is not None:
+        if ((apply_target or apply_card_transition) and
+                candidate_target_by_accelerator is not None):
             adopted_map, attribution_complete = (
                 self._calculate_concurrency_target_by_accelerator(
                     replica_infos, target_ceiling=self.target_num_replicas))
