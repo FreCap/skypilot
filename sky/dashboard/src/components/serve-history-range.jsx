@@ -38,6 +38,7 @@ export function getHistoryBounds(history) {
   const timestamps = [
     ...(history.samples || []).map((sample) => sample.timestamp),
     ...(history.requestSamples || []).map((sample) => sample.timestamp),
+    ...(history.responseTimeSamples || []).map((sample) => sample.timestamp),
     ...(history.autoscalerSamples || []).map((sample) => sample.timestamp),
   ].filter(Number.isFinite);
   const fallbackStart = timestamps.length ? Math.min(...timestamps) : null;

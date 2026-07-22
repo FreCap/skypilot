@@ -2179,6 +2179,55 @@ class TestAuthoritativeLbReportIngestion:
             report['request_history'],
         )
 
+    def test_response_time_history_uses_separate_persistence_contract(self):
+        ctrl, _, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        report['request_history_session_id'] = 'a' * 32
+        report['response_time_history'] = {
+            'bucket_seconds': 60,
+            'histogram_version': 1,
+            'buckets': [{
+                'bucket_start': 120,
+                'status_class_counts': {
+                    '2xx': [1] + [0] * 15,
+                },
+            }],
+        }
+
+        with mock.patch.object(controller.serve_history,
+                               'record_response_times') as record_history:
+            accepted = ctrl._record_response_time_history(  # pylint: disable=protected-access
+                report)
+
+        assert accepted is True
+        record_history.assert_called_once_with(
+            'svc',
+            'service-hash',
+            f"lb-a:{'a' * 32}",
+            report['response_time_history'],
+        )
+
+    @pytest.mark.parametrize(
+        ('history_error', 'history_accepted'),
+        [(RuntimeError('database unavailable'), False),
+         (ValueError('malformed snapshot'), True)],
+    )
+    def test_response_time_history_failure_is_observability_only(
+            self, history_error, history_accepted):
+        ctrl, _, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        report['request_history_session_id'] = 'a' * 32
+        report['response_time_history'] = {'histogram_version': 1}
+
+        with mock.patch.object(controller.serve_history,
+                               'record_response_times',
+                               side_effect=history_error):
+            accepted = asyncio.run(
+                ctrl._persist_response_time_history(  # pylint: disable=protected-access
+                    report))
+
+        assert accepted is history_accepted
+
     def test_autoscaler_history_distinguishes_demand_and_fill_targets(self):
         ctrl, _, _ = self._controller_and_report()
         ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
@@ -3381,6 +3430,7 @@ class TestLbSyncBlockingReadsOffLoop:
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint', 'request_history_accepted',
+            'response_time_history_accepted',
             'queued_compatibility_demand_supported', 'service_version'
         }
         assert body['queued_compatibility_demand_supported'] is True
@@ -3605,7 +3655,10 @@ class TestLbSyncOwnershipFences:
                     request_data))
 
         assert response.status_code == 200
-        assert json.loads(response.body) == {'request_history_accepted': True}
+        assert json.loads(response.body) == {
+            'request_history_accepted': True,
+            'response_time_history_accepted': True,
+        }
         persist.assert_awaited_once_with(request_data)
         ctrl._ingest_load_balancer_report.assert_not_awaited()  # pylint: disable=protected-access
 

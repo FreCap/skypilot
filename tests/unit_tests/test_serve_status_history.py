@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from sky.serve import constants
 from sky.serve import serve_history
 from sky.serve import serve_state
 
@@ -106,7 +107,11 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'retention_hours': 72,
         'samples': [],
         'request_samples': [],
+        'response_time_samples': [],
         'autoscaler_samples': [],
+        'response_time_histogram_version': 1,
+        'response_time_bucket_upper_bounds_seconds': list(
+            constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
         'rejection_history_available': False,
         'request_window_seconds': 3600,
         'requests_last_hour': 0,

@@ -110,6 +110,8 @@ const OPTIONAL_ACCELERATOR_HISTORY_FIELDS = [
   ['cold_launch_authority', 'coldLaunchAuthority'],
 ];
 
+const RESPONSE_TIME_STATUS_CLASSES = ['1xx', '2xx', '3xx', '4xx', '5xx'];
+
 export function normalizeAcceleratorBreakdown(value) {
   if (!value || typeof value !== 'object' || value.version !== 1) return null;
   const cards = value.configured_accelerators;
@@ -215,6 +217,70 @@ export function normalizeReplicaHistory(history) {
         })
         .filter(Boolean)
     : [];
+  const responseTimeHistogramVersion = Number(
+    history.response_time_histogram_version
+  );
+  const responseTimeBucketUpperBoundsSeconds = Array.isArray(
+    history.response_time_bucket_upper_bounds_seconds
+  )
+    ? history.response_time_bucket_upper_bounds_seconds.map(Number)
+    : [];
+  const responseTimeHistogramSupported =
+    responseTimeHistogramVersion === 1 &&
+    responseTimeBucketUpperBoundsSeconds.length > 0 &&
+    responseTimeBucketUpperBoundsSeconds.every(
+      (value, index) =>
+        Number.isFinite(value) &&
+        value > 0 &&
+        (index === 0 || value > responseTimeBucketUpperBoundsSeconds[index - 1])
+    );
+  const responseTimeBucketCount =
+    responseTimeBucketUpperBoundsSeconds.length + 1;
+  const responseTimeSamples =
+    responseTimeHistogramSupported &&
+    Array.isArray(history.response_time_samples)
+      ? history.response_time_samples
+          .map((sample) => {
+            const timestamp = Number(sample.timestamp);
+            const rawCounts = sample.status_class_counts;
+            if (
+              !Number.isFinite(timestamp) ||
+              !rawCounts ||
+              typeof rawCounts !== 'object' ||
+              Array.isArray(rawCounts)
+            ) {
+              return null;
+            }
+            const statusClassCounts = {};
+            for (const statusClass of RESPONSE_TIME_STATUS_CLASSES) {
+              if (
+                !Object.prototype.hasOwnProperty.call(rawCounts, statusClass)
+              ) {
+                continue;
+              }
+              const counts = rawCounts[statusClass];
+              if (
+                !Array.isArray(counts) ||
+                counts.length !== responseTimeBucketCount
+              ) {
+                return null;
+              }
+              const normalizedCounts = counts.map(Number);
+              if (
+                normalizedCounts.some(
+                  (count) => !Number.isInteger(count) || count < 0
+                )
+              ) {
+                return null;
+              }
+              statusClassCounts[statusClass] = normalizedCounts;
+            }
+            return Object.keys(statusClassCounts).length
+              ? { timestamp, statusClassCounts }
+              : null;
+          })
+          .filter(Boolean)
+      : [];
   const autoscalerSamples = Array.isArray(history.autoscaler_samples)
     ? history.autoscaler_samples
         .map((sample) => {
@@ -287,6 +353,13 @@ export function normalizeReplicaHistory(history) {
     windowEnd: Number(history.window_end) || null,
     samples,
     requestSamples,
+    responseTimeHistogramVersion: responseTimeHistogramSupported
+      ? responseTimeHistogramVersion
+      : null,
+    responseTimeBucketUpperBoundsSeconds: responseTimeHistogramSupported
+      ? responseTimeBucketUpperBoundsSeconds
+      : [],
+    responseTimeSamples,
     autoscalerSamples,
     rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:

@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import hmac
 import signal
+import time
 from typing import Any
 
 import fastapi
@@ -15,6 +16,57 @@ from sky.serve import serve_utils
 # Keep the historical logger name so moving these adapters does not alter
 # operator-visible log attribution.
 logger = sky_logging.init_logger('sky.serve.load_balancer')
+
+
+class _ResponseTimeMiddleware:
+    """Observe complete inference-response lifetimes without buffering bodies."""
+
+    def __init__(self, app: Any, aggregator: Any) -> None:
+        self._app = app
+        self._aggregator = aggregator
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (scope.get('type') != 'http' or
+                str(scope.get('path', '')).startswith('/_lb/')):
+            await self._app(scope, receive, send)
+            return
+
+        started_at = time.monotonic()
+        status_code = None
+        recorded = False
+
+        def _record(final_status: int) -> None:
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
+            try:
+                self._aggregator.add_response_time(
+                    time.monotonic() - started_at, final_status)
+            except Exception as e:  # pylint: disable=broad-except
+                # Response history is strictly observability. A malformed test
+                # double or future collector bug must never fail inference.
+                logger.warning('Failed to record response-time history: %s', e)
+
+        async def _send(message: Any) -> None:
+            nonlocal status_code
+            if message.get('type') == 'http.response.start':
+                status_code = message.get('status')
+            await send(message)
+            if (message.get('type') == 'http.response.body' and
+                    not message.get('more_body', False) and
+                    isinstance(status_code, int)):
+                _record(status_code)
+
+        try:
+            await self._app(scope, receive, _send)
+        except Exception:
+            # ServerErrorMiddleware, which materializes the 500 response, is
+            # outside user middleware. Record only failures before a response
+            # started; a mid-stream failure is incomplete, not a completion.
+            if status_code is None:
+                _record(500)
+            raise
 
 
 class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
