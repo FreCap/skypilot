@@ -1,6 +1,7 @@
 """Unit tests for sky/server/requests/process.py."""
 from concurrent.futures import Future
 import concurrent.futures.process
+import os
 import time
 import unittest.mock
 
@@ -20,6 +21,33 @@ def dummy_task(sleep_time=0.1):
 def failing_task():
     """A task that raises an exception."""
     raise ValueError('Task failed')
+
+
+def abruptly_exiting_task():
+    """A task that exits its disposable worker before returning a result."""
+    os._exit(7)
+
+
+def terminating_task():
+    """A task that raises a process-terminating exception."""
+    raise SystemExit(3)
+
+
+class UnserializableResult:
+    """A result whose serialization fails synchronously."""
+
+    def __reduce__(self):
+        raise TypeError('cannot serialize disposable result')
+
+
+def unserializable_result_task():
+    """Return a result that cannot cross the process boundary."""
+    return UnserializableResult()
+
+
+def large_result_task():
+    """Return a result larger than a typical OS pipe buffer."""
+    return b'x' * 1024 * 1024
 
 
 def verify_workers_cleanup(executor):
@@ -109,6 +137,52 @@ def test_disposable_executor():
         assert verify_workers_cleanup(
             executor), "Failed task worker not cleaned up"
         assert executor.has_idle_workers()  # Worker should be cleaned up
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_reports_worker_exit():
+    """A worker exit must fail its future instead of returning None."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(abruptly_exiting_task)
+        with pytest.raises(concurrent.futures.process.BrokenProcessPool,
+                           match='exit code 7'):
+            future.result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_contains_terminating_exception():
+    """A child BaseException must not terminate the future's caller."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(terminating_task)
+        with pytest.raises(RuntimeError, match='SystemExit: 3') as exc_info:
+            future.result(timeout=20)
+        assert isinstance(exc_info.value.__cause__, SystemExit)
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_reports_unserializable_result():
+    """An unserializable result must fail its future."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(unserializable_result_task)
+        with pytest.raises(TypeError,
+                           match='cannot serialize disposable result'):
+            future.result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_returns_large_result_without_deadlock():
+    """The monitor must drain a large result before joining its worker."""
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(large_result_task)
+        assert future.result(timeout=20) == b'x' * 1024 * 1024
     finally:
         executor.shutdown()
 
