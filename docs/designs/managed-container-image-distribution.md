@@ -1519,10 +1519,12 @@ The module creates or accepts these non-interchangeable identities:
   source/repository reads, metadata qualification, layer upload, and `PutImage`
   only for fixed destination repositories, with no deletion or administration;
 - lifecycle worker base: may assume only the exact lifecycle role;
-- lifecycle role: describe all fixed managed repositories and
-  `BatchDeleteImage` only for qualification repositories and eligible regional
-  workspace repositories, never canonical workspace repositories, with no push
-  or repository deletion; and
+- lifecycle role: `BatchGetImage`, `DescribeImages`, and `ListImages` on all
+  fixed managed repositories, including canonical, so exact absence can be
+  proved; `BatchDeleteImage` only for qualification repositories and eligible
+  regional workspace repositories, never canonical workspace repositories,
+  with the same read/delete split enforced by its identity policy, permissions
+  boundary, and repository policies, and with no push or repository deletion;
 - runtime pull principals: the actual EC2 instance-profile role, EKS kubelet
   node role, with token plus repository-scoped pull only.
 
@@ -1991,7 +1993,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   resource alternatives, forged private fields, and request config overrides;
 - scalar/object parsing, every selector combination, explicit opt-in/defaults,
   allowlists, direct restrictions, and byte-for-byte legacy `image_id` tests;
-- AWS integration plus negative IAM tests;
+- AWS integration plus mocked canonical-read, canonical-delete-denial,
+  regional-delete, identity-policy, repository-policy, and
+  permissions-boundary tests via
+  `terraform test -test-directory=terraform-tests`;
 - EC2 instance and EKS kubelet runtime pull-auth refresh tests, preinstalled
   helper/AMI enforcement, homogeneous EKS-node-role validation, multi-cluster
   attestation, no managed-path CLI install/login, plus
@@ -2433,3 +2438,16 @@ that the generic provider pre-call lease renewal could block across the teardown
 deadline, allowing EC2 or Kubernetes create to begin late. This revision
 separates current-attempt create possibility from the durable intent and adds
 the ordered create fence described above.
+
+Valid full-feature round 2 at
+`3abcf1561eb0ab20e4e9b87c7663b84e68822cfb` returned Codex `PURSUE` and Fable
+`RESHAPE`, resetting the acceptance streak. Fable proved that failed canonical
+reservation reclamation performs an exact `BatchGetImage`, while every
+lifecycle grant omitted canonical repositories and the permissions boundary
+simultaneously allowed `BatchDeleteImage` on them. Access denial was retried
+indefinitely, leaking the canonical reservation. This revision splits lifecycle
+read from delete in the role identity policy, permissions boundary, shard
+repository policies, and qualification policy. Read covers every fixed managed
+repository; delete covers only noncanonical and qualification repositories.
+Mocked Terraform assertions prove both the positive regional grants and the
+negative canonical delete boundary.

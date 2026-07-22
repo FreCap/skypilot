@@ -149,6 +149,26 @@ resource "aws_ecr_repository" "qualification" {
   depends_on = [terraform_data.validation]
 }
 
+locals {
+  lifecycle_read_actions = [
+    "ecr:BatchGetImage",
+    "ecr:DescribeImages",
+    "ecr:ListImages",
+  ]
+  lifecycle_delete_actions = ["ecr:BatchDeleteImage"]
+  all_managed_repository_arns = concat(
+    [for repository in aws_ecr_repository.shard : repository.arn],
+    [aws_ecr_repository.qualification.arn],
+  )
+  lifecycle_delete_repository_arns = concat(
+    [
+      for key, repository in aws_ecr_repository.shard : repository.arn
+      if !local.shards[key].canonical
+    ],
+    [aws_ecr_repository.qualification.arn],
+  )
+}
+
 data "aws_iam_policy_document" "copy_role_boundary" {
   statement {
     sid       = "CopyExactManagedRepositories"
@@ -174,17 +194,17 @@ data "aws_iam_policy_document" "copy_role_boundary" {
 
 data "aws_iam_policy_document" "lifecycle_role_boundary" {
   statement {
-    sid       = "LifecycleExactManagedRepositories"
+    sid       = "LifecycleReadAllManagedRepositories"
     effect    = "Allow"
-    actions   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:BatchDeleteImage"]
-    resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
+    actions   = local.lifecycle_read_actions
+    resources = local.all_managed_repository_arns
   }
 
   statement {
-    sid       = "LifecycleAuthorizationTokenOnly"
+    sid       = "LifecycleDeleteEligibleRepositories"
     effect    = "Allow"
-    actions   = ["ecr:GetAuthorizationToken"]
-    resources = ["*"]
+    actions   = local.lifecycle_delete_actions
+    resources = local.lifecycle_delete_repository_arns
   }
 }
 
@@ -201,7 +221,7 @@ resource "aws_iam_policy" "lifecycle_role_boundary" {
   count = local.create_lifecycle_role ? 1 : 0
 
   name        = "${var.lifecycle_target_role_name}-boundary"
-  description = "Maximum ECR delete permissions for the SkyPilot image lifecycle role."
+  description = "Maximum ECR read and custody-scoped delete permissions for the SkyPilot image lifecycle role."
   policy      = data.aws_iam_policy_document.lifecycle_role_boundary.json
   tags        = local.common_tags
 }
@@ -301,10 +321,6 @@ resource "aws_iam_role" "lifecycle_target" {
 locals {
   copy_target_role_arn      = var.existing_copy_target_role_arn != null ? var.existing_copy_target_role_arn : aws_iam_role.copy_target[0].arn
   lifecycle_target_role_arn = var.existing_lifecycle_target_role_arn != null ? var.existing_lifecycle_target_role_arn : aws_iam_role.lifecycle_target[0].arn
-  noncanonical_repository_arns = [
-    for key, repository in aws_ecr_repository.shard : repository.arn
-    if !local.shards[key].canonical
-  ]
 }
 
 data "aws_iam_policy_document" "copy_permissions" {
@@ -332,17 +348,17 @@ data "aws_iam_policy_document" "copy_permissions" {
 
 data "aws_iam_policy_document" "lifecycle_permissions" {
   statement {
-    sid       = "InspectAndDeleteEligibleContent"
+    sid       = "ReadAllManagedContent"
     effect    = "Allow"
-    actions   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:BatchDeleteImage"]
-    resources = concat(local.noncanonical_repository_arns, [aws_ecr_repository.qualification.arn])
+    actions   = local.lifecycle_read_actions
+    resources = local.all_managed_repository_arns
   }
 
   statement {
-    sid       = "LifecycleAuthorizationToken"
+    sid       = "DeleteEligibleManagedContent"
     effect    = "Allow"
-    actions   = ["ecr:GetAuthorizationToken"]
-    resources = ["*"]
+    actions   = local.lifecycle_delete_actions
+    resources = local.lifecycle_delete_repository_arns
   }
 }
 
@@ -388,12 +404,23 @@ data "aws_iam_policy_document" "shard" {
     }
   }
 
+  statement {
+    sid     = "SkyPilotLifecycleRead"
+    effect  = "Allow"
+    actions = local.lifecycle_read_actions
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.lifecycle_target_role_arn]
+    }
+  }
+
   dynamic "statement" {
     for_each = each.value.canonical ? [] : [local.lifecycle_target_role_arn]
     content {
-      sid     = "SkyPilotLifecycleWorker"
+      sid     = "SkyPilotLifecycleDelete"
       effect  = "Allow"
-      actions = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:BatchDeleteImage"]
+      actions = local.lifecycle_delete_actions
 
       principals {
         type        = "AWS"
@@ -436,9 +463,20 @@ data "aws_iam_policy_document" "qualification" {
   }
 
   statement {
-    sid     = "SkyPilotQualificationCleanup"
+    sid     = "SkyPilotQualificationLifecycleRead"
     effect  = "Allow"
-    actions = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:ListImages", "ecr:BatchDeleteImage"]
+    actions = local.lifecycle_read_actions
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.lifecycle_target_role_arn]
+    }
+  }
+
+  statement {
+    sid     = "SkyPilotQualificationLifecycleDelete"
+    effect  = "Allow"
+    actions = local.lifecycle_delete_actions
 
     principals {
       type        = "AWS"
