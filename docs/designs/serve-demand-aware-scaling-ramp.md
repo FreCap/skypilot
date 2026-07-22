@@ -380,6 +380,17 @@ update, or an accepted lower wave resets the window. Controller reconstruction
 also starts with no prior timer evidence. Another lower wave requires a new
 complete elapsed window.
 
+After the window elapses, a newly latched queue, rejection, or offered-arrival
+delta may defer the current decision tick. That deferral does not reset the
+elapsed window. At most two consecutive pressure deferrals are allowed per
+downscale episode, so pressure can add at most two decision intervals rather
+than two new full windows. A genuine raw-demand rebound still takes the
+upscale path and resets the downscale episode normally, as does an exact-card
+target increase. Stale demand resets the window because it breaks the required
+continuous fresh evidence. The two-tick bound is logical rather than a strict
+wall-clock guarantee because a reconciliation tick may exceed its nominal
+interval.
+
 Decision-loop counts are diagnostic only. They cannot implement this delay:
 large-fleet probing can make a nominal 20-second decision tick take much
 longer, which turned a configured 300-second delay into roughly 9.5 minutes in
