@@ -11,13 +11,12 @@ import aiohttp
 import fastapi
 import starlette.middleware.base
 
-from sky import global_user_state
 from sky import models
 from sky import sky_logging
 from sky.server import constants as server_constants
 from sky.server import middleware_utils
 from sky.server.auth import loopback
-from sky.users import permission
+from sky.server.auth import user_registration
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -158,11 +157,8 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                                 'return user info, check your oauth2-proxy'
                                 'setup.'
                         })
-                newly_added = await asyncio.to_thread(
-                    global_user_state.add_or_update_user, auth_user)
-                if newly_added:
-                    permission.permission_service.add_user_if_not_exists(
-                        auth_user.id)
+                await user_registration.add_or_update_user_with_default_role(
+                    auth_user)
                 request.state.auth_user = auth_user
                 return await call_next(request)
             elif auth_response.status == http.HTTPStatus.UNAUTHORIZED:
