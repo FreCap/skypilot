@@ -748,6 +748,19 @@ def _live_child_unresponsive_too_long(unresponsive_since: float | None,
             now - unresponsive_since >= _CHILD_UNRESPONSIVE_GRACE_SECONDS)
 
 
+def _controller_health_miss_is_graced(controller_responding: bool,
+                                      controller_needs_respawn: bool,
+                                      external_lb_healthy: bool) -> bool:
+    """Whether one controller health miss is intentionally tolerated.
+
+    A live child inside the fleet-scale unresponsive grace is not yet a
+    confirmed controller failure.  Do not let those tolerated misses advance
+    the degraded-status counter while the external data plane is healthy.
+    """
+    return (not controller_responding and not controller_needs_respawn and
+            external_lb_healthy)
+
+
 def _controller_child_responding(service_name: str, service_hash: str,
                                  controller_ip: str | None,
                                  controller_port: int) -> bool:
@@ -1782,7 +1795,11 @@ def _start(service_name: str,
                                 _child_respawn_backoff_seconds(child_failures))
                 else:
                     healthy = controller_responding and external_lb_healthy
-                    if not healthy and now >= child_retry_at:
+                    health_miss_graced = _controller_health_miss_is_graced(
+                        controller_responding, controller_needs_respawn,
+                        external_lb_healthy)
+                    if (not healthy and not health_miss_graced and
+                            now >= child_retry_at):
                         child_failures += 1
                         child_retry_at = now + _child_respawn_backoff_seconds(
                             child_failures)
@@ -1796,7 +1813,10 @@ def _start(service_name: str,
                         # otherwise leave the service stuck CONTROLLER_FAILED
                         # (the replica-driven writer is blocked on it).
                         needs_status_heal = False
-                elif child_failures >= _CHILD_FAILURES_BEFORE_FLAG:
+                elif (not _controller_health_miss_is_graced(
+                        controller_responding, controller_needs_respawn,
+                        external_lb_healthy) and
+                      child_failures >= _CHILD_FAILURES_BEFORE_FLAG):
                     _flag_service_degraded(service_name, service_incarnation,
                                            own_pid, pod_ip)
                     needs_status_heal = True

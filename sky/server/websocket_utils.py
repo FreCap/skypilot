@@ -65,6 +65,7 @@ async def run_websocket_proxy(
     websocket_closed = False
 
     async def websocket_to_backend():
+        nonlocal ssh_failed, websocket_closed
         try:
             async for message in websocket.iter_bytes():
                 if timestamps_supported:
@@ -107,51 +108,62 @@ async def run_websocket_proxy(
                     # But just in case.
                     logger.error(f'Failed to write to backend through '
                                  f'connection: {e}')
-                    nonlocal ssh_failed
                     ssh_failed = True
                     break
         except fastapi.WebSocketDisconnect:
             pass
-        nonlocal websocket_closed
-        websocket_closed = True
-        await close_backend()
+        finally:
+            websocket_closed = True
+            await close_backend()
 
     async def backend_to_websocket():
         nonlocal ssh_failed
-        while True:
-            try:
-                data = await read_from_backend()
-            except Exception as e:  # pylint: disable=broad-except
-                if not websocket_closed:
-                    logger.error('Failed to read from SSH backend: %s', e)
-                    ssh_failed = True
-                break
-            if not data:
-                if not websocket_closed:
-                    logger.warning('SSH connection to backend is disconnected '
-                                   'before websocket connection is closed')
-                    ssh_failed = True
-                break
-            if timestamps_supported:
-                # Prepend message type byte (0 = regular data)
-                message_type_bytes = struct.pack(
-                    '!B', SSHMessageType.REGULAR_DATA.value)
-                data = message_type_bytes + data
-            try:
-                await websocket.send_bytes(data)
-            except Exception as e:  # pylint: disable=broad-except
-                # A send failure is on the client-facing side of the proxy;
-                # it must not be classified as an SSH backend failure.
-                logger.debug('Stopped sending SSH data to websocket: %s', e)
-                break
         try:
-            await websocket.close()
-        except Exception:  # pylint: disable=broad-except
-            # The websocket might have been closed by the client
-            pass
+            while True:
+                data = b''
+                try:
+                    data = await read_from_backend()
+                except Exception as e:  # pylint: disable=broad-except
+                    if not websocket_closed:
+                        logger.error('Failed to read from SSH backend: %s', e)
+                        ssh_failed = True
+                    break
+                if not data:
+                    if not websocket_closed:
+                        logger.warning(
+                            'SSH connection to backend is disconnected '
+                            'before websocket connection is closed')
+                        ssh_failed = True
+                    break
+                if timestamps_supported:
+                    # Prepend message type byte (0 = regular data)
+                    message_type_bytes = struct.pack(
+                        '!B', SSHMessageType.REGULAR_DATA.value)
+                    data = message_type_bytes + data
+                try:
+                    await websocket.send_bytes(data)
+                except Exception as e:  # pylint: disable=broad-except
+                    # A send failure is on the client-facing side of the proxy;
+                    # it must not be classified as an SSH backend failure.
+                    logger.debug('Stopped sending SSH data to websocket: %s', e)
+                    break
+        finally:
+            try:
+                await websocket.close()
+            except Exception:  # pylint: disable=broad-except
+                # The websocket might have been closed by the client
+                pass
 
-    await asyncio.gather(websocket_to_backend(),
-                         backend_to_websocket(),
-                         return_exceptions=True)
+    proxy_tasks = (asyncio.create_task(websocket_to_backend()),
+                   asyncio.create_task(backend_to_websocket()))
+    try:
+        # Once either direction ends, its endpoint cleanup makes the other
+        # direction obsolete. Cancel it explicitly so an exceptional exit
+        # cannot leave the proxy waiting forever.
+        await asyncio.wait(proxy_tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in proxy_tasks:
+            task.cancel()
+        await asyncio.gather(*proxy_tasks, return_exceptions=True)
 
     return ssh_failed

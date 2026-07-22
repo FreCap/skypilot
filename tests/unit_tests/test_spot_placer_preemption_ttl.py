@@ -39,6 +39,7 @@ class TestPreemptionTtlRetry:
         placer.set_preemptive(cheap)
         assert cheap not in placer.active_locations()
         assert cheap in placer.preemptive_locations()
+        assert set(placer.known_locations()) == {cheap, other, third}
 
     def test_benched_past_ttl_becomes_active_again(self, placer_and_locations,
                                                    monkeypatch):
