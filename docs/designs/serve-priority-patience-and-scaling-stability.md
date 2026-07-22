@@ -19,6 +19,17 @@ per downscale episode, merged as
 `1.1.583`. At the time of this documentation update, the release was not yet
 deployed to the production control plane.
 
+Production observation on 2026-07-22, after SkyPilot `1.1.672` was deployed,
+confirmed two later safety fixes were active. PR #819 keeps restart capacity
+hints demand-only, so `reserved_fill=true` rows cannot rebuild or retain the
+demand target. PR #832 keeps one live controller child authoritative across
+transient HTTP health misses. The same observation exposed a remaining policy
+defect: each pressure veto still reset the complete five-minute downscale
+timer. With the two-veto bound, a configured five-minute proof could therefore
+hold an obsolete target for up to roughly fifteen minutes. This design now
+defines each veto as one decision-tick deferral after the original elapsed
+proof, without resetting that proof.
+
 The numerical production policy is an initial operating point, not a permanent
 default recommendation for every service. Future tuning must follow the
 [SkyServe autoscaling simulation runbook](serve-autoscaling-simulation.md) and
@@ -42,7 +53,9 @@ Those controls still leave four gaps for bursty one-request-per-GPU services:
    provisioning cohort when ready capacity is already more than half the
    fleet. A burst one minute later must then relaunch the same capacity.
 4. A magnitude-blind pressure delta can repeatedly restart downscale delay
-   under harmless trickle traffic, leaving adopted demand far above raw demand.
+   under harmless trickle traffic. Even a bounded two-veto policy can turn a
+   configured five-minute delay into roughly fifteen minutes, leaving adopted
+   demand far above raw demand.
 
 The production incident on 2026-07-20 demonstrated the third gap. The service
 had 124 ready logical slots and 109 provisioning slots. Its adopted target fell
@@ -266,32 +279,42 @@ actuation fences remain in force.
 
 ## Downscale stability
 
-The existing wall-clock downscale delay remains continuous quiet-time proof.
-Before accepting a lower target after the delay, the autoscaler vetoes the
-decision and restarts the delay if the latest complete, non-handoff-floored
-report has a rising queue, recent-rejection count, or offered-arrival count.
-It records a bounded reason string for status. A stable or shrinking queue and
-a stable nonzero rejection population do not veto forever. Each delta can
-restart the delay once; unchanged gauges cannot generate another veto.
+The existing wall-clock downscale delay remains continuous fresh lower-demand
+proof. Before accepting a lower target after the delay, the autoscaler may
+defer that decision for the current controller tick if the latest complete,
+non-handoff-floored report has a rising queue, recent-rejection count, or
+offered-arrival count. A veto does not reset the elapsed proof or
+`_downscale_started_at`. It records a bounded reason string for status. A
+stable or shrinking queue and a stable nonzero rejection population do not
+veto forever. Each delta can defer one decision tick; unchanged gauges cannot
+generate another veto.
 
 Consecutive vetoes are additionally capped at 2 per downscale episode (a run
 of recomputes whose raw target stays below the adopted target). The latch is
-magnitude-blind, so under trickle traffic a tiny positive delta re-arms it
-nearly every quiet window and an unbounded veto would restart the delay
-forever, starving downscale indefinitely. After the cap the elapsed delay
-accepts the lower target. Genuine rising pressure raises the raw target and
-takes the upscale branch, which ends the episode and refreshes the veto
-budget; an accepted downscale, an equal target, a stale tick, and a version
-update also reset the streak. Worst case the cap adds two full delay windows
-of extra hold, preserving the protection at the moment pressure begins.
+magnitude-blind, so under trickle traffic a tiny positive delta can re-arm it
+nearly every decision tick. After the cap, the already elapsed delay accepts
+the lower target. Genuine rising pressure raises the raw target and takes the
+upscale branch, which ends the episode and refreshes the veto budget; an
+exact-card target increase has the same effect. An accepted downscale, an equal
+target, a stale tick, and a version update also reset the streak. Worst case
+the cap adds two controller decision intervals, not two additional downscale
+windows, preserving protection at the moment pressure begins without turning
+five minutes into fifteen. This is a logical tick bound, not a strict
+wall-clock bound, because one large-fleet reconciliation tick can take longer
+than its nominal interval.
 
-The pressure baseline is the latest complete, non-floored report current when
-the downscale delay starts or the previous veto is consumed. Reports may arrive
-faster than decision ticks, so any positive delta is latched until the next
-decision consumes or clears it. Consuming a veto clears the latch and advances
-the baseline to the latest eligible report. A stale tick clears the latch and
-baseline. The first eligible report after construction, restart, or staleness
-only establishes a baseline and is never pressure.
+Every complete, non-handoff-floored report is compared with the immediately
+preceding eligible baseline and then becomes the new baseline, even when no
+decision tick runs. A positive component sets the pressure latch; the most
+recent positive delta supplies its reason. Quiet reports advance the baseline
+but do not clear an already latched event. Any number of positive reports
+received before a decision coalesce into one latched event and can defer only
+one decision tick. Starting a lower-demand window clears pressure latched
+before that window. Consuming a veto clears the latch and reasons while
+preserving both the current baseline and the original
+`_downscale_started_at`. A stale tick clears the baseline and latch and resets
+elapsed proof. The first eligible report after construction, restart, or
+staleness establishes a baseline and is not pressure.
 
 When a downscale is accepted, let:
 
@@ -377,7 +400,8 @@ Autoscaler status exposes:
 - 60-second and 300-second offered-arrival counts and arrival floor;
 - raw and adopted targets plus committed and provisioning capacity;
 - pressure streak, adaptive-active state, and adaptive hold remaining;
-- downscale elapsed time, veto reason, consecutive-veto streak and budget,
+- downscale elapsed time, veto reason, consecutive tick-deferral streak and
+  fixed tick-deferral budget,
   whole-fleet allowance, provisioning allowance, frozen
   provisioning-retention floor, and pending slots spent in the current
   episode.
@@ -439,8 +463,11 @@ free capacity cannot make an incrementally paid fleet appear underutilized.
 - Concurrency-autoscaler tests cover queue weighting, aggregate fallback,
   60/300-second arrival floors, saturation, retry-deduplicated counts, adaptive
   activation and expiry, HA-floor pressure exclusion, unchanged pacing,
-  delta-only downscale veto, and an independent provisioning cancellation
-  budget that stays frozen across reconciliation ticks.
+  delta-only downscale veto, preservation of elapsed proof across at most two
+  vetoed decision ticks, coalescing of multiple pre-decision pressure reports,
+  explicit status reporting of the fixed veto budget, and an independent
+  provisioning cancellation budget that stays frozen across reconciliation
+  ticks.
 - Existing focused request-queue, concurrency-autoscaler, LB sync, HA,
   controller, logical reconciliation, and status tests pass.
 - Run formatter, mypy, pylint, Ruff, and the broader Serve unit-test slice.
