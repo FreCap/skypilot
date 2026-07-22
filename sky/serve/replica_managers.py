@@ -251,6 +251,10 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
     """The controller lost authority while a replica launch was in flight."""
 
 
+class _ReplicaLaunchSupersededError(RuntimeError):
+    """A queued logical launch lost its exact-card target authority."""
+
+
 class _UnfencedExternalLbLaunchError(RuntimeError):
     """A legacy controller cannot satisfy the API replica-launch fence."""
 
@@ -272,6 +276,7 @@ def launch_cluster(
         availability_max_retry: int | None = None,
         exact_resources_override: bool = False,
         pre_launch_guard: Callable[[], bool] | None = None,
+        cloud_launch_guard: Callable[[], bool] | None = None,
         continue_guard: Callable[[], bool] | None = None,
         launch_fence: dict[str, Any] | None = None,
         service_spec: 'service_spec.SkyServiceSpec | None' = None) -> None:
@@ -411,6 +416,10 @@ def launch_cluster(
         try:
             if _check_is_cancelled():
                 return
+            if not _guard_allows(cloud_launch_guard):
+                raise _ReplicaLaunchSupersededError(
+                    f'Refusing superseded logical cloud launch for replica '
+                    f'{replica_id}.')
             # This is the authoritative DB-backed check immediately before
             # every cloud mutation. The shared watchdog event is a second,
             # cheap fence for an already-running request.
@@ -449,6 +458,8 @@ def launch_cluster(
             # re-drive or garbage-collect; discard local bookkeeping.
             replica_to_request_id.pop(replica_id)
             replica_to_launch_cancelled.pop(replica_id)
+            raise
+        except _ReplicaLaunchSupersededError:
             raise
         except _UnfencedExternalLbLaunchError:
             raise
@@ -837,6 +848,28 @@ def _uniform_whole_gpu_capacity(resources: typing.Iterable[Any]) -> int | None:
     unique_capacities = set(typing.cast(list[int], capacities))
     return (next(iter(unique_capacities))
             if len(unique_capacities) == 1 else None)
+
+
+def _exact_accelerator_shapes(
+        resources: typing.Iterable[Any]) -> dict[str, int]:
+    """Return the distinct exact-card catalog, or empty for legacy shapes."""
+    shapes: dict[str, int] = {}
+    canonical_by_name: dict[str, str] = {}
+    saw_resource = False
+    for resource in resources:
+        saw_resource = True
+        accelerators = getattr(resource, 'accelerators', None)
+        width = _whole_gpu_capacity(accelerators)
+        if width is None or accelerators is None:
+            return {}
+        card = str(next(iter(accelerators)))
+        folded = card.casefold()
+        canonical = canonical_by_name.setdefault(folded, card)
+        previous = shapes.get(canonical)
+        if previous is not None and previous != width:
+            return {}
+        shapes[canonical] = width
+    return shapes if saw_resource else {}
 
 
 def _validate_logical_capacity_sources(default_capacity: int | None,
@@ -2273,6 +2306,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                False) is True)
         self._default_planned_capacity = _uniform_whole_gpu_capacity(
             task.resources)
+        self._logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
+            task.resources) if self._uses_logical_replicas else {})
         self._spot_placer: spot_placer.SpotPlacer | None = (
             spot_placer.SpotPlacer.from_task(spec, task))
         if self._uses_logical_replicas:
@@ -2288,6 +2323,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             int, str] = thread_utils.ThreadSafeDict()
         self._replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
             int, bool] = thread_utils.ThreadSafeDict()
+        # Exact-card authority is assigned when a queued thread is admitted,
+        # then checked by that thread immediately before sdk.launch(). The
+        # separate map lets recovered PENDING rows use the same current target
+        # fence without rewriting their durable replica format.
+        self._replica_to_logical_launch_fence: thread_utils.ThreadSafeDict[
+            int, LogicalTargetState] = thread_utils.ThreadSafeDict()
         # update_service persists a version before waiting for the manager
         # lock.  A large placer-backed scale-up batch can hold that lock for
         # minutes while it assigns hundreds of replicas.  Publish the waiting
@@ -3068,6 +3109,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'availability_max_retry': availability_max_retry,
                 'exact_resources_override': location is not None,
                 'pre_launch_guard': self._service_is_launch_authorized,
+                'cloud_launch_guard':
+                    (lambda: self._queued_logical_launch_fence_holds(replica_id)
+                     if
+                     (getattr(self, '_uses_logical_replicas', False) and bool(
+                         getattr(self, '_logical_exact_accelerator_shapes', {})
+                     ) and not zero_cost_only and not prior_reserved_fill and
+                      cost_rebalance_for_replica_id is None and
+                      not prior_unknown_capacity_replacement) else None),
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence': self._replica_launch_fence_context(),
                 'service_spec': launch_spec,
@@ -4073,6 +4122,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'already finished. Delete the cluster now.')
             self._launch_thread_pool.pop(replica_id)
             self._replica_to_request_id.pop(replica_id)
+            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
+            if fence_map is not None:
+                fence_map.pop(replica_id)
 
         if replica_id in self._down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
@@ -5715,6 +5767,137 @@ class SkyPilotReplicaManager(ReplicaManager):
     # ReplicaManager Daemon Threads #
     #################################
 
+    @staticmethod
+    def _replica_card_for_catalog(
+            info: ReplicaInfo, canonical_by_name: dict[str, str]) -> str | None:
+        """Resolve one replica's exact card without folding card variants."""
+        accelerators = None
+        location = info.get_spot_location()
+        if location is not None:
+            accelerators = location.accelerators
+        if not accelerators:
+            accelerators = (getattr(info, 'resources_override', None) or
+                            {}).get('accelerators')
+        if not accelerators:
+            resources = getattr(getattr(info, 'handle', None),
+                                'launched_resources', None)
+            accelerators = getattr(resources, 'accelerators', None)
+        if not isinstance(accelerators, dict) or len(accelerators) != 1:
+            return None
+        return canonical_by_name.get(str(next(iter(accelerators))).casefold())
+
+    def _logical_pending_launch_admission(
+        self,
+        candidate_replica_id: int | None = None,
+    ) -> tuple[bool, LogicalTargetState | None, set[int]]:
+        """Return exact-card authority for not-yet-started demand launches.
+
+        The replica row and local launch thread can outlive the autoscaler tick
+        that created them, including across controller recovery. Only a fresh,
+        complete exact-card target may turn such a row into a cloud mutation.
+        READY/STARTING/PROVISIONING supply is counted first. Reserved-fill and
+        special replacement rows keep their independent fences; ordinary
+        zero-cost demand rows win the remaining demand budget before paid rows.
+
+        Returns (applicable, target_fence, authorized_ids). When applicable is
+        true and target_fence is None, exact-card telemetry is not currently
+        authoritative and every ordinary demand launch must be deferred.
+        """
+        if (not getattr(self, '_uses_logical_replicas', False) or
+                not getattr(self, '_logical_exact_accelerator_shapes', {})):
+            return False, None, set()
+
+        with self._logical_state_lock:
+            target_fence = self._logical_target
+            target_state = _logical_target_state_components(target_fence)
+            if (target_state is None or target_fence is None or
+                    len(target_fence) != 5 or
+                    not self._logical_reconcile_fence_holds(target_fence)):
+                return True, None, set()
+            (version, _, _, target_by_accelerator,
+             accelerator_shapes) = target_state
+            configured = {
+                str(card).casefold()
+                for card in self._logical_exact_accelerator_shapes
+            }
+            published = {str(card).casefold() for card, _ in accelerator_shapes}
+            if configured != published:
+                return True, None, set()
+
+        canonical_by_name = {
+            card.casefold(): card for card, _ in accelerator_shapes
+        }
+        targets = {card: 0 for card, _ in accelerator_shapes}
+        targets.update(dict(target_by_accelerator))
+        baseline = {card: 0 for card in targets}
+        candidates: dict[str, list[ReplicaInfo]] = {card: [] for card in targets}
+        authorized_ids: set[int] = set()
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        for info in replica_infos:
+            if (info.is_terminal or info.version != version or getattr(
+                    info.status_property, 'is_scale_down', False) is True or
+                    getattr(info.status_property, 'preempted', False) is True):
+                continue
+            card = self._replica_card_for_catalog(info, canonical_by_name)
+            if card is None:
+                continue
+            planned = int(getattr(info, 'planned_capacity', 1))
+            is_pending = (
+                (info.status == serve_state.ReplicaStatus.PENDING and
+                 getattr(info.status_property, 'sky_launch_status', None)
+                 in (None, common_utils.ProcessStatus.SCHEDULED)) or
+                info.replica_id == candidate_replica_id)
+            special_pending = bool(
+                getattr(info, 'reserved_fill', False) or
+                getattr(info, 'unknown_capacity_replacement', False) or
+                type(getattr(info, 'cost_rebalance_for_replica_id',
+                             None)) is int)
+            if is_pending and not special_pending:
+                candidates[card].append(info)
+            else:
+                baseline[card] += planned
+                if is_pending:
+                    authorized_ids.add(info.replica_id)
+
+        for card, card_candidates in candidates.items():
+            remaining = max(0, targets[card] - baseline[card])
+
+            def _candidate_key(info: ReplicaInfo) -> tuple[bool, float, int]:
+                created_at = getattr(info, 'created_at', None)
+                if not isinstance(created_at, (int, float)):
+                    created_at = float('-inf')
+                return (not bool(getattr(info, 'is_zero_cost', False)),
+                        float(created_at), info.replica_id)
+
+            for info in sorted(card_candidates, key=_candidate_key):
+                planned = int(getattr(info, 'planned_capacity', 1))
+                if planned > remaining:
+                    continue
+                authorized_ids.add(info.replica_id)
+                remaining -= planned
+
+        # A newer autoscaler tick may publish while the fleet read above is in
+        # flight. Never let an authorization set cross that target boundary.
+        with self._logical_state_lock:
+            if (self._logical_target != target_fence or
+                    not self._logical_reconcile_fence_holds(target_fence)):
+                return True, None, set()
+        return True, target_fence, authorized_ids
+
+    def _queued_logical_launch_fence_holds(self, replica_id: int) -> bool:
+        """Revalidate target and current supply before every sdk.launch()."""
+        fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
+        if fence_map is None:
+            return False
+        fence = fence_map.get(replica_id)
+        if fence is None:
+            return False
+        applicable, current_fence, authorized_ids = (
+            self._logical_pending_launch_admission(
+                candidate_replica_id=replica_id))
+        return (applicable and current_fence == fence and
+                replica_id in authorized_ids)
+
     @with_lock
     def _refresh_thread_pool(self) -> None:
         """Refresh the launch/down thread pool.
@@ -5759,6 +5942,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             replica_id for replica_id, t in finished_launches if isinstance(
                 getattr(t, 'exception', None), _UnfencedExternalLbLaunchError)
         }
+        superseded_launches = {
+            replica_id for replica_id, t in finished_launches if isinstance(
+                getattr(t, 'exception', None), _ReplicaLaunchSupersededError)
+        }
         launch_infos = serve_state.get_replica_infos_from_ids(
             self._service_name,
             [replica_id for replica_id, _ in finished_launches])
@@ -5780,6 +5967,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._launch_thread_pool.pop(replica_id)
             self._replica_to_request_id.pop(replica_id)
             self._replica_to_launch_cancelled.pop(replica_id)
+            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
+            if fence_map is not None:
+                fence_map.pop(replica_id)
         if stale_finished_launches:
             stale_replica_ids = set(stale_finished_launches)
             finished_launches = [(replica_id, t)
@@ -5800,7 +5990,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     location = resolved_location
                 finished_spot_locations[replica_id] = location
                 if t.format_exc is not None:
-                    if replica_id not in unfenced_launch_failures:
+                    if (replica_id not in unfenced_launch_failures and
+                            replica_id not in superseded_launches):
                         failed_spot_locations.add(location)
                 else:
                     selected_at = getattr(info, 'created_at', None)
@@ -5827,6 +6018,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert info is not None, replica_id
             if info.status == serve_state.ReplicaStatus.PENDING:
                 pending_launches.append((replica_id, t, info))
+                continue
+            if replica_id in superseded_launches:
+                logger.info(
+                    f'Cleaning up logical replica {replica_id}: its exact-card '
+                    'target was superseded before the first cloud mutation.')
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
                 continue
             # sky.launch finished
             # TODO(tian): Try-catch in thread, and have an enum return
@@ -5879,6 +6080,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         for replica_id, info, error_in_sky_launch in completed_launches:
             self._launch_thread_pool.pop(replica_id)
             self._replica_to_request_id.pop(replica_id)
+            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
+            if fence_map is not None:
+                fence_map.pop(replica_id)
             if error_in_sky_launch:
                 # Teardown after update replica info since
                 # _terminate_replica will update the replica info too.
@@ -5891,6 +6095,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # proof; re-checking it per replica only burns DB work and log
             # budget without changing the admission decision for this tick.
             authorization = self._service_launch_authorization()
+            (logical_admission_applies, logical_target_fence,
+             logical_authorized_ids) = (
+                 self._logical_pending_launch_admission())
             for replica_id, t, info in pending_launches:
                 if authorization is None:
                     logger.warning(
@@ -5908,7 +6115,43 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._launch_thread_pool.pop(replica_id)
                     self._replica_to_request_id.pop(replica_id)
                     self._replica_to_launch_cancelled.pop(replica_id)
+                    fence_map = getattr(self,
+                                        '_replica_to_logical_launch_fence',
+                                        None)
+                    if fence_map is not None:
+                        fence_map.pop(replica_id)
                     continue
+                special_logical_launch = bool(
+                    getattr(info, 'reserved_fill', False) or
+                    getattr(info, 'unknown_capacity_replacement', False) or
+                    type(getattr(info, 'cost_rebalance_for_replica_id',
+                                 None)) is int)
+                if logical_admission_applies and not special_logical_launch:
+                    if logical_target_fence is None:
+                        logger.info(
+                            f'Deferring queued logical launch for replica '
+                            f'{replica_id}: no fresh complete exact-card '
+                            'target is authoritative.')
+                        continue
+                    if replica_id not in logical_authorized_ids:
+                        # Recheck and commit the supersession while target
+                        # publication is excluded. The thread has never
+                        # started, so this cannot preempt serving work.
+                        with self._logical_state_lock:
+                            if not self._logical_reconcile_fence_holds(
+                                    logical_target_fence):
+                                continue
+                            logger.info(
+                                f'Superseding queued logical launch for '
+                                f'replica {replica_id}: current exact-card '
+                                'capacity already covers its target budget.')
+                            self._terminate_replica(
+                                replica_id,
+                                sync_down_logs=False,
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=True,
+                                in_flight_drain_cap_seconds=0)
+                        continue
                 if self._spot_placer is not None:
                     location = info.get_spot_location()
                     resolved_location = (
@@ -5932,9 +6175,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._launch_thread_pool.pop(replica_id)
                         self._replica_to_request_id.pop(replica_id)
                         self._replica_to_launch_cancelled.pop(replica_id)
+                        fence_map = getattr(self,
+                                            '_replica_to_logical_launch_fence',
+                                            None)
+                        if fence_map is not None:
+                            fence_map.pop(replica_id)
                         continue
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
+                if (logical_target_fence is not None and
+                        not special_logical_launch):
+                    fence_map = getattr(self,
+                                        '_replica_to_logical_launch_fence',
+                                        None)
+                    if fence_map is not None:
+                        fence_map[replica_id] = logical_target_fence
                 launch_to_admit.append((replica_id, t, info))
 
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
@@ -5983,6 +6238,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if not controller_utils.can_provision(self._is_pool,
                                                           in_flight=in_flight):
                         continue
+                    fence_map = getattr(self,
+                                        '_replica_to_logical_launch_fence',
+                                        None)
+                    logical_fence = (None if fence_map is None else
+                                     fence_map.get(replica_id))
+                    if logical_fence is not None:
+                        with self._logical_state_lock:
+                            if not self._logical_reconcile_fence_holds(
+                                    logical_fence):
+                                continue
                     t.start()
                     # This replica is now provisioning; reflect it locally
                     # instead of re-scanning the DB on the next replica.
@@ -6664,6 +6929,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         new_task = load_task_with_service_spec(new_yaml_content, spec)
         new_default_planned_capacity = _uniform_whole_gpu_capacity(
             new_task.resources)
+        new_logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
+            new_task.resources) if new_uses_logical_replicas else {})
         # A service update may change the placement policy or any_of shape
         # set. Rebuild it before mutating manager version state so neither
         # logical nor physical versions retain candidates from the prior spec.
@@ -6698,6 +6965,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._version_specs = version_specs
         version_specs[version] = spec
         self._default_planned_capacity = new_default_planned_capacity
+        self._logical_exact_accelerator_shapes = (
+            new_logical_exact_accelerator_shapes)
         self._spot_placer = new_spot_placer
 
         # Reuse all replicas that have the same config as the new version

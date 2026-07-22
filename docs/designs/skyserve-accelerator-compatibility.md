@@ -324,6 +324,32 @@ the autoscaler suppresses retirement. After normal hysteresis adopts the new
 card assignment, scale-down again uses the adopted map and the existing
 idle/graceful-drain proofs.
 
+The fence is checked again immediately before each queued demand launch makes
+its first cloud mutation. Persisting a replica row or placing it in the local
+launch pool is not launch authority: a large wave may wait behind bounded
+launch concurrency while a newer compatibility report changes the exact-card
+target. For each card, the pre-launch check counts current non-retiring
+READY/STARTING/PROVISIONING capacity first, then authorizes only the oldest
+zero-cost demand-owned PENDING rows and finally the oldest paid demand-owned
+PENDING rows that fit the remaining target. Rows launched for reserved fill
+remain governed by the independent broker-grant fence and are not charged to
+this demand budget.
+
+This check is restart-safe. A recovered logical controller must not treat all
+durable PENDING demand rows as fresh launch orders. It reconstructs their
+authorization from the first fresh, complete exact-card target it receives;
+until then, queued demand launches fail closed. A row excluded by the current
+budget is removed through normal replica cleanup and cannot call `sky.launch`.
+Recovery also revalidates an interrupted PROVISIONING row before re-driving
+`sky.launch`: the controller cannot prove that its pre-restart asynchronous
+request still owns live cloud work because the request ID is not durable.
+Cleanup may therefore cancel never-ready infrastructure, but it cannot preempt
+a routed user request. READY and STARTING capacity remains governed by the
+existing graceful downscale path. Consequently, a controller restart cannot
+turn an old `A100: 165` wave into new paid A100 cloud mutations after the
+current target has become `A100: 93` and 93 or more compatible A100 slots are
+already materialized.
+
 Reserved fill is reconciled against shaped demand launches in the same tick.
 Each exact-card demand launch first claims at most one freshly reported
 physical reserved slot of that card; logical targets convert their slot
@@ -754,6 +780,14 @@ aggregate and reconstructed per-card targets therefore remain reconcilable
 through the normal graceful downscale delay instead of disabling exact-card
 actuation until demand happens to reach the old aggregate target.
 
+Recovery of queued launch rows is deliberately stricter than recovery of the
+retirement target. Durable demand-owned PENDING rows and interrupted
+PROVISIONING re-drives wait for a fresh complete exact-card target and are
+revalidated at cloud-mutation time. Missing or stale compatibility telemetry
+can therefore retain ready capacity conservatively, but it cannot authorize a
+new paid cold start. This does not change request-priority semantics: no READY
+replica is preempted, and normal scale-down keeps its graceful drain contract.
+
 HA cutover snapshots carry both accepted compatibility arrivals and the live
 compatibility queue, recent-rejection, and exact-card in-flight gauges. Arrival
 events transfer to the promoted controller state exactly once; replaceable
@@ -835,6 +869,13 @@ Production checks:
   location and confirm flexible demand waits for L4 rather than cold-starting
   A100. Repeat with A100-only demand and confirm that A100 remains a valid cold
   target.
+- Queue a logical wave with `A100: 165`, start only part of it, then publish a
+  fresh complete `A100: 93` target while at least 93 A100 slots are already
+  READY or PROVISIONING. Confirm that not-yet-started paid A100 rows make zero
+  cloud launch calls. Repeat across a controller restart and confirm the same
+  result from recovered PENDING and interrupted PROVISIONING rows. Confirm
+  excluded never-ready rows are cleaned up without a new `sky.launch`, READY
+  replicas retain graceful downscale, and reserved-fill rows remain untouched.
 - During a rolling update, mark latest-version physical and logical replicas
   preempted while their derived status is still READY. Confirm they do not
   authorize retirement of healthy old-version serving coverage.
