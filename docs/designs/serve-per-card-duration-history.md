@@ -6,9 +6,9 @@ Dropped. Model-runtime telemetry supersedes this design.
 
 ## Decision
 
-Do not add a SkyPilot request-duration table, load-balancer histogram, HA
-reporting protocol, controller acknowledgement, status response, or online
-Datadog feedback loop for autoscaling calibration.
+Do not use prediction-time history as an online autoscaling calibration signal.
+The separate customer-facing observability contract is defined in
+`serve-prediction-time-history.md`.
 
 Boltz model runtimes already emit `boltz.prediction.duration` exactly once
 around `handle_request`, on success and exception, and emit the matching
@@ -52,8 +52,6 @@ costs and risks duplicate an existing, more accurate completion-path signal.
 
 ## Reopen conditions
 
-Reconsider SkyPilot-owned persistence only for a separate product requirement,
-such as provider-independent customer-facing runtime history when the model
-telemetry backend is unavailable or has insufficient retention. That work must
-have a new reviewed design and must not reuse async occupancy as per-request
-duration.
+The provider-independent customer-facing runtime-history condition is now met
+by `serve-prediction-time-history.md`. That implementation remains
+observability-only and must not reuse async occupancy as per-request duration.

@@ -335,14 +335,14 @@ describe('getServices', () => {
             rejected_count: 2,
           },
         ],
-        response_time_histogram_version: 1,
-        response_time_bucket_upper_bounds_seconds: [0.1, 1, 10],
-        response_time_samples: [
+        prediction_time_histogram_version: 1,
+        prediction_time_bucket_upper_bounds_seconds: [0.1, 1, 10],
+        prediction_time_samples: [
           {
             timestamp: 1751633160,
-            status_class_counts: {
-              '2xx': [1, 2, 3, 4],
-              '5xx': [0, 0, 1, 0],
+            outcome_counts: {
+              succeeded: [1, 2, 3, 4],
+              failed: [0, 0, 1, 0],
             },
           },
         ],
@@ -440,14 +440,14 @@ describe('getServices', () => {
       requestSamples: [
         { timestamp: 1751633160, requestCount: 9, rejectedCount: 2 },
       ],
-      responseTimeHistogramVersion: 1,
-      responseTimeBucketUpperBoundsSeconds: [0.1, 1, 10],
-      responseTimeSamples: [
+      predictionTimeHistogramVersion: 1,
+      predictionTimeBucketUpperBoundsSeconds: [0.1, 1, 10],
+      predictionTimeSamples: [
         {
           timestamp: 1751633160,
-          statusClassCounts: {
-            '2xx': [1, 2, 3, 4],
-            '5xx': [0, 0, 1, 0],
+          outcomeCounts: {
+            succeeded: [1, 2, 3, 4],
+            failed: [0, 0, 1, 0],
           },
         },
       ],

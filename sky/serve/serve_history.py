@@ -181,6 +181,49 @@ sqlalchemy.Index('serve_response_time_history_lookup_idx',
 sqlalchemy.Index('serve_response_time_history_bucket_idx',
                  serve_response_time_history_table.c.bucket_start)
 
+_PREDICTION_TIME_ARRAY_COLUMNS = tuple(
+    sqlalchemy.Column(f'{outcome}_counts',
+                      postgresql.ARRAY(sqlalchemy.Integer),
+                      nullable=False)
+    for outcome in constants.LB_PREDICTION_TIME_OUTCOMES)
+_PREDICTION_TIME_ARRAY_CONSTRAINTS = tuple(
+    constraint for outcome in constants.LB_PREDICTION_TIME_OUTCOMES
+    for constraint in (
+        sqlalchemy.CheckConstraint(
+            f'cardinality({outcome}_counts) = '
+            f'{constants.LB_PREDICTION_TIME_BUCKET_COUNT}',
+            name=f'serve_prediction_time_history_{outcome}_length'),
+        sqlalchemy.CheckConstraint(
+            f'0 <= ALL({outcome}_counts)',
+            name=f'serve_prediction_time_history_{outcome}_nonnegative'),
+    ))
+
+serve_prediction_time_history_table = sqlalchemy.Table(
+    'serve_prediction_time_history',
+    metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('reporter_session_id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      primary_key=True),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('prediction_count', sqlalchemy.Integer, nullable=False),
+    *_PREDICTION_TIME_ARRAY_COLUMNS,
+    sqlalchemy.CheckConstraint(
+        'prediction_count >= 0',
+        name='serve_prediction_time_history_prediction_count_nonnegative'),
+    *_PREDICTION_TIME_ARRAY_CONSTRAINTS,
+)
+sqlalchemy.Index('serve_prediction_time_history_lookup_idx',
+                 serve_prediction_time_history_table.c.service_name,
+                 serve_prediction_time_history_table.c.service_hash,
+                 serve_prediction_time_history_table.c.bucket_start.desc())
+sqlalchemy.Index('serve_prediction_time_history_bucket_idx',
+                 serve_prediction_time_history_table.c.bucket_start)
+
 serve_autoscaler_history_table = sqlalchemy.Table(
     'serve_autoscaler_history',
     metadata,
@@ -420,6 +463,10 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
             connection.execute(
                 sqlalchemy.delete(serve_response_time_history_table).where(
                     serve_response_time_history_table.c.bucket_start < cutoff))
+            connection.execute(
+                sqlalchemy.delete(serve_prediction_time_history_table).where(
+                    serve_prediction_time_history_table.c.bucket_start <
+                    cutoff))
             connection.execute(
                 sqlalchemy.delete(serve_autoscaler_history_table).where(
                     serve_autoscaler_history_table.c.bucket_start < cutoff))
@@ -675,6 +722,136 @@ def record_response_times(
                     },
                 },
                 where=excluded.response_count >= table.c.response_count))
+    return len(rows)
+
+
+def _prediction_time_history_rows(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    prediction_time_history: dict[str, Any],
+    observed_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    """Validate one LB prediction report and build reporter-minute rows."""
+    if not isinstance(prediction_time_history, dict):
+        raise ValueError('prediction_time_history must be an object.')
+    if prediction_time_history.get('bucket_seconds') != BUCKET_SECONDS:
+        raise ValueError('prediction_time_history bucket_seconds must be '
+                         f'{BUCKET_SECONDS}.')
+    if (prediction_time_history.get('histogram_version')
+            != constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION):
+        raise ValueError('prediction_time_history histogram_version is '
+                         'unsupported.')
+    buckets = prediction_time_history.get('buckets')
+    if not isinstance(buckets, list):
+        raise ValueError('prediction_time_history buckets must be a list.')
+    if len(buckets) > constants.LB_REQUEST_HISTORY_MAX_BUCKETS:
+        raise ValueError('prediction_time_history contains too many buckets.')
+
+    current_bucket = observed_at.replace(second=0, microsecond=0)
+    oldest_bucket = current_bucket - datetime.timedelta(
+        seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS +
+        2 * BUCKET_SECONDS)
+    newest_bucket = current_bucket + datetime.timedelta(seconds=2 *
+                                                        BUCKET_SECONDS)
+    seen_bucket_starts: set[int] = set()
+    rows = []
+    expected_outcomes = set(constants.LB_PREDICTION_TIME_OUTCOMES)
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise ValueError(
+                'prediction_time_history bucket must be an object.')
+        bucket_start = bucket.get('bucket_start')
+        if (not isinstance(bucket_start, int) or
+                isinstance(bucket_start, bool) or
+                bucket_start % BUCKET_SECONDS != 0):
+            raise ValueError('prediction_time_history bucket_start must be an '
+                             'aligned integer epoch timestamp.')
+        if bucket_start in seen_bucket_starts:
+            raise ValueError('prediction_time_history bucket_start must be '
+                             'unique.')
+        seen_bucket_starts.add(bucket_start)
+        bucket_datetime = _utc_datetime(bucket_start)
+        if not oldest_bucket <= bucket_datetime <= newest_bucket:
+            raise ValueError('prediction_time_history bucket_start is outside '
+                             'the accepted recent window.')
+
+        outcome_counts = bucket.get('outcome_counts')
+        if not isinstance(outcome_counts, dict):
+            raise ValueError('outcome_counts must be an object.')
+        if not set(outcome_counts).issubset(expected_outcomes):
+            raise ValueError('outcome_counts contains an unsupported '
+                             'prediction outcome.')
+        row = {
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'reporter_session_id': reporter_session_id,
+            'bucket_start': bucket_datetime,
+            'observed_at': observed_at,
+        }
+        prediction_count = 0
+        for outcome in constants.LB_PREDICTION_TIME_OUTCOMES:
+            counts = outcome_counts.get(
+                outcome, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
+            if (not isinstance(counts, list) or
+                    len(counts) != constants.LB_PREDICTION_TIME_BUCKET_COUNT or
+                    any(not isinstance(count, int) or isinstance(count, bool) or
+                        count < 0 for count in counts)):
+                raise ValueError(f'{outcome} prediction histogram must '
+                                 'contain the fixed number of nonnegative '
+                                 'integer buckets.')
+            prediction_count += sum(counts)
+            row[f'{outcome}_counts'] = counts
+        if prediction_count == 0:
+            raise ValueError('prediction_time_history bucket must contain a '
+                             'completed prediction.')
+        row['prediction_count'] = prediction_count
+        rows.append(row)
+    return rows
+
+
+def record_prediction_times(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    prediction_time_history: dict[str, Any] | None,
+    timestamp: float | None = None,
+) -> int:
+    """Persist cumulative prediction histograms from one LB process."""
+    if prediction_time_history is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    rows = _prediction_time_history_rows(service_name, service_hash,
+                                         reporter_session_id,
+                                         prediction_time_history, observed_at)
+    engine = _postgres_engine()
+    if engine is None or not rows:
+        return 0
+    table = serve_prediction_time_history_table
+    with engine.begin() as connection:
+        insert = postgresql.insert(table).values(rows)
+        excluded = insert.excluded
+        connection.execute(
+            insert.
+            on_conflict_do_update(index_elements=[
+                table.c.service_name,
+                table.c.service_hash,
+                table.c.reporter_session_id,
+                table.c.bucket_start,
+            ],
+                                  set_={
+                                      'observed_at': sqlalchemy.func.greatest(
+                                          table.c.observed_at,
+                                          excluded.observed_at),
+                                      'prediction_count':
+                                          excluded.prediction_count,
+                                      **{
+                                          f'{outcome}_counts': getattr(
+                                              excluded, f'{outcome}_counts') for outcome in constants.LB_PREDICTION_TIME_OUTCOMES
+                                      },
+                                  },
+                                  where=excluded.prediction_count
+                                  >= table.c.prediction_count))
     return len(rows)
 
 
@@ -946,12 +1123,12 @@ def get_status_history(
             'retention_hours': RETENTION_HOURS,
             'samples': [],
             'request_samples': [],
-            'response_time_samples': [],
+            'prediction_time_samples': [],
             'autoscaler_samples': [],
-            'response_time_histogram_version':
-                constants.LB_RESPONSE_TIME_HISTOGRAM_VERSION,
-            'response_time_bucket_upper_bounds_seconds': list(
-                constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+            'prediction_time_histogram_version':
+                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+            'prediction_time_bucket_upper_bounds_seconds': list(
+                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
             'rejection_history_available': False,
             'request_window_seconds':
                 constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
@@ -979,12 +1156,12 @@ def get_status_history(
                 'retention_hours': RETENTION_HOURS,
                 'samples': [],
                 'request_samples': [],
-                'response_time_samples': [],
+                'prediction_time_samples': [],
                 'autoscaler_samples': [],
-                'response_time_histogram_version':
-                    constants.LB_RESPONSE_TIME_HISTOGRAM_VERSION,
-                'response_time_bucket_upper_bounds_seconds': list(
-                    constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+                'prediction_time_histogram_version':
+                    constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+                'prediction_time_bucket_upper_bounds_seconds': list(
+                    constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
                 'rejection_history_available': False,
                 'request_window_seconds':
                     constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
@@ -1022,14 +1199,14 @@ def get_status_history(
                 request_history.c.bucket_start <= observed_at,
             ).group_by(request_history.c.bucket_start).order_by(
                 request_history.c.bucket_start)).all()
-        response_history = serve_response_time_history_table
-        response_rows = session.execute(
-            sqlalchemy.select(response_history).where(
-                response_history.c.service_name == service_name,
-                response_history.c.service_hash == service_hash,
-                response_history.c.bucket_start >= window_start,
-                response_history.c.bucket_start <= observed_at,
-            ).order_by(response_history.c.bucket_start)).mappings().all()
+        prediction_history = serve_prediction_time_history_table
+        prediction_rows = session.execute(
+            sqlalchemy.select(prediction_history).where(
+                prediction_history.c.service_name == service_name,
+                prediction_history.c.service_hash == service_hash,
+                prediction_history.c.bucket_start >= window_start,
+                prediction_history.c.bucket_start <= observed_at,
+            ).order_by(prediction_history.c.bucket_start)).mappings().all()
         autoscaler_history = serve_autoscaler_history_table
         autoscaler_rows = session.execute(
             sqlalchemy.select(autoscaler_history).where(
@@ -1062,27 +1239,28 @@ def get_status_history(
             'request_count': int(row.request_count),
             'rejected_count': rejected_count,
         })
-    response_time_by_bucket: dict[datetime.datetime, dict[str, list[int]]] = {}
-    for row in response_rows:
-        aggregate = response_time_by_bucket.setdefault(
+    prediction_time_by_bucket: dict[datetime.datetime, dict[str,
+                                                            list[int]]] = {}
+    for row in prediction_rows:
+        aggregate = prediction_time_by_bucket.setdefault(
             row['bucket_start'], {
-                status_class: [0] * constants.LB_RESPONSE_TIME_BUCKET_COUNT
-                for status_class in constants.LB_RESPONSE_TIME_STATUS_CLASSES
+                outcome: [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT
+                for outcome in constants.LB_PREDICTION_TIME_OUTCOMES
             })
-        for status_class in constants.LB_RESPONSE_TIME_STATUS_CLASSES:
-            counts = row[f'status_{status_class}_counts']
-            aggregate[status_class] = [
+        for outcome in constants.LB_PREDICTION_TIME_OUTCOMES:
+            counts = row[f'{outcome}_counts']
+            aggregate[outcome] = [
                 existing + int(incoming)
-                for existing, incoming in zip(aggregate[status_class], counts)
+                for existing, incoming in zip(aggregate[outcome], counts)
             ]
-    response_time_samples = []
-    for bucket_start in sorted(response_time_by_bucket):
-        counts_by_class = response_time_by_bucket[bucket_start]
-        response_time_samples.append({
+    prediction_time_samples = []
+    for bucket_start in sorted(prediction_time_by_bucket):
+        counts_by_outcome = prediction_time_by_bucket[bucket_start]
+        prediction_time_samples.append({
             'timestamp': bucket_start.timestamp(),
-            'status_class_counts': {
-                status_class: counts
-                for status_class, counts in counts_by_class.items()
+            'outcome_counts': {
+                outcome: counts
+                for outcome, counts in counts_by_outcome.items()
                 if any(counts)
             },
         })
@@ -1139,12 +1317,12 @@ def get_status_history(
         'window_end': observed_at.timestamp(),
         'samples': samples,
         'request_samples': request_samples,
-        'response_time_samples': response_time_samples,
+        'prediction_time_samples': prediction_time_samples,
         'autoscaler_samples': autoscaler_samples,
-        'response_time_histogram_version':
-            constants.LB_RESPONSE_TIME_HISTOGRAM_VERSION,
-        'response_time_bucket_upper_bounds_seconds': list(
-            constants.LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+        'prediction_time_histogram_version':
+            constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+        'prediction_time_bucket_upper_bounds_seconds': list(
+            constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
         'rejection_history_available': any(
             row.rejection_count_supported for row in request_rows),
         'request_window_seconds': constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
