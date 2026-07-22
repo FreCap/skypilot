@@ -89,6 +89,7 @@ const readiness = {
   shards_truncated: false,
   workers_truncated: false,
   provider_budgets_truncated: false,
+  queues_truncated: false,
 };
 
 describe('Image readiness', () => {
@@ -199,6 +200,25 @@ describe('Image readiness', () => {
     expect(screen.getByText('10,000+ terminal failures')).toBeVisible();
     expect(screen.getByText('10,000+ failed')).toBeVisible();
     expect(screen.getByText('≥17m')).toBeVisible();
+  });
+
+  it('marks aggregate counts and the table as partial when groups truncate', () => {
+    render(
+      <ImageReadiness
+        readiness={{ ...readiness, queues_truncated: true }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getAllByText('501+')).toHaveLength(1);
+    expect(screen.getByText('3+ terminal failures')).toBeVisible();
+    expect(
+      screen.getByText(/Showing the first 100 target groups/)
+    ).toBeVisible();
+    expect(screen.getByText(/reached a safety bound/)).toBeVisible();
   });
 
   it('ages worker heartbeats from a live client clock', () => {

@@ -127,12 +127,14 @@ export function ImageReadiness({
   const queueDepth =
     readiness?.queues.reduce((sum, queue) => sum + queue.queue_depth, 0) || 0;
   const queueDepthAtLeast = Boolean(
-    readiness?.queues.some((queue) => queue.queue_depth_at_least)
+    readiness?.queues_truncated ||
+      readiness?.queues.some((queue) => queue.queue_depth_at_least)
   );
   const failedCount =
     readiness?.queues.reduce((sum, queue) => sum + queue.failed_count, 0) || 0;
   const failedCountAtLeast = Boolean(
-    readiness?.queues.some((queue) => queue.failed_count_at_least)
+    readiness?.queues_truncated ||
+      readiness?.queues.some((queue) => queue.failed_count_at_least)
   );
 
   if (loading && !readiness) {
@@ -330,6 +332,11 @@ export function ImageReadiness({
             ETA is a provider-quota lower bound. It does not predict node cache
             fill or replica health.
           </p>
+          {readiness.queues_truncated && (
+            <p className="mt-1 text-sm font-medium text-amber-700">
+              Showing the first 100 target groups. Counts are lower bounds.
+            </p>
+          )}
         </div>
         <Table>
           <TableHeader>
@@ -501,7 +508,8 @@ export function ImageReadiness({
       {(readiness.profiles_truncated ||
         readiness.shards_truncated ||
         readiness.workers_truncated ||
-        readiness.provider_budgets_truncated) && (
+        readiness.provider_budgets_truncated ||
+        readiness.queues_truncated) && (
         <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
           This readiness projection reached a safety bound. Narrow the workspace
           or use paginated APIs.

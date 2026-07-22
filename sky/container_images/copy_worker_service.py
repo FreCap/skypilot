@@ -200,10 +200,11 @@ def _inspection_graph(source_reader: providers.RegistryV2Source,
                       max_artifact_bytes: int) -> oci.OciContentGraph:
     limits = oci.OciInspectionLimits(max_artifact_bytes=max_artifact_bytes)
     return oci.build_content_graph(
-        raw_root=source_reader.read_root(),
+        raw_root=source_reader.read_root(max_bytes=limits.max_root_bytes),
         expected_root_digest=source_reader.digest,
         requested_platform=requested_platform,
-        fetch_manifest=source_reader.read_manifest,
+        fetch_manifest=lambda digest: source_reader.read_manifest(
+            digest, max_bytes=limits.max_manifest_bytes),
         fetch_blob=lambda digest: source_reader.read_blob_bytes(
             digest, max_bytes=limits.max_config_bytes),
         limits=limits)

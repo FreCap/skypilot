@@ -26,6 +26,7 @@ _CATALOG_ROW_ID = 'authority'
 _OPERATION_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _FAILED_RESERVATION_SECONDS = 30 * 24 * 60 * 60
 _FAILED_PUBLICATION_RETENTION_SECONDS = 90 * 24 * 60 * 60
+_CATALOG_CHILD_SUMMARY_LIMIT = 10
 
 
 class IdempotencyKeyReusedError(ValueError):
@@ -775,7 +776,7 @@ def list_artifacts(
 
 def catalog_summaries(image_ids: set[str],
                       workspace: str) -> dict[str, dict[str, Any]]:
-    """Loads bounded release, source, and location summaries for one page."""
+    """Loads hard-capped child samples for one bounded artifact page."""
     if not image_ids:
         return {}
     if len(image_ids) > 101:
@@ -787,53 +788,109 @@ def catalog_summaries(image_ids: set[str],
             'source_refs': set(),
             'targets': set(),
             'location_states': {},
+            'publications_truncated': False,
+            'sources_truncated': False,
+            'locations_truncated': False,
         } for image_id in image_ids
+    }
+    params = {
+        'image_ids': json.dumps(sorted(image_ids)),
+        'workspace': workspace,
+        'sample_limit': _CATALOG_CHILD_SUMMARY_LIMIT + 1,
     }
     with orm.Session(engine()) as session:
         publication_rows = session.execute(
-            sqlalchemy.select(
-                schema.publications.c.image_id,
-                schema.publications.c.requested_release,
-                schema.profile_revisions.c.profile).join(
-                    schema.profile_revisions,
-                    schema.publications.c.profile_revision_id ==
-                    schema.profile_revisions.c.id).where(
-                        schema.publications.c.workspace == workspace,
-                        schema.publications.c.image_id.in_(image_ids),
-                        schema.publications.c.state ==
-                        models.ImagePublicationState.READY.value,
-                        schema.publications.c.reservation_active.is_(
-                            True))).mappings().all()
-        ranked_sources = sqlalchemy.select(
-            schema.sources.c.image_id, schema.sources.c.source_ref,
-            sqlalchemy.func.row_number().over(
-                partition_by=schema.sources.c.image_id,
-                order_by=(
-                    schema.sources.c.created_at,
-                    schema.sources.c.id)).label('source_rank')).where(
-                        schema.sources.c.workspace == workspace,
-                        schema.sources.c.image_id.in_(image_ids)).subquery()
+            sqlalchemy.text("""
+                WITH page_images AS (
+                    SELECT value AS image_id
+                    FROM jsonb_array_elements_text(
+                        CAST(:image_ids AS jsonb))
+                )
+                SELECT page.image_id, child.requested_release, child.profile
+                FROM page_images AS page
+                CROSS JOIN LATERAL (
+                    SELECT publication.requested_release, revision.profile,
+                           publication.created_at, publication.id
+                    FROM container_image_publications AS publication
+                    JOIN container_image_profile_revisions AS revision
+                      ON revision.id = publication.profile_revision_id
+                    WHERE publication.workspace = :workspace
+                      AND publication.image_id = page.image_id
+                      AND publication.state = 'READY'
+                      AND publication.reservation_active IS TRUE
+                    ORDER BY publication.created_at, publication.id
+                    LIMIT :sample_limit
+                ) AS child
+                ORDER BY page.image_id, child.created_at, child.id
+            """), params).mappings().all()
         source_rows = session.execute(
-            sqlalchemy.select(
-                ranked_sources.c.image_id, ranked_sources.c.source_ref).where(
-                    ranked_sources.c.source_rank <= 10)).mappings().all()
+            sqlalchemy.text("""
+                WITH page_images AS (
+                    SELECT value AS image_id
+                    FROM jsonb_array_elements_text(
+                        CAST(:image_ids AS jsonb))
+                )
+                SELECT page.image_id, child.source_ref
+                FROM page_images AS page
+                CROSS JOIN LATERAL (
+                    SELECT source.source_ref, source.created_at, source.id
+                    FROM container_image_sources AS source
+                    WHERE source.workspace = :workspace
+                      AND source.image_id = page.image_id
+                    ORDER BY source.created_at, source.id
+                    LIMIT :sample_limit
+                ) AS child
+                ORDER BY page.image_id, child.created_at, child.id
+            """), params).mappings().all()
         location_rows = session.execute(
-            sqlalchemy.select(
-                schema.locations.c.image_id, schema.locations.c.state,
-                schema.registry_shards.c.target_id).join(
-                    schema.registry_shards,
-                    schema.locations.c.shard_id == schema.registry_shards.c.id).
-            where(schema.locations.c.workspace == workspace,
-                  schema.locations.c.image_id.in_(image_ids))).mappings().all()
+            sqlalchemy.text("""
+                WITH page_images AS (
+                    SELECT value AS image_id
+                    FROM jsonb_array_elements_text(
+                        CAST(:image_ids AS jsonb))
+                )
+                SELECT page.image_id, child.state, child.target_id
+                FROM page_images AS page
+                CROSS JOIN LATERAL (
+                    SELECT location.state, shard.target_id,
+                           location.created_at, location.id
+                    FROM container_image_locations AS location
+                    JOIN container_image_registry_shards AS shard
+                      ON shard.id = location.shard_id
+                    WHERE location.workspace = :workspace
+                      AND location.image_id = page.image_id
+                    ORDER BY location.created_at, location.id
+                    LIMIT :sample_limit
+                ) AS child
+                ORDER BY page.image_id, child.created_at, child.id
+            """), params).mappings().all()
+    publication_counts: dict[str, int] = {}
     for row in publication_rows:
-        summary = summaries[str(row['image_id'])]
+        image_id = str(row['image_id'])
+        publication_counts[image_id] = publication_counts.get(image_id, 0) + 1
+        summary = summaries[image_id]
+        if publication_counts[image_id] > _CATALOG_CHILD_SUMMARY_LIMIT:
+            summary['publications_truncated'] = True
+            continue
         summary['releases'].add(str(row['requested_release']))
         summary['distributions'].add(str(row['profile']))
+    source_counts: dict[str, int] = {}
     for row in source_rows:
-        summaries[str(row['image_id'])]['source_refs'].add(
-            str(row['source_ref']))
+        image_id = str(row['image_id'])
+        source_counts[image_id] = source_counts.get(image_id, 0) + 1
+        summary = summaries[image_id]
+        if source_counts[image_id] > _CATALOG_CHILD_SUMMARY_LIMIT:
+            summary['sources_truncated'] = True
+            continue
+        summary['source_refs'].add(str(row['source_ref']))
+    location_counts: dict[str, int] = {}
     for row in location_rows:
-        summary = summaries[str(row['image_id'])]
+        image_id = str(row['image_id'])
+        location_counts[image_id] = location_counts.get(image_id, 0) + 1
+        summary = summaries[image_id]
+        if location_counts[image_id] > _CATALOG_CHILD_SUMMARY_LIMIT:
+            summary['locations_truncated'] = True
+            continue
         summary['targets'].add(str(row['target_id']))
         state = str(row['state'])
         summary['location_states'][state] = (
@@ -845,6 +902,9 @@ def catalog_summaries(image_ids: set[str],
             'source_refs': sorted(summary['source_refs']),
             'targets': sorted(summary['targets']),
             'location_states': dict(sorted(summary['location_states'].items())),
+            'publications_truncated': summary['publications_truncated'],
+            'sources_truncated': summary['sources_truncated'],
+            'locations_truncated': summary['locations_truncated'],
         } for image_id, summary in summaries.items()
     }
 

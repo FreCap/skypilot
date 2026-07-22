@@ -754,13 +754,27 @@ def readiness(request: fastapi.Request,
         shard_records = topology_state.list_shards(resolved, limit=1001)
         workers = topology_state.list_workers(limit=101)
         provider_budgets = topology_state.list_provider_budgets(limit=1001)
-        queues = topology_state.readiness_queue_stats(resolved)
         authority = catalog_state.get_catalog_authority_id()
         assert authority is not None
     except (RuntimeError, ValueError) as error:
         _api_error(error)
     shards_truncated = len(shard_records) > 1000
     shards = shard_records[:1000]
+    queue_shards = shard_records
+    if shards_truncated:
+        boundary = (shard_records[-1].profile, shard_records[-1].target_id,
+                    shard_records[-1].account, shard_records[-1].region)
+        queue_shards = [
+            shard for shard in shard_records
+            if (shard.profile, shard.target_id, shard.account,
+                shard.region) != boundary
+        ]
+    try:
+        queues, queue_groups_truncated = (
+            topology_state.readiness_queue_stats(queue_shards))
+    except (RuntimeError, ValueError) as error:
+        _api_error(error)
+    queues_truncated = shards_truncated or queue_groups_truncated
     profiles_truncated = len(profile_records) > 1000
     profiles = profile_records[:1000]
     workers_truncated = len(workers) > 100
@@ -816,4 +830,5 @@ def readiness(request: fastapi.Request,
         ],
         provider_budgets_truncated=provider_budgets_truncated,
         queues=queues,
+        queues_truncated=queues_truncated,
         generated_at=int(time.time()))

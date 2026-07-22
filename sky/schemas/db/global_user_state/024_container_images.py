@@ -912,6 +912,11 @@ def _create_tables() -> None:
     op.create_index('ix_container_image_publications_image',
                     'container_image_publications',
                     ['image_id', 'created_at', 'id'])
+    op.create_index('ix_container_image_publications_active_image',
+                    'container_image_publications',
+                    ['image_id', 'created_at', 'id'],
+                    postgresql_where=sqlalchemy.text(
+                        "state = 'READY' AND reservation_active IS TRUE"))
     op.create_index('ix_container_image_publications_ready_release',
                     'container_image_publications',
                     ['workspace', 'requested_release', 'image_id'],

@@ -569,6 +569,12 @@ publications = sqlalchemy.Table(
                      'canonical_location_id', 'state', 'id'),
     sqlalchemy.Index('ix_container_image_publications_image', 'image_id',
                      'created_at', 'id'),
+    sqlalchemy.Index('ix_container_image_publications_active_image',
+                     'image_id',
+                     'created_at',
+                     'id',
+                     postgresql_where=sqlalchemy.text(
+                         "state = 'READY' AND reservation_active IS TRUE")),
     sqlalchemy.Index('ix_container_image_publications_ready_release',
                      'workspace',
                      'requested_release',

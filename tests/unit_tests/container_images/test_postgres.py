@@ -4487,9 +4487,11 @@ def test_ambiguous_delete_quarantines_physical_location(
     assert (shard_after.reserved_declared_bytes ==
             shard_before.reserved_declared_bytes)
     assert shard_after.in_flight == 0
+    queues, queues_truncated = topology_state.readiness_queue_stats(
+        topology_state.list_shards('research', limit=1001))
+    assert not queues_truncated
     queue = next(
-        item for item in topology_state.readiness_queue_stats('research')
-        if item['target'] == profile.targets[0].name)
+        item for item in queues if item['target'] == profile.targets[0].name)
     assert queue['quarantined_count'] == 1
     assert not queue['quarantined_count_at_least']
     assert (queue['quarantined_reserved_declared_bytes'] ==
@@ -4602,7 +4604,9 @@ def test_readiness_projection_is_capped_and_index_headed_at_scale(
             })
         connection.execute(sqlalchemy.text('ANALYZE container_image_locations'))
 
-    queues = topology_state.readiness_queue_stats('research')
+    queues, queues_truncated = topology_state.readiness_queue_stats(
+        topology_state.list_shards('research', limit=1001))
+    assert not queues_truncated
     queue = next(
         item for item in queues if item['target'] == profile.targets[0].name)
     assert queue['queue_depth'] == 10_000
@@ -4625,6 +4629,202 @@ def test_readiness_projection_is_capped_and_index_headed_at_scale(
             }).scalar_one()
     assert 'ix_container_image_locations_shard_readiness' in str(plan)
     assert 'Limit' in str(plan)
+
+
+def test_readiness_many_target_groups_use_one_capped_statement(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    template = topology_state.list_shards('research', limit=1001)[0]
+    shards = [
+        dataclasses.replace(
+            template,
+            id=f'readiness-scale-shard-{index}',
+            target_id=f'readiness-scale-target-{index:03d}',
+            target_fingerprint=f'readiness-scale-target-fingerprint-{index}',
+            physical_fingerprint=(
+                f'readiness-scale-physical-fingerprint-{index}'),
+            shard_index=index,
+        ) for index in range(105)
+    ]
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context,
+                         _executemany) -> None:
+        statements.append(statement)
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            record_statement)
+    try:
+        queues, truncated = topology_state.readiness_queue_stats(shards)
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                record_statement)
+
+    assert truncated
+    assert len(queues) == 100
+    assert len(statements) == 1
+    assert 'jsonb_to_recordset' in statements[0]
+    assert 'array_agg' not in statements[0].lower()
+
+
+def test_catalog_summary_is_capped_and_index_headed_for_hot_artifact(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, canonical, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    assert publication_record.image_id is not None
+    authority_id = catalog_state.get_catalog_authority_id()
+    assert authority_id is not None
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_operations (
+                    id, authority_id, scope, actor_hash, kind,
+                    idempotency_key, request_hash, state, created_at,
+                    updated_at, terminal_expires_at
+                )
+                SELECT 'catalog-scale-operation-' || series,
+                       :authority_id, 'research', repeat('1', 64), 'PUBLISH',
+                       'catalog-scale-publication-' || series,
+                       repeat('2', 64), 'SUCCEEDED', 100 + series,
+                       100 + series, 1000000 + series
+                FROM generate_series(1, 20000) AS series
+            """), {'authority_id': authority_id})
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_sources (
+                    id, workspace, image_id, source_ref,
+                    source_root_digest, source_root_media_type,
+                    requested_platform, selected_child_digest, created_at
+                )
+                SELECT 'catalog-scale-source-' || series, 'research',
+                       :image_id,
+                       ('registry.example/catalog-' || series ||
+                        '@sha256:' || lpad(to_hex(series), 64, '0')),
+                       'sha256:' || lpad(to_hex(series), 64, '0'),
+                       :media_type, 'linux/amd64', :runtime_digest,
+                       100 + series
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'image_id': publication_record.image_id,
+                'media_type': _MANIFEST_MEDIA_TYPE,
+                'runtime_digest': _DIGEST,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_publications (
+                    id, workspace, operation_id, profile_revision_id,
+                    requested_release, reservation_active, source_ref,
+                    source_root_digest, requested_platform, state, image_id,
+                    source_id, canonical_location_id, created_at, updated_at
+                )
+                SELECT 'catalog-scale-publication-' || series, 'research',
+                       'catalog-scale-operation-' || series,
+                       :profile_revision_id,
+                       'catalog-scale-release-' || series, TRUE,
+                       ('registry.example/catalog-' || series ||
+                        '@sha256:' || lpad(to_hex(series), 64, '0')),
+                       'sha256:' || lpad(to_hex(series), 64, '0'),
+                       'linux/amd64', 'READY', :image_id,
+                       'catalog-scale-source-' || series,
+                       :canonical_location_id, 100 + series, 100 + series
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'profile_revision_id': active.id,
+                'image_id': publication_record.image_id,
+                'canonical_location_id': canonical.id,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_locations (
+                    id, workspace, image_id, shard_id, target_fingerprint,
+                    physical_fingerprint, runtime_digest, canonical,
+                    canonical_location_id, target_ref, state, attempt_count,
+                    reserved_declared_bytes, created_at, updated_at
+                )
+                SELECT 'catalog-scale-location-' || series, 'research',
+                       :image_id, :shard_id,
+                       'catalog-scale-target-' || series,
+                       'catalog-scale-physical-' || series, :runtime_digest,
+                       FALSE, :canonical_location_id,
+                       ('registry.example/location-' || series || '@' ||
+                        :runtime_digest),
+                       'READY', 0, 1, 100 + series, 100 + series
+                FROM generate_series(1, 20000) AS series
+            """), {
+                'image_id': publication_record.image_id,
+                'shard_id': regional.shard_id,
+                'runtime_digest': _DIGEST,
+                'canonical_location_id': canonical.id,
+            })
+        for table in ('container_image_publications', 'container_image_sources',
+                      'container_image_locations'):
+            connection.execute(sqlalchemy.text(f'ANALYZE {table}'))
+
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context,
+                         _executemany) -> None:
+        statements.append(statement)
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            record_statement)
+    try:
+        summary = catalog_state.catalog_summaries(
+            {publication_record.image_id},
+            'research')[publication_record.image_id]
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                record_statement)
+
+    assert len(statements) == 3
+    assert all('LIMIT' in statement for statement in statements)
+    assert summary['publications_truncated']
+    assert summary['sources_truncated']
+    assert summary['locations_truncated']
+    assert len(summary['releases']) <= 10
+    assert len(summary['source_refs']) <= 10
+    assert sum(summary['location_states'].values()) == 10
+
+    with image_database.connect() as connection:
+        publication_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT requested_release, created_at, id
+                FROM container_image_publications
+                WHERE image_id = :image_id AND state = 'READY'
+                  AND reservation_active IS TRUE
+                ORDER BY created_at, id
+                LIMIT 11
+            """), {
+                'image_id': publication_record.image_id
+            }).scalars().all()
+        source_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT source_ref, created_at, id
+                FROM container_image_sources
+                WHERE image_id = :image_id
+                ORDER BY created_at, id
+                LIMIT 11
+            """), {
+                'image_id': publication_record.image_id
+            }).scalars().all()
+        location_plan = connection.execute(
+            sqlalchemy.text("""
+                EXPLAIN (COSTS OFF)
+                SELECT state, created_at, id
+                FROM container_image_locations
+                WHERE image_id = :image_id
+                ORDER BY created_at, id
+                LIMIT 11
+            """), {
+                'image_id': publication_record.image_id
+            }).scalars().all()
+    assert 'ix_container_image_publications_active_image' in str(
+        publication_plan)
+    assert 'ix_container_image_sources_image' in str(source_plan)
+    assert 'ix_container_image_locations_artifact' in str(location_plan)
 
 
 def test_profile_history_is_keyset_paginated_and_indexed_at_scale(

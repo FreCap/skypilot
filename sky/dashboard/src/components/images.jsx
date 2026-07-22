@@ -59,7 +59,7 @@ function bytes(value) {
   return `${current.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function locationSummary(states) {
+function locationSummary(states, truncated) {
   const entries = Object.entries(states || {});
   if (!entries.length) return <span className="text-gray-400">None</span>;
   return (
@@ -70,6 +70,14 @@ function locationSummary(states) {
           <span className="text-xs text-gray-500">×{count}</span>
         </span>
       ))}
+      {truncated && (
+        <span
+          className="text-xs font-medium text-amber-700"
+          title="More locations exist; open the artifact for paginated details."
+        >
+          more…
+        </span>
+      )}
     </div>
   );
 }
@@ -631,11 +639,14 @@ export function Images() {
                           className="block font-medium text-blue-700 hover:underline"
                         >
                           {artifact.releases.length
-                            ? artifact.releases.join(', ')
+                            ? `${artifact.releases.join(', ')}${
+                                artifact.publications_truncated ? ', more…' : ''
+                              }`
                             : 'Unreleased'}
                         </Link>
                         <div className="mt-1 text-xs text-gray-500">
                           {artifact.distributions.join(', ')}
+                          {artifact.publications_truncated ? ', more…' : ''}
                         </div>
                       </TableCell>
                       <TableCell className="max-w-sm">
@@ -666,13 +677,17 @@ export function Images() {
                           title={artifact.source_refs[0]}
                         >
                           {artifact.source_refs[0] || 'Unknown'}
+                          {artifact.sources_truncated ? ' (more…)' : ''}
                         </div>
                       </TableCell>
                       <TableCell>
                         {bytes(artifact.declared_size_bytes)}
                       </TableCell>
                       <TableCell>
-                        {locationSummary(artifact.location_states)}
+                        {locationSummary(
+                          artifact.location_states,
+                          artifact.locations_truncated
+                        )}
                       </TableCell>
                       <TableCell className="text-sm text-gray-500">
                         {timestamp(artifact.updated_at)}

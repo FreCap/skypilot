@@ -980,6 +980,9 @@ class EcrRepository:
                 raise TypeError('OCI source blob readers must yield bytes.')
             digest.update(chunk)
             size += len(chunk)
+            if size > descriptor.size:
+                raise ValueError(
+                    'OCI source blob exceeds its declared descriptor size.')
             yield chunk
         actual_digest = f'sha256:{digest.hexdigest()}'
         if size != descriptor.size or actual_digest != descriptor.digest:

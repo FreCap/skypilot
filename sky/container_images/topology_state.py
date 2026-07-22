@@ -1232,37 +1232,15 @@ def record_inventory_attestation_and_release(
         return recorded
 
 
-def _bounded_location_count(session: orm.Session, shard_ids: list[str],
-                            states: tuple[str, ...], result_cap: int) -> int:
-    bounded = sqlalchemy.select(schema.locations.c.id).where(
-        schema.locations.c.shard_id.in_(shard_ids),
-        schema.locations.c.state.in_(states)).limit(result_cap + 1).subquery()
-    statement = sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
-                                 ).select_from(bounded)
-    return int(session.execute(statement).scalar_one())
-
-
-def _bounded_location_reservation_stats(session: orm.Session,
-                                        shard_ids: list[str], state: str,
-                                        result_cap: int) -> tuple[int, int]:
-    bounded = sqlalchemy.select(
-        schema.locations.c.id,
-        schema.locations.c.reserved_declared_bytes).where(
-            schema.locations.c.shard_id.in_(shard_ids),
-            schema.locations.c.state == state).limit(result_cap + 1).subquery()
-    statement = sqlalchemy.select(
-        sqlalchemy.func.count(),  # pylint: disable=not-callable
-        sqlalchemy.func.coalesce(
-            sqlalchemy.func.sum(bounded.c.reserved_declared_bytes), 0),
-    ).select_from(bounded)
-    count, reserved_bytes = session.execute(statement).one()
-    return int(count), int(reserved_bytes)
-
-
-def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
-    """Returns bounded queue and capacity aggregates without provider I/O."""
+def readiness_queue_stats(
+    shard_records: list[ShardRecord],
+    *,
+    group_limit: int = 100,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Returns one capped, fixed-query projection for selected shard groups."""
+    if not 1 <= group_limit <= 100:
+        raise ValueError('Readiness queue group limit must be 1 through 100.')
     result_cap = 10_000
-    shards = schema.registry_shards
     pending_states = (
         models.ImageLocationState.PENDING.value,
         models.ImageLocationState.COPYING.value,
@@ -1270,86 +1248,131 @@ def readiness_queue_stats(workspace: str) -> list[dict[str, Any]]:
         models.ImageLocationState.MISSING.value,
         models.ImageLocationState.EVICTED.value,
     )
-    capacity_statement = sqlalchemy.select(
-        shards.c.profile,
-        shards.c.target_id,
-        shards.c.account,
-        shards.c.region,
-        sqlalchemy.func.sum(
-            shards.c.reserved_manifests).label('reserved_manifests'),
-        sqlalchemy.func.sum(shards.c.max_manifests).label('max_manifests'),
-        sqlalchemy.func.sum(
-            shards.c.reserved_declared_bytes).label('reserved_declared_bytes'),
-        sqlalchemy.func.sum(
-            shards.c.max_declared_bytes).label('max_declared_bytes'),
-        sqlalchemy.func.sum(shards.c.in_flight).label('in_flight'),
-        sqlalchemy.func.sum(shards.c.max_in_flight).label('max_in_flight'),
-        sqlalchemy.func.array_agg(shards.c.id).label('shard_ids'),
-    ).where(shards.c.workspace == workspace).group_by(
-        shards.c.profile, shards.c.target_id, shards.c.account,
-        shards.c.region).order_by(shards.c.profile, shards.c.target_id)
+    grouped: dict[tuple[str, str, str, str], list[ShardRecord]] = {}
+    for shard in shard_records:
+        key = (shard.profile, shard.target_id, shard.account, shard.region)
+        grouped.setdefault(key, []).append(shard)
+    ordered_groups = sorted(grouped.items())
+    truncated = len(ordered_groups) > group_limit
+    selected_groups = ordered_groups[:group_limit]
+    for _, items in selected_groups:
+        if len(items) > 256:
+            raise ValueError(
+                'Registry target contains too many physical shards.')
+    if not selected_groups:
+        return [], truncated
+    group_payload = [{
+        'group_index': index,
+        'shard_ids': [shard.id for shard in items],
+    } for index, (_, items) in enumerate(selected_groups)]
+    statement = sqlalchemy.text("""
+        WITH selected_groups AS (
+            SELECT group_index, shard_ids
+            FROM jsonb_to_recordset(CAST(:groups AS jsonb))
+                 AS selected(group_index integer, shard_ids text[])
+        )
+        SELECT selected.group_index,
+               queued.result_count AS queued_count,
+               failed.result_count AS failed_count,
+               quarantined.result_count AS quarantined_count,
+               quarantined.reserved_bytes AS quarantined_bytes,
+               oldest.updated_at AS oldest_queued_at
+        FROM selected_groups AS selected
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS result_count
+            FROM (
+                SELECT location.id
+                FROM container_image_locations AS location
+                WHERE location.shard_id = ANY(selected.shard_ids)
+                  AND location.state = ANY(CAST(:pending_states AS text[]))
+                LIMIT :result_limit
+            ) AS bounded
+        ) AS queued
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS result_count
+            FROM (
+                SELECT location.id
+                FROM container_image_locations AS location
+                WHERE location.shard_id = ANY(selected.shard_ids)
+                  AND location.state = ANY(CAST(:failed_states AS text[]))
+                LIMIT :result_limit
+            ) AS bounded
+        ) AS failed
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS result_count,
+                   COALESCE(SUM(bounded.reserved_declared_bytes), 0)
+                       AS reserved_bytes
+            FROM (
+                SELECT location.reserved_declared_bytes
+                FROM container_image_locations AS location
+                WHERE location.shard_id = ANY(selected.shard_ids)
+                  AND location.state = 'QUARANTINED'
+                LIMIT :result_limit
+            ) AS bounded
+        ) AS quarantined
+        CROSS JOIN LATERAL (
+            SELECT MIN(candidate.updated_at) AS updated_at
+            FROM unnest(selected.shard_ids) AS shard(id)
+            CROSS JOIN unnest(CAST(:pending_states AS text[]))
+                AS state(value)
+            CROSS JOIN LATERAL (
+                SELECT location.updated_at
+                FROM container_image_locations AS location
+                WHERE location.shard_id = shard.id
+                  AND location.state = state.value
+                ORDER BY location.updated_at, location.id
+                LIMIT 1
+            ) AS candidate
+        ) AS oldest
+        ORDER BY selected.group_index
+    """)
     with orm.Session(catalog_state.engine()) as session:
-        rows = session.execute(capacity_statement).mappings().all()
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            shard_ids = [str(item) for item in row['shard_ids']]
-            queued_count = _bounded_location_count(session, shard_ids,
-                                                   pending_states, result_cap)
-            failed_count = _bounded_location_count(
-                session, shard_ids,
-                (models.ImageLocationState.FAILED.value,
-                 models.ImageLocationState.QUARANTINED.value), result_cap)
-            quarantined_count, quarantined_bytes = (
-                _bounded_location_reservation_stats(
-                    session, shard_ids,
-                    models.ImageLocationState.QUARANTINED.value, result_cap))
-            # The minimum of each shard/state index head is the exact global
-            # oldest row, without scanning or sorting the complete queue.
-            oldest_statement = sqlalchemy.text("""
-                SELECT MIN(candidate.updated_at)
-                FROM unnest(CAST(:shard_ids AS text[])) AS shard(id)
-                CROSS JOIN unnest(CAST(:states AS text[])) AS selected(state)
-                CROSS JOIN LATERAL (
-                    SELECT location.updated_at
-                    FROM container_image_locations AS location
-                    WHERE location.shard_id = shard.id
-                      AND location.state = selected.state
-                    ORDER BY location.updated_at, location.id
-                    LIMIT 1
-                ) AS candidate
-            """).bindparams(
-                sqlalchemy.bindparam('shard_ids',
-                                     type_=postgresql.ARRAY(sqlalchemy.Text())),
-                sqlalchemy.bindparam('states',
-                                     type_=postgresql.ARRAY(sqlalchemy.Text())))
-            oldest_queued_at = session.execute(oldest_statement, {
-                'shard_ids': shard_ids,
-                'states': list(pending_states),
-            }).scalar_one()
-            results.append({
-                'profile': str(row['profile']),
-                'target': str(row['target_id']),
-                'account': str(row['account']),
-                'region': str(row['region']),
-                'reserved_manifests': int(row['reserved_manifests'] or 0),
-                'max_manifests': int(row['max_manifests'] or 0),
-                'reserved_declared_bytes': int(row['reserved_declared_bytes'] or
-                                               0),
-                'max_declared_bytes': int(row['max_declared_bytes'] or 0),
-                'in_flight': int(row['in_flight'] or 0),
-                'max_in_flight': int(row['max_in_flight'] or 0),
-                'queue_depth': min(queued_count, result_cap),
-                'queue_depth_at_least': queued_count > result_cap,
-                'failed_count': min(failed_count, result_cap),
-                'failed_count_at_least': failed_count > result_cap,
-                'quarantined_count': min(quarantined_count, result_cap),
-                'quarantined_count_at_least': quarantined_count > result_cap,
-                'quarantined_reserved_declared_bytes': quarantined_bytes,
-                'quarantined_reserved_declared_bytes_at_least':
-                    quarantined_count > result_cap,
-                'oldest_queued_at': oldest_queued_at,
-            })
-    return results
+        rows = session.execute(
+            statement, {
+                'groups': json.dumps(group_payload),
+                'pending_states': list(pending_states),
+                'failed_states': [
+                    models.ImageLocationState.FAILED.value,
+                    models.ImageLocationState.QUARANTINED.value,
+                ],
+                'result_limit': result_cap + 1,
+            }).mappings().all()
+    stats = {int(row['group_index']): row for row in rows}
+    results: list[dict[str, Any]] = []
+    for index, (key, items) in enumerate(selected_groups):
+        row = stats[index]
+        queued_count = int(row['queued_count'])
+        failed_count = int(row['failed_count'])
+        quarantined_count = int(row['quarantined_count'])
+        profile, target, account, region = key
+        results.append({
+            'profile': profile,
+            'target': target,
+            'account': account,
+            'region': region,
+            'reserved_manifests': sum(item.reserved_manifests for item in items
+                                     ),
+            'max_manifests': sum(item.max_manifests for item in items),
+            'reserved_declared_bytes': sum(
+                item.reserved_declared_bytes for item in items),
+            'max_declared_bytes': sum(item.max_declared_bytes for item in items
+                                     ),
+            'in_flight': sum(item.in_flight for item in items),
+            'max_in_flight': sum(item.max_in_flight for item in items),
+            'queue_depth': min(queued_count, result_cap),
+            'queue_depth_at_least': queued_count > result_cap,
+            'failed_count': min(failed_count, result_cap),
+            'failed_count_at_least': failed_count > result_cap,
+            'quarantined_count': min(quarantined_count, result_cap),
+            'quarantined_count_at_least': quarantined_count > result_cap,
+            'quarantined_reserved_declared_bytes': int(row['quarantined_bytes']
+                                                      ),
+            'quarantined_reserved_declared_bytes_at_least': quarantined_count >
+                                                            result_cap,
+            'oldest_queued_at': (int(row['oldest_queued_at']) if
+                                 row['oldest_queued_at'] is not None else None),
+        })
+    return results, truncated
 
 
 def get_shard(shard_id: str) -> ShardRecord | None:

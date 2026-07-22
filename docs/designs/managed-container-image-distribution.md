@@ -391,6 +391,20 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    release ceiling is a typed `IMAGE_LIMIT_EXCEEDED` failure rather than a
    source-content validation failure.
 
+Source adoption is also a network trust boundary. Publication request handling
+validates syntax only and performs no DNS or registry I/O. The isolated copy
+worker accepts only credential-free HTTPS source and redirect URLs, disables
+environment proxy inheritance, rejects localhost and non-public IP literals,
+and checks the actual connected peer immediately after every TCP connection and
+before TLS, HTTP bytes, or credentials. This closes direct private addresses,
+DNS rebinding, bearer realms, and signed-URL redirects over private or link-local
+space. Basic source credentials may authenticate a bearer realm only on the
+same normalized authority. Token requests never follow redirects. A blob may
+follow at most one public HTTPS redirect without forwarding source
+authorization. Manifest, token, config, and blob inspection bodies are streamed
+under explicit byte limits. Private-network source registries require a future
+qualified operator-controlled network policy and are not accepted by v0.
+
 An existing READY release is immutable. A conflicting digest is rejected. A
 failed replacement never changes another release or any deployment already
 pinned to an older artifact.
@@ -1899,9 +1913,22 @@ per profile. Profile-history reads use an indexed, newest-first keyset page and
 never materialize the durable revision history. Capabilities first derive the
 at-most-128 configured and allowed profile names, then query only their ACTIVE
 rows through the partial unique index; it does not scan historical revisions.
-Readiness counts scan at most 10,001 indexed queue rows per target and report
-`at_least: 10000` above that cap; oldest-age lookup is index-bounded. No
-dashboard read creates a generic request row.
+Each catalog page loads at most ten active-publication, source, and location
+samples per artifact through three fixed lateral-limit statements and matching
+artifact indexes. `publications_truncated`, `sources_truncated`, and
+`locations_truncated` mark partial summaries; the UI labels them as partial and
+uses the paginated artifact endpoints for complete detail.
+
+Readiness first selects at most 1,001 shards, excludes any boundary target group
+that could be partial, and projects at most the first 100 complete
+profile/target/account/region groups. One fixed PostgreSQL statement serves all
+selected groups. Each group scans at most 10,001 indexed queue rows per state
+class and reports `at_least: 10000` above that cap; oldest age reads one indexed
+head per shard and pending state. `queues_truncated` marks either shard or group
+truncation, so aggregate counts and the table are displayed as lower bounds.
+The query never materializes every durable group, uses no global `array_agg`, and
+does not issue per-group round trips. No dashboard read creates a generic
+request row.
 
 The workspace publication feed is required for recovery, not a duplicate
 catalog. A publication that fails while inspecting its source has no artifact
@@ -1917,6 +1944,10 @@ CLI or Dashboard locates such a publication for explicit retry.
   arguments, API responses, or dashboard state.
 - Source authentication is a named access-binding reference resolved only inside
   the isolated worker. V0 supports only source paths with a qualified resolver.
+- Source registry connections require a public HTTPS peer at connect time.
+  Proxy inheritance, private or link-local peers, cross-authority basic
+  credential forwarding, bearer-token redirects, redirect chains, and
+  unbounded source response bodies fail closed before destination authority.
 - Provider errors are mapped to bounded codes before persistence.
 - API, copy base/target, lifecycle base/target, and runtime-pull identities are
   non-interchangeable.
@@ -2022,6 +2053,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- source-reader tests for private literals, DNS rebinding before TLS bytes,
+  off-authority bearer realms, private and chained redirects, disabled token
+  redirects, absent proxy inheritance, credential non-forwarding, and streamed
+  token/manifest size ceilings;
 - replay after lost mutation responses, key/body collision, detach before/after
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
@@ -2043,6 +2078,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, and inventory claims use their exact partial
   due-time indexes with large terminal or idle populations present;
+- hot-artifact catalog fixtures proving three fixed summary statements, ten-row
+  child caps, explicit truncation flags, and publication/source/location index
+  plans, plus many-target readiness fixtures proving one statement, a 100-group
+  cap, queue lower-bound flags, and no per-group query growth;
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;
@@ -2492,3 +2531,19 @@ table name while independently changing a column type, named check constraint,
 named index, and generated expression; further cases cover missing and extra
 tables, changed cluster-binding columns, and invalid or non-singleton catalog
 state. Each case must fail atomically before preview adoption.
+
+The restarted parallel final-acceptance attempt at
+`b335624f6fc7d47283c14e787957317e3b4e8fcb` was halted before pairing and the
+streak remained zero. One Codex round returned `PURSUE`, while two independent
+Codex rounds returned `RESHAPE`; the pending Fable processes were stopped once
+the blockers were confirmed. The first blocker allowed a digest-pinned source,
+bearer realm, redirect, or rebound hostname to reach private network peers and
+could forward basic credentials across authorities. The second found that a hot
+artifact catalog summary scanned all child rows and that readiness materialized
+all shard groups followed by four database round trips per group. This revision
+adds the connect-time public-peer and credential-confinement contract, bounded
+source bodies, fixed ten-row catalog child samples with truncation markers, and
+a single-statement readiness projection over at most 100 preselected complete
+target groups. Hot-artifact index plans, fixed statement counts, many-group
+truncation, and UI lower-bound behavior are executable acceptance proofs before
+the next paired round starts.

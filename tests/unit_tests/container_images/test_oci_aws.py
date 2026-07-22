@@ -439,6 +439,18 @@ class _AwsError(Exception):
         self.response = {'Error': {'Code': code}}
 
 
+def test_ecr_copy_rejects_source_blob_above_descriptor_before_upload() -> None:
+    descriptor = oci.OciDescriptor(media_type='application/octet-stream',
+                                   digest='sha256:' + 'a' * 64,
+                                   size=3)
+    chunks = aws.EcrRepository._verified_chunks(  # pylint: disable=protected-access
+        [b'ab', b'cd'], descriptor, threading.Event())
+
+    assert next(chunks) == b'ab'
+    with pytest.raises(ValueError, match='exceeds its declared descriptor'):
+        next(chunks)
+
+
 def test_ecr_copy_and_delete_converge_only_on_exact_digest() -> None:
     manifest, config, _ = _image()
     graph = _graph_from_root(manifest, config, platform='linux/amd64')

@@ -171,6 +171,9 @@ class CatalogArtifactView(ArtifactView):
     source_refs: list[str]
     targets: list[str]
     location_states: dict[str, int]
+    publications_truncated: bool = False
+    sources_truncated: bool = False
+    locations_truncated: bool = False
 
     @classmethod
     def from_summary(
@@ -502,4 +505,5 @@ class ReadinessView(_ApiModel):
     provider_budgets: list[ProviderBudgetView]
     provider_budgets_truncated: bool
     queues: list[dict[str, Any]]
+    queues_truncated: bool = False
     generated_at: int

@@ -17,6 +17,14 @@ jest.mock('next/router', () => ({
   useRouter: () => mockRouter,
 }));
 
+jest.mock(
+  'next/link',
+  () =>
+    function MockLink({ children }) {
+      return children;
+    }
+);
+
 jest.mock('@/data/connectors/images', () => ({
   getImageCapabilities: jest.fn(),
   getImageCatalog: jest.fn(),
@@ -92,6 +100,43 @@ describe('Images dashboard', () => {
     expect(screen.queryByRole('button', { name: 'Readiness' })).toBeNull();
     await waitFor(() => expect(getImageCatalog).toHaveBeenCalledTimes(1));
     expect(getImagePublications).not.toHaveBeenCalled();
+  });
+
+  it('marks every bounded catalog summary as partial', async () => {
+    getImageCapabilities.mockResolvedValue(capabilities());
+    getImageCatalog.mockResolvedValue({
+      items: [
+        {
+          id: 'image-1',
+          releases: ['boltz-l4'],
+          distributions: ['gpu-production'],
+          source_refs: ['ghcr.io/boltz-bio/runtime@sha256:abc'],
+          targets: ['aws-us-west-2'],
+          location_states: { READY: 10 },
+          publications_truncated: true,
+          sources_truncated: true,
+          locations_truncated: true,
+          runtime_digest: 'sha256:runtime',
+          platform: 'linux/amd64',
+          declared_size_bytes: 1024,
+          updated_at: 100,
+        },
+      ],
+      next_cursor: null,
+    });
+
+    render(<Images />);
+
+    expect(await screen.findByText('boltz-l4, more…')).toBeVisible();
+    expect(screen.getByText('gpu-production, more…')).toBeVisible();
+    expect(
+      screen.getByText('ghcr.io/boltz-bio/runtime@sha256:abc (more…)')
+    ).toBeVisible();
+    expect(
+      screen.getByTitle(
+        'More locations exist; open the artifact for paginated details.'
+      )
+    ).toBeVisible();
   });
 
   it('resets a stale keyset cursor and reloads the first page', async () => {
