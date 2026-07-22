@@ -21,19 +21,36 @@ class TestBackoff:
         assert huge == service._CHILD_RESPAWN_BACKOFF_CAP_SECONDS
 
 
-class TestControllerUnresponsiveGrace:
+class _FakeProc:
 
-    def test_live_child_is_not_replaced_before_grace(self):
-        grace = service._CHILD_UNRESPONSIVE_GRACE_SECONDS
-        assert not service._live_child_unresponsive_too_long(
-            100.0, 100.0 + grace - 0.001)
+    def __init__(self, alive=True, error=None):
+        self._alive = alive
+        self._error = error
+        self.pid = 123
 
-    def test_live_child_is_replaced_at_grace(self):
-        grace = service._CHILD_UNRESPONSIVE_GRACE_SECONDS
-        assert service._live_child_unresponsive_too_long(100.0, 100.0 + grace)
+    def is_alive(self):
+        if self._error is not None:
+            raise self._error
+        return self._alive
 
-    def test_healthy_child_has_no_unresponsive_deadline(self):
-        assert not service._live_child_unresponsive_too_long(None, 10_000.0)
+
+class TestControllerReplacementTrigger:
+
+    def test_live_child_is_never_replaced_for_elapsed_health_miss(self):
+        process = _FakeProc(alive=True)
+        for unused_elapsed_seconds in (60, 300, 3600):
+            assert not service._controller_child_needs_respawn('svc', process)
+
+    def test_dead_child_needs_respawn(self):
+        assert service._controller_child_needs_respawn('svc',
+                                                       _FakeProc(alive=False))
+
+    def test_missing_child_handle_fails_closed(self):
+        assert not service._controller_child_needs_respawn('svc', None)
+
+    def test_liveness_error_fails_closed(self):
+        assert not service._controller_child_needs_respawn(
+            'svc', _FakeProc(error=RuntimeError('unknown')))
 
     def test_live_child_health_miss_is_graced_with_healthy_data_plane(self):
         assert service._controller_health_miss_is_graced(
@@ -41,7 +58,7 @@ class TestControllerUnresponsiveGrace:
             controller_needs_respawn=False,
             external_lb_healthy=True)
 
-    def test_health_miss_is_not_graced_after_respawn_deadline(self):
+    def test_health_miss_is_not_graced_for_dead_child(self):
         assert not service._controller_health_miss_is_graced(
             controller_responding=False,
             controller_needs_respawn=True,
