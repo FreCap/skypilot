@@ -339,9 +339,19 @@ def _schedule_demand_capacity_refresh(contexts: set[str]) -> None:
         if _DEMAND_REFRESH_RUNNING:
             return
         _DEMAND_REFRESH_RUNNING = True
-    threading.Thread(target=_demand_capacity_refresh_worker,
-                     name='serve-demand-capacity-refresh',
-                     daemon=True).start()
+    worker = threading.Thread(target=_demand_capacity_refresh_worker,
+                              name='serve-demand-capacity-refresh',
+                              daemon=True)
+    try:
+        worker.start()
+    except RuntimeError as e:
+        # Thread.start() can fail under transient process-wide thread
+        # exhaustion. No worker exists to release this reservation, so make
+        # the pending contexts retryable by the next reconciliation tick.
+        with _DEMAND_REFRESH_STATE_LOCK:
+            _DEMAND_REFRESH_RUNNING = False
+        logger.error('Failed to start shared demand-capacity refresh worker: '
+                     f'{common_utils.format_exception(e)}')
 
 
 def get_cached_free_gpus_by_pool(

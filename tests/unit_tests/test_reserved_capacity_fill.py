@@ -1522,6 +1522,83 @@ class TestQueryFreeSlots(unittest.TestCase):
         self.assertIsNone(availability)
 
 
+class TestDemandCapacityRefreshScheduling(unittest.TestCase):
+    """Worker launch ownership follows the actual worker lifecycle."""
+
+    def setUp(self):
+        self._old_running = reserved_capacity._DEMAND_REFRESH_RUNNING
+        self._old_pending = set(
+            reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS)
+        reserved_capacity._DEMAND_REFRESH_RUNNING = False
+        reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS.clear()
+
+    def tearDown(self):
+        reserved_capacity._DEMAND_REFRESH_RUNNING = self._old_running
+        reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS.clear()
+        reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS.update(
+            self._old_pending)
+
+    def test_launch_failure_releases_ownership_and_preserves_pending(self):
+        worker = mock.Mock()
+
+        def _fail_start():
+            # Model another reconciliation coalescing work after launch
+            # ownership was reserved but before Thread.start() failed.
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-b'})
+            raise RuntimeError("can't start new thread")
+
+        worker.start.side_effect = _fail_start
+        with mock.patch.object(reserved_capacity.threading,
+                               'Thread',
+                               return_value=worker), \
+             mock.patch.object(reserved_capacity.logger, 'error') as error:
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-a'})
+
+        self.assertFalse(reserved_capacity._DEMAND_REFRESH_RUNNING)
+        self.assertEqual(reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS,
+                         {'ctx-a', 'ctx-b'})
+        error.assert_called_once()
+
+    def test_next_schedule_retries_all_pending_contexts(self):
+        worker = mock.Mock()
+        starts = 0
+
+        def _start():
+            nonlocal starts
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("can't start new thread")
+
+        worker.start.side_effect = _start
+        with mock.patch.object(reserved_capacity.threading,
+                               'Thread',
+                               return_value=worker):
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-a'})
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-b'})
+
+        self.assertEqual(starts, 2)
+        self.assertTrue(reserved_capacity._DEMAND_REFRESH_RUNNING)
+        self.assertEqual(reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS,
+                         {'ctx-a', 'ctx-b'})
+
+    def test_successful_launch_remains_single_flight(self):
+        worker = mock.Mock()
+        with mock.patch.object(reserved_capacity.threading,
+                               'Thread',
+                               return_value=worker) as thread:
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-a'})
+            reserved_capacity._schedule_demand_capacity_refresh({'ctx-b'})
+
+        thread.assert_called_once_with(
+            target=reserved_capacity._demand_capacity_refresh_worker,
+            name='serve-demand-capacity-refresh',
+            daemon=True)
+        worker.start.assert_called_once_with()
+        self.assertTrue(reserved_capacity._DEMAND_REFRESH_RUNNING)
+        self.assertEqual(reserved_capacity._DEMAND_REFRESH_PENDING_CONTEXTS,
+                         {'ctx-a', 'ctx-b'})
+
+
 class TestCostFeasibilityDegradation(unittest.TestCase):
     """Empty feasible list degrades to inf cost, never a boot crash."""
 
