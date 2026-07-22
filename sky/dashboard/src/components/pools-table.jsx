@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useState } from 'react';
 import Link from 'next/link';
 import { CircularProgress } from '@mui/material';
 
@@ -18,95 +18,15 @@ import {
   TableCell,
 } from '@/components/ui/table';
 import { buildFilterUrl } from '@/components/shared/FilterSystem';
-import { getPoolStatus } from '@/data/connectors/jobs';
-import dashboardCache from '@/lib/cache';
 
-export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
-  const [data, setData] = useState([]);
+export function PoolsTable({ data, loading }) {
   const [sortConfig, setSortConfig] = useState({
     key: null,
     direction: 'ascending',
   });
-  const [loading, setLocalLoading] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
-  const mountedRef = useRef(false);
-  const requestVersionRef = useRef(0);
-  const refreshInFlightRef = useRef(null);
-
-  const fetchData = React.useCallback(
-    async ({ forceRefresh = false } = {}) => {
-      const version = requestVersionRef.current + 1;
-      requestVersionRef.current = version;
-      refreshInFlightRef.current = version;
-      const ownsState = () =>
-        mountedRef.current && version === requestVersionRef.current;
-      setLocalLoading(true);
-      setLoading(true);
-      try {
-        if (forceRefresh) {
-          dashboardCache.invalidate(getPoolStatus, [{}]);
-        }
-        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
-        if (!ownsState()) return;
-        const { pools = [] } = poolsResponse || {};
-        setData(pools);
-        setIsInitialLoad(false);
-      } catch (err) {
-        if (!ownsState()) return;
-        console.error('Error fetching pools data:', err);
-        if (!forceRefresh) {
-          setData([]);
-        }
-        setIsInitialLoad(false);
-      } finally {
-        if (ownsState()) {
-          setLocalLoading(false);
-          setLoading(false);
-        }
-        if (refreshInFlightRef.current === version) {
-          refreshInFlightRef.current = null;
-        }
-      }
-    },
-    [setLoading]
-  );
-
-  // Expose fetchData to parent component
-  React.useEffect(() => {
-    if (refreshDataRef) {
-      refreshDataRef.current = fetchData;
-    }
-    return () => {
-      if (refreshDataRef?.current === fetchData) {
-        refreshDataRef.current = null;
-      }
-    };
-  }, [refreshDataRef, fetchData]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    setData([]);
-    let isCurrent = true;
-
-    fetchData();
-
-    const interval = setInterval(() => {
-      if (isCurrent && window.document.visibilityState === 'visible') {
-        if (refreshInFlightRef.current) return;
-        void fetchData({ forceRefresh: true });
-      }
-    }, refreshInterval);
-
-    return () => {
-      isCurrent = false;
-      mountedRef.current = false;
-      requestVersionRef.current += 1;
-      refreshInFlightRef.current = null;
-      clearInterval(interval);
-    };
-  }, [refreshInterval, fetchData]);
+  const poolRows = React.useMemo(() => data || [], [data]);
 
   const requestSort = (key) => {
     let direction = 'ascending';
@@ -125,9 +45,9 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
 
   // Sort the data
   const sortedData = React.useMemo(() => {
-    if (!sortConfig.key) return data;
+    if (!sortConfig.key) return poolRows;
 
-    return [...data].sort((a, b) => {
+    return [...poolRows].sort((a, b) => {
       if (a[sortConfig.key] < b[sortConfig.key]) {
         return sortConfig.direction === 'ascending' ? -1 : 1;
       }
@@ -136,7 +56,7 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
       }
       return 0;
     });
-  }, [data, sortConfig]);
+  }, [poolRows, sortConfig]);
 
   // Calculate pagination
   const totalPages = Math.ceil(sortedData.length / pageSize);
@@ -217,7 +137,7 @@ export function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {loading && isInitialLoad ? (
+            {loading && poolRows.length === 0 ? (
               <TableRow>
                 <TableCell
                   colSpan={5}
