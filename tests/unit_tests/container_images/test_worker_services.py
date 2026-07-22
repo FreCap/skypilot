@@ -305,11 +305,11 @@ def test_canary_persists_only_closed_error_codes(
     monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
                         _OwnedHeartbeat)
     failed = mock.Mock()
-    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
-                        failed)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', failed)
 
     assert not canary_worker_service.run_canary(operation)
-    failed.assert_called_once_with(operation, expected, now=mock.ANY)
+    failed.assert_called_once_with(operation, expected, teardown_verified=True)
 
 
 def test_deadline_expired_canary_without_child_terminalizes_without_provider(
@@ -325,16 +325,15 @@ def test_deadline_expired_canary_without_child_terminalizes_without_provider(
          mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
     run_ec2 = mock.Mock()
     monkeypatch.setattr(canary_worker_service, '_run_ec2_canary', run_ec2)
-    fail_expired = mock.Mock(return_value=True)
+    failed = mock.Mock(return_value=True)
     monkeypatch.setattr(canary_worker_service.qualification,
-                        'fail_expired_canary', fail_expired)
+                        'fail_owned_canary', failed)
 
     assert not canary_worker_service.run_canary(operation)
     run_ec2.assert_not_called()
-    fail_expired.assert_called_once_with(operation,
-                                         'CANARY_TIMEOUT',
-                                         teardown_verified=True,
-                                         now=mock.ANY)
+    failed.assert_called_once_with(operation,
+                                   'CANARY_TIMEOUT',
+                                   teardown_verified=True)
 
 
 def test_unverified_canary_teardown_remains_reclaimable(
@@ -352,15 +351,11 @@ def test_unverified_canary_teardown_remains_reclaimable(
         canary_worker_service, '_run_ec2_canary',
         mock.Mock(side_effect=ValueError('CANARY_TEARDOWN_FAILED')))
     fail = mock.Mock()
-    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
-                        fail)
-    fail_expired = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification,
-                        'fail_expired_canary', fail_expired)
+                        'fail_owned_canary', fail)
 
     assert not canary_worker_service.run_canary(operation)
     fail.assert_not_called()
-    fail_expired.assert_not_called()
 
 
 def test_persisted_canary_child_survives_contract_reload_failure(
@@ -373,15 +368,11 @@ def test_persisted_canary_child_survives_contract_reload_failure(
         canary_worker_service, '_load_contract',
         mock.Mock(side_effect=ValueError('QUALIFICATION_FAILED')))
     fail = mock.Mock()
-    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
-                        fail)
-    fail_expired = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification,
-                        'fail_expired_canary', fail_expired)
+                        'fail_owned_canary', fail)
 
     assert not canary_worker_service.run_canary(operation)
     fail.assert_not_called()
-    fail_expired.assert_not_called()
 
 
 @pytest.mark.parametrize('backend', ['aws_vm', 'aws_eks'])
@@ -422,15 +413,13 @@ def test_initial_canary_client_failure_terminalizes_without_provider_child(
             mock.Mock(
                 side_effect=RuntimeError('Kubernetes client unavailable')))
     failed = mock.Mock(return_value=True)
-    monkeypatch.setattr(canary_worker_service.qualification, 'fail_canary',
-                        failed)
-    fail_expired = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification,
-                        'fail_expired_canary', fail_expired)
+                        'fail_owned_canary', failed)
 
     assert not canary_worker_service.run_canary(operation)
-    failed.assert_called_once_with(operation, 'CANARY_FAILED', now=mock.ANY)
-    fail_expired.assert_not_called()
+    failed.assert_called_once_with(operation,
+                                   'CANARY_FAILED',
+                                   teardown_verified=True)
 
 
 def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
@@ -1343,6 +1332,7 @@ def test_inventory_lease_loss_during_budget_wait_blocks_provider_call(
     record_page.assert_not_called()
     abandon.assert_called_once_with(shard.id,
                                     'inventory-token',
+                                    shard.inventory_epoch,
                                     invalid_cursor=False)
 
 

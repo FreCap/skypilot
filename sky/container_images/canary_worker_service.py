@@ -790,15 +790,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
 def _fail_owned_canary(operation: catalog_state.OperationRecord, code: str,
                        heartbeat: worker_lease.LeaseHeartbeat) -> None:
     heartbeat.assert_owned()
-    current = int(time.time())
-    deadline = operation.teardown_deadline
-    if deadline is not None and current >= deadline:
-        qualification.fail_expired_canary(operation,
-                                          'CANARY_TIMEOUT',
-                                          teardown_verified=True,
-                                          now=current)
-    else:
-        qualification.fail_canary(operation, code, now=current)
+    qualification.fail_owned_canary(operation, code, teardown_verified=True)
 
 
 def run_canary(operation: catalog_state.OperationRecord,

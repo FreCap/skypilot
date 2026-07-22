@@ -1155,28 +1155,46 @@ def release_inventory_claim(shard_id: str,
 
 def abandon_inventory_claim(shard_id: str,
                             lease_token: str,
+                            expected_inventory_epoch: int,
                             *,
                             invalid_cursor: bool = False,
                             now: int | None = None) -> bool:
     """Releases a failed claim, restarting only an invalid provider cursor."""
-    current = int(time.time()) if now is None else now
-    values: dict[str, Any] = {
-        'inventory_lease_token': None,
-        'inventory_lease_expires_at': None,
-        'inventory_next_at': current,
-        'updated_at': current,
-    }
-    if invalid_cursor:
-        values.update(inventory_cursor=None,
-                      inventory_started_at=None,
-                      inventory_completed_at=None,
-                      inventory_finalizing=False,
-                      observed_manifests=0)
+    table = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        changed = session.execute(schema.registry_shards.update().where(
-            schema.registry_shards.c.id == shard_id,
-            schema.registry_shards.c.inventory_lease_token ==
-            lease_token).values(**values)).rowcount
+        row = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.id == shard_id).with_for_update()).mappings().first()
+        if (row is None or
+                int(row['inventory_epoch']) != expected_inventory_epoch or
+                row['inventory_lease_token'] != lease_token or
+                row['inventory_lease_expires_at'] is None or
+                row['inventory_started_at'] is None):
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        if int(row['inventory_lease_expires_at']) <= current:
+            return False
+        values: dict[str, Any] = {
+            'inventory_lease_token': None,
+            'inventory_lease_expires_at': None,
+            'inventory_next_at': current,
+            'updated_at': current,
+        }
+        if invalid_cursor:
+            values.update(inventory_cursor=None,
+                          inventory_started_at=None,
+                          inventory_completed_at=None,
+                          inventory_finalizing=False,
+                          observed_manifests=0)
+        changed = session.execute(table.update().where(
+            table.c.id == shard_id,
+            table.c.inventory_epoch == expected_inventory_epoch,
+            table.c.inventory_lease_token == lease_token,
+            table.c.inventory_lease_expires_at.is_not(None),
+            table.c.inventory_lease_expires_at
+            > catalog_state.database_epoch_expression(now=now),
+            table.c.inventory_started_at.is_not(None)).values(
+                **values)).rowcount
     return changed == 1
 
 

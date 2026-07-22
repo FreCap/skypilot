@@ -28,6 +28,7 @@ from sqlalchemy import orm
 from sky import global_user_state
 from sky.container_images import aws
 from sky.container_images import builder_prototype
+from sky.container_images import canary_worker_service
 from sky.container_images import catalog_state
 from sky.container_images import config
 from sky.container_images import demand_state
@@ -464,6 +465,41 @@ def test_canary_terminal_fence_rechecks_database_clock_after_blocking_lock(
             lock_connection.exec_driver_sql('SELECT pg_sleep(1.2)')
             lock_transaction.commit()
             assert not future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    unchanged = catalog_state.get_operation(claimed.id, 'research')
+    assert unchanged is not None
+    assert unchanged.state == models.ImageOperationState.RUNNING
+    assert unchanged.lease_token == claimed.lease_token
+
+
+def test_canary_worker_failure_does_not_reuse_prelock_application_time(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-worker-clock-key')
+    claimed = qualification.claim_canary(worker_id='worker-a', lease_seconds=1)
+    assert claimed is not None and claimed.lease_token is not None
+    heartbeat = types.SimpleNamespace(assert_owned=lambda: None)
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.select(schema.operations.c.id).where(
+            schema.operations.c.id == claimed.id).with_for_update()).one()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(canary_worker_service._fail_owned_canary,
+                                     claimed, 'CANARY_FAILED', heartbeat)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(1.2)')
+            lock_transaction.commit()
+            future.result(timeout=10)
     finally:
         if lock_transaction.is_active:
             lock_transaction.rollback()
@@ -1508,6 +1544,39 @@ def _start_inventory_listing(
     assert released.inventory_completed_at is None
     assert released.inventory_lease_token is None
     return released
+
+
+def test_inventory_abandon_rechecks_database_clock_after_blocking_lock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    claimed = topology_state.claim_inventory_shard(worker_id='copy-1',
+                                                   lease_seconds=1)
+    assert claimed is not None
+    assert claimed.inventory_lease_token is not None
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.select(schema.registry_shards.c.id).where(
+            schema.registry_shards.c.id == claimed.id).with_for_update()).one()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(topology_state.abandon_inventory_claim,
+                                     claimed.id, claimed.inventory_lease_token,
+                                     claimed.inventory_epoch)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(1.2)')
+            lock_transaction.commit()
+            assert not future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    unchanged = topology_state.get_shard(claimed.id)
+    assert unchanged is not None
+    assert unchanged.inventory_epoch == claimed.inventory_epoch
+    assert unchanged.inventory_lease_token == claimed.inventory_lease_token
 
 
 def test_inventory_attestation_and_lease_release_are_atomic(
@@ -5471,6 +5540,80 @@ def test_profile_staging_is_serialized_by_transaction_advisory_lock(
            ].count(models.ImageProfileState.QUALIFYING) == 1
     assert [revision.state for revision in revisions
            ].count(models.ImageProfileState.SUPERSEDED) == 1
+
+
+def test_profile_activation_rechecks_freshness_after_advisory_lock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    short_lived = dataclasses.replace(
+        profile,
+        qualification=dataclasses.replace(
+            profile.qualification, runtime_attestation_max_age_seconds=2))
+    active = _activate_profile(image_database, short_lived)
+    requirements = qualification._attestation_requirements(  # pylint: disable=protected-access
+        short_lived, active.attestations)
+    revision = active
+    for key in requirements:
+        existing = revision.attestations.get(key)
+        evidence = (dict(existing) if isinstance(existing, dict) else {
+            'status': 'READY'
+        })
+        observed_at = int(time.time())
+        evidence.update(status='READY', observed_at=observed_at)
+        revision = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=key,
+            evidence=evidence,
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=observed_at)
+    for key, max_age in requirements.items():
+        if max_age != 2:
+            continue
+        observed_at = int(time.time())
+        evidence = dict(revision.attestations[key])
+        evidence['observed_at'] = observed_at
+        revision = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=key,
+            evidence=evidence,
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=observed_at)
+    assert revision.attestations_hash is not None
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == revision.id).values(
+                state=models.ImageProfileState.QUALIFYING.value,
+                qualified_at=None))
+        connection.execute(schema.registry_shards.update().where(
+            schema.registry_shards.c.workspace == 'research',
+            schema.registry_shards.c.profile == short_lived.name).values(
+                profile_revision_id=None))
+
+    lock_key = json.dumps(['research', short_lived.name], separators=(',', ':'))
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(qualification.maybe_activate_profile,
+                                     revision.id)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(3.2)')
+            lock_transaction.commit()
+            assert future.result(timeout=10) is None
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    unchanged = topology_state.get_profile_revision(revision.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageProfileState.QUALIFYING
 
 
 def test_canonical_ready_takes_profile_lock_and_permanently_fences_custody(

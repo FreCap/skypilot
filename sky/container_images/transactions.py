@@ -1255,6 +1255,22 @@ def _activation_shard_capacities(
     return max_manifests, max_declared_bytes, max_in_flight
 
 
+def _validate_activation_attestations(attestations: dict[str, Any],
+                                      required_attestations: dict[str,
+                                                                  int | None],
+                                      *, now: int) -> None:
+    """Revalidates every required proof at one post-lock database epoch."""
+    for attestation, max_age_seconds in required_attestations.items():
+        evidence = attestations.get(attestation)
+        if (not isinstance(evidence, dict) or
+                evidence.get('status') != 'READY' or
+                not isinstance(evidence.get('observed_at'), int) or
+                now < evidence['observed_at'] or
+            (max_age_seconds is not None and
+             now - evidence['observed_at'] > max_age_seconds)):
+            raise ValueError('QUALIFICATION_FAILED')
+
+
 def activate_profile(
         *,
         profile_revision_id: str,
@@ -1265,7 +1281,6 @@ def activate_profile(
         required_attestations: dict[str, int | None],
         now: int | None = None) -> topology_state.ProfileRevisionRecord:
     """Promotes only the still-desired fully attested immutable revision."""
-    current = int(time.time()) if now is None else now
     table = schema.profile_revisions
     with orm.Session(catalog_state.engine()) as session, session.begin():
         optimistic = session.execute(
@@ -1314,20 +1329,15 @@ def activate_profile(
             raise ValueError('QUALIFICATION_FAILED')
         active_ids = {str(row['id']) for row in active_rows}
         attestations = json.loads(str(desired['attestations_json']))
-        for attestation, max_age_seconds in required_attestations.items():
-            evidence = attestations.get(attestation)
-            if (not isinstance(evidence, dict) or
-                    evidence.get('status') != 'READY' or
-                    not isinstance(evidence.get('observed_at'), int) or
-                    current < evidence['observed_at'] or
-                (max_age_seconds is not None and
-                 current - evidence['observed_at'] > max_age_seconds)):
-                raise ValueError('QUALIFICATION_FAILED')
         configured = models.ManagedRegistryProfile.from_snapshot(
             json.loads(str(desired['config_json'])))
+        lock_current = catalog_state.database_epoch(session, now=now)
+        _validate_activation_attestations(attestations,
+                                          required_attestations,
+                                          now=lock_current)
         budget_facts = _activation_budget_facts(configured,
                                                 attestations,
-                                                now=current)
+                                                now=lock_current)
         for fact in budget_facts:
             topology_state.upsert_provider_budget_in_session(
                 session,
@@ -1338,7 +1348,7 @@ def activate_profile(
                 api_family=fact['api_family'],
                 applied_rate_per_second=fact['applied_rate_per_second'],
                 burst=fact['burst'],
-                now=current)
+                now=lock_current)
         shards = schema.registry_shards
         targets = (configured.canonical,) + configured.targets
         target_by_name = {target.name: target for target in targets}
@@ -1347,6 +1357,11 @@ def activate_profile(
                 shards.c.workspace == desired['workspace'],
                 shards.c.profile == desired['profile']).order_by(
                     shards.c.id).with_for_update()).mappings().all()
+        current = catalog_state.database_epoch(session, now=now)
+        _validate_activation_attestations(attestations,
+                                          required_attestations,
+                                          now=current)
+        _activation_budget_facts(configured, attestations, now=current)
         if len(shard_rows) != sum(target.shard_count for target in targets):
             raise ValueError('QUALIFICATION_FAILED')
         target_counts = {target.name: 0 for target in targets}

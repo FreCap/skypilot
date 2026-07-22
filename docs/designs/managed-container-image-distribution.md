@@ -541,6 +541,15 @@ attachment, success, failure, and timeout. Tests may substitute an explicit
 literal epoch, but production finalizers use the database wall clock after the
 wait and roll back every earlier write when the fence fails.
 
+Canary failure classification follows the same rule. The worker does not choose
+ordinary failure versus deadline-expired timeout from an application timestamp.
+One transaction locks the exact operation, samples the database wall clock, and
+then attempts the matching live-lease mutation. If the lease or deadline crosses
+its fence before the SQL update, the update fails and a successor reclaims the
+operation. Inventory abandonment likewise requires the exact inventory epoch,
+token, and still-live lease in one database-clock mutation; a delayed exception
+handler cannot clear a successor claim or rewind its cursor.
+
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
 and teardown deadline. The canary resource is tagged with operation/profile/
@@ -1439,7 +1448,12 @@ workers may coordinate aggregation but cannot assume or simulate lifecycle or
 runtime roles. `transactions.activate_profile()` locks the
 current desired row and promotes it only after rechecking desired generation,
 config and Terraform hashes, target fingerprints, and fresh required
-attestations. A late older qualifier becomes SUPERSEDED and cannot activate. The
+attestations. Production callers do not pass a pre-lock application timestamp.
+Activation samples the database wall clock only after its profile advisory lock,
+candidate and active profile rows, provider-budget rows, and physical shard rows
+have been acquired, then revalidates attestation freshness and budget facts
+before applying any promotion. A late older qualifier becomes SUPERSEDED and
+cannot activate. The
 previous active revision remains selectable until the new one commits ACTIVE;
 existing plans retain their exact old revision until their demands drain. New
 runtime resolution, publication, and prepare requests likewise use that ACTIVE
@@ -1567,8 +1581,9 @@ missing shards per target through the persisted provider budget; the current
 ACTIVE revision remains available while larger rings converge in the
 background.
 
-Activation locks every revision for the profile in ID order, then every shared
-provider budget in provider-scope order, then every physical shard in ID order.
+Activation takes the per-profile transaction advisory lock, locks only the exact
+candidate and at most one indexed ACTIVE row, then acquires every shared provider
+budget in provider-scope order and every physical shard in ID order.
 For each shard it rechecks the candidate Terraform limits, exact target and
 physical fingerprints, a fresh live proof for the shard's current inventory
 epoch, the absence of an inventory lease, and either an unowned bootstrap slot
@@ -2285,7 +2300,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
-  pre/post lease fences, and renewal-crosses-deadline rejection for EC2/EKS;
+  pre/post lease fences, renewal-crosses-deadline rejection for EC2/EKS, and a
+  production failure caller blocked past lease expiry without stale-clock
+  terminalization;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
 - source/destination/compute account separation, cross-identity attestation,
@@ -2297,7 +2314,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   READY-versus-stage interleavings, and activation revalidation;
 - one-million-row resumable inventory, exact missing confirmation, durable cursor,
   batched token grants, hot/cold target no-starvation, throttling, count/byte
-  ceilings, and empty failed-reservation reclamation tests;
+  ceilings, expired blocked abandonment fencing, and empty failed-reservation
+  reclamation tests;
 - PostgreSQL `EXPLAIN (FORMAT JSON)` scale fixtures proving that publication
   inspection, copy-shard dispatch, inventory claims and runtime-digest matches,
   readiness, live/terminal demand pages, expired reservations, canonical
@@ -2846,4 +2864,18 @@ expired canary with a persisted child when a worker cannot decode a future
 contract shape, and makes guest-initiated EC2 canary shutdown terminate rather
 than stop the instance. The full managed-image suites and the random optimizer
 DAG test pass locally. The acceptance streak remains zero until both reviewers
+accept one immutable current-base head three consecutive times.
+
+Restarted paired final-acceptance round 1 at
+`6c4129ce1157cf7b22ba924242329a9930001e95` returned Fable `PURSUE` and Codex
+`RESHAPE`, resetting the streak. Codex reproduced two PostgreSQL stale-clock
+races: the production canary worker passed a timestamp sampled before its row
+lock into terminal failure, and profile activation reused a timestamp sampled
+before its transaction advisory lock, allowing an attestation to expire while
+the transaction waited. This revision makes one locked canary transaction choose
+ordinary failure versus verified timeout with database time, makes activation
+acquire its bounded lock set before its final database-time freshness and budget
+validation, and applies the same epoch, token, live-lease, and database-clock
+fence to inventory abandonment. Blocking PostgreSQL regressions exercise the
+production caller paths. The acceptance streak remains zero until both reviewers
 accept one immutable current-base head three consecutive times.

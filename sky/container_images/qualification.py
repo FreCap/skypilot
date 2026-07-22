@@ -530,6 +530,40 @@ def fail_expired_canary(operation: catalog_state.OperationRecord,
                                             now=now)
 
 
+def fail_owned_canary(operation: catalog_state.OperationRecord,
+                      error_code: str,
+                      *,
+                      teardown_verified: bool,
+                      now: int | None = None) -> bool:
+    """Fails the exact live owner after classifying its locked deadline."""
+    if error_code == 'CANARY_TEARDOWN_FAILED':
+        raise ValueError('Unverified canary teardown must remain reclaimable.')
+    if not teardown_verified:
+        raise ValueError('Canary teardown must be verified before failure.')
+    if operation.lease_token is None:
+        return False
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        locked = session.execute(
+            sqlalchemy.select(schema.operations.c.teardown_deadline).where(
+                schema.operations.c.id ==
+                operation.id).with_for_update()).first()
+        if locked is None:
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        deadline = locked.teardown_deadline
+        deadline_expired = (deadline is not None and current >= int(deadline))
+        return catalog_state.fail_operation(
+            session,
+            operation.id,
+            'CANARY_TIMEOUT' if deadline_expired else error_code,
+            result_kind=operation.result_kind,
+            result_id=operation.result_id,
+            result=operation.result,
+            lease_token=operation.lease_token,
+            deadline_expired=deadline_expired,
+            now=now)
+
+
 def schedule_automatic_canaries(*,
                                 limit: int = 100,
                                 now: int | None = None) -> int:
@@ -588,7 +622,7 @@ def maybe_activate_profile(
         *,
         now: int | None = None) -> topology_state.ProfileRevisionRecord | None:
     """Activates exactly the still-desired revision after all proofs converge."""
-    current = int(time.time()) if now is None else now
+    preflight_current = int(time.time()) if now is None else now
     revision = topology_state.get_profile_revision(profile_revision_id)
     if revision is None:
         return None
@@ -610,9 +644,11 @@ def maybe_activate_profile(
             ready = (isinstance(evidence, dict) and
                      evidence.get('status') == 'READY' and
                      isinstance(evidence.get('observed_at'), int) and
-                     evidence['observed_at'] <= current)
+                     evidence['observed_at'] <= preflight_current)
         else:
-            ready = _fresh(evidence, now=current, max_age_seconds=max_age)
+            ready = _fresh(evidence,
+                           now=preflight_current,
+                           max_age_seconds=max_age)
         if not ready:
             return None
     try:
@@ -623,6 +659,6 @@ def maybe_activate_profile(
             expected_terraform_hash=revision.terraform_hash,
             expected_attestations_hash=revision.attestations_hash,
             required_attestations=requirements,
-            now=current)
+            now=now)
     except (topology_state.StaleProfileRevisionError, ValueError):
         return None

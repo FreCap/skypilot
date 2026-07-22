@@ -930,15 +930,18 @@ def reconcile_inventory(
             return recorded is not None
     except (aws.ProviderThrottledError, aws.AmbiguousProviderOutcomeError,
             budgets.ProviderBudgetUnavailableError):
-        topology_state.abandon_inventory_claim(shard.id, token)
+        topology_state.abandon_inventory_claim(shard.id, token,
+                                               shard.inventory_epoch)
         return False
     except LookupError:
-        topology_state.abandon_inventory_claim(shard.id, token)
+        topology_state.abandon_inventory_claim(shard.id, token,
+                                               shard.inventory_epoch)
         return False
     except Exception as error:  # pylint: disable=broad-except
         topology_state.abandon_inventory_claim(
             shard.id,
             token,
+            shard.inventory_epoch,
             invalid_cursor=(shard.inventory_cursor is not None and
                             aws.is_invalid_inventory_cursor(error)))
         return False

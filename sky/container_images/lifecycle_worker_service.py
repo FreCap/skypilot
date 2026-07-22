@@ -474,7 +474,7 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 expected_generation=revision.desired_generation,
                 expected_config_hash=revision.config_hash,
                 now=current)
-        qualification.maybe_activate_profile(revision.id, now=current)
+        qualification.maybe_activate_profile(revision.id, now=now)
     return True
 
 
