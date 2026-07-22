@@ -156,7 +156,7 @@ class WorkerRecord:
 class ProviderGrant:
     budget_id: str
     tokens: int
-    expires_at: int
+    valid_for_seconds: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -385,7 +385,6 @@ def stage_profile_revision(*,
                            max_daily_canary_microusd: int,
                            now: int | None = None) -> ProfileRevisionRecord:
     """Stages a nonblocking desired revision and supersedes older desired work."""
-    current = int(time.time()) if now is None else now
     encoded_config = json.dumps(config_snapshot,
                                 sort_keys=True,
                                 separators=(',', ':'))
@@ -422,6 +421,7 @@ def stage_profile_revision(*,
             raise CanonicalCustodyChangeError(
                 'V0 cannot change the canonical physical manifest after a '
                 'release is published.')
+        current = catalog_state.database_epoch(session, now=now)
         session.execute(table.update().where(
             table.c.workspace == workspace, table.c.profile == profile,
             table.c.state == models.ImageProfileState.QUALIFYING.value).values(
@@ -609,7 +609,6 @@ def record_profile_attestation(*,
                                terraform_hash: str | None = None,
                                now: int | None = None) -> ProfileRevisionRecord:
     """Merges one independently authenticated, secret-free attestation."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         return record_profile_attestation_in_session(
             session,
@@ -619,18 +618,19 @@ def record_profile_attestation(*,
             expected_generation=expected_generation,
             expected_config_hash=expected_config_hash,
             terraform_hash=terraform_hash,
-            now=current)
+            now=now)
 
 
-def record_profile_attestation_in_session(session: orm.Session,
-                                          *,
-                                          profile_revision_id: str,
-                                          kind: str,
-                                          evidence: dict[str, Any],
-                                          expected_generation: int,
-                                          expected_config_hash: str,
-                                          terraform_hash: str | None = None,
-                                          now: int) -> ProfileRevisionRecord:
+def record_profile_attestation_in_session(
+        session: orm.Session,
+        *,
+        profile_revision_id: str,
+        kind: str,
+        evidence: dict[str, Any],
+        expected_generation: int,
+        expected_config_hash: str,
+        terraform_hash: str | None = None,
+        now: int | None = None) -> ProfileRevisionRecord:
     """Transaction-scoped variant for operation and attestation atomicity."""
     if not isinstance(kind, str) or not kind or len(kind) > 128:
         raise ValueError('Attestation kind must be a bounded identifier.')
@@ -643,6 +643,7 @@ def record_profile_attestation_in_session(session: orm.Session,
     row = session.execute(
         sqlalchemy.select(table).where(table.c.id == profile_revision_id).
         with_for_update()).mappings().one()
+    current = catalog_state.database_epoch(session, now=now)
     if (str(row['state']) not in (models.ImageProfileState.QUALIFYING.value,
                                   models.ImageProfileState.ACTIVE.value) or
             int(row['desired_generation']) != expected_generation or
@@ -658,7 +659,7 @@ def record_profile_attestation_in_session(session: orm.Session,
     values: dict[str, Any] = {
         'attestations_json': encoded,
         'attestations_hash': attestation_hash,
-        'updated_at': now,
+        'updated_at': current,
     }
     if terraform_hash is not None:
         if row['terraform_hash'] not in (None, terraform_hash):
@@ -671,12 +672,19 @@ def record_profile_attestation_in_session(session: orm.Session,
 
 
 def record_candidate_shard_attestation(
-        *, profile_revision_id: str, expected_generation: int,
-        expected_config_hash: str, shard_id: str,
-        expected_operational_revision_id: str, expected_target_fingerprint: str,
-        expected_physical_fingerprint: str, expected_inventory_epoch: int,
-        expected_inventory_completed_at: int, kind: str,
-        evidence: dict[str, Any], now: int) -> ProfileRevisionRecord | None:
+        *,
+        profile_revision_id: str,
+        expected_generation: int,
+        expected_config_hash: str,
+        shard_id: str,
+        expected_operational_revision_id: str,
+        expected_target_fingerprint: str,
+        expected_physical_fingerprint: str,
+        expected_inventory_epoch: int,
+        expected_inventory_completed_at: int,
+        kind: str,
+        evidence: dict[str, Any],
+        now: int | None = None) -> ProfileRevisionRecord | None:
     """Records candidate proof only against one unchanged operational epoch."""
     profiles = schema.profile_revisions
     shards = schema.registry_shards
@@ -1692,11 +1700,11 @@ def claim_next_location(*,
                         workspace: str | None = None,
                         now: int | None = None) -> LocationRecord | None:
     """Claims one indexed due shard, then one indexed local location."""
-    current = int(time.time()) if now is None else now
     shards = schema.registry_shards
     locations = schema.locations
+    clock = catalog_state.database_epoch_expression(now=now)
     shard_statement = sqlalchemy.select(shards).where(
-        shards.c.copy_next_at.is_not(None), shards.c.copy_next_at <= current)
+        shards.c.copy_next_at.is_not(None), shards.c.copy_next_at <= clock)
     if workspace is not None:
         shard_statement = shard_statement.where(shards.c.workspace == workspace)
     shard_statement = shard_statement.order_by(
@@ -1714,9 +1722,9 @@ def claim_next_location(*,
                     models.ImageLocationState.COPYING.value,
                     models.ImageLocationState.VERIFYING.value,
                 ]), locations.c.copy_claimable_at
-                <= current).order_by(locations.c.copy_claimable_at,
-                                     locations.c.id).limit(1).with_for_update(
-                                         skip_locked=True)).mappings().first()
+                <= clock).order_by(locations.c.copy_claimable_at,
+                                   locations.c.id).limit(1).with_for_update(
+                                       skip_locked=True)).mappings().first()
         if (location_row is None and str(
                 shard_row['state']) in (models.ImageShardState.READY.value,
                                         models.ImageShardState.FULL.value) and
@@ -1725,11 +1733,18 @@ def claim_next_location(*,
                 sqlalchemy.select(locations).where(
                     locations.c.shard_id == shard_row['id'], locations.c.state
                     == models.ImageLocationState.PENDING.value,
-                    locations.c.copy_claimable_at <= current).order_by(
+                    locations.c.copy_claimable_at <= clock).order_by(
                         locations.c.copy_claimable_at,
                         locations.c.id).limit(1).with_for_update(
                             skip_locked=True)).mappings().first()
+        current = catalog_state.database_epoch(session, now=now)
         if location_row is None:
+            _refresh_shard_copy_queue_in_session(session,
+                                                 str(shard_row['id']),
+                                                 now=current)
+            return None
+        if (location_row['copy_claimable_at'] is None or
+                int(location_row['copy_claimable_at']) > current):
             _refresh_shard_copy_queue_in_session(session,
                                                  str(shard_row['id']),
                                                  now=current)
@@ -1980,7 +1995,6 @@ def retry_location(location_id: str,
                    workspace: str,
                    *,
                    now: int | None = None) -> LocationRecord | None:
-    current = int(time.time()) if now is None else now
     locations = schema.locations
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -2008,6 +2022,7 @@ def retry_location(location_id: str,
         if str(shard['state']) not in (models.ImageShardState.READY.value,
                                        models.ImageShardState.FULL.value):
             return None
+        current = catalog_state.database_epoch(session, now=now)
         values: dict[str, Any] = {
             'state': models.ImageLocationState.PENDING.value,
             'next_retry_at': None,
@@ -2047,9 +2062,9 @@ def register_worker(worker_id: str,
                     max_in_flight: int,
                     *,
                     now: int | None = None) -> WorkerRecord:
-    current = int(time.time()) if now is None else now
     table = schema.workers
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         row = session.execute(
             postgresql.insert(table).values(
                 id=worker_id,
@@ -2079,17 +2094,17 @@ def heartbeat_worker(worker_id: str,
                      in_flight: int,
                      success: bool = False,
                      now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     if (not isinstance(in_flight, int) or isinstance(in_flight, bool) or
             in_flight < 0):
         return False
-    values: dict[str, Any] = {
-        'heartbeat_at': current,
-        'in_flight': in_flight,
-    }
-    if success:
-        values['last_success_at'] = current
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
+        values: dict[str, Any] = {
+            'heartbeat_at': current,
+            'in_flight': in_flight,
+        }
+        if success:
+            values['last_success_at'] = current
         changed = session.execute(schema.workers.update().where(
             schema.workers.c.id == worker_id, in_flight
             <= schema.workers.c.max_in_flight).values(**values)).rowcount
@@ -2139,52 +2154,95 @@ def _quarantine_eviction(
 
 def claim_next_eviction(*,
                         worker_id: str,
-                        unused_before: int,
+                        lease_seconds: int,
+                        retention_seconds: int | None = None,
+                        workspace_retention_seconds: dict[str, int | None] |
+                        None = None,
+                        unused_before: int | None = None,
                         workspace_unused_before: dict[str, int | None] |
                         None = None,
-                        lease_seconds: int,
                         now: int | None = None) -> LocationRecord | None:
     """Claims one demand-free regional digest after its retention window."""
-    current = int(time.time()) if now is None else now
     locations = schema.locations
     demands = schema.demands
     age_anchor = sqlalchemy.func.coalesce(locations.c.last_used_at,
                                           locations.c.last_verified_at,
                                           locations.c.created_at)
-    workspace_cutoffs = workspace_unused_before or {}
-    for workspace, cutoff in workspace_cutoffs.items():
-        if (not isinstance(workspace, str) or not workspace or
-            (cutoff is not None and
-             (not isinstance(cutoff, int) or isinstance(cutoff, bool)))):
-            raise ValueError('Workspace eviction cutoff is invalid.')
-    if workspace_cutoffs:
-        configured = tuple(workspace_cutoffs)
-        due_conditions = [
-            sqlalchemy.and_(locations.c.workspace == workspace, age_anchor
-                            < cutoff)
-            for workspace, cutoff in workspace_cutoffs.items()
-            if cutoff is not None
-        ]
-        retention_due = sqlalchemy.or_(
-            sqlalchemy.and_(locations.c.workspace.not_in(configured), age_anchor
-                            < unused_before), *due_conditions)
+    duration_mode = retention_seconds is not None
+    workspace_retentions: dict[str, int | None] = {}
+    workspace_cutoffs: dict[str, int | None] = {}
+    if duration_mode:
+        if unused_before is not None or workspace_unused_before is not None:
+            raise ValueError(
+                'Eviction retention durations cannot mix with cutoffs.')
+        if (not isinstance(retention_seconds, int) or
+                isinstance(retention_seconds, bool) or retention_seconds < 0):
+            raise ValueError('Default eviction retention is invalid.')
+        workspace_retentions = workspace_retention_seconds or {}
+        for workspace, seconds in workspace_retentions.items():
+            if (not isinstance(workspace, str) or not workspace or
+                (seconds is not None and
+                 (not isinstance(seconds, int) or isinstance(seconds, bool) or
+                  seconds < 0))):
+                raise ValueError('Workspace eviction retention is invalid.')
     else:
-        retention_due = age_anchor < unused_before
-    ready_due = sqlalchemy.and_(
-        locations.c.state == models.ImageLocationState.READY.value,
-        locations.c.canonical.is_(False), retention_due,
-        ~sqlalchemy.exists().where(
-            demands.c.location_id == locations.c.id,
-            demands.c.state.in_([
-                models.ImageDemandState.WARMING.value,
-                models.ImageDemandState.READY.value,
-            ])))
-    expired = sqlalchemy.and_(
-        locations.c.state == models.ImageLocationState.EVICTING.value,
-        locations.c.lease_expires_at <= current)
+        if retention_seconds is None and unused_before is None:
+            raise ValueError('An eviction retention policy is required.')
+        if workspace_retention_seconds is not None:
+            raise ValueError(
+                'Workspace retention durations require a default duration.')
+        if now is None:
+            raise ValueError(
+                'Absolute eviction cutoffs require an explicit test clock.')
+        if (not isinstance(unused_before, int) or
+                isinstance(unused_before, bool)):
+            raise ValueError('Default eviction cutoff is invalid.')
+        workspace_cutoffs = workspace_unused_before or {}
+        for workspace, cutoff in workspace_cutoffs.items():
+            if (not isinstance(workspace, str) or not workspace or
+                (cutoff is not None and
+                 (not isinstance(cutoff, int) or isinstance(cutoff, bool)))):
+                raise ValueError('Workspace eviction cutoff is invalid.')
     token = f'{worker_id}:{uuid.uuid4()}'
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        selection_current = catalog_state.database_epoch(session, now=now)
+        if duration_mode:
+            assert retention_seconds is not None
+            default_cutoff = selection_current - retention_seconds
+            workspace_cutoffs = {
+                workspace:
+                    (None if seconds is None else selection_current - seconds)
+                for workspace, seconds in workspace_retentions.items()
+            }
+        else:
+            assert unused_before is not None
+            default_cutoff = unused_before
+        if workspace_cutoffs:
+            configured = tuple(workspace_cutoffs)
+            due_conditions = [
+                sqlalchemy.and_(locations.c.workspace == workspace, age_anchor
+                                < cutoff)
+                for workspace, cutoff in workspace_cutoffs.items()
+                if cutoff is not None
+            ]
+            retention_due = sqlalchemy.or_(
+                sqlalchemy.and_(locations.c.workspace.not_in(configured),
+                                age_anchor < default_cutoff), *due_conditions)
+        else:
+            retention_due = age_anchor < default_cutoff
+        ready_due = sqlalchemy.and_(
+            locations.c.state == models.ImageLocationState.READY.value,
+            locations.c.canonical.is_(False), retention_due,
+            ~sqlalchemy.exists().where(
+                demands.c.location_id == locations.c.id,
+                demands.c.state.in_([
+                    models.ImageDemandState.WARMING.value,
+                    models.ImageDemandState.READY.value,
+                ])))
+        expired = sqlalchemy.and_(
+            locations.c.state == models.ImageLocationState.EVICTING.value,
+            locations.c.lease_expires_at <= selection_current)
         claimable_for_shard = sqlalchemy.and_(
             sqlalchemy.not_(_inventory_active_condition(shards)),
             sqlalchemy.or_(
@@ -2222,8 +2280,29 @@ def claim_next_eviction(*,
                         skip_locked=True)).mappings().first()
         if row is None:
             return None
+        current = catalog_state.database_epoch(session, now=now)
         reclaimed = (str(
             row['state']) == models.ImageLocationState.EVICTING.value)
+        if (reclaimed and (row['lease_expires_at'] is None or
+                           int(row['lease_expires_at']) > current)):
+            return None
+        if not reclaimed:
+            if duration_mode:
+                assert retention_seconds is not None
+                default_cutoff = current - retention_seconds
+                workspace_cutoffs = {
+                    workspace: (None if seconds is None else current - seconds)
+                    for workspace, seconds in workspace_retentions.items()
+                }
+            row_cutoff = workspace_cutoffs.get(str(row['workspace']),
+                                               default_cutoff)
+            row_anchor = row['last_used_at']
+            if row_anchor is None:
+                row_anchor = row['last_verified_at']
+            if row_anchor is None:
+                row_anchor = row['created_at']
+            if row_cutoff is None or int(row_anchor) >= row_cutoff:
+                return None
         if (not reclaimed and
                 int(shard['in_flight']) >= int(shard['max_in_flight'])):
             return None
@@ -2465,7 +2544,6 @@ def reap_failed_canonical_reservation(location_id: str,
     """Deletes one empty failed reservation after rechecking every fence."""
     if not exact_absence:
         return False
-    current = int(time.time()) if now is None else now
     locations = schema.locations
     shards = schema.registry_shards
     publications = schema.publications
@@ -2496,6 +2574,7 @@ def reap_failed_canonical_reservation(location_id: str,
                 demands.c.location_id == location_id).limit(1)).first()
         if retained_publication is not None or any_demand is not None:
             return False
+        current = catalog_state.database_epoch(session, now=now)
         # Failed history remains queryable, but its expired reservation no
         # longer owns the physical location being removed.
         session.execute(publications.update().where(
@@ -2604,7 +2683,8 @@ def upsert_provider_budget_in_session(session: orm.Session, *, provider: str,
                     'burst_milli': burst_milli,
                     'tokens_milli': sqlalchemy.func.least(
                         table.c.tokens_milli, burst_milli),
-                    'refilled_at': now,
+                    'refilled_at': sqlalchemy.func.greatest(
+                        table.c.refilled_at, now),
                     'updated_at': now,
                 }).returning(table)).mappings().one()
     return _provider_budget(row)
@@ -2620,7 +2700,6 @@ def ensure_provider_budget(*,
                            burst: int,
                            now: int | None = None) -> ProviderBudgetRecord:
     """Creates a missing qualification budget without changing a live one."""
-    current = int(time.time()) if now is None else now
     budget_id, values, rate_milli, burst_milli = _provider_budget_values(
         provider=provider,
         partition=partition,
@@ -2631,6 +2710,12 @@ def ensure_provider_budget(*,
         burst=burst)
     table = schema.provider_budgets
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        existing = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.id == budget_id).with_for_update()).mappings().first()
+        if existing is not None:
+            return _provider_budget(existing)
+        current = catalog_state.database_epoch(session, now=now)
         row = session.execute(
             postgresql.insert(table).values(
                 id=budget_id,
@@ -2659,8 +2744,20 @@ def upsert_provider_budget(*,
                            burst: int,
                            now: int | None = None) -> ProviderBudgetRecord:
     """Installs one qualification-backed, account-region API budget."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        budget_id, _, _, _ = _provider_budget_values(
+            provider=provider,
+            partition=partition,
+            account=account,
+            region=region,
+            api_family=api_family,
+            applied_rate_per_second=applied_rate_per_second,
+            burst=burst)
+        session.execute(
+            sqlalchemy.select(schema.provider_budgets.c.id).where(
+                schema.provider_budgets.c.id ==
+                budget_id).with_for_update()).first()
+        current = catalog_state.database_epoch(session, now=now)
         return upsert_provider_budget_in_session(
             session,
             provider=provider,
@@ -2706,7 +2803,9 @@ def acquire_provider_grant(worker_id: str,
                            grant_seconds: int = 1,
                            now: int | None = None) -> ProviderGrant | None:
     """Moves a bounded token batch from one provider budget to one worker."""
-    current = int(time.time()) if now is None else now
+    if (not isinstance(grant_seconds, int) or isinstance(grant_seconds, bool) or
+            not 1 <= grant_seconds <= 60):
+        raise ValueError('Provider grant duration is invalid.')
     budgets = schema.provider_budgets
     workers = schema.workers
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -2718,6 +2817,7 @@ def acquire_provider_grant(worker_id: str,
             with_for_update()).mappings().first()
         if budget is None or worker is None:
             return None
+        current = catalog_state.database_epoch(session, now=now)
         if (budget['blocked_until'] is not None and
                 int(budget['blocked_until']) > current):
             return None
@@ -2726,11 +2826,12 @@ def acquire_provider_grant(worker_id: str,
                 int(worker['grant_tokens_milli']) > 0):
             if str(worker['grant_budget_id']) != budget_id:
                 return None
-            return ProviderGrant(budget_id=str(worker['grant_budget_id']),
-                                 tokens=int(worker['grant_tokens_milli']) //
-                                 1000,
-                                 expires_at=int(worker['grant_expires_at']))
-        elapsed = max(0, current - int(budget['refilled_at']))
+            return ProviderGrant(
+                budget_id=str(worker['grant_budget_id']),
+                tokens=int(worker['grant_tokens_milli']) // 1000,
+                valid_for_seconds=(int(worker['grant_expires_at']) - current))
+        refill_current = max(current, int(budget['refilled_at']))
+        elapsed = max(0, refill_current - int(budget['refilled_at']))
         available = min(
             int(budget['burst_milli']),
             int(budget['tokens_milli']) +
@@ -2742,13 +2843,13 @@ def acquire_provider_grant(worker_id: str,
         if granted <= 0:
             session.execute(budgets.update().where(
                 budgets.c.id == budget_id).values(tokens_milli=available,
-                                                  refilled_at=current,
+                                                  refilled_at=refill_current,
                                                   updated_at=current))
             return None
         expires_at = current + grant_seconds
         session.execute(budgets.update().where(
             budgets.c.id == budget_id).values(tokens_milli=available - granted,
-                                              refilled_at=current,
+                                              refilled_at=refill_current,
                                               updated_at=current))
         session.execute(workers.update().where(
             workers.c.id == worker_id).values(grant_budget_id=budget_id,
@@ -2757,13 +2858,12 @@ def acquire_provider_grant(worker_id: str,
                                               heartbeat_at=current))
         return ProviderGrant(budget_id=budget_id,
                              tokens=granted // 1000,
-                             expires_at=expires_at)
+                             valid_for_seconds=grant_seconds)
 
 
 def record_provider_throttle(budget_id: str,
                              *,
                              now: int | None = None) -> int | None:
-    current = int(time.time()) if now is None else now
     budgets = schema.provider_budgets
     with orm.Session(catalog_state.engine()) as session, session.begin():
         row = session.execute(
@@ -2771,6 +2871,7 @@ def record_provider_throttle(budget_id: str,
             with_for_update()).mappings().first()
         if row is None:
             return None
+        current = catalog_state.database_epoch(session, now=now)
         count = int(row['throttle_count']) + 1
         delay = min(2**min(count, 8), 300)
         blocked_until = current + delay
@@ -2778,15 +2879,22 @@ def record_provider_throttle(budget_id: str,
             budgets.c.id == budget_id).values(throttle_count=count,
                                               blocked_until=blocked_until,
                                               updated_at=current))
-        return blocked_until
+        return delay
 
 
-def compact_stale_workers(*, older_than: int, limit: int = 500) -> int:
+def compact_stale_workers(*,
+                          max_age_seconds: int,
+                          limit: int = 500,
+                          now: int | None = None) -> int:
+    if (not isinstance(max_age_seconds, int) or
+            isinstance(max_age_seconds, bool) or max_age_seconds < 1):
+        raise ValueError('Worker retention duration is invalid.')
     table = schema.workers
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         worker_ids = session.execute(
-            sqlalchemy.select(
-                table.c.id).where(table.c.heartbeat_at < older_than).order_by(
+            sqlalchemy.select(table.c.id).where(
+                table.c.heartbeat_at < current - max_age_seconds).order_by(
                     table.c.heartbeat_at,
                     table.c.id).limit(limit).with_for_update(
                         skip_locked=True)).scalars().all()

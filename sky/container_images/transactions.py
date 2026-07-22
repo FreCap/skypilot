@@ -8,7 +8,6 @@ publication and operation; watermark and demand.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 import uuid
 
@@ -455,7 +454,6 @@ def reserve_regional_location(
         max_regional_locations: int,
         now: int | None = None) -> topology_state.LocationRecord:
     """Reserves one selected target, never a target fanout."""
-    current = int(time.time()) if now is None else now
     locations = schema.locations
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -513,6 +511,7 @@ def reserve_regional_location(
                         models.ImageShardState.FULL.value):
                     raise topology_state.RegistryShardUnavailableError(
                         'REGISTRY_SHARD_UNAVAILABLE')
+                current = catalog_state.database_epoch(session, now=now)
                 location_values: dict[str, Any] = {
                     'state': models.ImageLocationState.PENDING.value,
                     'next_retry_at': None,
@@ -556,6 +555,7 @@ def reserve_regional_location(
                 locations.c.canonical.is_(False))).scalar_one()
         if int(regional_count) >= max_regional_locations:
             raise ImageLimitExceededError('IMAGE_LIMIT_EXCEEDED')
+        current = catalog_state.database_epoch(session, now=now)
         target_ref = _target_reference(shard, str(artifact['runtime_digest']))
         inserted = session.execute(
             postgresql.insert(locations).values(
@@ -608,8 +608,13 @@ def reserve_regional_location(
 
 def _finish_location(session: orm.Session, *, location_id: str,
                      lease_token: str, ready: bool, error_code: str | None,
-                     retry_at: int | None, terminal: bool,
+                     retry_at: int | None, retry_delay_seconds: int | None,
+                     terminal: bool,
                      now: int | None) -> sqlalchemy.engine.RowMapping:
+    if retry_at is not None and retry_delay_seconds is not None:
+        raise ValueError('Specify a retry time or delay, not both.')
+    if retry_delay_seconds is not None and retry_delay_seconds < 0:
+        raise ValueError('Retry delay must be nonnegative.')
     locations = schema.locations
     optimistic = session.execute(
         sqlalchemy.select(
@@ -637,6 +642,9 @@ def _finish_location(session: orm.Session, *, location_id: str,
     else:
         state = models.ImageLocationState.PENDING.value
     current = catalog_state.database_epoch(session, now=now)
+    next_retry_at = retry_at
+    if retry_delay_seconds is not None:
+        next_retry_at = current + retry_delay_seconds
     updated = session.execute(locations.update().where(
         locations.c.id == location_id, locations.c.lease_token == lease_token,
         locations.c.lease_expires_at.is_not(None), locations.c.lease_expires_at
@@ -649,7 +657,7 @@ def _finish_location(session: orm.Session, *, location_id: str,
             lease_kind=None,
             lease_token=None,
             lease_expires_at=None,
-            next_retry_at=None if ready or terminal else retry_at,
+            next_retry_at=None if ready or terminal else next_retry_at,
             error_code=error_code,
             last_verified_at=current if ready else row['last_verified_at'],
             updated_at=current).returning(locations)).mappings().first()
@@ -780,6 +788,7 @@ def converge_canonical(*,
                        ready: bool,
                        error_code: str | None = None,
                        retry_at: int | None = None,
+                       retry_delay_seconds: int | None = None,
                        terminal: bool = True,
                        now: int | None = None) -> topology_state.LocationRecord:
     """Commits canonical result and release projections in one transaction."""
@@ -792,6 +801,7 @@ def converge_canonical(*,
                                     ready=ready,
                                     error_code=error_code,
                                     retry_at=retry_at,
+                                    retry_delay_seconds=retry_delay_seconds,
                                     terminal=terminal,
                                     now=now)
         current = int(location['updated_at'])
@@ -810,7 +820,6 @@ def reconcile_canonical_publications(location_id: str,
                                      *,
                                      now: int | None = None) -> int:
     """Resumes bounded publication fanout without provider I/O."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         profile_key = _lock_canonical_profile(session, location_id)
         location = session.execute(
@@ -821,6 +830,7 @@ def reconcile_canonical_publications(location_id: str,
                     models.ImageLocationState.READY.value,
                     models.ImageLocationState.FAILED.value,
                 ])).with_for_update()).mappings().one()
+        current = catalog_state.database_epoch(session, now=now)
         return _project_dependent_publications(
             session,
             location,
@@ -864,7 +874,6 @@ def retry_publication(
         operation_id: str,
         now: int | None = None) -> catalog_state.PublicationRecord:
     """Requeues one retained failed publication behind its shared location."""
-    current = int(time.time()) if now is None else now
     publications = schema.publications
     locations = schema.locations
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -902,6 +911,7 @@ def retry_publication(
                 != models.ImagePublicationState.FAILED.value or
                 not bool(publication['reservation_active'])):
             raise ValueError('Only a retained FAILED publication can retry.')
+        current = catalog_state.database_epoch(session, now=now)
         if location is not None and str(
                 location['state']) in (models.ImageLocationState.FAILED.value,
                                        models.ImageLocationState.MISSING.value):
@@ -986,7 +996,6 @@ def create_warming_demand(*,
                           placement: dict[str, Any],
                           now: int | None = None) -> demand_state.DemandRecord:
     """Commits a demand only after exact location and revision revalidation."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         _lock_profile(session,
                       profile_revision_id,
@@ -1016,7 +1025,7 @@ def create_warming_demand(*,
             target_fingerprint=target_fingerprint,
             location_id=location_id,
             placement=placement,
-            now=current)
+            now=now)
 
 
 def create_warming_demand_for_controller_epoch(
@@ -1037,7 +1046,6 @@ def create_warming_demand_for_controller_epoch(
         placement: dict[str, Any],
         now: int | None = None) -> demand_state.DemandRecord:
     """Maps one controller epoch and converges its monotonic demand."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         profile_row = _lock_profile(session,
                                     profile_revision_id,
@@ -1069,7 +1077,7 @@ def create_warming_demand_for_controller_epoch(
             target_fingerprint=target_fingerprint,
             location_id=location_id,
             placement=placement,
-            now=current,
+            now=now,
             require_existing=(str(
                 profile_row['state']) == models.ImageProfileState.RETIRED.value
                              ))
@@ -1081,7 +1089,6 @@ def commit_ready_demand(*,
                         pull_plan: dict[str, Any],
                         now: int | None = None) -> demand_state.DemandRecord:
     """Atomically fences a READY location and its secret-free runtime plan."""
-    current = int(time.time()) if now is None else now
     encoded_plan = json.dumps(pull_plan, sort_keys=True, separators=(',', ':'))
     if len(encoded_plan.encode()) > 16 * 1024:
         raise ValueError('Runtime pull plan exceeds 16 KiB.')
@@ -1151,6 +1158,7 @@ def commit_ready_demand(*,
                 demand)
         if str(demand['state']) != models.ImageDemandState.WARMING.value:
             raise ValueError('Only a WARMING demand can become READY.')
+        current = catalog_state.database_epoch(session, now=now)
         updated = session.execute(schema.demands.update().where(
             schema.demands.c.id == demand_id).values(
                 state=models.ImageDemandState.READY.value,

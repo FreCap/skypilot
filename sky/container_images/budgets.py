@@ -16,7 +16,7 @@ class ProviderBudgetUnavailableError(RuntimeError):
 @dataclasses.dataclass
 class _LocalGrant:
     tokens: int
-    expires_at: int
+    expires_at_monotonic: float
 
 
 class ProviderBudgetLimiter:
@@ -59,16 +59,17 @@ class ProviderBudgetLimiter:
         while time.monotonic() < deadline:
             wait_seconds = 0.05
             with self._lock:
-                current = int(time.time())
+                current = time.monotonic()
                 grant = self._grants.get(budget.id)
-                if grant is not None and grant.expires_at > current:
+                if (grant is not None and grant.expires_at_monotonic > current):
                     if grant.tokens > 0:
                         grant.tokens -= 1
                         return
                     wait_seconds = min(
-                        0.25, max(0.05, grant.expires_at - time.time()))
+                        0.25, max(0.05, grant.expires_at_monotonic - current))
                 else:
                     self._grants.pop(budget.id, None)
+                    request_started = time.monotonic()
                     acquired = topology_state.acquire_provider_grant(
                         self._worker_id, budget.id, requested_calls=64)
                     if acquired is not None:
@@ -77,7 +78,9 @@ class ProviderBudgetLimiter:
                         self._grants = {
                             budget.id: _LocalGrant(
                                 tokens=acquired.tokens - 1,
-                                expires_at=acquired.expires_at)
+                                expires_at_monotonic=(
+                                    request_started +
+                                    acquired.valid_for_seconds))
                         }
                         return
             time.sleep(wait_seconds)

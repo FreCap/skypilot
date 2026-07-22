@@ -553,6 +553,59 @@ def test_canary_claim_samples_database_clock_after_profile_lock(
     assert claimed.lease_expires_at == claimed.updated_at + 1
 
 
+def test_provider_grant_samples_database_clock_after_budget_lock(
+        image_database) -> None:
+    budget = topology_state.upsert_provider_budget(provider='aws',
+                                                   partition='aws',
+                                                   account='123456789012',
+                                                   region='us-east-1',
+                                                   api_family='ecr',
+                                                   applied_rate_per_second=10,
+                                                   burst=10,
+                                                   now=1)
+    topology_state.register_worker('copy-budget-worker',
+                                   models.ImageWorkerKind.COPY,
+                                   'test',
+                                   1,
+                                   now=1)
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    started = int(
+        lock_connection.execute(
+            sqlalchemy.select(
+                catalog_state.database_epoch_expression())).scalar_one())
+    lock_connection.execute(schema.provider_budgets.update().where(
+        schema.provider_budgets.c.id == budget.id).values(
+            blocked_until=started + 1,
+            tokens_milli=10_000,
+            refilled_at=started,
+            updated_at=started))
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(topology_state.acquire_provider_grant,
+                                     'copy-budget-worker', budget.id, 1)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(2.1)')
+            lock_transaction.commit()
+            grant = future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    assert grant is not None
+    assert grant.tokens == 1
+    assert grant.valid_for_seconds == 1
+    refreshed = topology_state.get_provider_budget(provider='aws',
+                                                   partition='aws',
+                                                   account='123456789012',
+                                                   region='us-east-1',
+                                                   api_family='ecr')
+    assert refreshed is not None
+    assert refreshed.refilled_at >= started + 2
+
+
 def test_deadline_expired_canary_is_teardown_only(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -1025,14 +1078,13 @@ def _publish_and_bind(
     idempotency_key: str = 'publication-idempotency-0001',
     now: int = 20,
 ) -> tuple[catalog_state.PublicationRecord, topology_state.LocationRecord]:
-    with pytest.MonkeyPatch.context() as clock:
-        clock.setattr(catalog_state.time, 'time', lambda: now)
-        mutation = publication.publish(source_ref=source,
-                                       release=release,
-                                       distribution=profile.name,
-                                       workspace='research',
-                                       actor_hash='1' * 64,
-                                       idempotency_key=idempotency_key)
+    mutation = publication.publish(source_ref=source,
+                                   release=release,
+                                   distribution=profile.name,
+                                   workspace='research',
+                                   actor_hash='1' * 64,
+                                   idempotency_key=idempotency_key,
+                                   now=now)
     assert catalog_state.get_ready_release(release, 'research') is None
     claimed = catalog_state.claim_publication_inspection(worker_id='copy-1',
                                                          lease_seconds=60,
@@ -1077,6 +1129,43 @@ def test_bound_pending_publication_never_reenters_source_inspection(
                                                       now=100) is None
 
 
+def test_publication_retry_delay_uses_database_epoch(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    mutation = publication.publish(
+        source_ref=_SOURCE,
+        release='retry-delay',
+        distribution=profile.name,
+        workspace='research',
+        actor_hash='1' * 64,
+        idempotency_key='publication-retry-delay-0001',
+        now=20)
+    claimed = catalog_state.claim_publication_inspection(worker_id='copy-1',
+                                                         lease_seconds=60,
+                                                         now=20)
+    assert claimed is not None and claimed.id == mutation.publication.id
+    assert claimed.inspection_lease_token is not None
+
+    assert catalog_state.fail_publication_inspection(
+        claimed.id,
+        claimed.inspection_lease_token,
+        models.ImageLocationErrorCode.MATERIALIZATION_FAILED.value,
+        retry_delay_seconds=9,
+        terminal=False,
+        now=21)
+    failed = catalog_state.get_publication(claimed.id, 'research')
+    assert failed is not None and failed.next_retry_at == 30
+    assert catalog_state.claim_publication_inspection(worker_id='copy-2',
+                                                      lease_seconds=60,
+                                                      now=29) is None
+    reclaimed = catalog_state.claim_publication_inspection(worker_id='copy-2',
+                                                           lease_seconds=60,
+                                                           now=30)
+    assert reclaimed is not None and reclaimed.id == claimed.id
+
+
 def _complete_location(location: topology_state.LocationRecord, *,
                        now: int) -> topology_state.LocationRecord:
     claim = topology_state.claim_next_location(worker_id='copy-1',
@@ -1119,10 +1208,11 @@ def test_full_shard_dispatches_already_reserved_retry(
         lease_token=first.lease_token,
         ready=False,
         error_code=(models.ImageLocationErrorCode.MATERIALIZATION_FAILED.value),
-        retry_at=40,
+        retry_delay_seconds=9,
         terminal=False,
         now=31)
     assert retried.state == models.ImageLocationState.PENDING
+    assert retried.next_retry_at == 40
     assert topology_state.claim_next_location(worker_id='copy-2',
                                               lease_seconds=60,
                                               workspace='research',
@@ -1195,14 +1285,13 @@ def test_canonical_publication_retry_obeys_shard_admission_state(
             schema.registry_shards.c.id == shard.id).values(**values))
 
     def retry() -> publication.PublicationMutation:
-        with pytest.MonkeyPatch.context() as clock:
-            clock.setattr(transactions.time, 'time', lambda: 32)
-            return publication.retry(
-                publication_id=publication_record.id,
-                workspace='research',
-                actor_hash='2' * 64,
-                idempotency_key=(
-                    f'canonical-retry-{shard_state.value.lower()}-0001'))
+        return publication.retry(
+            publication_id=publication_record.id,
+            workspace='research',
+            actor_hash='2' * 64,
+            idempotency_key=(
+                f'canonical-retry-{shard_state.value.lower()}-0001'),
+            now=32)
 
     if allowed:
         mutation = retry()
@@ -2447,6 +2536,66 @@ def test_demand_fences_eviction_until_two_terminal_observations(
             shard_before.reserved_declared_bytes)
 
 
+def test_terminal_observation_samples_database_clock_after_owner_locks(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='clocked-service:v1',
+                             consumer_kind='service_version',
+                             controller_epoch='service:clocked-service:v1',
+                             controller_sequence=1,
+                             consumer_metadata={
+                                 'workload_type': 'service',
+                                 'workload_id': 'clocked-service',
+                                 'workload_task_id': 1,
+                                 'service_hash': 'clocked-service-hash',
+                             })
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    started = int(
+        lock_connection.execute(
+            sqlalchemy.select(
+                catalog_state.database_epoch_expression())).scalar_one())
+    lock_connection.execute(
+        schema.demands.update().where(schema.demands.c.id == demand.id).values(
+            first_terminal_observed_at=started - 3599,
+            last_terminal_observed_at=started - 3599,
+            terminal_observation_count=1,
+            updated_at=started - 3599))
+    lock_connection.execute(
+        sqlalchemy.select(schema.consumer_watermarks.c.consumer_owner).where(
+            schema.consumer_watermarks.c.workspace == 'research',
+            schema.consumer_watermarks.c.consumer_kind == 'service_version',
+            schema.consumer_watermarks.c.consumer_owner ==
+            demand.consumer_owner).with_for_update()).one()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(demand_state.observe_consumer_terminal,
+                                     demand.id,
+                                     'research',
+                                     authoritative=True)
+            time.sleep(0.1)
+            assert not future.done()
+            lock_connection.exec_driver_sql('SELECT pg_sleep(2.1)')
+            lock_transaction.commit()
+            assert future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    released = demand_state.get_demand(demand.id, 'research')
+    assert released is not None
+    assert released.state == models.ImageDemandState.RELEASED
+    assert released.terminal_at is not None
+    assert released.terminal_at >= started + 2
+
+
 def test_cluster_request_terminal_lookup_is_index_bounded(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -2998,10 +3147,19 @@ def test_cluster_row_and_demand_release_commit_atomically(
     monkeypatch.setattr(global_user_state._db_manager, 'get_engine',
                         lambda: image_database)
     monkeypatch.setattr(global_user_state.time, 'time', lambda: 100)
+    with image_database.connect() as connection:
+        before = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
 
     global_user_state.remove_cluster('cluster-a', terminate=True)
 
     with image_database.connect() as connection:
+        after = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
         assert connection.execute(
             sqlalchemy.select(global_user_state.cluster_table.c.name).where(
                 global_user_state.cluster_table.c.name ==
@@ -3016,9 +3174,11 @@ def test_cluster_row_and_demand_release_commit_atomically(
                 schema.consumer_watermarks.c.consumer_kind == 'cluster',
                 schema.consumer_watermarks.c.consumer_owner ==
                 demand.consumer_owner)).mappings().one()
-    assert watermark['owner_deleted_at'] == 100
+    owner_deleted_at = int(watermark['owner_deleted_at'])
+    assert before <= owner_deleted_at <= after
+    assert owner_deleted_at != 100
     assert demand_state.compact_terminal_demands(
-        now=100 + demand_state._TERMINAL_RETENTION_SECONDS) == 1
+        now=owner_deleted_at + demand_state._TERMINAL_RETENTION_SECONDS) == 1
     assert demand_state.get_demand(demand.id, 'research') is None
     with image_database.connect() as connection:
         assert connection.execute(
@@ -4260,6 +4420,33 @@ def test_disabled_eviction_policy_blocks_new_claim_but_not_expired_reclaim(
                                                    now=161)
     assert reclaimed is not None and reclaimed.id == regional.id
     assert reclaimed.lease_kind == 'EVICT'
+
+
+def test_live_eviction_lease_ignores_fast_worker_wall_clock(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _, _, _, regional = _ready_regional(image_database, monkeypatch, profile)
+    with image_database.connect() as connection:
+        current = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
+    claimed = topology_state.claim_next_eviction(worker_id='lifecycle-1',
+                                                 unused_before=current + 1,
+                                                 lease_seconds=60,
+                                                 now=current)
+    assert claimed is not None and claimed.lease_token is not None
+    monkeypatch.setattr(topology_state.time, 'time', lambda: current + 10_000)
+
+    assert topology_state.claim_next_eviction(worker_id='lifecycle-2',
+                                              retention_seconds=0,
+                                              lease_seconds=60) is None
+
+    unchanged = topology_state.get_location(regional.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageLocationState.EVICTING
+    assert unchanged.lease_kind == 'EVICT'
+    assert unchanged.lease_token == claimed.lease_token
 
 
 def test_locked_oldest_shard_does_not_block_global_eviction(
@@ -5720,6 +5907,28 @@ def test_canonical_ready_takes_profile_lock_and_permanently_fences_custody(
     with pytest.raises(topology_state.CanonicalCustodyChangeError,
                        match='cannot change'):
         _stage_candidate_profile(changed, now=40)
+
+
+def test_copy_claim_lease_ignores_fast_worker_wall_clock(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    _, location = _publish_and_bind(profile)
+    with image_database.connect() as connection:
+        before = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
+    monkeypatch.setattr(topology_state.time, 'time', lambda: before + 10_000)
+
+    claim = topology_state.claim_next_location(worker_id='copy-clock-worker',
+                                               lease_seconds=60,
+                                               workspace='research')
+
+    assert claim is not None and claim.id == location.id
+    assert before <= claim.updated_at < before + 1_000
+    assert claim.lease_expires_at == claim.updated_at + 60
 
 
 def test_canonical_completion_rechecks_database_clock_after_blocking_lock(

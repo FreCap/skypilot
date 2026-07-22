@@ -1998,11 +1998,8 @@ def remove_cluster(cluster_name: str,
                         terminal_consumer_kind == 'cluster' and
                         terminal_consumer_owner is not None):
                     demand_state.release_owner_authoritatively_in_session(
-                        session,
-                        terminal_workspace,
-                        terminal_consumer_kind,
-                        terminal_consumer_owner,
-                        now=int(time.time()))
+                        session, terminal_workspace, terminal_consumer_kind,
+                        terminal_consumer_owner)
                 else:
                     assert terminal_demand_id is not None
                     # Compatibility for pre-binding cluster rows. The kind
@@ -2011,8 +2008,7 @@ def remove_cluster(cluster_name: str,
                         session,
                         terminal_demand_id,
                         terminal_workspace,
-                        expected_consumer_kind='cluster',
-                        now=int(time.time()))
+                        expected_consumer_kind='cluster')
             count = mutation_query.delete()
         else:
             if row is None or row.handle is None:

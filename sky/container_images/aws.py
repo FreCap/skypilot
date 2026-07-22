@@ -328,7 +328,7 @@ def ingest_terraform_qualification(
     now: int | None = None,
 ) -> topology_state.ProfileRevisionRecord:
     """Stages exact Terraform facts without claiming live runtime readiness."""
-    current = int(time.time()) if now is None else now
+    observed_at = int(time.time()) if now is None else now
     manifest = TerraformQualificationManifest.from_json(payload)
     if manifest.schema_version != 1:
         raise ValueError(
@@ -428,7 +428,7 @@ def ingest_terraform_qualification(
             raise ValueError('Qualification repository name is invalid.')
         target_evidence.append((target.name, {
             'status': 'READY',
-            'observed_at': current,
+            'observed_at': observed_at,
             'target_fingerprint': target.target_fingerprint,
             'registry': target.registry,
             'repository_name': repository_name,
@@ -450,13 +450,14 @@ def ingest_terraform_qualification(
         physical_manifest_hash=profile.physical_manifest_hash,
         max_daily_canary_microusd=(
             profile.qualification.max_daily_canary_microusd),
-        now=current)
+        now=now)
     if desired.terraform_hash not in (None, manifest.manifest_hash):
         raise ValueError('Terraform qualification hash is immutable.')
     with orm.Session(catalog_state.engine()) as session, session.begin():
         topology_state.lock_profile_shards(session,
                                            workspace=manifest.workspace,
                                            profile=profile.name)
+        state_current = catalog_state.database_epoch(session, now=now)
         for shard in sorted(manifest.shards,
                             key=lambda item: (item.target, item.shard_index)):
             target = profile.target(shard.target)
@@ -479,7 +480,7 @@ def ingest_terraform_qualification(
                 max_manifests=shard.max_manifests,
                 max_declared_bytes=shard.max_declared_bytes,
                 max_in_flight=shard.max_in_flight,
-                now=current)
+                now=state_current)
     for partition, account, region, rate, burst in provider_budgets:
         # A missing budget is required to run first-time qualification. An
         # existing operational budget remains unchanged until this revision
@@ -491,13 +492,13 @@ def ingest_terraform_qualification(
                                               api_family='ecr',
                                               applied_rate_per_second=rate,
                                               burst=burst,
-                                              now=current)
+                                              now=now)
     desired = topology_state.record_profile_attestation(
         profile_revision_id=desired.id,
         kind='terraform',
         evidence={
             'status': 'READY',
-            'observed_at': current,
+            'observed_at': observed_at,
             'manifest_hash': manifest.manifest_hash,
             'generated_at': manifest.generated_at,
             'shard_count': len(manifest.shards),
@@ -505,7 +506,7 @@ def ingest_terraform_qualification(
         expected_generation=desired.desired_generation,
         expected_config_hash=profile.config_hash,
         terraform_hash=manifest.manifest_hash,
-        now=current)
+        now=now)
     for shard in manifest.shards:
         target = profile.target(shard.target)
         applied_quota, reserved_headroom = regional_quotas[shard.region]
@@ -517,7 +518,7 @@ def ingest_terraform_qualification(
                                                 shard.physical_fingerprint),
             evidence={
                 'status': 'READY',
-                'observed_at': current,
+                'observed_at': observed_at,
                 'physical_fingerprint': shard.physical_fingerprint,
                 'target_fingerprint': target.target_fingerprint,
                 'target': shard.target,
@@ -538,7 +539,7 @@ def ingest_terraform_qualification(
             },
             expected_generation=desired.desired_generation,
             expected_config_hash=profile.config_hash,
-            now=current)
+            now=now)
     for partition, account, region, rate, burst in provider_budgets:
         desired = topology_state.record_profile_attestation(
             profile_revision_id=desired.id,
@@ -547,7 +548,7 @@ def ingest_terraform_qualification(
                                                 'ecr'),
             evidence={
                 'status': 'READY',
-                'observed_at': current,
+                'observed_at': observed_at,
                 'provider': 'aws',
                 'partition': partition,
                 'account': account,
@@ -558,7 +559,7 @@ def ingest_terraform_qualification(
             },
             expected_generation=desired.desired_generation,
             expected_config_hash=profile.config_hash,
-            now=current)
+            now=now)
     for target_name, evidence in target_evidence:
         desired = topology_state.record_profile_attestation(
             profile_revision_id=desired.id,
@@ -567,7 +568,7 @@ def ingest_terraform_qualification(
             evidence=evidence,
             expected_generation=desired.desired_generation,
             expected_config_hash=profile.config_hash,
-            now=current)
+            now=now)
     return desired
 
 

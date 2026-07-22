@@ -127,7 +127,7 @@ def test_terminal_unattached_cluster_is_reconciled_after_bounded_retention(
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     defer.assert_not_called()
-    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', now=current)
 
 
 def test_unattached_cluster_demand_is_not_released_early(
@@ -244,7 +244,7 @@ def test_known_absent_binding_does_not_mask_old_cluster_incarnation(
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     defer.assert_not_called()
-    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', now=current)
 
 
 def test_cluster_terminal_confirmation_uses_locked_reconciliation(
@@ -270,10 +270,10 @@ def test_cluster_terminal_confirmation_uses_locked_reconciliation(
 
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     clear.assert_not_called()
-    reconcile.assert_called_once_with(demand, 'orphan-cluster', current)
+    reconcile.assert_called_once_with(demand, 'orphan-cluster', now=current)
 
 
-def test_lifecycle_policy_refresh_keeps_last_valid_cutoffs(
+def test_lifecycle_policy_refresh_keeps_last_valid_retentions(
         monkeypatch: pytest.MonkeyPatch) -> None:
     previous = {'research': 123, 'retained': None}
     reload_config = mock.Mock()
@@ -283,14 +283,35 @@ def test_lifecycle_policy_refresh_keeps_last_valid_cutoffs(
         lifecycle_worker_service.config, 'list_workspace_policies',
         mock.Mock(side_effect=ValueError('malformed workspace policy')))
 
-    refreshed = lifecycle_worker_service._refresh_workspace_eviction_cutoffs(
-        200, previous)
-    startup = lifecycle_worker_service._refresh_workspace_eviction_cutoffs(
-        200, None)
+    refreshed = (lifecycle_worker_service.
+                 _refresh_workspace_eviction_retentions(previous))
+    startup = lifecycle_worker_service._refresh_workspace_eviction_retentions(
+        None)
 
     assert refreshed is previous
     assert startup is None
     assert reload_config.call_count == 2
+
+
+def test_provider_budget_limiter_uses_only_monotonic_local_expiry(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    limiter = budgets.ProviderBudgetLimiter('copy-worker')
+    monkeypatch.setattr(limiter, '_budget',
+                        lambda _: SimpleNamespace(id='provider-budget'))
+    acquire = mock.Mock(return_value=topology_state.ProviderGrant(
+        budget_id='provider-budget', tokens=2, valid_for_seconds=1))
+    monkeypatch.setattr(topology_state, 'acquire_provider_grant', acquire)
+    monkeypatch.setattr(budgets.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(
+        budgets.time, 'time',
+        mock.Mock(side_effect=AssertionError('wall clock is not local expiry')))
+
+    limiter.before_call(SimpleNamespace())
+    limiter.before_call(SimpleNamespace())
+
+    acquire.assert_called_once_with('copy-worker',
+                                    'provider-budget',
+                                    requested_calls=64)
 
 
 @pytest.mark.parametrize(
@@ -1053,7 +1074,7 @@ def test_ambiguous_copy_is_verified_before_ready(
                                      lease_token=location.lease_token,
                                      ready=True,
                                      error_code=None,
-                                     retry_at=None,
+                                     retry_delay_seconds=None,
                                      terminal=False)
 
 

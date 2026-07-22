@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import time
 from typing import Any
 import uuid
 
@@ -18,6 +17,7 @@ from sky.container_images import models
 from sky.container_images import schema
 
 _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
+_UNATTACHED_REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 _TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_POSTGRES_BIGINT = (1 << 63) - 1
 
@@ -230,7 +230,7 @@ def create_demand_in_session(
         target_fingerprint: str,
         location_id: str,
         placement: dict[str, Any],
-        now: int,
+        now: int | None = None,
         controller_epoch: str | None = None,
         controller_sequence: int | None = None) -> DemandRecord:
     """Creates one WARMING demand while enforcing the owner high watermark."""
@@ -238,6 +238,7 @@ def create_demand_in_session(
         controller_epoch = f'legacy-owner-epoch:{owner_epoch}'
         controller_sequence = owner_epoch
     placement_json = _encode_placement(placement)
+    initial_current = catalog_state.database_epoch(session, now=now)
     watermark = _lock_watermark(session,
                                 workspace=workspace,
                                 consumer_kind=consumer_kind,
@@ -246,7 +247,7 @@ def create_demand_in_session(
                                 controller_sequence=controller_sequence,
                                 owner_epoch=owner_epoch,
                                 generation=consumer_generation,
-                                now=now)
+                                now=initial_current)
     max_seen = int(watermark['max_seen_generation'])
     max_terminal = int(watermark['max_terminal_generation'])
     if consumer_generation < max_seen or consumer_generation <= max_terminal:
@@ -278,13 +279,14 @@ def create_demand_in_session(
             raise ValueError(
                 'A consumer generation cannot change image target.')
         return _demand(existing)
+    current = catalog_state.database_epoch(session, now=now)
     if consumer_generation > max_seen:
         session.execute(schema.consumer_watermarks.update().where(
             schema.consumer_watermarks.c.workspace == workspace,
             schema.consumer_watermarks.c.consumer_kind == consumer_kind,
             schema.consumer_watermarks.c.consumer_owner ==
             consumer_owner).values(max_seen_generation=consumer_generation,
-                                   updated_at=now))
+                                   updated_at=current))
     request_id = None
     consumer_metadata = placement.get('consumer')
     if consumer_kind == 'cluster' and isinstance(consumer_metadata, dict):
@@ -314,15 +316,15 @@ def create_demand_in_session(
         placement_json=placement_json,
         state=models.ImageDemandState.WARMING.value,
         consumer_attached=False,
-        created_at=now,
-        updated_at=now).returning(table)).mappings().one()
+        created_at=current,
+        updated_at=current).returning(table)).mappings().one()
     return _demand(row)
 
 
 def create_demand(**kwargs: Any) -> DemandRecord:
-    current = int(kwargs.pop('now', time.time()))
+    now = kwargs.pop('now', None)
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        return create_demand_in_session(session, now=current, **kwargs)
+        return create_demand_in_session(session, now=now, **kwargs)
 
 
 def create_demand_for_controller_epoch_in_session(
@@ -342,13 +344,14 @@ def create_demand_for_controller_epoch_in_session(
         target_fingerprint: str,
         location_id: str,
         placement: dict[str, Any],
-        now: int,
+        now: int | None = None,
         require_existing: bool = False) -> DemandRecord:
     """Maps a controller epoch and converges its durable target fence."""
     controller_epoch = validate_controller_epoch(controller_epoch)
     controller_sequence = validate_controller_sequence(controller_sequence)
     placement_json = _encode_placement(placement)
     watermarks = schema.consumer_watermarks
+    initial_current = catalog_state.database_epoch(session, now=now)
     inserted = session.execute(
         postgresql.insert(watermarks).values(
             workspace=workspace,
@@ -359,8 +362,8 @@ def create_demand_for_controller_epoch_in_session(
             owner_epoch=0,
             max_seen_generation=0,
             max_terminal_generation=-1,
-            created_at=now,
-            updated_at=now).on_conflict_do_nothing(index_elements=[
+            created_at=initial_current,
+            updated_at=initial_current).on_conflict_do_nothing(index_elements=[
                 watermarks.c.workspace, watermarks.c.consumer_kind,
                 watermarks.c.consumer_owner
             ]).returning(watermarks.c.consumer_owner)).first()
@@ -402,11 +405,12 @@ def create_demand_for_controller_epoch_in_session(
                     models.ImageDemandState.FAILED.value,
                 ])).order_by(
                     schema.demands.c.id).with_for_update()).mappings().all()
+        current = catalog_state.database_epoch(session, now=now)
         for row in previous:
             _terminalize(session,
                          row,
                          models.ImageDemandState.SUPERSEDED,
-                         now=now)
+                         now=current)
         if owner_epoch >= _MAX_POSTGRES_BIGINT:
             raise ValueError('Demand owner epoch is exhausted.')
         owner_epoch += 1
@@ -417,7 +421,7 @@ def create_demand_for_controller_epoch_in_session(
                 controller_epoch=controller_epoch,
                 controller_sequence=controller_sequence,
                 owner_epoch=owner_epoch,
-                updated_at=now).returning(watermarks)).mappings().one()
+                updated_at=current).returning(watermarks)).mappings().one()
     existing_rows = session.execute(
         sqlalchemy.select(schema.demands).where(
             schema.demands.c.workspace == workspace,
@@ -559,8 +563,8 @@ def attach_consumer(demand_id: str,
                     workspace: str,
                     *,
                     now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         changed = session.execute(schema.demands.update().where(
             schema.demands.c.id == demand_id,
             schema.demands.c.workspace == workspace,
@@ -575,8 +579,8 @@ def mark_demand_failed(demand_id: str,
                        error_code: str,
                        *,
                        now: int | None = None) -> bool:
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         changed = session.execute(schema.demands.update().where(
             schema.demands.c.id == demand_id, schema.demands.c.state ==
             models.ImageDemandState.WARMING.value).values(
@@ -593,7 +597,6 @@ def mark_cluster_request_terminal(request_id: str,
     if (not isinstance(request_id, str) or not request_id or
             len(request_id) > 1024):
         raise ValueError('Cluster demand request ID is invalid.')
-    current = int(time.time()) if now is None else now
     demands = schema.demands
     with orm.Session(catalog_state.engine()) as session, session.begin():
         rows = session.execute(
@@ -606,6 +609,7 @@ def mark_cluster_request_terminal(request_id: str,
                     models.ImageDemandState.READY.value,
                     models.ImageDemandState.FAILED.value,
                 ])).order_by(demands.c.id).with_for_update()).mappings().all()
+        current = catalog_state.database_epoch(session, now=now)
         changed = 0
         for row in rows:
             values: dict[str, Any] = {
@@ -626,7 +630,6 @@ def supersede_demand(demand_id: str,
                      *,
                      now: int | None = None) -> bool:
     """Ends a demand only after the owning controller chose real failover."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         optimistic = session.execute(
             sqlalchemy.select(schema.demands).where(
@@ -648,6 +651,7 @@ def supersede_demand(demand_id: str,
         if str(row['state']) in (models.ImageDemandState.SUPERSEDED.value,
                                  models.ImageDemandState.RELEASED.value):
             return True
+        current = catalog_state.database_epoch(session, now=now)
         _terminalize(session,
                      row,
                      models.ImageDemandState.SUPERSEDED,
@@ -661,7 +665,7 @@ def release_demand_authoritatively_in_session(session: orm.Session,
                                               *,
                                               expected_consumer_kind: str |
                                               None = None,
-                                              now: int) -> bool:
+                                              now: int | None = None) -> bool:
     """Releases and retires an owner inside its deletion transaction."""
     optimistic = session.execute(
         sqlalchemy.select(schema.demands).where(
@@ -685,20 +689,26 @@ def release_demand_authoritatively_in_session(session: orm.Session,
             workspace).with_for_update()).mappings().first()
     if row is None:
         return False
+    current = catalog_state.database_epoch(session, now=now)
     if str(row['state']) not in (models.ImageDemandState.RELEASED.value,
                                  models.ImageDemandState.SUPERSEDED.value):
-        _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+        _terminalize(session,
+                     row,
+                     models.ImageDemandState.RELEASED,
+                     now=current)
     return _mark_owner_deleted_in_session(session,
                                           workspace=owner_workspace,
                                           consumer_kind=owner_kind,
                                           consumer_owner=owner,
-                                          now=now)
+                                          now=current)
 
 
 def release_owner_authoritatively_in_session(session: orm.Session,
-                                             workspace: str, consumer_kind: str,
-                                             consumer_owner: str, *,
-                                             now: int) -> bool:
+                                             workspace: str,
+                                             consumer_kind: str,
+                                             consumer_owner: str,
+                                             *,
+                                             now: int | None = None) -> bool:
     """Releases every live demand for one durably bound deleted owner."""
     watermarks = schema.consumer_watermarks
     demands = schema.demands
@@ -720,13 +730,17 @@ def release_owner_authoritatively_in_session(session: orm.Session,
                 models.ImageDemandState.READY.value,
                 models.ImageDemandState.FAILED.value,
             ])).order_by(demands.c.id).with_for_update()).mappings().all()
+    current = catalog_state.database_epoch(session, now=now)
     for row in rows:
-        _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+        _terminalize(session,
+                     row,
+                     models.ImageDemandState.RELEASED,
+                     now=current)
     return _mark_owner_deleted_in_session(session,
                                           workspace=workspace,
                                           consumer_kind=consumer_kind,
                                           consumer_owner=consumer_owner,
-                                          now=now)
+                                          now=current)
 
 
 def release_demand_authoritatively(demand_id: str,
@@ -734,12 +748,11 @@ def release_demand_authoritatively(demand_id: str,
                                    *,
                                    now: int | None = None) -> bool:
     """Releases and retires an owner after first-party deletion proof."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         return release_demand_authoritatively_in_session(session,
                                                          demand_id,
                                                          workspace,
-                                                         now=current)
+                                                         now=now)
 
 
 def fail_and_supersede_demand(demand_id: str,
@@ -747,7 +760,6 @@ def fail_and_supersede_demand(demand_id: str,
                               *,
                               now: int | None = None) -> bool:
     """Atomically records terminal materialization failure and opens failover."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         optimistic = session.execute(
             sqlalchemy.select(schema.demands).where(
@@ -766,6 +778,7 @@ def fail_and_supersede_demand(demand_id: str,
         if str(row['state']) in (models.ImageDemandState.SUPERSEDED.value,
                                  models.ImageDemandState.RELEASED.value):
             return True
+        current = catalog_state.database_epoch(session, now=now)
         session.execute(schema.demands.update().where(
             schema.demands.c.id == demand_id).values(error_code=error_code,
                                                      updated_at=current))
@@ -801,17 +814,18 @@ def defer_consumer_reconciliation(demand_id: str,
                                   *,
                                   now: int | None = None) -> bool:
     """Invalidates partial terminal proof and rotates a live candidate."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         return defer_consumer_reconciliation_in_session(session,
                                                         demand_id,
-                                                        now=current)
+                                                        now=now)
 
 
 def defer_consumer_reconciliation_in_session(session: orm.Session,
-                                             demand_id: str, *,
-                                             now: int) -> bool:
+                                             demand_id: str,
+                                             *,
+                                             now: int | None = None) -> bool:
     """Clears partial terminal proof inside a caller-owned transaction."""
+    current = catalog_state.database_epoch(session, now=now)
     changed = session.execute(schema.demands.update().where(
         schema.demands.c.id == demand_id,
         schema.demands.c.state.in_([
@@ -821,7 +835,7 @@ def defer_consumer_reconciliation_in_session(session: orm.Session,
         ])).values(first_terminal_observed_at=None,
                    last_terminal_observed_at=None,
                    terminal_observation_count=0,
-                   updated_at=now)).rowcount
+                   updated_at=current)).rowcount
     return changed == 1
 
 
@@ -829,8 +843,8 @@ def defer_terminal_confirmation(demand_id: str,
                                 *,
                                 now: int | None = None) -> bool:
     """Rotates a candidate without erasing its pending terminal proof."""
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         changed = session.execute(schema.demands.update().where(
             schema.demands.c.id == demand_id,
             schema.demands.c.state.in_([
@@ -904,18 +918,20 @@ def observe_consumer_terminal(demand_id: str,
     """Requires two authoritative observations an hour apart before release."""
     if not authoritative:
         return False
-    current = int(time.time()) if now is None else now
     with orm.Session(catalog_state.engine()) as session, session.begin():
         return observe_consumer_terminal_in_session(session,
                                                     demand_id,
                                                     workspace,
                                                     authoritative=authoritative,
-                                                    now=current)
+                                                    now=now)
 
 
-def observe_consumer_terminal_in_session(session: orm.Session, demand_id: str,
-                                         workspace: str, *, authoritative: bool,
-                                         now: int) -> bool:
+def observe_consumer_terminal_in_session(session: orm.Session,
+                                         demand_id: str,
+                                         workspace: str,
+                                         *,
+                                         authoritative: bool,
+                                         now: int | None = None) -> bool:
     """Observes terminal state inside a caller-owned transaction."""
     if not authoritative:
         return False
@@ -939,38 +955,50 @@ def observe_consumer_terminal_in_session(session: orm.Session, demand_id: str,
             workspace).with_for_update()).mappings().first()
     if row is None:
         return False
+    current = catalog_state.database_epoch(session, now=now)
     if str(row['state']) in (models.ImageDemandState.RELEASED.value,
                              models.ImageDemandState.SUPERSEDED.value):
         return _mark_owner_deleted_in_session(session,
                                               workspace=owner_workspace,
                                               consumer_kind=owner_kind,
                                               consumer_owner=owner,
-                                              now=now)
+                                              now=current)
     first = row['first_terminal_observed_at']
     count = int(row['terminal_observation_count'])
     if first is None:
-        session.execute(demands.update().where(
-            demands.c.id == demand_id).values(first_terminal_observed_at=now,
-                                              last_terminal_observed_at=now,
-                                              terminal_observation_count=1,
-                                              updated_at=now))
-        return False
-    if now - int(first) < _TERMINAL_CONFIRMATION_SECONDS:
         session.execute(
             demands.update().where(demands.c.id == demand_id).values(
-                last_terminal_observed_at=now,
+                first_terminal_observed_at=current,
+                last_terminal_observed_at=current,
+                terminal_observation_count=1,
+                updated_at=current))
+        return False
+    if (str(row['consumer_kind']) == 'cluster' and
+            not bool(row['consumer_attached']) and
+            current - int(row['created_at'])
+            < _UNATTACHED_REQUEST_RETENTION_SECONDS):
+        session.execute(
+            demands.update().where(demands.c.id == demand_id).values(
+                last_terminal_observed_at=current,
                 terminal_observation_count=max(count, 1),
-                updated_at=now))
+                updated_at=current))
+        return False
+    if current - int(first) < _TERMINAL_CONFIRMATION_SECONDS:
+        session.execute(
+            demands.update().where(demands.c.id == demand_id).values(
+                last_terminal_observed_at=current,
+                terminal_observation_count=max(count, 1),
+                updated_at=current))
         return False
     session.execute(demands.update().where(demands.c.id == demand_id).values(
-        last_terminal_observed_at=now,
+        last_terminal_observed_at=current,
         terminal_observation_count=max(count + 1, 2)))
-    _terminalize(session, row, models.ImageDemandState.RELEASED, now=now)
+    _terminalize(session, row, models.ImageDemandState.RELEASED, now=current)
     return _mark_owner_deleted_in_session(session,
                                           workspace=owner_workspace,
                                           consumer_kind=owner_kind,
                                           consumer_owner=owner,
-                                          now=now)
+                                          now=current)
 
 
 def compact_terminal_demands(*,
@@ -979,10 +1007,10 @@ def compact_terminal_demands(*,
     """Compacts tombstones while retaining their nonresurrection fences."""
     if not 1 <= limit <= 1000:
         raise ValueError('Demand compaction page size is invalid.')
-    current = int(time.time()) if now is None else now
     demands = schema.demands
     watermarks = schema.consumer_watermarks
     with orm.Session(catalog_state.engine()) as session, session.begin():
+        current = catalog_state.database_epoch(session, now=now)
         candidate_rows = session.execute(
             sqlalchemy.select(demands.c.id, demands.c.workspace,
                               demands.c.consumer_kind,

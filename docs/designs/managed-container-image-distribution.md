@@ -541,6 +541,27 @@ attachment, success, failure, and timeout. Tests may substitute an explicit
 literal epoch, but production finalizers use the database wall clock after the
 wait and roll back every earlier write when the fence fails.
 
+The same database-clock rule governs shared work admission and retention, not
+only result finalization. Copy and eviction claims use the database clock for
+their indexed candidate scan, then sample it again after locking the selected
+shard and location and recheck lease and retention eligibility. Production
+eviction callers provide retention durations, and production retry callers
+provide delays; the transaction derives absolute cutoffs and `next_retry_at`
+instead of trusting a worker-computed epoch. Provider budgets and worker grants
+sample database time after locking the budget and worker rows, never move a
+future refill anchor backward, and return only a remaining grant duration to the
+process. The process maps that duration onto `time.monotonic()` and uses
+monotonic time for housekeeping intervals, so host wall-clock jumps cannot spend
+a database grant longer or bypass a shared throttle.
+
+Consumer safety fences are database-clock decisions too. Demand creation,
+attachment, terminal observation, the one-hour second-observation interval, the
+24-hour unattached-cluster proof window, authoritative owner retirement, worker
+heartbeats, and terminal compaction all derive their persisted timestamps after
+the rows that authorize the mutation are locked. A scheduler may decide when to
+attempt reconciliation using monotonic process time, but it does not pass that
+time into the final PostgreSQL decision.
+
 Canary failure classification follows the same rule. The worker does not choose
 ordinary failure versus deadline-expired timeout from an application timestamp.
 One transaction locks the exact operation, samples the database wall clock, and
@@ -2294,6 +2315,11 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- worker-clock skew and blocking-lock tests proving that copy and eviction
+  claims, provider grants and throttles, retry delays, consumer terminal
+  confirmation, unattached-cluster retention, worker cleanup, and terminal
+  compaction derive shared epochs from PostgreSQL, while local grant expiry and
+  worker housekeeping use only monotonic process time;
 - source-reader tests for private and multicast literals, DNS rebinding to
   private or multicast peers before TLS bytes,
   off-authority bearer realms, private and chained redirects, disabled token
@@ -2905,3 +2931,16 @@ less operation table explicitly, and large-population plan coverage proves both
 pending and expired-running canaries stay index-bounded. The acceptance streak
 remains zero until both reviewers accept one immutable current-base head three
 consecutive times.
+
+Restarted paired final-acceptance round 1 at
+`cdf7139377afdac40e6cd1a10fbf151bf2b50176` returned Fable `PURSUE` and Codex
+`RESHAPE`, resetting the streak. Codex grouped the remaining blockers under one
+clock-authority defect: copy and eviction claims could steal live leases when a
+worker clock was fast; shared provider grants and throttles mixed database epochs
+with application wall time; and consumer retirement reused scheduler time for
+the one-hour and 24-hour safety fences. This revision makes shared claims,
+retention, retries, grants, throttles, heartbeats, terminal observation, and
+compaction database-authoritative after their lock sets, while local grant and
+housekeeping deadlines use monotonic time. Blocking PostgreSQL and skew
+regressions cover the production paths. The acceptance streak remains zero until
+both reviewers accept one immutable current-base head three consecutive times.

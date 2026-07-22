@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import time
 from typing import Any
 import uuid
 
@@ -300,7 +299,7 @@ def begin_operation(session: orm.Session,
     """Creates or converges one operation inside the caller transaction."""
     if not 16 <= len(idempotency_key.encode()) <= 128:
         raise ValueError('Idempotency keys must contain 16 through 128 bytes.')
-    current = int(time.time()) if now is None else now
+    current = database_epoch(session, now=now)
     table = schema.operations
     operation_id = str(uuid.uuid4())
     result = session.execute(
@@ -411,23 +410,24 @@ def bind_operation_result(operation_id: str,
                           None = None,
                           error_code: str | None = None,
                           now: int | None = None) -> OperationRecord:
-    current = int(time.time()) if now is None else now
-    values: dict[str, Any] = {
-        'result_kind': result_kind,
-        'result_id': result_id,
-        'result_json': json.dumps(result, sort_keys=True,
-                                  separators=(',', ':')),
-        'updated_at': current,
-    }
-    if terminal_state is not None:
-        if terminal_state not in (models.ImageOperationState.SUCCEEDED,
-                                  models.ImageOperationState.FAILED):
-            raise ValueError('Operation terminal state is invalid.')
-        values.update(state=terminal_state.value,
-                      error_code=error_code,
-                      terminal_expires_at=(current +
-                                           _OPERATION_RETENTION_SECONDS))
     with orm.Session(engine()) as session, session.begin():
+        current = database_epoch(session, now=now)
+        values: dict[str, Any] = {
+            'result_kind': result_kind,
+            'result_id': result_id,
+            'result_json': json.dumps(result,
+                                      sort_keys=True,
+                                      separators=(',', ':')),
+            'updated_at': current,
+        }
+        if terminal_state is not None:
+            if terminal_state not in (models.ImageOperationState.SUCCEEDED,
+                                      models.ImageOperationState.FAILED):
+                raise ValueError('Operation terminal state is invalid.')
+            values.update(state=terminal_state.value,
+                          error_code=error_code,
+                          terminal_expires_at=(current +
+                                               _OPERATION_RETENTION_SECONDS))
         row = session.execute(schema.operations.update().where(
             schema.operations.c.id == operation_id,
             schema.operations.c.state.in_([
@@ -530,7 +530,6 @@ def create_publication(
         source_auth_fingerprint: str | None,
         now: int | None = None) -> tuple[OperationRecord, PublicationRecord]:
     """Commits one release reservation and its idempotent operation."""
-    current = int(time.time()) if now is None else now
     release = models.validate_release_label(release, 'Image release')
     source_ref = models.validate_oci_reference(source_ref, 'Image source')
     source_root_digest = models.validate_sha256_digest(source_root_digest,
@@ -539,6 +538,7 @@ def create_publication(
                                                       'Requested platform')
     table = schema.publications
     with orm.Session(engine()) as session, session.begin():
+        current = database_epoch(session, now=now)
         operation, created = begin_operation(session,
                                              authority_id=authority_id,
                                              scope=workspace,
@@ -725,9 +725,14 @@ def fail_publication_inspection(publication_id: str,
                                 lease_token: str,
                                 error_code: str,
                                 *,
-                                retry_at: int | None,
+                                retry_at: int | None = None,
+                                retry_delay_seconds: int | None = None,
                                 terminal: bool,
                                 now: int | None = None) -> bool:
+    if retry_at is not None and retry_delay_seconds is not None:
+        raise ValueError('Specify a retry time or delay, not both.')
+    if retry_delay_seconds is not None and retry_delay_seconds < 0:
+        raise ValueError('Retry delay must be nonnegative.')
     table = schema.publications
     state = (models.ImagePublicationState.FAILED.value
              if terminal else models.ImagePublicationState.PENDING.value)
@@ -737,7 +742,9 @@ def fail_publication_inspection(publication_id: str,
             'state': state,
             'inspection_lease_token': None,
             'inspection_lease_expires_at': None,
-            'next_retry_at': None if terminal else retry_at,
+            'next_retry_at': (None if terminal else
+                              (clock + retry_delay_seconds if
+                               retry_delay_seconds is not None else retry_at)),
             'error_code': error_code,
             'updated_at': clock,
         }
@@ -1149,10 +1156,10 @@ def compact_terminal_records(*,
                              now: int | None = None,
                              batch_size: int = 500) -> tuple[int, int]:
     """Expires failed reservations and deletes bounded terminal projections."""
-    current = int(time.time()) if now is None else now
     publications = schema.publications
     operations = schema.operations
     with orm.Session(engine()) as session, session.begin():
+        current = database_epoch(session, now=now)
         expiring = session.execute(
             sqlalchemy.select(publications.c.id).where(
                 publications.c.state ==

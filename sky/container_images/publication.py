@@ -33,7 +33,8 @@ def publish(*,
             actor_hash: str,
             idempotency_key: str,
             requested_platform: str = 'linux/amd64',
-            source_auth_binding_id: str | None = None) -> PublicationMutation:
+            source_auth_binding_id: str | None = None,
+            now: int | None = None) -> PublicationMutation:
     """Reserves one release and queues source inspection without provider I/O."""
     source_ref = models.validate_oci_reference(source_ref, 'Publication source')
     _, source_digest = models.split_digest(source_ref)
@@ -85,12 +86,17 @@ def publish(*,
         source_root_digest=source_digest,
         requested_platform=requested_platform,
         source_auth_binding_id=source_auth_binding_id,
-        source_auth_fingerprint=source_fingerprint)
+        source_auth_fingerprint=source_fingerprint,
+        now=now)
     return PublicationMutation(operation=operation, publication=publication)
 
 
-def retry(*, publication_id: str, workspace: str, actor_hash: str,
-          idempotency_key: str) -> PublicationMutation:
+def retry(*,
+          publication_id: str,
+          workspace: str,
+          actor_hash: str,
+          idempotency_key: str,
+          now: int | None = None) -> PublicationMutation:
     """Requeues one retained failed release reservation idempotently."""
     publication_id = models.validate_catalog_id(publication_id,
                                                 'Publication ID')
@@ -119,7 +125,8 @@ def retry(*, publication_id: str, workspace: str, actor_hash: str,
         return PublicationMutation(operation=operation, publication=publication)
     publication = transactions.retry_publication(publication_id=publication_id,
                                                  workspace=workspace,
-                                                 operation_id=operation.id)
+                                                 operation_id=operation.id,
+                                                 now=now)
     refreshed = catalog_state.get_operation(operation.id, workspace)
     if refreshed is None:
         raise RuntimeError('Publication retry operation disappeared.')

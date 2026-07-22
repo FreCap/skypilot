@@ -288,13 +288,12 @@ def inspect_publication(publication: catalog_state.PublicationRecord,
             terminal=True)
         return False
     except Exception:  # pylint: disable=broad-except
-        retry_at = int(time.time()) + min(3600, 2**min(
-            publication.attempt_count, 10))
         catalog_state.fail_publication_inspection(
             publication.id,
             token,
             models.ImageLocationErrorCode.MATERIALIZATION_FAILED.value,
-            retry_at=retry_at,
+            retry_delay_seconds=min(3600, 2**min(publication.attempt_count,
+                                                 10)),
             terminal=False)
         return False
 
@@ -478,7 +477,7 @@ def copy_location(location: topology_state.LocationRecord,
             ready=verified,
             error_code=(None if verified else
                         models.ImageLocationErrorCode.MANIFEST_MISSING.value),
-            retry_at=(None if verified else int(time.time()) + 30),
+            retry_delay_seconds=None if verified else 30,
             terminal=False)
         return verified
     except (aws.ProviderThrottledError, budgets.ProviderBudgetUnavailableError):
@@ -487,7 +486,7 @@ def copy_location(location: topology_state.LocationRecord,
             lease_token=token,
             ready=False,
             error_code=models.ImageLocationErrorCode.PROVIDER_THROTTLED.value,
-            retry_at=int(time.time()) + 30,
+            retry_delay_seconds=30,
             terminal=False)
         return False
     except aws.DestinationContentMismatchError:
@@ -500,8 +499,6 @@ def copy_location(location: topology_state.LocationRecord,
             terminal=True)
         return False
     except Exception:  # pylint: disable=broad-except
-        retry_at = int(time.time()) + min(3600, 2**min(location.attempt_count,
-                                                       10))
         try:
             transactions.converge_canonical(
                 location_id=location.id,
@@ -509,7 +506,8 @@ def copy_location(location: topology_state.LocationRecord,
                 ready=False,
                 error_code=(
                     models.ImageLocationErrorCode.MATERIALIZATION_FAILED.value),
-                retry_at=retry_at,
+                retry_delay_seconds=min(3600, 2**min(location.attempt_count,
+                                                     10)),
                 terminal=False)
         except topology_state.LocationLeaseLostError:
             pass
@@ -610,6 +608,7 @@ def _reconcile_candidate_shard_attestation(
     *,
     limiter: budgets.ProviderBudgetLimiter,
     now: int,
+    state_now: int | None = None,
 ) -> bool:
     """Probes one candidate authority without mutating operational inventory."""
     if revision.state != models.ImageProfileState.QUALIFYING:
@@ -678,7 +677,7 @@ def _reconcile_candidate_shard_attestation(
                 'inventory_epoch': shard.inventory_epoch,
                 'inventory_completed_at': shard.inventory_completed_at,
             },
-            now=now)
+            now=state_now)
         if recorded is None:
             return False
         probed += 1
@@ -727,7 +726,7 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
                                  limiter: budgets.ProviderBudgetLimiter,
                                  now: int | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
-    current = int(time.time()) if now is None else now
+    observed_at = int(time.time()) if now is None else now
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
     shard = topology_state.get_target_shard(revision.workspace, profile.name,
@@ -753,7 +752,7 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         kind=models.profile_attestation_key('infrastructure', target.name),
         evidence={
             'status': 'READY',
-            'observed_at': current,
+            'observed_at': observed_at,
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
             'repository_arn': repository_arn,
@@ -764,13 +763,14 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
-        now=current)
+        now=now)
     _reconcile_candidate_shard_attestation(revision,
                                            profile,
                                            target,
                                            limiter=limiter,
-                                           now=current)
-    if not _qualification_copy_needed(revision, profile, target, current):
+                                           now=observed_at,
+                                           state_now=now)
+    if not _qualification_copy_needed(revision, profile, target, observed_at):
         return True
     reader = providers.RegistryV2Source(profile.qualification.canary_ref,
                                         lambda: None)
@@ -789,7 +789,7 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         kind=models.profile_attestation_key('copy', target.name),
         evidence={
             'status': 'READY',
-            'observed_at': current,
+            'observed_at': observed_at,
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
             'repository_arn': repository_arn,
@@ -799,7 +799,7 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
-        now=current)
+        now=now)
     return True
 
 
@@ -808,7 +808,6 @@ def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
                                      limit: int = 8,
                                      now: int | None = None) -> int:
     """Runs a bounded fair page of independent copy-role attestations."""
-    current = int(time.time()) if now is None else now
     completed = 0
     for revision in topology_state.list_qualifying_profiles(include_active=True,
                                                             limit=limit):
@@ -819,7 +818,7 @@ def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
                 if reconcile_qualification_copy(revision,
                                                 target,
                                                 limiter=limiter,
-                                                now=current):
+                                                now=now):
                     completed += 1
             except Exception:  # pylint: disable=broad-except
                 logger.warning('Managed image copy qualification probe failed.')
@@ -1005,8 +1004,8 @@ class CopyWorkerService:
                                        self.version, self.max_in_flight)
         if self._health is not None:
             self._health.registered()
-        last_config_refresh = 0
-        last_qualification_refresh = 0
+        last_config_refresh = 0.0
+        last_qualification_refresh = 0.0
         manifest_directory = os.environ.get(
             'SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR')
         with concurrent.futures.ThreadPoolExecutor(
@@ -1025,8 +1024,9 @@ class CopyWorkerService:
                 if (qualification_future is not None and
                         qualification_future.done()):
                     qualification_future = None
-                current = int(time.time())
-                if current - last_config_refresh >= _CONFIG_REFRESH_SECONDS:
+                schedule_now = time.monotonic()
+                if (schedule_now - last_config_refresh
+                        >= _CONFIG_REFRESH_SECONDS):
                     try:
                         skypilot_config.safe_reload_config()
                         if manifest_directory is not None:
@@ -1034,15 +1034,15 @@ class CopyWorkerService:
                     except (OSError, TypeError, ValueError):
                         logger.warning(
                             'Image worker configuration refresh failed.')
-                    last_config_refresh = current
-                if (current - last_qualification_refresh
+                    last_config_refresh = schedule_now
+                if (schedule_now - last_qualification_refresh
                         >= _CONFIG_REFRESH_SECONDS and
                         qualification_future is None and
                         len(futures) < self.max_in_flight):
                     qualification_future = executor.submit(
                         _qualification_maintenance, self._budget_limiter)
                     futures.add(qualification_future)
-                    last_qualification_refresh = current
+                    last_qualification_refresh = schedule_now
                 heartbeat_ok = topology_state.heartbeat_worker(
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:

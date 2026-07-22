@@ -90,24 +90,22 @@ def _profile_target_for_location(
     return profile, target
 
 
-def _workspace_eviction_cutoffs(now: int) -> dict[str, int | None]:
+def _workspace_eviction_retentions() -> dict[str, int | None]:
     seconds_per_week = 7 * 24 * 60 * 60
     return {
         workspace: (
-            None if policy.regional_cache_retention_weeks is None else now -
+            None if policy.regional_cache_retention_weeks is None else
             policy.regional_cache_retention_weeks * seconds_per_week
         ) for workspace, policy in config.list_workspace_policies().items()
     }
 
 
-def _refresh_workspace_eviction_cutoffs(
-    now: int,
-    previous: dict[str, int | None] | None,
-) -> dict[str, int | None] | None:
+def _refresh_workspace_eviction_retentions(
+    previous: dict[str, int | None] | None,) -> dict[str, int | None] | None:
     """Reloads retention policy without killing the lifecycle claim loop."""
     try:
         skypilot_config.safe_reload_config()
-        return _workspace_eviction_cutoffs(now)
+        return _workspace_eviction_retentions()
     except (OSError, TypeError, ValueError):
         logger.warning('Image lifecycle policy refresh failed.')
         return previous
@@ -238,7 +236,9 @@ def _reconcile_publication_fanout(limit: int = 100) -> int:
 
 
 def _reconcile_cluster_terminal(demand: demand_state.DemandRecord,
-                                cluster_name: str, current: int) -> bool:
+                                cluster_name: str,
+                                *,
+                                now: int | None = None) -> bool:
     """Re-proves cluster absence and observes it in one transaction."""
     with orm.Session(catalog_state.engine()) as session, session.begin():
         global_user_state.lock_container_image_cluster_lifecycle_in_session(
@@ -252,18 +252,20 @@ def _reconcile_cluster_terminal(demand: demand_state.DemandRecord,
              active_consumer == (demand.consumer_kind, demand.consumer_owner))):
             demand_state.defer_consumer_reconciliation_in_session(session,
                                                                   demand.id,
-                                                                  now=current)
+                                                                  now=now)
             return False
         return demand_state.observe_consumer_terminal_in_session(
-            session,
-            demand.id,
-            demand.workspace,
-            authoritative=True,
-            now=current)
+            session, demand.id, demand.workspace, authoritative=True, now=now)
 
 
-def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
+def _reconcile_terminal_consumers(now: int | None = None,
+                                  limit: int = 500) -> int:
     """Releases fences only from each consumer's authoritative lifecycle."""
+    if now is None:
+        with orm.Session(catalog_state.engine()) as session:
+            current = catalog_state.database_epoch(session)
+    else:
+        current = now
     candidates = demand_state.list_consumer_reconciliation_candidates(
         older_than=current - _CONSUMER_RECONCILIATION_SECONDS, limit=limit)
     cluster_names: set[str] = set()
@@ -327,28 +329,25 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
         if demand.consumer_kind == 'cluster':
             cluster_name = demand_cluster_identity.get(demand.id)
             if cluster_name is None:
-                demand_state.defer_consumer_reconciliation(demand.id,
-                                                           now=current)
+                demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             legacy_name_owner = ':incarnation:' not in demand.consumer_owner
             active_consumer = cluster_consumers.get(cluster_name)
             if (cluster_name in cluster_consumers and
                 (legacy_name_owner or active_consumer is None or active_consumer
                  == (demand.consumer_kind, demand.consumer_owner))):
-                demand_state.defer_consumer_reconciliation(demand.id,
-                                                           now=current)
+                demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             if not demand.consumer_attached:
                 if demand.first_terminal_observed_at is None:
                     demand_state.defer_consumer_reconciliation(demand.id,
-                                                               now=current)
+                                                               now=now)
                     continue
                 if (current - demand.created_at
                         < _UNATTACHED_REQUEST_RETENTION_SECONDS):
-                    demand_state.defer_terminal_confirmation(demand.id,
-                                                             now=current)
+                    demand_state.defer_terminal_confirmation(demand.id, now=now)
                     continue
-            if _reconcile_cluster_terminal(demand, cluster_name, current):
+            if _reconcile_cluster_terminal(demand, cluster_name, now=now):
                 reconciled += 1
             continue
         elif demand.consumer_kind == 'service_version':
@@ -356,8 +355,7 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
             state = (service_states.get(current_service_identity)
                      if current_service_identity is not None else None)
             if state is not True:
-                demand_state.defer_consumer_reconciliation(demand.id,
-                                                           now=current)
+                demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             authoritative_terminal = True
         elif demand.consumer_kind == 'managed_job_task':
@@ -365,23 +363,22 @@ def _reconcile_terminal_consumers(current: int, limit: int = 500) -> int:
             state = (job_states.get(current_job_identity)
                      if current_job_identity is not None else None)
             if state is not True:
-                demand_state.defer_consumer_reconciliation(demand.id,
-                                                           now=current)
+                demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             authoritative_terminal = True
         else:
-            demand_state.defer_consumer_reconciliation(demand.id, now=current)
+            demand_state.defer_consumer_reconciliation(demand.id, now=now)
             continue
         if (demand.first_terminal_observed_at is not None and
                 current - demand.first_terminal_observed_at
                 < _TERMINAL_CONFIRMATION_SECONDS):
-            demand_state.defer_terminal_confirmation(demand.id, now=current)
+            demand_state.defer_terminal_confirmation(demand.id, now=now)
             continue
         if demand_state.observe_consumer_terminal(
                 demand.id,
                 demand.workspace,
                 authoritative=(authoritative_terminal),
-                now=current):
+                now=now):
             reconciled += 1
     return reconciled
 
@@ -391,7 +388,7 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                                       limit: int = 8,
                                       now: int | None = None) -> bool:
     """Deletes canaries only after every declared runtime tuple proved pull."""
-    current = int(time.time()) if now is None else now
+    observed_at = int(time.time()) if now is None else now
     for revision in topology_state.list_qualifying_profiles(include_active=True,
                                                             limit=limit):
         profile = models.ManagedRegistryProfile.from_snapshot(
@@ -464,7 +461,7 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 kind=lifecycle_key,
                 evidence={
                     'status': 'READY',
-                    'observed_at': current,
+                    'observed_at': observed_at,
                     'target': target.name,
                     'target_fingerprint': target.target_fingerprint,
                     'repository_arn': repository_arn,
@@ -473,7 +470,7 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 },
                 expected_generation=revision.desired_generation,
                 expected_config_hash=revision.config_hash,
-                now=current)
+                now=now)
         qualification.maybe_activate_profile(revision.id)
     return True
 
@@ -538,11 +535,11 @@ class LifecycleWorkerService:
     def stop(self) -> None:
         self._stop.set()
 
-    def _maintenance(self, current: int) -> None:
+    def _maintenance(self) -> None:
         _reconcile_publication_fanout()
-        catalog_state.compact_terminal_records(now=current)
-        demand_state.compact_terminal_demands(now=current)
-        topology_state.compact_stale_workers(older_than=current - 24 * 60 * 60)
+        catalog_state.compact_terminal_records()
+        demand_state.compact_terminal_demands()
+        topology_state.compact_stale_workers(max_age_seconds=24 * 60 * 60)
 
     def run_forever(self) -> None:
         topology_state.register_worker(self.worker_id,
@@ -550,12 +547,12 @@ class LifecycleWorkerService:
                                        self.version, self.max_in_flight)
         if self._health is not None:
             self._health.registered()
-        last_maintenance = 0
-        last_consumer_reconciliation = 0
-        last_qualification_reconciliation = 0
-        last_canonical_reconciliation = 0
-        last_policy_refresh = 0
-        workspace_cutoffs: dict[str, int | None] | None = None
+        last_maintenance = 0.0
+        last_consumer_reconciliation = 0.0
+        last_qualification_reconciliation = 0.0
+        last_canonical_reconciliation = 0.0
+        last_policy_refresh = 0.0
+        workspace_retentions: dict[str, int | None] | None = None
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_in_flight,
                 thread_name_prefix='image-lifecycle') as executor:
@@ -575,27 +572,27 @@ class LifecycleWorkerService:
                     qualification_future = None
                 if canonical_future is not None and canonical_future.done():
                     canonical_future = None
-                current = int(time.time())
+                schedule_now = time.monotonic()
                 heartbeat_ok = topology_state.heartbeat_worker(
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
-                if current - last_maintenance >= 5 * 60:
-                    self._maintenance(current)
-                    last_maintenance = current
-                if (current - last_consumer_reconciliation
+                if schedule_now - last_maintenance >= 5 * 60:
+                    self._maintenance()
+                    last_maintenance = schedule_now
+                if (schedule_now - last_consumer_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS):
-                    _reconcile_terminal_consumers(current)
-                    last_consumer_reconciliation = current
-                if (current - last_qualification_reconciliation
+                    _reconcile_terminal_consumers()
+                    last_consumer_reconciliation = schedule_now
+                if (schedule_now - last_qualification_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         qualification_future is None and
                         len(futures) < self.max_in_flight):
                     qualification_future = executor.submit(
                         reconcile_qualification_lifecycle, self._budget_limiter)
                     futures.add(qualification_future)
-                    last_qualification_reconciliation = current
-                if (current - last_canonical_reconciliation
+                    last_qualification_reconciliation = schedule_now
+                if (schedule_now - last_canonical_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         canonical_future is None and
                         len(futures) < self.max_in_flight):
@@ -603,22 +600,23 @@ class LifecycleWorkerService:
                         reconcile_failed_canonical_reservations,
                         self._budget_limiter)
                     futures.add(canonical_future)
-                    last_canonical_reconciliation = current
-                if current - last_policy_refresh >= 60:
-                    workspace_cutoffs = _refresh_workspace_eviction_cutoffs(
-                        current, workspace_cutoffs)
-                    last_policy_refresh = current
-                if workspace_cutoffs is None:
+                    last_canonical_reconciliation = schedule_now
+                if schedule_now - last_policy_refresh >= 60:
+                    workspace_retentions = (
+                        _refresh_workspace_eviction_retentions(
+                            workspace_retentions))
+                    last_policy_refresh = schedule_now
+                if workspace_retentions is None:
                     self._stop.wait(1 if futures else 5)
                     continue
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = topology_state.claim_next_eviction(
                         worker_id=self.worker_id,
-                        unused_before=current - self.retention_seconds,
-                        workspace_unused_before=workspace_cutoffs,
+                        retention_seconds=self.retention_seconds,
+                        workspace_retention_seconds=workspace_retentions,
                         lease_seconds=self.lease_seconds,
-                        now=current)
+                    )
                     if claim is None:
                         break
                     futures.add(
