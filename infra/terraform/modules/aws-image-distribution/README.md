@@ -31,10 +31,13 @@ Copy and lifecycle target roles have separate inline policies and separate
 Terraform-managed permissions boundaries. The copy role can inspect and publish
 only the declared repositories and read quota facts. The lifecycle role can
 inspect canonical, regional, and qualification content, but can delete only
-eligible regional and qualification content. Keep these roles separate when
-supplying existing role ARNs as well. An externally managed lifecycle target
-role must carry the same identity-side read and delete split; repository policy
-alone is not a substitute for that identity permission.
+eligible regional and qualification content. Managed v0 always creates and owns
+both target roles, their trust policies, their inline policies, and their
+permissions boundaries. Operators adopting deterministic role names that
+already exist must import the exact roles, and any same-named boundary policies,
+into this module's Terraform state and let Terraform converge them. There is no
+external-role escape hatch because an unattached policy or boundary would make
+the qualification fingerprints misleading.
 
 Run the mocked custody-boundary tests with Terraform 1.7 or newer:
 

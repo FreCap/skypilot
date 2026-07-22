@@ -56,6 +56,42 @@ mock_provider "aws" {
       repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/skypilot/images/test-qualification"
     }
   }
+
+  override_resource {
+    target          = aws_iam_policy.copy_role_boundary
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:policy/image-copy-target-boundary"
+      id  = "arn:aws:iam::123456789012:policy/image-copy-target-boundary"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_policy.lifecycle_role_boundary
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:policy/image-lifecycle-target-boundary"
+      id  = "arn:aws:iam::123456789012:policy/image-lifecycle-target-boundary"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.copy_target
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/image-copy-target"
+      id  = "image-copy-target"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.lifecycle_target
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/image-lifecycle-target"
+      id  = "image-lifecycle-target"
+    }
+  }
 }
 
 variables {
@@ -86,6 +122,36 @@ variables {
 
 run "canonical_is_readable_but_never_deletable" {
   command = plan
+
+  assert {
+    condition     = aws_iam_role.copy_target.permissions_boundary == aws_iam_policy.copy_role_boundary.arn
+    error_message = "The module-owned copy target role must attach the module-owned copy permissions boundary."
+  }
+
+  assert {
+    condition     = aws_iam_role.lifecycle_target.permissions_boundary == aws_iam_policy.lifecycle_role_boundary.arn
+    error_message = "The module-owned lifecycle target role must attach the module-owned lifecycle permissions boundary."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.copy_target.role == aws_iam_role.copy_target.id
+    error_message = "The copy identity policy must attach to the module-owned copy target role."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.lifecycle_target.role == aws_iam_role.lifecycle_target.id
+    error_message = "The lifecycle identity policy must attach to the module-owned lifecycle target role."
+  }
+
+  assert {
+    condition     = output.copy_target_role_arn == aws_iam_role.copy_target.arn
+    error_message = "The copy role output must identify the role whose boundary and inline policy are managed here."
+  }
+
+  assert {
+    condition     = output.lifecycle_target_role_arn == aws_iam_role.lifecycle_target.arn
+    error_message = "The lifecycle role output must identify the role whose boundary and inline policy are managed here."
+  }
 
   assert {
     condition = toset(one([

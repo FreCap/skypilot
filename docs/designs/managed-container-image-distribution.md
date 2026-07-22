@@ -1510,7 +1510,10 @@ any number of regions in the same AWS partition. Source registries and compute
 accounts may differ. Multiple destination registry accounts remain outside
 managed v0 until a later topology is reviewed.
 
-The module creates or accepts these non-interchangeable identities:
+The module creates and owns the registry copy and lifecycle roles below,
+including their trust policies, inline policies, and permissions boundaries.
+Worker base roles and runtime pull principals are exact input ARNs. These
+identities are non-interchangeable:
 
 - API: PostgreSQL metadata and intent only, with no ECR, Service Quotas, KMS, or
   data-role `sts:AssumeRole` permission;
@@ -1586,7 +1589,7 @@ declared workspaces, prefix,
 fixed shard count/generation, manifest and declared-byte ceilings,
 encryption/scanning settings, quota headroom, exact compute pull-principal ARNs,
 qualified EC2 AMI IDs/helper fingerprint, optional organization/tag policy
-conditions, and optional existing worker role ARNs. It
+conditions, and exact worker base-role ARNs. It
 reads applied repository and images-per-repository quotas when permitted;
 otherwise it requires explicit validated inputs and leaves readiness false.
 
@@ -2451,3 +2454,16 @@ repository policies, and qualification policy. Read covers every fixed managed
 repository; delete covers only noncanonical and qualification repositories.
 Mocked Terraform assertions prove both the positive regional grants and the
 negative canonical delete boundary.
+
+Restarted full-feature round 1 at
+`6b852c271ac6573a1ff9fec1b642f2eae53e424c` returned Codex `RESHAPE` and Fable
+`PURSUE`, resetting the acceptance streak. Codex proved that either externally
+managed target-role input could bypass the module's identity policy and
+permissions boundary while its output still attested hashes for unattached
+documents. This revision removes both target-role escape hatches. Managed v0
+owns the copy and lifecycle roles, their trust, inline policies, and boundaries;
+existing deterministic names must be imported into the exact Terraform resource
+addresses before convergence. Fable also observed an exact-head AWS adaptor
+memory check failure. The public image SDK facade is now lazy, and a clean
+subprocess regression test prevents its client and API model graph from loading
+during ordinary `import sky`.

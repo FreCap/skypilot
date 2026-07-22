@@ -116,20 +116,6 @@ variable "lifecycle_target_role_name" {
   type        = string
 }
 
-variable "existing_copy_target_role_arn" {
-  description = "Existing externally managed target role, or null to create one."
-  type        = string
-  default     = null
-  nullable    = true
-}
-
-variable "existing_lifecycle_target_role_arn" {
-  description = "Existing externally managed lifecycle role, or null to create one."
-  type        = string
-  default     = null
-  nullable    = true
-}
-
 variable "worker_assume_role_external_id" {
   description = "Optional external ID required by registry target roles."
   type        = string

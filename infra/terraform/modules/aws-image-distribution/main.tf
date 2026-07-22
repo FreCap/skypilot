@@ -45,8 +45,6 @@ locals {
   shards = { for shard in flatten(local.shard_specs) : shard.key => shard }
 
   qualification_repository_name = "${var.repository_prefix}/r${var.catalog_authority_base32}/qualification/${var.region}"
-  create_copy_role              = var.existing_copy_target_role_arn == null
-  create_lifecycle_role         = var.existing_lifecycle_target_role_arn == null
 }
 
 resource "terraform_data" "validation" {
@@ -84,12 +82,12 @@ resource "terraform_data" "validation" {
       error_message = "A configured manifest ceiling exceeds the verified quota after headroom."
     }
     precondition {
-      condition     = !local.create_copy_role || length(var.copy_worker_base_role_arns) > 0
-      error_message = "copy_worker_base_role_arns is required when creating the copy target role."
+      condition     = length(var.copy_worker_base_role_arns) > 0
+      error_message = "copy_worker_base_role_arns is required for the module-owned copy target role."
     }
     precondition {
-      condition     = !local.create_lifecycle_role || length(var.lifecycle_worker_base_role_arns) > 0
-      error_message = "lifecycle_worker_base_role_arns is required when creating the lifecycle target role."
+      condition     = length(var.lifecycle_worker_base_role_arns) > 0
+      error_message = "lifecycle_worker_base_role_arns is required for the module-owned lifecycle target role."
     }
   }
 }
@@ -209,8 +207,6 @@ data "aws_iam_policy_document" "lifecycle_role_boundary" {
 }
 
 resource "aws_iam_policy" "copy_role_boundary" {
-  count = local.create_copy_role ? 1 : 0
-
   name        = "${var.copy_target_role_name}-boundary"
   description = "Maximum ECR and quota-read permissions for the SkyPilot image copy role."
   policy      = data.aws_iam_policy_document.copy_role_boundary.json
@@ -218,8 +214,6 @@ resource "aws_iam_policy" "copy_role_boundary" {
 }
 
 resource "aws_iam_policy" "lifecycle_role_boundary" {
-  count = local.create_lifecycle_role ? 1 : 0
-
   name        = "${var.lifecycle_target_role_name}-boundary"
   description = "Maximum ECR read and custody-scoped delete permissions for the SkyPilot image lifecycle role."
   policy      = data.aws_iam_policy_document.lifecycle_role_boundary.json
@@ -227,8 +221,6 @@ resource "aws_iam_policy" "lifecycle_role_boundary" {
 }
 
 data "aws_iam_policy_document" "copy_trust" {
-  count = local.create_copy_role ? 1 : 0
-
   statement {
     sid     = "ExactCopyWorkerPrincipals"
     effect  = "Allow"
@@ -263,8 +255,6 @@ data "aws_iam_policy_document" "copy_trust" {
 }
 
 data "aws_iam_policy_document" "lifecycle_trust" {
-  count = local.create_lifecycle_role ? 1 : 0
-
   statement {
     sid     = "ExactLifecycleWorkerPrincipals"
     effect  = "Allow"
@@ -299,28 +289,24 @@ data "aws_iam_policy_document" "lifecycle_trust" {
 }
 
 resource "aws_iam_role" "copy_target" {
-  count = local.create_copy_role ? 1 : 0
-
   name                 = var.copy_target_role_name
-  assume_role_policy   = data.aws_iam_policy_document.copy_trust[0].json
-  permissions_boundary = aws_iam_policy.copy_role_boundary[0].arn
+  assume_role_policy   = data.aws_iam_policy_document.copy_trust.json
+  permissions_boundary = aws_iam_policy.copy_role_boundary.arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "copy" })
 }
 
 resource "aws_iam_role" "lifecycle_target" {
-  count = local.create_lifecycle_role ? 1 : 0
-
   name                 = var.lifecycle_target_role_name
-  assume_role_policy   = data.aws_iam_policy_document.lifecycle_trust[0].json
-  permissions_boundary = aws_iam_policy.lifecycle_role_boundary[0].arn
+  assume_role_policy   = data.aws_iam_policy_document.lifecycle_trust.json
+  permissions_boundary = aws_iam_policy.lifecycle_role_boundary.arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "lifecycle" })
 }
 
 locals {
-  copy_target_role_arn      = var.existing_copy_target_role_arn != null ? var.existing_copy_target_role_arn : aws_iam_role.copy_target[0].arn
-  lifecycle_target_role_arn = var.existing_lifecycle_target_role_arn != null ? var.existing_lifecycle_target_role_arn : aws_iam_role.lifecycle_target[0].arn
+  copy_target_role_arn      = aws_iam_role.copy_target.arn
+  lifecycle_target_role_arn = aws_iam_role.lifecycle_target.arn
 }
 
 data "aws_iam_policy_document" "copy_permissions" {
@@ -363,16 +349,14 @@ data "aws_iam_policy_document" "lifecycle_permissions" {
 }
 
 resource "aws_iam_role_policy" "copy_target" {
-  count  = local.create_copy_role ? 1 : 0
   name   = "copy-managed-image-content"
-  role   = aws_iam_role.copy_target[0].id
+  role   = aws_iam_role.copy_target.id
   policy = data.aws_iam_policy_document.copy_permissions.json
 }
 
 resource "aws_iam_role_policy" "lifecycle_target" {
-  count  = local.create_lifecycle_role ? 1 : 0
   name   = "lifecycle-managed-image-content"
-  role   = aws_iam_role.lifecycle_target[0].id
+  role   = aws_iam_role.lifecycle_target.id
   policy = data.aws_iam_policy_document.lifecycle_permissions.json
 }
 

@@ -119,6 +119,7 @@ _set_http_proxy_env_vars()
 from sky import backends
 from sky import batch  # noqa: F401 # pylint: disable=unused-import
 from sky import clouds
+from sky.adaptors import common as adaptors_common
 from sky.admin_policy import AdminPolicy
 from sky.admin_policy import MutatedUserRequest
 from sky.admin_policy import UserRequest
@@ -154,7 +155,6 @@ from sky.client.sdk import storage_delete
 from sky.client.sdk import storage_ls
 from sky.client.sdk import stream_and_get
 from sky.client.sdk import tail_logs
-from sky.container_images import client as image
 from sky.container_images import ContainerImage
 from sky.dag import Dag
 from sky.dag import DagExecution
@@ -174,6 +174,8 @@ from sky.utils.config_utils import Config
 from sky.utils.registry import CLOUD_REGISTRY
 from sky.utils.registry import JOBS_RECOVERY_STRATEGY_REGISTRY
 from sky.utils.status_lib import ClusterStatus
+
+image = adaptors_common.LazyImport('sky.container_images.client')
 
 # Aliases.
 IBM = clouds.IBM
