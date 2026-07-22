@@ -155,7 +155,6 @@ export function useManagedJobsPageData() {
   const [poolsLoading, setPoolsLoading] = useState(true); // Start as true for initial load
   const initialLoadRef = useRef(true);
   const jobsRefreshRef = useRef(null);
-  const poolsRefreshRef = useRef(null);
   const refreshInFlightRef = useRef(null);
   const [poolsData, setPoolsData] = useState([]);
   const [preloadingComplete, setPreloadingComplete] = useState(false);
@@ -163,100 +162,123 @@ export function useManagedJobsPageData() {
   const mountedRef = useRef(false);
   const requestVersionRef = useRef(0);
 
-  const loadPageData = useCallback(
-    async ({ forcePreload = false, refreshChildren = false } = {}) => {
+  const refreshPoolsData = useCallback(
+    ({
+      source = 'initial',
+      forcePreload = false,
+      refreshJobs = false,
+      forcePoolRefresh = false,
+      allowSupersede = false,
+    } = {}) => {
+      const inFlight = refreshInFlightRef.current;
+      if (inFlight) {
+        if (inFlight.source === source || !allowSupersede) {
+          return inFlight.promise;
+        }
+      }
+
       const version = requestVersionRef.current + 1;
       requestVersionRef.current = version;
       const isInitialLoad = initialLoadRef.current;
+      const shouldPreload = isInitialLoad || forcePreload;
       const ownsState = () =>
         mountedRef.current && version === requestVersionRef.current;
+      const refreshPromise = (async () => {
+        if (isInitialLoad) {
+          setPoolsLoading(true);
+        }
 
-      if (isInitialLoad) {
-        setPoolsLoading(true);
-      }
-
-      try {
         try {
-          if (forcePreload) {
-            await cachePreloader.preloadForPage('jobs', { force: true });
-          } else {
-            await cachePreloader.preloadForPage('jobs');
+          if (shouldPreload) {
+            try {
+              if (forcePreload) {
+                await cachePreloader.preloadForPage('jobs', { force: true });
+              } else {
+                await cachePreloader.preloadForPage('jobs');
+              }
+            } catch (error) {
+              if (ownsState()) {
+                console.error('Error preloading jobs data:', error);
+              }
+            }
+          }
+
+          if (!ownsState()) return;
+
+          setPreloadingComplete(true);
+          setLastFetchedTime(new Date());
+
+          if (refreshJobs) {
+            jobsRefreshRef.current?.();
+          }
+          if (forcePoolRefresh) {
+            dashboardCache.invalidate(getPoolStatus, [{}]);
+          }
+
+          const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+          if (ownsState()) {
+            setPoolsData(poolsResponse?.pools || []);
           }
         } catch (error) {
           if (ownsState()) {
-            console.error('Error preloading jobs data:', error);
+            console.error('Error fetching data:', error);
           }
-        }
-
-        if (!ownsState()) return;
-
-        setPreloadingComplete(true);
-        setLastFetchedTime(new Date());
-
-        // Child refreshes do not depend on the page-level pool snapshot. Start
-        // them before awaiting that snapshot so manual refresh keeps its
-        // existing parallel fanout.
-        if (refreshChildren) {
-          jobsRefreshRef.current?.();
-          poolsRefreshRef.current?.();
-        }
-
-        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
-        if (ownsState()) {
-          setPoolsData(poolsResponse?.pools || []);
-        }
-      } catch (error) {
-        if (ownsState()) {
-          console.error('Error fetching data:', error);
-        }
-      } finally {
-        if (ownsState()) {
-          if (isInitialLoad) {
+        } finally {
+          if (ownsState() && isInitialLoad) {
             setPoolsLoading(false);
             initialLoadRef.current = false;
           }
+          if (refreshInFlightRef.current?.promise === refreshPromise) {
+            refreshInFlightRef.current = null;
+          }
         }
-      }
+      })();
+      refreshInFlightRef.current = { source, promise: refreshPromise };
+      return refreshPromise;
     },
     []
   );
 
   useEffect(() => {
     mountedRef.current = true;
-    loadPageData();
+    void refreshPoolsData();
+    const interval = setInterval(() => {
+      if (window.document.visibilityState !== 'visible') {
+        return;
+      }
+      void refreshPoolsData({
+        source: 'interval',
+        forcePoolRefresh: true,
+      });
+    }, REFRESH_INTERVAL);
     return () => {
       mountedRef.current = false;
       requestVersionRef.current += 1;
       jobsRefreshRef.current = null;
-      poolsRefreshRef.current = null;
       refreshInFlightRef.current = null;
+      clearInterval(interval);
     };
-  }, [loadPageData]);
+  }, [refreshPoolsData]);
 
   const handleRefresh = useCallback(() => {
-    if (refreshInFlightRef.current !== null) {
-      return;
+    if (refreshInFlightRef.current?.source === 'manual') {
+      return refreshInFlightRef.current.promise;
     }
-
     jobsCacheManager.invalidateCache();
-    dashboardCache.invalidate(getPoolStatus, [{}]);
     dashboardCache.invalidate(getWorkspaces);
     setPreloadingComplete(false);
-    const refreshPromise = loadPageData({
+    return refreshPoolsData({
+      source: 'manual',
+      allowSupersede: true,
       forcePreload: true,
-      refreshChildren: true,
-    }).finally(() => {
-      if (refreshInFlightRef.current === refreshPromise) {
-        refreshInFlightRef.current = null;
-      }
+      refreshJobs: true,
+      forcePoolRefresh: true,
     });
-    refreshInFlightRef.current = refreshPromise;
-  }, [loadPageData]);
+  }, [refreshPoolsData]);
 
   return {
     setLoading,
     jobsRefreshRef,
-    poolsRefreshRef,
     poolsData,
     poolsLoading,
     preloadingComplete,
@@ -270,7 +292,6 @@ export function ManagedJobs() {
   const {
     setLoading,
     jobsRefreshRef,
-    poolsRefreshRef,
     poolsData,
     poolsLoading,
     preloadingComplete,
@@ -392,11 +413,7 @@ export function ManagedJobs() {
 
       {/* Pools table - always visible */}
       <div className="mb-4">
-        <PoolsTable
-          refreshInterval={REFRESH_INTERVAL}
-          setLoading={setLoading}
-          refreshDataRef={poolsRefreshRef}
-        />
+        <PoolsTable data={poolsData} loading={poolsLoading} />
       </div>
     </>
   );

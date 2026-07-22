@@ -37,14 +37,26 @@ class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
         # 3. Thread 1 schedules the task to other pool even if the pool is
         #    currently idle.
         self.running: atomic.AtomicInt = atomic.AtomicInt(0)
+        # Serialize submission with the worker snapshot in shutdown. The
+        # standard executor has its own lifecycle lock, but taking the
+        # snapshot before calling its shutdown leaves a window where a submit
+        # can create a process that proactive cancellation never sees.
+        self._lifecycle_lock = threading.Lock()
 
     def submit(self, fn, /, *args, **kwargs) -> concurrent.futures.Future:
         """Submit a task for execution.
 
         If reuse_worker is False, wraps the function to exit after completion.
         """
-        self.running.increment()
-        future = super().submit(fn, *args, **kwargs)
+        with self._lifecycle_lock:
+            self.running.increment()
+            try:
+                future = super().submit(fn, *args, **kwargs)
+            except BaseException:
+                # A rejected submission never produces a future whose callback
+                # can release this capacity, so roll it back synchronously.
+                self.running.decrement()
+                raise
         future.add_done_callback(lambda _: self.running.decrement())
         return future
 
@@ -60,15 +72,18 @@ class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
         # Here wait means wait for the proactive cancellation complete.
         # TODO(aylei): we may support wait=True in the future if needed.
         assert wait is True, 'wait=False is not supported'
-        executor_processes = list(self._processes.values())
-        # Shutdown the executor so that executor process can exit once the
-        # running task is finished or interrupted.
-        super().shutdown(wait=False)
-        # Proactively interrupt the running task to avoid indefinite waiting.
-        subprocess_utils.run_in_parallel(
-            subprocess_utils.kill_process_with_grace_period,
-            executor_processes,
-            num_threads=len(executor_processes))
+        with self._lifecycle_lock:
+            executor_processes = (list(self._processes.values())
+                                  if self._processes is not None else [])
+            # Shutdown the executor so that executor process can exit once the
+            # running task is finished or interrupted.
+            super().shutdown(wait=False, cancel_futures=cancel_futures)
+            # Proactively interrupt the running task to avoid indefinite
+            # waiting.
+            subprocess_utils.run_in_parallel(
+                subprocess_utils.kill_process_with_grace_period,
+                executor_processes,
+                num_threads=len(executor_processes))
 
 
 # Define the worker function outside of the class to avoid pickling self
