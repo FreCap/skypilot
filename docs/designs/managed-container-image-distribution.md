@@ -2834,3 +2834,16 @@ tag-on-create authority explicit, rejects managed-only selectors before demand
 lookup, treats redacted bindings as absent, and repairs the exact-head gates.
 The acceptance streak remains zero until both reviewers accept the same new
 immutable head three consecutive times.
+
+The next paired round at
+`a19d9d015a20a2b5cf71b1a544730135d3066150` returned Fable `PURSUE` and Codex
+`RESHAPE`. Codex found no managed-image defect and made the exact-head random
+optimizer DAG failure its sole blocker; the same test passed locally. During
+that review, `origin/improvements` advanced to `7815fe09f0`, independently
+invalidating the reviewed base and resetting the streak. This revision merges
+that base, revalidates its Dashboard refresh-ownership change, preserves an
+expired canary with a persisted child when a worker cannot decode a future
+contract shape, and makes guest-initiated EC2 canary shutdown terminate rather
+than stop the instance. The full managed-image suites and the random optimizer
+DAG test pass locally. The acceptance streak remains zero until both reviewers
+accept one immutable current-base head three consecutive times.
