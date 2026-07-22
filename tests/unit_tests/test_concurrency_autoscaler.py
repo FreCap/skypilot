@@ -842,6 +842,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'A100': 1
             }
         }])
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'A100': 1})
 
     def test_physical_inflight_overflow_cold_starts_cheapest_card(self):
         autoscaler = _make_autoscaler(max_replicas=4)
@@ -864,6 +867,10 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'L4': 1
             }
         }])
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 1})
 
     def test_production_shaped_overflow_adds_only_one_l4(self):
         autoscaler = _make_autoscaler(max_replicas=200)
@@ -901,6 +908,16 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'A100-80GB': 5,
             'L4': 16,
         })
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {
+            'A100': 121,
+            'A100-80GB': 2,
+            'L4': 14,
+        })
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 1})
+        self.assertEqual(
+            autoscaler.info()['cold_launch_authority_by_accelerator'],
+            {'L4': 1})
         scale_ups = _scale_ups(decisions)
         self.assertEqual(len(scale_ups), 1)
         self.assertEqual(scale_ups[0].target, {'accelerators': {'L4': 1}})
@@ -930,6 +947,10 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'A100': 1
             }
         }])
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'A100': 1})
 
     def test_logical_unknown_inflight_overflow_preserves_total_work(self):
         autoscaler = _make_autoscaler(max_replicas=5, replica_unit='logical')
@@ -955,6 +976,10 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'A100': 1,
             'L4': 2,
         })
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 2})
         self.assertEqual(len(decisions), 1)
         self.assertIsInstance(decisions[0].target,
                               autoscalers.LogicalScaleTarget)

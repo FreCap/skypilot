@@ -31,6 +31,8 @@ const history = {
         configuredAccelerators: ['A100', 'A100-80GB'],
         minReplicas: { A100: 1, 'A100-80GB': 2 },
         demandTarget: { A100: 3, 'A100-80GB': 4 },
+        warmRetentionTarget: { A100: 2, 'A100-80GB': 1 },
+        coldLaunchAuthority: { A100: 0, 'A100-80GB': 3 },
         readyCapacity: { A100: 2, 'A100-80GB': 1 },
         provisioningCapacity: { A100: 1, 'A100-80GB': 3 },
         totalCapacity: { A100: 3, 'A100-80GB': 4 },
@@ -52,6 +54,8 @@ describe('AcceleratorHistoryCard', () => {
     expect(view.cards).toEqual(['A100', 'A100-80GB']);
     expect(view.valuesByCard.A100.demandTarget).toEqual([3]);
     expect(view.valuesByCard['A100-80GB'].demandTarget).toEqual([4]);
+    expect(view.valuesByCard.A100.warmRetentionTarget).toEqual([2]);
+    expect(view.valuesByCard['A100-80GB'].coldLaunchAuthority).toEqual([3]);
   });
 
   it('switches between serving and reserved signals without losing cards', () => {
@@ -65,7 +69,10 @@ describe('AcceleratorHistoryCard', () => {
 
     expect(
       screen.getByLabelText('A100 accelerator history chart')
-    ).toHaveTextContent('Traffic target by card');
+    ).toHaveTextContent('Serving target by card');
+    expect(
+      screen.getByLabelText('A100 accelerator history chart')
+    ).toHaveTextContent('Cold-launch authority');
     expect(
       screen.getByLabelText('A100-80GB accelerator history chart')
     ).toHaveTextContent('Ready capacity');

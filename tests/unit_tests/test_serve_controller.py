@@ -2248,6 +2248,8 @@ class TestAuthoritativeLbReportIngestion:
             'A100-80GB': 2,
         }
         autoscaler.min_replicas_by_accelerator = {'A100-80GB': 1}
+        autoscaler.warm_retention_target_by_accelerator = {'A100': 1}
+        autoscaler.cold_launch_authority_by_accelerator = {'A100-80GB': 1}
         ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
 
         breakdown = ctrl._get_accelerator_history_breakdown(  # pylint: disable=protected-access
@@ -2274,6 +2276,12 @@ class TestAuthoritativeLbReportIngestion:
             'demand_target': {
                 'A100': 1,
                 'A100-80GB': 2
+            },
+            'warm_retention_target': {
+                'A100': 1
+            },
+            'cold_launch_authority': {
+                'A100-80GB': 1
             },
             'ready_capacity': {
                 'A100': 1,

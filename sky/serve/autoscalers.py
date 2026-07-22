@@ -234,6 +234,15 @@ class Autoscaler:
             spec.min_replicas, sum(self.min_replicas_by_accelerator.values()))
         self.target_num_replicas_by_accelerator: dict[str, int] = dict(
             self.min_replicas_by_accelerator)
+        # Explanatory subset of the per-card serving target that retains
+        # running or occupancy-unknown work on its already-materialized exact
+        # card. It is not additive with target_num_replicas_by_accelerator.
+        self.warm_retention_target_by_accelerator: dict[str, int] = {}
+        # Positive incremental exact-card shortage that can authorize a cold
+        # launch in the most recent reconciliation tick. Unlike the serving
+        # target, this never treats satisfied warm retention as scale-up
+        # demand.
+        self.cold_launch_authority_by_accelerator: dict[str, int] = {}
         # Seed from the constructed service version (not always
         # INITIAL_VERSION). On a controller restart/respawn the autoscaler is
         # rebuilt; if it reset to version 1 while live replicas are at version
@@ -344,6 +353,8 @@ class Autoscaler:
         self.cost_rebalance_stabilization_seconds = float(
             getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
         self._cost_rebalance_candidate_since.clear()
+        self.warm_retention_target_by_accelerator = {}
+        self.cold_launch_authority_by_accelerator = {}
 
     def set_spot_placer(self, placer: spot_placer.SpotPlacer | None) -> None:
         """Publish ReplicaManager's live placement/bench state for this tick."""
@@ -1023,6 +1034,10 @@ class Autoscaler:
                 getattr(self, 'target_num_replicas_by_accelerator', {})),
             'demand_target_by_accelerator': dict(
                 getattr(self, 'target_num_replicas_by_accelerator', {})),
+            'warm_retention_target_by_accelerator': dict(
+                getattr(self, 'warm_retention_target_by_accelerator', {})),
+            'cold_launch_authority_by_accelerator': dict(
+                getattr(self, 'cold_launch_authority_by_accelerator', {})),
         }
         request_timestamps = getattr(self, 'request_timestamps', None)
         request_window_seconds = getattr(self, 'qps_window_size', None)
@@ -2342,6 +2357,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self.compatibility_profiles = []
             self.queued_compatibility_profiles = []
             self.target_num_replicas_by_accelerator = {}
+            self.warm_retention_target_by_accelerator = {}
+            self.cold_launch_authority_by_accelerator = {}
             self.free_reserved_slots_by_accelerator = {}
             self._compatibility_demand_complete = False
 
@@ -3562,9 +3579,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.compatibility_profiles = []
             self.queued_compatibility_profiles = []
             self.rejected_compatibility_profiles = []
+            self.warm_retention_target_by_accelerator = {}
+            self.cold_launch_authority_by_accelerator = {}
             self._compatibility_demand_complete = False
         if not self.configured_accelerator_shapes:
             self.target_num_replicas_by_accelerator = {}
+            self.warm_retention_target_by_accelerator = {}
+            self.cold_launch_authority_by_accelerator = {}
             self.compatibility_profiles = []
             self.queued_compatibility_profiles = []
             self.rejected_compatibility_profiles = []
@@ -4669,6 +4690,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
         if not configured_cards:
+            self.warm_retention_target_by_accelerator = {}
             return {}, False
         if self.replica_unit == 'logical':
             capacity_per_card = {
@@ -4758,6 +4780,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             provisioning=provisioning,
             free_reserved=free_reserved,
             cold_order=self._cold_paid_card_order(configured_cards))
+        if attribution_complete:
+            self.warm_retention_target_by_accelerator = {
+                card: min(target.get(card, 0),
+                          math.ceil(work / capacity_per_card[card]))
+                for card, work in fixed.items()
+                if work > 0 and target.get(card, 0) > 0 and
+                capacity_per_card[card] > 0
+            }
+        else:
+            self.warm_retention_target_by_accelerator = {}
         return target, attribution_complete
 
     def _logical_committed_capacity_by_accelerator(
@@ -4860,6 +4892,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         demand_target = self.target_num_replicas_by_accelerator
         if (not self._compatibility_demand_complete or
                 sum(demand_target.values()) != self.target_num_replicas):
+            self.warm_retention_target_by_accelerator = {}
+            self.cold_launch_authority_by_accelerator = {}
             return {}, False
         final_target = self.get_final_target_num_replicas()
         desired_target, attribution_complete = (
@@ -5580,6 +5614,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 latest_nonterminal_replicas)
 
         scaling_decisions: list[AutoscalerDecision] = []
+        self.cold_launch_authority_by_accelerator = {}
         target_num_replicas = self.get_final_target_num_replicas()
         current_num_replicas = len(latest_nonterminal_replicas)
         target_by_card, use_card_targets = (
@@ -5604,6 +5639,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             shortages = {
                 card: max(0, target - len(replicas_by_card.get(card, [])))
                 for card, target in target_by_card.items()
+            }
+            self.cold_launch_authority_by_accelerator = {
+                card: shortage
+                for card, shortage in shortages.items()
+                if shortage > 0
             }
             if any(shortages.values()):
                 for card, shortage in shortages.items():
@@ -5711,6 +5751,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     ) -> list[AutoscalerDecision]:
         """Generate one shaped scale target or capacity-safe retirements."""
         target = self.get_final_target_num_replicas()
+        self.cold_launch_authority_by_accelerator = {}
         target_by_card, use_card_targets = (
             self._actuation_target_by_accelerator(latest_nonterminal_replicas))
         if self.configured_accelerator_shapes and not use_card_targets:
@@ -5735,6 +5776,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if card is not None:
                 committed_by_card[card] = (committed_by_card.get(card, 0) +
                                            self._committed_capacity(info))
+        if use_card_targets:
+            self.cold_launch_authority_by_accelerator = {
+                card: card_target - committed_by_card.get(card, 0)
+                for card, card_target in target_by_card.items()
+                if committed_by_card.get(card, 0) < card_target
+            }
         card_shortage = (use_card_targets and any(
             committed_by_card.get(card, 0) < card_target
             for card, card_target in target_by_card.items()))
@@ -5924,6 +5971,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if not self.has_recomputed_with_fresh_data():
             info['target_num_replicas_by_accelerator'] = {}
             info['demand_target_by_accelerator'] = {}
+            info['warm_retention_target_by_accelerator'] = {}
+            info['cold_launch_authority_by_accelerator'] = {}
         in_flight_total = (sum(self._in_flight_by_replica_id.values()) if
                            self._in_flight_by_replica_id is not None else None)
         report_age = (time.time() - self._report_received_at

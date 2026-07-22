@@ -389,7 +389,23 @@ service:
 - Missing keys have floor zero. The whole map may be omitted for backward compatibility.
 - Values are non-negative serving-replica counts. Reject `sum(per-card floors) > max_replicas`.
 - Existing `min_replicas` remains an independent aggregate floor. If it exceeds the sum of card floors, allocate the remainder with the same ready/reserved/cheapest policy.
-- `demand_target_by_accelerator` includes the hard per-card floor and its entries sum to the existing aggregate `target_num_replicas`.
+- `demand_target_by_accelerator` remains the backward-compatible per-card
+  serving target. It includes the hard per-card floor and its entries sum to
+  the existing aggregate `target_num_replicas`. Running or unknown work pinned
+  to an already-materialized expensive card may therefore retain that card in
+  this target even when every newly queued request is compatible with a
+  cheaper card. It is not, by itself, authority to cold launch that card.
+- `warm_retention_target_by_accelerator` reports the subset of the serving
+  target required to retain running or unknown work on its current exact card.
+  It is explanatory and non-additive: it is already included in
+  `demand_target_by_accelerator`.
+- `cold_launch_authority_by_accelerator` reports only the positive incremental
+  exact-card shortage that can emit a scale-up decision in the current
+  reconciliation. It is zero for an expensive card whose serving target is
+  satisfied by already-materialized capacity. For a fully compatible cold
+  demand wave it may be nonzero only on the cheapest compatible card selected
+  by the allocator. Exact-card-constrained demand may authorize its required
+  card.
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
 - Economic cost rebalancing may move a replica to a cheaper provider, region,
@@ -645,6 +661,8 @@ SkyPilot changes:
 
 - Extend `/autoscaler/info`, LB capacity hints, service status, and Prometheus metrics additively with:
   - `demand_target_by_accelerator`
+  - `warm_retention_target_by_accelerator`
+  - `cold_launch_authority_by_accelerator`
   - `min_replicas_by_accelerator`
   - ready/provisioning/live counts by accelerator
   - `fill_target_by_accelerator`
@@ -653,19 +671,25 @@ SkyPilot changes:
 - Keep existing aggregate `target_num_replicas`, current/max/in-flight capacity, and old dashboard fields intact.
 - In `sky/dashboard/src/data/connectors/services.jsx` and `sky/dashboard/src/pages/services/[service].js`, retain the global `ready / total (target: N)` summary and add an exact-card table:
 
-| Card | Ready | Provisioning | Demand target | Hard floor | Fill target | Free reserved slots |
-|---|---:|---:|---:|---:|---:|---:|
-| L4 | ... | ... | ... | ... | ... | ... |
-| A100 | ... | ... | ... | ... | ... | ... |
-| A100-80GB | ... | ... | ... | ... | ... | ... |
-| H100 | ... | ... | ... | ... | ... | ... |
+| Card | Ready | Provisioning | Serving target | Warm retention | Cold-launch authority | Hard floor | Fill target | Free reserved slots |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| L4 | ... | ... | ... | ... | ... | ... | ... | ... |
+| A100 | ... | ... | ... | ... | ... | ... | ... | ... |
+| A100-80GB | ... | ... | ... | ... | ... | ... | ... | ... |
+| H100 | ... | ... | ... | ... | ... | ... | ... | ... |
 
-- Add tooltips explaining that demand target sizes traffic, floor is a hard serving minimum, fill is optional zero-cost extra serving capacity, and free reserved slots are physical supply not yet represented by a serving replica.
+- Add tooltips explaining that serving target includes demand plus nonpreemptive
+  retention of work already running on an exact card, warm retention explains
+  that included subset, cold-launch authority is the current incremental
+  shortage that can request new capacity, floor is a hard serving minimum,
+  fill is optional zero-cost extra serving capacity, and free reserved slots
+  are physical supply not yet represented by a serving replica.
 
 Persist the same exact-card values in the existing one-minute
 `serve_autoscaler_history` row as bounded PostgreSQL JSON objects. Store:
 
-- traffic demand targets by exact accelerator;
+- serving targets, warm-retention targets, and cold-launch authority by exact
+  accelerator;
 - ready, provisioning, and non-failed tracked capacity by exact accelerator;
 - hard floor, reserved-fill target, zero-cost ready capacity, and free
   reserved slots by exact accelerator.
@@ -698,10 +722,13 @@ views:
 1. **Traffic and capacity.** The default aggregate view keeps the existing
    traffic target (with hysteresis), traffic-or-reservation target, ready,
    provisioning, and non-failed tracked capacity lines. An `Accelerators`
-   view renders small multiples for traffic target, ready, provisioning, and
-   non-failed tracked capacity by exact card. It must never stack overlapping
-   target concepts. Reserved fill remains its own line in the reserved view,
-   rather than inventing an exact-card version of the aggregate maximum.
+   view renders small multiples for serving target, its included warm-retention
+   subset, cold-launch authority, ready, provisioning, and non-failed tracked
+   capacity by exact card. It must never stack overlapping target concepts.
+   In particular, warm retention is not added to serving target and cold-launch
+   authority is an incremental scale-up signal, not desired total capacity.
+   Reserved fill remains its own line in the reserved view, rather than
+   inventing an exact-card version of the aggregate maximum.
 2. **Reserved capacity.** Aggregate and exact-card views show reserved-fill
    target, zero-cost ready capacity, and free reserved slots. These are
    separate from traffic demand so an already-provisioned reserved cluster is
@@ -709,8 +736,13 @@ views:
 3. **Demand pressure.** Keep request arrivals, peak in-flight, peak queued,
    and rejections aggregate. Flexible compatibility sets cannot be truthfully
    labeled as queue depth "on A100" before the allocator chooses a target.
-   The exact-card traffic-target history is the allocation result and is the
-   card-specific scaling graph.
+   The exact-card serving-target history is the allocation result. The
+   cold-launch-authority history is the card-specific scale-up graph.
+
+Regression coverage must include a production-shaped all-compatible wave in
+which A100 and A100-80GB serving targets rise or remain elevated solely to
+retain already-running work while `cold_launch_authority_by_accelerator`
+contains only L4. A constrained A100-only wave must instead authorize A100.
 
 The aggregate/card switch changes only presentation. Aggregate values remain
 stored directly as the backward-compatible control-plane contract. Per-card
