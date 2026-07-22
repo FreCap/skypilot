@@ -78,6 +78,15 @@ class OnDemandThreadExecutor(concurrent.futures.Executor):
                 # Only set the exception if the future is not cancelled to avoid
                 # setting the exception twice leading to another exception.
                 fut.set_exception(e)
+        except BaseException as e:  # pylint: disable=broad-except
+            logger.debug(
+                f'Executor [{self.name}] terminated while executing {fn}: {e}')
+            if not fut.cancelled():
+                error = RuntimeError(
+                    f'Executor [{self.name}] task terminated with '
+                    f'{type(e).__name__}: {e}')
+                error.__cause__ = e
+                fut.set_exception(error)
         finally:
             self.running.decrement()
             self._cleanup_thread(threading.current_thread())
