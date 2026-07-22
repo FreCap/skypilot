@@ -3472,9 +3472,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # concurrency report. Running work is attributed separately from the
         # per-replica in-flight map at decision time, so it remains pinned to
         # the card already serving it.
-        # Windowed arrival profiles are retained only for a later switch to
-        # QPS autoscaling. Concurrency sizing continues to use aggregate
-        # arrival timestamps solely as its stale-signal scale-up floor.
+        # Windowed accepted-arrival profiles shape the deduplicated offered-
+        # arrival floor without controlling its magnitude. They also survive
+        # a later switch to QPS autoscaling.
         self.compatibility_profiles: list[dict[str, Any]] = []
         self.queued_compatibility_profiles: list[dict[str, Any]] = []
         self.rejected_compatibility_profiles: list[dict[str, Any]] = []
@@ -3767,7 +3767,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.request_timestamps = self.request_timestamps[index:]
         self.compatibility_profiles = [
             profile for profile in self.compatibility_profiles
-            if profile['timestamp'] >= current_time - self.qps_window_size
+            if profile['timestamp'] >= current_time -
+            constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
         ]
 
         in_flight = request_aggregator_info.get('in_flight_by_replica_id')
@@ -4175,6 +4176,55 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         retained = (1.15 * self._offered_arrival_count(300) * duration /
                     constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
         return max(recent, retained)
+
+    def _arrival_compatibility_work(
+        self,
+        arrival_work: float,
+        allocator_attributed_work: float,
+    ) -> list[tuple[int, tuple[str, ...], float]]:
+        """Shape only the offered-arrival work not already attributed.
+
+        Offered-arrival counters are the deduplicated magnitude authority.
+        Accepted-arrival profiles are used only as compatibility/priority
+        distribution evidence, so retries cannot inflate total work here.
+        """
+        arrival_gap = max(0.0, arrival_work - allocator_attributed_work)
+        if arrival_gap <= 0:
+            return []
+
+        duration = self.expected_request_duration_seconds
+        offered_counts_complete = (duration is not None and
+                                   self._unique_job_arrivals_60s is not None and
+                                   self._unique_job_arrivals_300s is not None
+                                   and
+                                   self._headerless_arrivals_60s is not None and
+                                   self._headerless_arrivals_300s is not None)
+        window_seconds = self.qps_window_size
+        if offered_counts_complete:
+            assert duration is not None
+            recent_work = (self._offered_arrival_count(60) * duration /
+                           constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
+            retained_work = (1.15 * self._offered_arrival_count(300) *
+                             duration /
+                             constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
+            if retained_work > recent_work:
+                window_seconds = constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
+
+        cutoff = time.time() - window_seconds
+        evidence = [
+            (int(profile['priority']),
+             tuple(profile['compatible_accelerators']), float(profile['count']))
+            for profile in self.compatibility_profiles
+            if profile['timestamp'] >= cutoff and float(profile['count']) > 0
+        ]
+        evidence_total = sum(work for _, _, work in evidence)
+        if evidence_total <= 0:
+            # Compatibility-unknown work may hold the aggregate target, but
+            # it must never authorize a guessed exact-card launch.
+            return []
+        scale = arrival_gap / evidence_total
+        return [(priority, compatible, work * scale)
+                for priority, compatible, work in evidence]
 
     def _adaptive_scale_up_active(self) -> bool:
         return (self.adaptive_scale_up is not None and
@@ -4618,6 +4668,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                  rejected_total - rejected_profile_total))
         fixed, attribution_complete = (
             self._fixed_concurrency_work_by_accelerator(replica_infos))
+        if self.replica_unit == 'logical' and self._fresh_for_tick():
+            allocator_attributed_work = (sum(fixed.values()) +
+                                         sum(work for _, _, work in profiles))
+            profiles.extend(
+                self._arrival_compatibility_work(self._arrival_work(),
+                                                 allocator_attributed_work))
         floors = {
             card.casefold(): int(floor)
             for card, floor in self.min_replicas_by_accelerator.items()
@@ -4895,9 +4951,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if attribution_complete:
                 candidate_target_by_accelerator = candidate
                 # Compatibility constraints can require a different physical
-                # packing than the aggregate best-capacity estimate. Logical
-                # mode has uniform slot capacity and therefore remains equal.
-                raw_target_num = sum(candidate.values())
+                # packing than the aggregate best-capacity estimate. The
+                # aggregate offered-arrival floor remains independently
+                # authoritative when compatibility evidence is unavailable.
+                raw_target_num = max(raw_target_num, sum(candidate.values()))
 
         target_num_replicas = self._clip_concurrency_demand_target(
             raw_target_num)

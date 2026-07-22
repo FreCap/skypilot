@@ -254,6 +254,11 @@ def slow_entrypoint():
     return 'success'
 
 
+def exiting_entrypoint():
+    """Dummy entrypoint that exits its worker thread."""
+    raise SystemExit('Entry point exited')
+
+
 async def _wait_for_threading_event(event: threading.Event) -> None:
     while not event.is_set():
         await asyncio.sleep(0.01)
@@ -507,6 +512,44 @@ async def test_execute_request_coroutine_fails_if_storage_probe_fails():
 
     mock_failure.assert_awaited_once()
     request.entrypoint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_request_coroutine_records_thread_exit_as_failure():
+    request = requests_lib.Request(
+        request_id='thread-exit-failure',
+        name='sky.logs',
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='test-user-id',
+        entrypoint=exiting_entrypoint,
+        request_body=payloads.RequestBody(),
+    )
+    mock_ctx = mock.Mock()
+    mock_ctx.vars = {}
+    mock_ctx.redirect_log.return_value = mock.sentinel.original_output
+    mock_failure = mock.AsyncMock()
+
+    with mock.patch('sky.utils.context.initialize'), \
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(requests_lib, 'update_status_async',
+                           new_callable=mock.AsyncMock), \
+         mock.patch.object(requests_lib, 'get_request_log_storage_usage',
+                           return_value=mock.Mock(hard_free_bytes=1024)), \
+         mock.patch.object(requests_lib, 'get_request_status_async',
+                           new_callable=mock.AsyncMock,
+                           return_value=requests_lib.StatusWithMsg(
+                               requests_lib.RequestStatus.RUNNING)), \
+         mock.patch.object(requests_lib, 'set_request_failed_async',
+                           mock_failure):
+        task = executor.execute_request_in_coroutine(request)
+        await asyncio.wait_for(task.task, timeout=2)
+
+    mock_failure.assert_awaited_once()
+    error = mock_failure.await_args.args[1]
+    assert isinstance(error, RuntimeError)
+    assert isinstance(error.__cause__, SystemExit)
+    mock_ctx.cancel.assert_called_once_with()
 
 
 CALLED_FLAG = [False]

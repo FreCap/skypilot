@@ -223,6 +223,55 @@ arrival_target = ceil(arrival_work / effective_capacity_per_gpu)
 raw_target = max(outstanding_target, arrival_target)
 ```
 
+Exact-card services must preserve the same maximum after compatibility
+allocation. The load balancer already records bounded accepted-arrival
+profiles as `(timestamp, priority, compatible_accelerators, count)` and
+publishes current queue and rejection profiles separately. For concurrency
+autoscaling, retain accepted-arrival profiles for the same 300-second window
+as the offered-arrival counters. The 60-second floor uses only profiles newer
+than 60 seconds; the retained floor uses profiles newer than 300 seconds. The
+profile counts are distribution evidence, not a second arrival counter: the
+allocator normalizes the profiles from whichever aggregate window produced
+`arrival_work` to the exact missing work defined below.
+
+```text
+allocator_attributed_work = sum(fixed_running_and_unknown_work_by_card)
+                          + sum(canonical_queue_profile_work)
+                          + sum(canonical_rejection_profile_work)
+
+arrival_gap = max(0, arrival_work - allocator_attributed_work)
+```
+
+The canonical queue and rejection profile work above means the exact inputs
+that `_allocate_compatibility_target()` will receive after existing aggregate
+fallbacks and rejection normalization. It deliberately does not mean
+`outstanding_work`, because priority patience can weight the aggregate queue
+differently from the current exact-card queue inputs. Only a fresh logical
+exact-card recompute with complete compatibility gauges adds arrival-gap
+profiles. It preserves every recorded priority and compatible-accelerator set,
+and scales their work proportionally so their sum is exactly `arrival_gap`.
+This adds only the difference rather than all arrival work, avoiding double
+counting work already represented by occupancy, queue, or rejection gauges.
+
+If the selected 60-second or 300-second window has no usable compatibility
+profile, the gap is compatibility-unknown. It still raises the aggregate raw
+target and therefore cannot authorize a downscale, but it does not authorize
+an exact-card launch or widen to all configured accelerators. Known fixed,
+queued, and rejected work can still produce an exact-card candidate. Stale
+reports and mixed-version reports keep their existing hold behavior.
+
+For a complete fresh recompute, the unconstrained scalar raw target is the
+maximum of the aggregate outstanding target, the aggregate arrival floor, and
+the sum of the exact-card candidate. The candidate can be larger than the
+aggregate estimates because per-card floors, compatibility fragmentation, and
+whole-slot rounding are real constraints. It must never be smaller than the
+exact target for fixed, queued, and rejected inputs, and when compatibility
+evidence covers `arrival_gap`, it must not be smaller than the clipped arrival
+floor. A scale-up wave may deliberately adopt a smaller scalar ceiling; the
+second allocation with `target_ceiling` must sum to that adopted ceiling before
+the card map is published. A compatibility-unknown gap fails that equality
+check and keeps the prior safe card map rather than guessing placement.
+
 If the expected duration or new arrival counts are unavailable, the existing
 one-minute timestamp floor remains the fallback. The floor never lowers an
 outstanding-work target. The 15 percent five-minute headroom covers burst
@@ -461,7 +510,15 @@ free capacity cannot make an incrementally paid fleet appear underutilized.
 - HA tests prove snapshot parsing, map maximum merge, mixed-version omission,
   and offered-arrival floors without addition.
 - Concurrency-autoscaler tests cover queue weighting, aggregate fallback,
-  60/300-second arrival floors, saturation, retry-deduplicated counts, adaptive
+  60/300-second arrival floors, the production regression where 126 arrivals
+  per minute at 30 seconds and 90 percent utilization cannot be replaced by an
+  exact-card target of 44, zero arrival gap when allocator-attributed work is
+  already larger, A100-only residual work that never becomes L4-compatible,
+  compatibility-unknown gaps that hold without guessed placement, per-card
+  floors and fragmentation that may exceed the aggregate floor, max-replica
+  clipping, wave-ceiling maps that sum to the adopted scalar target, unchanged
+  stale and mixed-version behavior, saturation, retry-deduplicated counts,
+  adaptive
   activation and expiry, HA-floor pressure exclusion, unchanged pacing,
   delta-only downscale veto, preservation of elapsed proof across at most two
   vetoed decision ticks, coalescing of multiple pre-decision pressure reports,
