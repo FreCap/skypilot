@@ -11,15 +11,20 @@ Scheduling and scaling follow these rules:
 1. Never preempt or migrate an admitted request.
 2. Numeric request priority remains the primary queue order (`high = 50`, `low = 20` in boltz-platform).
 3. At equal numeric priority, make a supply-aware assignment that maximizes immediate admissions and protects the request with the worst realistic fallback; FIFO breaks a true fallback tie. Raw compatibility-set size is not a sufficient ordering rule.
-4. A request uses already-ready compatible capacity before causing a scale-up, even if that ready capacity is a larger card. Among otherwise-valid ready assignments, prefer reserved/zero-cost replicas before paid replicas so paid capacity can become idle and scale down.
-5. A healthy, non-retiring provisioning replica is committed future capacity,
-   not a routable slot: count it against the target to avoid a duplicate
-   launch. For demand still unmet after ready and committed capacity, launch
-   into a free compatible reserved-capacity slot, then cold-start the cheapest
-   compatible paid card. A retained per-card target is not authority to replace
-   disappeared warm capacity on that same card: every cold launch must still be
-   justified by the current compatibility profiles, floors, pinned work, and
-   supply snapshot.
+4. A request uses already-ready compatible capacity before causing a scale-up,
+   even if that ready capacity is a larger card. Among otherwise-valid ready
+   assignments, prefer reserved/zero-cost replicas before paid replicas. This
+   routing choice does not reattribute flexible traffic demand to the serving
+   card: the per-card demand target remains on the cheapest compatible card.
+5. Demand attribution and launch suppression are separate calculations. Assign
+   each flexible demand unit to the cheapest compatible card first. Then clamp
+   its cold-launch authority with all compatible healthy ready, provisioning,
+   and free reserved supply, regardless of which card currently supplies it.
+   This counts the request once, keeps a ready A100 eligible to serve it, and
+   avoids both an A100 demand target and a duplicate L4 launch. A retained
+   per-card target is not authority to replace disappeared warm capacity on
+   that same card: every cold launch must still be justified by the current
+   compatibility profiles, floors, pinned work, and supply snapshot.
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
 7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. With reserved fill enabled, every fresh broker-granted slot is launched independently of demand while total live and planned capacity remains below the hard `max_replicas` ceiling. The UI shows all three signals.
 8. `A100` and `A100-80GB` are distinct identifiers in validation, queue indexes, metrics, APIs, placement, tests, and UI. Matching may be case-insensitive, but it must never use family, prefix, regex, or memory-suffix normalization.
@@ -251,15 +256,24 @@ Compatibility demand is counted once. It must never be copied into every compati
 
 The active LB reports a bounded histogram keyed by `(numeric priority, compatibility bitmap)` over the service's exact configured cards. List order is ignored for the histogram, so equivalent sets coalesce. `MAX_COMPATIBILITY_ACCELERATORS = 8` bounds compatibility masks at 255; numeric priority is already bounded to 0..100, and the sparse payload is additionally bounded by the configured request-queue size. Priority partitions demand for ordering but never duplicates a request or multiplies desired capacity. In-flight work is attributed to the exact card actually holding the slot.
 
-The autoscaler allocates aggregate demand by numeric priority descending using the same exact-card marginal-supply model, with stable assignments and existing up/down hysteresis to prevent oscillation. Below `max_replicas`, all priority partitions still contribute demand; when the cap forces a choice, the per-card target allocation mirrors queue precedence instead of reserving scarce capacity for work that cannot yet be admitted. For each compatibility profile:
+The autoscaler allocates aggregate demand by numeric priority descending, with
+stable assignments and existing up/down hysteresis to prevent oscillation.
+Below `max_replicas`, all priority partitions still contribute demand; when
+the cap forces a choice, the per-card target allocation mirrors queue
+precedence instead of reserving scarce capacity for work that cannot yet be
+admitted. For each compatibility profile:
 
-1. subtract ready capacity already assigned to its demand, consuming reserved/zero-cost ready slots before paid ready slots within an otherwise-valid compatibility assignment;
-2. subtract healthy compatible replicas already provisioning from the still-needed target—they are committed capacity, not a place to dispatch;
-3. for residual scale-out, claim a free exact-card slot on reserved/zero-cost infrastructure;
-4. for any remaining scale-out, choose the cheapest cold paid compatible
-   resource, using request/service order only as a deterministic equal-cost
-   tie-break. Cold placement does not fall through to a more expensive card
-   merely because the cheapest card is temporarily unavailable.
+1. consume any unused hard-floor capacity on a compatible card;
+2. attribute the remaining demand to the cheapest cold paid compatible card,
+   using request/service order only as a deterministic equal-cost tie-break;
+3. independently recompute cold-launch authority by consuming compatible ready
+   reserved, ready paid, healthy provisioning, and free reserved supply before
+   leaving any exact-card launch shortage.
+
+Existing supply therefore changes whether a launch is necessary, not which
+card owns flexible demand in the dashboard or retained demand target. Cold
+placement does not fall through to a more expensive card merely because the
+cheapest card is temporarily unavailable.
 
 For placer-backed services, cheapest means the lowest nominal cached hourly
 cost across every enumerated paid location, including a location currently
@@ -282,22 +296,25 @@ must never promote a larger priced card ahead of an unpriced cheaper card.
 
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 
-The adopted per-card map and the cold-launch map have different safety roles.
-The adopted map retains ready capacity and controls graceful retirement through
-the existing card-migration and aggregate downscale hysteresis. Before emitting
-any exact-card scale-up, a fresh and complete control tick recomputes the
-desired card placement at the already-adopted aggregate target from the current
-compatibility profiles, hard floors, non-retiring pinned work, and current
-supply. The actuation map keeps each adopted card unit only while current
-non-retiring ready, healthy-provisioning, or free-reserved supply backs it. Any
-unbacked adopted unit whose fresh desired placement wants a different card may
-move toward that placement immediately. This fence is derived from the current
-supply deficit rather than the continued presence of a retiring replica row,
-so it survives row deletion and controller recovery. Healthy backed same-total
-card migrations continue to obey the existing hysteresis and logical scale-up
-wave limits. This revalidation does not increase the adopted aggregate target
-and does not accelerate retirement. It only prevents disappeared warm capacity
-from becoming a cold same-card replacement order.
+The adopted demand map and the cold-launch map have different safety roles.
+The adopted map records the cheapest compatible placement of flexible demand
+and retains the existing compatibility-change hysteresis and logical-card wave
+limits. Before emitting any exact-card scale-up or card-specific retirement, a
+fresh and complete control tick recomputes an actuation placement at the
+already-adopted aggregate target from the current compatibility profiles, hard
+floors, non-retiring pinned work, and current supply. That second placement may
+be backed by a different compatible card. Only its positive shortage is cold
+launch authority. Any unbacked adopted unit whose fresh desired placement
+wants a different card may move toward that placement immediately. A backed
+unit may move only onto compatible capacity that already exists, such as a
+ready or free reserved A100 replacing a paid L4. This fence is derived from the
+current supply deficit rather than the continued presence of a retiring
+replica row, so it survives row deletion and controller recovery. It cannot
+authorize an unadopted compatibility migration or bypass a logical scale-up
+wave. This revalidation does not increase the adopted aggregate target and
+does not accelerate retirement. It prevents disappeared warm capacity from
+becoming a cold same-card replacement order and lets existing compatible
+supply suppress redundant paid capacity.
 
 Rows already marked for scale-down or preempted are excluded from
 ready/provisioning supply in that cold-launch recomputation and from
@@ -388,20 +405,25 @@ service:
 - Keys must resolve to distinct exact accelerators present in the service task resources. Unknown/family/regex keys are invalid.
 - Missing keys have floor zero. The whole map may be omitted for backward compatibility.
 - Values are non-negative serving-replica counts. Reject `sum(per-card floors) > max_replicas`.
-- Existing `min_replicas` remains an independent aggregate floor. If it exceeds the sum of card floors, allocate the remainder with the same ready/reserved/cheapest policy.
+- Existing `min_replicas` remains an independent aggregate floor. If it
+  exceeds the sum of card floors, attribute the remainder to the cheapest
+  configured card. Compatible existing supply may suppress the resulting cold
+  launch, but does not change the floor's demand attribution.
 - `demand_target_by_accelerator` remains the backward-compatible per-card
-  serving target. It includes the hard per-card floor and its entries sum to
-  the existing aggregate `target_num_replicas`. Running or unknown work pinned
-  to an already-materialized expensive card may therefore retain that card in
-  this target even when every newly queued request is compatible with a
-  cheaper card. It is not, by itself, authority to cold launch that card.
-- `warm_retention_target_by_accelerator` reports the subset of the serving
-  target required to retain running or unknown work on its current exact card.
-  It is explanatory and non-additive: it is already included in
-  `demand_target_by_accelerator`.
+  demand target. It includes the hard per-card floor and its entries sum to
+  the existing aggregate `target_num_replicas`. Flexible work is attributed to
+  its cheapest compatible card even when a larger ready card serves it. Work
+  whose compatibility is unknown or known to be exact-card constrained remains
+  pinned conservatively. The demand target is not, by itself, authority to
+  cold launch any card.
+- `warm_retention_target_by_accelerator` reports running or unknown work that
+  must remain on its current exact card. It is explanatory and non-additive,
+  but is not required to be a subset of the cheapest-card demand map. For
+  example, demand can be `{L4: 6}` while warm retention is `{A100: 2}` and cold
+  launch authority is empty.
 - `cold_launch_authority_by_accelerator` reports only the positive incremental
   exact-card shortage that can emit a scale-up decision in the current
-  reconciliation. It is zero for an expensive card whose serving target is
+  reconciliation. It is zero for an expensive card whose demand target is
   satisfied by already-materialized capacity. For a fully compatible cold
   demand wave it may be nonzero only on the cheapest compatible card selected
   by the allocator. Exact-card-constrained demand may authorize its required
@@ -438,12 +460,17 @@ service:
   separately reported physical counts.
 - Concurrency sizing preserves the existing aggregate outstanding-work
   contract and its utilization, rejection-duration, hysteresis, wave-limit,
-  and stale-report rules. Running and unknown work is pinned to the exact card
-  of the backend already carrying it, so a priority change never preempts or
-  relabels active work. Queued and recently rejected work remains flexible
-  within its declared compatibility set and is allocated priority-first using
-  the same ready-reserved, ready, provisioning, free-reserved, then cold-paid
-  ordering as request admission.
+  and stale-report rules. Running and unknown work remains physically pinned
+  for warm retention and actuation, so a priority change never preempts active
+  work. In logical-slot mode, the demand map uses the complete bounded
+  accepted-arrival compatibility histogram for running work and the protocol's
+  all-configured-cards default after that evidence ages out. Flexible queued,
+  recently rejected, and attributable accepted work is assigned priority-first
+  to the cheapest compatible card. Physical-backend mode keeps its historical
+  current-card attribution because heterogeneous backend counts are not
+  logical capacity units. A separate supply-aware pass pins active work, then
+  consumes ready-reserved, ready-paid, provisioning, and free-reserved
+  capacity to derive cold-launch authority.
 - Exact-card rounding happens independently. If fractional duration-normalized
   work spans several disjoint compatibility profiles, the compatibility-safe
   target may be slightly larger than `ceil(total_work / per_slot_capacity)`;
@@ -605,11 +632,21 @@ SkyPilot changes:
 - In `sky/serve/reserved_capacity.py`, `sky/serve/reserved_capacity_broker.py`, and `sky/serve/replica_managers.py`, expose exact-card free supply, prefer zero-incremental-cost compatible supply, and keep fill targets separate from demand targets. Broker entitlement remains aggregate for a service's zero-cost location group: it prevents cross-service overcommit, while exact demand placement consumes the per-card free-supply map. `fill_target_by_accelerator` is an observed projection of that aggregate surplus, not a second per-card actuator.
 - In the existing aggregate fill overlay, make free-slot launch emission independent of the demand/fill target ordering while preserving the hard aggregate ceiling across rolling-update versions.
 - Mark both demand-launched and fill-launched replicas as zero-cost when their selected exact location is in the current reserved-capacity set, persist that marker across controller restarts, and clear/recompute it only from authoritative placement metadata—not a stale fill reason.
-- Preserve sticky assignments to ready/provisioning cards across control loops and add hysteresis around card reassignment so transient snapshots do not churn L4/A100/H100 targets.
+- Preserve sticky actuation assignments to ready/provisioning cards across
+  control loops. Demand attribution remains cheapest-compatible and uses the
+  existing hysteresis only when an exact compatibility or cost-order change
+  requires a real target migration.
 
 Tests:
 
-- Extend `tests/unit_tests/test_instance_aware_autoscaler.py` and `tests/unit_tests/test_reserved_capacity_fill.py` with empty-fleet cheapest selection, already-ready larger-card selection, healthy-provisioning capacity preventing duplicate launch, timed-out provisioning triggering replanning, free-reserved-before-paid residual scale-out, constrained demand reserving/scaling its exact card, crossed-set fallback-cost allocation, and no double-count of flexible demand.
+- Extend `tests/unit_tests/test_instance_aware_autoscaler.py` and
+  `tests/unit_tests/test_reserved_capacity_fill.py` with empty-fleet cheapest
+  selection, ready larger-card supply suppressing a launch without changing
+  cheapest-card demand attribution, healthy-provisioning capacity preventing a
+  duplicate launch, timed-out provisioning triggering replanning,
+  free-reserved-before-paid residual scale-out, constrained demand
+  reserving/scaling its exact card, crossed-set fallback-cost allocation, and
+  no double-count of flexible demand.
 - Cover global min greater than floor sum, floor sum greater than calculated demand, max-replica saturation, per-card graceful scale-down, optional fill enabled/disabled, and reserved physical machines remaining after serving replicas drain.
 - Cover a paid fleet satisfying a demand target larger than the reserved
   target, all fresh granted slots launching into available headroom, planned
@@ -671,24 +708,25 @@ SkyPilot changes:
 - Keep existing aggregate `target_num_replicas`, current/max/in-flight capacity, and old dashboard fields intact.
 - In `sky/dashboard/src/data/connectors/services.jsx` and `sky/dashboard/src/pages/services/[service].js`, retain the global `ready / total (target: N)` summary and add an exact-card table:
 
-| Card | Ready | Provisioning | Serving target | Warm retention | Cold-launch authority | Hard floor | Fill target | Free reserved slots |
+| Card | Ready | Provisioning | Demand target | Warm retention | Cold-launch authority | Hard floor | Fill target | Free reserved slots |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | L4 | ... | ... | ... | ... | ... | ... | ... | ... |
 | A100 | ... | ... | ... | ... | ... | ... | ... | ... |
 | A100-80GB | ... | ... | ... | ... | ... | ... | ... | ... |
 | H100 | ... | ... | ... | ... | ... | ... | ... | ... |
 
-- Add tooltips explaining that serving target includes demand plus nonpreemptive
-  retention of work already running on an exact card, warm retention explains
-  that included subset, cold-launch authority is the current incremental
-  shortage that can request new capacity, floor is a hard serving minimum,
-  fill is optional zero-cost extra serving capacity, and free reserved slots
-  are physical supply not yet represented by a serving replica.
+- Add tooltips explaining that demand target is cheapest-compatible demand
+  attribution, warm retention is the independent current-card floor for work
+  that cannot be interrupted, cold-launch authority is the current incremental
+  shortage that can request new capacity after compatible supply is consumed,
+  floor is a hard serving minimum, fill is optional zero-cost extra serving
+  capacity, and free reserved slots are physical supply not yet represented by
+  a serving replica.
 
 Persist the same exact-card values in the existing one-minute
 `serve_autoscaler_history` row as bounded PostgreSQL JSON objects. Store:
 
-- serving targets, warm-retention targets, and cold-launch authority by exact
+- demand targets, warm-retention targets, and cold-launch authority by exact
   accelerator;
 - ready, provisioning, and non-failed tracked capacity by exact accelerator;
 - hard floor, reserved-fill target, zero-cost ready capacity, and free
@@ -722,10 +760,10 @@ views:
 1. **Traffic and capacity.** The default aggregate view keeps the existing
    traffic target (with hysteresis), traffic-or-reservation target, ready,
    provisioning, and non-failed tracked capacity lines. An `Accelerators`
-   view renders small multiples for serving target, its included warm-retention
-   subset, cold-launch authority, ready, provisioning, and non-failed tracked
-   capacity by exact card. It must never stack overlapping target concepts.
-   In particular, warm retention is not added to serving target and cold-launch
+   view renders small multiples for demand target, independent warm retention,
+   cold-launch authority, ready, provisioning, and non-failed tracked capacity
+   by exact card. It must never stack overlapping target concepts.
+   In particular, warm retention is not added to demand target and cold-launch
    authority is an incremental scale-up signal, not desired total capacity.
    Reserved fill remains its own line in the reserved view, rather than
    inventing an exact-card version of the aggregate maximum.
@@ -736,13 +774,16 @@ views:
 3. **Demand pressure.** Keep request arrivals, peak in-flight, peak queued,
    and rejections aggregate. Flexible compatibility sets cannot be truthfully
    labeled as queue depth "on A100" before the allocator chooses a target.
-   The exact-card serving-target history is the allocation result. The
+   The exact-card demand-target history is the allocation result. The
    cold-launch-authority history is the card-specific scale-up graph.
 
-Regression coverage must include a production-shaped all-compatible wave in
-which A100 and A100-80GB serving targets rise or remain elevated solely to
-retain already-running work while `cold_launch_authority_by_accelerator`
-contains only L4. A constrained A100-only wave must instead authorize A100.
+Regression coverage must include a logical-slot all-compatible wave in which
+the demand target is attributed only to L4 even while A100 and
+A100-80GB serve or retain already-running work. That warm work appears only in
+`warm_retention_target_by_accelerator`, and compatible warm supply may leave
+`cold_launch_authority_by_accelerator` empty. When more capacity is actually
+required, cold authority contains only L4. A constrained A100-only wave must
+instead target and authorize A100.
 
 The aggregate/card switch changes only presentation. Aggregate values remain
 stored directly as the backward-compatible control-plane contract. Per-card
@@ -900,6 +941,18 @@ lock from the old autoscaler's locked dynamic-state dump through restore,
 version/catalog initialization, and publication of the replacement. This both
 prevents torn dumps and prevents an authoritative LB report from landing on the
 old object after the snapshot and being lost during the swap.
+Fleet-size-dependent cluster-handle resolution must not run as one database
+query per replica while either autoscaler state lock is held. Before entering a
+decision critical section, batch-read the cluster records needed for uncached
+shapes or costs and expose that immutable tick snapshot to every shape/cost
+pass. A
+not-yet-completed exact-card launch may use its current accelerator override as
+its planned shape without a cluster read; it is not memoized across ticks, so a
+later failover or completed launch is still re-resolved. The LB sync handler
+may then acquire the state lock and refresh the 60-second exact-card authority
+even while the next fleet snapshot is being fetched. Keep the existing
+fail-closed freshness fence rather than lengthening it to hide controller
+starvation.
 Concurrency retains the windowed exact-card arrival profiles solely for this
 handoff, while continuing to size outstanding work from live gauges and using
 only aggregate arrivals as its stale-signal floor. The profile key is emitted

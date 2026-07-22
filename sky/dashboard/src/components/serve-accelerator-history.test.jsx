@@ -69,7 +69,7 @@ describe('AcceleratorHistoryCard', () => {
 
     expect(
       screen.getByLabelText('A100 accelerator history chart')
-    ).toHaveTextContent('Serving target by card');
+    ).toHaveTextContent('Demand target by card');
     expect(
       screen.getByLabelText('A100 accelerator history chart')
     ).toHaveTextContent('Cold-launch authority');

@@ -625,17 +625,16 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         _decisions(autoscaler, [l4])
 
-        # The A100-only 23-work-unit arrival gap gets 26 A100 slots before the
-        # four low-priority flexible overflow units are placed. Those units
-        # reuse the A100 profile's 0.4 spare work capacity and add four L4
-        # slots, meeting the aggregate 70-slot floor without widening the
-        # constrained arrival gap to L4.
+        # The complete accepted-arrival evidence says the current wave is
+        # A100-only, so demand attribution stays entirely on A100. The running
+        # L4 work remains visible separately as warm retention and actuation
+        # does not preempt it.
         self.assertEqual(autoscaler._arrival_floor_target, 70)
         self.assertEqual(autoscaler.target_num_replicas, 70)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 44,
-            'A100': 26,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 70})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'L4': 40})
 
     def test_attributed_work_above_arrivals_adds_no_arrival_gap(self):
         autoscaler = _make_autoscaler(
@@ -662,14 +661,14 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         _decisions(autoscaler, [a100])
 
         # Eighty units of attributed work already exceed the 63-unit arrival
-        # estimate, so there is no arrival gap. The 72 units backed by the 80
-        # materialized A100 slots stay exact; the eight flexible overflow
-        # units require nine L4 slots instead of authorizing nine more A100s.
+        # estimate, so there is no arrival gap. Accepted-arrival compatibility
+        # keeps the demand map on A100 while warm retention records the actual
+        # occupied A100 slots independently.
         self.assertEqual(autoscaler.target_num_replicas, 89)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 9,
-            'A100': 80,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 89})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 80})
 
     def test_retained_arrival_floor_uses_300_second_profiles(self):
         autoscaler = _make_autoscaler(
@@ -905,8 +904,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
             'A100': 121,
-            'A100-80GB': 5,
-            'L4': 16,
+            'A100-80GB': 2,
+            'L4': 19,
         })
         self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {
             'A100': 121,
@@ -936,9 +935,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         decisions = _decisions(autoscaler, [a100])
 
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'A100': 2,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 2})
         # The exact-card queue entry has priority 50. It consumes the only
         # remaining target slot before flexible in-flight overflow, whose
         # synthetic compatibility profile deliberately has priority 0.
@@ -972,10 +970,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(fixed, {'A100': 1.0})
         self.assertEqual(overflow, 2.0)
         self.assertEqual(sum(fixed.values()) + overflow, 3.0)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'A100': 1,
-            'L4': 2,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 3})
         self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
                          {'A100': 1})
         self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
@@ -989,6 +985,61 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'A100': 1,
                 'L4': 2,
             })
+
+    def test_logical_compatible_inflight_demand_stays_on_cheapest_card(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100 = _replica(1, card='A100', planned_capacity=1)
+        _report(
+            autoscaler,
+            in_flight={1: 1},
+            observed_slots={1: 1},
+            compatibility_profiles=[
+                self._arrival_profile(50, ['L4', 'A100'], 1)
+            ],
+            compatibility_complete=True,
+        )
+
+        decisions = _decisions(autoscaler, [a100])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 1})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(decisions, [])
+
+    def test_logical_idle_floor_demand_stays_on_cheapest_card(self):
+        autoscaler = _make_autoscaler(min_replicas=6,
+                                      max_replicas=200,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        replicas = [
+            _replica(replica_id, card='A100', planned_capacity=1)
+            for replica_id in range(1, 56)
+        ] + [
+            _replica(replica_id, card='A100-80GB', planned_capacity=1)
+            for replica_id in range(56, 78)
+        ] + [
+            _replica(replica_id, card='L4', planned_capacity=1)
+            for replica_id in range(78, 201)
+        ]
+        _report(autoscaler,
+                in_flight={info.replica_id: 0 for info in replicas},
+                observed_slots={info.replica_id: 1 for info in replicas},
+                compatibility_complete=True)
+
+        _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 6)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 6})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
 
     def test_physical_zero_demand_retires_last_exact_card(self):
         autoscaler = _make_autoscaler(max_replicas=2)
@@ -1152,10 +1203,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         scale_downs = _scale_downs(second)
 
         self.assertEqual(autoscaler.target_num_replicas, 5)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 3,
-            'A100': 2,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
         self.assertEqual(len(scale_downs), 2)
         self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
@@ -1532,6 +1581,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 1})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'L4': 1})
         self.assertEqual(decisions, [])
 
     def test_flexible_backlog_reuses_spare_capacity_on_running_card(self):
@@ -1553,27 +1604,25 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                          {'A100': 1})
         self.assertEqual(decisions, [])
 
-    def test_ready_reserved_card_wins_for_flexible_backlog(self):
+    def test_ready_reserved_card_suppresses_launch_without_owning_demand(self):
         autoscaler = _make_autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        paid_l4 = _replica(1, card='L4')
-        paid_l4.is_zero_cost = False
-        reserved_a100 = _replica(2, card='A100')
+        reserved_a100 = _replica(1, card='A100')
         reserved_a100.is_zero_cost = True
         _report(autoscaler,
-                in_flight={
-                    1: 0,
-                    2: 0
-                },
+                in_flight={1: 0},
                 queue_depth=1,
                 queued_profiles=[self._profile(20, ['L4', 'A100'], 1)],
                 rejected_profiles=[],
                 compatibility_complete=True)
 
-        _decisions(autoscaler, [paid_l4, reserved_a100])
+        decisions = _decisions(autoscaler, [reserved_a100])
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(decisions, [])
 
     def test_retiring_warm_card_does_not_authorize_paid_replacement(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
@@ -1599,14 +1648,12 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 rejected_profiles=[],
                 compatibility_complete=True)
         self.assertEqual(_decisions(autoscaler, replicas), [])
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 1,
-            'A100': 1,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 2})
 
-        # Model an operator retirement or reclaimed warm slot. The adopted
-        # map intentionally remains behind one extra upscale observation, but
-        # that stale A100 assignment must not become an A100 cold launch.
+        # Model an operator retirement or reclaimed warm slot. Demand remains
+        # attributed to L4 and the supply-aware launch fence must replace the
+        # retiring A100 with L4 capacity.
         a100.status_property.is_scale_down = True
         _report(autoscaler,
                 in_flight={
@@ -1625,17 +1672,15 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         decisions = _decisions(autoscaler, replicas)
 
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 1,
-            'A100': 1,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 2})
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].operator, _SCALE_UP)
         self.assertEqual(
             dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
 
-        # A completed drain can delete the A100 row before the normal card-map
-        # hysteresis adopts L4. The next tick must retain the L4 cold fence.
+        # A completed drain can delete the A100 row. The next tick must retain
+        # the L4 cold fence.
         _report(autoscaler,
                 in_flight={1: 0},
                 observed_slots={1: 1},
@@ -1645,10 +1690,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 compatibility_complete=True,
                 generation=3)
         decisions = _decisions(autoscaler, [l4])
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 1,
-            'A100': 1,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 2})
         self.assertEqual(len(decisions), 1)
         self.assertEqual(
             dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
@@ -4621,6 +4664,22 @@ class TestInfo(unittest.TestCase):
 class TestSharedGpuShapeResolver(unittest.TestCase):
     """Both shape-aware autoscalers use ONE resolution implementation."""
 
+    def test_pending_exact_override_never_queries_cluster_table(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+        info = _replica(1, card='L4')
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        info.handle.side_effect = AssertionError('unexpected cluster lookup')
+
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('L4', 1))
+        self.assertNotIn(1, autoscaler._gpu_shape_cache)
+
+        info.resources_override = {'accelerators': {'A100': 4}}
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('A100', 4))
+        self.assertNotIn(1, autoscaler._gpu_shape_cache)
+
     def test_concurrency_uses_post_launch_only_cache(self):
         autoscaler = _make_autoscaler(knob=1.0)
         info = _replica(1, gpu_count=4)
@@ -4653,6 +4712,40 @@ class TestSharedGpuShapeResolver(unittest.TestCase):
         _report(autoscaler, in_flight={1: 1})
         autoscaler.generate_scaling_decisions(replicas, [1])
         self.assertNotIn(99, autoscaler._gpu_shape_cache)
+
+    def test_shape_preload_does_not_hold_demand_state_lock(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+        decision_errors = []
+
+        def _blocked_preload(_):
+            preload_started.set()
+            if not release_preload.wait(timeout=5):
+                raise TimeoutError('test did not release shape preload')
+            return {}
+
+        def _decide():
+            try:
+                autoscaler.generate_scaling_decisions([], [1])
+            except Exception as error:  # pylint: disable=broad-except
+                decision_errors.append(error)
+
+        with mock.patch.object(autoscaler,
+                               '_resolve_gpu_shape_handles',
+                               side_effect=_blocked_preload):
+            decision_thread = threading.Thread(target=_decide)
+            decision_thread.start()
+            self.assertTrue(preload_started.wait(timeout=5))
+            acquired = autoscaler._logical_state_lock.acquire(timeout=1)
+            self.assertTrue(acquired)
+            if acquired:
+                autoscaler._logical_state_lock.release()
+            release_preload.set()
+            decision_thread.join(timeout=5)
+
+        self.assertFalse(decision_thread.is_alive())
+        self.assertEqual(decision_errors, [])
 
 
 if __name__ == '__main__':
