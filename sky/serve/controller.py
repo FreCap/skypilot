@@ -2307,17 +2307,18 @@ class SkyServeController:
             configured.sort(key=lambda card: (qps_order.get(
                 card.casefold(), len(qps_order)), card.casefold()))
 
-        # A dynamic placer provides the actual cached per-machine price of
-        # each active paid shape. Publish that order to the LB, while the
-        # autoscaler recomputes from the live placer again on every tick.
+        # A dynamic placer provides the nominal cached per-machine price of
+        # every configured paid shape. Include temporarily benched locations:
+        # transient availability may delay an exact-card cold launch, but must
+        # never promote a more expensive compatible card into its place.
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
             paid_costs: dict[str, float] = {}
             try:
-                active_locations = placer.active_locations()
+                known_locations = placer.known_locations()
             except Exception:  # pylint: disable=broad-except
-                active_locations = []
-            for location in active_locations:
+                known_locations = []
+            for location in known_locations:
                 accelerators = location.accelerators or {}
                 if len(accelerators) != 1:
                     continue

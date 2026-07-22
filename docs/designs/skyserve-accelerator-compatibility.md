@@ -256,14 +256,23 @@ The autoscaler allocates aggregate demand by numeric priority descending using t
 1. subtract ready capacity already assigned to its demand, consuming reserved/zero-cost ready slots before paid ready slots within an otherwise-valid compatibility assignment;
 2. subtract healthy compatible replicas already provisioning from the still-needed target—they are committed capacity, not a place to dispatch;
 3. for residual scale-out, claim a free exact-card slot on reserved/zero-cost infrastructure;
-4. for any remaining scale-out, choose the cheapest cold paid compatible resource, using request/service order only as a deterministic equal-cost tie-break.
+4. for any remaining scale-out, choose the cheapest cold paid compatible
+   resource, using request/service order only as a deterministic equal-cost
+   tie-break. Cold placement does not fall through to a more expensive card
+   merely because the cheapest card is temporarily unavailable.
 
-For placer-backed services, cheapest means the lowest current cached hourly
-cost among active paid locations; a temporarily unavailable card sorts behind
-active paid alternatives. Without a placement policy, a multi-card service
-must use an ordered accelerator resource list before advertising compatibility.
-An unordered `resources.any_of` service keeps legacy aggregate behavior rather
-than turning hash iteration into a cold-card policy.
+For placer-backed services, cheapest means the lowest nominal cached hourly
+cost across every enumerated paid location, including a location currently
+benched after a capacity failure. Availability controls whether an exact-card
+launch can proceed, but it never changes the card target. If the cheapest card
+is unavailable, the request remains queued and SkyServe retries that exact card
+under the placer's normal bounded retry policy; it does not cold-start a larger
+compatible card. Already-ready or healthy-provisioning larger cards remain
+valid warm supply and can avoid that cold launch. Without a placement policy, a
+multi-card service must use an ordered accelerator resource list before
+advertising compatibility. An unordered `resources.any_of` service keeps
+legacy aggregate behavior rather than turning transient availability or hash
+iteration into a cold-card policy.
 
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 
@@ -273,24 +282,29 @@ the existing card-migration and aggregate downscale hysteresis. Before emitting
 any exact-card scale-up, a fresh and complete control tick recomputes the
 desired card placement at the already-adopted aggregate target from the current
 compatibility profiles, hard floors, non-retiring pinned work, and current
-supply. The actuation map keeps the adopted card map except for generic
-overprovision slots and the subset of adopted slots whose backing replicas are
-already retiring or preempted. Only that subset may move toward the recomputed
-placement immediately. Healthy same-total card migrations continue to obey the
-existing hysteresis and logical scale-up wave limits. This revalidation does
-not increase the adopted aggregate target and does not accelerate retirement.
-It only prevents a disappearing warm card assignment from becoming a cold
-same-card replacement order.
+supply. The actuation map keeps each adopted card unit only while current
+non-retiring ready, healthy-provisioning, or free-reserved supply backs it. Any
+unbacked adopted unit whose fresh desired placement wants a different card may
+move toward that placement immediately. This fence is derived from the current
+supply deficit rather than the continued presence of a retiring replica row,
+so it survives row deletion and controller recovery. Healthy backed same-total
+card migrations continue to obey the existing hysteresis and logical scale-up
+wave limits. This revalidation does not increase the adopted aggregate target
+and does not accelerate retirement. It only prevents disappeared warm capacity
+from becoming a cold same-card replacement order.
 
-Rows already marked for scale-down are excluded from ready/provisioning supply
-in that cold-launch recomputation. Work still draining on such a row remains in
-the aggregate outstanding-work safety total, but it does not pin replacement
-capacity to the retiring row's card. The replacement portion is allocated by
-the current request compatibility sets. Consequently:
+Rows already marked for scale-down or preempted are excluded from
+ready/provisioning supply in that cold-launch recomputation and from
+latest-version coverage used to authorize an old-version rollout drain. Work
+still draining on such a row remains in the aggregate outstanding-work safety
+total, but it does not pin replacement capacity to the retiring row's card.
+The replacement portion is allocated by the current request compatibility
+sets. Consequently:
 
 - losing an idle or retiring reserved A100 that had served default-all or
-  `L4/A100` work shifts any replacement shortfall to L4 when L4 is the cheapest
-  compatible paid card;
+  `L4/A100` work shifts any unbacked replacement shortfall to L4 when L4 is the
+  cheapest compatible paid card, even after the A100 row disappears and even
+  while every L4 location is temporarily benched;
 - an A100-only hard floor, running request on a non-retiring A100, or current
   A100-only queued demand can still authorize an A100 cold launch;
 - an already-ready compatible A100 remains eligible for routing and avoids an
@@ -793,8 +807,14 @@ Production checks:
 - Removing demand causes graceful per-card scale-down; reserved physical capacity or configured fill remains clearly reported as extra supply.
 - Retire one ready reserved A100 while default-all or `L4/A100` demand remains.
   Confirm the cold-launch target moves the missing slot to L4 immediately and
-  no paid A100 replacement is created. Repeat with A100-only demand and confirm
-  that A100 remains a valid cold target.
+  no paid A100 replacement is created. Delete the retired row before target-map
+  hysteresis adopts L4 and confirm the fence remains on L4. Bench every L4
+  location and confirm flexible demand waits for L4 rather than cold-starting
+  A100. Repeat with A100-only demand and confirm that A100 remains a valid cold
+  target.
+- During a rolling update, mark latest-version physical and logical replicas
+  preempted while their derived status is still READY. Confirm they do not
+  authorize retirement of healthy old-version serving coverage.
 - Replay representative traffic with measured per-request service times and
   per-card startup distributions. Low-priority requests must complete queue
   admission before their 600-second timeout, default-all/L4-compatible traffic

@@ -1143,7 +1143,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
         autoscaler = _make_autoscaler(max_replicas=2,
                                       replica_unit='logical',
-                                      upscale_delay_seconds=2 * interval,
+                                      upscale_delay_seconds=4 * interval,
                                       downscale_delay_seconds=300)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         l4 = _replica(1, card='L4', planned_capacity=1)
@@ -1195,6 +1195,25 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         })
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
+
+        # A completed drain can delete the A100 row before the normal card-map
+        # hysteresis adopts L4. The next tick must retain the L4 cold fence.
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 1},
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'A100'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=3)
+        decisions = _decisions(autoscaler, [l4])
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
+            'A100': 1,
+        })
+        self.assertEqual(len(decisions), 1)
         self.assertEqual(
             dict(decisions[0].target.target_capacity_by_accelerator), {'L4': 2})
 
@@ -2913,6 +2932,18 @@ class TestRollingDrain(unittest.TestCase):
             old + [new_ready], [1, 2])
         self.assertEqual(sorted(retired), [1, 2, 3])
 
+    def test_preempted_latest_physical_replica_cannot_cover_rolling_drain(self):
+        autoscaler = self._mid_update(target=1)
+        old = _replica(1, version=1)
+        preempted = _replica(2, version=2)
+        preempted.status_property.preempted = True
+        _report(autoscaler, in_flight={1: 0, 2: 0})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [old, preempted], [1, 2])
+
+        self.assertEqual(retired, [])
+
     def test_terminal_branch_never_retires_busy_old_replicas(self):
         # Enough ready latest replicas is NOT a license to abort
         # in-progress hour-long jobs: busy old replicas (including
@@ -3008,6 +3039,25 @@ class TestRollingDrain(unittest.TestCase):
         self.assertEqual(len(retired), 5)
         self.assertTrue(
             set(retired).issubset({info.replica_id for info in old}))
+
+    def test_preempted_latest_logical_capacity_cannot_cover_rolling_drain(self):
+        autoscaler = self._logical_mid_update(target=5, raw_target=5)
+        old = [_replica(i, version=1) for i in range(1, 6)]
+        preempted = _replica(101, version=2, planned_capacity=5)
+        preempted.status_property.preempted = True
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5})
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [*old, preempted], [1, 2])
+
+        self.assertEqual(retired, [])
 
     def test_logical_blue_green_waits_for_complete_latest_target(self):
         autoscaler = self._logical_mid_update(

@@ -1257,7 +1257,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     def test_qps_retiring_warm_card_cold_replacement_uses_cheapest_card(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
         autoscaler = self._autoscaler(max_replicas=1,
-                                      upscale_delay_seconds=2 * interval,
+                                      upscale_delay_seconds=4 * interval,
                                       downscale_delay_seconds=300)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         now = time.time()
@@ -1275,6 +1275,18 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
 
         # Hysteresis keeps the adopted retirement map on A100 for one more
         # observation, but the cold-launch fence must already move to L4.
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual([decision.target for decision in decisions], [{
+            'accelerators': {
+                'L4': 1
+            }
+        }])
+
+        # The cold-launch fence is a supply invariant, not a property of the
+        # retiring row. It must survive the row disappearing before card-map
+        # hysteresis adopts the new placement.
+        decisions = autoscaler.generate_scaling_decisions([], [1])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
         self.assertEqual([decision.target for decision in decisions], [{
@@ -1587,14 +1599,19 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
 
-    def test_live_paid_cost_and_availability_choose_cold_card(self):
+    def test_benched_cheapest_card_is_not_replaced_by_costlier_cold_card(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
-        # L4 is currently unavailable; A100 is the only active paid fallback.
+        # L4 is currently benched, but it remains the nominal cheapest cold
+        # card. Warm A100 stays compatible; its availability is not permission
+        # to cold-launch an A100 for flexible demand.
         placer.active_locations.return_value = [a100_location]
-        placer.cost_per_hour.return_value = 2.0
+        placer.known_locations.return_value = [l4_location, a100_location]
+        placer.cost_per_hour.side_effect = (lambda location: 1.0
+                                            if location is l4_location else 2.0)
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler._compatibility_demand_complete = True
@@ -1602,7 +1619,24 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
+
+    def test_preempted_latest_qps_replica_cannot_cover_rolling_drain(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec(max_replicas=1), version=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        autoscaler.compatibility_profiles = self._profiles(50, ['L4'])
+        autoscaler._compatibility_demand_complete = True
+        old = self._replica(1, 'L4', version=1)
+        preempted = self._replica(2, 'L4', version=2)
+        preempted.status_property.preempted = True
+        autoscaler.target_num_replicas = 1
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 1}
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [old, preempted], [1, 2])
+
+        self.assertEqual(retired, [])
 
     def test_active_task_catalog_drops_removed_card_demand(self):
         autoscaler = self._autoscaler(max_replicas=1)
