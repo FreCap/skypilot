@@ -1,4 +1,5 @@
 """Unit tests for sky.server.requests.precond module."""
+import asyncio
 import unittest
 from unittest import mock
 
@@ -143,6 +144,50 @@ class TestPrecondition(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result)
         mock_set_failed.assert_awaited_once()
+
+    @mock.patch('sky.server.requests.requests.set_request_failed_async')
+    @mock.patch('sky.server.requests.requests.get_request_async')
+    async def test_precondition_callback_exception_marks_request_failed(
+            self, mock_get_request, mock_set_failed):
+        """A failed queue insertion must not leave the request pending."""
+
+        class Ready(preconditions.Precondition):
+
+            async def check(self):
+                await asyncio.sleep(0)
+                return True, None
+
+        mock_get_request.return_value = mock.MagicMock(
+            status=api_requests.RequestStatus.PENDING)
+        failed_enqueue = mock.AsyncMock(
+            side_effect=RuntimeError('queue unavailable'))
+
+        await Ready(self.request_id).wait_async(on_condition_met=failed_enqueue)
+
+        mock_set_failed.assert_awaited_once()
+        self.assertIsInstance(mock_set_failed.call_args.args[1], RuntimeError)
+
+    @mock.patch('sky.server.requests.requests.set_request_failed_async')
+    @mock.patch('sky.server.requests.requests.get_request_async')
+    async def test_precondition_callback_cancellation_propagates(
+            self, mock_get_request, mock_set_failed):
+        """Server shutdown cancellation must not become a request failure."""
+
+        class Ready(preconditions.Precondition):
+
+            async def check(self):
+                await asyncio.sleep(0)
+                return True, None
+
+        mock_get_request.return_value = mock.MagicMock(
+            status=api_requests.RequestStatus.PENDING)
+        cancelled_enqueue = mock.AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await Ready(self.request_id
+                       ).wait_async(on_condition_met=cancelled_enqueue)
+
+        mock_set_failed.assert_not_awaited()
 
 
 class TestClusterStartCompletePrecondition(unittest.IsolatedAsyncioTestCase):
