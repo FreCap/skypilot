@@ -209,12 +209,26 @@ async def handle_interactive_auth_async(line: str) -> str | None:
         return line
 
     session_id = match.group(1)
+    auth_lock = _INTERACTIVE_AUTH_LOCK
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _INTERACTIVE_AUTH_LOCK.acquire)
+    acquire_future = loop.run_in_executor(None, auth_lock.acquire)
+    try:
+        # Shield the executor future so cancellation cannot discard the only
+        # handle capable of releasing a lock acquired after this task exits.
+        await asyncio.shield(acquire_future)
+    except asyncio.CancelledError:
+
+        def release_cancelled_acquire(future: asyncio.Future[bool]) -> None:
+            if (not future.cancelled() and future.exception() is None and
+                    future.result()):
+                auth_lock.release()
+
+        acquire_future.add_done_callback(release_cancelled_acquire)
+        raise
     try:
         with rich_utils.safe_logger():
             await _handle_interactive_auth_websocket(session_id)
     finally:
-        _INTERACTIVE_AUTH_LOCK.release()
+        auth_lock.release()
 
     return None
