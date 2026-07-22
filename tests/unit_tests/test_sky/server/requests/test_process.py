@@ -1,12 +1,15 @@
 """Unit tests for sky/server/requests/process.py."""
 from concurrent.futures import Future
 import concurrent.futures.process
+import multiprocessing
 import os
+import threading
 import time
 import unittest.mock
 
 import pytest
 
+from sky import exceptions
 from sky.server.requests.process import BurstableExecutor
 from sky.server.requests.process import DisposableExecutor
 from sky.server.requests.process import PoolExecutor
@@ -185,6 +188,143 @@ def test_disposable_executor_returns_large_result_without_deadlock():
         assert future.result(timeout=20) == b'x' * 1024 * 1024
     finally:
         executor.shutdown()
+
+
+def test_disposable_executor_reserves_starting_worker(monkeypatch):
+    """A starting process must consume capacity before it has a PID."""
+    executor = DisposableExecutor(max_workers=1)
+    original_start = multiprocessing.Process.start
+    first_start_entered = threading.Event()
+    release_first_start = threading.Event()
+    start_count = 0
+    start_count_lock = threading.Lock()
+
+    def block_first_start(process):
+        nonlocal start_count
+        with start_count_lock:
+            start_count += 1
+            current_start = start_count
+        if current_start == 1:
+            first_start_entered.set()
+            assert release_first_start.wait(timeout=20)
+        return original_start(process)
+
+    monkeypatch.setattr(multiprocessing.Process, 'start', block_first_start)
+    first_futures = []
+    first_errors = []
+
+    def submit_first():
+        try:
+            first_futures.append(executor.submit(dummy_task))
+        except BaseException as e:  # pylint: disable=broad-except
+            first_errors.append(e)
+
+    submit_thread = threading.Thread(target=submit_first)
+    try:
+        submit_thread.start()
+        assert first_start_entered.wait(timeout=20)
+        with pytest.raises(exceptions.ExecutionPoolFullError):
+            executor.submit(dummy_task)
+    finally:
+        release_first_start.set()
+        submit_thread.join(timeout=20)
+        executor.shutdown()
+
+    assert not submit_thread.is_alive()
+    assert not first_errors
+    assert len(first_futures) == 1
+
+
+def test_disposable_executor_releases_failed_start_reservation(monkeypatch):
+    """A failed process start must restore disposable capacity."""
+    executor = DisposableExecutor(max_workers=1)
+    original_start = multiprocessing.Process.start
+
+    def fail_start(_):
+        raise OSError('process start failed')
+
+    try:
+        monkeypatch.setattr(multiprocessing.Process, 'start', fail_start)
+        with pytest.raises(OSError, match='process start failed'):
+            executor.submit(dummy_task)
+        assert executor.has_idle_workers()
+
+        monkeypatch.setattr(multiprocessing.Process, 'start', original_start)
+        assert executor.submit(dummy_task).result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_cleans_up_failed_monitor_start(monkeypatch):
+    """A monitor-thread failure must not strand its child process."""
+    executor = DisposableExecutor(max_workers=1)
+    original_thread_start = threading.Thread.start
+
+    def fail_monitor_start(thread):
+        if thread._target == executor._monitor_worker:
+            raise RuntimeError('monitor start failed')
+        return original_thread_start(thread)
+
+    try:
+        monkeypatch.setattr(threading.Thread, 'start', fail_monitor_start)
+        with pytest.raises(RuntimeError, match='monitor start failed'):
+            executor.submit(dummy_task, sleep_time=30)
+        assert executor.has_idle_workers()
+        with executor._lock:
+            assert not executor.workers
+    finally:
+        executor.shutdown()
+
+
+def test_disposable_executor_shutdown_waits_for_starting_worker(monkeypatch):
+    """Shutdown must include an accepted worker that has no PID yet."""
+    executor = DisposableExecutor(max_workers=1)
+    original_start = multiprocessing.Process.start
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    shutdown_started = threading.Event()
+    shutdown_returned = threading.Event()
+    submitted_futures = []
+    submit_errors = []
+
+    def block_start(process):
+        start_entered.set()
+        assert release_start.wait(timeout=20)
+        return original_start(process)
+
+    monkeypatch.setattr(multiprocessing.Process, 'start', block_start)
+
+    def submit_worker():
+        try:
+            submitted_futures.append(executor.submit(dummy_task, sleep_time=30))
+        except BaseException as e:  # pylint: disable=broad-except
+            submit_errors.append(e)
+
+    def shutdown_executor():
+        shutdown_started.set()
+        executor.shutdown()
+        shutdown_returned.set()
+
+    submit_thread = threading.Thread(target=submit_worker)
+    shutdown_thread = threading.Thread(target=shutdown_executor)
+    try:
+        submit_thread.start()
+        assert start_entered.wait(timeout=20)
+        shutdown_thread.start()
+        assert shutdown_started.wait(timeout=20)
+        assert not shutdown_returned.wait(timeout=0.5)
+    finally:
+        release_start.set()
+        submit_thread.join(timeout=20)
+        shutdown_thread.join(timeout=20)
+        executor.shutdown()
+
+    assert not submit_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert not submit_errors
+    assert len(submitted_futures) == 1
+    with pytest.raises(concurrent.futures.process.BrokenProcessPool):
+        submitted_futures[0].result(timeout=20)
 
 
 def test_burstable_executor():
