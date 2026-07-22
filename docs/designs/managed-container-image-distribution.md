@@ -2942,5 +2942,11 @@ the one-hour and 24-hour safety fences. This revision makes shared claims,
 retention, retries, grants, throttles, heartbeats, terminal observation, and
 compaction database-authoritative after their lock sets, while local grant and
 housekeeping deadlines use monotonic time. Blocking PostgreSQL and skew
-regressions cover the production paths. The acceptance streak remains zero until
-both reviewers accept one immutable current-base head three consecutive times.
+regressions cover the production paths. During repair, `origin/improvements`
+advanced to `3e036aa341`; integrating it linearized the new SkyServe
+response-time-history migration as revision 024 after this feature's Serve
+workspace and replica-lookup revisions 022 and 023. The real-PostgreSQL
+migration-chain test now proves the revision-023 index, revision-024 response
+history table, and final declared Serve head together. The acceptance streak
+remains zero until both reviewers accept one immutable current-base head three
+consecutive times.

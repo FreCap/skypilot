@@ -64,7 +64,8 @@ class _Replica:
     def get_spot_location(self):
         return self._location
 
-    def handle(self):
+    def handle(self, cluster_record=None):
+        del cluster_record
         return self._handle
 
 

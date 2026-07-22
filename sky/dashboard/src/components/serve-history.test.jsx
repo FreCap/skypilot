@@ -21,6 +21,20 @@ jest.mock('./serve-history-range', () => {
   };
 });
 
+jest.mock('./serve-response-time-history', () => ({
+  ResponseTimeHistoryCard: ({ range, onRangeSelect }) => (
+    <button
+      type="button"
+      aria-label="Response time trend chart"
+      data-start={range.start}
+      data-end={range.end}
+      onClick={() => onRangeSelect({ start: 120, end: 300 })}
+    >
+      response chart
+    </button>
+  ),
+}));
+
 const history = {
   available: true,
   bucketSeconds: 60,
@@ -101,6 +115,7 @@ const history = {
 function chartRanges() {
   return [
     'Request history chart',
+    'Response time trend chart',
     'Demand pressure chart',
     'L4 accelerator history chart',
     'Machine history chart',
@@ -143,10 +158,12 @@ describe('ServeHistorySection', () => {
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
+      { start: 23 * 60 * 60 + 60, end: 24 * 60 * 60 },
     ]);
 
     fireEvent.click(screen.getByRole('button', { name: '12h' }));
     expect(chartRanges()).toEqual([
+      { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
       { start: 12 * 60 * 60 + 60, end: 24 * 60 * 60 },
@@ -161,6 +178,7 @@ describe('ServeHistorySection', () => {
       { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },
+      { start: 120, end: 300 },
     ]);
 
     fireEvent.click(screen.getByRole('button', { name: '1h' }));
@@ -168,6 +186,7 @@ describe('ServeHistorySection', () => {
       screen.getByRole('button', { name: 'Machine history chart' })
     );
     expect(chartRanges()).toEqual([
+      { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },
       { start: 120, end: 300 },

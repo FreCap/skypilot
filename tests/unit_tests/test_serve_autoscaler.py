@@ -1028,8 +1028,10 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
         self.assertIn(1, autoscaler._qps_dict_by_version)
         info = mock.Mock()
         info.replica_id = 1
+        info.cluster_name = 'svc-1'
         info.version = 2
         info.is_terminal = False
+        info.resources_override = {'accelerators': {'A100': 1}}
         with mock.patch.object(
                 autoscaler,
                 '_set_target_num_replicas_with_instance_aware_logic'), \
@@ -1243,7 +1245,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'A100': 1})
 
-    def test_ready_reserved_card_beats_ready_paid_for_flexible_demand(self):
+    def test_ready_reserved_card_serves_flexible_cheapest_card_demand(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         replicas = [
@@ -1252,7 +1254,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         ]
         autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
 
     def test_qps_retiring_warm_card_cold_replacement_uses_cheapest_card(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
@@ -1268,15 +1270,15 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
 
         self.assertEqual(autoscaler.generate_scaling_decisions([a100], [1]), [])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
 
         a100.status_property.is_scale_down = True
         decisions = autoscaler.generate_scaling_decisions([a100], [1])
 
-        # Hysteresis keeps the adopted retirement map on A100 for one more
-        # observation, but the cold-launch fence must already move to L4.
+        # Demand attribution already stays on L4. Retirement only changes the
+        # supply-aware actuation target, which authorizes an L4 replacement.
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
         self.assertEqual([decision.target for decision in decisions], [{
             'accelerators': {
                 'L4': 1
@@ -1288,7 +1290,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         # hysteresis adopts the new placement.
         decisions = autoscaler.generate_scaling_decisions([], [1])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
         self.assertEqual([decision.target for decision in decisions], [{
             'accelerators': {
                 'L4': 1
@@ -1333,13 +1335,47 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
             }
         }])
 
-    def test_free_reserved_card_beats_cold_paid_card_for_flexible_demand(self):
+    def test_free_reserved_card_does_not_own_flexible_demand(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler.set_free_reserved_slots_by_accelerator({'A100': 1})
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'A100': 1})
+                         {'L4': 1})
+
+    def test_qps_shape_preload_does_not_hold_demand_state_lock(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+        decision_errors = []
+
+        def _blocked_preload(_):
+            preload_started.set()
+            if not release_preload.wait(timeout=5):
+                raise TimeoutError('test did not release shape preload')
+            return {}
+
+        def _decide():
+            try:
+                autoscaler.generate_scaling_decisions([], [1])
+            except Exception as error:  # pylint: disable=broad-except
+                decision_errors.append(error)
+
+        with mock.patch.object(autoscaler,
+                               '_resolve_gpu_shape_handles',
+                               side_effect=_blocked_preload):
+            decision_thread = threading.Thread(target=_decide)
+            decision_thread.start()
+            self.assertTrue(preload_started.wait(timeout=5))
+            acquired = autoscaler._instance_state_lock.acquire(timeout=1)
+            self.assertTrue(acquired)
+            if acquired:
+                autoscaler._instance_state_lock.release()
+            release_preload.set()
+            decision_thread.join(timeout=5)
+
+        self.assertFalse(decision_thread.is_alive())
+        self.assertEqual(decision_errors, [])
 
     def test_flexible_demand_claims_reserved_slot_before_fill(self):
         autoscaler = self._autoscaler(max_replicas=1,
@@ -1481,10 +1517,8 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         ]
 
         self.assertEqual(autoscaler.get_final_target_num_replicas(), 5)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 3,
-            'A100': 2,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
         self.assertEqual(len(scale_downs), 2)
         self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
@@ -1686,10 +1720,10 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
             'A100': 1,
         })
 
-    def test_crossed_sets_use_both_ready_cards_before_cold_start(self):
+    def test_crossed_sets_keep_demand_on_cheapest_compatible_cards(self):
         autoscaler = self._autoscaler(max_replicas=2)
-        # Put the more-flexible ready assignment first to prove report order
-        # cannot consume A100 and force an unnecessary cold L4 launch.
+        # Demand attribution is independent of ready supply. The first profile
+        # needs A100; the second profile stays on its cheapest card, L4.
         autoscaler.compatibility_profiles = (
             self._profiles(50, ['A100', 'H100']) +
             self._profiles(50, ['L4', 'A100']))
@@ -1698,8 +1732,8 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 1,
             'A100': 1,
-            'H100': 1,
         })
 
     def test_crossed_sets_protect_worse_cold_fallback_at_capacity(self):

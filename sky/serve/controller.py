@@ -1130,11 +1130,13 @@ class SkyServeController:
             replica_counts = self._get_replica_counts(replica_infos)
             history_capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
-            request_history_accepted, _ = await asyncio.gather(
-                self._persist_request_history(request_data),
-                self._persist_autoscaler_history(replica_counts,
-                                                 history_capacity_hint),
-            )
+            (request_history_accepted, response_time_history_accepted,
+             _) = await asyncio.gather(
+                 self._persist_request_history(request_data),
+                 self._persist_response_time_history(request_data),
+                 self._persist_autoscaler_history(replica_counts,
+                                                  history_capacity_hint),
+             )
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             # All awaits, including durable bridge confirmation, are above
@@ -1163,6 +1165,7 @@ class SkyServeController:
                 'routing_spec': routing_spec,
                 'capacity_hint': capacity_hint,
                 'request_history_accepted': request_history_accepted,
+                'response_time_history_accepted': response_time_history_accepted,
                 # Additive protocol negotiation for mixed-version rollouts.
                 # A new LB only relies exclusively on the replaceable queue
                 # gauge after a controller positively advertises support.
@@ -1768,9 +1771,15 @@ class SkyServeController:
             None, self._lb_report_authority, request_data.get('lb_session_id'))
         if not authority[0]:
             return fastapi.Response(status_code=503)
-        accepted = await self._persist_request_history(request_data)
-        return responses.JSONResponse(
-            content={'request_history_accepted': accepted}, status_code=200)
+        request_accepted, response_time_accepted = await asyncio.gather(
+            self._persist_request_history(request_data),
+            self._persist_response_time_history(request_data),
+        )
+        return responses.JSONResponse(content={
+            'request_history_accepted': request_accepted,
+            'response_time_history_accepted': response_time_accepted,
+        },
+                                      status_code=200)
 
     async def _persist_request_history(self, request_data: dict[str,
                                                                 Any]) -> bool:
@@ -1823,6 +1832,53 @@ class SkyServeController:
             service_hash,
             reporter_session_id,
             request_history,
+        )
+        return True
+
+    async def _persist_response_time_history(
+            self, request_data: dict[str, Any]) -> bool:
+        """Persist response histograms without allowing them to fail sync."""
+        if request_data.get('response_time_history') is None:
+            return True
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                None, self._record_response_time_history, request_data)
+        except ValueError as e:
+            # A malformed bounded snapshot cannot become valid by retrying.
+            logger.warning('Dropping invalid load balancer response-time '
+                           f'history for {self._service_name!r}: '
+                           f'{common_utils.format_exception(e)}')
+            return True
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to persist load balancer response-time '
+                           f'history for {self._service_name!r}: '
+                           f'{common_utils.format_exception(e)}')
+            return False
+
+    def _record_response_time_history(self, request_data: dict[str,
+                                                               Any]) -> bool:
+        """Persist one live LB process's cumulative response histograms."""
+        response_time_history = request_data.get('response_time_history')
+        if response_time_history is None:
+            return True
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            return True
+        lb_session_id = request_data.get('lb_session_id')
+        process_session_id = request_data.get('request_history_session_id')
+        if (not isinstance(lb_session_id, str) or not lb_session_id or
+                not isinstance(process_session_id, str) or
+                len(process_session_id) != 32 or
+                any(character not in '0123456789abcdef'
+                    for character in process_session_id)):
+            raise ValueError('Invalid response history reporter session.')
+        reporter_session_id = f'{lb_session_id}:{process_session_id}'
+        serve_history.record_response_times(
+            self._service_name,
+            service_hash,
+            reporter_session_id,
+            response_time_history,
         )
         return True
 

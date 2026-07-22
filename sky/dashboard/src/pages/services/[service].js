@@ -473,9 +473,10 @@ export function AcceleratorCapacityCard({ serviceData }) {
         <div>
           <h3 className="text-lg font-semibold">Capacity by exact card</h3>
           <p className="mt-1 text-sm text-gray-500">
-            Serving target can retain work already running on a card. Only
-            cold-launch authority requests incremental exact-card capacity.
-            Reserved-fill capacity remains independent.
+            Demand target assigns flexible work to the cheapest compatible card.
+            Warm retention shows work staying on its current card. Only cold
+            launch authority requests incremental exact card capacity. Reserved
+            fill capacity remains independent.
           </p>
         </div>
         {(serviceData.fillTarget != null ||
@@ -499,7 +500,7 @@ export function AcceleratorCapacityCard({ serviceData }) {
             <TableHead className="text-right">Ready</TableHead>
             <TableHead className="text-right">Provisioning</TableHead>
             <TableHead className="text-right">Total</TableHead>
-            <TableHead className="text-right">Serving target</TableHead>
+            <TableHead className="text-right">Demand target</TableHead>
             <TableHead className="text-right">Warm retention</TableHead>
             <TableHead className="text-right">Cold-launch authority</TableHead>
             <TableHead className="text-right">Hard floor</TableHead>
