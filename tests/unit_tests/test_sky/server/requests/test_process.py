@@ -169,6 +169,67 @@ def test_pool_executor_forwards_cancel_futures(monkeypatch):
     assert shutdown_calls == [(False, True)]
 
 
+def test_pool_executor_shutdown_includes_concurrent_submission(monkeypatch):
+    """Shutdown must terminate a process created by an accepted submit."""
+    executor = PoolExecutor(max_workers=1)
+    original_adjust = executor._adjust_process_count
+    adjust_entered = threading.Event()
+    release_adjust = threading.Event()
+    shutdown_started = threading.Event()
+    snapshot_attempted = threading.Event()
+    submitted_futures = []
+    submit_errors = []
+
+    class RecordingProcessMap(dict):
+
+        def values(self):
+            snapshot_attempted.set()
+            return super().values()
+
+    executor._processes = RecordingProcessMap()
+
+    def block_process_start():
+        adjust_entered.set()
+        assert release_adjust.wait(timeout=20)
+        original_adjust()
+
+    monkeypatch.setattr(executor, '_adjust_process_count', block_process_start)
+
+    def submit_worker():
+        try:
+            submitted_futures.append(executor.submit(dummy_task, sleep_time=2))
+        except BaseException as e:  # pylint: disable=broad-except
+            submit_errors.append(e)
+
+    def shutdown_executor():
+        shutdown_started.set()
+        executor.shutdown()
+
+    submit_thread = threading.Thread(target=submit_worker)
+    shutdown_thread = threading.Thread(target=shutdown_executor)
+    try:
+        submit_thread.start()
+        assert adjust_entered.wait(timeout=20)
+        shutdown_thread.start()
+        assert shutdown_started.wait(timeout=20)
+        # The custom lifecycle lock must keep shutdown away from the worker
+        # snapshot until the accepted submission has registered its process.
+        assert not snapshot_attempted.wait(timeout=0.5)
+    finally:
+        release_adjust.set()
+        submit_thread.join(timeout=20)
+        shutdown_thread.join(timeout=20)
+        executor.shutdown()
+
+    assert not submit_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert not submit_errors
+    assert len(submitted_futures) == 1
+    assert snapshot_attempted.is_set()
+    with pytest.raises(concurrent.futures.process.BrokenProcessPool):
+        submitted_futures[0].result(timeout=20)
+
+
 def test_disposable_executor():
     """Test DisposableExecutor functionality."""
     executor = DisposableExecutor(max_workers=2)
