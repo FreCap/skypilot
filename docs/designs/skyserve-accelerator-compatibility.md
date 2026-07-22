@@ -130,6 +130,13 @@ all three traffic-retirement state transitions:
   hysteresis window; and
 - the frozen pending-capacity retention budget for that downscale episode.
 
+The rebuilt-blind capacity hint sent to the load balancer before the first
+fresh autoscaler decision must use the same demand-owned latest-version
+cohort. It may continue reporting total ready and provisioning capacity in
+their dedicated fields, because fill capacity can serve traffic while it
+exists, but fill-origin rows must not raise the advertised traffic target or
+delay platform spill/backfill as if they were paid demand intent.
+
 Apply the pending budget only to demand-owned pending rows. Fill-origin pending
 rows neither enlarge the cancellation allowance nor consume the protected
 demand cohort. Rows persisted by versions that predate `reserved_fill` default

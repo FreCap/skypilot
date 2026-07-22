@@ -2930,6 +2930,26 @@ class TestGetCapacityHint:
         assert hint['target_num_replicas'] == 10
         assert hint['max_replicas'] == 20
 
+    def test_stale_target_floor_excludes_reserved_fill(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=1,
+            recomputed=False,
+            latest_version=2)
+        replicas = self._replicas()
+        replicas[1].reserved_fill = True
+
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            replicas,
+            logical_versions=set())
+
+        # READY replica 1 and STARTING replica 3 are demand-owned. The
+        # PROVISIONING fill row remains visible as capacity on the way, but it
+        # cannot raise the rebuilt-blind demand target.
+        assert hint['target_num_replicas'] == 2
+        assert hint['provisioning_replicas'] == 2
+        assert hint['total_replicas'] == 5
+
     def test_capacity_hint_reuses_precomputed_replica_counts(self):
         ctrl = _make_controller()
         ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
@@ -3049,6 +3069,36 @@ class TestGetCapacityHint:
         assert hint['logical_replica_urls'] == ['http://logical']
         assert hint['ready_replicas'] == 9
         assert hint['physical_ready_replicas'] == 2
+
+    def test_stale_logical_target_floor_excludes_fill_width(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=1,
+            recomputed=False,
+            latest_version=2,
+            replica_unit='logical')
+        replicas = self._replicas()
+        replicas[0].planned_capacity = 8
+        replicas[1].planned_capacity = 4
+        replicas[1].reserved_fill = True
+        replicas[2].planned_capacity = 1
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://eight', 'A100', 8),
+            2: ('http://four', 'A100', 4),
+            3: ('http://one', 'A100', 1),
+        }
+
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            replicas, logical_versions={2})
+
+        assert hint['target_num_replicas'] == 9
+        assert hint['provisioning_replicas'] == 5
+        assert hint['total_replicas'] == 15
+        assert hint['planned_capacity_by_url'] == {
+            'http://eight': 8,
+            'http://four': 4,
+            'http://one': 1,
+        }
 
     def test_logical_hint_includes_lb_verified_physical_bridge(self):
         ctrl = _make_controller()
