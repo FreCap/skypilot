@@ -3011,11 +3011,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if existing_replica_infos is None:
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
-            if paid_location_launch_budget is None:
-                paid_location_launch_budget = (
-                    self._build_paid_location_launch_budget(
-                        existing_replica_infos))
-            assert paid_location_launch_budget is not None
             if zero_cost_only:
                 # Broker epoch fence: a fill decision computed from a
                 # superseded allocation round (the pool's epoch moved
@@ -3062,33 +3057,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
-            elif self._demand_should_skip_zero_cost(existing_replica_infos):
-                # The broker grant or speculative-probe budget says this
-                # demand launch should compete on paid capacity instead of
-                # preferring the zero-cost tier.  The placer falls back to
-                # zero-cost when no paid candidate exists.
-                location = self._select_with_paid_location_budget(
-                    paid_location_launch_budget,
-                    skip_zero_cost_preference=True,
-                    **allowed_location_kwargs)
-                if location is None:
-                    logger.info('Deferring demand launch because every active '
-                                'paid location is awaiting launch feedback.')
-                    return False
-                if (zero_cost_demand_budget is not None and
-                        location in self._spot_placer.zero_cost_locations()):
-                    budgeted_location = self._select_budgeted_zero_cost_location(
-                        zero_cost_demand_budget, allowed_locations)
-                    if budgeted_location is None:
-                        logger.info('Deferring demand launch because the '
-                                    'shared zero-cost GPU budget is exhausted '
-                                    'and no paid location is active.')
-                        return False
-                    location = budgeted_location
-            elif zero_cost_demand_budget is not None:
-                location = self._select_budgeted_zero_cost_location(
-                    zero_cost_demand_budget, allowed_locations)
-                if location is None:
+            else:
+                if paid_location_launch_budget is None:
+                    paid_location_launch_budget = (
+                        self._build_paid_location_launch_budget(
+                            existing_replica_infos))
+                assert paid_location_launch_budget is not None
+                if self._demand_should_skip_zero_cost(existing_replica_infos):
+                    # The broker grant or speculative-probe budget says this
+                    # demand launch should compete on paid capacity instead of
+                    # preferring the zero-cost tier.  The placer falls back to
+                    # zero-cost when no paid candidate exists.
                     location = self._select_with_paid_location_budget(
                         paid_location_launch_budget,
                         skip_zero_cost_preference=True,
@@ -3098,29 +3077,56 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
                         return False
-                    if location in self._spot_placer.zero_cost_locations():
-                        # A successful zero (or an exhausted speculative
-                        # allowance) is authoritative. If no paid candidate is
-                        # active, defer instead of falling through into the
-                        # same saturated research pool.
-                        logger.info('Deferring demand launch because the '
-                                    'shared zero-cost GPU budget is exhausted '
-                                    'and no paid location is active.')
-                        return False
-            elif self._demand_should_skip_saturated_zero_cost(
-                    existing_replica_infos):
-                location = self._select_with_paid_location_budget(
-                    paid_location_launch_budget,
-                    skip_zero_cost_preference=True,
-                    **allowed_location_kwargs)
-            else:
-                location = self._select_with_paid_location_budget(
-                    paid_location_launch_budget, **allowed_location_kwargs)
+                    if (zero_cost_demand_budget is not None and location
+                            in self._spot_placer.zero_cost_locations()):
+                        budgeted_location = (
+                            self._select_budgeted_zero_cost_location(
+                                zero_cost_demand_budget, allowed_locations))
+                        if budgeted_location is None:
+                            logger.info(
+                                'Deferring demand launch because the shared '
+                                'zero-cost GPU budget is exhausted and no '
+                                'paid location is active.')
+                            return False
+                        location = budgeted_location
+                elif zero_cost_demand_budget is not None:
+                    location = self._select_budgeted_zero_cost_location(
+                        zero_cost_demand_budget, allowed_locations)
+                    if location is None:
+                        location = self._select_with_paid_location_budget(
+                            paid_location_launch_budget,
+                            skip_zero_cost_preference=True,
+                            **allowed_location_kwargs)
+                        if location is None:
+                            logger.info(
+                                'Deferring demand launch because every active '
+                                'paid location is awaiting launch feedback.')
+                            return False
+                        if location in self._spot_placer.zero_cost_locations():
+                            # A successful zero (or an exhausted speculative
+                            # allowance) is authoritative. If no paid candidate
+                            # is active, defer instead of falling through into
+                            # the same saturated research pool.
+                            logger.info(
+                                'Deferring demand launch because the shared '
+                                'zero-cost GPU budget is exhausted and no '
+                                'paid location is active.')
+                            return False
+                elif self._demand_should_skip_saturated_zero_cost(
+                        existing_replica_infos):
+                    location = self._select_with_paid_location_budget(
+                        paid_location_launch_budget,
+                        skip_zero_cost_preference=True,
+                        **allowed_location_kwargs)
+                else:
+                    location = self._select_with_paid_location_budget(
+                        paid_location_launch_budget, **allowed_location_kwargs)
             if location is None:
                 logger.info('Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
                 return False
             debit_paid_location_launch_budget = (
+                paid_location_launch_budget is not None and
                 location in paid_location_launch_budget.remaining_by_location)
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
@@ -3418,9 +3424,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not active:
             # Preserve the placer's existing no-active-location error. Exact
             # accelerator mismatches are rejected before this helper is called.
-            return self._spot_placer.select_next_location(
-                skip_zero_cost_preference=skip_zero_cost_preference,
-                allowed_locations=set())
+            selection_kwargs: dict[str, Any] = {}
+            if skip_zero_cost_preference:
+                selection_kwargs['skip_zero_cost_preference'] = True
+            if allowed_locations is not None:
+                selection_kwargs['allowed_locations'] = set()
+            return self._spot_placer.select_next_location(**selection_kwargs)
         zero_cost = set(self._spot_placer.zero_cost_locations())
         active_paid = [
             location for location in active if location not in zero_cost

@@ -65,8 +65,8 @@ class TestSkyPilotReplicaManagerInitOrdering:
                  'start_supervised_thread') as mock_supervised:
 
             def _record(target, *_args, **_kwargs):
-                started_records.append((getattr(target, '__name__',
-                                                repr(target))))
+                started_records.append(getattr(target, '__name__',
+                                               repr(target)))
                 return mock.Mock()
 
             mock_supervised.side_effect = _record
