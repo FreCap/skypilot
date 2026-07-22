@@ -354,6 +354,8 @@ describe('getServices', () => {
               configured_accelerators: ['A100', 'A100-80GB'],
               min_replicas: { A100: 1, 'A100-80GB': 0 },
               demand_target: { A100: 3, 'A100-80GB': 1 },
+              warm_retention_target: { A100: 2, 'A100-80GB': 0 },
+              cold_launch_authority: { A100: 0, 'A100-80GB': 1 },
               ready_capacity: { A100: 4, 'A100-80GB': 2 },
               provisioning_capacity: { A100: 1, 'A100-80GB': 1 },
               total_capacity: { A100: 6, 'A100-80GB': 3 },
@@ -446,6 +448,8 @@ describe('getServices', () => {
             configuredAccelerators: ['A100', 'A100-80GB'],
             minReplicas: { A100: 1, 'A100-80GB': 0 },
             demandTarget: { A100: 3, 'A100-80GB': 1 },
+            warmRetentionTarget: { A100: 2, 'A100-80GB': 0 },
+            coldLaunchAuthority: { A100: 0, 'A100-80GB': 1 },
             readyCapacity: { A100: 4, 'A100-80GB': 2 },
             provisioningCapacity: { A100: 1, 'A100-80GB': 1 },
             totalCapacity: { A100: 6, 'A100-80GB': 3 },
@@ -683,6 +687,8 @@ describe('normalizeService / normalizeReplica', () => {
       rawServiceRecord({
         min_replicas_by_accelerator: { A100: 1, 'A100-80GB': 2 },
         target_num_replicas_by_accelerator: { A100: 3, 'A100-80GB': 4 },
+        warm_retention_target_by_accelerator: { A100: 2, 'A100-80GB': 1 },
+        cold_launch_authority_by_accelerator: { A100: 0, 'A100-80GB': 3 },
         ready_replicas_by_accelerator: { A100: 2, 'A100-80GB': 1 },
         provisioning_replicas_by_accelerator: {
           A100: 1,
@@ -704,6 +710,8 @@ describe('normalizeService / normalizeReplica', () => {
         ready: 2,
         provisioning: 1,
         demandTarget: 3,
+        warmRetentionTarget: 2,
+        coldLaunchAuthority: 0,
         hardFloor: 1,
       }),
       expect.objectContaining({
@@ -711,6 +719,8 @@ describe('normalizeService / normalizeReplica', () => {
         ready: 1,
         provisioning: 3,
         demandTarget: 4,
+        warmRetentionTarget: 1,
+        coldLaunchAuthority: 3,
         hardFloor: 2,
       }),
     ]);

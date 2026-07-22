@@ -44,6 +44,28 @@ For every proposed policy:
 A simulation result is advisory if baseline calibration fails. It is not a
 rollout gate until the cause of the mismatch is understood.
 
+The simulator must derive every displayed scenario field from the scenario
+object actually executed. A second declarative metadata block is not an
+acceptable source because it can silently describe a different policy. The
+baseline launcher must use the same exact-card choice rules as the deployed
+controller and must be able to launch every card represented in the modeled
+supply. A hard-coded cheapest-card-only launcher cannot validate whether the
+baseline would have requested A100.
+
+Visualizations may render only accelerators whose supply, startup, service
+rate, and dispatch behavior are modeled. Do not add empty card panels that
+imply H100, H200, or B200 behavior when the replay contains no such model. A
+per-card desired total is labeled `Serving target`, not `Traffic target`, when
+it can include retention of already-running exact-card work. If the replay
+models them, show warm retention and incremental cold-launch authority as
+separate, non-stacked series.
+
+For the 2026-07-22 production comparison, the canonical policy family keeps
+the deployed 300-second downscale delay and least-load dispatch. Compare the
+current 90 percent target utilization with a 95 percent target-utilization
+candidate. A 20-second downscale delay or a lookahead/ordered dispatch policy
+is a separate experiment and is not part of this rollout candidate.
+
 ## Fidelity levels
 
 Use the highest fidelity whose required data is available:

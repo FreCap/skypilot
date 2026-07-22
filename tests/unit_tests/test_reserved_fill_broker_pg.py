@@ -835,6 +835,12 @@ class TestServeStatusHistoryPG:
                     'A100': 2,
                     'A100-80GB': 3
                 },
+                'warm_retention_target': {
+                    'A100': 2
+                },
+                'cold_launch_authority': {
+                    'A100-80GB': 1
+                },
                 'ready_capacity': {
                     'A100': 2,
                     'A100-80GB': 2
@@ -931,6 +937,14 @@ class TestServeStatusHistoryPG:
                 'demand_target': {
                     'A100': 3,
                     'A100-80GB': 3
+                },
+                'warm_retention_target': {
+                    'A100': 2,
+                    'A100-80GB': 0
+                },
+                'cold_launch_authority': {
+                    'A100': 0,
+                    'A100-80GB': 1
                 },
                 'ready_capacity': {
                     'A100': 2,

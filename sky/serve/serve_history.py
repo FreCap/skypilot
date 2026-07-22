@@ -529,6 +529,11 @@ _ACCELERATOR_BREAKDOWN_MAP_FIELDS = (
     'free_reserved_slots',
 )
 
+_OPTIONAL_ACCELERATOR_BREAKDOWN_MAP_FIELDS = (
+    'warm_retention_target',
+    'cold_launch_authority',
+)
+
 
 def _normalize_accelerator_breakdown(
         value: dict[str, Any] | None) -> dict[str, Any]:
@@ -559,6 +564,21 @@ def _normalize_accelerator_breakdown(
         for card in configured:
             raw_count = raw_mapping.get(card, 0)
             count = _nonnegative_int(raw_count, f'{field}[{card}]')
+            assert count is not None
+            normalized[card] = count
+        result[field] = normalized
+    for field in _OPTIONAL_ACCELERATOR_BREAKDOWN_MAP_FIELDS:
+        if field not in value:
+            continue
+        raw_mapping = value[field]
+        if not isinstance(raw_mapping, dict):
+            raise ValueError(f'{field} must be an exact-card count object.')
+        if not set(raw_mapping).issubset(configured_set):
+            raise ValueError(f'{field} contains an unconfigured accelerator.')
+        normalized = {}
+        for card in configured:
+            count = _nonnegative_int(raw_mapping.get(card, 0),
+                                     f'{field}[{card}]')
             assert count is not None
             normalized[card] = count
         result[field] = normalized

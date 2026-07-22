@@ -2019,6 +2019,8 @@ def _get_service_status(
                 'min_replicas_by_accelerator': 'min_replicas_by_accelerator',
                 'target_num_replicas_by_accelerator': 'target_num_replicas_by_accelerator',
                 'demand_target_by_accelerator': 'demand_target_by_accelerator',
+                'warm_retention_target_by_accelerator': 'warm_retention_target_by_accelerator',
+                'cold_launch_authority_by_accelerator': 'cold_launch_authority_by_accelerator',
                 'ready_replicas_by_accelerator': 'ready_replicas_by_accelerator',
                 'provisioning_replicas_by_accelerator': 'provisioning_replicas_by_accelerator',
                 'total_replicas_by_accelerator': 'total_replicas_by_accelerator',

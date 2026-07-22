@@ -1931,6 +1931,12 @@ class SkyServeController:
             'min_replicas': dict(
                 getattr(self._autoscaler, 'min_replicas_by_accelerator', {})),
             'demand_target': dict(demand_target),
+            'warm_retention_target': dict(
+                getattr(self._autoscaler,
+                        'warm_retention_target_by_accelerator', {})),
+            'cold_launch_authority': dict(
+                getattr(self._autoscaler,
+                        'cold_launch_authority_by_accelerator', {})),
             'ready_capacity': mapping('ready_replicas_by_accelerator'),
             'provisioning_capacity':
                 mapping('provisioning_replicas_by_accelerator'),
@@ -2063,6 +2069,14 @@ class SkyServeController:
             hint['target_num_replicas_by_accelerator'] = dict(
                 demand_by_accelerator)
             hint['demand_target_by_accelerator'] = dict(demand_by_accelerator)
+        if (isinstance(self._autoscaler, autoscalers.ConcurrencyAutoscaler) and
+                self._autoscaler.has_recomputed_with_fresh_data()):
+            hint['warm_retention_target_by_accelerator'] = dict(
+                getattr(self._autoscaler,
+                        'warm_retention_target_by_accelerator', {}))
+            hint['cold_launch_authority_by_accelerator'] = dict(
+                getattr(self._autoscaler,
+                        'cold_launch_authority_by_accelerator', {}))
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -2189,6 +2203,12 @@ class SkyServeController:
             demand_target = {}
         if isinstance(demand_target, dict) and demand_target:
             counts['demand_target_by_accelerator'] = dict(demand_target)
+        if (isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler) and
+                autoscaler.has_recomputed_with_fresh_data()):
+            counts['warm_retention_target_by_accelerator'] = dict(
+                getattr(autoscaler, 'warm_retention_target_by_accelerator', {}))
+            counts['cold_launch_authority_by_accelerator'] = dict(
+                getattr(autoscaler, 'cold_launch_authority_by_accelerator', {}))
         counts['replica_unit'] = ('logical_slot'
                                   if logical else 'physical_backend')
         return counts
