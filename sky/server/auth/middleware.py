@@ -21,6 +21,7 @@ from sky.server import common
 from sky.server import config as server_config
 from sky.server import middleware_utils
 from sky.server.auth import loopback
+from sky.server.auth import user_registration
 from sky.skylet import constants
 from sky.users import permission
 from sky.utils import common_utils
@@ -537,11 +538,8 @@ class AuthProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
 
         # Add user to database if auth_user is present
         if auth_user is not None:
-            newly_added = await asyncio.to_thread(
-                global_user_state.add_or_update_user, auth_user)
-            if newly_added:
-                permission.permission_service.add_user_if_not_exists(
-                    auth_user.id)
+            await user_registration.add_or_update_user_with_default_role(
+                auth_user)
 
         # Store user info in request.state for access by GET endpoints
         if auth_user is not None:

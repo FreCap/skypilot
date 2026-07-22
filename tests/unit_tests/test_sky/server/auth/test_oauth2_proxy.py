@@ -3,6 +3,7 @@
 import asyncio
 import http
 import os
+import threading
 import unittest.mock as mock
 
 import aiohttp
@@ -411,6 +412,51 @@ class TestOriginalOAuth2ProxyMiddleware:
             response_data = response.body.decode()
             assert 'oauth2-proxy is enabled but did not' in response_data
             assert 'return user info' in response_data
+
+    @pytest.mark.asyncio
+    async def test_authenticate_finishes_new_user_role_after_cancellation(
+            self, middleware_enabled, mock_request,
+            mock_auth_response_accepted):
+        response_context = mock.AsyncMock()
+        response_context.__aenter__.return_value = mock_auth_response_accepted
+        response_context.__aexit__.return_value = None
+        session = mock.Mock()
+        session.request.return_value = response_context
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        role_assigned = threading.Event()
+
+        def add_or_update_user(user):
+            del user
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+            return True
+
+        def add_user_if_not_exists(user_id):
+            del user_id
+            role_assigned.set()
+
+        call_next = mock.AsyncMock(return_value=fastapi.Response(
+            status_code=204))
+        with mock.patch(
+                'sky.server.auth.user_registration.global_user_state.'
+                'add_or_update_user', side_effect=add_or_update_user), \
+             mock.patch(
+                 'sky.server.auth.user_registration.permission.'
+                 'permission_service.add_user_if_not_exists',
+                 side_effect=add_user_if_not_exists):
+            authenticate_task = asyncio.create_task(
+                middleware_enabled._authenticate(mock_request, call_next,
+                                                 session))
+            assert await asyncio.to_thread(worker_started.wait, 5)
+            authenticate_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await authenticate_task
+            release_worker.set()
+
+            assert await asyncio.to_thread(role_assigned.wait, 5)
+            call_next.assert_not_awaited()
 
     def test_middleware_initialization_missing_base_url(self):
         """Test that middleware raises error when enabled but no base URL."""
