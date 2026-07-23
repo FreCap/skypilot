@@ -2,6 +2,7 @@
 import json
 from unittest import mock
 
+import orjson
 import pytest
 
 from sky.server import constants as server_constants
@@ -138,6 +139,17 @@ class TestDefaultSerializer:
         data = {'outer': {1: 'one'}}
         result = return_value_serializers.default_serializer(data)
         assert json.loads(result) == {'outer': {'1': 'one'}}
+
+    def test_fallback_never_persists_undecodable_output(self):
+        """The fallback must not persist output orjson.loads rejects."""
+        # NaN only reaches the fallback path alongside an orjson TypeError
+        # trigger (here, a non-str key); allow_nan=False rejects it there.
+        with pytest.raises(ValueError):
+            return_value_serializers.default_serializer({1: float('nan')})
+        # Lone surrogates serialize with stdlib json but fail the strict
+        # round-trip validation.
+        with pytest.raises(orjson.JSONDecodeError):
+            return_value_serializers.default_serializer({1: '\ud800'})
 
 
 class TestSerializeKubernetesNodeInfo:
