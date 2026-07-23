@@ -9,12 +9,12 @@ from unittest import mock
 from sky.serve import spot_placer
 
 
-def make_location(
-        region: str,
-        accelerators: Optional[Dict[str, int]] = None,
-        use_spot: bool = True,
-        cloud_name: Optional[str] = None,
-        ephemeral_storage: Optional[int] = None) -> spot_placer.Location:
+def make_location(region: str,
+                  accelerators: Optional[Dict[str, int]] = None,
+                  use_spot: bool = True,
+                  cloud_name: Optional[str] = None,
+                  ephemeral_storage: Optional[int] = None,
+                  instance_type: Optional[str] = None) -> spot_placer.Location:
     """A Location on a mock cloud whose identity is its str()."""
     cloud = mock.MagicMock()
     cloud.is_same_cloud = lambda other: str(other) == str(cloud)
@@ -26,7 +26,8 @@ def make_location(
                                 zone=None,
                                 accelerators=accelerators,
                                 use_spot=use_spot,
-                                ephemeral_storage=ephemeral_storage)
+                                ephemeral_storage=ephemeral_storage,
+                                instance_type=instance_type)
 
 
 def make_placer(

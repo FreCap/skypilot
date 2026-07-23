@@ -516,6 +516,120 @@ class TestTargetMath(unittest.TestCase):
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
 
+    def test_launch_priority_uses_highest_active_demand(self):
+        autoscaler = _make_autoscaler(knob=1, max_replicas=1000)
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=101,
+                queue_depth_by_priority={
+                    20: 100,
+                    50: 1,
+                },
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['L4'],
+                    'count': 100,
+                }, {
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                compatibility_complete=True)
+
+        self.assertEqual(autoscaler.current_launch_priority(), 50)
+
+    def test_launch_priority_defaults_and_clamps(self):
+        autoscaler = _make_autoscaler(knob=1)
+        self.assertEqual(autoscaler.current_launch_priority(),
+                         constants.LB_REQUEST_PRIORITY_MIN)
+        autoscaler._queue_depth_by_priority = {1000: 1}
+        autoscaler._launch_priority_report_received_at = time.time()
+        self.assertEqual(autoscaler.current_launch_priority(),
+                         constants.LB_REQUEST_PRIORITY_MAX)
+
+    def test_launch_priority_is_specific_to_compatible_accelerator(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['L4'],
+                    'count': 100,
+                }, {
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                compatibility_complete=True)
+
+        assert autoscaler.current_launch_priorities_by_accelerator(
+            ['L4', 'A100']) == {
+                'L4': 20,
+                'A100': 50,
+            }
+        assert isinstance(
+            autoscaler.queued_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
+
+    def test_launch_priority_missing_compatibility_applies_to_every_card(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler._launch_priority_report_received_at = time.time()
+        autoscaler.queued_compatibility_profiles = [{
+            'priority': 50,
+            'count': 1,
+        }]
+
+        assert autoscaler.current_launch_priorities_by_accelerator(
+            ['A100', 'A100-80GB']) == {
+                'A100': 50,
+                'A100-80GB': 50,
+            }
+
+    def test_launch_priority_does_not_fall_back_across_excluded_card(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler._launch_priority_report_received_at = time.time()
+        autoscaler._queue_depth_by_priority = {50: 1}
+        autoscaler.queued_compatibility_profiles = [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }]
+
+        assert autoscaler.current_launch_priorities_by_accelerator(['L4']) == {
+            'L4': constants.LB_REQUEST_PRIORITY_MIN,
+        }
+
+    def test_launch_priority_evidence_expires(self):
+        autoscaler = _make_autoscaler(knob=1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100):
+            _report(autoscaler,
+                    in_flight={},
+                    queue_depth=1,
+                    queue_depth_by_priority={50: 1},
+                    queued_profiles=[{
+                        'priority': 50,
+                        'compatible_accelerators': ['A100'],
+                        'count': 1,
+                    }],
+                    compatibility_complete=True)
+            assert autoscaler.current_launch_priority() == 50
+            assert autoscaler.current_launch_priorities_by_accelerator(
+                ['A100']) == {
+                    'A100': 50,
+                }
+
+        expired_at = 101 + autoscaler._staleness_threshold_seconds()
+        with mock.patch.object(autoscalers.time,
+                               'time',
+                               return_value=expired_at):
+            assert autoscaler.current_launch_priority() == (
+                constants.LB_REQUEST_PRIORITY_MIN)
+            assert autoscaler.current_launch_priorities_by_accelerator(
+                ['A100']) == {
+                    'A100': constants.LB_REQUEST_PRIORITY_MIN,
+                }
+
     def test_default_assumed_lead_removes_deadline_discount(self):
         autoscaler = _make_autoscaler(
             knob=1,
@@ -715,6 +829,37 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
         autoscaler._snap_target_on_next_recompute = False
         return autoscaler
+
+    def test_qps_launch_priority_uses_tuple_backed_queue_and_rejections(self):
+        autoscaler = self._instance_aware_autoscaler()
+        autoscaler.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [{
+                'priority': 20,
+                'compatible_accelerators': ['L4'],
+                'count': 100,
+            }],
+            'rejected_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'recent_count': 1,
+            }],
+            'compatibility_demand_complete': True,
+        })
+
+        self.assertEqual(
+            autoscaler.current_launch_priorities_by_accelerator(['L4', 'A100']),
+            {
+                'L4': 20,
+                'A100': 50,
+            })
+        self.assertIsInstance(
+            autoscaler.queued_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
+        self.assertIsInstance(
+            autoscaler.rejected_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
 
     def test_logical_exact_card_preserves_production_arrival_floor(self):
         autoscaler = _make_autoscaler(
@@ -1440,7 +1585,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 target_capacity=57,
                 launch_budget=10,
                 target_capacity_by_accelerator=(('L4', 57),),
-                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
+                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1)),
+                launch_priority_by_accelerator=(('L4', 0),)))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
 
     def test_free_reserved_slot_cannot_back_paid_rollout_authority(self):
@@ -1522,20 +1668,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(target, {'A100': 10})
 
-    def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
-        autoscaler = _make_autoscaler(max_replicas=20,
-                                      reserved_capacity_fill=True)
-        autoscaler.set_configured_accelerator_shapes({
-            'L4': 1,
-            'A100': 1,
-            'A100-80GB': 1,
-        })
-        autoscaler.target_num_replicas = 3
-        autoscaler.target_num_replicas_by_accelerator = {
-            'L4': 2,
-            'A100': 1,
-            'A100-80GB': 0,
-        }
+    @staticmethod
+    def _reserved_fill_shelter_inputs(autoscaler, grant=None):
         now = time.time()
         reserved_keys = [{
             'cloud': 'Kubernetes',
@@ -1548,7 +1682,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'image_id': None,
             'disk_tier': None,
         } for card in ('A100', 'A100-80GB')]
-        autoscaler.collect_reserved_capacity(0, reserved_keys, now)
+        autoscaler.collect_reserved_capacity(0, reserved_keys, now, grant=grant)
 
         paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
         reserved = [
@@ -1570,13 +1704,29 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             info.created_at = now - 10
             info.reserved_fill = True
             info.get_spot_location.return_value = location_by_card[card]
-
         ordinary = [
             autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
             for replica_id in (4, 5, 6, 7, 8)
         ]
-        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
-                                                             ordinary)
+        return [*paid, *reserved], ordinary
+
+    def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+            'A100-80GB': 0,
+        }
+        autoscaler._compatibility_demand_complete = True
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler)
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
 
         # Fill owns all six A100-family holdings. Only one of them overlaps
         # A100 demand; L4 demand cannot consume the other five units of
@@ -1598,52 +1748,49 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'A100': 1,
             'A100-80GB': 0,
         }
-        now = time.time()
-        reserved_keys = [{
-            'cloud': 'Kubernetes',
-            'region': 'research-ctx',
-            'zone': None,
-            'accelerators': {
-                card: 1
-            },
-            'use_spot': False,
-            'image_id': None,
-            'disk_tier': None,
-        } for card in ('A100', 'A100-80GB')]
-        autoscaler.collect_reserved_capacity(0, reserved_keys, now, grant=4)
-
-        paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
-        reserved = [
-            *[_replica(replica_id, card='A100') for replica_id in (3, 4, 5)],
-            *[
-                _replica(replica_id, card='A100-80GB')
-                for replica_id in (6, 7, 8)
-            ],
-        ]
-        location_by_card = {
-            card: spot_placer.Location.from_pickleable(key)
-            for card, key in zip(('A100', 'A100-80GB'), reserved_keys)
-        }
-        for info in paid:
-            info.created_at = now - 10
-            info.get_spot_location.return_value = None
-        for info in reserved:
-            card = next(iter(info.resources_override['accelerators']))
-            info.created_at = now - 10
-            info.reserved_fill = True
-            info.get_spot_location.return_value = location_by_card[card]
-
-        ordinary = [
-            autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
-            for replica_id in (4, 5, 6, 7, 8)
-        ]
-        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
-                                                             ordinary)
+        autoscaler._compatibility_demand_complete = True
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler,
+                                                                grant=4)
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
 
         # The reduced grant retains the three existing A100s and one existing
         # A100-80GB. A100 demand overlaps one retained A100, so the shelter is
         # two A100s plus one A100-80GB. Exactly two A100-80GB victims drain.
         self.assertEqual(_scale_downs(decisions), [6, 7])
+
+    def test_incomplete_exact_card_target_uses_aggregate_fill_shelter(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {}
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler,
+                                                                grant=4)
+
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
+
+        # The aggregate fallback shelters only fill_target - demand_target = 1
+        # victim, so the fleet converges to the broker's grant ceiling of 4.
+        self.assertEqual(_scale_downs(decisions), [4, 5, 6, 7])
+
+    def test_unattributed_overprovision_uses_aggregate_fill_shelter(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      num_overprovision=1,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+        }
+        autoscaler._compatibility_demand_complete = True
+
+        self.assertEqual(autoscaler.get_final_target_num_replicas(), 4)
+        self.assertIsNone(autoscaler._exact_card_fill_shelter([], 5))
 
     def test_num_overprovision_keeps_exact_card_scale_up_shaped(self):
         autoscaler = _make_autoscaler(max_replicas=2, num_overprovision=1)

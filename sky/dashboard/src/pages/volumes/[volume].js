@@ -74,7 +74,7 @@ export function useVolumeDetails({ volumeName }) {
     }
 
     const refreshPromise = (async () => {
-      dashboardCache.invalidateFunction(getVolumes);
+      dashboardCache.invalidate(getVolumes, [{ name: volumeName }]);
       await fetchData();
     })().finally(() => {
       if (refreshInFlightRef.current?.promise === refreshPromise) {

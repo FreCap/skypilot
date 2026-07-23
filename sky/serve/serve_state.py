@@ -20,6 +20,7 @@ from sqlalchemy.ext import declarative
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.serve import lb_ha
+from sky.serve import paid_capacity
 from sky.utils import common_utils
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
@@ -139,6 +140,9 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column('cluster_name', sqlalchemy.Text),
     sqlalchemy.Column('created_at', sqlalchemy.Float),
     sqlalchemy.Column('is_spot', sqlalchemy.Boolean),
+    sqlalchemy.Column('paid_capacity_pool_key',
+                      sqlalchemy.Text,
+                      server_default=None),
     sqlalchemy.Column(
         'replica_state',
         sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
@@ -337,6 +341,57 @@ demand_capacity_observations_table = sqlalchemy.Table(
     sqlalchemy.Column('completed_at', sqlalchemy.Float, nullable=False),
     sqlalchemy.Column('availability', sqlalchemy.Text, server_default=None),
 )
+
+# Global paid provider-pool admission. The pool row serializes claims from
+# independent service controllers. Claims are durable only while their
+# corresponding replica remains PENDING or PROVISIONING.
+paid_capacity_pools_table = sqlalchemy.Table(
+    'paid_capacity_pools',
+    Base.metadata,
+    sqlalchemy.Column('pool_key', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('current_limit', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('successes_since_resize',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('last_success_at', sqlalchemy.Float),
+    sqlalchemy.Column('last_failure_at', sqlalchemy.Float),
+    sqlalchemy.Column('updated_at', sqlalchemy.Float, nullable=False),
+)
+
+paid_capacity_claims_table = sqlalchemy.Table(
+    'paid_capacity_claims',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('pool_key',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('paid_capacity_pools.pool_key',
+                                            ondelete='CASCADE'),
+                      nullable=False),
+    sqlalchemy.Column('priority', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('claimed_at', sqlalchemy.Float, nullable=False),
+)
+sqlalchemy.Index('paid_capacity_claims_pool_idx',
+                 paid_capacity_claims_table.c.pool_key)
+
+paid_capacity_waiters_table = sqlalchemy.Table(
+    'paid_capacity_waiters',
+    Base.metadata,
+    sqlalchemy.Column('pool_key',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('paid_capacity_pools.pool_key',
+                                            ondelete='CASCADE'),
+                      primary_key=True),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('priority', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('first_wait_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('heartbeat_at', sqlalchemy.Float, nullable=False),
+)
+sqlalchemy.Index('paid_capacity_waiters_pool_idx',
+                 paid_capacity_waiters_table.c.pool_key)
 
 
 def create_table(engine: sqlalchemy.engine.Engine):
@@ -1002,6 +1057,12 @@ def remove_service(service_name: str) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         session.execute(
+            sqlalchemy.delete(paid_capacity_claims_table).where(
+                paid_capacity_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(paid_capacity_waiters_table).where(
+                paid_capacity_waiters_table.c.service_name == service_name))
+        session.execute(
             sqlalchemy.delete(services_table).where(
                 services_table.c.name == service_name))
         session.commit()
@@ -1112,6 +1173,12 @@ def remove_service_completely(
         session.execute(
             sqlalchemy.delete(reserved_fill_claims_table).where(
                 reserved_fill_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(paid_capacity_claims_table).where(
+                paid_capacity_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(paid_capacity_waiters_table).where(
+                paid_capacity_waiters_table.c.service_name == service_name))
         if resource_scope is not None:
             session.execute(
                 sqlalchemy.delete(
@@ -2730,12 +2797,14 @@ def get_service_pool_from_db(service_name: str) -> bool | None:
 
 # === Replica functions ===
 
-# 999 (the oldest SQLITE_MAX_VARIABLE_NUMBER default) // 11 fields per row,
-# rounded down for headroom.
-_REPLICA_UPSERT_CHUNK_SIZE = 90
+_SQLITE_MAX_BIND_PARAMS = 999
 _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE = 300
 _REPLICA_DELETE_CHUNK_SIZE = 500
 _REPLICA_STATE_VERSION = 1
+_PAID_CAPACITY_UNRESOLVED_STATUSES = (
+    ReplicaStatus.PENDING.value,
+    ReplicaStatus.PROVISIONING.value,
+)
 
 
 def _replica_row_values(
@@ -2759,8 +2828,37 @@ def _replica_row_values(
         'cluster_name': replica_info.cluster_name,
         'created_at': getattr(replica_info, 'created_at', None),
         'is_spot': replica_info.is_spot,
+        'paid_capacity_pool_key': getattr(replica_info,
+                                          'paid_capacity_pool_key', None),
         'replica_state': replica_state,
     }
+
+
+def _upsert_replica_rows_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+) -> None:
+    """Upsert replica rows in dialect-safe bounded batches."""
+    chunk_size = (max(1, _SQLITE_MAX_BIND_PARAMS // len(replicas_table.c)) if
+                  engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value
+                  else _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
+    insert_func = _upsert_insert_func(engine)
+    for start in range(0, len(replica_infos), chunk_size):
+        chunk = replica_infos[start:start + chunk_size]
+        insert_stmt = insert_func(replicas_table).values([
+            _replica_row_values(service_name, replica_id, replica_info)
+            for replica_id, replica_info in chunk
+        ])
+        session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=['service_name', 'replica_id'],
+                set_={
+                    column.name: getattr(insert_stmt.excluded, column.name)
+                    for column in replicas_table.c
+                    if column.name not in ('service_name', 'replica_id')
+                }))
 
 
 def _replica_from_state(
@@ -2770,6 +2868,467 @@ def _replica_from_state(
         raise RuntimeError('Unsupported replica state version: '
                            f'{replica_state_version!r}')
     return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
+
+
+def _lock_service_owner_in_session(
+    session: orm.Session,
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+    *,
+    require_launch_allowed: bool,
+) -> bool:
+    """Lock and validate one service controller owner."""
+    owner = session.execute(
+        sqlalchemy.select(services_table.c.hash,
+                          services_table.c.controller_pid,
+                          services_table.c.controller_ip,
+                          services_table.c.status).where(
+                              services_table.c.name ==
+                              service_name).with_for_update()).fetchone()
+    if (owner is None or owner[0] != expected_service_hash or
+        (expected_controller_owner is not None and
+         (owner[1], owner[2]) != expected_controller_owner)):
+        return False
+    return (not require_launch_allowed or
+            owner[3] not in ServiceStatus.replica_launch_blocking_statuses())
+
+
+def _valid_paid_capacity_claims_in_session(
+    session: orm.Session, pool_key: str
+) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
+    """Return valid and stale claim identities for one locked pool."""
+    rows = session.execute(
+        sqlalchemy.select(
+            paid_capacity_claims_table.c.service_name,
+            paid_capacity_claims_table.c.service_hash,
+            paid_capacity_claims_table.c.replica_id,
+            services_table.c.hash,
+            replicas_table.c.status,
+            replicas_table.c.paid_capacity_pool_key,
+        ).select_from(
+            paid_capacity_claims_table.outerjoin(
+                services_table, services_table.c.name ==
+                paid_capacity_claims_table.c.service_name).outerjoin(
+                    replicas_table,
+                    sqlalchemy.and_(
+                        replicas_table.c.service_name ==
+                        paid_capacity_claims_table.c.service_name,
+                        replicas_table.c.replica_id ==
+                        paid_capacity_claims_table.c.replica_id))).
+        where(paid_capacity_claims_table.c.pool_key == pool_key)).fetchall()
+    valid = []
+    stale = []
+    for service_name, service_hash, replica_id, current_hash, status, row_pool in rows:
+        identity = (service_name, service_hash, replica_id)
+        if (current_hash == service_hash and
+                status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
+                row_pool == pool_key):
+            valid.append(identity)
+        else:
+            stale.append(identity)
+    return valid, stale
+
+
+def _delete_paid_capacity_claims_in_session(
+        session: orm.Session, identities: list[tuple[str, str, int]]) -> None:
+    if not identities:
+        return
+    session.execute(
+        sqlalchemy.delete(paid_capacity_claims_table).where(
+            sqlalchemy.tuple_(
+                paid_capacity_claims_table.c.service_name,
+                paid_capacity_claims_table.c.service_hash,
+                paid_capacity_claims_table.c.replica_id).in_(identities)))
+
+
+def _ensure_paid_capacity_pool_in_session(session: orm.Session,
+                                          engine: sqlalchemy.engine.Engine,
+                                          pool_key: str, base_limit: int,
+                                          now: float) -> None:
+    insert_stmt = _upsert_insert_func(engine)(paid_capacity_pools_table).values(
+        pool_key=pool_key,
+        current_limit=base_limit,
+        successes_since_resize=0,
+        updated_at=now)
+    session.execute(
+        insert_stmt.on_conflict_do_nothing(index_elements=['pool_key']))
+
+
+def _paid_capacity_pool_row_for_update(session: orm.Session,
+                                       pool_key: str) -> Any:
+    row = session.execute(
+        sqlalchemy.select(paid_capacity_pools_table).where(
+            paid_capacity_pools_table.c.pool_key ==
+            pool_key).with_for_update()).fetchone()
+    if row is None:
+        raise RuntimeError('Paid-capacity pool disappeared while locked.')
+    return row
+
+
+def get_paid_capacity_pool_states(
+    pool_keys: list[str],
+    *,
+    base_limit: int,
+    max_limit: int,
+    now: float,
+    success_ttl_seconds: float,
+) -> dict[str, dict[str, Any]]:
+    """Read advisory shared headroom for exact paid provider pools."""
+    pool_keys = list(dict.fromkeys(pool_keys))
+    if not pool_keys:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        pool_rows = {
+            row.pool_key: row for row in session.execute(
+                sqlalchemy.select(paid_capacity_pools_table).where(
+                    paid_capacity_pools_table.c.pool_key.in_(pool_keys)))
+        }
+        valid_counts = {pool_key: 0 for pool_key in pool_keys}
+        rows = session.execute(
+            sqlalchemy.select(
+                paid_capacity_claims_table.c.pool_key,
+                paid_capacity_claims_table.c.service_hash,
+                services_table.c.hash,
+                replicas_table.c.status,
+                replicas_table.c.paid_capacity_pool_key,
+            ).select_from(
+                paid_capacity_claims_table.outerjoin(
+                    services_table, services_table.c.name ==
+                    paid_capacity_claims_table.c.service_name).outerjoin(
+                        replicas_table,
+                        sqlalchemy.and_(
+                            replicas_table.c.service_name ==
+                            paid_capacity_claims_table.c.service_name,
+                            replicas_table.c.replica_id ==
+                            paid_capacity_claims_table.c.replica_id))).where(
+                                paid_capacity_claims_table.c.pool_key.in_(
+                                    pool_keys))).fetchall()
+        for pool_key, claim_hash, current_hash, status, row_pool in rows:
+            if (claim_hash == current_hash and
+                    status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
+                    row_pool == pool_key):
+                valid_counts[pool_key] += 1
+    result = {}
+    for pool_key in pool_keys:
+        row = pool_rows.get(pool_key)
+        current_limit = base_limit if row is None else row.current_limit
+        last_success_at = None if row is None else row.last_success_at
+        effective_limit, expired = paid_capacity.effective_limit(
+            current_limit,
+            last_success_at,
+            bootstrap_limit=base_limit,
+            ceiling_limit=max_limit,
+            now=now,
+            ttl_seconds=success_ttl_seconds)
+        active_claims = valid_counts[pool_key]
+        result[pool_key] = {
+            'current_limit': effective_limit,
+            'active_claims': active_claims,
+            'remaining': max(0, effective_limit - active_claims),
+            'successes_since_resize': (
+                0 if row is None or expired else int(row.successes_since_resize)
+            ),
+            'last_success_at': last_success_at,
+            'last_failure_at': None if row is None else row.last_failure_at,
+        }
+    return result
+
+
+def try_add_replica_with_paid_capacity_claim(
+    service_name: str,
+    service_hash: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    pool_key: str,
+    priority: int,
+    base_limit: int,
+    max_limit: int,
+    now: float,
+    success_ttl_seconds: float,
+    waiter_ttl_seconds: float,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> str:
+    """Atomically persist one replica and its global paid-capacity claim."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if not _lock_service_owner_in_session(session,
+                                              service_name,
+                                              service_hash,
+                                              expected_controller_owner,
+                                              require_launch_allowed=True):
+            session.rollback()
+            return 'ownership_lost'
+        _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
+                                              base_limit, now)
+        pool = _paid_capacity_pool_row_for_update(session, pool_key)
+        effective_limit, expired = paid_capacity.effective_limit(
+            pool.current_limit,
+            pool.last_success_at,
+            bootstrap_limit=base_limit,
+            ceiling_limit=max_limit,
+            now=now,
+            ttl_seconds=success_ttl_seconds)
+        if expired or effective_limit != pool.current_limit:
+            session.execute(
+                sqlalchemy.update(paid_capacity_pools_table).where(
+                    paid_capacity_pools_table.c.pool_key == pool_key).values(
+                        current_limit=effective_limit,
+                        successes_since_resize=(0 if expired else
+                                                pool.successes_since_resize),
+                        last_success_at=(None
+                                         if expired else pool.last_success_at),
+                        updated_at=now))
+
+        valid_claims, stale_claims = _valid_paid_capacity_claims_in_session(
+            session, pool_key)
+        _delete_paid_capacity_claims_in_session(session, stale_claims)
+
+        identity = (service_name, service_hash, replica_id)
+        is_existing_claim = identity in valid_claims
+        if not is_existing_claim:
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == pool_key,
+                    paid_capacity_waiters_table.c.heartbeat_at
+                    < now - waiter_ttl_seconds))
+            current_service_incarnation = sqlalchemy.exists().where(
+                services_table.c.name ==
+                paid_capacity_waiters_table.c.service_name,
+                services_table.c.hash ==
+                paid_capacity_waiters_table.c.service_hash)
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == pool_key,
+                    sqlalchemy.not_(current_service_incarnation)))
+            waiter_insert = _upsert_insert_func(engine)(
+                paid_capacity_waiters_table).values(pool_key=pool_key,
+                                                    service_name=service_name,
+                                                    service_hash=service_hash,
+                                                    priority=priority,
+                                                    first_wait_at=now,
+                                                    heartbeat_at=now)
+            session.execute(
+                waiter_insert.on_conflict_do_update(
+                    index_elements=['pool_key', 'service_name', 'service_hash'],
+                    set_={
+                        'priority': priority,
+                        'heartbeat_at': now,
+                    }))
+            best_waiter = session.execute(
+                sqlalchemy.select(
+                    paid_capacity_waiters_table.c.service_name,
+                    paid_capacity_waiters_table.c.service_hash).where(
+                        paid_capacity_waiters_table.c.pool_key ==
+                        pool_key).order_by(
+                            paid_capacity_waiters_table.c.priority.desc(),
+                            paid_capacity_waiters_table.c.first_wait_at,
+                            paid_capacity_waiters_table.c.service_name).limit(
+                                1)).fetchone()
+            if best_waiter is None:
+                raise RuntimeError(
+                    'Paid-capacity waiter disappeared during admission.')
+            if len(valid_claims) >= effective_limit:
+                session.commit()
+                return 'saturated'
+            if (best_waiter.service_name,
+                    best_waiter.service_hash) != (service_name, service_hash):
+                session.commit()
+                return 'higher_priority_waiting'
+
+        replica_info.paid_capacity_pool_key = pool_key
+        replica_insert = _upsert_insert_func(engine)(replicas_table).values(
+            **_replica_row_values(service_name, replica_id, replica_info))
+        session.execute(
+            replica_insert.on_conflict_do_update(
+                index_elements=['service_name', 'replica_id'],
+                set_={
+                    column.name: getattr(replica_insert.excluded, column.name)
+                    for column in replicas_table.c
+                    if column.name not in ('service_name', 'replica_id')
+                }))
+        claim_insert = _upsert_insert_func(engine)(
+            paid_capacity_claims_table).values(service_name=service_name,
+                                               service_hash=service_hash,
+                                               replica_id=replica_id,
+                                               pool_key=pool_key,
+                                               priority=priority,
+                                               claimed_at=now)
+        session.execute(
+            claim_insert.on_conflict_do_update(
+                index_elements=['service_name', 'service_hash', 'replica_id'],
+                set_={
+                    'pool_key': pool_key,
+                    'priority': priority,
+                }))
+        if not is_existing_claim:
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == pool_key,
+                    paid_capacity_waiters_table.c.service_name == service_name,
+                    paid_capacity_waiters_table.c.service_hash == service_hash))
+        session.commit()
+    return 'acquired'
+
+
+def adopt_paid_capacity_claims(
+    service_name: str,
+    service_hash: str,
+    claims: list[tuple[int, str, int, 'replica_managers.ReplicaInfo']],
+    *,
+    base_limit: int,
+    now: float,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> bool:
+    """Attach pre-migration unresolved rows to shared pool claims."""
+    if not claims:
+        return True
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if not _lock_service_owner_in_session(session,
+                                              service_name,
+                                              service_hash,
+                                              expected_controller_owner,
+                                              require_launch_allowed=False):
+            session.rollback()
+            return False
+        for pool_key in sorted({pool_key for _, pool_key, _, _ in claims}):
+            _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
+                                                  base_limit, now)
+            _paid_capacity_pool_row_for_update(session, pool_key)
+        for replica_id, pool_key, priority, replica_info in claims:
+            row = session.execute(
+                sqlalchemy.select(replicas_table.c.status).where(
+                    replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id == replica_id)).fetchone()
+            if (row is None or
+                    row.status not in _PAID_CAPACITY_UNRESOLVED_STATUSES):
+                continue
+            replica_info.paid_capacity_pool_key = pool_key
+            row_values = _replica_row_values(service_name, replica_id,
+                                             replica_info)
+            session.execute(
+                sqlalchemy.update(replicas_table).where(
+                    replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id == replica_id).values(
+                        paid_capacity_pool_key=pool_key,
+                        replica_info=row_values['replica_info'],
+                        replica_state=row_values['replica_state']))
+            claim_insert = _upsert_insert_func(engine)(
+                paid_capacity_claims_table).values(service_name=service_name,
+                                                   service_hash=service_hash,
+                                                   replica_id=replica_id,
+                                                   pool_key=pool_key,
+                                                   priority=priority,
+                                                   claimed_at=now)
+            session.execute(
+                claim_insert.on_conflict_do_update(index_elements=[
+                    'service_name', 'service_hash', 'replica_id'
+                ],
+                                                   set_={
+                                                       'pool_key': pool_key,
+                                                       'priority': priority,
+                                                   }))
+        session.commit()
+    return True
+
+
+def add_or_update_replicas_with_paid_capacity_outcomes(
+    service_name: str,
+    service_hash: str,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+    outcomes: dict[int, paid_capacity.LaunchOutcome],
+    *,
+    base_limit: int,
+    max_limit: int,
+    now: float,
+    success_ttl_seconds: float,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> bool:
+    """Persist a completed launch wave and release claims atomically."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if not _lock_service_owner_in_session(session,
+                                              service_name,
+                                              service_hash,
+                                              expected_controller_owner,
+                                              require_launch_allowed=False):
+            session.rollback()
+            return False
+        _upsert_replica_rows_in_session(session, engine, service_name,
+                                        replica_infos)
+        if not outcomes:
+            session.commit()
+            return True
+        claim_rows = session.execute(
+            sqlalchemy.select(
+                paid_capacity_claims_table.c.replica_id,
+                paid_capacity_claims_table.c.pool_key,
+                paid_capacity_claims_table.c.claimed_at).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash == service_hash,
+                    paid_capacity_claims_table.c.replica_id.in_(
+                        list(outcomes)))).fetchall()
+        outcomes_by_pool: dict[
+            str, list[tuple[paid_capacity.LaunchOutcome,
+                            float]]] = collections.defaultdict(list)
+        identities = []
+        for replica_id, pool_key, claimed_at in claim_rows:
+            outcomes_by_pool[pool_key].append(
+                (outcomes[replica_id], claimed_at))
+            identities.append((service_name, service_hash, replica_id))
+        for pool_key in sorted(outcomes_by_pool):
+            _paid_capacity_pool_row_for_update(session, pool_key)
+        _delete_paid_capacity_claims_in_session(session, identities)
+        for pool_key, pool_outcomes in outcomes_by_pool.items():
+            pool = session.execute(
+                sqlalchemy.select(paid_capacity_pools_table).where(
+                    paid_capacity_pools_table.c.pool_key ==
+                    pool_key)).fetchone()
+            if pool is None:
+                raise RuntimeError('Paid-capacity pool disappeared.')
+            capacity_failed = any(
+                outcome == paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                for outcome, _ in pool_outcomes)
+            if capacity_failed:
+                session.execute(
+                    sqlalchemy.update(paid_capacity_pools_table).where(
+                        paid_capacity_pools_table.c.pool_key ==
+                        pool_key).values(current_limit=base_limit,
+                                         successes_since_resize=0,
+                                         last_success_at=None,
+                                         last_failure_at=now,
+                                         updated_at=now))
+                continue
+            evidence = [
+                outcome for outcome, claimed_at in pool_outcomes
+                if (outcome == paid_capacity.LaunchOutcome.SUCCESS and
+                    (pool.last_failure_at is None or
+                     claimed_at >= pool.last_failure_at))
+            ]
+            if not evidence:
+                continue
+            ramp_update = paid_capacity.record_outcomes(
+                pool.current_limit,
+                pool.successes_since_resize,
+                pool.last_success_at,
+                evidence,
+                bootstrap_limit=base_limit,
+                ceiling_limit=max_limit,
+                now=now,
+                ttl_seconds=success_ttl_seconds)
+            session.execute(
+                sqlalchemy.update(paid_capacity_pools_table).where(
+                    paid_capacity_pools_table.c.pool_key == pool_key).values(
+                        current_limit=ramp_update.current_limit,
+                        successes_since_resize=(
+                            ramp_update.successes_since_resize),
+                        last_success_at=now,
+                        updated_at=now))
+        session.commit()
+    return True
 
 
 def add_or_update_replica(
@@ -2872,37 +3431,11 @@ def add_or_update_replicas(
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
         # Older SQLite builds cap SQLITE_MAX_VARIABLE_NUMBER at 999, while
-        # PostgreSQL can preserve the prior 300-row batches. Keep the SQLite
-        # chunk below 999 / 11 bind params without slowing the production
-        # PostgreSQL probe loop.
-        chunk_size = (_REPLICA_UPSERT_CHUNK_SIZE if engine.dialect.name
-                      == db_utils.SQLAlchemyDialect.SQLITE.value else
-                      _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
-        for start in range(0, len(replica_infos), chunk_size):
-            chunk = replica_infos[start:start + chunk_size]
-            insert_stmt = insert_func(replicas_table).values([
-                _replica_row_values(service_name, replica_id, replica_info)
-                for replica_id, replica_info in chunk
-            ])
-
-            insert_stmt = insert_stmt.on_conflict_do_update(
-                index_elements=['service_name', 'replica_id'],
-                set_={
-                    column.name: getattr(insert_stmt.excluded, column.name)
-                    for column in replicas_table.c
-                    if column.name not in ('service_name', 'replica_id')
-                })
-
-            session.execute(insert_stmt)
+        # PostgreSQL can preserve the prior 300-row batches. The helper derives
+        # SQLite's safe chunk from the live table width.
+        _upsert_replica_rows_in_session(session, engine, service_name,
+                                        replica_infos)
         session.commit()
     return True
 
@@ -2944,6 +3477,10 @@ def remove_replica(
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
+        session.execute(
+            sqlalchemy.delete(paid_capacity_claims_table).where(
+                paid_capacity_claims_table.c.service_name == service_name,
+                paid_capacity_claims_table.c.replica_id == replica_id))
         result = session.execute(
             sqlalchemy.delete(replicas_table).where(*predicates))
         session.commit()
@@ -2998,6 +3535,10 @@ def remove_replicas(
             return False
         for start in range(0, len(replica_ids), _REPLICA_DELETE_CHUNK_SIZE):
             chunk = replica_ids[start:start + _REPLICA_DELETE_CHUNK_SIZE]
+            session.execute(
+                sqlalchemy.delete(paid_capacity_claims_table).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.replica_id.in_(chunk)))
             session.execute(
                 sqlalchemy.delete(replicas_table).where(
                     replicas_table.c.service_name == service_name,
