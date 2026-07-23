@@ -1599,7 +1599,8 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'reserved_capacity_fill requires one Kubernetes context '
                     'and one GPU count per backend; the resources span '
                     f'{shapes}.')
-        if task.service.uses_logical_replicas and gpu_counts != {1}:
+        if (task.service.uses_logical_replicas and gpu_counts and
+                gpu_counts != {1}):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     'dynamic_fallback_per_gpu with reserved_capacity_fill '

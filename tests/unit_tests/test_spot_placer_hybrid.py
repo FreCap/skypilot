@@ -682,6 +682,12 @@ run: echo hi
                           logical=True)
         serve_utils.validate_service_task(task, pool=False)
 
+    def test_logical_aws_only_accepts_broker_supplied_reserved_fill(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        serve_utils.validate_service_task(self._task([], logical=True),
+                                          pool=False)
+
     @pytest.mark.parametrize(
         'gpu_count',
         [0.5, 1.5, 2, float('nan'), float('inf')])
@@ -704,9 +710,33 @@ run: echo hi
 
 
 class TestContainerImageNormalizationEndToEnd:
-    """Enumerated locations must carry the first-class container image."""
+    """Enumerated locations preserve native and legacy image provenance."""
 
-    def test_enumeration_normalizes_legacy_image_id(self):
+    def test_enumeration_keeps_native_container_image(self):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        image_ref = 'registry.example/model@sha256:' + 'a' * 64
+        task = sky.Task.from_yaml_str(f"""
+resources:
+  infra: aws/us-east-1
+  accelerators: L4:1
+  use_spot: true
+  container_image:
+    ref: {image_ref}
+    distribution: direct
+run: echo hi
+""")
+
+        locations = spot_placer._get_possible_location_from_task(task)
+
+        assert locations
+        for location in locations:
+            assert location.image_id is None
+            assert location.container_image is not None
+            assert location.container_image.ref == image_ref
+            assert location.container_image.distribution == 'direct'
+
+    def test_enumeration_preserves_legacy_image_id_copy_path(self):
         # pylint: disable=import-outside-toplevel
         import sky
         t = sky.Task.from_yaml_str("""
@@ -722,10 +752,13 @@ run: echo hi
 """)
         locs = spot_placer._get_possible_location_from_task(t)
         assert locs, 'expected at least one location'
+        resource = next(iter(t.resources))
         for loc in locs:
-            assert loc.image_id is None, loc
-            assert loc.container_image is not None, loc
-            assert loc.container_image.ref == 'myrepo/model:v1', loc
+            assert loc.image_id == {'docker': 'myrepo/model:v1'}, loc
+            assert loc.container_image is None, loc
+            copied = resource.copy(**loc.to_dict())
+            assert copied.container_image_from_legacy_image_id
+            assert copied.extract_docker_image() == 'myrepo/model:v1'
 
 
 class TestDiskTierPerLocation:
