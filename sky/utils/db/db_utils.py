@@ -4,10 +4,12 @@ from collections.abc import Callable
 from collections.abc import Iterable
 import contextlib
 import enum
+import functools
 import os
 import pathlib
 import sqlite3
 import threading
+import time
 import typing
 from typing import Any, Literal
 
@@ -40,6 +42,70 @@ if typing.TYPE_CHECKING:
 # 1000x parallelism, this is thus thought to be a conservative setting.
 # For more info, see the PR description for #4552.
 _DB_TIMEOUT_S = 60
+
+# SQLite's busy handler (and therefore _DB_TIMEOUT_S) is NOT invoked for every
+# contended write. In WAL mode a deferred transaction that took its read
+# snapshot before another connection committed fails immediately with
+# SQLITE_BUSY_SNAPSHOT rather than waiting, so the write must be retried from
+# the beginning to observe the newer snapshot. These retries are therefore
+# short: they exist for the fail-immediately case, while genuine lock waits are
+# still absorbed by the connection timeout.
+_SQLITE_BUSY_MAX_ATTEMPTS = 5
+_SQLITE_BUSY_INITIAL_BACKOFF_S = 0.02
+_SQLITE_BUSY_BACKOFF_MULTIPLIER = 3
+
+
+def is_sqlite_busy_error(e: BaseException) -> bool:
+    """Whether an exception is SQLite refusing a write due to contention."""
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    message = str(e).lower()
+    return 'database is locked' in message or 'database is busy' in message
+
+
+def retry_on_sqlite_busy(func):
+    """Retry a SQLite write that failed immediately due to contention.
+
+    Only for operations that are safe to repeat: a busy error means the
+    transaction was not applied, so the callable must not have committed
+    partial state before raising.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        backoff = _SQLITE_BUSY_INITIAL_BACKOFF_S
+        for attempt in range(_SQLITE_BUSY_MAX_ATTEMPTS):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if (not is_sqlite_busy_error(e) or
+                        attempt == _SQLITE_BUSY_MAX_ATTEMPTS - 1):
+                    raise
+                time.sleep(backoff)
+                backoff *= _SQLITE_BUSY_BACKOFF_MULTIPLIER
+        raise AssertionError('unreachable')
+
+    return wrapper
+
+
+def retry_on_sqlite_busy_async(func):
+    """Async counterpart of retry_on_sqlite_busy."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        backoff = _SQLITE_BUSY_INITIAL_BACKOFF_S
+        for attempt in range(_SQLITE_BUSY_MAX_ATTEMPTS):
+            try:
+                return await func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if (not is_sqlite_busy_error(e) or
+                        attempt == _SQLITE_BUSY_MAX_ATTEMPTS - 1):
+                    raise
+                await asyncio.sleep(backoff)
+                backoff *= _SQLITE_BUSY_BACKOFF_MULTIPLIER
+        raise AssertionError('unreachable')
+
+    return wrapper
 
 
 class UniqueConstraintViolationError(Exception):
