@@ -134,6 +134,32 @@ export function useServiceDetails({ serviceName }) {
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
   const historyRefreshInFlightRef = useRef(null);
+  const summaryArgs = useMemo(
+    () => [
+      {
+        serviceNames: [serviceName],
+        summaryOnly: true,
+        includeTargetReplicas: true,
+        historyHours: SERVICE_HISTORY_HOURS,
+      },
+    ],
+    [serviceName]
+  );
+  const fullArgs = useMemo(
+    () => [{ serviceNames: [serviceName] }],
+    [serviceName]
+  );
+  const historyArgs = useMemo(
+    () => [
+      {
+        serviceNames: [serviceName],
+        summaryOnly: true,
+        includeTargetReplicas: false,
+        historyHours: SERVICE_HISTORY_HOURS,
+      },
+    ],
+    [serviceName]
+  );
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
@@ -156,14 +182,7 @@ export function useServiceDetails({ serviceName }) {
     let fullLanded = false;
     let summaryPromise;
     summaryPromise = dashboardCache
-      .get(getServices, [
-        {
-          serviceNames: [serviceName],
-          summaryOnly: true,
-          includeTargetReplicas: true,
-          historyHours: SERVICE_HISTORY_HOURS,
-        },
-      ])
+      .get(getServices, summaryArgs)
       .then(({ services }) => {
         if (!isCurrentRequest()) return;
         const found = (services || []).find((s) => s.name === serviceName);
@@ -188,7 +207,7 @@ export function useServiceDetails({ serviceName }) {
       promise: summaryPromise,
     };
     const fullPromise = dashboardCache
-      .get(getServices, [{ serviceNames: [serviceName] }])
+      .get(getServices, fullArgs)
       .then(({ services }) => {
         if (!isCurrentRequest()) return;
         const found = (services || []).find((s) => s.name === serviceName);
@@ -204,7 +223,7 @@ export function useServiceDetails({ serviceName }) {
         }
       });
     await Promise.allSettled([summaryPromise, fullPromise]);
-  }, [serviceName]);
+  }, [fullArgs, serviceName, summaryArgs]);
 
   useEffect(() => {
     fetchData();
@@ -222,14 +241,6 @@ export function useServiceDetails({ serviceName }) {
   useEffect(() => {
     if (!serviceName) return undefined;
     let active = true;
-    const historyArgs = [
-      {
-        serviceNames: [serviceName],
-        summaryOnly: true,
-        includeTargetReplicas: false,
-        historyHours: SERVICE_HISTORY_HOURS,
-      },
-    ];
     const refreshHistory = async () => {
       const inFlight = historyRefreshInFlightRef.current;
       if (inFlight?.serviceName === serviceName) {
@@ -274,7 +285,7 @@ export function useServiceDetails({ serviceName }) {
       active = false;
       clearInterval(interval);
     };
-  }, [serviceName]);
+  }, [historyArgs, serviceName]);
 
   const refreshData = useCallback(() => {
     const inFlight = refreshInFlightRef.current;
@@ -283,8 +294,9 @@ export function useServiceDetails({ serviceName }) {
     }
 
     const refreshPromise = (async () => {
-      // Drop every args-keyed getServices variant (summary and full).
-      dashboardCache.invalidateFunction(getServices);
+      dashboardCache.invalidate(getServices, summaryArgs);
+      dashboardCache.invalidate(getServices, fullArgs);
+      dashboardCache.invalidate(getServices, historyArgs);
       await fetchData();
     })().finally(() => {
       if (refreshInFlightRef.current?.promise === refreshPromise) {
@@ -293,7 +305,7 @@ export function useServiceDetails({ serviceName }) {
     });
     refreshInFlightRef.current = { serviceName, promise: refreshPromise };
     return refreshPromise;
-  }, [fetchData, serviceName]);
+  }, [fetchData, fullArgs, historyArgs, serviceName, summaryArgs]);
 
   return {
     serviceData,
