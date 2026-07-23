@@ -732,7 +732,10 @@ separate statement instead requires the exact declared subnet. That statement
 cannot authorize an independent network-interface create: the role has no
 `CreateNetworkInterface` action, and the complete `RunInstances` call must still
 pass every exact image, network, instance, profile, and tagged-resource
-statement. A separate `ec2:CreateTags` statement is limited by
+statement. Exact AMI policy resources use EC2's accountless authorization ARN,
+`arn:<partition>:ec2:<region>::image/<ami-id>`; the separately qualified AMI ID,
+observed owner account, and compute-account binding retain ownership identity.
+A separate `ec2:CreateTags` statement is limited by
 `ec2:CreateAction=RunInstances`; it is not combined with launch conditions. The
 role never relies on an implicit VPC default security group.
 

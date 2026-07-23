@@ -53,7 +53,7 @@ variables {
   catalog_authority       = "00000000-0000-4000-8000-000000000001"
   runtime_role_arns       = ["arn:aws:iam::123456789012:role/runtime"]
   instance_profile_arns   = ["arn:aws:iam::123456789012:instance-profile/runtime"]
-  ami_arns                = ["arn:aws:ec2:us-east-1:123456789012:image/ami-0123456789abcdef0"]
+  ami_arns                = ["arn:aws:ec2:us-east-1::image/ami-0123456789abcdef0"]
   subnet_arns             = ["arn:aws:ec2:us-east-1:123456789012:subnet/subnet-0123456789abcdef0"]
   security_group_arns     = ["arn:aws:ec2:us-east-1:123456789012:security-group/sg-0123456789abcdef0"]
   canary_instance_types   = ["t3.micro"]
@@ -197,4 +197,14 @@ run "ec2_launch_authority_matches_each_resource_context" {
     ])
     error_message = "Tag-on-create authority must cover exactly the three resources emitted by the canary worker."
   }
+}
+
+run "rejects_account_qualified_image_arns" {
+  command = plan
+
+  variables {
+    ami_arns = ["arn:aws:ec2:us-east-1:123456789012:image/ami-0123456789abcdef0"]
+  }
+
+  expect_failures = [var.ami_arns]
 }

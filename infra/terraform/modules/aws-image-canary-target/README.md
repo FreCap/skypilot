@@ -10,6 +10,8 @@ Configure `ami_arns`, `subnet_arns`, and at least one exact
 `canary_instance_type` for EC2 qualification. The launch policy constrains all
 three plus the runtime instance profile, requires catalog and operation tags on
 the created instance and EBS volumes, and permits `iam:PassRole` only to EC2.
+AMI policy resources must use EC2's accountless authorization form,
+`arn:<partition>:ec2:<region>::image/<ami-id>`, including for private AMIs.
 AWS does not expose those request tags or the instance type while authorizing
 the implicit primary network interface. Its separate `RunInstances` statement
 is therefore limited to the exact configured subnets. It cannot create a
