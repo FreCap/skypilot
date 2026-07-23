@@ -6,8 +6,8 @@ and the alembic migration chain must be exercised on a real PG engine, not
 only sqlite. This module:
 
 - boots a throwaway postgres:16 container once per session via
-  testcontainers (skipping the whole module cleanly when docker is
-  unavailable or the container cannot start);
+  testcontainers (skipping locally when Docker is unavailable, but failing
+  the required unit-test CI lane);
 - re-runs the FULL sqlite round-mechanics/claims/prune/lease/epoch suite
   from test_reserved_fill_broker.py against the PG engine by overriding its
   `broker_engine` fixture (the test bodies are inherited, not copied);
@@ -19,12 +19,15 @@ only sqlite. This module:
 # pylint: disable=cell-var-from-loop,missing-class-docstring
 # pylint: disable=protected-access,redefined-outer-name,unused-import
 import datetime
+import importlib
+import os
 import shutil
 import threading
 import time
 from unittest import mock
 import uuid
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
@@ -39,22 +42,41 @@ import test_reserved_fill_broker as sqlite_suite
 
 from sky.serve import constants
 from sky.serve import lb_ha
+from sky.serve import paid_capacity
 from sky.serve import placement_history
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
 from sky.serve import serve_state
+from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import migration_utils
 
-psycopg2 = pytest.importorskip('psycopg2')
-testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
+_POSTGRES_REQUIRED = os.environ.get('SKYPILOT_REQUIRE_SERVE_POSTGRES') == '1'
+
+
+def _required_import(module: str):
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        if _POSTGRES_REQUIRED:
+            pytest.fail(f'{module} is required for Serve PostgreSQL tests.',
+                        pytrace=False)
+        pytest.skip(f'{module} unavailable; skipping real-PostgreSQL tests.',
+                    allow_module_level=True)
+
+
+psycopg2 = _required_import('psycopg2')
+testcontainers_postgres = _required_import('testcontainers.postgres')
 
 _PG_IMAGE = 'postgres:16'
+_DOCKER_UNAVAILABLE = shutil.which('docker') is None
 
 pytestmark = pytest.mark.skipif(
-    shutil.which('docker') is None,
+    _DOCKER_UNAVAILABLE and not _POSTGRES_REQUIRED,
     reason='docker unavailable; skipping real-Postgres broker tests')
+if _DOCKER_UNAVAILABLE and _POSTGRES_REQUIRED:
+    pytest.fail('Docker is required for Serve PostgreSQL tests.', pytrace=False)
 
 
 @pytest.fixture(scope='session')
@@ -62,14 +84,16 @@ def pg_server():
     """One throwaway postgres:16 container for the whole session.
 
     Yields the started PostgresContainer (testcontainers handles port
-    mapping and readiness). Skips (never fails) when the container cannot
-    start or never becomes ready: CI without a working docker daemon must
-    not go red on this module.
+    mapping and readiness). Local runs skip when the container cannot start;
+    the required unit-test CI lane fails instead.
     """
     container = testcontainers_postgres.PostgresContainer(_PG_IMAGE)
     try:
         container.start()
     except Exception as e:  # pylint: disable=broad-except
+        if _POSTGRES_REQUIRED:
+            pytest.fail(f'could not start required postgres container: {e}',
+                        pytrace=False)
         pytest.skip(f'could not start postgres container: {e}')
     try:
         yield container
@@ -202,6 +226,615 @@ class TestGroupedReplicaSnapshotPG:
 
         assert set(grouped) == {'svc-0', 'svc-1', 'svc-2'}
         assert all(len(infos) == 2 for infos in grouped.values())
+
+
+class TestPaidCapacityAuthorityPG:
+    """Global paid launch claims use real PostgreSQL locking semantics."""
+
+    @staticmethod
+    def _add_service(name: str, service_hash: str, pid: int) -> None:
+        assert serve_state.add_service(name=name,
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[AWS(L4):1]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=pid,
+                                       entrypoint='entry',
+                                       spec=None,
+                                       yaml_content='service: {}',
+                                       controller_ip='10.0.0.1',
+                                       service_hash=service_hash,
+                                       resource_scope=f'scope-{name}')
+
+    @staticmethod
+    def _info(service_name: str,
+              replica_id: int) -> replica_managers.ReplicaInfo:
+        return replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'{service_name}-{replica_id}',
+            replica_port='8080',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'use_spot': True})
+
+    def test_priority_waiter_and_success_failure_ramp(self, broker_engine,
+                                                      monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('low', 'hash-low', 11)
+        self._add_service('high', 'hash-high', 22)
+        pool_key = 'aws/us-east-1a/g6.xlarge/spot'
+
+        def _claim(service_name, service_hash, pid, replica_id, priority, now):
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                service_name,
+                service_hash,
+                replica_id,
+                self._info(service_name, replica_id),
+                pool_key=pool_key,
+                priority=priority,
+                base_limit=2,
+                max_limit=8,
+                now=now,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        assert _claim('low', 'hash-low', 11, 1, 20, 100) == 'acquired'
+        assert _claim('low', 'hash-low', 11, 2, 20, 100) == 'acquired'
+        assert _claim('high', 'hash-high', 22, 1, 50, 101) == 'saturated'
+
+        low_one = serve_state.get_replica_info_from_id('low', 1)
+        assert low_one is not None
+        low_one.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'low',
+            'hash-low', [(1, low_one)],
+            {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=102,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        assert (_claim('low', 'hash-low', 11, 3, 20,
+                       103) == 'higher_priority_waiting')
+        assert _claim('high', 'hash-high', 22, 1, 50, 103) == 'acquired'
+
+        low_two = serve_state.get_replica_info_from_id('low', 2)
+        high_one = serve_state.get_replica_info_from_id('high', 1)
+        assert low_two is not None and high_one is not None
+        low_two.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        high_one.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'low',
+            'hash-low', [(2, low_two)],
+            {2: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=104,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'high',
+            'hash-high', [(1, high_one)],
+            {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=104,
+            success_ttl_seconds=60,
+            expected_controller_owner=(22, '10.0.0.1'))
+        states = serve_state.get_paid_capacity_pool_states(
+            [pool_key],
+            base_limit=2,
+            max_limit=8,
+            now=104,
+            success_ttl_seconds=60)
+        assert states[pool_key]['current_limit'] == 4
+
+        assert _claim('high', 'hash-high', 22, 2, 50, 105) == 'acquired'
+        failed = serve_state.get_replica_info_from_id('high', 2)
+        assert failed is not None
+        failed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'high',
+            'hash-high', [(2, failed)],
+            {2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=106,
+            success_ttl_seconds=60,
+            expected_controller_owner=(22, '10.0.0.1'))
+        states = serve_state.get_paid_capacity_pool_states(
+            [pool_key],
+            base_limit=2,
+            max_limit=8,
+            now=106,
+            success_ttl_seconds=60)
+        assert states[pool_key]['current_limit'] == 2
+
+    def test_saturation_wins_before_priority_deferral(self, broker_engine,
+                                                      monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('low', 'hash-low', 11)
+        self._add_service('high', 'hash-high', 22)
+
+        def _claim(service_name, service_hash, pid, replica_id, priority):
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                service_name,
+                service_hash,
+                replica_id,
+                self._info(service_name, replica_id),
+                pool_key='pool',
+                priority=priority,
+                base_limit=1,
+                max_limit=4,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        assert _claim('low', 'hash-low', 11, 1, 20) == 'acquired'
+        assert _claim('high', 'hash-high', 22, 1, 50) == 'saturated'
+        assert _claim('low', 'hash-low', 11, 2, 20) == 'saturated'
+
+    @pytest.mark.parametrize(
+        'stale_mode',
+        ['terminal_replica', 'missing_replica', 'replaced_service'])
+    def test_claim_admission_reconciles_stale_claims(self, broker_engine,
+                                                     monkeypatch, stale_mode):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('owner', 'hash-owner', 11)
+        self._add_service('peer', 'hash-peer', 22)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'owner',
+            'hash-owner',
+            1,
+            self._info('owner', 1),
+            pool_key='pool',
+            priority=20,
+            base_limit=1,
+            max_limit=4,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            if stale_mode == 'terminal_replica':
+                session.execute(
+                    sqlalchemy.update(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'owner',
+                        serve_state.replicas_table.c.replica_id == 1).values(
+                            status=serve_state.ReplicaStatus.READY.value))
+            elif stale_mode == 'missing_replica':
+                session.execute(
+                    sqlalchemy.delete(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'owner',
+                        serve_state.replicas_table.c.replica_id == 1))
+            else:
+                assert stale_mode == 'replaced_service'
+                session.execute(
+                    sqlalchemy.update(serve_state.services_table).where(
+                        serve_state.services_table.c.name == 'owner').values(
+                            hash='replacement-hash'))
+            session.commit()
+
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'peer',
+            'hash-peer',
+            1,
+            self._info('peer', 1),
+            pool_key='pool',
+            priority=20,
+            base_limit=1,
+            max_limit=4,
+            now=101,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(22, '10.0.0.1')) == 'acquired'
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.service_name,
+                    serve_state.paid_capacity_claims_table.c.service_hash,
+                    serve_state.paid_capacity_claims_table.c.replica_id,
+                )).all()
+        assert claims == [('peer', 'hash-peer', 1)]
+
+    def test_capacity_failure_wins_same_outcome_batch(self, broker_engine,
+                                                      monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        infos = []
+        for replica_id in (1, 2):
+            info = self._info('svc', replica_id)
+            assert serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                info,
+                pool_key='pool',
+                priority=20,
+                base_limit=2,
+                max_limit=8,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+            infos.append((replica_id, info))
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.paid_capacity_pools_table).where(
+                    serve_state.paid_capacity_pools_table.c.pool_key ==
+                    'pool').values(current_limit=4,
+                                   successes_since_resize=3,
+                                   last_success_at=100,
+                                   updated_at=100))
+            session.commit()
+        infos[0][1].status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        infos[1][1].status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash',
+            infos, {
+                1: paid_capacity.LaunchOutcome.SUCCESS,
+                2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+            },
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60)['pool']
+        assert state['current_limit'] == 2
+        assert state['successes_since_resize'] == 0
+        assert state['last_success_at'] is None
+        assert state['last_failure_at'] == 110
+
+    @pytest.mark.parametrize('status', [
+        serve_state.ServiceStatus.SHUTTING_DOWN,
+        serve_state.ServiceStatus.FAILED_CLEANUP
+    ])
+    def test_teardown_status_allows_outcome_persistence(self, broker_engine,
+                                                        monkeypatch, status):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        info = self._info('svc', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            info,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == 'svc').values(
+                        status=status.value))
+            session.commit()
+
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, info)], {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=101,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=101,
+            success_ttl_seconds=60)['pool']
+        assert state['active_claims'] == 0
+        assert state['successes_since_resize'] == 1
+
+    def test_late_success_selected_before_failure_does_not_rebuild_ramp(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        def _claim(replica_id: int, now: float) -> replica_managers.ReplicaInfo:
+            info = self._info('svc', replica_id)
+            assert serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                info,
+                pool_key='pool',
+                priority=20,
+                base_limit=2,
+                max_limit=8,
+                now=now,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+            return info
+
+        slow = _claim(1, 100)
+        failed = _claim(2, 110)
+        failed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(2, failed)],
+            {2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=120,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+        # Recovery may retry the same durable claim after the failure. That
+        # retry must not rewrite its original selection timestamp and turn an
+        # older launch into newer positive evidence.
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            slow,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=125,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        slow.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, slow)], {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=130,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=130,
+            success_ttl_seconds=60)['pool']
+        assert state['current_limit'] == 2
+        assert state['successes_since_resize'] == 0
+        assert state['last_success_at'] is None
+        assert state['last_failure_at'] == 120
+
+    def test_outcome_batch_upserts_more_than_postgresql_chunk(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        infos = [(replica_id, self._info('svc', replica_id))
+                 for replica_id in range(301)]
+
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash',
+            infos, {},
+            base_limit=60,
+            max_limit=480,
+            now=100,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+        assert len(serve_state.get_replica_infos('svc')) == 301
+
+    def test_concurrent_services_cannot_oversubscribe_one_pool(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc-a', 'hash-a', 11)
+        self._add_service('svc-b', 'hash-b', 22)
+        barrier = threading.Barrier(8)
+        results = []
+        result_lock = threading.Lock()
+
+        def _run(index: int) -> None:
+            service_name, service_hash, pid = (('svc-a', 'hash-a',
+                                                11) if index % 2 == 0 else
+                                               ('svc-b', 'hash-b', 22))
+            barrier.wait()
+            result = serve_state.try_add_replica_with_paid_capacity_claim(
+                service_name,
+                service_hash,
+                index + 1,
+                self._info(service_name, index + 1),
+                pool_key='shared-pool',
+                priority=20,
+                base_limit=3,
+                max_limit=12,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+            with result_lock:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=_run, args=(index,)) for index in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert results.count('acquired') == 3
+        assert set(results) <= {
+            'acquired', 'saturated', 'higher_priority_waiting'
+        }
+
+    def test_stale_snapshot_loses_at_atomic_claim(self, broker_engine,
+                                                  monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc-a', 'hash-a', 11)
+        self._add_service('svc-b', 'hash-b', 22)
+        pool_key = 'shared-pool'
+
+        snapshot = serve_state.get_paid_capacity_pool_states(
+            [pool_key],
+            base_limit=1,
+            max_limit=4,
+            now=100,
+            success_ttl_seconds=60)
+        assert snapshot[pool_key]['remaining'] == 1
+
+        def _claim(service_name: str, service_hash: str, pid: int) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                service_name,
+                service_hash,
+                1,
+                self._info(service_name, 1),
+                pool_key=pool_key,
+                priority=20,
+                base_limit=1,
+                max_limit=4,
+                now=101,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        assert _claim('svc-a', 'hash-a', 11) == 'acquired'
+        assert _claim('svc-b', 'hash-b', 22) == 'saturated'
+        assert serve_state.get_replica_info_from_id('svc-b', 1) is None
+
+    def test_existing_claim_retry_ignores_new_priority_waiter(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('low', 'hash-low', 11)
+        self._add_service('high', 'hash-high', 22)
+
+        def _claim(service_name: str, service_hash: str, pid: int,
+                   replica_id: int, priority: int) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                service_name,
+                service_hash,
+                replica_id,
+                self._info(service_name, replica_id),
+                pool_key='shared-pool',
+                priority=priority,
+                base_limit=1,
+                max_limit=4,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        assert _claim('low', 'hash-low', 11, 1, 20) == 'acquired'
+        assert _claim('low', 'hash-low', 11, 2, 20) == 'saturated'
+        assert _claim('high', 'hash-high', 22, 1, 50) == 'saturated'
+        assert _claim('low', 'hash-low', 11, 1, 20) == 'acquired'
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            waiters = session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_waiters_table.c.
+                                  service_name)).scalars().all()
+        assert set(waiters) == {'low', 'high'}
+
+    def test_unattributable_legacy_row_does_not_debit_unrelated_pool(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('legacy', 'hash-legacy', 11)
+        self._add_service('new', 'hash-new', 22)
+        legacy = self._info('legacy', 1)
+        assert serve_state.add_or_update_replica('legacy', 1, legacy)
+
+        acquired = serve_state.try_add_replica_with_paid_capacity_claim(
+            'new',
+            'hash-new',
+            1,
+            self._info('new', 1),
+            pool_key='shared-pool',
+            priority=20,
+            base_limit=1,
+            max_limit=4,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(22, '10.0.0.1'))
+        assert acquired == 'acquired'
+        assert serve_state.get_replica_info_from_id('new', 1) is not None
+
+    def test_restart_adopts_legacy_pending_row_and_owner_fences(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        info = self._info('svc', 1)
+        assert serve_state.add_or_update_replica('svc', 1, info)
+        assert serve_state.adopt_paid_capacity_claims(
+            'svc',
+            'hash', [(1, 'pool', 20, info)],
+            base_limit=60,
+            now=100,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    serve_state.replicas_table.c.paid_capacity_pool_key).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id == 1)).one()
+            claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table)).fetchall()
+        assert row[0] == 'pool'
+        assert len(claims) == 1
+        restored = serve_state.get_replica_info_from_id('svc', 1)
+        assert restored is not None
+        assert restored.paid_capacity_pool_key == 'pool'
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            2,
+            self._info('svc', 2),
+            pool_key='pool',
+            priority=50,
+            base_limit=60,
+            max_limit=480,
+            now=101,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(999, '10.0.0.1')) == 'ownership_lost'
+        assert serve_state.get_replica_info_from_id('svc', 2) is None
 
 
 class TestServiceLivenessSnapshotPG:
@@ -356,6 +989,9 @@ class TestMigrationChainPG:
                     'serve_prediction_time_history',
                     'serve_autoscaler_history',
                     'serve_placement_events',
+                    'paid_capacity_pools',
+                    'paid_capacity_claims',
+                    'paid_capacity_waiters',
                 }.issubset(tables), tables
                 autoscaler_columns = {
                     column['name'] for column in inspector.get_columns(
@@ -468,6 +1104,45 @@ class TestMigrationChainPG:
                             'SELECT version_num FROM '
                             'alembic_version_serve_state_db')).scalar_one()
                 assert revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_027_downgrades_cleanly_to_026(self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '026')
+
+            inspector = sqlalchemy.inspect(engine)
+            assert not {
+                'paid_capacity_pools',
+                'paid_capacity_claims',
+                'paid_capacity_waiters',
+            } & set(inspector.get_table_names())
+            assert 'paid_capacity_pool_key' not in {
+                column['name'] for column in inspector.get_columns('replicas')
+            }
+            with engine.connect() as connection:
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert revision == '026'
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            inspector = sqlalchemy.inspect(engine)
+            assert {
+                'paid_capacity_pools',
+                'paid_capacity_claims',
+                'paid_capacity_waiters',
+            } <= set(inspector.get_table_names())
         finally:
             engine.dispose()
 
@@ -834,8 +1509,14 @@ class TestMigrationChainPG:
                 'cluster_name',
                 'created_at',
                 'is_spot',
+                'paid_capacity_pool_key',
                 'replica_state',
             } <= replica_columns
+            assert {
+                'paid_capacity_pools',
+                'paid_capacity_claims',
+                'paid_capacity_waiters',
+            } <= set(inspector.get_table_names())
             with engine.connect() as connection:
                 workspace = connection.execute(
                     sqlalchemy.text(

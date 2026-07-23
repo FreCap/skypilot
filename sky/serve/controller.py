@@ -3371,11 +3371,53 @@ class SkyServeController:
                 # loop-scoped list is intentional (B023 false positive).
                 def _flush_scale_up(
                         expected_version: int = decision_version) -> None:
-                    if pending_scale_up:  # noqa: B023
+                    if not pending_scale_up:  # noqa: B023
+                        return
+                    aggregate_priority = (
+                        decision_autoscaler.current_launch_priority())
+                    if not isinstance(
+                            decision_autoscaler,
+                            autoscalers.InstanceAwareRequestRateAutoscaler):
                         self._replica_manager.scale_up_batch(
                             list(pending_scale_up),  # noqa: B023
-                            expected_version=expected_version)
+                            expected_version=expected_version,
+                            launch_priority=aggregate_priority)
                         pending_scale_up.clear()  # noqa: B023
+                        return
+
+                    # QPS exact-card decisions are ordinary physical
+                    # overrides, not one LogicalScaleTarget. Preserve decision
+                    # order while splitting consecutive card runs so an
+                    # A100-only high-priority request cannot promote L4 claims.
+                    card_batches: list[tuple[str | None,
+                                             list[dict[str, Any] | None]]] = []
+                    for resources_override in pending_scale_up:  # noqa: B023
+                        card = None
+                        accelerators = (resources_override or
+                                        {}).get('accelerators')
+                        if isinstance(accelerators,
+                                      dict) and len(accelerators) == 1:
+                            card = str(next(iter(accelerators)))
+                        if not card_batches or card_batches[-1][0] != card:
+                            card_batches.append((card, []))
+                        card_batches[-1][1].append(resources_override)
+                    targeted_cards = [
+                        card for card, _ in card_batches if card is not None
+                    ]
+                    priorities_by_card = (
+                        decision_autoscaler.
+                        current_launch_priorities_by_accelerator(targeted_cards)
+                    )
+                    for card, resources_overrides in card_batches:
+                        launch_priority = (
+                            aggregate_priority
+                            if card is None else priorities_by_card.get(
+                                card, serve_constants.LB_REQUEST_PRIORITY_MIN))
+                        self._replica_manager.scale_up_batch(
+                            resources_overrides,
+                            expected_version=expected_version,
+                            launch_priority=launch_priority)
+                    pending_scale_up.clear()  # noqa: B023
 
                 def _flush_logical_scale_down() -> None:
                     if not pending_logical_scale_down:  # noqa: B023
@@ -3418,6 +3460,13 @@ class SkyServeController:
                             if logical_target.launch_budget is not None:
                                 replacement_kwargs['launch_budget'] = (
                                     logical_target.launch_budget)
+                            replacement_kwargs['launch_priority'] = (
+                                logical_target.launch_priority)
+                            if (logical_target.launch_priority_by_accelerator):
+                                replacement_kwargs[
+                                    'launch_priority_by_accelerator'] = dict(
+                                        logical_target.
+                                        launch_priority_by_accelerator)
                             if logical_target.target_capacity_by_accelerator:
                                 replacement_kwargs[
                                     'target_capacity_by_accelerator'] = dict(

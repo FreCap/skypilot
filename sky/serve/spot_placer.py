@@ -126,8 +126,12 @@ class Location:
     # Per-entry Kubernetes ephemeral-storage request in GiB. Cloud VM
     # entries must keep this unset because they reject the field.
     ephemeral_storage: int | None = None
+    # Exact provider instance shape selected by catalog feasibility. Keeping
+    # it on the location lets cross-service paid-capacity admission distinguish
+    # provider pools that expose the same accelerator count.
+    instance_type: str | None = None
 
-    def _accel_key(self) -> str:
+    def _accel_key(self, *, include_instance_type: bool = True) -> str:
         parts = []
         if self.accelerators:
             parts.append(','.join(
@@ -147,6 +151,8 @@ class Location:
             parts.append(f'disk_tier={self.disk_tier}')
         if self.ephemeral_storage is not None:
             parts.append(f'ephemeral_storage={self.ephemeral_storage}')
+        if include_instance_type and self.instance_type is not None:
+            parts.append(f'instance_type={self.instance_type}')
         return '|'.join(parts)
 
     def sort_key(self) -> tuple[str, str, str, str, bool]:
@@ -184,7 +190,8 @@ class Location:
                    image_id=image_id,
                    container_image=container_image,
                    disk_tier=disk_tier,
-                   ephemeral_storage=resources.ephemeral_storage)
+                   ephemeral_storage=resources.ephemeral_storage,
+                   instance_type=resources.instance_type)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -207,6 +214,7 @@ class Location:
                                 if self.container_image is not None else None)
         d['disk_tier'] = self.disk_tier
         d['ephemeral_storage'] = self.ephemeral_storage
+        d['instance_type'] = self.instance_type
         return d
 
     @classmethod
@@ -234,6 +242,7 @@ class Location:
                              is not None else None),
             disk_tier=data.get('disk_tier'),
             ephemeral_storage=data.get('ephemeral_storage'),
+            instance_type=data.get('instance_type'),
         )
 
     def to_pickleable(self) -> dict[str, Any]:
@@ -248,6 +257,7 @@ class Location:
                                 if self.container_image is not None else None),
             'disk_tier': self.disk_tier,
             'ephemeral_storage': self.ephemeral_storage,
+            'instance_type': self.instance_type,
         }
 
     @classmethod
@@ -287,6 +297,7 @@ class Location:
                              is not None else None),
             disk_tier=override.get('disk_tier'),
             ephemeral_storage=override.get('ephemeral_storage'),
+            instance_type=override.get('instance_type'),
         )
 
 
@@ -402,7 +413,8 @@ def _get_possible_location_from_task(
         config = resources.copy(cloud=None, region=None,
                                 zone=None).to_yaml_config()
         for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
-                    'container_image', 'disk_tier', 'ephemeral_storage'):
+                    'container_image', 'disk_tier', 'ephemeral_storage',
+                    'instance_type'):
             config.pop(key, None)
         return config
 
@@ -418,7 +430,7 @@ def _get_possible_location_from_task(
                     'for spot placement. All resources must have the same '
                     'configuration except for cloud/region/zone/'
                     'accelerators/use_spot/image_id/container_image/disk_tier/'
-                    'ephemeral_storage.')
+                    'ephemeral_storage/instance_type.')
 
     # Group entries by (accelerators, use_spot) shape: locations are
     # enumerated per shape so each candidate location knows exactly what
@@ -505,6 +517,10 @@ def _get_possible_location_from_task(
                                          is not None else None)
                         loc.ephemeral_storage = (
                             candidate_shape.ephemeral_storage)
+                        # Feasibility resolves the provider shape. Preserve it
+                        # even though accelerator count is restored from the
+                        # catalog-expanded entry above.
+                        loc.instance_type = launchable.instance_type
                         possible_locations.add(loc)
 
     return list(possible_locations)
@@ -565,31 +581,63 @@ class SpotPlacer:
         """
         raise NotImplementedError
 
-    def resolve_location(self, location: Location) -> Location | None:
+    def resolve_location(
+            self,
+            location: Location,
+            *,
+            allow_ambiguous_legacy_shape: bool = False) -> Location | None:
         """Map a possibly-legacy location onto this placer's key set.
 
-        Replica rows pickled before locations carried
-        (accelerators, use_spot, image_id) deserialize shape-less and no
-        longer hash-match the shape-bearing keys. Fall back to matching
-        on (cloud, region, zone) when that is unambiguous; return None
-        (callers skip, never assert) when nothing matches.
+        A row written before ``instance_type`` was persisted may map to a
+        current shape only when all older shape fields match and exactly one
+        instance type is possible. Operational callers may opt into the
+        cheapest matching current shape to preserve temporary rollout behavior,
+        but claim attribution always uses the strict default. Rows predating
+        all shape fields retain the coordinates-only fallback under the same
+        rule.
         """
         if location in self.location2status:
             return location
+        if location.instance_type is None:
+            # pylint: disable=protected-access
+            shape_matches = [
+                key for key in self.location2status
+                if key.cloud.is_same_cloud(location.cloud) and
+                key.region == location.region and key.zone == location.zone and
+                key.use_spot == location.use_spot and key._accel_key(
+                    include_instance_type=False) == location._accel_key(
+                        include_instance_type=False)
+            ]
+            # pylint: enable=protected-access
+            if len(shape_matches) == 1:
+                return shape_matches[0]
+            if allow_ambiguous_legacy_shape and shape_matches:
+                return self._min_cost_location(shape_matches)
+        fully_shape_less = (location.accelerators is None and
+                            location.image_id is None and
+                            location.container_image is None and
+                            location.disk_tier is None and
+                            location.ephemeral_storage is None and
+                            location.instance_type is None)
+        if not fully_shape_less:
+            return None
         matches = [
             key for key in self.location2status
-            if str(key.cloud) == str(location.cloud) and
+            if key.cloud.is_same_cloud(location.cloud) and
             key.region == location.region and key.zone == location.zone
         ]
         if len(matches) == 1:
             return matches[0]
+        if allow_ambiguous_legacy_shape and matches:
+            return self._min_cost_location(matches)
         return None
 
     def set_active(self,
                    location: Location,
                    *,
                    selected_at: float | None = None) -> None:
-        resolved = self.resolve_location(location)
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
         if resolved is None:
             logger.warning(f'set_active: unknown location {location}; '
                            'ignoring (likely a pre-upgrade replica row).')
@@ -606,7 +654,8 @@ class SpotPlacer:
         self.location2preempted_at.pop(resolved, None)
 
     def set_preemptive(self, location: Location) -> None:
-        resolved = self.resolve_location(location)
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
         if resolved is None:
             logger.warning(f'set_preemptive: unknown location {location}; '
                            'ignoring (likely a pre-upgrade replica row).')
@@ -789,7 +838,8 @@ class SpotPlacer:
 
     def is_active_location(self, location: Location) -> bool:
         """Whether a known location is currently selectable."""
-        resolved = self.resolve_location(location)
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
         return (resolved is not None and
                 self._effective_status(resolved) == LocationStatus.ACTIVE)
 
@@ -803,7 +853,8 @@ class SpotPlacer:
         ACTIVE. A bench recorded after the row was selected is newer failure
         evidence and fences the queued launch.
         """
-        resolved = self.resolve_location(location)
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
         if resolved is None:
             return False
         if self._effective_status(resolved) == LocationStatus.ACTIVE:
@@ -816,7 +867,8 @@ class SpotPlacer:
 
     def cost_per_hour(self, location: Location) -> float:
         """Return the current cached catalog cost for a known location."""
-        resolved = self.resolve_location(location)
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
         if resolved is None:
             return float('inf')
         return self._get_cost_per_hour_cached(resolved)
