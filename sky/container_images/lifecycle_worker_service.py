@@ -568,35 +568,53 @@ class LifecycleWorkerService:
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
+                if self._stop.is_set():
+                    break
                 if schedule_now - last_maintenance >= 5 * 60:
+                    if self._stop.is_set():
+                        break
                     self._maintenance()
                     last_maintenance = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_consumer_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS):
                     _reconcile_terminal_consumers()
                     last_consumer_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_qualification_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         qualification_future is None and
                         len(futures) < self.max_in_flight):
+                    if self._stop.is_set():
+                        break
                     qualification_future = executor.submit(
                         reconcile_qualification_lifecycle, self._budget_limiter)
                     futures.add(qualification_future)
                     last_qualification_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_canonical_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         canonical_future is None and
                         len(futures) < self.max_in_flight):
+                    if self._stop.is_set():
+                        break
                     canonical_future = executor.submit(
                         reconcile_failed_canonical_reservations,
                         self._budget_limiter)
                     futures.add(canonical_future)
                     last_canonical_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if schedule_now - last_policy_refresh >= 60:
                     workspace_retentions = (
                         _refresh_workspace_eviction_retentions(
                             workspace_retentions))
                     last_policy_refresh = schedule_now
+                if self._stop.is_set():
+                    break
                 if workspace_retentions is None:
                     self._stop.wait(1 if futures else 5)
                     continue
@@ -609,6 +627,8 @@ class LifecycleWorkerService:
                         lease_seconds=self.lease_seconds,
                     )
                     if claim is None:
+                        break
+                    if self._stop.is_set():
                         break
                     futures.add(
                         executor.submit(evict_location,

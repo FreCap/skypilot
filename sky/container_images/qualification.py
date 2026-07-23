@@ -377,6 +377,41 @@ def heartbeat_canary(operation_id: str,
     return changed == 1
 
 
+def release_drained_canary(operation: catalog_state.OperationRecord,
+                           *,
+                           teardown_verified: bool,
+                           now: int | None = None) -> bool:
+    """Makes a child-free or teardown-verified canary promptly reclaimable."""
+    if teardown_verified is not True:
+        raise ValueError(
+            'Canary drain teardown must be verified before release.')
+    if operation.lease_token is None:
+        return False
+    table = schema.operations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = session.execute(
+            sqlalchemy.select(
+                table.c.kind, table.c.state, table.c.lease_token,
+                table.c.lease_expires_at).where(table.c.id == operation.id).
+            with_for_update()).mappings().first()
+        if (row is None or row['kind'] != 'PROFILE_CANARY' or
+                row['state'] != models.ImageOperationState.RUNNING.value or
+                row['lease_token'] != operation.lease_token or
+                row['lease_expires_at'] is None):
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        if int(row['lease_expires_at']) <= current:
+            return False
+        changed = session.execute(table.update().where(
+            table.c.id == operation.id, table.c.kind == 'PROFILE_CANARY',
+            table.c.state == models.ImageOperationState.RUNNING.value,
+            table.c.lease_token == operation.lease_token,
+            table.c.lease_expires_at
+            > current).values(lease_expires_at=current,
+                              updated_at=current)).rowcount
+    return changed == 1
+
+
 def attach_canary_child(operation_id: str,
                         lease_token: str,
                         child_launch_id: str,

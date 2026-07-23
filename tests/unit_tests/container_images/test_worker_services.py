@@ -418,6 +418,58 @@ def test_unverified_canary_teardown_remains_reclaimable(
     fail.assert_not_called()
 
 
+def test_unstarted_canary_drain_does_not_load_or_terminalize(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    drain_event = threading.Event()
+    drain_event.set()
+    load_contract = mock.Mock()
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_load_contract', load_contract)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    load_contract.assert_not_called()
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
+
+
+def test_canary_drain_is_forwarded_without_terminalizing(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    drain_event = threading.Event()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.reference))
+    run_ec2 = mock.Mock(
+        side_effect=canary_worker_service._CanaryDrainRequested())
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary', run_ec2)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    assert run_ec2.call_args.kwargs['drain_event'] is drain_event
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
+
+
 def test_persisted_canary_child_survives_contract_reload_failure(
         monkeypatch: pytest.MonkeyPatch) -> None:
     operation = dataclasses.replace(_canary_operation(),
@@ -480,6 +532,103 @@ def test_initial_canary_client_failure_terminalizes_without_provider_child(
     failed.assert_called_once_with(operation,
                                    'CANARY_FAILED',
                                    teardown_verified=True)
+
+
+def test_ec2_drain_of_persisted_child_runs_uncancelled_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    operation = dataclasses.replace(
+        _canary_operation(),
+        child_launch_id=f'ec2:{target.region}:{_canary_operation().id}')
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '3' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    drain_event = threading.Event()
+    drain_event.set()
+    heartbeat = _OwnedHeartbeat()
+    ec2 = mock.Mock()
+    tagged_instances = mock.Mock(return_value=[])
+    terminate = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: ec2)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_tagged_instances',
+                        tagged_instances)
+    monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
+                        terminate)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._run_ec2_canary(
+            operation,
+            payload,
+            _revision(profile),
+            profile,
+            target,
+            binding,
+            _DIGEST,
+            f'{target.registry}/qualification@{_DIGEST}',
+            heartbeat,
+            drain_event=drain_event)
+
+    ec2.run_instances.assert_not_called()
+    tagged_instances.assert_called_once_with(ec2, operation.id)
+    terminate.assert_called_once()
+
+
+def test_eks_drain_of_persisted_child_runs_uncancelled_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_eks')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    qualified = binding.qualified_clusters[0]
+    operation = dataclasses.replace(_canary_operation(),
+                                    child_launch_id='eks:persisted-child')
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '4' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    drain_event = threading.Event()
+    drain_event.set()
+    heartbeat = _OwnedHeartbeat()
+    core = mock.Mock()
+    delete_pod = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: core)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod', delete_pod)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._run_eks_canary(
+            operation,
+            payload,
+            _revision(profile),
+            profile,
+            target,
+            binding,
+            _DIGEST,
+            f'{target.registry}/qualification@{_DIGEST}',
+            heartbeat,
+            drain_event=drain_event)
+
+    core.create_namespaced_pod.assert_not_called()
+    delete_pod.assert_called_once()
 
 
 def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
@@ -1439,6 +1588,30 @@ def test_ec2_teardown_resolves_prior_malformed_inventory_after_clean_window(
         initial_unidentified_child_observed=True)
 
     assert ec2.describe_instances.call_count == 2
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_teardown_stops_at_wall_clock_bound_after_slow_provider_call(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_SECONDS', 300)
+    ec2 = mock.Mock()
+
+    def slow_empty_inventory(**_kwargs: object) -> dict[str, object]:
+        current[0] = 301.0
+        return {'Reservations': []}
+
+    ec2.describe_instances.side_effect = slow_empty_inventory
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        initial_unidentified_child_observed=True)
+
+    ec2.describe_instances.assert_called_once()
     ec2.terminate_instances.assert_not_called()
 
 
@@ -2906,6 +3079,245 @@ def test_worker_health_http_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         assert error.value.code == 503
     finally:
         health_server.stop()
+
+
+def test_copy_worker_stop_during_heartbeat_fences_new_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    reload_config = mock.Mock()
+    qualification_maintenance = mock.Mock()
+    claim = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.skypilot_config,
+                        'safe_reload_config', reload_config)
+    monkeypatch.setattr(copy_worker_service, '_qualification_maintenance',
+                        qualification_maintenance)
+    monkeypatch.setattr(service, '_claim', claim)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    reload_config.assert_called_once_with()
+    qualification_maintenance.assert_not_called()
+    claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+def test_lifecycle_worker_stop_during_heartbeat_fences_new_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(
+        lifecycle_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    maintenance = mock.Mock()
+    consumers = mock.Mock()
+    qualification_lifecycle = mock.Mock()
+    canonical_reconciliation = mock.Mock()
+    policy_refresh = mock.Mock()
+    eviction_claim = mock.Mock()
+    monkeypatch.setattr(service, '_maintenance', maintenance)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_reconcile_terminal_consumers', consumers)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        'reconcile_qualification_lifecycle',
+                        qualification_lifecycle)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        'reconcile_failed_canonical_reservations',
+                        canonical_reconciliation)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        policy_refresh)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction', eviction_claim)
+
+    service.run_forever()
+
+    maintenance.assert_not_called()
+    consumers.assert_not_called()
+    qualification_lifecycle.assert_not_called()
+    canonical_reconciliation.assert_not_called()
+    policy_refresh.assert_not_called()
+    eviction_claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+def test_canary_worker_stop_during_heartbeat_fences_paid_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(
+        canary_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    claim = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        claim)
+
+    service.run_forever()
+
+    claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+def test_copy_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(copy_worker_service.topology_state, 'heartbeat_worker',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(copy_worker_service.time, 'monotonic', lambda: 1.0)
+    claim = mock.Mock(side_effect=lambda:
+                      (service.stop() or ('publication', mock.sentinel.record)))
+    monkeypatch.setattr(service, '_claim', claim)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    claim.assert_called_once_with()
+    executor.submit.assert_not_called()
+
+
+def test_lifecycle_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    monkeypatch.setattr(lifecycle_worker_service.time, 'monotonic',
+                        lambda: 61.0)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_CONSUMER_RECONCILIATION_SECONDS', 1000)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        mock.Mock(return_value={}))
+    claim = mock.Mock(
+        side_effect=lambda **_kwargs: (service.stop() or mock.sentinel.record))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction', claim)
+
+    service.run_forever()
+
+    claim.assert_called_once_with(worker_id='lifecycle-worker',
+                                  retention_seconds=60,
+                                  workspace_retention_seconds={},
+                                  lease_seconds=service.lease_seconds)
+    executor.submit.assert_not_called()
+
+
+def test_canary_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(canary_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    claim = mock.Mock(side_effect=lambda **_kwargs:
+                      (service.stop() or mock.sentinel.operation))
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        claim)
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    service.run_forever()
+
+    claim.assert_called_once_with(worker_id='canary-worker',
+                                  lease_seconds=service.lease_seconds)
+    release.assert_called_once_with(mock.sentinel.operation,
+                                    teardown_verified=True)
+    executor.submit.assert_not_called()
+
+
+def test_canary_worker_submits_shared_drain_event(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    executor.submit.side_effect = lambda *_args, **_kwargs: (service.stop() or
+                                                             future)
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(canary_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    operation = _canary_operation()
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        mock.Mock(return_value=operation))
+
+    service.run_forever()
+
+    executor.submit.assert_called_once_with(canary_worker_service.run_canary,
+                                            operation,
+                                            lease_seconds=service.lease_seconds,
+                                            drain_event=service._stop)
 
 
 @pytest.mark.parametrize(('worker_module', 'service_name'),

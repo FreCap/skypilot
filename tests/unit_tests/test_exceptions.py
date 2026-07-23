@@ -234,19 +234,20 @@ def test_deserialize_partial_dict():
     e = exceptions.deserialize_exception({})
     assert isinstance(e, RuntimeError)
 
-    # Unknown type with message uses message in fallback
+    # A future server type must not reflect its identity or payload.
     e = exceptions.deserialize_exception({
         'type': 'NonExistent',
-        'message': 'details'
+        'message': 'credential=secret'
     })
-    assert isinstance(e, Exception)
-    assert 'NonExistent' in str(e)
-    assert 'details' in str(e)
+    assert isinstance(e, RuntimeError)
+    assert str(e) == 'Server error response is malformed.'
+    assert 'NonExistent' not in str(e)
+    assert 'credential=secret' not in str(e)
 
-    # Unknown type without message still works
+    # Unknown types without a message use the identical value-free result.
     e = exceptions.deserialize_exception({'type': 'NonExistent'})
-    assert isinstance(e, Exception)
-    assert 'NonExistent' in str(e)
+    assert isinstance(e, RuntimeError)
+    assert str(e) == 'Server error response is malformed.'
 
 
 @pytest.mark.parametrize('bad_input', [
@@ -345,7 +346,7 @@ def test_builtin_exception_with_notes_round_trips():
 
 
 def test_deserialize_tolerates_attribute_the_constructor_rejects():
-    """An unusable attribute must not mask the original error."""
+    """A forward-version attribute must not mask the known error type."""
     deserialized = exceptions.deserialize_exception({
         'type': 'ResourcesUnavailableError',
         'message': 'boom',
@@ -354,7 +355,9 @@ def test_deserialize_tolerates_attribute_the_constructor_rejects():
             'not_a_constructor_argument': 1
         },
     })
-    assert 'boom' in str(deserialized)
+    assert isinstance(deserialized, exceptions.ResourcesUnavailableError)
+    assert str(deserialized) == 'boom'
+    assert deserialized.not_a_constructor_argument == 1
 
 
 def test_attribute_that_cannot_be_set_does_not_lose_the_error():

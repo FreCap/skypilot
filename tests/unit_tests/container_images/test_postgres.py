@@ -487,6 +487,42 @@ def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
     assert qualification.fail_canary(successor, 'CANARY_FAILED', now=111)
 
 
+def test_drained_canary_release_is_immediately_reclaimable_and_fenced(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-drained-release-key')
+    first = qualification.claim_canary(worker_id='worker-a',
+                                       lease_seconds=100,
+                                       now=100)
+    assert first is not None and first.lease_token is not None
+    child_id = f'ec2:{profile.targets[0].region}:{first.id}'
+    assert qualification.attach_canary_child(first.id,
+                                             first.lease_token,
+                                             child_id,
+                                             now=101)
+
+    with pytest.raises(ValueError, match='teardown must be verified'):
+        qualification.release_drained_canary(first,
+                                             teardown_verified=False,
+                                             now=102)
+    assert qualification.release_drained_canary(first,
+                                                teardown_verified=True,
+                                                now=102)
+    assert not qualification.heartbeat_canary(
+        first.id, first.lease_token, lease_seconds=100, now=102)
+    successor = qualification.claim_canary(worker_id='worker-b',
+                                           lease_seconds=100,
+                                           now=102)
+    assert successor is not None and successor.lease_token is not None
+    assert successor.lease_token != first.lease_token
+    assert successor.child_launch_id == child_id
+    assert not qualification.release_drained_canary(
+        first, teardown_verified=True, now=103)
+
+
 def test_incompatible_worker_preserves_persisted_canary_child(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

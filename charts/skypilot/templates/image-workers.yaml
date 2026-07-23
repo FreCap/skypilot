@@ -12,6 +12,9 @@
 {{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
 {{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
 {{- end -}}
+{{- if and .Values.imageCanaryWorker.enabled (lt (int .Values.imageCanaryWorker.terminationGracePeriodSeconds) 600) -}}
+{{- fail "imageCanaryWorker.terminationGracePeriodSeconds must be at least 600 seconds" -}}
+{{- end -}}
 {{- $sourceCredentialIdentities := dict -}}
 {{- range .Values.imageCopyWorker.sourceCredentialSecrets -}}
 {{- if or (not .namespace) (not .name) -}}
@@ -106,7 +109,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.imageCopyWorker.terminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -287,7 +290,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.imageLifecycleWorker.terminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -454,7 +457,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.imageCanaryWorker.terminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

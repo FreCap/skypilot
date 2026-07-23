@@ -89,6 +89,18 @@ tests:
       - isKind:
           of: Deployment
         documentIndex: 2
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        documentIndex: 1
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 600
+        documentIndex: 2
       - contains:
           path: spec.template.spec.containers[0].env
           content:

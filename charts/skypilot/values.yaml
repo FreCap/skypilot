@@ -322,6 +322,9 @@ imageCopyWorker:
   healthPort: 8081
   # @schema type: [integer]; minimum: 5
   livenessDeadlineSeconds: 30
+  # Maximum time for already-submitted work to drain after SIGTERM.
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 30
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null
@@ -371,6 +374,9 @@ imageLifecycleWorker:
   healthPort: 8081
   # @schema type: [integer]; minimum: 5
   livenessDeadlineSeconds: 30
+  # Maximum time for already-submitted work to drain after SIGTERM.
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 30
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null
@@ -413,6 +419,10 @@ imageCanaryWorker:
   healthPort: 8081
   # @schema type: [integer]; minimum: 5
   livenessDeadlineSeconds: 30
+  # Active canaries observe SIGTERM and enter uncancelled provider teardown.
+  # This covers cancellation, the 300-second EC2 settling loop, and API margin.
+  # @schema type: [integer]; minimum: 600
+  terminationGracePeriodSeconds: 600
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null

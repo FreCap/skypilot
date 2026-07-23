@@ -1115,17 +1115,24 @@ ordinary provisioning, quotas, setup, or user code are not rewritten by the
 image feature.
 Exception-envelope decoding is itself a bounded compatibility boundary. The
 decoder accepts only a string exception type, a list or tuple of positional
-arguments, and a dictionary with string attribute keys. Unknown types retain
-the existing generic fallback, while malformed fields or a constructor that
-rejects the supplied shape return a generic built-in error. Invalid envelopes
-never raise a secondary decoder exception or reflect the complete untrusted
-payload into an error message. Built-in exceptions are constructed from
-positional arguments only, after which ordinary string-key attributes are
-restored independently; an attribute that is read-only, slotted, or otherwise
-unsettable is skipped without replacing the original error. Dunder attributes
-are never constructor arguments. Valid Python 3.11 exception notes are emitted
-outside the attribute map for old-client compatibility, while the decoder also
-accepts the legacy attribute form and restores notes only after construction.
+arguments, and a dictionary with string attribute keys. Unknown types and known
+objects that are not exception classes both return the same fixed, value-free
+`RuntimeError`; neither the supplied type nor message is reflected. Malformed
+fields or a constructor that rejects the supplied shape return that generic
+built-in error too. Invalid envelopes never raise a secondary decoder exception
+or reflect the complete untrusted payload into an error message.
+
+Built-in exceptions are constructed from positional arguments only, after which
+ordinary string-key attributes are restored independently. For a known SkyPilot
+exception, only ordinary attributes named by an unbound keyword-capable
+constructor parameter are passed to its constructor. Remaining forward-version
+attributes are restored after construction, so an older client preserves the
+known exception type when a newer server adds an ordinary attribute. An
+attribute that is read-only, slotted, or otherwise unsettable is skipped without
+replacing the original error. Dunder attributes are never constructor arguments.
+Valid Python 3.11 exception notes are emitted outside the attribute map for
+old-client compatibility, while the decoder also accepts the legacy attribute
+form and restores notes only after construction.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -2069,16 +2076,19 @@ Helm exposes three disabled-by-default deployments:
 imageCopyWorker.enabled
 imageCopyWorker.replicaCount
 imageCopyWorker.maxInFlight
+imageCopyWorker.terminationGracePeriodSeconds
 imageCopyWorker.serviceAccount
 
 imageLifecycleWorker.enabled
 imageLifecycleWorker.replicaCount
 imageLifecycleWorker.maxInFlight
+imageLifecycleWorker.terminationGracePeriodSeconds
 imageLifecycleWorker.serviceAccount
 
 imageCanaryWorker.enabled
 imageCanaryWorker.replicaCount
 imageCanaryWorker.maxInFlight
+imageCanaryWorker.terminationGracePeriodSeconds
 imageCanaryWorker.serviceAccount
 ```
 
@@ -2179,9 +2189,38 @@ inspection is read-only, and destination authority remains fenced after it.
 Lifecycle additionally makes durable `DELETE` intent a synchronous precondition
 of every destructive provider call.
 
-Shutdown stops new claims, cancels work that has not started provider I/O, and
-lets leases expire after ambiguous I/O. Restart recovery verifies actual
-registry state for immutable copy work and pre-delete claims. An expired
+Shutdown is a no-new-work fence. Every worker rechecks its process stop event
+after heartbeat or configuration work and immediately before each maintenance
+call, queue claim, and executor submission. A stop observed at any boundary
+exits the claim loop without beginning more database or provider work. Work
+already submitted drains through the executor; lease fencing and durable state
+still own any ambiguous provider result.
+
+The canary worker additionally passes the same stop event into every submitted
+canary. A task that has not created a provider child exits without launching
+one. A task that may own a child observes the event between bounded provider
+calls and on every runtime poll, then enters its existing `finally` teardown.
+Cancellation never interrupts teardown itself. A persisted child claimed before
+shutdown therefore runs in cleanup-only mode and cannot be recreated. This
+reduces shutdown observation from the 3,600-second runtime maximum to one
+bounded provider call or the 10-second poll interval, followed by custody
+cleanup. Once an unstarted task or verified teardown has no live provider child,
+the exact owner advances its lease expiry to PostgreSQL's current time under the
+same token. The replacement worker can reclaim it immediately without waiting
+for the normal 15-minute lease. A failed release remains safe and falls back to
+ordinary lease-expiry recovery.
+
+The canary Deployment enforces a termination grace of at least 600 seconds. The
+grace covers cancellation observation, the 300-second wall-clock EC2 teardown
+settling budget, bounded provider-call overhead, and margin. The process exits
+immediately when cleanup completes, so the configured ceiling does not add a
+fixed rollout delay. The same drain applies to disable and scale-down. If the
+grace expires or bounded provider cleanup itself fails, the operation and
+concrete child identity remain RUNNING for lease-expiry recovery rather than
+being falsely terminalized.
+
+Restart recovery verifies actual registry state for immutable copy work and
+pre-delete claims. An expired
 destructive intent quarantines its exact physical reference without trusting a
 read to bound an older delete.
 
@@ -2598,6 +2637,15 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
+  workers proving that shutdown begins no later maintenance, claim, or executor
+  submission; provider-level canary drain tests proving cancellation cannot
+  create a new child and always enters uncancelled teardown for an owned child;
+  a slow-provider test proving EC2 settling cannot start another call after its
+  300-second wall-clock budget;
+  PostgreSQL tests proving a verified drain is immediately reclaimable while a
+  stale token cannot release its successor; plus Helm rendering and schema tests
+  enforcing the canary's 600-second minimum custody-cleanup grace;
 - worker-clock skew and blocking-lock tests proving that copy and eviction
   claims, provider grants and throttles, retry delays, consumer terminal
   confirmation, unattached-cluster retention, worker cleanup, and terminal
@@ -2688,6 +2736,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker-entrypoint tests proving copy, lifecycle, and runtime-canary processes
   verify global state, Serve, and Managed Jobs before health construction and
   fail before health or provider work when any central schema is stale;
+- exception-envelope tests proving unknown and known non-exception types share
+  one value-free sanitized result, forward-version ordinary attributes preserve
+  a known SkyPilot exception type, and unsettable attributes cannot replace the
+  original error;
 - Dashboard A-to-B workspace-switch tests with workspace A already rendered,
   proving both pending and failed capability replacement immediately remove A's
   data, mutation controls, open dialogs, retries, and hidden errors, plus
@@ -3491,3 +3543,24 @@ revision integrates that base's GCP capacity classification, SQLite contention
 retry, and landed exception-compatibility fixes while retaining strict envelope
 shape validation, constructor-safe note serialization, tolerant attribute
 restoration, and sanitized fallbacks. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`e6d46103b872433ad504517ba11db76f8fa5c967` returned `RESHAPE`; Fable again
+could not start because its exact `claude-fable-5` request reached the account
+limit before using any token. Codex re-proved the latest EC2 custody repair and
+the complete 26-check GitHub rollup, then reproduced two independent boundary
+defects. A stop signal arriving during a worker heartbeat could still begin
+maintenance, claim, and submit new work; the canary Deployment's 30-second
+termination grace could then kill a paid canary before its bounded runtime and
+teardown completed. Separately, unknown exception types reflected untrusted type
+and message values, while a forward-version ordinary attribute could replace a
+known SkyPilot exception with a generic fallback. This revision makes shutdown
+a no-new-work fence for all three workers, actively cancels canary runtime waits
+into uncancelled custody teardown, enforces a 600-second cleanup grace, sanitizes
+unknown exception identities, and partitions known constructor fields from
+restorable forward-version attributes. The acceptance streak remains zero.
+
+PR #368 merged as `e712186072fede57d08841e0ac7e0d184b174c18` before the
+round-one repairs above were committed. The corrections therefore continue as
+a focused follow-up from `966a8d014ca81610f3b24ceb35e221384b0aab2b`; they do
+not rewrite the merge or treat the merged state as reviewed acceptance.

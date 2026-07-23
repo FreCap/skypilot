@@ -2,6 +2,7 @@
 import builtins
 from collections.abc import Sequence
 import enum
+import inspect
 import traceback
 import types
 import typing
@@ -132,6 +133,30 @@ def _restore_exception_attributes(e: BaseException,
             pass
 
 
+def _partition_constructor_attributes(
+    exception_class: type[BaseException],
+    args: Sequence[Any],
+    attributes: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separates explicit constructor kwargs from restorable attributes."""
+    try:
+        signature = inspect.signature(exception_class)
+        bound = signature.bind_partial(*args)
+    except (TypeError, ValueError):
+        return {}, attributes
+    constructor_attributes: dict[str, Any] = {}
+    restorable_attributes: dict[str, Any] = {}
+    for attribute, value in attributes.items():
+        parameter = signature.parameters.get(attribute)
+        if (parameter is not None and attribute not in bound.arguments and
+                parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                   inspect.Parameter.KEYWORD_ONLY)):
+            constructor_attributes[attribute] = value
+        else:
+            restorable_attributes[attribute] = value
+    return constructor_attributes, restorable_attributes
+
+
 def deserialize_exception(serialized: Any) -> Exception:
     """Deserialize the exception.
 
@@ -159,10 +184,8 @@ def deserialize_exception(serialized: Any) -> Exception:
     else:
         exception_class = globals().get(exception_type, None)
     if exception_class is None:
-        # Unknown exception type.
-        message = serialized.get('message')
-        detail = message if isinstance(message, str) else 'Unknown server error'
-        return Exception(f'{exception_type}: {detail}')
+        # An older client must not reflect a future server's type or payload.
+        return RuntimeError('Server error response is malformed.')
     if (not isinstance(exception_class, type) or
             not issubclass(exception_class, BaseException)):
         return RuntimeError('Server error response is malformed.')
@@ -180,18 +203,17 @@ def deserialize_exception(serialized: Any) -> Exception:
             # Built-in exception constructors reject keyword arguments. Restore
             # validated ordinary attributes after construction instead.
             e = exception_class(*args)
+            restorable_attributes = attributes
         else:
-            e = exception_class(*args, **attributes)
+            (constructor_attributes,
+             restorable_attributes) = _partition_constructor_attributes(
+                 exception_class, args, attributes)
+            e = exception_class(*args, **constructor_attributes)
     except Exception:  # pylint: disable=broad-exception-caught
-        # An attribute the constructor does not accept must not replace the
-        # original error with an unrelated failure.
-        message = serialized.get('message')
-        detail = message if isinstance(message, str) else 'Unknown server error'
-        return Exception(f'{exception_type}: {detail}')
+        return RuntimeError('Server error response is malformed.')
     if not isinstance(e, Exception):
         return RuntimeError('Server error response is malformed.')
-    if hasattr(builtins, exception_type):
-        _restore_exception_attributes(e, attributes)
+    _restore_exception_attributes(e, restorable_attributes)
     _restore_exception_attributes(e, dunder_attributes)
     notes = serialized.get('notes', legacy_notes)
     if (isinstance(notes, list) and

@@ -1034,22 +1034,30 @@ class CopyWorkerService:
                         logger.warning(
                             'Image worker configuration refresh failed.')
                     last_config_refresh = schedule_now
-                if (schedule_now - last_qualification_refresh
-                        >= _CONFIG_REFRESH_SECONDS and
-                        qualification_future is None and
-                        len(futures) < self.max_in_flight):
-                    qualification_future = executor.submit(
-                        _qualification_maintenance, self._budget_limiter)
-                    futures.add(qualification_future)
-                    last_qualification_refresh = schedule_now
+                if self._stop.is_set():
+                    break
                 heartbeat_ok = topology_state.heartbeat_worker(
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
+                if self._stop.is_set():
+                    break
+                if (schedule_now - last_qualification_refresh
+                        >= _CONFIG_REFRESH_SECONDS and
+                        qualification_future is None and
+                        len(futures) < self.max_in_flight):
+                    if self._stop.is_set():
+                        break
+                    qualification_future = executor.submit(
+                        _qualification_maintenance, self._budget_limiter)
+                    futures.add(qualification_future)
+                    last_qualification_refresh = schedule_now
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = self._claim()
                     if claim is None:
+                        break
+                    if self._stop.is_set():
                         break
                     kind, record = claim
                     if kind == 'publication':
