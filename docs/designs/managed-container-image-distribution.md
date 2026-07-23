@@ -3917,4 +3917,8 @@ teardown failure, cleanup lease loss, and cleanup-time drain discard the losing
 provider graph before raising their deterministic winner. Exact object-graph
 and serialized-envelope regressions cover all four EKS precedence outcomes and
 the equivalent EC2 teardown-failure schedule. The acceptance streak remains
-zero.
+zero. Before the repaired-head acceptance run, `origin/improvements` advanced
+to `0758b9b32e5828a0befd6cde1fe09dce62e6f605`. Integrating it preserves the
+new managed-job cancellation attribution and transient-INIT recovery contracts
+without changing this feature's 22-file base-relative diff; all gates are rerun
+against that actual merge candidate.
