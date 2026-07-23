@@ -10,6 +10,24 @@ from test_jobs_state import _seed_multi_task_job
 from test_jobs_state import _seed_test_jobs
 
 from sky.jobs import state
+from sky.jobs import utils as jobs_utils
+
+
+def _insert_legacy_running_job(engine, *, workspace='default') -> int:
+    with engine.begin() as connection:
+        result = connection.execute(state.job_info_table.insert().values(
+            name='legacy-job',
+            workspace=workspace,
+            schedule_state=None,
+        ))
+        job_id = result.lastrowid
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            task_name='task-0',
+            status=state.ManagedJobStatus.RUNNING.value,
+        ))
+    return job_id
 
 
 class TestGetJobsToCheckStatusInfo:
@@ -40,6 +58,17 @@ class TestGetJobsToCheckStatusInfo:
             state.ManagedJobStatus.SUCCEEDED,
             state.ManagedJobStatus.RUNNING,
         ]
+
+    def test_legacy_job_is_excluded_instead_of_crashing(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs):
+        legacy_job_id = _insert_legacy_running_job(_mock_managed_jobs_db_conn)
+
+        info = state.get_jobs_to_check_status_info([legacy_job_id])
+
+        assert not info
+        modern_info = state.get_jobs_to_check_status_info()
+        assert legacy_job_id not in modern_info
+        assert modern_info
 
     def test_batched_job_ids_filter_matches_full_snapshot(
             self, _seed_test_jobs):
@@ -90,3 +119,18 @@ class TestGetJobsToCheckStatusInfo:
 
         assert info
         assert select_count == 1
+
+    def test_cancel_legacy_job_skips_refresh_snapshot_and_writes_signal(
+            self, _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
+        legacy_job_id = _insert_legacy_running_job(_mock_managed_jobs_db_conn)
+        monkeypatch.setattr('sky.jobs.constants.SIGNAL_FILE_PREFIX',
+                            str(tmp_path / '{}'))
+        monkeypatch.setattr(jobs_utils, '_controller_is_restarting',
+                            lambda: False)
+
+        result = jobs_utils.cancel_jobs_by_id([legacy_job_id],
+                                              current_workspace='default')
+
+        assert result == f'Job with ID {legacy_job_id} is scheduled to be cancelled.'
+        assert ((tmp_path / str(legacy_job_id)).read_text(
+            encoding='utf-8') == jobs_utils.UserSignal.CANCEL.value)

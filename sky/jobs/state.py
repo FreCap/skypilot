@@ -572,10 +572,12 @@ def get_jobs_to_check_status(job_ids: list[int] | None = None) -> list[int]:
     Args:
         job_ids: Optional job IDs to check. If None, checks all jobs.
 
-    Returns a list of job_ids, including the following:
+    Returns a list of modern job_ids, including the following:
     - Jobs that have a schedule_state that is not DONE
     - Jobs have schedule_state DONE but are in a non-terminal status
-    - Legacy jobs (that is, no schedule state) that are in non-terminal status
+
+    Legacy jobs have no schedule state and are handled by their dedicated
+    single-job controller paths.
     """
     where_condition = _get_jobs_to_check_status_condition(job_ids)
     engine = _db_manager.get_engine()
@@ -847,16 +849,18 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     # Get jobs that are either:
     # 1. Have schedule state that is not DONE, or
     # 2. Have schedule state DONE AND are in non-terminal status (unexpected
-    #    inconsistent state), or
-    # 3. Have no schedule state (legacy) AND are in non-terminal status
+    #    inconsistent state).
+    #
+    # Legacy single-job controllers have NULL schedule_state. They are not
+    # manageable through the consolidated refresh sweep, which only knows how
+    # to reason about modern schedule-state rows. Fence them out here so
+    # cancellation and refresh can fall through to the dedicated legacy signal
+    # path instead of crashing while decoding a NULL enum.
     condition1 = sqlalchemy.and_(
         job_info_table.c.schedule_state.is_not(None),
         job_info_table.c.schedule_state != ManagedJobScheduleState.DONE.value)
     condition2 = sqlalchemy.and_(
-        sqlalchemy.or_(
-            job_info_table.c.schedule_state.is_(None),
-            job_info_table.c.schedule_state ==
-            ManagedJobScheduleState.DONE.value),
+        job_info_table.c.schedule_state == ManagedJobScheduleState.DONE.value,
         ~spot_table.c.status.in_(terminal_status_values),
     )
     where_condition = sqlalchemy.or_(condition1, condition2)
