@@ -174,12 +174,16 @@ export function ImageDetail() {
     typeof router.query.image === 'string' ? router.query.image : null;
   const requestedWorkspace =
     typeof router.query.workspace === 'string' ? router.query.workspace : null;
-  const [workspace, setWorkspace] = useState(requestedWorkspace);
-  const [detail, setDetail] = useState(null);
-  const [capabilities, setCapabilities] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [oldServer, setOldServer] = useState(false);
+  const requestScope = JSON.stringify([requestedWorkspace, imageId]);
+  const [requestState, setRequestState] = useState(() => ({
+    scope: requestScope,
+    workspace: requestedWorkspace,
+    detail: null,
+    capabilities: null,
+    loading: true,
+    error: null,
+    oldServer: false,
+  }));
   const [activeTab, setActiveTab] = useState('overview');
   const [prepareOpen, setPrepareOpen] = useState(false);
   const [retry, setRetry] = useState(null);
@@ -192,21 +196,51 @@ export function ImageDetail() {
   const generation = useRef(0);
   const requestController = useRef(null);
   const collectionControllers = useRef({});
+  const loadedScope = useRef(null);
+  const requestScopeRef = useRef(requestScope);
+  requestScopeRef.current = requestScope;
+  const requestStateIsCurrent = requestState.scope === requestScope;
+  const workspace = requestStateIsCurrent
+    ? requestState.workspace
+    : requestedWorkspace;
+  const detail = requestStateIsCurrent ? requestState.detail : null;
+  const capabilities = requestStateIsCurrent ? requestState.capabilities : null;
+  const loading = requestStateIsCurrent ? requestState.loading : true;
+  const error = requestStateIsCurrent ? requestState.error : null;
+  const oldServer = requestStateIsCurrent ? requestState.oldServer : false;
 
   const load = useCallback(async () => {
     if (!imageId) return undefined;
+    const scope = requestScope;
+    const scopeChanged = loadedScope.current !== scope;
+    loadedScope.current = scope;
     requestController.current?.abort();
     Object.values(collectionControllers.current).forEach((controller) =>
       controller.abort()
     );
     collectionControllers.current = {};
     setCollectionLoading({});
+    if (scopeChanged) {
+      setActiveTab('overview');
+      setPrepareOpen(false);
+      setRetry(null);
+      setCollectionCursorStacks(initialCollectionCursorStacks());
+      setCollectionErrors({});
+      setCollectionNotices({});
+    }
     const controller = new AbortController();
     requestController.current = controller;
     const currentGeneration = ++generation.current;
-    setLoading(true);
-    setError(null);
-    setOldServer(false);
+    setRequestState((current) => ({
+      scope,
+      workspace:
+        current.scope === scope ? current.workspace : requestedWorkspace,
+      detail: current.scope === scope ? current.detail : null,
+      capabilities: current.scope === scope ? current.capabilities : null,
+      loading: true,
+      error: null,
+      oldServer: false,
+    }));
     let capabilitiesLoaded = false;
     try {
       const nextCapabilities = await getImageCapabilities(
@@ -214,40 +248,67 @@ export function ImageDetail() {
         controller.signal
       );
       capabilitiesLoaded = true;
+      if (
+        generation.current !== currentGeneration ||
+        requestScopeRef.current !== scope
+      )
+        return;
       const nextDetail = await getImageArtifactDetail(
         imageId,
         nextCapabilities.workspace,
         controller.signal
       );
-      if (generation.current !== currentGeneration) return;
-      setWorkspace(nextCapabilities.workspace);
-      setCapabilities(nextCapabilities);
-      setDetail(nextDetail);
+      if (
+        generation.current !== currentGeneration ||
+        requestScopeRef.current !== scope
+      )
+        return;
+      setRequestState({
+        scope,
+        workspace: nextCapabilities.workspace,
+        detail: nextDetail,
+        capabilities: nextCapabilities,
+        loading: false,
+        error: null,
+        oldServer: false,
+      });
       setCollectionCursorStacks(initialCollectionCursorStacks());
       setCollectionErrors({});
       setCollectionNotices({});
     } catch (requestError) {
       if (
         requestError.name !== 'AbortError' &&
-        generation.current === currentGeneration
+        generation.current === currentGeneration &&
+        requestScopeRef.current === scope
       ) {
-        if (
+        const isOldServer =
           !capabilitiesLoaded &&
-          (requestError.status === 404 || requestError.status === 426)
-        ) {
-          setOldServer(true);
-          setError(requestError.code || requestError.message);
-        } else {
-          setError(requestError.code || requestError.message);
-        }
+          (requestError.status === 404 || requestError.status === 426);
+        setRequestState((current) =>
+          current.scope === scope
+            ? {
+                ...current,
+                loading: false,
+                error: requestError.code || requestError.message,
+                oldServer: isOldServer,
+              }
+            : current
+        );
       }
     } finally {
-      if (generation.current === currentGeneration) setLoading(false);
+      if (
+        generation.current === currentGeneration &&
+        requestScopeRef.current === scope
+      ) {
+        setRequestState((current) =>
+          current.scope === scope ? { ...current, loading: false } : current
+        );
+      }
       if (requestController.current === controller) {
         requestController.current = null;
       }
     }
-  }, [imageId, requestedWorkspace]);
+  }, [imageId, requestedWorkspace, requestScope]);
 
   useEffect(() => {
     load();
@@ -264,7 +325,8 @@ export function ImageDetail() {
 
   const pageArtifactCollection = useCallback(
     async (collection, direction) => {
-      if (!imageId || !workspace || !detail) return;
+      if (!requestStateIsCurrent || !imageId || !workspace || !detail) return;
+      const scope = requestScope;
       const currentStack =
         collectionCursorStacks[collection] || firstImageCursorHistory();
       let nextStack;
@@ -334,21 +396,29 @@ export function ImageDetail() {
 
         if (
           generation.current !== currentGeneration ||
+          requestScopeRef.current !== scope ||
           collectionControllers.current[collection] !== controller
         )
           return;
-        setDetail((current) => {
-          if (!current || current.artifact.id !== detail.artifact.id)
+        setRequestState((current) => {
+          if (
+            current.scope !== scope ||
+            !current.detail ||
+            current.detail.artifact.id !== detail.artifact.id
+          )
             return current;
           const nextCursors = {
-            ...(current.next_cursors || {}),
+            ...(current.detail.next_cursors || {}),
             [collection]: page.next_cursor || null,
           };
           return {
             ...current,
-            [collection]: page.items,
-            next_cursors: nextCursors,
-            truncated: Object.values(nextCursors).some(Boolean),
+            detail: {
+              ...current.detail,
+              [collection]: page.items,
+              next_cursors: nextCursors,
+              truncated: Object.values(nextCursors).some(Boolean),
+            },
           };
         });
         setCollectionCursorStacks((current) => ({
@@ -359,6 +429,7 @@ export function ImageDetail() {
         if (
           requestError.name !== 'AbortError' &&
           generation.current === currentGeneration &&
+          requestScopeRef.current === scope &&
           collectionControllers.current[collection] === controller
         ) {
           setCollectionErrors((current) => ({
@@ -369,14 +440,23 @@ export function ImageDetail() {
       } finally {
         if (collectionControllers.current[collection] === controller) {
           delete collectionControllers.current[collection];
-          setCollectionLoading((current) => ({
-            ...current,
-            [collection]: false,
-          }));
+          if (requestScopeRef.current === scope) {
+            setCollectionLoading((current) => ({
+              ...current,
+              [collection]: false,
+            }));
+          }
         }
       }
     },
-    [detail, imageId, workspace, collectionCursorStacks]
+    [
+      collectionCursorStacks,
+      detail,
+      imageId,
+      requestScope,
+      requestStateIsCurrent,
+      workspace,
+    ]
   );
 
   const hasNonterminal = useMemo(

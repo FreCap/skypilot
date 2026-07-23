@@ -128,7 +128,11 @@ export function Images() {
   const [readinessError, setReadinessError] = useState(null);
   const [publishOpen, setPublishOpen] = useState(false);
   const [retryPublication, setRetryPublication] = useState(null);
+  const [capabilityReload, setCapabilityReload] = useState(0);
   const lastWorkspace = useRef(requestedWorkspace);
+  const routeWorkspace = useRef(requestedWorkspace);
+  routeWorkspace.current = requestedWorkspace;
+  const navigationGeneration = useRef(0);
   const capabilityGeneration = useRef(0);
   const catalogGeneration = useRef(0);
   const failedPublicationGeneration = useRef(0);
@@ -193,12 +197,20 @@ export function Images() {
     setRetryPublication(null);
   }, []);
 
+  const reloadCurrentWorkspace = useCallback(() => {
+    invalidateWorkspaceState();
+    setWorkspaceInput(routeWorkspace.current);
+    setCapabilityReload((current) => current + 1);
+  }, [invalidateWorkspaceState]);
+
   const selectWorkspace = useCallback(
-    (nextWorkspace) => {
+    async (nextWorkspace) => {
       if (nextWorkspace === requestedWorkspace) {
         setWorkspaceInput(nextWorkspace);
+        if (!capabilities) reloadCurrentWorkspace();
         return;
       }
+      const currentNavigation = ++navigationGeneration.current;
       invalidateWorkspaceState();
       setActiveTab('catalog');
       const query = { ...router.query };
@@ -206,14 +218,34 @@ export function Images() {
       else delete query.workspace;
       delete query.image;
       delete query.tab;
-      router.replace({ pathname: '/images', query }, undefined, {
-        shallow: true,
-      });
+      let navigated = false;
+      try {
+        navigated =
+          (await router.replace({ pathname: '/images', query }, undefined, {
+            shallow: true,
+          })) !== false;
+      } catch {
+        navigated = false;
+      }
+      if (
+        navigated ||
+        navigationGeneration.current !== currentNavigation ||
+        routeWorkspace.current !== requestedWorkspace
+      )
+        return;
+      reloadCurrentWorkspace();
     },
-    [invalidateWorkspaceState, requestedWorkspace, router]
+    [
+      capabilities,
+      invalidateWorkspaceState,
+      reloadCurrentWorkspace,
+      requestedWorkspace,
+      router,
+    ]
   );
 
   useEffect(() => {
+    navigationGeneration.current += 1;
     const workspaceChanged = lastWorkspace.current !== requestedWorkspace;
     lastWorkspace.current = requestedWorkspace;
     setWorkspaceInput(requestedWorkspace);
@@ -256,13 +288,14 @@ export function Images() {
         });
       });
     return () => {
+      navigationGeneration.current += 1;
       capabilityGeneration.current += 1;
       controller.abort();
       if (capabilityController.current === controller) {
         capabilityController.current = null;
       }
     };
-  }, [invalidateWorkspaceState, requestedWorkspace]);
+  }, [capabilityReload, invalidateWorkspaceState, requestedWorkspace]);
 
   const loadCatalog = useCallback(async () => {
     if (!capabilities) return;

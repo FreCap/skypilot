@@ -2122,6 +2122,23 @@ failed A-to-B capability request therefore cannot leave workspace A controls,
 rows, dialogs, or errors visible or actionable, even when the same user is
 authorized in both workspaces.
 
+Artifact-detail state is scoped by the compound route identity
+`(requested_workspace, artifact_id)`. Detail data, capabilities, collection
+pages and cursors, errors, tabs, and mutation dialogs render only while that
+identity exactly matches the current route. A route-identity change fences the
+old state during render, before effects run, then aborts old detail and
+collection requests, closes dialogs, and resets scoped navigation. A failed
+replacement request may retain cached data only for the same compound identity;
+it can never restore data or controls from the previous identity.
+
+Workspace selection is a recoverable navigation transaction. The Dashboard
+hides the old scope before requesting the route change, but owns the
+`router.replace` result. A rejected navigation or an explicit `false` result
+reloads the unchanged route workspace and restores its selector value. Applying
+the current workspace is a no-op only while current capabilities exist;
+otherwise it restarts capability loading. A superseded navigation result cannot
+reload an older route.
+
 Status labels never conflate layers:
 
 - publication `PENDING|INSPECTING|READY|FAILED`;
@@ -2519,7 +2536,13 @@ drained and every image table is empty; it is never part of Helm rollback.
   fail before health or provider work when any central schema is stale;
 - Dashboard A-to-B workspace-switch tests with workspace A already rendered,
   proving both pending and failed capability replacement immediately remove A's
-  data, mutation controls, open dialogs, retries, and hidden errors;
+  data, mutation controls, open dialogs, retries, and hidden errors, plus
+  rejected and `false` route-navigation tests proving the unchanged workspace
+  reloads instead of remaining blank;
+- Dashboard artifact-detail route tests proving workspace-only, artifact-only,
+  and compound identity changes synchronously remove the previous data,
+  collection state, mutation controls, and open dialogs, and that a replacement
+  failure cannot restore them;
 - managed-runtime architecture tests rejecting ARM64 and unknown EC2
   placements, rejecting missing or non-AMD64 EKS selectors, accepting an
   unknown EKS placement only with its exact qualified AMD64 selector, and
@@ -3156,3 +3179,17 @@ entrypoints verify every central schema before health, and request-scopes plus
 synchronously invalidates all Dashboard workspace state. The acceptance streak
 remains zero until both reviewers accept one immutable current-base head three
 consecutive times.
+
+Paired final-acceptance round 1 at
+`ade35661185121fb02ac465b4230d6c40d84de09` returned Codex `RESHAPE`; Fable
+exhausted its usage quota after independently verifying the immutable identity,
+reading the complete design, and reproducing both backend suite counts, but
+before issuing a verdict. Codex re-proved the database-clock, profile-lock,
+worker-schema, AMD64 runtime, migration, provider-boundary, bounded-work, Helm,
+and deployment repairs. It reproduced two remaining Dashboard gaps:
+artifact-detail data and dialogs were generation-fenced but not bound to the
+current compound route identity, and Images cleared the current workspace before
+an unhandled rejected or `false` route replacement, leaving no dependency
+change to restart capabilities. This revision extends request scoping to the
+detail route and treats workspace navigation as a recoverable transaction. The
+acceptance streak remains zero.

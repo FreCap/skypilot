@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 import { Images } from '@/components/images';
 import {
@@ -76,6 +82,7 @@ describe('Images dashboard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRouter.query = {};
+    mockRouter.replace.mockResolvedValue(true);
     getWorkspaces.mockResolvedValue({ workspaces: ['research'] });
     getImageCatalog.mockResolvedValue(emptyPage);
     getImagePublications.mockResolvedValue(emptyPage);
@@ -390,5 +397,76 @@ describe('Images dashboard', () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Publish' })).toBeVisible();
     expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['rejects', 'returns false'])(
+    'reloads the unchanged workspace when route navigation %s',
+    async (failureMode) => {
+      mockRouter.query = { workspace: 'workspace-a' };
+      getImageCapabilities.mockResolvedValue(
+        capabilities({ workspace: 'workspace-a', publish: true })
+      );
+      if (failureMode === 'rejects') {
+        mockRouter.replace.mockRejectedValueOnce(
+          new Error('navigation failed')
+        );
+      } else {
+        mockRouter.replace.mockResolvedValueOnce(false);
+      }
+
+      render(<Images />);
+      expect(
+        await screen.findByRole('button', { name: 'Publish' })
+      ).toBeVisible();
+      fireEvent.change(screen.getByLabelText('Workspace'), {
+        target: { value: 'workspace-b' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Loading image workspace capabilities'
+      );
+      await waitFor(() =>
+        expect(getImageCapabilities).toHaveBeenCalledTimes(2)
+      );
+      expect(await screen.findByText('workspace-a')).toBeVisible();
+      expect(screen.getByLabelText('Workspace')).toHaveValue('workspace-a');
+      expect(screen.getByRole('button', { name: 'Publish' })).toBeVisible();
+    }
+  );
+
+  it('ignores a failed navigation after a newer route supersedes it', async () => {
+    const oldNavigation = deferred();
+    mockRouter.query = { workspace: 'workspace-a' };
+    getImageCapabilities
+      .mockResolvedValueOnce(
+        capabilities({ workspace: 'workspace-a', publish: true })
+      )
+      .mockResolvedValueOnce(
+        capabilities({ workspace: 'workspace-c', publish: true })
+      );
+    mockRouter.replace.mockReturnValueOnce(oldNavigation.promise);
+
+    const view = render(<Images />);
+    expect(
+      await screen.findByRole('button', { name: 'Publish' })
+    ).toBeVisible();
+    fireEvent.change(screen.getByLabelText('Workspace'), {
+      target: { value: 'workspace-b' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    mockRouter.query = { workspace: 'workspace-c' };
+    view.rerender(<Images />);
+    expect(await screen.findByText('workspace-c')).toBeVisible();
+
+    await act(async () => {
+      oldNavigation.reject(new Error('superseded navigation failed'));
+      await oldNavigation.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('workspace-c')).toBeVisible();
+    expect(screen.getByLabelText('Workspace')).toHaveValue('workspace-c');
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
   });
 });
