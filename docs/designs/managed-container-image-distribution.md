@@ -1295,7 +1295,11 @@ history each use an exact partial or composite index matching their predicate
 and ordering. Artifact demand history uses a bidirectionally scanned B-tree on
 `(workspace, image_id, created_at, id)`, matching its newest-first keyset page
 without a population sort for either sparse or dense artifacts. Inventory
-matching has a shard-and-runtime-digest lookup index.
+matching has a shard-and-runtime-digest lookup index. Its 100,000-row scale test
+may raise the statement timeout only inside the committed fixture-population
+transaction. Sparse and dense `EXPLAIN ANALYZE` proofs run in a new transaction
+that inherits and explicitly asserts the engine's 15-second statement timeout;
+the fixture allowance cannot weaken the bounded-query gate.
 Cross-state pages use one matching partial index for the precise state set or a
 fixed number of per-state indexed heads followed by an in-memory bounded merge;
 they never sort the full table to return a bounded page. Canonical completion
@@ -3421,3 +3425,16 @@ ordinary qualification failure. This revision requires the entire bounded
 settling window after an ambiguous create, accumulates every late child, and
 preserves successor custody whenever the final poll cannot prove the complete
 retained set terminated. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`16ea1a2ddb6c569e9d0c3e7f8d4fc0fa901742a0` returned `RESHAPE`; Fable again
+could not start because its exact-model request returned HTTP 429 with zero
+tokens. Codex independently passed the repaired EC2 custody schedules and found
+no additional functional blocker, but proved that the 60-second local timeout
+for the 100,000-row artifact-demand fixture remained active for the sparse and
+dense `EXPLAIN ANALYZE` statements in the same transaction. The exact index and
+query shape were correct, but the documented 15-second bounded-query acceptance
+proof was not. This revision commits the relaxed fixture transaction before
+opening a new default-timeout transaction, asserts the restored 15-second
+ceiling, and only then executes both plan proofs. The acceptance streak remains
+zero.

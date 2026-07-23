@@ -2928,6 +2928,12 @@ def test_artifact_demand_history_is_index_bounded_for_sparse_and_dense_images(
                 'seed_demand_id': seed.id,
             })
         connection.execute(sqlalchemy.text('ANALYZE container_image_demands'))
+
+    # End the fixture-only timeout before proving the production query. A new
+    # transaction must inherit the engine's ordinary 15-second ceiling.
+    with image_database.begin() as connection:
+        assert connection.execute(
+            sqlalchemy.text('SHOW statement_timeout')).scalar_one() == '15s'
         plans = []
         for image_id in (seed.image_id, other_image_id):
             plans.append(
