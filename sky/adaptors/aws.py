@@ -139,6 +139,28 @@ def session(check_credentials: bool = True, profile: str | None = None):
     return s
 
 
+def session_with_client_defaults(*,
+                                 connect_timeout: int,
+                                 read_timeout: int,
+                                 total_max_attempts: int,
+                                 profile: str | None = None):
+    """Creates an uncached session with bounds inherited by credential clients.
+
+    Botocore credential providers can lazily create their own STS clients while
+    signing a caller-created client request. Setting only the caller's Config
+    does not constrain those nested clients. Install the defaults on the
+    botocore session before its credential-provider chain is constructed.
+    """
+    config = botocore_config().Config(
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        retries={'total_max_attempts': total_max_attempts})
+    with _session_creation_lock:
+        core_session = botocore.session.Session(profile=profile)
+        core_session.set_default_client_config(config)
+        return boto3.session.Session(botocore_session=core_session)
+
+
 # New typing overloads can be added as needed.
 @typing.overload
 def resource(service_name: Literal['ec2'],

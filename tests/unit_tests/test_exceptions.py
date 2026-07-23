@@ -350,6 +350,95 @@ def test_builtin_exception_with_notes_round_trips():
     assert deserialized.__notes__ == ["when serializing dict item 'bad'"]
 
 
+def test_raised_exception_context_round_trips_and_reserializes_exactly():
+    original = None
+    try:
+        raise ValueError('inner failure')
+    except ValueError:
+        try:
+            # Implicit chaining is the behavior under test.
+            # pylint: disable-next=raise-missing-from
+            raise exceptions.ResourcesUnavailableError('outer failure',
+                                                       no_failover=True)
+        except exceptions.ResourcesUnavailableError as error:
+            original = error
+
+    assert original is not None
+    serialized = exceptions.serialize_exception(original)
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert isinstance(restored, exceptions.ResourcesUnavailableError)
+    assert restored.no_failover is True
+    assert isinstance(restored.__context__, ValueError)
+    assert str(restored.__context__) == 'inner failure'
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_unsafe_nested_exception_context_uses_safe_wire_type():
+
+    class MockBotoError(Exception):
+        pass
+
+    MockBotoError.__module__ = 'botocore.exceptions'
+    outer = RuntimeError('outer')
+    outer.__context__ = MockBotoError('provider failure')
+
+    serialized = exceptions.serialize_exception(outer)
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert serialized['context']['type'] == 'CloudError'
+    assert isinstance(restored.__context__, exceptions.CloudError)
+    assert restored.__context__.cloud_provider == 'botocore'
+    assert restored.__context__.error_type == 'MockBotoError'
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_exception_context_cycle_is_replaced_by_fixed_error():
+    outer = ValueError('outer')
+    inner = TypeError('inner')
+    outer.__context__ = inner
+    inner.__context__ = outer
+
+    serialized = exceptions.serialize_exception(outer)
+    cycle_tail = serialized['context']['context']
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert cycle_tail == exceptions._sanitized_exception_envelope()  # pylint: disable=protected-access
+    assert isinstance(restored.__context__, TypeError)
+    assert isinstance(restored.__context__.__context__, RuntimeError)
+    assert str(restored.__context__.__context__) == (
+        'Server error response is malformed.')
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_exception_context_depth_is_bounded_to_eight_levels():
+    errors = [ValueError(f'level-{index}') for index in range(10)]
+    for outer, inner in zip(errors, errors[1:]):
+        outer.__context__ = inner
+
+    serialized = exceptions.serialize_exception(errors[0])
+    current = serialized
+    for index in range(8):
+        assert current['type'] == 'ValueError'
+        assert current['message'] == f'level-{index}'
+        current = current['context']
+    assert current == exceptions._sanitized_exception_envelope()  # pylint: disable=protected-access
+
+
+def test_malformed_nested_context_is_sanitized_without_losing_outer_error():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'outer',
+        'args': ('outer',),
+        'attributes': {},
+        'context': ['not', 'an', 'envelope'],
+    })
+
+    assert isinstance(restored, ValueError)
+    assert isinstance(restored.__context__, RuntimeError)
+    assert str(restored.__context__) == 'Server error response is malformed.'
+
+
 def test_deserialize_tolerates_attribute_the_constructor_rejects():
     """A forward-version attribute must not mask the known error type."""
     deserialized = exceptions.deserialize_exception({
@@ -462,6 +551,8 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
                                 lambda cls=exception_class: cls('message'))
         error = factory()
         error.round_trip_context = {'class': exception_class.__name__}
+        error.__context__ = ValueError(
+            f'context for {exception_class.__name__}')
         error.add_note(f'note for {exception_class.__name__}')
         serialized = exceptions.serialize_exception(error)
 
@@ -471,4 +562,7 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
         assert restored.args == error.args
         assert str(restored) == str(error)
         assert restored.__dict__ == error.__dict__
+        assert isinstance(restored.__context__, ValueError)
+        assert str(
+            restored.__context__) == (f'context for {exception_class.__name__}')
         assert exceptions.serialize_exception(restored) == serialized

@@ -33,6 +33,19 @@ COMMAND_NOT_FOUND_EXIT_CODE = 127
 ARCH_NOT_SUPPORTED_EXIT_CODE = 133
 
 _MISSING_EXCEPTION_MESSAGE = object()
+_MISSING_EXCEPTION_CONTEXT = object()
+_MAX_EXCEPTION_CONTEXT_DEPTH = 8
+_MALFORMED_SERVER_ERROR = 'Server error response is malformed.'
+
+
+def _sanitized_exception_envelope() -> dict[str, Any]:
+    return {
+        'type': 'RuntimeError',
+        'message': _MALFORMED_SERVER_ERROR,
+        'args': (_MALFORMED_SERVER_ERROR,),
+        'attributes': {},
+        'stacktrace': None,
+    }
 
 
 def is_safe_exception(exc: BaseException) -> bool:
@@ -86,7 +99,20 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     into SkyPilot's CloudError before serialization to ensure clients can
     deserialize them without needing cloud provider packages installed.
     """
-    # Wrap unsafe exceptions before serialization
+    return _serialize_exception(e, depth=0, seen=set())
+
+
+def _serialize_exception(e: BaseException, *, depth: int,
+                         seen: set[int]) -> dict[str, Any]:
+    """Serializes one bounded exception context envelope."""
+    identity = id(e)
+    if identity in seen or depth >= _MAX_EXCEPTION_CONTEXT_DEPTH:
+        return _sanitized_exception_envelope()
+    next_seen = set(seen)
+    next_seen.add(identity)
+    context = e.__context__
+
+    # Wrap unsafe exceptions before serialization.
     e = wrap_exception(e)
 
     stacktrace = getattr(e, 'stacktrace', None)
@@ -116,6 +142,10 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
         # Keep Python 3.11+ exception notes out of constructor kwargs so older
         # clients can continue deserializing the payload.
         data['notes'] = notes
+    if context is not None:
+        data['context'] = _serialize_exception(context,
+                                               depth=depth + 1,
+                                               seen=next_seen)
     return data
 
 
@@ -230,36 +260,47 @@ def deserialize_exception(serialized: Any) -> Exception:
     Handles non-standard inputs gracefully (None, str, partial dicts) to
     avoid crashing when the server returns unexpected error responses.
     """
+    return _deserialize_exception(serialized, depth=0, seen=set())
+
+
+def _deserialize_exception(serialized: Any, *, depth: int,
+                           seen: set[int]) -> Exception:
+    """Deserializes one bounded exception context envelope."""
     if serialized is None:
         return RuntimeError('Unknown server error (no detail in response)')
     if isinstance(serialized, str):
         return RuntimeError(serialized)
     if not isinstance(serialized, dict) or 'type' not in serialized:
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
+    identity = id(serialized)
+    if identity in seen or depth >= _MAX_EXCEPTION_CONTEXT_DEPTH:
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
+    next_seen = set(seen)
+    next_seen.add(identity)
     exception_type = serialized['type']
     if not isinstance(exception_type, str):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     args = serialized.get('args', ())
     if not isinstance(args, (list, tuple)):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     message = serialized.get('message', _MISSING_EXCEPTION_MESSAGE)
     if (message is not _MISSING_EXCEPTION_MESSAGE and
             not isinstance(message, str)):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     raw_attributes = serialized.get('attributes', {})
     if (not isinstance(raw_attributes, dict) or
             not all(isinstance(key, str) for key in raw_attributes)):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     if hasattr(builtins, exception_type):
         exception_class = getattr(builtins, exception_type)
     else:
         exception_class = globals().get(exception_type, None)
     if exception_class is None:
         # An older client must not reflect a future server's type or payload.
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     if (not isinstance(exception_class, type) or
             not issubclass(exception_class, BaseException)):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     attributes = dict(raw_attributes)
     legacy_notes = attributes.pop('__notes__', None)
     # Dunder entries are never constructor arguments, for a built-in or a
@@ -285,7 +326,7 @@ def deserialize_exception(serialized: Any) -> Exception:
         e = _restore_transformed_exception(exception_class, args, attributes,
                                            message)
         if e is None:
-            return RuntimeError('Server error response is malformed.')
+            return RuntimeError(_MALFORMED_SERVER_ERROR)
     else:
         _restore_exception_attributes(e, restorable_attributes)
         if (not hasattr(builtins, exception_type) and
@@ -293,9 +334,9 @@ def deserialize_exception(serialized: Any) -> Exception:
             e = _restore_transformed_exception(exception_class, args,
                                                attributes, message)
             if e is None:
-                return RuntimeError('Server error response is malformed.')
+                return RuntimeError(_MALFORMED_SERVER_ERROR)
     if not isinstance(e, Exception):
-        return RuntimeError('Server error response is malformed.')
+        return RuntimeError(_MALFORMED_SERVER_ERROR)
     _restore_exception_attributes(e, dunder_attributes)
     notes = serialized.get('notes', legacy_notes)
     if (isinstance(notes, list) and
@@ -309,6 +350,19 @@ def deserialize_exception(serialized: Any) -> Exception:
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         _restore_exception_attributes(e, {'stacktrace': stacktrace})
+    raw_context = serialized.get('context', _MISSING_EXCEPTION_CONTEXT)
+    if raw_context is not _MISSING_EXCEPTION_CONTEXT and raw_context is not None:
+        context: Exception
+        if not isinstance(raw_context, dict):
+            context = RuntimeError(_MALFORMED_SERVER_ERROR)
+        else:
+            context = _deserialize_exception(raw_context,
+                                             depth=depth + 1,
+                                             seen=next_seen)
+        try:
+            e.__context__ = context
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
     return e
 
 

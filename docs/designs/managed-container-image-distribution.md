@@ -1069,8 +1069,13 @@ work. The AWS adapter invokes the exact lease fence immediately before and after
 its STS `AssumeRole` request; caller-side checks alone are not credential
 fencing. Both STS authority acquisition and the assumed service client use an
 explicit 10-second connect timeout, 60-second read timeout, and one total
-attempt. A hidden SDK retry therefore cannot consume the canary custody budget
-or continue indefinitely after worker drain. The worker synchronously re-proves
+attempt. The botocore session that resolves the worker's ambient credentials
+inherits that same default client configuration before its credential-provider
+chain is constructed. Deferred IRSA `AssumeRoleWithWebIdentity`, profile-role,
+and other nested credential clients therefore cannot silently restore the SDK's
+longer retry policy while signing the explicit STS request. A hidden credential
+refresh or SDK retry cannot consume the canary custody budget or continue
+indefinitely after worker drain. The worker synchronously re-proves
 ownership in the hook immediately before every ECR call, records `DELETE` intent
 before the destructive call, and rechecks ownership again before database
 completion. Lease loss sets
@@ -1147,7 +1152,14 @@ is read-only, slotted, or otherwise unsettable is skipped without replacing the
 original error. Dunder attributes are never constructor arguments. Valid Python
 3.11 exception notes are emitted outside the attribute map for old-client
 compatibility, while the decoder also accepts the legacy attribute form and
-restores notes only after construction.
+restores notes only after construction. The real `BaseException.__context__`
+slot is a separate optional envelope field rather than an ordinary attribute.
+Context serialization applies the same safe-exception wrapping and canonical
+decoder rules recursively, stops at eight levels, and replaces a cycle,
+malformed nested envelope, or over-depth tail with the same fixed value-free
+`RuntimeError`. Restoring or reserializing a valid raised-inside-except chain
+therefore preserves its exact safe types and state without permitting an
+attacker-controlled type name or unbounded graph.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -2218,9 +2230,14 @@ observed at any boundary finishes only an already-open atomic transaction and
 exits without beginning more database or provider work. Submitted individual
 lease-owned operations drain through the executor; bounded qualification pages
 also stop between independent profile, target, reservation, and automatic
-runtime-canary scheduling items, and recheck stop between provider acquisition,
-provider proof, and the next database transaction. Lease fencing and durable
-state still own any ambiguous provider result.
+runtime-canary scheduling items. Copy-role qualification threads the same live
+predicate into each per-target and per-shard helper, its source-registry reader,
+every ECR provider fence, and the transfer cancellation event. Lifecycle-role
+qualification applies the predicate inside exact-delete request and readback,
+so a stop observed after a delete response cannot begin the later presence
+proof. Both roles recheck stop between provider acquisition, provider proof,
+and the next database transaction. Lease fencing and durable state still own
+any ambiguous provider result.
 
 The canary worker additionally passes the same stop event into every submitted
 canary. A task that has not created a provider child exits without launching
@@ -2252,14 +2269,27 @@ the provider wrapper. That wrapper proves the lease first, rechecks the deadline
 after any blocking heartbeat database round trip, and only then invokes the raw
 SDK call. A call that crosses the deadline makes cleanup unverified and no later
 provider call starts. EKS cleanup applies the same call-start ordering to its own
-bounded delete/read settling deadline. The canary Deployment enforces a
-termination grace of at least 600 seconds. The grace covers cancellation
+bounded delete/read settling deadline. Its canary-specific Kubernetes client
+executes kubeconfig `exec` credentials with a 15-second subprocess timeout,
+terminates a timed-out command, and removes transparent library-side exec
+refresh from the raw API call path. The wrapper caches the resulting credential
+only until its declared expiry or the configured kubeconfig refresh interval.
+Every refresh receives the current ordinary drain fence or cleanup deadline,
+rechecks that fence after credential acquisition, and only then invokes the raw
+Kubernetes method. Cleanup establishes its one 60-second deadline before any
+replacement client acquisition, so a missing or expired client cannot create a
+fresh auth budget outside teardown. Unsupported legacy auth-provider commands
+are rejected on this bounded EKS canary path rather than executed without a
+timeout. The canary Deployment enforces a termination grace of at least 600
+seconds. The grace covers cancellation
 observation, that 300-second EC2 settling budget, bounded provider-call overhead,
 and margin. The process exits immediately when cleanup completes, so the
 configured ceiling does not add a fixed rollout delay. The same drain applies to
 disable and scale-down. For `helm upgrade --reuse-values`, legacy value maps that
 omit the three worker grace keys render copy/lifecycle/canary defaults of
-30/30/600 seconds; an explicit canary value below 600 remains invalid. If the
+30/30/600 seconds. Null is treated as a legacy omission, while an explicit zero,
+non-integral value, string, or canary value below 600 remains invalid in both
+schema validation and the independent template guard. If the
 grace expires or bounded provider cleanup itself fails, the operation and
 concrete child identity remain RUNNING for lease-expiry recovery rather than
 being falsely terminalized.
@@ -2678,7 +2708,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   duplicate environment, volume, and mount-path collisions, excludes API-only
   inputs from the Job, mounts shared database TLS material into every database
   consumer, and keeps two same-namespace source-secret grants distinct under a
-  63-character fullname;
+  63-character fullname; schema-bypassed template tests independently reject
+  explicit zero, sub-600, non-integral, and string canary grace values;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
@@ -2686,10 +2717,14 @@ drained and every image table is empty; it is never part of Helm rollback.
   workers proving that shutdown begins no later maintenance, internal copy
   claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
   transaction, terminal-consumer query or transaction, qualification item, or
-  executor submission; provider-level canary drain tests proving cancellation
-  cannot create a new child, cannot begin an ordinary authority acquisition or
-  provider read after a lease heartbeat observes drain, always enters
-  uncancelled teardown for an owned child, and cannot terminalize success or
+  executor submission; per-target copy and per-shard qualification tests prove
+  stop after a provider proof cannot start the next database transaction or
+  shard, the source reader receives the live predicate, transfer cancellation
+  observes it without a snapshot, and lifecycle stop after a concluded delete
+  cannot begin exact readback; provider-level canary drain tests proving
+  cancellation cannot create a new child, cannot begin an ordinary authority
+  acquisition or provider read after a lease heartbeat observes drain, always
+  enters uncancelled teardown for an owned child, and cannot terminalize success or
   failure when shutdown arrives during verified cleanup; slow-provider tests
   proving EC2 settling passes one absolute deadline through the real fenced
   client, rechecks it after a heartbeat that crosses the deadline, treats an
@@ -2699,6 +2734,12 @@ drained and every image table is empty; it is never part of Helm rollback.
   stale token cannot release its successor; plus Helm rendering and schema tests
   enforcing the canary's 600-second minimum custody-cleanup grace and legacy
   `--reuse-values` defaults of 30/30/600;
+- real deferred-IRSA credential-provider tests proving its nested unsigned STS
+  client inherits 10/60/one-attempt defaults without making a network request;
+  real kubeconfig exec tests proving bounded success, hard timeout and process
+  termination, no transparent API-client refresh hook, ordinary refresh stopped
+  before a raw call, cleanup refresh stopped at the shared deadline, and
+  persisted-child drain entering cleanup-only before ordinary auth acquisition;
 - worker-clock skew and blocking-lock tests proving that copy and eviction
   claims, provider grants and throttles, retry delays, consumer terminal
   confirmation, unattached-cluster retention, worker cleanup, and terminal
@@ -2794,7 +2835,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   a known SkyPilot exception type, unsettable attributes cannot replace the
   original error, and every currently defined SkyPilot exception class has an
   exact serialize/deserialize round trip for type, arguments, message, notes,
-  and restorable ordinary state;
+  restorable ordinary state, and the real raised-inside-except context slot;
+  unsafe nested types use the safe wrapper, while cycles, malformed nested
+  envelopes, and chains beyond eight levels end in the fixed sanitized error;
 - Dashboard A-to-B workspace-switch tests with workspace A already rendered,
   proving both pending and failed capability replacement immediately remove A's
   data, mutation controls, open dialogs, retries, and hidden errors, plus
@@ -3647,3 +3690,18 @@ start later independent transactions after stop. This revision moves deadline
 and drain checks inside the provider fence and threads the stop predicate through
 every independently startable synchronous item. The acceptance streak remains
 zero.
+
+Codex final-acceptance round 1 at
+`15db7837245a07a632b1587ba8a0b0fbe649c58c` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request again reached its seven-day limit
+before using any token, so no paired acceptance was recorded. Codex verified
+the repaired canary deadline fence, compound maintenance stops, all 191 Helm
+tests, and the complete 26-check GitHub rollup, then reproduced five remaining
+cross-boundary defects. Per-target copy qualification dropped the live stop
+predicate inside provider and database work; deferred IRSA credential refresh
+could use botocore's longer retry defaults; kubeconfig exec acquisition and
+transparent refresh were outside EKS drain and cleanup fences; the real
+`BaseException.__context__` slot was not serialized; and the Helm template
+silently treated explicit zero as an omitted canary grace. This revision closes
+those boundaries together with one bounded credential design rather than adding
+caller-only checks. The acceptance streak remains zero.

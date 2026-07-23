@@ -42,12 +42,30 @@ logger = sky_logging.init_logger(__name__)
 _LeaseHeartbeat = worker_lease.LeaseHeartbeat
 
 
+class _QualificationDrainRequested(RuntimeError):
+    """Stops nondurable qualification work after process drain is observed."""
+
+
+def _raise_if_stopping(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise _QualificationDrainRequested()
+
+
 def _ecr_hooks(
     limiter: budgets.ProviderBudgetLimiter,
     shard: topology_state.ShardRecord,
+    provider_fence: Callable[[], None] | None = None,
 ) -> aws.EcrCallHooks:
     """Binds provider-budget callbacks to one immutable shard record."""
-    return aws.EcrCallHooks(before_call=lambda: limiter.before_call(shard),
+
+    def before_call() -> None:
+        if provider_fence is not None:
+            provider_fence()
+        limiter.before_call(shard)
+        if provider_fence is not None:
+            provider_fence()
+
+    return aws.EcrCallHooks(before_call=before_call,
                             on_throttle=lambda: limiter.record_throttle(shard))
 
 
@@ -442,6 +460,10 @@ def reconcile_qualification_lifecycle(
     """Deletes canaries only after every declared runtime tuple proved pull."""
     if should_stop is not None and should_stop():
         return False
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     revisions = topology_state.list_qualifying_profiles(include_active=True,
                                                         limit=limit)
     if should_stop is not None and should_stop():
@@ -497,8 +519,12 @@ def reconcile_qualification_lifecycle(
                     break
             if not runtime_ready:
                 continue
+            if should_stop is not None and should_stop():
+                return False
             shard = topology_state.get_target_shard(revision.workspace,
                                                     profile.name, target.name)
+            if should_stop is not None and should_stop():
+                return False
             if shard is None:
                 continue
             repository_name, repository_arn = (
@@ -506,17 +532,40 @@ def reconcile_qualification_lifecycle(
             binding = profile.bindings[target.qualification_delete_authority]
             if should_stop is not None and should_stop():
                 return False
-            repository = aws.EcrRepository.from_role(
-                _lifecycle_role(binding, profile),
-                target.region,
-                repository_name,
-                hooks=_ecr_hooks(limiter, shard))
+            try:
+                repository = aws.EcrRepository.from_role(
+                    _lifecycle_role(binding, profile),
+                    target.region,
+                    repository_name,
+                    hooks=_ecr_hooks(limiter,
+                                     shard,
+                                     provider_fence=provider_fence),
+                    provider_fence=provider_fence)
+            except _QualificationDrainRequested:
+                return False
             if should_stop is not None and should_stop():
                 return False
             digest = models.validate_sha256_digest(
                 copy_evidence['runtime_digest'], 'Qualification canary digest')
-            if not repository.exact_delete(digest):
-                continue
+            try:
+                request_outcome = repository.delete_request_outcome(digest)
+                _raise_if_stopping(should_stop)
+                if request_outcome != aws.DeleteRequestOutcome.CONCLUDED:
+                    raise aws.AmbiguousProviderOutcomeError(
+                        'ECR qualification deletion did not conclude.')
+                try:
+                    present = repository.exact_manifest_exists(digest)
+                except _QualificationDrainRequested:
+                    raise
+                except Exception as error:  # pylint: disable=broad-except
+                    raise aws.AmbiguousProviderOutcomeError(
+                        'ECR qualification deletion has no exact final '
+                        'presence proof.') from error
+                _raise_if_stopping(should_stop)
+                if present:
+                    continue
+            except _QualificationDrainRequested:
+                return False
             if should_stop is not None and should_stop():
                 return False
             revision = topology_state.record_profile_attestation(
@@ -547,6 +596,10 @@ def reconcile_failed_canonical_reservations(
     """Reclaims capacity only after an exact canonical-absence proof."""
     if should_stop is not None and should_stop():
         return False
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     locations = topology_state.list_failed_canonical_reap_candidates(
         limit=limit)
     if should_stop is not None and should_stop():
@@ -555,21 +608,29 @@ def reconcile_failed_canonical_reservations(
         if should_stop is not None and should_stop():
             return False
         shard = topology_state.get_shard(location.shard_id)
+        if should_stop is not None and should_stop():
+            return False
         if (shard is None or
                 shard.target_fingerprint != location.target_fingerprint):
             continue
         resolved = _profile_target_for_location(location, shard)
+        if should_stop is not None and should_stop():
+            return False
         if resolved is None:
             continue
         profile, target = resolved
         binding = profile.bindings[target.qualification_delete_authority]
         if should_stop is not None and should_stop():
             return False
-        repository = aws.EcrRepository.from_role(
-            _lifecycle_role(binding, profile),
-            shard.region,
-            shard.repository_name,
-            hooks=_ecr_hooks(limiter, shard))
+        try:
+            repository = aws.EcrRepository.from_role(
+                _lifecycle_role(binding, profile),
+                shard.region,
+                shard.repository_name,
+                hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+                provider_fence=provider_fence)
+        except _QualificationDrainRequested:
+            return False
         if should_stop is not None and should_stop():
             return False
         try:
@@ -585,6 +646,8 @@ def reconcile_failed_canonical_reservations(
         except (aws.ProviderThrottledError,
                 budgets.ProviderBudgetUnavailableError):
             continue
+        except _QualificationDrainRequested:
+            return False
         except Exception:  # pylint: disable=broad-except
             continue
     return True

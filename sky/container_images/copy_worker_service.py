@@ -50,6 +50,27 @@ _QUALIFICATION_ACTOR_HASH = hashlib.sha256(
 logger = sky_logging.init_logger(__name__)
 
 
+class _QualificationDrainRequested(RuntimeError):
+    """Stops nondurable qualification work after process drain is observed."""
+
+
+def _raise_if_stopping(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise _QualificationDrainRequested()
+
+
+class _StopPredicateEvent(threading.Event):
+    """Exposes a live stop predicate to transfer code expecting an Event."""
+
+    def __init__(self, should_stop: Callable[[], bool] | None) -> None:
+        super().__init__()
+        self._should_stop = should_stop
+
+    def is_set(self) -> bool:
+        return (super().is_set() or
+                (self._should_stop is not None and self._should_stop()))
+
+
 def _qualification_database_epoch(*, now: int | None = None) -> int:
     """Returns the shared clock used by qualification freshness checks."""
     with orm.Session(catalog_state.engine()) as session:
@@ -334,14 +355,19 @@ def _ecr_hooks(
     limiter: budgets.ProviderBudgetLimiter,
     shard: topology_state.ShardRecord,
     heartbeat: worker_lease.LeaseHeartbeat | None = None,
+    provider_fence: Callable[[], None] | None = None,
 ) -> aws.EcrCallHooks:
 
     def before_call() -> None:
         if heartbeat is not None:
             heartbeat.assert_owned()
+        if provider_fence is not None:
+            provider_fence()
         limiter.before_call(shard)
         if heartbeat is not None:
             heartbeat.assert_owned()
+        if provider_fence is not None:
+            provider_fence()
 
     return aws.EcrCallHooks(before_call=before_call,
                             on_throttle=lambda: limiter.record_throttle(shard))
@@ -627,18 +653,26 @@ def _reconcile_candidate_shard_attestation(
     limiter: budgets.ProviderBudgetLimiter,
     now: int,
     state_now: int | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """Probes one candidate authority without mutating operational inventory."""
+    _raise_if_stopping(should_stop)
     if revision.state != models.ImageProfileState.QUALIFYING:
         return True
     shards = topology_state.list_target_shards(revision.workspace, profile.name,
                                                target.name)
+    _raise_if_stopping(should_stop)
     if (len(shards) != target.shard_count or
             any(shard.target_fingerprint != target.target_fingerprint
                 for shard in shards)):
         return False
     probed = 0
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     for shard in shards:
+        _raise_if_stopping(should_stop)
         live_key, expected = _expected_shard_attestation(revision, shard)
         evidence = revision.attestations.get(live_key)
         if (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
@@ -657,22 +691,33 @@ def _reconcile_candidate_shard_attestation(
                 not 0 <= now - shard.inventory_completed_at <=
                 _CONFIG_REFRESH_SECONDS * 10):
             return False
+        _raise_if_stopping(should_stop)
         operational = topology_state.get_profile_revision(
             shard.profile_revision_id)
+        _raise_if_stopping(should_stop)
         if (operational is None or
                 operational.state != models.ImageProfileState.ACTIVE):
             return False
         binding = profile.bindings[target.write_authority]
         role = _aws_role(binding, profile, 'verify')
-        repository = aws.EcrRepository.from_role(role,
-                                                 shard.region,
-                                                 shard.repository_name,
-                                                 hooks=_ecr_hooks(
-                                                     limiter, shard))
-        verified = _matching_shard_metadata(repository, role, shard, expected)
+        _raise_if_stopping(should_stop)
+        repository = aws.EcrRepository.from_role(
+            role,
+            shard.region,
+            shard.repository_name,
+            hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+            provider_fence=provider_fence)
+        _raise_if_stopping(should_stop)
+        verified = _matching_shard_metadata(repository,
+                                            role,
+                                            shard,
+                                            expected,
+                                            provider_fence=provider_fence)
+        _raise_if_stopping(should_stop)
         if verified is None:
             return False
         metadata, applied_quota, headroom = verified
+        _raise_if_stopping(should_stop)
         recorded = topology_state.record_candidate_shard_attestation(
             profile_revision_id=revision.id,
             expected_generation=revision.desired_generation,
@@ -695,6 +740,7 @@ def _reconcile_candidate_shard_attestation(
                 'inventory_completed_at': shard.inventory_completed_at,
             },
             now=state_now)
+        _raise_if_stopping(should_stop)
         if recorded is None:
             return False
         probed += 1
@@ -730,32 +776,46 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
     return False
 
 
-def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
-                                 target: models.ManagedRegistryTarget,
-                                 *,
-                                 limiter: budgets.ProviderBudgetLimiter,
-                                 now: int | None = None) -> bool:
+def reconcile_qualification_copy(
+        revision: topology_state.ProfileRevisionRecord,
+        target: models.ManagedRegistryTarget,
+        *,
+        limiter: budgets.ProviderBudgetLimiter,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
+    _raise_if_stopping(should_stop)
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
+    _raise_if_stopping(should_stop)
     shard = topology_state.get_target_shard(revision.workspace, profile.name,
                                             target.name)
+    _raise_if_stopping(should_stop)
     if shard is None:
         return False
     repository_name, repository_arn = qualification.qualification_repository(
         revision, target)
     binding = profile.bindings[target.write_authority]
-    destination = aws.EcrRepository.from_role(_aws_role(binding, profile,
-                                                        'destination_write'),
-                                              target.region,
-                                              repository_name,
-                                              hooks=_ecr_hooks(limiter, shard))
+    _raise_if_stopping(should_stop)
+    destination = aws.EcrRepository.from_role(
+        _aws_role(binding, profile, 'destination_write'),
+        target.region,
+        repository_name,
+        hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+        provider_fence=provider_fence)
+    _raise_if_stopping(should_stop)
     metadata = destination.repository_metadata()
+    _raise_if_stopping(should_stop)
     expected_uri = f'{target.registry}/{repository_name}'
     if (metadata['repository_arn'] != repository_arn or
             metadata['repository_uri'] != expected_uri or
             metadata['tag_mutability'] != 'IMMUTABLE'):
         raise ValueError('Qualification repository live identity drifted.')
+    _raise_if_stopping(should_stop)
     revision = topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind=models.profile_attestation_key('infrastructure', target.name),
@@ -772,28 +832,40 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=now)
+    _raise_if_stopping(should_stop)
     candidate_now = _qualification_database_epoch(now=now)
+    _raise_if_stopping(should_stop)
     _reconcile_candidate_shard_attestation(revision,
                                            profile,
                                            target,
                                            limiter=limiter,
                                            now=candidate_now,
-                                           state_now=now)
+                                           state_now=now,
+                                           should_stop=should_stop)
+    _raise_if_stopping(should_stop)
     copy_due_now = _qualification_database_epoch(now=now)
+    _raise_if_stopping(should_stop)
     if not _qualification_copy_needed(revision, profile, target, copy_due_now):
         return True
     reader = providers.RegistryV2Source(profile.qualification.canary_ref,
-                                        lambda: None)
+                                        lambda: None,
+                                        provider_fence=provider_fence)
+    _raise_if_stopping(should_stop)
     graph = _inspection_graph(reader, profile.qualification.canary_platform,
                               profile.limits.max_artifact_bytes)
-    outcome = destination.copy_graph(graph, reader.read_blob, threading.Event())
+    _raise_if_stopping(should_stop)
+    outcome = destination.copy_graph(graph, reader.read_blob,
+                                     _StopPredicateEvent(should_stop))
+    _raise_if_stopping(should_stop)
     if (outcome == aws.CopyOutcome.AMBIGUOUS and
             not destination.verify_graph(graph)):
         raise aws.AmbiguousProviderOutcomeError(
             'Qualification canary copy requires readback retry.')
+    _raise_if_stopping(should_stop)
     if not destination.verify_graph(graph):
         raise aws.DestinationContentMismatchError(
             'Qualification canary did not verify after copy.')
+    _raise_if_stopping(should_stop)
     topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind=models.profile_attestation_key('copy', target.name),
@@ -809,6 +881,7 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=now)
+    _raise_if_stopping(should_stop)
     return True
 
 
@@ -838,8 +911,11 @@ def reconcile_qualification_profiles(
                 if reconcile_qualification_copy(revision,
                                                 target,
                                                 limiter=limiter,
-                                                now=now):
+                                                now=now,
+                                                should_stop=should_stop):
                     completed += 1
+            except _QualificationDrainRequested:
+                return completed
             except Exception:  # pylint: disable=broad-except
                 logger.warning('Managed image copy qualification probe failed.')
     return completed

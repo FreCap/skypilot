@@ -1,8 +1,19 @@
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
-{{- $copyTerminationGracePeriodSeconds := default 30 .Values.imageCopyWorker.terminationGracePeriodSeconds -}}
-{{- $lifecycleTerminationGracePeriodSeconds := default 30 .Values.imageLifecycleWorker.terminationGracePeriodSeconds -}}
-{{- $canaryTerminationGracePeriodSeconds := default 600 .Values.imageCanaryWorker.terminationGracePeriodSeconds -}}
+{{- $copyTerminationGracePeriodSeconds := 30 -}}
+{{- if and (hasKey .Values.imageCopyWorker "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.imageCopyWorker.terminationGracePeriodSeconds)) -}}
+{{- $copyTerminationGracePeriodSeconds = .Values.imageCopyWorker.terminationGracePeriodSeconds -}}
+{{- end -}}
+{{- $lifecycleTerminationGracePeriodSeconds := 30 -}}
+{{- if and (hasKey .Values.imageLifecycleWorker "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.imageLifecycleWorker.terminationGracePeriodSeconds)) -}}
+{{- $lifecycleTerminationGracePeriodSeconds = .Values.imageLifecycleWorker.terminationGracePeriodSeconds -}}
+{{- end -}}
+{{- $canaryTerminationGracePeriodSeconds := 600 -}}
+{{- $canaryTerminationGracePeriodSecondsConfigured := false -}}
+{{- if and (hasKey .Values.imageCanaryWorker "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.imageCanaryWorker.terminationGracePeriodSeconds)) -}}
+{{- $canaryTerminationGracePeriodSeconds = .Values.imageCanaryWorker.terminationGracePeriodSeconds -}}
+{{- $canaryTerminationGracePeriodSecondsConfigured = true -}}
+{{- end -}}
 {{- if and (or .Values.imageCopyWorker.enabled .Values.imageLifecycleWorker.enabled .Values.imageCanaryWorker.enabled) (not $databaseConfigured) -}}
 {{- fail "Managed image workers require external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
 {{- end -}}
@@ -14,6 +25,15 @@
 {{- end -}}
 {{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
 {{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- if and .Values.imageCanaryWorker.enabled $canaryTerminationGracePeriodSecondsConfigured -}}
+{{- $canaryGraceKind := kindOf $canaryTerminationGracePeriodSeconds -}}
+{{- if not (or (eq $canaryGraceKind "int") (eq $canaryGraceKind "int64") (eq $canaryGraceKind "float64")) -}}
+{{- fail "imageCanaryWorker.terminationGracePeriodSeconds must be an integer" -}}
+{{- end -}}
+{{- if ne (float64 $canaryTerminationGracePeriodSeconds) (floor (float64 $canaryTerminationGracePeriodSeconds)) -}}
+{{- fail "imageCanaryWorker.terminationGracePeriodSeconds must be an integer" -}}
+{{- end -}}
 {{- end -}}
 {{- if and .Values.imageCanaryWorker.enabled (lt (int $canaryTerminationGracePeriodSeconds) 600) -}}
 {{- fail "imageCanaryWorker.terminationGracePeriodSeconds must be at least 600 seconds" -}}

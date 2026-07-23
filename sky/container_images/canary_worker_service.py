@@ -34,6 +34,7 @@ _EC2_TEARDOWN_POLL_SECONDS = 5
 _EKS_TEARDOWN_SECONDS = 60
 _EKS_TEARDOWN_POLL_SECONDS = 2
 _EKS_ABSENCE_SETTLE_SECONDS = kubernetes.API_TIMEOUT + 1
+_KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS = 15
 _LeaseHeartbeat = worker_lease.LeaseHeartbeat
 _CANARY_ERROR_CODES = frozenset({
     'CANARY_DUPLICATE_CHILD',
@@ -79,6 +80,7 @@ class _FencedClient:
         self._heartbeat = heartbeat
 
     def _call(self,
+              method_name: str,
               value: Callable[..., Any],
               args: tuple[Any, ...],
               kwargs: dict[str, Any],
@@ -87,21 +89,27 @@ class _FencedClient:
               deadline_error: Callable[[], Exception] | None = None,
               drain_event: threading.Event | None = None,
               on_start: Callable[[], None] | None = None) -> Any:
-        self._heartbeat.assert_owned()
-        _raise_if_draining(drain_event)
-        if deadline is not None and time.monotonic() >= deadline:
-            if deadline_error is not None:
-                raise deadline_error()
-            raise ValueError('CANARY_TIMEOUT')
+
+        def provider_fence() -> None:
+            self._heartbeat.assert_owned()
+            _raise_if_draining(drain_event)
+            if deadline is not None and time.monotonic() >= deadline:
+                if deadline_error is not None:
+                    raise deadline_error()
+                raise ValueError('CANARY_TIMEOUT')
+
+        provider_fence()
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            return self._client.call_with_provider_fence(
+                method_name, provider_fence, on_start, *args, **kwargs)
         if on_start is not None:
             on_start()
         try:
             result = value(*args, **kwargs)
         except Exception:  # pylint: disable=broad-except
-            self._heartbeat.assert_owned()
+            provider_fence()
             raise
-        self._heartbeat.assert_owned()
-        _raise_if_draining(drain_event)
+        provider_fence()
         return result
 
     def __getattr__(self, name: str) -> Any:
@@ -110,7 +118,7 @@ class _FencedClient:
             return value
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            return self._call(value, args, kwargs)
+            return self._call(name, value, args, kwargs)
 
         return call
 
@@ -122,7 +130,11 @@ class _FencedClient:
         if not callable(value):
             raise TypeError(
                 f'Provider attribute {method_name!r} is not callable.')
-        return self._call(value, args, kwargs, drain_event=drain_event)
+        return self._call(method_name,
+                          value,
+                          args,
+                          kwargs,
+                          drain_event=drain_event)
 
     def call_before_deadline(self, method_name: str, deadline: float,
                              on_start: Callable[[], None], *args: Any,
@@ -132,7 +144,8 @@ class _FencedClient:
         if not callable(value):
             raise TypeError(
                 f'Provider attribute {method_name!r} is not callable.')
-        return self._call(value,
+        return self._call(method_name,
+                          value,
                           args,
                           kwargs,
                           deadline=deadline,
@@ -145,7 +158,8 @@ class _FencedClient:
         if not callable(value):
             raise TypeError(
                 f'Provider attribute {method_name!r} is not callable.')
-        return self._call(value,
+        return self._call(method_name,
+                          value,
                           args,
                           kwargs,
                           deadline=deadline,
@@ -195,26 +209,36 @@ def _assumed_client(
                                     region,
                                     provider_fence=provider_fence)
     except Exception:  # pylint: disable=broad-except
-        heartbeat.assert_owned()
+        provider_fence()
         raise
     provider_fence()
     return _FencedClient(client, heartbeat)
 
 
-def _kubernetes_core(
-        context: str,
-        heartbeat: worker_lease.LeaseHeartbeat,
-        *,
-        drain_event: threading.Event | None = None) -> _FencedClient:
-    heartbeat.assert_owned()
-    _raise_if_draining(drain_event)
-    try:
-        core = kubernetes.core_api(context)
-    except Exception:  # pylint: disable=broad-except
+def _kubernetes_core(context: str,
+                     heartbeat: worker_lease.LeaseHeartbeat,
+                     *,
+                     drain_event: threading.Event | None = None,
+                     cleanup_deadline: float | None = None) -> _FencedClient:
+
+    def provider_fence() -> None:
         heartbeat.assert_owned()
+        _raise_if_draining(drain_event)
+        if (cleanup_deadline is not None and
+                time.monotonic() >= cleanup_deadline):
+            raise _CanaryCleanupDeadlineExceeded()
+
+    provider_fence()
+    try:
+        core = kubernetes.provider_fenced_core_api(
+            context,
+            exec_credential_timeout_seconds=(
+                _KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS),
+            provider_fence=provider_fence)
+    except Exception:  # pylint: disable=broad-except
+        provider_fence()
         raise
-    heartbeat.assert_owned()
-    _raise_if_draining(drain_event)
+    provider_fence()
     return _FencedClient(core, heartbeat)
 
 
@@ -927,10 +951,15 @@ def _qualified_eks_nodes(
     return len(nodes), node_set_hash
 
 
-def _delete_eks_pod(core: Any, pod_name: str, namespace: str, *,
-                    settle_absence: bool) -> bool:
+def _delete_eks_pod(core: Any,
+                    pod_name: str,
+                    namespace: str,
+                    *,
+                    settle_absence: bool,
+                    cleanup_deadline: float | None = None) -> bool:
     """Deletes one deterministic pod and fences ambiguous late creation."""
-    cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
+    if cleanup_deadline is None:
+        cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
     try:
         _cleanup_provider_call(core,
                                'delete_namespaced_pod',
@@ -1086,10 +1115,7 @@ def _run_eks_canary(
     try:
         if not persisted_child:
             _raise_if_draining(drain_event)
-        core = _kubernetes_core(
-            context,
-            heartbeat,
-            drain_event=None if persisted_child else drain_event)
+        core = _kubernetes_core(context, heartbeat, drain_event=drain_event)
         _raise_if_draining(drain_event)
         deadline = _authorized_launch_deadline(operation,
                                                child_id,
@@ -1205,16 +1231,25 @@ def _run_eks_canary(
     finally:
         if not persisted_child and not create_attempted:
             teardown_verified = True
-        elif core is None:
-            heartbeat.assert_owned()
-            raise ValueError('CANARY_TEARDOWN_FAILED')
         else:
-            teardown_verified = _delete_eks_pod(
-                core,
-                pod_name,
-                namespace,
-                settle_absence=(persisted_child or
-                                (create_attempted and not create_confirmed)))
+            cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
+            if core is None:
+                try:
+                    core = _kubernetes_core(context,
+                                            heartbeat,
+                                            cleanup_deadline=cleanup_deadline)
+                except worker_lease.LeaseLostError:
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    core = None
+            if core is not None:
+                teardown_verified = _delete_eks_pod(
+                    core,
+                    pod_name,
+                    namespace,
+                    settle_absence=(persisted_child or (create_attempted and
+                                                        not create_confirmed)),
+                    cleanup_deadline=cleanup_deadline)
         if not teardown_verified:
             raise ValueError('CANARY_TEARDOWN_FAILED')
         _raise_if_draining(drain_event)

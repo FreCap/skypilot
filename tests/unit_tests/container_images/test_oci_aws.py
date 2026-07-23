@@ -707,31 +707,62 @@ def test_service_quota_calls_are_synchronously_provider_fenced(
 
 def test_ecr_role_acquisition_fences_actual_sts_boundary(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    ambient_credentials = mock.Mock()
+    ambient_credentials.get_frozen_credentials.return_value = (
+        types.SimpleNamespace(access_key='ambient-access',
+                              secret_key='ambient-secret',
+                              token='ambient-token'))
+    ambient_session = mock.Mock()
+    ambient_session.get_credentials.return_value = ambient_credentials
+    session_with_defaults = mock.Mock(return_value=ambient_session)
+    monkeypatch.setattr(aws.aws_adaptor, 'session_with_client_defaults',
+                        session_with_defaults)
+    monkeypatch.setattr(aws.aws_adaptor, 'get_workspace_profile',
+                        lambda: 'worker-profile')
     sts = mock.Mock()
-    client = mock.Mock(return_value=sts)
-    monkeypatch.setattr(aws.aws_adaptor, 'client', client)
+    sts_session = mock.Mock()
+    sts_session.client.return_value = sts
+    boto_session = mock.Mock(return_value=sts_session)
+    monkeypatch.setattr(aws.aws_adaptor.boto3, 'Session', boto_session)
     binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
                                  external_id=None,
                                  session_name='test',
                                  catalog_tag='catalog',
                                  profile_tag='profile')
-    lost = mock.Mock(side_effect=RuntimeError('lease lost at STS boundary'))
+    lost = mock.Mock(side_effect=[
+        None,
+        None,
+        None,
+        None,
+        RuntimeError('lease lost at STS boundary'),
+    ])
 
     with pytest.raises(RuntimeError, match='lease lost at STS boundary'):
         aws.EcrRepository.from_role(binding,
                                     'us-east-1',
                                     'skypilot/images/shard',
                                     provider_fence=lost)
-    lost.assert_called_once_with()
+    assert lost.call_count == 5
     sts.assume_role.assert_not_called()
-    client.assert_called_once_with('sts',
-                                   connect_timeout=10,
-                                   read_timeout=60,
-                                   total_max_attempts=1)
+    session_with_defaults.assert_called_once_with(connect_timeout=10,
+                                                  read_timeout=60,
+                                                  total_max_attempts=1,
+                                                  profile='worker-profile')
 
 
 def test_assumed_client_bounds_sts_and_service_sdk_attempts(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    ambient_credentials = mock.Mock()
+    ambient_credentials.get_frozen_credentials.return_value = (
+        types.SimpleNamespace(access_key='ambient-access',
+                              secret_key='ambient-secret',
+                              token='ambient-token'))
+    ambient_session = mock.Mock()
+    ambient_session.get_credentials.return_value = ambient_credentials
+    session_with_defaults = mock.Mock(return_value=ambient_session)
+    monkeypatch.setattr(aws.aws_adaptor, 'session_with_client_defaults',
+                        session_with_defaults)
+    monkeypatch.setattr(aws.aws_adaptor, 'get_workspace_profile', lambda: None)
     sts = mock.Mock()
     sts.assume_role.return_value = {
         'Credentials': {
@@ -740,12 +771,12 @@ def test_assumed_client_bounds_sts_and_service_sdk_attempts(
             'SessionToken': 'token',
         }
     }
-    adaptor_client = mock.Mock(return_value=sts)
-    monkeypatch.setattr(aws.aws_adaptor, 'client', adaptor_client)
-    session = mock.Mock()
-    session.client.return_value = mock.sentinel.ecr
-    monkeypatch.setattr(aws.aws_adaptor.boto3, 'Session',
-                        mock.Mock(return_value=session))
+    sts_session = mock.Mock()
+    sts_session.client.return_value = sts
+    service_session = mock.Mock()
+    service_session.client.return_value = mock.sentinel.ecr
+    boto_session = mock.Mock(side_effect=[sts_session, service_session])
+    monkeypatch.setattr(aws.aws_adaptor.boto3, 'Session', boto_session)
     binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
                                  external_id=None,
                                  session_name='test',
@@ -754,14 +785,55 @@ def test_assumed_client_bounds_sts_and_service_sdk_attempts(
 
     assert aws.assumed_client(binding, 'ecr', 'us-east-1') is mock.sentinel.ecr
 
-    adaptor_client.assert_called_once_with('sts',
-                                           connect_timeout=10,
-                                           read_timeout=60,
-                                           total_max_attempts=1)
-    config = session.client.call_args.kwargs['config']
-    assert config.connect_timeout == 10
-    assert config.read_timeout == 60
-    assert config.retries['total_max_attempts'] == 1
+    session_with_defaults.assert_called_once_with(connect_timeout=10,
+                                                  read_timeout=60,
+                                                  total_max_attempts=1,
+                                                  profile=None)
+    sts_config = sts_session.client.call_args.kwargs['config']
+    service_config = service_session.client.call_args.kwargs['config']
+    for config in (sts_config, service_config):
+        assert config.connect_timeout == 10
+        assert config.read_timeout == 60
+        assert config.retries['total_max_attempts'] == 1
+
+
+def test_deferred_irsa_nested_sts_inherits_worker_client_bounds(
+        monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    token_file = tmp_path / 'web-identity-token'
+    token_file.write_text('test-token', encoding='utf-8')
+    for variable in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+                     'AWS_SESSION_TOKEN', 'AWS_PROFILE'):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv('AWS_EC2_METADATA_DISABLED', 'true')
+    monkeypatch.setenv('AWS_ROLE_ARN',
+                       'arn:aws:iam::123456789012:role/image-worker')
+    monkeypatch.setenv('AWS_WEB_IDENTITY_TOKEN_FILE', str(token_file))
+    monkeypatch.setenv('AWS_ROLE_SESSION_NAME', 'image-worker')
+    monkeypatch.setenv('AWS_DEFAULT_REGION', 'us-east-1')
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(tmp_path / 'missing-config'))
+    monkeypatch.setenv('AWS_SHARED_CREDENTIALS_FILE',
+                       str(tmp_path / 'missing-credentials'))
+
+    session = aws.aws_adaptor.session_with_client_defaults(connect_timeout=10,
+                                                           read_timeout=60,
+                                                           total_max_attempts=1)
+    credentials = session.get_credentials()
+
+    assert credentials is not None
+    assert credentials.method == 'assume-role-with-web-identity'
+    # Inspect the real deferred provider without refreshing it over the network.
+    fetcher = credentials._refresh_using.__self__  # pylint: disable=protected-access
+    nested_sts = fetcher._client_creator(  # pylint: disable=protected-access
+        'sts',
+        config=aws.aws_adaptor.botocore.config.Config(
+            signature_version=aws.aws_adaptor.botocore.UNSIGNED))
+    try:
+        config = nested_sts.meta.config
+        assert config.connect_timeout == 10
+        assert config.read_timeout == 60
+        assert config.retries['total_max_attempts'] == 1
+    finally:
+        nested_sts.close()
 
 
 def test_ecr_sdk_client_is_fenced_before_and_after_each_call() -> None:

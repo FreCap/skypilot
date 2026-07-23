@@ -727,6 +727,20 @@ def assumed_client(
     provider_fence: Callable[[], None] | None = None,
 ) -> Any:
     """Mints one short-lived role session for a bounded worker adapter."""
+
+    def fenced_provider_call(call: Callable[[], Any]) -> Any:
+        if provider_fence is not None:
+            provider_fence()
+        try:
+            result = call()
+        except Exception:
+            if provider_fence is not None:
+                provider_fence()
+            raise
+        if provider_fence is not None:
+            provider_fence()
+        return result
+
     assume_kwargs: dict[str, Any] = {
         'RoleArn': binding.role_arn,
         'RoleSessionName': binding.session_name,
@@ -741,15 +755,30 @@ def assumed_client(
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
-    sts = aws_adaptor.client('sts',
-                             connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
-                             read_timeout=_AWS_READ_TIMEOUT_SECONDS,
-                             total_max_attempts=_AWS_TOTAL_MAX_ATTEMPTS)
-    if provider_fence is not None:
-        provider_fence()
-    response = sts.assume_role(**assume_kwargs)
-    if provider_fence is not None:
-        provider_fence()
+    ambient_session = aws_adaptor.session_with_client_defaults(
+        connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+        total_max_attempts=_AWS_TOTAL_MAX_ATTEMPTS,
+        profile=aws_adaptor.get_workspace_profile())
+    credentials = fenced_provider_call(ambient_session.get_credentials)
+    if credentials is None:
+        raise aws_adaptor.botocore_exceptions().NoCredentialsError()
+    # Force deferred IRSA/profile-role refresh to finish under the bounded
+    # botocore-session defaults, then fence again before the explicit STS call.
+    frozen = fenced_provider_call(credentials.get_frozen_credentials)
+    sts_session = aws_adaptor.boto3.Session(
+        aws_access_key_id=frozen.access_key,
+        aws_secret_access_key=frozen.secret_key,
+        aws_session_token=frozen.token,
+        region_name=region)
+    sts = cast(Any, sts_session).client(
+        'sts',
+        region_name=region,
+        config=aws_adaptor.botocore.config.Config(
+            connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS}))
+    response = fenced_provider_call(lambda: sts.assume_role(**assume_kwargs))
     credentials = response['Credentials']
     session = aws_adaptor.boto3.Session(
         aws_access_key_id=credentials['AccessKeyId'],

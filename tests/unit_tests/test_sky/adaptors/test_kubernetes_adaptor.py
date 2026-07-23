@@ -1,8 +1,11 @@
 """Tests for Kubernetes adaptor."""
+# pylint: disable=protected-access
 
 import concurrent.futures
 import gc
+import json
 import os
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -125,7 +128,7 @@ def test_kubeconfig_refresh_interval_refreshes_client(monkeypatch):
     """
     api_clients = []
 
-    def track_get_api_client(context=None):
+    def track_get_api_client(_context=None):
         mock_client = MagicMock()
         api_clients.append(mock_client)
         return mock_client
@@ -164,7 +167,7 @@ def test_kubeconfig_refresh_interval_no_refresh_when_interval_not_elapsed(
     """When interval has not elapsed, no refresh runs (single client)."""
     api_clients = []
 
-    def track_get_api_client(context=None):
+    def track_get_api_client(_context=None):
         mock_client = MagicMock()
         api_clients.append(mock_client)
         return mock_client
@@ -214,6 +217,122 @@ def test_kubeconfig_refresh_interval_invalid_value_disables_refresh(
 
     interval = kubernetes._get_kubeconfig_refresh_interval_seconds()  # pylint: disable=protected-access
     assert interval == 0.0
+
+
+def _write_exec_kubeconfig(tmp_path, script):
+    path = tmp_path / 'exec-kubeconfig.json'
+    path.write_text(json.dumps({
+        'apiVersion': 'v1',
+        'kind': 'Config',
+        'clusters': [{
+            'cluster': {
+                'server': 'https://bounded.example.test',
+                'insecure-skip-tls-verify': True,
+            },
+            'name': 'bounded-cluster',
+        }],
+        'contexts': [{
+            'context': {
+                'cluster': 'bounded-cluster',
+                'user': 'bounded-user',
+            },
+            'name': 'bounded-context',
+        }],
+        'current-context': 'bounded-context',
+        'users': [{
+            'name': 'bounded-user',
+            'user': {
+                'exec': {
+                    'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                    'command': sys.executable,
+                    'args': ['-c', script],
+                },
+            },
+        }],
+    }),
+                    encoding='utf-8')
+    return path
+
+
+def test_bounded_core_api_exec_credential_has_no_transparent_refresh(
+        monkeypatch, tmp_path):
+    response = json.dumps({
+        'apiVersion': 'client.authentication.k8s.io/v1beta1',
+        'kind': 'ExecCredential',
+        'status': {
+            'token': 'bounded-token',
+            'expirationTimestamp': '2099-01-01T00:00:00Z',
+        },
+    })
+    path = _write_exec_kubeconfig(
+        tmp_path, f'import sys; sys.stdout.write({response!r})')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    fences = []
+
+    core, expires_at = kubernetes._bounded_core_api(  # pylint: disable=protected-access
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: fences.append('fence'))
+    try:
+        configuration = core.api_client.configuration
+        assert configuration.host == 'https://bounded.example.test'
+        assert configuration.api_key['authorization'] == (
+            'Bearer bounded-token')
+        assert configuration.refresh_api_key_hook is None
+        assert expires_at == 4070908800.0
+        assert fences == ['fence'] * 4
+    finally:
+        core.api_client.close()
+
+
+def test_bounded_core_api_terminates_timed_out_exec_credential(
+        monkeypatch, tmp_path):
+    path = _write_exec_kubeconfig(tmp_path, 'import time; time.sleep(60)')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    started = time.monotonic()
+
+    with pytest.raises(config_exception, match='bounded timeout'):
+        kubernetes._bounded_core_api(  # pylint: disable=protected-access
+            'bounded-context',
+            exec_credential_timeout_seconds=0.05,
+            provider_fence=lambda: None)
+
+    assert time.monotonic() - started < 2
+
+
+def test_provider_fenced_core_refresh_observes_new_stop_before_raw_call(
+        monkeypatch):
+    initial = SimpleNamespace(api_client=MagicMock(), list_node=MagicMock())
+    replacement = SimpleNamespace(api_client=MagicMock(), list_node=MagicMock())
+    stopped = False
+    build_count = 0
+
+    def build(*_args, **_kwargs):
+        nonlocal build_count, stopped
+        build_count += 1
+        if build_count == 1:
+            return initial, None
+        stopped = True
+        return replacement, None
+
+    def provider_fence():
+        if stopped:
+            raise RuntimeError('worker stopped')
+
+    monkeypatch.setattr(kubernetes, '_bounded_core_api', build)
+    core = kubernetes.ProviderFencedCoreApi('bounded-context',
+                                            exec_credential_timeout_seconds=2,
+                                            provider_fence=provider_fence)
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+
+    with pytest.raises(RuntimeError, match='worker stopped'):
+        core.call_with_provider_fence('list_node', provider_fence, None)
+
+    initial.list_node.assert_not_called()
+    replacement.list_node.assert_not_called()
+    replacement.api_client.close.assert_called_once_with()
 
 
 def _create_test_kubeconfig(num_contexts):

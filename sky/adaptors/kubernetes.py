@@ -11,9 +11,12 @@ kubeconfig (e.g. for short-lived certs).
 """
 from collections.abc import Callable
 import functools
+import json
 import logging
 import os
 import platform
+import subprocess
+import sys
 import threading
 import time
 import typing
@@ -58,6 +61,7 @@ IN_CLUSTER_CONTEXT_NAME_ENV_VAR = 'SKYPILOT_IN_CLUSTER_CONTEXT_NAME'
 # interval.
 KUBECONFIG_REFRESH_INTERVAL_ENV_VAR = (
     'SKYPILOT_KUBECONFIG_REFRESH_INTERVAL_SECONDS')
+_MAX_EXEC_CREDENTIAL_OUTPUT_BYTES = 1024 * 1024
 
 logger = sky_logging.init_logger(__name__)
 
@@ -205,6 +209,262 @@ def _get_api_client(context: str | None = None) -> Any:
             # Otherwise, if context is None, fall through to kubeconfig
 
     return _get_api_client_from_kubeconfig(context)
+
+
+def _run_bounded_exec_credential(
+        exec_config: Any, cluster: Any, cwd: str | None, *,
+        timeout_seconds: float,
+        provider_fence: Callable[[], None]) -> dict[str, Any]:
+    """Runs one kubeconfig exec credential command with a hard timeout."""
+    config_error_cls = kubernetes.config.config_exception.ConfigException
+    for key in ('command', 'apiVersion'):
+        if key not in exec_config:
+            raise config_error_cls(
+                f'exec: malformed request. missing key {key!r}')
+    if timeout_seconds <= 0:
+        raise ValueError('Kubernetes exec credential timeout must be positive.')
+    args = [exec_config['command']]
+    if exec_config.safe_get('args'):
+        args.extend(exec_config['args'])
+    env = os.environ.copy()
+    if exec_config.safe_get('env'):
+        for item in exec_config['env']:
+            env[item['name']] = item['value']
+    is_interactive = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+    exec_info: dict[str, Any] = {
+        'apiVersion': exec_config['apiVersion'],
+        'kind': 'ExecCredential',
+        'spec': {
+            'interactive': is_interactive,
+        },
+    }
+    if exec_config.safe_get('provideClusterInfo'):
+        cluster_value = cluster.value
+        for extension in cluster_value.get('extensions', []):
+            if extension.get('name') == 'client.authentication.k8s.io/exec':
+                cluster_value['config'] = extension.get('extension')
+                break
+        exec_info['spec']['cluster'] = cluster_value
+    env['KUBERNETES_EXEC_INFO'] = json.dumps(exec_info)
+    provider_fence()
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=(sys.stderr if is_interactive else subprocess.PIPE),
+        stdin=sys.stdin if is_interactive else None,
+        cwd=cwd or None,
+        env=env,
+        text=True,
+        shell=platform.system() == 'Windows')
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        process.terminate()
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        raise config_error_cls(
+            'exec: credential command exceeded its bounded timeout') from error
+    provider_fence()
+    if process.returncode != 0:
+        message = f'exec: process returned {process.returncode}'
+        if isinstance(stderr, str) and stderr.strip():
+            message += f'. {stderr.strip()}'
+        raise config_error_cls(message)
+    if len(stdout.encode()) > _MAX_EXEC_CREDENTIAL_OUTPUT_BYTES:
+        raise config_error_cls('exec: credential response exceeds 1 MiB')
+    try:
+        payload = json.loads(stdout)
+    except ValueError as error:
+        raise config_error_cls(
+            f'exec: failed to decode process output: {error}') from error
+    if not isinstance(payload, dict):
+        raise config_error_cls('exec: malformed response object')
+    for key in ('apiVersion', 'kind', 'status'):
+        if key not in payload:
+            raise config_error_cls(
+                f'exec: malformed response. missing key {key!r}')
+    if payload['apiVersion'] != exec_config['apiVersion']:
+        raise config_error_cls(
+            f'exec: plugin api version {payload["apiVersion"]} does not match '
+            f'{exec_config["apiVersion"]}')
+    status = payload['status']
+    if not isinstance(status, dict):
+        raise config_error_cls('exec: malformed response status')
+    return status
+
+
+def _bounded_core_api(
+        context: str, *, exec_credential_timeout_seconds: float,
+        provider_fence: Callable[[], None]) -> tuple[Any, float | None]:
+    """Builds one CoreV1Api without a transparent unbounded exec refresh."""
+    provider_fence()
+    if context == in_cluster_context_name():
+        client_api = _get_api_client(context)
+        client_api.configuration.refresh_api_key_hook = None
+        core = kubernetes.client.CoreV1Api(api_client=client_api)
+        provider_fence()
+        return core, None
+
+    kube_config = kubernetes.config.kube_config
+    loader = kube_config._get_kube_config_loader_for_yaml_file(  # pylint: disable=protected-access
+        _get_config_file(),
+        active_context=context)
+    user = loader._user  # pylint: disable=protected-access
+    if user is None:
+        raise kubernetes.config.config_exception.ConfigException(
+            'Kubeconfig context has no user credentials.')
+    if 'auth-provider' in user:
+        raise kubernetes.config.config_exception.ConfigException(
+            'Bounded EKS canaries do not support kubeconfig auth-provider '
+            'credential commands.')
+    credential_expires_at: float | None = None
+    if 'exec' in user:
+        base_path = loader._get_base_path(  # pylint: disable=protected-access
+            loader._cluster.path)  # pylint: disable=protected-access
+        status = _run_bounded_exec_credential(
+            user['exec'],
+            loader._cluster,  # pylint: disable=protected-access
+            base_path,
+            timeout_seconds=exec_credential_timeout_seconds,
+            provider_fence=provider_fence)
+        del user.value['exec']
+        if isinstance(status.get('token'), str) and status['token']:
+            user.value['token'] = status['token']
+        elif (isinstance(status.get('clientCertificateData'), str) and
+              isinstance(status.get('clientKeyData'), str)):
+            loader.cert_file = kube_config.FileOrData(  # pylint: disable=protected-access
+                status,
+                None,
+                data_key_name='clientCertificateData',
+                file_base_path=base_path,
+                base64_file_content=False,
+                temp_file_path=loader._temp_file_path).as_file()  # pylint: disable=protected-access
+            loader.key_file = kube_config.FileOrData(  # pylint: disable=protected-access
+                status,
+                None,
+                data_key_name='clientKeyData',
+                file_base_path=base_path,
+                base64_file_content=False,
+                temp_file_path=loader._temp_file_path).as_file()  # pylint: disable=protected-access
+        else:
+            raise kubernetes.config.config_exception.ConfigException(
+                'exec: missing token or complete client certificate data')
+        expiration = status.get('expirationTimestamp')
+        if isinstance(expiration, str):
+            credential_expires_at = kube_config.parse_rfc3339(
+                expiration).timestamp()
+    configuration = kubernetes.client.Configuration()
+    loader.load_and_set(configuration)
+    # The canary wrapper owns every refresh so no library hook can reload the
+    # kubeconfig between its drain/deadline fence and the raw API call.
+    configuration.refresh_api_key_hook = None
+    provider_fence()
+    return (kubernetes.client.CoreV1Api(api_client=kubernetes.client.ApiClient(
+        configuration=configuration)), credential_expires_at)
+
+
+class ProviderFencedCoreApi:
+    """Refreshes bounded kubeconfig credentials before a fenced raw API call."""
+
+    def __init__(self, context: str, *, exec_credential_timeout_seconds: float,
+                 provider_fence: Callable[[], None]) -> None:
+        self._context = context
+        self._exec_credential_timeout_seconds = (
+            exec_credential_timeout_seconds)
+        self._refresh_lock = threading.Lock()
+        self._client, self._credential_expires_at = _bounded_core_api(
+            context,
+            exec_credential_timeout_seconds=exec_credential_timeout_seconds,
+            provider_fence=provider_fence)
+        self._last_refresh_time = time.time()
+
+    @property
+    def api_client(self) -> Any:
+        return self._client.api_client
+
+    def _should_refresh(self) -> bool:
+        interval = _get_kubeconfig_refresh_interval_seconds()
+        if interval > 0 and time.time() - self._last_refresh_time >= interval:
+            return True
+        return (self._credential_expires_at is not None and
+                time.time() + API_TIMEOUT >= self._credential_expires_at)
+
+    @staticmethod
+    def _close(client: Any) -> None:
+        try:
+            client_api = getattr(client, 'api_client', None)
+            if client_api is not None:
+                client_api.close()
+        except Exception as error:  # pylint: disable=broad-except
+            if logger is not None:
+                logger.debug(
+                    f'Error closing provider-fenced Kubernetes client: '
+                    f'{error}')
+
+    def _refresh(self, provider_fence: Callable[[], None]) -> None:
+        if not self._should_refresh():
+            return
+        with self._refresh_lock:
+            if not self._should_refresh():
+                return
+            try:
+                new_client, expires_at = _bounded_core_api(
+                    self._context,
+                    exec_credential_timeout_seconds=(
+                        self._exec_credential_timeout_seconds),
+                    provider_fence=provider_fence)
+            except BaseException:
+                provider_fence()
+                raise
+            try:
+                provider_fence()
+            except BaseException:
+                self._close(new_client)
+                raise
+            old_client = self._client
+            self._client = new_client
+            self._credential_expires_at = expires_at
+            self._last_refresh_time = time.time()
+            self._close(old_client)
+
+    def call_with_provider_fence(self, method_name: str,
+                                 provider_fence: Callable[[], None],
+                                 on_start: Callable[[], None] | None, *args:
+                                 Any, **kwargs: Any) -> Any:
+        provider_fence()
+        self._refresh(provider_fence)
+        provider_fence()
+        method = getattr(self._client, method_name)
+        if on_start is not None:
+            on_start()
+        try:
+            result = method(*args, **kwargs)
+        except Exception:
+            provider_fence()
+            raise
+        provider_fence()
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def __del__(self) -> None:
+        client = self.__dict__.get('_client')
+        if client is not None:
+            self._close(client)
+
+
+def provider_fenced_core_api(
+        context: str, *, exec_credential_timeout_seconds: float,
+        provider_fence: Callable[[], None]) -> ProviderFencedCoreApi:
+    """Returns the canary-only bounded and dynamically fenced CoreV1 client."""
+    return ProviderFencedCoreApi(
+        context,
+        exec_credential_timeout_seconds=exec_credential_timeout_seconds,
+        provider_fence=provider_fence)
 
 
 def list_kube_config_contexts():
