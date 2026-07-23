@@ -353,8 +353,8 @@ class TestGetServiceStatusSummary:
         assert 'replica_status_counts' not in record
 
 
-class TestUpdateServiceStatusLookup:
-    """The update fence must not serialize the full replica fleet."""
+class TestControlPlaneStatusLookups:
+    """Control-plane writes must stay on the slim lifecycle snapshot."""
 
     def test_update_uses_service_row_only(self, monkeypatch):
         get_status = mock.Mock(return_value={'hash': 'incarnation-a'})
@@ -375,9 +375,49 @@ class TestUpdateServiceStatusLookup:
         get_status.assert_called_once_with('svc',
                                            pool=False,
                                            with_replica_info=False,
-                                           with_yaml=False)
+                                           with_yaml=False,
+                                           status_snapshot_only=True)
         post.assert_called_once()
         assert post.call_args.kwargs['json']['has_submitted_yaml'] is True
+
+    def test_lb_ha_update_uses_service_row_only(self, monkeypatch):
+        get_status = mock.Mock(return_value={'hash': 'incarnation-a'})
+        response = mock.Mock(status_code=200)
+        post = mock.Mock(return_value=response)
+        monkeypatch.setattr(serve_utils, '_get_service_status', get_status)
+        monkeypatch.setattr(serve_utils, '_post_to_controller_with_retry', post)
+
+        serve_utils.set_load_balancer_high_availability_encoded(
+            'svc', True, 'incarnation-a', 11)
+
+        get_status.assert_called_once_with('svc',
+                                           pool=False,
+                                           with_replica_info=False,
+                                           with_yaml=False,
+                                           status_snapshot_only=True)
+        post.assert_called_once()
+
+    def test_terminate_replica_uses_service_row_only(self, monkeypatch):
+        get_status = mock.Mock(return_value={'hash': 'incarnation-a'})
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {'message': 'scheduled'}
+        post = mock.Mock(return_value=response)
+        get_replica = mock.Mock(return_value=object())
+        monkeypatch.setattr(serve_utils, '_get_service_status', get_status)
+        monkeypatch.setattr(serve_utils, '_post_to_controller_with_retry', post)
+        monkeypatch.setattr(serve_utils.serve_state, 'get_replica_info_from_id',
+                            get_replica)
+
+        result = serve_utils.terminate_replica('svc', 7, purge=False)
+
+        assert result == 'scheduled'
+        get_status.assert_called_once_with('svc',
+                                           pool=False,
+                                           with_replica_info=False,
+                                           with_yaml=False,
+                                           status_snapshot_only=True)
+        get_replica.assert_called_once_with('svc', 7)
+        post.assert_called_once()
 
 
 class TestGetServiceStatusPickledSummary:
