@@ -535,16 +535,13 @@ def test_bounded_core_api_terminates_timed_out_exec_credential_group(
     parent_pid = tmp_path / 'parent-pid'
     child_started = tmp_path / 'child-started'
     child_survived = tmp_path / 'child-survived'
-    parent_script = (
-        f'printf "%s" "$$" > {shlex.quote(str(parent_pid))}; '
-        f'(sleep 1.5; printf survived > '
-        f'{shlex.quote(str(child_survived))}) & '
-        f'child=$!; printf "%s" "$child" > '
-        f'{shlex.quote(str(child_started))}; '
-        'printf DESCENDANT_CREDENTIAL_SECRET; sleep 60')
-    path = _write_exec_kubeconfig(tmp_path,
-                                  parent_script,
-                                  command='/bin/sh')
+    parent_script = (f'printf "%s" "$$" > {shlex.quote(str(parent_pid))}; '
+                     f'(sleep 1.5; printf survived > '
+                     f'{shlex.quote(str(child_survived))}) & '
+                     f'child=$!; printf "%s" "$child" > '
+                     f'{shlex.quote(str(child_started))}; '
+                     'printf DESCENDANT_CREDENTIAL_SECRET; sleep 60')
+    path = _write_exec_kubeconfig(tmp_path, parent_script, command='/bin/sh')
     monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
     config_exception = (
         kubernetes.kubernetes.config.config_exception.ConfigException)
