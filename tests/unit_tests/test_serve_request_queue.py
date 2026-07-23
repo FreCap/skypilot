@@ -3,7 +3,6 @@
 import asyncio
 from collections.abc import AsyncIterator
 import json
-import time
 from typing import Any
 from unittest import mock
 
@@ -1108,13 +1107,28 @@ def test_dense_compatibility_matching_is_bounded_by_profiles_and_slots():
         lb._request_queue_waiters = {50: waiters}
         lb._waiting_request_count = len(waiters)
 
-        started = time.monotonic()
-        plan = lb._build_request_queue_grant_plan_locked(
-            {card: 16 for card in cards}, {card: 0 for card in cards}, 128)
-        elapsed = time.monotonic() - started
+        profile_count = len({
+            getattr(waiter.request, '_skyserve_compatible_accelerators')
+            for waiter in waiters.values()
+        })
+        with mock.patch.object(
+                load_balancer.heapq,
+                'heappush',
+                wraps=load_balancer.heapq.heappush) as heappush, \
+             mock.patch.object(
+                 load_balancer.heapq,
+                 'heappop',
+                 wraps=load_balancer.heapq.heappop) as heappop:
+            plan = lb._build_request_queue_grant_plan_locked(
+                {card: 16 for card in cards}, {card: 0 for card in cards}, 128)
 
         assert len(plan) == 128
-        assert elapsed < 2
+        assert profile_count == 255
+        # Pin the algorithmic bound without depending on wall-clock timing on
+        # a shared CI runner: one initial push per profile, then at most one
+        # pop and one requeue per granted slot.
+        assert heappop.call_count <= 128
+        assert heappush.call_count <= profile_count + 128
     finally:
         loop.close()
 
