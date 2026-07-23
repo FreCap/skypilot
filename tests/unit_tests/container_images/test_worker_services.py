@@ -12,6 +12,7 @@ import socket
 import threading
 import types
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 import urllib.error
 import urllib.request
@@ -852,11 +853,14 @@ def test_eks_dynamic_credential_refresh_observes_drain_before_raw_call(
     replacement.api_client.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize('failure_kind', ('lease', 'drain', 'deadline'))
-def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
-        monkeypatch: pytest.MonkeyPatch, failure_kind: str) -> None:
-    marker = 'INITIAL_CANARY_FENCE_EXEC_TOKEN'
-    configuration = SimpleNamespace(api_key={'authorization': marker},
+def _installed_eks_fenced_client(
+    marker: str,
+    heartbeat: Any,
+    *,
+    host: str = 'https://eks.example'
+) -> tuple[Any, Any, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+    configuration = SimpleNamespace(host=host,
+                                    api_key={'authorization': marker},
                                     api_key_prefix={'authorization': 'Bearer'},
                                     username=marker,
                                     password=marker,
@@ -867,16 +871,26 @@ def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
                                  default_headers={'Authorization': marker},
                                  cookie=marker,
                                  close=mock.Mock())
-    raw_call = mock.Mock()
-    raw_core = SimpleNamespace(api_client=api_client, list_node=raw_call)
-    monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
-                        lambda *_args, **_kwargs: (raw_core, None))
-    core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
-        'bounded-context',
-        exec_credential_timeout_seconds=2,
-        provider_fence=lambda: None)
-    heartbeat = mock.Mock(spec=['assert_owned'])
+    raw_core = SimpleNamespace(api_client=api_client, list_node=mock.Mock())
+    core = object.__new__(
+        canary_worker_service.kubernetes.ProviderFencedCoreApi)
+    core._context = 'bounded-context'
+    core._exec_credential_timeout_seconds = 2
+    core._refresh_lock = threading.Lock()
+    core._client = raw_core
+    core._credential_refresh_deadline = None
+    core._last_refresh_monotonic = 0.0
     fenced = canary_worker_service._FencedClient(core, heartbeat)
+    return fenced, core, configuration, api_client, raw_core
+
+
+@pytest.mark.parametrize('failure_kind', ('lease', 'drain', 'deadline'))
+def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
+        monkeypatch: pytest.MonkeyPatch, failure_kind: str) -> None:
+    marker = 'INITIAL_CANARY_FENCE_EXEC_TOKEN'
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client(marker, heartbeat))
     drain_event = None
     expected_error: type[BaseException]
     if failure_kind == 'lease':
@@ -904,7 +918,7 @@ def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
     assert error.__context__ is None
     assert marker not in str(error)
     _assert_canary_traceback_value_free(error, marker)
-    raw_call.assert_not_called()
+    raw_core.list_node.assert_not_called()
     assert core._client is None
     assert configuration.api_key == {}
     assert configuration.api_key_prefix == {}
@@ -915,6 +929,136 @@ def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
     assert api_client.default_headers == {}
     assert api_client.cookie is None
     api_client.close.assert_called_once_with()
+
+
+def test_eks_outer_validation_failure_scrubs_installed_credential_before_escape(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'OUTER_EKS_VALIDATION_EXEC_TOKEN'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    heartbeat = _OwnedHeartbeat()
+    fenced, core, configuration, api_client, _ = (_installed_eks_fenced_client(
+        marker, heartbeat, host='https://wrong.example'))
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://right.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+
+    with pytest.raises(ValueError,
+                       match='CANARY_PRINCIPAL_UNVERIFIED') as exc_info:
+        canary_worker_service._run_eks_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+
+
+def test_eks_success_scrubs_installed_credential_before_return(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'OUTER_EKS_SUCCESS_EXEC_TOKEN'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    heartbeat = _OwnedHeartbeat()
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client(marker, heartbeat))
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    node = _eks_node('node-a', 'i-a')
+    pod = SimpleNamespace(metadata=SimpleNamespace(labels={
+        'skypilot.co/image-canary-operation': operation.id,
+    }),
+                          spec=SimpleNamespace(
+                              containers=[SimpleNamespace(image=reference)],
+                              node_name='node-a'),
+                          status=SimpleNamespace(phase='Succeeded'))
+    raw_core.create_namespaced_pod = mock.Mock()
+    raw_core.read_namespaced_pod = mock.Mock(return_value=pod)
+    raw_core.read_namespaced_pod_log = mock.Mock(return_value=payload['nonce'])
+    raw_core.read_node = mock.Mock(return_value=node)
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://eks.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+    monkeypatch.setattr(canary_worker_service, '_qualified_eks_nodes',
+                        lambda *_args, **_kwargs: (1, 'f' * 64))
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod',
+                        lambda *_args, **_kwargs: True)
+
+    evidence = canary_worker_service._run_eks_canary(operation, payload,
+                                                     _revision(profile),
+                                                     profile, target, binding,
+                                                     _DIGEST, reference,
+                                                     heartbeat)
+
+    assert evidence['teardown_verified']
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+    raw_core.create_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod_log.assert_called_once()
+    raw_core.read_node.assert_called_once()
 
 
 def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(
@@ -1317,7 +1461,16 @@ def _canary_object_graph_contains(root: object, marker: str) -> bool:
         if isinstance(current, types.MethodType):
             pending.append(current.__self__)
             continue
-        if isinstance(current, (types.ModuleType, types.FunctionType, type)):
+        if isinstance(current, types.FunctionType):
+            pending.extend(current.__defaults__ or ())
+            pending.extend((current.__kwdefaults__ or {}).values())
+            for cell in current.__closure__ or ():
+                try:
+                    pending.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            continue
+        if isinstance(current, (types.ModuleType, type)):
             continue
         try:
             pending.extend(vars(current).values())

@@ -915,6 +915,10 @@ class ProviderFencedCoreApi:
         self._credential_refresh_deadline = None
         self._close(client)
 
+    def close(self) -> None:
+        """Closes and scrubs the installed client. This method is idempotent."""
+        self._invalidate()
+
     def _refresh(self, provider_fence: Callable[[], None]) -> None:
         if not self._should_refresh():
             return

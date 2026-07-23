@@ -103,6 +103,13 @@ class _FencedClient:
                 f'Provider attribute {method_name!r} is not callable.')
         return value
 
+    def invalidate_kubernetes_credentials(self) -> None:
+        """Drops an installed Kubernetes client before this wrapper escapes."""
+        client = self._client
+        if isinstance(client, kubernetes.ProviderFencedCoreApi):
+            client.close()
+            self._client = None
+
     def _call(self,
               method_name: str,
               value: Callable[..., Any] | None,
@@ -1286,30 +1293,36 @@ def _run_eks_canary(
             'nonce_hash': hashlib.sha256(payload['nonce'].encode()).hexdigest(),
         }
     finally:
-        if not persisted_child and not create_attempted:
-            teardown_verified = True
-        else:
-            cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
-            if core is None:
-                try:
-                    core = _kubernetes_core(context,
-                                            heartbeat,
-                                            cleanup_deadline=cleanup_deadline)
-                except worker_lease.LeaseLostError:
-                    raise
-                except Exception:  # pylint: disable=broad-except
-                    core = None
+        try:
+            if not persisted_child and not create_attempted:
+                teardown_verified = True
+            else:
+                cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
+                if core is None:
+                    try:
+                        core = _kubernetes_core(
+                            context,
+                            heartbeat,
+                            cleanup_deadline=cleanup_deadline)
+                    except worker_lease.LeaseLostError:
+                        raise
+                    except Exception:  # pylint: disable=broad-except
+                        core = None
+                if core is not None:
+                    teardown_verified = _delete_eks_pod(
+                        core,
+                        pod_name,
+                        namespace,
+                        settle_absence=(persisted_child or
+                                        (create_attempted and
+                                         not create_confirmed)),
+                        cleanup_deadline=cleanup_deadline)
+            if not teardown_verified:
+                raise ValueError('CANARY_TEARDOWN_FAILED')
+            _raise_if_draining(drain_event)
+        finally:
             if core is not None:
-                teardown_verified = _delete_eks_pod(
-                    core,
-                    pod_name,
-                    namespace,
-                    settle_absence=(persisted_child or (create_attempted and
-                                                        not create_confirmed)),
-                    cleanup_deadline=cleanup_deadline)
-        if not teardown_verified:
-            raise ValueError('CANARY_TEARDOWN_FAILED')
-        _raise_if_draining(drain_event)
+                core.invalidate_kubernetes_credentials()
     if evidence is None:
         raise ValueError('CANARY_FAILED')
     evidence['teardown_verified'] = True

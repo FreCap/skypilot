@@ -2334,6 +2334,12 @@ traceback frame still owns the live credential-bearing wrapper. The inner
 wrapper captures an initial control failure, invalidates and scrubs the client,
 then propagates the detached original control type. Non-Kubernetes providers
 retain the generic wrapper's direct pre-call fence.
+The EKS canary also owns one explicit outer client lifetime. Its `finally`
+block completes any required child teardown first, then closes and scrubs the
+Kubernetes wrapper before any success, validation failure, provider failure,
+drain, lease loss, cleanup failure, or other exception leaves
+`_run_eks_canary`. No outer canary traceback frame may therefore retain a live
+installed credential after the function exits.
 Transparent library-side refresh is removed from the raw API call path. The
 wrapper converts a kubeconfig credential's declared wall-clock expiry into one
 monotonic refresh deadline when the credential is accepted, preserving the
@@ -2826,8 +2832,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   plus the nested exception graph, serialized envelope, and captured logs for
   unpredictable child-generated secrets; installed-client invalidation on
   refresh, provider, and control failures, including an initial canary lease,
-  drain, or deadline failure before Kubernetes refresh; direct-child reaping,
-  no transparent API-client refresh hook, one-minute monotonic
+  drain, or deadline failure before Kubernetes refresh, plus explicit
+  outer-canary invalidation after success, validation failure, provider failure,
+  drain, lease loss, or teardown; direct-child reaping, no transparent
+  API-client refresh hook, one-minute monotonic
   in-cluster projected-token rotation, monotonic declared-expiry conversion,
   rejection when a final fence or pre-call callback consumes the remaining
   headroom, backward and forward wall-clock jump immunity,
@@ -3873,3 +3881,15 @@ revision delegates that initial Kubernetes fence to the credential-owning inner
 wrapper, which scrubs and invalidates before propagation, and adds an
 object-graph regression for the exact pre-fence schedule. The acceptance streak
 remains zero.
+
+Codex exact-head review round 7 at
+`1d62e047b831d124656759f9bf33788498c8275d` was stopped without a verdict after
+its closure-aware reproduction confirmed the initial lease, drain, and deadline
+repair, then found an adjacent residual. A validation failure after successful
+Kubernetes client acquisition, reproduced with
+`CANARY_PRINCIPAL_UNVERIFIED`, escaped `_run_eks_canary` while that outer
+traceback frame still owned the live installed credential. The client had not
+been invalidated or closed. This revision defines an explicit outer EKS client
+lifetime that always scrubs after required teardown and before any result or
+exception leaves, with closure-aware regressions for both successful and
+exceptional exits. The acceptance streak remains zero.
