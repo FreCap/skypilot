@@ -12,6 +12,7 @@ from sky import exceptions
 from sky.jobs import runner as managed_job_runner
 from sky.jobs.server import cancellation as jobs_cancellation
 from sky.jobs.server import core as jobs_core
+from sky.usage import usage_lib
 from sky.utils import controller_utils
 
 
@@ -161,6 +162,20 @@ def test_cancel_facade_preserves_callable_and_pickle_identity():
     assert jobs_core.cancel is jobs_cancellation.cancel
     assert jobs_core.cancel.__module__ == jobs_core.__name__
     assert pickle.loads(pickle.dumps(jobs_core.cancel)) is jobs_core.cancel
+
+
+def test_cancel_preserves_usage_entrypoint_attribution(cancellation_gateway):
+    usage_message = usage_lib.messages.usage
+    option_type = type(usage_lib.env_options.Options.DISABLE_LOGGING)
+    with mock.patch.object(option_type, 'get', return_value=False), \
+         mock.patch.object(usage_message, 'entrypoint', None), \
+         mock.patch.object(usage_message, 'update_entrypoint') as update, \
+         mock.patch.object(usage_lib, '_send_local_messages'):
+        with pytest.raises(ValueError, match='Can only specify one'):
+            jobs_core.cancel()
+
+    update.assert_called_once_with('sky.jobs.server.core.cancel')
+    cancellation_gateway.get_backend.assert_not_called()
 
 
 def _forwarded_tail(tail):

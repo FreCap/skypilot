@@ -41,7 +41,8 @@ the existing `SkyletClient` seam for gRPC.
 Preserve these behavior contracts:
 
 1. The public function signature and docstring remain unchanged.
-2. Exactly one of job IDs, name, pool, `all`, or `all_users` is accepted.
+2. Exactly one selector category of job IDs, name, pool, or `all`/`all_users`
+   is accepted.
 3. gRPC requests retain workspace, user, graceful cancellation, and selector
    projection semantics.
 4. `SkyletMethodNotImplementedError` falls back to the legacy runner with the
@@ -49,8 +50,11 @@ Preserve these behavior contracts:
 5. Missing output and ambiguous name responses retain their exception types
    and messages.
 6. The stable facade is a direct alias, so cancellation adds no wrapper call,
-   controller lookup, RPC, retry, or allocation.
+   controller lookup, RPC, retry, or allocation. Both the decorated callable
+   and its wrapped implementation retain the historical facade module.
 7. Logging retains the historical `sky.jobs.server.core` logger name.
+8. Usage events retain the historical `sky.jobs.server.core.cancel`
+   entrypoint attribution after the implementation moves modules.
 
 ## Alternatives considered
 
@@ -74,7 +78,9 @@ service would create a new concept without a shared implementation contract.
    fallback, selector validation, missing output, and ambiguous names. Run it
    against the unsplit implementation.
 2. Move cancellation unchanged, add the direct facade alias, and prove the
-   moved function is normalized AST identical.
+   moved function is normalized AST identical. Preserve the wrapped
+   implementation's module because the usage decorator derives attribution
+   from it at call time rather than from a later alias.
 3. Run the focused managed jobs server and SDK type tests, formatting and
    static analysis, import checks, and the relevant CI matrix.
 4. Merge only after the full visible exact head CI rollup and review state are
