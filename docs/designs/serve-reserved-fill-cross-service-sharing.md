@@ -121,9 +121,21 @@ complete active fleet as transitional supply evidence, including healthy old
 versions, while committed latest-version capacity remains latest-only. This
 keeps the two concerns separate:
 
-- old replicas may prove that an adopted accelerator target is attributable;
+- old replicas may prove that an adopted accelerator target is attributable,
+  and busy old replicas remain protected from drain;
+- running work on every version is reported as warm retention but does not pin
+  the private desired-card map to its serving card or create same-card
+  replacement authority; compatibility demand ownership selects the cold card;
 - old replicas never satisfy the latest-version launch target;
 - the latest version emits the existing fenced logical scale target;
+- a mixed-version rollout preserves the adopted compatibility-owned card map
+  for paid actuation; once the rollout completes, only materialized,
+  non-retiring latest-version replicas may move compatible demand from its
+  adopted paid card onto another card in the demand actuator;
+- unmaterialized broker-reported free slots never back demand actuation and
+  never create paid cold-launch authority for their accelerator;
+- reserved-fill decisions remain the only path that materializes those free
+  slots, and retain their existing zero-cost-only placement fence;
 - configured scale-up waves bound the adopted latest-version target when
   enabled, while `max_replicas` remains the demand-target ceiling;
 - old replicas drain only after ready latest capacity covers them, with busy
@@ -135,8 +147,11 @@ Without complete-fleet revalidation, a service with 57 ready old L4 replicas,
 zero latest replicas, demand target 57, `max_replicas: 64`, and seven free A100
 reserved slots revokes its exact-card target and emits no scale-up. The broker
 correctly assigns the seven slots, but physical rebalancing cannot begin. The
-rolling-progress fix restores the ordinary latest-version surge first; fill
-then consumes eligible reserved headroom without bypassing demand safety.
+rolling-progress fix restores the ordinary latest-version L4 surge first; fill
+then independently consumes eligible reserved A100 headroom without bypassing
+demand safety. If a reported research A100 slot disappears before launch, its
+fill attempt is skipped or fails at that pinned zero-cost location. It must not
+be retried as a paid cloud A100 merely to preserve exact-card rollout coverage.
 
 ## Failure and rollback behavior
 
@@ -167,6 +182,11 @@ The rolling-progress regression covers the production deadlock shape:
 - an exact-card catalog containing L4, A100, and A100-80GB;
 - seven free reserved A100-family slots assigned by the broker;
 - a latest-version fenced logical scale target is emitted;
+- the demand target and paid cold-launch authority remain L4-only;
+- A100-family launches, if any, are separate zero-cost-only fill decisions;
+- cross-card supply reuse resumes only after no old-version replicas remain;
+- busy old-version A100-family replicas remain retained until their work
+  completes without requiring a latest-version A100-family replacement;
 - no old replica drains before latest-version ready coverage exists;
 - fill cannot exceed the broker grant or aggregate ceiling while demand surge
   is pending.

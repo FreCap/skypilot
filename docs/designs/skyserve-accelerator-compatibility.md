@@ -78,6 +78,7 @@ not evidence that the behavior is active in production.
 | `1.1.702` | PR #862, separate demand from actuation | Attributed flexible unmet demand to the cheapest compatible cold card, then independently adopted ready, provisioning, and free reserved compatible supply for actuation. | Included in deployed `1.1.704`; this remains the active allocation contract. |
 | `1.1.703` | PR #863, response-time history | Added full HTTP completion history without changing placement. | Included in deployed `1.1.704`; later superseded by prediction-time history. |
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
+| Unreleased | Reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Required after production evidence showed an exact-card rolling replacement retrying a failed research-pool A100 launch on paid GCP A100 capacity. |
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable
@@ -469,6 +470,21 @@ service:
   demand wave it may be nonzero only on the cheapest compatible card selected
   by the allocator. Exact-card-constrained demand may authorize its required
   card.
+- Broker-reported free reserved slots are not materialized capacity and cannot
+  back a supply-aware demand reassignment. They are consumed only by the
+  reserved-fill overlay, whose launch carries the zero-cost-only fence. This
+  remains true during rolling updates: losing or failing a research-pool
+  A100-family slot cannot create a paid A100-family replacement launch for
+  otherwise L4-compatible demand.
+- In logical concurrency mode, running work remains visible in
+  `warm_retention_target_by_accelerator` and blocks its replica from draining,
+  but the serving card does not pin the private desired-card actuation map.
+  Compatibility demand ownership selects the cold card. While old and latest
+  versions coexist, paid actuation preserves that adopted card map exactly;
+  after rollout, materialized latest-version supply may satisfy compatible
+  demand without changing ownership. This prevents a warm research A100 from
+  becoming paid A100 replacement authority while preserving exact-card and
+  non-preemptive rollout safety.
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
 - Economic cost rebalancing may move a replica to a cheaper provider, region,

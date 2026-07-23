@@ -132,8 +132,17 @@ def deserialize_exception(serialized: Any) -> Exception:
         # Unknown exception type.
         return Exception(
             f'{exception_type}: {serialized.get("message", serialized)}')
-    e = exception_class(*serialized.get('args', ()),
-                        **serialized.get('attributes', {}))
+    args = serialized.get('args', ())
+    attributes = serialized.get('attributes', {})
+    if hasattr(builtins, exception_type):
+        # Built-in exception constructors reject keyword arguments. Python
+        # 3.14 adds contextual ``__notes__`` to some built-in exceptions, so
+        # restore their serialized attributes after construction instead.
+        e = exception_class(*args)
+        for key, value in attributes.items():
+            setattr(e, key, value)
+    else:
+        e = exception_class(*args, **attributes)
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         setattr(e, 'stacktrace', stacktrace)

@@ -1442,6 +1442,85 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
 
+    def test_free_reserved_slot_cannot_back_paid_rollout_authority(self):
+        autoscaler = _make_autoscaler(max_replicas=20, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+        })
+        autoscaler.target_num_replicas = 10
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 5})
+
+        old_a100 = [
+            _replica(replica_id, card='A100', version=1)
+            for replica_id in range(1, 6)
+        ]
+        latest_l4 = [
+            _replica(replica_id,
+                     card='L4',
+                     version=2,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for replica_id in range(11, 16)
+        ]
+        replicas = [*old_a100, *latest_l4]
+        _report(autoscaler,
+                in_flight={
+                    replica.replica_id: int(replica.version == 1)
+                    for replica in replicas
+                },
+                observed_slots={replica.replica_id: 1 for replica in old_a100},
+                compatibility_complete=True)
+
+        decisions = autoscaler._generate_logical_scaling_decisions(
+            replicas, latest_l4)
+
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 5})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator,
+                         {'L4': 10})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 5})
+        target = _scale_ups(decisions)[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'L4': 10})
+
+    def test_rollout_preserves_exact_adopted_card(self):
+        autoscaler = _make_autoscaler(max_replicas=20, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+        })
+        autoscaler.target_num_replicas = 10
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 10}
+        autoscaler._snap_target_on_next_recompute = False
+
+        old_a100 = [
+            _replica(replica_id, card='A100', version=1)
+            for replica_id in range(1, 6)
+        ]
+        latest_l4 = [
+            _replica(replica_id,
+                     card='L4',
+                     version=2,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for replica_id in range(11, 16)
+        ]
+        replicas = [*old_a100, *latest_l4]
+        _report(autoscaler,
+                in_flight={replica.replica_id: 1 for replica in old_a100},
+                observed_slots={replica.replica_id: 1 for replica in old_a100},
+                compatibility_complete=True)
+
+        target, complete = autoscaler._actuation_target_by_accelerator(replicas)
+
+        self.assertTrue(complete)
+        self.assertEqual(target, {'A100': 10})
+
     def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
         autoscaler = _make_autoscaler(max_replicas=20,
                                       reserved_capacity_fill=True)

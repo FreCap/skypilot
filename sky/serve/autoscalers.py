@@ -2308,6 +2308,7 @@ def _revalidate_actuation_target(
     nonretiring_supply: dict[str, int],
     configured_cards: list[str],
     final_target: int,
+    allow_adopted_reassignment: bool = True,
 ) -> dict[str, int]:
     """Build a supply-aware actuator without bypassing target adoption.
 
@@ -2345,6 +2346,13 @@ def _revalidate_actuation_target(
     if remaining < 0 or fill_toward_desired(remaining,
                                             require_backing=False) != 0:
         return {}
+    if not allow_adopted_reassignment:
+        # A mixed-version rollout must preserve the compatibility-owned card
+        # map. Old-version supply cannot prove that a cross-card replacement is
+        # compatible, and moving an adopted unit here can turn a warm
+        # zero-cost card into paid same-card launch authority. Generic
+        # overprovision was assigned above without changing adopted demand.
+        return {card: count for card, count in target.items() if count > 0}
 
     # First replace adopted capacity that is disappearing. This is allowed to
     # create a cold shortage, because retaining the old card would otherwise
@@ -5158,6 +5166,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         min_replicas_override: int | None = None,
         use_existing_supply: bool = False,
         pin_running_work: bool = False,
+        use_free_reserved: bool = True,
     ) -> tuple[dict[str, int], bool]:
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
@@ -5255,7 +5264,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             card.casefold(): int(floor)
             for card, floor in self.min_replicas_by_accelerator.items()
         }
-        free_reserved = dict(self.free_reserved_slots_by_accelerator)
+        free_reserved = (dict(self.free_reserved_slots_by_accelerator)
+                         if use_free_reserved else {})
         if self.replica_unit == 'logical':
             free_reserved = {
                 card: count * self._configured_gpu_count(card)
@@ -5438,7 +5448,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 target_ceiling=final_target,
                 min_replicas_override=final_target,
                 use_existing_supply=True,
-                pin_running_work=True))
+                pin_running_work=False,
+                use_free_reserved=False))
         cards = self._configured_cards_from_profiles()
         canonical_by_name = {card.casefold(): card for card in cards}
         nonretiring_supply = {card: 0 for card in cards}
@@ -5453,19 +5464,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             width = (max(1, int(self._replica_capacity(info)))
                      if self.replica_unit == 'logical' else 1)
             nonretiring_supply[card] += width
-        for raw_card, count in self.free_reserved_slots_by_accelerator.items():
-            card = canonical_by_name.get(raw_card.casefold())
-            if card is None:
-                continue
-            width = (self._configured_gpu_count(card)
-                     if self.replica_unit == 'logical' else 1)
-            nonretiring_supply[card] += max(0, int(count)) * width
+        # Broker-reported free slots are opportunities, not materialized
+        # supply. Treating them as backing here can move flexible L4 demand
+        # onto A100 during a rollout. If the research slot then disappears,
+        # the exact-card shortage retries on a paid A100 location. Reserved
+        # fill owns those opportunities independently and carries the
+        # zero-cost-only launch fence; demand actuation may reuse the card only
+        # after a latest-version replica row materializes it.
         target = _revalidate_actuation_target(
             adopted_target=demand_target,
             desired_target=desired_target,
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
-            final_target=final_target)
+            final_target=final_target,
+            allow_adopted_reassignment=not any(
+                not info.is_terminal and info.version != self.latest_version
+                for info in replica_infos))
         if not target and final_target > 0:
             self._logical_card_transition_pending = False
             return {}, False

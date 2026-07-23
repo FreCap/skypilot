@@ -19,6 +19,18 @@ def test_value_error():
     assert str(deserialized) == 'test'
 
 
+def test_builtin_exception_attributes():
+    """Built-in exception attributes are restored after construction."""
+    e = TypeError('test')
+    e.add_note('when serializing a result')
+
+    deserialized = _serialize_deserialize(e)
+
+    assert isinstance(deserialized, TypeError)
+    assert str(deserialized) == 'test'
+    assert deserialized.__notes__ == ['when serializing a result']
+
+
 def test_execution_control_errors_are_picklable():
     """Retry and pause exceptions preserve their constructor state."""
     retryable = exceptions.ExecutionRetryableError('retry', 'later', 3)
