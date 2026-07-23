@@ -24,6 +24,17 @@ from sky.serve import serve_utils
 from sky.utils import yaml_utils
 
 
+@pytest.fixture(autouse=True)
+def _restore_consolidation_override():
+    """Keep the in-process controller marker scoped to each test."""
+    marker = controller.constants.OVERRIDE_CONSOLIDATION_MODE
+    original = os.environ.pop(marker, None)
+    yield
+    os.environ.pop(marker, None)
+    if original is not None:
+        os.environ[marker] = original
+
+
 def test_update_ignores_stale_submitted_yaml_without_request_declaration():
     with mock.patch('builtins.open') as open_file:
         submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access

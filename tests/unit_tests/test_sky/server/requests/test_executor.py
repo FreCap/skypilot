@@ -1,4 +1,7 @@
 """Unit tests for sky.server.requests.executor module."""
+# pylint: disable=import-outside-toplevel,missing-class-docstring
+# pylint: disable=protected-access,redefined-outer-name,reimported
+# pylint: disable=unused-argument,unused-import
 import asyncio
 import concurrent.futures
 import functools
@@ -7,7 +10,6 @@ import pathlib
 import queue as queue_lib
 import threading
 import time
-from typing import List
 from unittest import mock
 
 import fastapi
@@ -16,6 +18,7 @@ import pytest
 from sky import exceptions
 from sky import models
 from sky import skypilot_config
+from sky.container_images import errors as container_image_errors
 from sky.serve import constants as serve_constants
 from sky.server import config as server_config
 from sky.server import constants as server_constants
@@ -261,6 +264,92 @@ async def _wait_for_threading_event(event: threading.Event) -> None:
         await asyncio.sleep(0.01)
 
 
+_MANAGED_IMAGE_LOG_SECRET = 'synthetic-provider-secret'
+
+
+class _ManagedImageFailureBody(payloads.RequestBody):
+    task: str
+    typed_image_error: bool
+
+
+def _managed_image_failure(*, typed_image_error: bool) -> BaseException:
+    message = f'provider token={_MANAGED_IMAGE_LOG_SECRET}'
+    if not typed_image_error:
+        return RuntimeError(message)
+    marker = container_image_errors.ContainerImageError(
+        'IMAGE_RESOLUTION_FAILED')
+    return exceptions.ResourcesUnavailableError(message,
+                                                failover_history=[marker])
+
+
+def _managed_image_failure_entrypoint(*, typed_image_error: bool, **_):
+    raise _managed_image_failure(typed_image_error=typed_image_error)
+
+
+def _managed_image_failure_request(
+        request_id: str, *, legacy_image_id: bool,
+        typed_image_error: bool) -> requests_lib.Request:
+    if legacy_image_id:
+        task = 'resources:\n  image_id: docker:ubuntu\n'
+    else:
+        task = ('resources:\n  container_image: '
+                'ubuntu@sha256:' + 'a' * 64 + '\n')
+    return requests_lib.Request(
+        request_id=request_id,
+        name=(server_constants.REQUEST_NAME_PREFIX +
+              request_names.RequestName.CLUSTER_LAUNCH.value),
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='test-user-id',
+        entrypoint=_managed_image_failure_entrypoint,
+        request_body=_ManagedImageFailureBody(
+            task=task, typed_image_error=typed_image_error),
+    )
+
+
+def _assert_managed_image_failure_is_value_free(request_id: str,
+                                                error_log: mock.Mock) -> None:
+    rendered_log = str(error_log.call_args_list)
+    assert _MANAGED_IMAGE_LOG_SECRET not in rendered_log
+    assert 'IMAGE_RESOLUTION_FAILED' in rendered_log
+    stored = requests_lib.get_request(request_id)
+    assert stored is not None
+    error = stored.get_error()
+    assert error is not None
+    assert _MANAGED_IMAGE_LOG_SECRET not in error['message']
+    assert _MANAGED_IMAGE_LOG_SECRET not in getattr(error['object'],
+                                                    'stacktrace', '')
+
+
+def _assert_ordinary_failure_is_preserved(request_id: str,
+                                          error_log: mock.Mock) -> None:
+    assert _MANAGED_IMAGE_LOG_SECRET in str(error_log.call_args_list)
+    stored = requests_lib.get_request(request_id)
+    assert stored is not None
+    error = stored.get_error()
+    assert error is not None
+    assert _MANAGED_IMAGE_LOG_SECRET in error['message']
+
+
+def test_managed_image_marker_search_is_cycle_safe_and_bounded(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    cyclic = RuntimeError('ordinary failure')
+    cyclic.__cause__ = cyclic
+    assert container_image_errors.find_safe_error(cyclic) is None
+
+    marker = container_image_errors.ContainerImageError(
+        'IMAGE_RESOLUTION_FAILED')
+    middle = RuntimeError('middle wrapper')
+    middle.__cause__ = marker
+    outer = RuntimeError('outer wrapper')
+    outer.__cause__ = middle
+    monkeypatch.setattr(container_image_errors, '_MAX_NESTED_ERRORS', 2)
+    assert container_image_errors.find_safe_error(outer) is None
+
+    outer.__cause__ = marker
+    assert container_image_errors.find_safe_error(outer) is marker
+
+
 @pytest.mark.asyncio
 async def test_execute_request_coroutine_ctx_cancelled_on_cancellation():
     """Test that context is always cancelled when execute_request_coroutine
@@ -311,6 +400,59 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation():
         mock_ctx.cancel.assert_called()
         mock_set_cancelled.assert_awaited_once_with(request.request_id)
         assert task.task.cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('legacy_image_id', [False, True])
+@pytest.mark.parametrize('typed_image_error', [False, True])
+async def test_coroutine_sanitizes_only_typed_image_boundary_failures(
+        isolated_database, legacy_image_id, typed_image_error):
+    request_id = 'managed-image-coroutine-failure'
+    request = _managed_image_failure_request(
+        request_id,
+        legacy_image_id=legacy_image_id,
+        typed_image_error=typed_image_error)
+    assert await requests_lib.create_if_not_exists_async(request)
+    future = asyncio.get_running_loop().create_future()
+    future.set_exception(
+        _managed_image_failure(typed_image_error=typed_image_error))
+    mock_ctx = mock.Mock()
+    mock_ctx.redirect_log.return_value = None
+    with mock.patch('sky.utils.context.initialize'), \
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(executor, 'get_request_thread_executor'), \
+         mock.patch.object(context_utils,
+                           'to_thread_with_executor',
+                           return_value=future), \
+         mock.patch.object(executor.logger, 'error') as error_log:
+        await executor._execute_request_coroutine(request)
+
+    if typed_image_error:
+        _assert_managed_image_failure_is_value_free(request_id, error_log)
+    else:
+        _assert_ordinary_failure_is_preserved(request_id, error_log)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('legacy_image_id', [False, True])
+@pytest.mark.parametrize('typed_image_error', [False, True])
+async def test_process_sanitizes_only_typed_image_boundary_failures(
+        mock_fd_operations, legacy_image_id, typed_image_error):
+    del mock_fd_operations
+    request_id = 'managed-image-process-failure'
+    request = _managed_image_failure_request(
+        request_id,
+        legacy_image_id=legacy_image_id,
+        typed_image_error=typed_image_error)
+    assert await requests_lib.create_if_not_exists_async(request)
+    with mock.patch.object(executor.logger, 'error') as error_log:
+        executor._request_execution_wrapper(request_id,
+                                            ignore_return_value=False)
+
+    if typed_image_error:
+        _assert_managed_image_failure_is_value_free(request_id, error_log)
+    else:
+        _assert_ordinary_failure_is_preserved(request_id, error_log)
 
 
 @pytest.mark.asyncio
@@ -647,12 +789,12 @@ async def test_execute_with_isolated_env_and_config(isolated_database,
 FAKE_FD_START = 100000
 
 
-def _get_saved_fd_close_count(close_calls: List[int], created_fds: set) -> int:
+def _get_saved_fd_close_count(close_calls: list[int], created_fds: set) -> int:
     """Get the number of close() calls for file descriptors we created."""
     return sum(1 for fd in close_calls if fd in created_fds)
 
 
-def _assert_no_double_close(close_calls: List[int], created_fds: set) -> None:
+def _assert_no_double_close(close_calls: list[int], created_fds: set) -> None:
     """Verify that no file descriptor was closed more than once."""
     from collections import Counter
     our_close_calls = [fd for fd in close_calls if fd in created_fds]
@@ -1703,7 +1845,7 @@ def _run_override(request_name: str, resolution):
             constants.USER_ID_ENV_VAR: 'client-user-id',
             constants.USER_ENV_VAR: 'client-user',
         })
-    info_calls: List[str] = []
+    info_calls: list[str] = []
     with mock.patch.object(workspaces_core,
                            'resolve_workspace_for_user',
                            return_value=resolution), \

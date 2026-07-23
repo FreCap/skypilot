@@ -325,6 +325,7 @@ def _get_machine_type_for_zone(zone: str) -> 'pd.DataFrame':
         'InstanceType': machine_type['name'],
         'vCPUs': machine_type['guestCpus'],
         'MemoryGiB': machine_type['memoryMb'] / 1024,
+        'Arch': machine_type.get('architecture'),
         'Region': zone.rpartition('-')[0],
         'AvailabilityZone': zone
     } for machine_type in machine_types]
@@ -794,6 +795,8 @@ def get_catalog_df(region_prefix: str) -> 'pd.DataFrame':
     gcp_skus = get_skus(GCE_SERVICE_ID)
     vm_df = get_vm_df(gcp_skus, region_prefix)
     gpu_df = get_gpu_df(gcp_skus, region_prefix)
+    architecture_by_instance = (
+        vm_df.drop_duplicates('InstanceType').set_index('InstanceType')['Arch'])
 
     # Drop regions without the given prefix.
     # NOTE: We intentionally do not drop any TPU regions.
@@ -807,6 +810,7 @@ def get_catalog_df(region_prefix: str) -> 'pd.DataFrame':
 
     # Merge the dataframes.
     df = pd.concat([vm_df, gpu_df, tpu_df, TPU_V4_HOST_DF])
+    df['Arch'] = df['InstanceType'].map(architecture_by_instance)
 
     # Reorder the columns.
     df = df[[
@@ -816,6 +820,7 @@ def get_catalog_df(region_prefix: str) -> 'pd.DataFrame':
         'AcceleratorName',
         'AcceleratorCount',
         'GpuInfo',
+        'Arch',
         'Region',
         'AvailabilityZone',
         'Price',

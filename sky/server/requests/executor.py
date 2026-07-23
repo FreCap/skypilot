@@ -65,6 +65,7 @@ from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import context_utils
+from sky.utils import debug_dump_helpers
 from sky.utils import subprocess_utils
 from sky.utils import tempstore
 from sky.utils import timeline
@@ -403,7 +404,13 @@ class RequestWorker:
             condition = getattr(e, 'continue_condition', None)
             # Surface why we are retrying, not just the wait time. status_msg
             # is a single-line field, so strip color and collapse whitespace.
-            reason = ' '.join(common_utils.remove_color(str(e)).split())
+            request = api_requests.get_request(request_id,
+                                               fields=['name', 'request_body'])
+            safe_error = (api_requests.sanitize_request_error(
+                request.name, e, request.request_body)
+                          if request is not None else e)
+            reason = ' '.join(
+                common_utils.remove_color(str(safe_error)).split())
             if len(reason) > _RETRY_STATUS_MSG_REASON_MAX_LEN:
                 reason = reason[:_RETRY_STATUS_MSG_REASON_MAX_LEN].rstrip(
                 ) + '...'
@@ -803,6 +810,7 @@ def _request_execution_wrapper(request_id: str,
             original_stderr = None
 
     request_name = None
+    request_body: payloads.RequestBody | None = None
     # Set _in_request_execution inside the try so `finally` always clears it,
     # even if a SIGTERM lands before any wrapper code runs.
     global _in_request_execution  # pylint: disable=global-statement
@@ -855,7 +863,8 @@ def _request_execution_wrapper(request_id: str,
                     request_body, request_id, request_name), \
                 tempstore.tempdir():
                 if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
-                    config = skypilot_config.to_dict()
+                    config = debug_dump_helpers.redact_config(
+                        dict(skypilot_config.to_dict()))
                     logger.debug(f'request config: \n'
                                  f'{yaml_utils.dump_yaml_str(dict(config))}')
                 (metrics_utils.SKY_APISERVER_PROCESS_EXECUTION_START_TOTAL.
@@ -874,8 +883,11 @@ def _request_execution_wrapper(request_id: str,
         subprocess_utils.kill_children_processes()
         return
     except exceptions.ExecutionRetryableError as e:
-        logger.error(e)
-        logger.info(e.hint)
+        safe_retry_error = api_requests.sanitize_request_error(
+            request_name, e, request_body)
+        logger.error(safe_retry_error)
+        if safe_retry_error is e:
+            logger.info(e.hint)
         should_retry = False
         with api_requests.update_request(request_id) as request_task:
             if (request_task is not None and
@@ -892,13 +904,15 @@ def _request_execution_wrapper(request_id: str,
                     'or no longer running')
         return
     except (Exception, SystemExit) as e:  # pylint: disable=broad-except
+        safe_failure_error = api_requests.sanitize_request_error(
+            request_name, e, request_body)
         api_requests.set_request_failed(request_id, e)
         # Manually reset the original stdout and stderr file descriptors early
         # so that the "Request xxxx failed due to ..." log message will be
         # written to the original stdout and stderr file descriptors.
         _restore_output()
         logger.error(f'Request {request_id} failed due to '
-                     f'{common_utils.format_exception(e)}')
+                     f'{common_utils.format_exception(safe_failure_error)}')
         return
     else:
         api_requests.set_request_succeeded(
@@ -1061,9 +1075,11 @@ async def _execute_request_coroutine(request: api_requests.Request):
             **request_body.to_kwargs())
     except Exception as e:  # pylint: disable=broad-except
         ctx.redirect_log(original_output)
+        safe_submission_error = api_requests.sanitize_request_error(
+            request.name, e, request_body)
         await api_requests.set_request_failed_async(request.request_id, e)
         logger.error(f'Failed to run request {request.request_id} due to '
-                     f'{common_utils.format_exception(e)}')
+                     f'{common_utils.format_exception(safe_submission_error)}')
         return
 
     async def poll_task(request_id: str) -> bool:
@@ -1082,9 +1098,12 @@ async def _execute_request_coroutine(request: api_requests.Request):
                     request_id, result)
             except Exception as e:  # pylint: disable=broad-except
                 ctx.redirect_log(original_output)
+                safe_future_error = api_requests.sanitize_request_error(
+                    request.name, e, request_body)
                 await api_requests.set_request_failed_async(request_id, e)
-                logger.error(f'Request {request_id} failed due to '
-                             f'{common_utils.format_exception(e)}')
+                logger.error(
+                    f'Request {request_id} failed due to '
+                    f'{common_utils.format_exception(safe_future_error)}')
             return True
         return False
 
@@ -1103,10 +1122,15 @@ async def _execute_request_coroutine(request: api_requests.Request):
     except (Exception, KeyboardInterrupt, SystemExit) as e:
         # Handle any other error
         ctx.redirect_log(original_output)
+        safe_unhandled_error = api_requests.sanitize_request_error(
+            request.name, e, request_body)
         await api_requests.set_request_failed_async(request.request_id, e)
         logger.error(f'Request {request.request_id} interrupted due to '
-                     f'unhandled exception: {common_utils.format_exception(e)}')
-        raise
+                     'unhandled exception: '
+                     f'{common_utils.format_exception(safe_unhandled_error)}')
+        if safe_unhandled_error is e:
+            raise
+        raise safe_unhandled_error from None
     finally:
         # Always cancel the context to kill potentially running background
         # routine.

@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn, TypeVar
 import uuid
 
 import anyio
@@ -27,6 +27,7 @@ from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
+from sky.container_images import errors as container_image_errors
 from sky.metrics import utils as metrics_lib
 from sky.server import common as server_common
 from sky.server import constants as server_constants
@@ -47,6 +48,8 @@ from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+
+_ErrorT = TypeVar('_ErrorT', bound=BaseException)
 
 
 def _unresolved_entrypoint(*args: Any, **kwargs: Any) -> NoReturn:
@@ -234,6 +237,21 @@ def _build_error_dict(error: BaseException) -> dict[str, Any]:
     }
 
 
+def sanitize_request_error(
+    name: str | None,
+    error: _ErrorT,
+    request_body: payloads.RequestBody | None = None,
+) -> _ErrorT | ValueError:
+    """Strips values only from failures marked by the image boundary."""
+    del name, request_body
+    safe_error = container_image_errors.find_safe_error(error)
+    if safe_error is not None:
+        # Return a fresh built-in exception. It carries neither the wrapper's
+        # provider values nor typed-error attributes such as a demand ID.
+        return ValueError(str(safe_error))
+    return error
+
+
 def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
     """Encode a return value, dropping to None on encoder failure.
 
@@ -325,7 +343,11 @@ class Request:
 
     def set_error(self, error: BaseException) -> None:
         """Set the error."""
-        self.error = _build_error_dict(error)
+        sanitized_error = sanitize_request_error(self.name, error,
+                                                 self.request_body)
+        if sanitized_error is not error:
+            _set_value_free_exception_stacktrace(sanitized_error)
+        self.error = _build_error_dict(sanitized_error)
 
     def get_error(self) -> dict[str, Any] | None:
         """Get the error."""
@@ -402,6 +424,10 @@ class Request:
         """Serialize the SkyPilot API request."""
         assert isinstance(self.request_body,
                           payloads.RequestBody), (self.name, self.request_body)
+        # Pydantic validates normal request construction, but this final fence
+        # also covers internally constructed or restored bodies before their
+        # task text can enter the durable request row.
+        payloads.validate_task_request_body_for_persistence(self.request_body)
         try:
             # Use version-aware serializer to handle backward compatibility
             # for old clients that don't recognize new fields.
@@ -1647,26 +1673,70 @@ def set_exception_stacktrace(e: BaseException) -> None:
     setattr(e, 'stacktrace', stacktrace)
 
 
+def _set_value_free_exception_stacktrace(e: BaseException) -> None:
+    """Attaches an exception-only trace without the active raw exception."""
+    stacktrace = ''.join(traceback.format_exception_only(type(e), e))
+    setattr(e, 'stacktrace', stacktrace)
+
+
+def _mark_container_image_request_terminal(request_id: str) -> None:
+    """Best-effort image-fence observation after request state is durable."""
+    try:
+        database = global_user_state.initialize_and_get_db()
+        if (database.dialect.name
+                != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            return
+        # Importing at module load would create requests -> demand_state ->
+        # global_user_state -> server initialization recursion.
+        # pylint: disable=import-outside-toplevel
+        from sky.container_images import demand_state as image_demand_state
+
+        # pylint: enable=import-outside-toplevel
+        image_demand_state.mark_cluster_request_terminal(request_id)
+    except Exception as e:  # pylint: disable=broad-except
+        # Losing this hint is fail-safe: reconciliation retains the fence.
+        logger.warning('Failed to record container image request termination: '
+                       f'{common_utils.format_exception(e)}')
+
+
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
-    set_exception_stacktrace(e)
+    request = get_request(request_id, fields=['name', 'request_body'])
+    sanitized_error = (sanitize_request_error(
+        request.name, e, request.request_body) if request is not None else e)
+    if sanitized_error is not e:
+        e = sanitized_error
+        _set_value_free_exception_stacktrace(e)
+    else:
+        set_exception_stacktrace(e)
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.FAILED, error=e)
+    _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
 @asyncio_utils.shield
 async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
-    set_exception_stacktrace(e)
+    request = await get_request_async(request_id,
+                                      fields=['name', 'request_body'])
+    sanitized_error = (sanitize_request_error(
+        request.name, e, request.request_body) if request is not None else e)
+    if sanitized_error is not e:
+        e = sanitized_error
+        _set_value_free_exception_stacktrace(e)
+    else:
+        set_exception_stacktrace(e)
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.FAILED, error=e)
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.SUCCEEDED, result=result)
+    _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1676,6 +1746,7 @@ async def set_request_succeeded_async(request_id: str,
     """Set a request to succeeded and populate the result."""
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.SUCCEEDED, result=result)
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 @metrics_lib.time_me_async
@@ -1690,6 +1761,7 @@ async def set_request_cancelled_async(request_id: str) -> None:
             return
         request_task.finished_at = time.time()
         request_task.status = RequestStatus.CANCELLED
+    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
 @metrics_lib.time_me

@@ -427,6 +427,70 @@
                 }
             }
         },
+        "databaseConnection": {
+            "type": "object",
+            "properties": {
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumeMounts": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumes": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                }
+            }
+        },
+        "databaseMigration": {
+            "type": "object",
+            "properties": {
+                "activeDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "annotations": {
+                    "type": [
+                        "object",
+                        "null"
+                    ]
+                },
+                "backoffLimit": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "bootstrapFreshSchema": {
+                    "type": "boolean"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "ttlSecondsAfterFinished": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            }
+        },
         "digitaloceanCredentials": {
             "type": "object",
             "properties": {
@@ -507,6 +571,275 @@
         },
         "grafana": {
             "type": "object"
+        },
+        "imageCanaryWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "kubeconfigSecretName": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
+        },
+        "imageCopyWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "qualificationManifestConfigMapName": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "sourceCredentialSecrets": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "maxLength": 253,
+                                "minLength": 1
+                            },
+                            "namespace": {
+                                "type": "string",
+                                "maxLength": 253,
+                                "minLength": 1
+                            }
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
+        },
+        "imageLifecycleWorker": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "livenessDeadlineSeconds": {
+                    "type": "integer",
+                    "minimum": 5
+                },
+                "maxInFlight": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicaCount": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "retentionSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "serviceAccount": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": [
+                                "object",
+                                "null"
+                            ]
+                        },
+                        "create": {
+                            "type": "boolean"
+                        },
+                        "name": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                "tolerations": {
+                    "type": "array"
+                }
+            }
         },
         "ingress": {
             "type": "object",

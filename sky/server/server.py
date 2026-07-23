@@ -23,6 +23,8 @@ import uuid
 import zlib
 
 import fastapi
+from fastapi import exception_handlers as fastapi_exception_handlers
+from fastapi import exceptions as fastapi_exceptions
 from fastapi.middleware import cors
 import starlette.background
 import uvloop
@@ -37,6 +39,7 @@ from sky import execution
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
+from sky.container_images import server as container_images_rest
 from sky.data import storage_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
@@ -60,6 +63,7 @@ from sky.server import core_middleware
 from sky.server import csp_utils
 from sky.server import daemons
 from sky.server import dashboard as dashboard_app
+from sky.server import database_migrations
 from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
@@ -408,6 +412,9 @@ app.include_router(workspaces_rest.router,
                    prefix='/workspaces',
                    tags=['workspaces'])
 app.include_router(volumes_rest.router, prefix='/volumes', tags=['volumes'])
+app.include_router(container_images_rest.router,
+                   prefix='/images',
+                   tags=['images'])
 app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
@@ -416,6 +423,50 @@ app.include_router(file_mount_uploads.router)
 # increase the resource limit for the server
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+
+
+def _is_container_image_request_path(path: str) -> bool:
+    return (path == '/images' or path.startswith('/images/') or
+            path == '/api/v1/images' or path.startswith('/api/v1/images/'))
+
+
+def _contains_container_image_input(value: Any) -> bool:
+    """Returns whether rejected input may contain a managed-image selector."""
+    if isinstance(value, str):
+        return 'container_image' in value or 'image_id' in value
+    if isinstance(value, dict):
+        return any(key in ('container_image',
+                           'image_id') or _contains_container_image_input(item)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_container_image_input(item) for item in value)
+    return False
+
+
+@app.exception_handler(fastapi_exceptions.RequestValidationError)
+async def handle_request_validation_error(
+    request: fastapi.Request,
+    error: fastapi_exceptions.RequestValidationError,
+) -> fastapi.responses.Response:
+    """Prevents rejected container-image input from crossing the API wire."""
+    if (not payloads.is_container_image_task_validation_error(error) and
+            not _is_container_image_request_path(request.url.path) and
+            not _contains_container_image_input(error.body)):
+        return await fastapi_exception_handlers.request_validation_exception_handler(
+            request, error)
+    # FastAPI's default 422 body repeats both Pydantic's message and raw input.
+    # Image references are an authentication boundary, so even rejected values
+    # must not be reflected. Keep the standard detail-list shape without
+    # including attacker-controlled locations, contexts, messages, or inputs.
+    return fastapi.responses.JSONResponse(
+        status_code=422,
+        content={
+            'detail': [{
+                'type': 'value_error',
+                'loc': ['request'],
+                'msg': 'Invalid container image request.',
+            }]
+        })
 
 
 @app.exception_handler(exceptions.ConcurrentWorkerExhaustedError)
@@ -861,6 +912,8 @@ async def launch(launch_body: payloads.LaunchBody,
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
         service_hash = launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        service_version = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
         controller_pid = launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
         controller_ip = launch_context.get(
@@ -869,6 +922,8 @@ async def launch(launch_body: payloads.LaunchBody,
              serve_utils.is_external_load_balancer_mode()) and
             (not isinstance(service_name, str) or not service_name or
              not isinstance(service_hash, str) or not service_hash or
+             not (service_version is None or
+                  type(service_version) is int and service_version > 0) or
              not (controller_pid is None or isinstance(controller_pid, int)) or
              not (controller_ip is None or isinstance(controller_ip, str)))):
             raise fastapi.HTTPException(
@@ -2312,11 +2367,11 @@ if __name__ == '__main__':
     # that it is shown only when the API server is started.
     usage_lib.maybe_show_privacy_policy()
 
-    # Initialize global user state db
+    # Initialize and verify every central Alembic schema before serving.
     db_utils.set_max_connections(1)
-    logger.info('Initializing database engine')
-    global_user_state.initialize_and_get_db()
-    logger.info('Database engine initialized')
+    logger.info('Initializing database engines')
+    database_migrations.initialize_central_databases()
+    logger.info('Database engines initialized')
     # Initialize request db, recovering request state from the previous
     # server run (or wiping it if recovery is disabled or fails). Returns
     # whether the recovery transitions actually ran and completed; only then

@@ -370,9 +370,10 @@ def apply_workspace_option_callback(ctx, param, value):
     """Click callback for the `--workspace`/`-w` flag.
 
     Translates `--workspace <name>` into the equivalent
-    `--config active_workspace=<name>`, then drops the value (the
-    option's `expose_value=False` keeps it out of the function signature).
-    Decorating commands need only:
+    `--config active_workspace=<name>`. The callback returns the original value
+    so commands with a purpose-built workspace wire field can also use
+    `expose_value=True` and pass it explicitly. Other commands can continue to
+    use `expose_value=False`:
 
         @click.option('--workspace', '-w', expose_value=False,
                       callback=flags.apply_workspace_option_callback, ...)

@@ -264,9 +264,13 @@ export const apiClient = {
     });
   },
 
-  get: async (path) => {
+  get: async (path, options = {}) => {
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
-    return await trackedFetch(fullUrl, { headers: withVersionHeader({}) });
+    const request = options.trackRequest === false ? fetch : trackedFetch;
+    return await request(fullUrl, {
+      headers: withVersionHeader(options.headers || {}),
+      signal: options.signal,
+    });
   },
 };

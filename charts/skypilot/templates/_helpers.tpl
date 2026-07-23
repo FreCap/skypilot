@@ -34,6 +34,76 @@
 {{- end -}}
 
 {{/*
+Fail before rendering a Pod whose configurable environment, volume, or mount
+inputs collide with each other or with chart-owned fields.
+*/}}
+{{- define "skypilot.validatePodExtras" -}}
+{{- $seenEnvs := dict -}}
+{{- range (default (list) .reservedEnvNames) -}}
+{{- $_ := set $seenEnvs . true -}}
+{{- end -}}
+{{- range $envList := (default (list) .envLists) -}}
+{{- range (default (list) $envList) -}}
+{{- $name := default "" .name -}}
+{{- if empty $name -}}
+{{- fail "extraEnvs entries must have a nonempty name" -}}
+{{- end -}}
+{{- if hasKey $seenEnvs $name -}}
+{{- if eq $name "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+{{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" -}}
+{{- else -}}
+{{- fail (printf "environment variable %q is duplicated or reserved by the chart" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $seenEnvs $name true -}}
+{{- end -}}
+{{- end -}}
+
+{{- $seenVolumes := dict -}}
+{{- range (default (list) .reservedVolumeNames) -}}
+{{- $_ := set $seenVolumes . true -}}
+{{- end -}}
+{{- range $volumeList := (default (list) .volumeLists) -}}
+{{- range (default (list) $volumeList) -}}
+{{- $name := default "" .name -}}
+{{- if empty $name -}}
+{{- fail "extraVolumes entries must have a nonempty name" -}}
+{{- end -}}
+{{- if hasKey $seenVolumes $name -}}
+{{- fail (printf "volume name %q is duplicated or reserved by the chart" $name) -}}
+{{- end -}}
+{{- $_ := set $seenVolumes $name true -}}
+{{- end -}}
+{{- end -}}
+
+{{- $seenMountNames := dict -}}
+{{- range (default (list) .reservedVolumeNames) -}}
+{{- $_ := set $seenMountNames . true -}}
+{{- end -}}
+{{- $seenMountPaths := dict -}}
+{{- range (default (list) .reservedMountPaths) -}}
+{{- $_ := set $seenMountPaths . true -}}
+{{- end -}}
+{{- range $mountList := (default (list) .mountLists) -}}
+{{- range (default (list) $mountList) -}}
+{{- $name := default "" .name -}}
+{{- $path := default "" .mountPath -}}
+{{- if or (empty $name) (empty $path) -}}
+{{- fail "extraVolumeMounts entries must have nonempty name and mountPath fields" -}}
+{{- end -}}
+{{- if hasKey $seenMountNames $name -}}
+{{- fail (printf "volume mount name %q is duplicated or reserved by the chart" $name) -}}
+{{- end -}}
+{{- if hasKey $seenMountPaths $path -}}
+{{- fail (printf "volume mount path %q is duplicated or reserved by the chart" $path) -}}
+{{- end -}}
+{{- $_ := set $seenMountNames $name true -}}
+{{- $_ := set $seenMountPaths $path true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Resolve the image name, overriding the registry when global.imageRegistry is set.
 Usage: {{ include "common.image" (dict "root" . "image" "repo/name:tag") }}
 */}}
@@ -107,6 +177,39 @@ Create the name of the service account to use
 {{ .Values.rbac.serviceAccountName }}
 {{- else -}}
 {{ include "skypilot.fullname" . }}-api-sa
+{{- end -}}
+{{- end -}}
+
+{{/* Managed image workers use intentionally separate workload identities. */}}
+{{- define "skypilot.imageCopyWorkerServiceAccountName" -}}
+{{- if .Values.imageCopyWorker.serviceAccount.name -}}
+{{ .Values.imageCopyWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-copy-worker
+{{- end -}}
+{{- end -}}
+
+{{/* Length-safe, identity-stable RBAC name for one source credential. */}}
+{{- define "skypilot.imageSourceRbacName" -}}
+{{- $base := include "skypilot.fullname" .root | trunc 42 | trimSuffix "-" -}}
+{{- $identity := printf "%s/%s" .namespace .name -}}
+{{- $hash := sha256sum $identity | trunc 12 -}}
+{{- printf "%s-img-src-%s" $base $hash | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "skypilot.imageLifecycleWorkerServiceAccountName" -}}
+{{- if .Values.imageLifecycleWorker.serviceAccount.name -}}
+{{ .Values.imageLifecycleWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-lifecycle-worker
+{{- end -}}
+{{- end -}}
+
+{{- define "skypilot.imageCanaryWorkerServiceAccountName" -}}
+{{- if .Values.imageCanaryWorker.serviceAccount.name -}}
+{{ .Values.imageCanaryWorker.serviceAccount.name }}
+{{- else -}}
+{{ include "skypilot.fullname" . }}-image-canary-worker
 {{- end -}}
 {{- end -}}
 

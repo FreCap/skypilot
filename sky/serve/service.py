@@ -6,6 +6,7 @@ controller child; it never starts an in-pod load balancer.
 """
 import argparse
 from collections.abc import Callable
+import contextlib
 import dataclasses
 import json
 import multiprocessing
@@ -23,6 +24,7 @@ import filelock
 
 from sky import exceptions
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
@@ -1285,12 +1287,36 @@ def _run_cleanup_and_finalize_locked(
     _cleanup_task_run_script(job_id)
 
 
+def _validate_recovery_target(service_name: str, record: dict[str, Any],
+                              requested_incarnation: str | None,
+                              job_id: int) -> None:
+    """Rejects a stale controller before it can mutate legacy service state."""
+    service_incarnation = record.get('hash')
+    if (requested_incarnation is not None and
+            requested_incarnation != service_incarnation):
+        raise RuntimeError(
+            f'Refusing stale controller bootstrap for {service_name!r} '
+            f'incarnation {requested_incarnation!r}; current incarnation '
+            f'is {service_incarnation!r}.')
+    if (requested_incarnation is None and
+            serve_utils.is_consolidation_mode(bool(record.get('pool'))) and
+            record.get('controller_job_id') != job_id):
+        # Recovery scripts produced before --service-incarnation was
+        # introduced still carry the original controller job ID. Fence those
+        # scripts before workspace backfill or any other durable mutation.
+        raise RuntimeError(
+            f'Refusing stale controller bootstrap for {service_name!r} '
+            f'controller job {job_id!r}; current controller job is '
+            f'{record.get("controller_job_id")!r}.')
+
+
 def _start(service_name: str,
            tmp_task_yaml: str,
            job_id: int,
            entrypoint: str,
            requested_incarnation: str | None = None,
            lifecycle_epoch: int | None = None,
+           workspace: str | None = None,
            created_by: str | None = None,
            submitted_task_yaml: str | None = None):
     """Start the service controller and reconcile its external LB."""
@@ -1299,11 +1325,23 @@ def _start(service_name: str,
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
+    is_recovery = service is not None
+    if service is not None:
+        _validate_recovery_target(service_name, service, requested_incarnation,
+                                  job_id)
+        workspace_hint = workspace
+        if (workspace_hint is None and
+                skypilot_config.is_active_workspace_set()):
+            workspace_hint = skypilot_config.get_active_workspace()
+        workspace = serve_utils.resolve_service_workspace(
+            service_name, service, workspace_hint, trusted_recovery_hint=True)
+    else:
+        workspace = (workspace or skypilot_config.get_active_workspace() or
+                     skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
     # This bit comes from the API-side topology that allocated the lifecycle
     # epoch. It cannot be re-derived in the controller child: run_controller
     # sets OVERRIDE_CONSOLIDATION_MODE for unrelated controller behavior.
     enforce_launch_fence = lifecycle_epoch is not None
-    is_recovery = service is not None
     logger.info(f'It is a {"first" if not is_recovery else "recovery"} run')
     if not is_recovery and requested_incarnation is None:
         # Fresh controllers created by this version always carry an API-
@@ -1322,24 +1360,6 @@ def _start(service_name: str,
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
-        if (requested_incarnation is not None and
-                requested_incarnation != service_incarnation):
-            raise RuntimeError(
-                f'Refusing stale controller bootstrap for {service_name!r} '
-                f'incarnation {requested_incarnation!r}; current incarnation '
-                f'is {service_incarnation!r}.')
-        if (requested_incarnation is None and
-                serve_utils.is_consolidation_mode(bool(service.get('pool'))) and
-                service.get('controller_job_id') != job_id):
-            # Recovery scripts produced before --service-incarnation was
-            # introduced still carry the original controller job ID.  Fence
-            # those legacy scripts too: an already-spawned recovery must not
-            # adopt a same-name successor merely because it has no explicit
-            # incarnation argument.
-            raise RuntimeError(
-                f'Refusing stale controller bootstrap for {service_name!r} '
-                f'controller job {job_id!r}; current controller job is '
-                f'{service.get("controller_job_id")!r}.')
         recovery_expected_controller_pid = service.get('controller_pid')
         recovery_expected_controller_ip = service.get('controller_ip')
         resource_scope = service.get('resource_scope')
@@ -1485,6 +1505,7 @@ def _start(service_name: str,
                     controller_ip=pod_ip,
                     spec=service_spec,
                     yaml_content=yaml_content,
+                    workspace=workspace,
                     entrypoint=entrypoint,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
@@ -1969,6 +1990,9 @@ if __name__ == '__main__':
                         type=str,
                         help='Name of the service',
                         required=True)
+    parser.add_argument('--workspace',
+                        type=str,
+                        help='Durable workspace for replica launches')
     parser.add_argument('--service-incarnation',
                         type=str,
                         help='Preallocated service incarnation/resource scope')
@@ -1997,6 +2021,32 @@ if __name__ == '__main__':
     # We start process with 'spawn', because 'fork' could result in weird
     # behaviors; 'spawn' is also cross-platform.
     multiprocessing.set_start_method('spawn', force=True)
-    _start(args.service_name, args.task_yaml, args.job_id, args.entrypoint,
-           args.service_incarnation, args.lifecycle_epoch, args.created_by,
-           args.submitted_task_yaml)
+    cli_workspace = args.workspace
+    service_record = serve_state.get_service_from_name(args.service_name)
+    if service_record is not None:
+        _validate_recovery_target(args.service_name, service_record,
+                                  args.service_incarnation, args.job_id)
+        cli_workspace_hint = cli_workspace
+        if (cli_workspace_hint is None and
+                skypilot_config.is_active_workspace_set()):
+            cli_workspace_hint = skypilot_config.get_active_workspace()
+        cli_workspace = serve_utils.resolve_service_workspace(
+            args.service_name,
+            service_record,
+            cli_workspace_hint,
+            trusted_recovery_hint=True)
+    elif cli_workspace is None:
+        cli_workspace = skypilot_config.get_active_workspace()
+    workspace_context = (
+        skypilot_config.local_active_workspace_ctx(cli_workspace)
+        if cli_workspace is not None else contextlib.nullcontext())
+    with workspace_context:
+        _start(args.service_name,
+               args.task_yaml,
+               args.job_id,
+               args.entrypoint,
+               args.service_incarnation,
+               args.lifecycle_epoch,
+               workspace=cli_workspace,
+               created_by=args.created_by,
+               submitted_task_yaml=args.submitted_task_yaml)

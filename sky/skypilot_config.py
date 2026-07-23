@@ -231,6 +231,51 @@ def _get_config_from_path(path: str | None) -> config_utils.Config:
     return parse_and_validate_config_file(path)
 
 
+def _redact_container_image_config_for_logging(
+        config: dict[str, Any]) -> dict[str, Any]:
+    """Redacts untrusted registry policy before validation or debug output."""
+    redacted = copy.deepcopy(dict(config))
+    if redacted.get('container_registries') is not None:
+        redacted['container_registries'] = '<redacted>'
+    if 'workspaces' not in redacted:
+        return redacted
+    workspaces = redacted['workspaces']
+    if not isinstance(workspaces, dict):
+        # A malformed parent can otherwise make the generic schema validator
+        # reflect its complete value before the image-policy boundary is known.
+        redacted['workspaces'] = '<redacted>'
+        return redacted
+    if any(not common_utils.is_valid_workspace_name(workspace)
+           for workspace in workspaces):
+        # Mapping keys are values too. A credential-shaped workspace key can
+        # otherwise survive value redaction and be emitted by config logging
+        # or a debug dump before semantic admission rejects it.
+        redacted['workspaces'] = '<redacted>'
+        return redacted
+    for workspace, workspace_config in list(workspaces.items()):
+        if not isinstance(workspace_config, dict):
+            workspaces[workspace] = '<redacted>'
+        elif 'container_images' in workspace_config:
+            workspace_config['container_images'] = '<redacted>'
+    return redacted
+
+
+def _has_container_image_config(config: dict[str, Any]) -> bool:
+    """Returns whether untrusted config contains image distribution policy."""
+    if config.get('container_registries') is not None:
+        return True
+    if 'workspaces' not in config:
+        return False
+    workspaces = config['workspaces']
+    if not isinstance(workspaces, dict):
+        return True
+    return (any(not common_utils.is_valid_workspace_name(workspace)
+                for workspace in workspaces) or
+            any(not isinstance(workspace_config, dict) or
+                'container_images' in workspace_config
+                for workspace_config in workspaces.values()))
+
+
 def resolve_user_config_path() -> str | None:
     # find the user config file path, None if not resolved.
     user_config_path = _get_config_file_path(ENV_VAR_GLOBAL_CONFIG)
@@ -324,8 +369,15 @@ def _overlay_db_config(server_config: config_utils.Config,
         with orm.Session(_db_manager.get_engine()) as session:
             row = session.query(config_yaml_table).filter_by(key=key).first()
         if row:
-            db_config = config_utils.Config(yaml_utils.safe_load(row.value))
+            try:
+                config_dict = yaml_utils.read_yaml_str(
+                    row.value, reject_duplicate_keys=True)
+                db_config = config_utils.Config.from_dict(config_dict)
+            except (TypeError, ValueError, yaml.YAMLError):
+                raise ValueError(
+                    'Invalid database server config YAML syntax.') from None
             db_config.pop_nested(('db',), None)
+            _validate_config(db_config, '<database server config>')
             return db_config
         return None
 
@@ -595,14 +647,78 @@ def _get_config_file_path(envvar: str) -> str | None:
 
 def _validate_config(config: dict[str, Any], config_source: str) -> None:
     """Validates the config."""
-    common_utils.validate_schema(
-        config,
-        schemas.get_config_schema(),
-        f'Invalid config YAML from ({config_source}). See: '
-        'https://docs.skypilot.co/en/latest/reference/config.html. '  # pylint: disable=line-too-long
-        'Error: ',
-        skip_none=False)
+    try:
+        common_utils.validate_schema(
+            config,
+            schemas.get_config_schema(),
+            f'Invalid config YAML from ({config_source}). See: '
+            'https://docs.skypilot.co/en/latest/reference/config.html. '  # pylint: disable=line-too-long
+            'Error: ',
+            skip_none=False)
+    except ValueError:
+        # jsonschema includes the rejected instance in many error messages.
+        # Registry policy is secret-free by contract, but it is untrusted at
+        # this boundary and a malformed value must not become a log or terminal
+        # exfiltration channel.
+        if _has_container_image_config(config):
+            raise ValueError(
+                f'Invalid config YAML from ({config_source}). Container image '
+                'registry configuration does not match the supported schema.'
+            ) from None
+        raise
     _validate_dashboard_external_links(config, config_source)
+    _validate_container_image_config(config, config_source)
+
+
+def _validate_container_image_config(config: dict[str, Any],
+                                     config_source: str) -> None:
+    """Fully validates secret-free registry models at config admission."""
+    # Lazy imports avoid adding registry modules to the ordinary CLI import
+    # path and avoid a cycle through sky.container_images.config.
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as image_config_lib
+    from sky.container_images import models as image_models
+
+    registries = config.get('container_registries') or {}
+    try:
+        bindings = image_config_lib.parse_access_bindings(
+            registries.get('access_bindings'))
+        profiles = image_config_lib.parse_profiles(registries.get('profiles'),
+                                                   bindings)
+
+        default_profile = registries.get('default_profile')
+        if default_profile == 'direct':
+            raise ValueError("'direct' cannot be the default registry profile.")
+        if default_profile is not None and default_profile not in profiles:
+            raise ValueError(
+                f'Default registry profile {default_profile!r} is not '
+                'configured.')
+        for workspace, workspace_config in (config.get('workspaces') or
+                                            {}).items():
+            raw_policy = workspace_config.get('container_images')
+            if raw_policy is None:
+                continue
+            image_models.validate_workspace_name(
+                workspace, 'Container image policy workspace')
+            policy = image_config_lib.parse_workspace_policy(raw_policy)
+            selected_profiles = set(policy.allowed_profiles)
+            if policy.default_profile is not None:
+                selected_profiles.add(policy.default_profile)
+            if 'direct' in selected_profiles:
+                raise ValueError(
+                    f'Workspace {workspace!r} cannot configure direct as a '
+                    'default or allowed registry profile.')
+            missing = sorted(selected_profiles - profiles.keys())
+            if missing:
+                raise ValueError(
+                    f'Workspace {workspace!r} references unconfigured '
+                    f'registry profiles: {missing!r}.')
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            f'Invalid config YAML from ({config_source}). Container image '
+            'registry configuration is invalid. Check registry profile, '
+            'target, Kubernetes binding, and workspace policy fields.'
+        ) from None
 
 
 def _validate_dashboard_external_links(config: dict[str, Any],
@@ -669,7 +785,8 @@ def reload_config() -> None:
 def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
     config = config_utils.Config()
     try:
-        config_dict = yaml_utils.read_yaml(config_path)
+        config_dict = yaml_utils.read_yaml(config_path,
+                                           reject_duplicate_keys=True)
         config = config_utils.Config.from_dict(config_dict)
         # pop the db url from the config, and set it to the env var.
         # this is to avoid db url (considered a sensitive value)
@@ -678,10 +795,13 @@ def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
         if db_url:
             os.environ[constants.ENV_VAR_DB_CONNECTION_URI] = db_url
         if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+            safe_config = _redact_container_image_config_for_logging(config)
             logger.debug(f'Config loaded from {config_path}:\n'
-                         f'{yaml_utils.dump_yaml_str(dict(config))}')
-    except yaml.YAMLError as e:
-        logger.error(f'Error in loading config file ({config_path}):', e)
+                         f'{yaml_utils.dump_yaml_str(safe_config)}')
+    except yaml.YAMLError:
+        # read_yaml() converts parser failures to a value-free ValueError.
+        # Keep this defensive branch for alternate YAML implementations.
+        raise ValueError('Invalid config YAML syntax.') from None
     if config:
         _validate_config(config, config_path)
 
@@ -703,12 +823,12 @@ def _parse_dotlist(dotlist: list[str]) -> config_utils.Config:
         try:
             key, value = arg.split('=', 1)
         except ValueError as e:
-            raise ValueError(f'Invalid config override: {arg}. '
-                             'Please use the format: key=value') from e
+            raise ValueError('Invalid config override. Please use the format: '
+                             'key=value') from e
         if len(key) == 0 or len(value) == 0:
-            raise ValueError(f'Invalid config override: {arg}. '
-                             'Please use the format: key=value')
-        value = yaml_utils.safe_load(value)
+            raise ValueError('Invalid config override. Please use the format: '
+                             'key=value')
+        value = yaml_utils.safe_load_value_free(value)
         nested_keys = tuple(key.split('.'))
         config.set_nested(nested_keys, value)
     return config
@@ -759,8 +879,10 @@ def _reload_config_as_server() -> None:
     if db_url:
         server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        safe_server_config = _redact_container_image_config_for_logging(
+            server_config)
         logger.debug(f'server config: \n'
-                     f'{yaml_utils.dump_yaml_str(dict(server_config))}')
+                     f'{yaml_utils.dump_yaml_str(safe_server_config)}')
     _set_loaded_config(server_config)
     _set_loaded_config_path(server_config_path)
 
@@ -786,9 +908,10 @@ def _reload_config_as_client() -> None:
         overlaid_client_config = overlay_skypilot_config(
             original_config=overlaid_client_config, override_configs=override)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
-        logger.debug(
-            f'client config (before task and CLI overrides): \n'
-            f'{yaml_utils.dump_yaml_str(dict(overlaid_client_config))}')
+        safe_client_config = _redact_container_image_config_for_logging(
+            overlaid_client_config)
+        logger.debug(f'client config (before task and CLI overrides): \n'
+                     f'{yaml_utils.dump_yaml_str(safe_client_config)}')
     _set_loaded_config(overlaid_client_config)
     _set_loaded_config_path([user_config_path, project_config_path])
 
@@ -879,27 +1002,25 @@ def override_skypilot_config(
     _active_workspace_context = threading.local()
 
     try:
-        common_utils.validate_schema(
-            config,
-            schemas.get_config_schema(),
-            'Invalid config. See: '
-            'https://docs.skypilot.co/en/latest/reference/config.html. '  # pylint: disable=line-too-long
-            'Error: ',
-            skip_none=False)
+        _validate_config(config, '<request override>')
         _set_config_overridden(True)
         _set_loaded_config(config)
         _set_loaded_config_path(_get_loaded_config_path() +
                                 override_config_path)
         yield
     except exceptions.InvalidSkyPilotConfigError as e:
+        safe_original_config = _redact_container_image_config_for_logging(
+            original_config)
+        safe_override_configs = _redact_container_image_config_for_logging(
+            override_configs)
         with ux_utils.print_exception_no_traceback():
             raise exceptions.InvalidSkyPilotConfigError(
                 'Failed to override the SkyPilot config on API '
                 'server with your local SkyPilot config:\n'
                 '=== SkyPilot config on API server ===\n'
-                f'{yaml_utils.dump_yaml_str(dict(original_config))}\n'
+                f'{yaml_utils.dump_yaml_str(safe_original_config)}\n'
                 '=== Your local SkyPilot config ===\n'
-                f'{yaml_utils.dump_yaml_str(dict(override_configs))}\n'
+                f'{yaml_utils.dump_yaml_str(safe_override_configs)}\n'
                 f'Details: {e}') from e
     finally:
         _set_loaded_config(original_config)
@@ -1110,8 +1231,9 @@ def remove_queue_name_from_config() -> Iterator[None]:
         update_to_none_if_set(('workspaces', workspace_name, 'kubernetes'))
         remove_from_context_configs(
             ('workspaces', workspace_name, 'kubernetes'))
-    logger.debug(
-        f'config without local queue: {yaml_utils.dump_yaml_str(dict(config))}')
+    safe_config = _redact_container_image_config_for_logging(config)
+    logger.debug('config without local queue: '
+                 f'{yaml_utils.dump_yaml_str(safe_config)}')
     with replace_skypilot_config(config):
         yield
 
@@ -1140,8 +1262,8 @@ def _compose_cli_config(cli_config: list[str] | None) -> config_utils.Config:
             parsed_config = _parse_dotlist(cli_config)
         _validate_config(parsed_config, config_source)
     except ValueError as e:
-        raise ValueError(f'Invalid config override: {cli_config}. '
-                         f'Check if config file exists or if the dotlist '
+        raise ValueError(f'Invalid config override. '
+                         f'Check if the config file exists or if the dotlist '
                          f'is formatted as: key1=value1,key2=value2.\n'
                          f'Details: {e}') from e
     logger.debug('CLI overrides config syntax check passed.')
@@ -1161,8 +1283,10 @@ def apply_cli_config(cli_config: list[str] | None) -> dict[str, Any]:
     """
     parsed_config = _compose_cli_config(cli_config)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        safe_cli_config = _redact_container_image_config_for_logging(
+            parsed_config)
         logger.debug(f'applying following CLI overrides: \n'
-                     f'{yaml_utils.dump_yaml_str(dict(parsed_config))}')
+                     f'{yaml_utils.dump_yaml_str(safe_cli_config)}')
     _set_loaded_config(
         overlay_skypilot_config(original_config=_get_loaded_config(),
                                 override_configs=parsed_config))

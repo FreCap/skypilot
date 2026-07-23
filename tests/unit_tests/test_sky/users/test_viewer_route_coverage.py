@@ -88,6 +88,13 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/{service_name}/versions', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
     ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
+    # --- Managed container image writes ---
+    ('/images/publications', 'POST'),
+    ('/images/artifacts/{image_id}/prepare', 'POST'),
+    ('/images/publications/{publication_id}/retry', 'POST'),
+    ('/images/locations/{location_id}/retry', 'POST'),
+    ('/images/profiles/{profile_name}/qualification', 'POST'),
+    ('/images/profiles/{profile_name}/canaries', 'POST'),
     # Authenticated LB-to-controller sync proxy; exposes internal routing and
     # capacity state and is never a viewer API.
     ('/api/internal/serve/{service_name}/controller/load_balancer_sync', 'POST'

@@ -22,6 +22,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.backends import backend_utils
 from sky.client import sdk
+from sky.container_images import consumers as container_image_consumers
 from sky.jobs import file_content_utils
 from sky.jobs import runtime as managed_job_runtime
 from sky.jobs import scheduler
@@ -134,6 +135,7 @@ class StrategyExecutor:
         self.recover_on_exit_codes = recover_on_exit_codes or []
         self.job_id = job_id
         self.task_id = task_id
+        self.workspace = state.get_workspace(job_id)
         self.pool = pool
         self.restart_cnt_on_failure = 0
         self.job_id_on_pool_cluster: int | None = None
@@ -141,6 +143,22 @@ class StrategyExecutor:
         self.starting_lock = starting_lock
         self.starting_signal = starting_signal
         self.file_mounts_blob_id = file_mounts_blob_id
+
+    def _launch_in_workspace(
+        self, *args: Any, **kwargs: Any
+    ) -> server_common.RequestId[tuple[int | None, backends.ResourceHandle |
+                                       None]]:
+        """Runs an SDK launch in the durable job workspace on its worker."""
+        with skypilot_config.local_active_workspace_ctx(self.workspace):
+            return sdk.launch(*args, **kwargs)
+
+    def _exec_in_workspace(
+        self, *args: Any, **kwargs: Any
+    ) -> server_common.RequestId[tuple[int | None, backends.ResourceHandle |
+                                       None]]:
+        """Runs an SDK exec in the durable job workspace on its worker."""
+        with skypilot_config.local_active_workspace_ctx(self.workspace):
+            return sdk.exec(*args, **kwargs)
 
     def set_strategy_config(self, config: dict) -> None:
         """Handle strategy-specific config from the job_recovery dict.
@@ -630,9 +648,16 @@ class StrategyExecutor:
 
                             request_id = None
                             try:
-                                extra_ctx = self.extra_launch_context()
+                                extra_ctx = dict(self.extra_launch_context())
+                                recovery_generation = await (
+                                    state.get_image_recovery_generation_async(
+                                        self.job_id, self.task_id))
+                                extra_ctx[
+                                    container_image_consumers.
+                                    MANAGED_JOB_RECOVERY_GENERATION_KEY] = (
+                                        recovery_generation)
                                 request_id = await asyncio.to_thread(
-                                    sdk.launch,
+                                    self._launch_in_workspace,
                                     self.dag,
                                     cluster_name=self.cluster_name,
                                     # We expect to tear down the cluster as soon
@@ -692,7 +717,7 @@ class StrategyExecutor:
                             request_id = None
                             try:
                                 request_id = await asyncio.to_thread(
-                                    sdk.exec,
+                                    self._exec_in_workspace,
                                     self.dag,
                                     cluster_name=self.cluster_name,
                                 )

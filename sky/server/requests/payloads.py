@@ -23,6 +23,7 @@ Compatibility note:
 Also refer to sky.server.constants.MIN_COMPATIBLE_API_VERSION and the
 sky.server.versions module for more details.
 """
+import copy
 import os
 import typing
 from typing import Any
@@ -33,6 +34,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.container_images import models as container_image_models
 from sky.serve import constants as serve_constants
 from sky.server import common
 from sky.skylet import autostop_lib
@@ -42,7 +44,9 @@ from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import common as common_lib
 from sky.utils import common_utils
+from sky.utils import infra_utils
 from sky.utils import registry
+from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import pydantic
@@ -50,6 +54,52 @@ else:
     pydantic = adaptors_common.LazyImport('pydantic')
 
 logger = sky_logging.init_logger(__name__)
+
+_CONTAINER_IMAGE_TASK_ERROR_MESSAGE = (
+    'Invalid managed container image task specification.')
+_MAX_TASK_RESOURCE_CONFIGS = 4096
+_RESOURCE_CANDIDATE_FIELDS = ('any_of', 'ordered')
+
+
+class ContainerImageTaskValidationError(ValueError):
+    """Closed marker for task-image validation failures at the REST edge."""
+
+
+def _without_server_owned_override_config(
+        override_configs: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Removes ignored server-owned config before durable persistence."""
+    if override_configs is None:
+        return None
+    if not isinstance(override_configs, dict):
+        raise ValueError('Invalid client SkyPilot configuration override.')
+    sanitized = copy.deepcopy(override_configs)
+    for key_path in constants.SKIPPED_CLIENT_OVERRIDE_KEYS:
+        parent: Any = sanitized
+        for key in key_path[:-1]:
+            if not isinstance(parent, dict):
+                break
+            parent = parent.get(key)
+        else:
+            if isinstance(parent, dict):
+                parent.pop(key_path[-1], None)
+    return sanitized
+
+
+def is_container_image_task_validation_error(error: Any) -> bool:
+    """Returns whether a Pydantic/FastAPI error carries the closed marker."""
+    try:
+        details = error.errors()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        context = detail.get('ctx')
+        if (isinstance(context, dict) and isinstance(
+                context.get('error'), ContainerImageTaskValidationError)):
+            return True
+    return False
+
 
 # These non-skypilot environment variables will be updated from the local
 # environment on each request when running a local API server.
@@ -229,6 +279,360 @@ class RequestBody(BasePayload):
         return self.env_vars.get(constants.USER_ID_ENV_VAR)
 
 
+def _resource_config_cloud_constraint(
+        resource_config: dict[str, Any]) -> str | None:
+    """Parses one resource cloud constraint with normal wildcard semantics."""
+    cloud = resource_config.get('cloud')
+    infra = resource_config.get('infra')
+    if cloud is not None and not isinstance(cloud, str):
+        raise ValueError
+    if infra is not None and not isinstance(infra, str):
+        raise ValueError
+    if (infra is not None and any(
+            resource_config.get(field) is not None
+            for field in ('cloud', 'region', 'zone'))):
+        raise ValueError
+    if isinstance(infra, str):
+        return infra_utils.InfraInfo.from_str(infra).cloud
+    if cloud is None:
+        return None
+    normalized = cloud.strip().lower()
+    if not normalized or normalized == '*':
+        return None
+    if normalized == 'k8s':
+        return 'kubernetes'
+    return normalized
+
+
+def _resource_config_targets_kubernetes(
+        resource_config: dict[str, Any]) -> bool:
+    """Returns whether one effective resource config targets Kubernetes."""
+    cloud_name = _resource_config_cloud_constraint(resource_config)
+    if cloud_name is None:
+        return False
+    return _cloud_constraint_targets_kubernetes(cloud_name)
+
+
+def _resource_config_may_target_kubernetes(
+        resource_config: dict[str, Any]) -> bool:
+    """Returns whether optimization can reinterpret an image ID as Docker."""
+    cloud_name = _resource_config_cloud_constraint(resource_config)
+    if cloud_name is None:
+        return True
+    return _cloud_constraint_targets_kubernetes(cloud_name)
+
+
+def _cloud_constraint_targets_kubernetes(cloud_name: str) -> bool:
+    """Resolves a validated cloud constraint without optimization-only guards."""
+    cloud = registry.CLOUD_REGISTRY.from_str(cloud_name)
+    kubernetes = registry.CLOUD_REGISTRY.from_str('kubernetes')
+    if cloud is None or kubernetes is None:
+        raise ValueError
+    return isinstance(cloud, type(kubernetes))
+
+
+def _validate_legacy_image_id(image_id: Any,
+                              *,
+                              kubernetes_possible: bool,
+                              scan_unclassified: bool = False) -> bool:
+    """Validates legacy Docker ``image_id`` forms and returns if one exists."""
+    if image_id is None:
+        return False
+
+    docker_references: list[str] = []
+    has_reserved_docker_key = False
+    has_docker_image_value = False
+    if isinstance(image_id, str):
+        image_value = image_id.strip()
+        if image_value.startswith('docker:'):
+            docker_references.append(image_value[len('docker:'):])
+        elif kubernetes_possible:
+            docker_references.append(image_value)
+        elif scan_unclassified:
+            _validate_unclassified_legacy_image_value(image_value)
+    elif isinstance(image_id, dict):
+        for region, raw_image_value in image_id.items():
+            if region is not None and not isinstance(region, str):
+                raise ValueError
+            if not isinstance(raw_image_value, str):
+                raise ValueError
+            image_value = raw_image_value.strip()
+            if region == 'docker':
+                has_reserved_docker_key = True
+                if image_value.startswith('docker:'):
+                    image_value = image_value[len('docker:'):]
+                docker_references.append(image_value)
+            elif image_value.startswith('docker:'):
+                has_docker_image_value = True
+                docker_references.append(image_value[len('docker:'):])
+            elif kubernetes_possible:
+                has_docker_image_value = True
+                docker_references.append(image_value)
+            elif scan_unclassified:
+                _validate_unclassified_legacy_image_value(image_value)
+    else:
+        raise ValueError
+
+    if has_reserved_docker_key and has_docker_image_value:
+        raise ValueError
+    normalized_references = {
+        container_image_models.ContainerImage.from_legacy_ref(reference).ref
+        for reference in docker_references
+    }
+    if len(normalized_references) > 1:
+        raise ValueError
+    return bool(normalized_references)
+
+
+def _validate_unclassified_legacy_image_value(image_value: str) -> None:
+    """Rejects credential syntax without treating a cloud VM ID as OCI."""
+    suspicious = (len(image_value) > 1024 or not image_value.isprintable() or
+                  any(character.isspace() for character in image_value) or
+                  '://' in image_value or
+                  any(character in image_value
+                      for character in ('@', '?', '#', '%', '\\', '=')))
+    if suspicious:
+        container_image_models.validate_operational_image_selector(image_value)
+
+
+def _validate_container_image_docker_login_config(
+        resource_config: dict[str, Any]) -> bool:
+    """Validates a resource login config and reports inline credentials."""
+    login_config = resource_config.get('_docker_login_config')
+    if login_config is None:
+        return False
+    if not isinstance(login_config, dict):
+        raise ValueError
+    has_inline_credentials = False
+    for field in ('username', 'password'):
+        value = login_config.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError
+        if value:
+            has_inline_credentials = True
+    return has_inline_credentials
+
+
+def _validate_task_container_image_credentials(
+        task_config: dict[str, Any]) -> None:
+    """Rejects inline Docker credentials before a task can be persisted."""
+    credential_keys = (constants.DOCKER_USERNAME_ENV_VAR,
+                       constants.DOCKER_PASSWORD_ENV_VAR)
+    for field in ('envs', 'secrets'):
+        values = task_config.get(field)
+        if values is None:
+            continue
+        if field == 'secrets' and isinstance(values, list):
+            # Managed secret references contain no inline credential value.
+            continue
+        if not isinstance(values, dict):
+            raise ValueError
+        for key in credential_keys:
+            value = values.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError
+            if value:
+                raise ValueError
+
+
+def _validate_resource_container_images(
+    resource_config: dict[str, Any],
+    *,
+    include_unconstrained_kubernetes: bool,
+    scan_unclassified: bool,
+) -> tuple[bool, bool]:
+    """Validates image selectors in one explicit or effective config."""
+    if '_resolved_container_image' in resource_config:
+        # This is a server-created placement snapshot. Reject it before the
+        # serialized task can enter the request database, even when the task
+        # has no ordinary image selector that would otherwise classify it as
+        # a managed-image request.
+        raise ValueError
+    if ('container_image' not in resource_config and
+            'image_id' not in resource_config):
+        return False, False
+    has_container_image = False
+    container_image = resource_config.get('container_image')
+    if container_image is not None:
+        container_image_models.ContainerImage.from_config(container_image)
+        if _validate_container_image_docker_login_config(resource_config):
+            raise ValueError
+        has_container_image = True
+
+    image_id = resource_config.get('image_id')
+    kubernetes_possible = False
+    if image_id is not None:
+        kubernetes_possible = (
+            _resource_config_may_target_kubernetes(resource_config)
+            if include_unconstrained_kubernetes else
+            _resource_config_targets_kubernetes(resource_config))
+    has_legacy_container_image = _validate_legacy_image_id(
+        image_id,
+        kubernetes_possible=kubernetes_possible,
+        scan_unclassified=scan_unclassified)
+    if has_container_image and has_legacy_container_image:
+        raise ValueError
+    return (has_container_image or
+            has_legacy_container_image, has_container_image)
+
+
+def _serialized_task_uses_container_image(value: str) -> bool:
+    """Validates and classifies image selectors in serialized task YAML."""
+    yaml_utils.check_no_duplicate_keys(value)
+    configs = yaml_utils.read_yaml_all_str(value)
+    uses_container_image = False
+    processed_resource_configs = 0
+    for task_config in configs:
+        if task_config is None:
+            continue
+        if isinstance(task_config, str):
+            # Preserve the existing request-model contract for opaque task
+            # placeholders used by internal and older clients.  A scalar
+            # string cannot define a SkyPilot resource mapping, so there is no
+            # managed-image selector to validate at this edge. Normal task
+            # parsing remains responsible for rejecting it before execution.
+            continue
+        if not isinstance(task_config, dict):
+            raise ValueError
+        resources_config = task_config.get('resources')
+        if resources_config is None:
+            continue
+        task_uses_explicit_container_image = False
+        task_has_inline_resource_credentials = False
+        if isinstance(resources_config, dict):
+            root_resource_configs = [resources_config]
+        elif isinstance(resources_config, list):
+            root_resource_configs = list(resources_config)
+        else:
+            raise ValueError
+
+        pending_resource_configs: list[tuple[dict[str, Any], dict[str, Any],
+                                             frozenset[int]]] = []
+        for root_resource_config in root_resource_configs:
+            if not isinstance(root_resource_config, dict):
+                raise ValueError
+            pending_resource_configs.append(
+                (root_resource_config, {}, frozenset()))
+
+        while pending_resource_configs:
+            resource_config, inherited_config, ancestors = (
+                pending_resource_configs.pop())
+            resource_config_id = id(resource_config)
+            if resource_config_id in ancestors:
+                raise ValueError
+            processed_resource_configs += 1
+            if processed_resource_configs > _MAX_TASK_RESOURCE_CONFIGS:
+                raise ValueError
+            task_has_inline_resource_credentials |= (
+                _validate_container_image_docker_login_config(resource_config))
+
+            # Validate explicit fields even when a child candidate overrides
+            # them. Rejected task text must never persist credential-bearing
+            # image values that happen not to survive resource inheritance.
+            raw_uses_image, raw_uses_explicit_image = (
+                _validate_resource_container_images(
+                    resource_config,
+                    include_unconstrained_kubernetes=False,
+                    scan_unclassified=True))
+            uses_container_image |= raw_uses_image
+            task_uses_explicit_container_image |= raw_uses_explicit_image
+
+            effective_config = inherited_config.copy()
+            effective_config.update({
+                key: item
+                for key, item in resource_config.items()
+                if key not in _RESOURCE_CANDIDATE_FIELDS
+            })
+            candidate_lists: list[list[Any]] = []
+            candidate_fields_present = 0
+            for candidate_field in _RESOURCE_CANDIDATE_FIELDS:
+                candidates = resource_config.get(candidate_field)
+                if candidates is None:
+                    continue
+                candidate_fields_present += 1
+                if not isinstance(candidates, list):
+                    raise ValueError
+                candidate_lists.append(candidates)
+            if candidate_fields_present > 1:
+                raise ValueError
+
+            candidates = candidate_lists[0] if candidate_lists else []
+            # A known Kubernetes-family constraint is meaningful at every
+            # intermediate node. An unconstrained node is classified only if
+            # it is a concrete leaf; its children may inherit a non-container
+            # cloud whose VM image syntax is intentionally not OCI.
+            effective_uses_image, effective_uses_explicit_image = (
+                _validate_resource_container_images(
+                    effective_config,
+                    include_unconstrained_kubernetes=not candidates,
+                    scan_unclassified=False))
+            uses_container_image |= effective_uses_image
+            task_uses_explicit_container_image |= (
+                effective_uses_explicit_image)
+            if not candidates:
+                continue
+            next_ancestors = ancestors | {resource_config_id}
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError
+                pending_resource_configs.append(
+                    (candidate, effective_config, next_ancestors))
+        if task_uses_explicit_container_image:
+            if task_has_inline_resource_credentials:
+                raise ValueError
+            _validate_task_container_image_credentials(task_config)
+    return uses_container_image
+
+
+def validate_task_request_body_for_persistence(body: 'RequestBody') -> None:
+    """Sanitizes server-owned config and revalidates final request-row data."""
+    body.override_skypilot_config = _without_server_owned_override_config(
+        body.override_skypilot_config)
+    if isinstance(body, DagRequestBody):
+        _validate_serialized_task_container_images(body.dag)
+        return
+    task_body_types = (LaunchBody, ExecBody, JobsLaunchBody, ServeUpBody,
+                       ServeUpdateBody, JobsPoolApplyBody)
+    if isinstance(body, task_body_types):
+        task = body.task
+        if task is not None:
+            _validate_serialized_task_container_images(task)
+
+
+def serialized_task_uses_container_image(value: str | None) -> bool:
+    """Returns whether serialized task YAML crosses the image boundary.
+
+    Persisted request bodies have already passed the validator below. For an
+    older or corrupted row, fail closed so its terminal error cannot expose a
+    provider value.
+    """
+    if value is None:
+        return False
+    try:
+        return _serialized_task_uses_container_image(value)
+    except Exception:  # pylint: disable=broad-except
+        return True
+
+
+def _validate_serialized_task_container_images(value: str | None) -> str | None:
+    """Validates managed-image selectors before a task body is persisted.
+
+    Task-bearing REST payloads intentionally keep YAML as a string until the
+    request worker processes file mounts. Without this preflight, invalid
+    ``container_image`` or effective legacy Docker ``image_id`` values could
+    be stored in task.db before normal task parsing rejects them. Collapse
+    every failure to a value-free error.
+    """
+    if value is None:
+        return value
+    try:
+        _serialized_task_uses_container_image(value)
+    except Exception:  # pylint: disable=broad-except
+        raise ContainerImageTaskValidationError(
+            _CONTAINER_IMAGE_TASK_ERROR_MESSAGE) from None
+    return value
+
+
 class CheckBody(RequestBody):
     """The request body for the check endpoint."""
     clouds: tuple[str, ...] | None = None
@@ -257,7 +661,12 @@ class KubernetesLabelGpusBody(RequestBody):
 
 class DagRequestBody(RequestBody):
     """Request body base class for endpoints with a dag."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     dag: str
+
+    _validate_container_images = pydantic.field_validator('dag')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
         # Import here to avoid requirement of the whole SkyPilot dependency on
@@ -306,6 +715,8 @@ class OptimizeBody(DagRequestBodyWithRequestOptions):
 
 class LaunchBody(RequestBody):
     """The request body for the launch endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str
     cluster_name: str
     retry_until_up: bool = False
@@ -334,6 +745,9 @@ class LaunchBody(RequestBody):
     # set against any server.
     include_credentials: bool = False
 
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
+
     def to_kwargs(self) -> dict[str, Any]:
 
         kwargs = super().to_kwargs()
@@ -361,11 +775,16 @@ class LaunchBody(RequestBody):
 
 class ExecBody(RequestBody):
     """The request body for the exec endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str
     cluster_name: str
     dryrun: bool = False
     down: bool = False
     backend: str | None = None
+
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
 
@@ -615,10 +1034,15 @@ class JobStatusBody(RequestBody):
 
 class JobsLaunchBody(RequestBody):
     """The request body for the jobs launch endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str
     name: str | None
     pool: str | None = None
     num_jobs: int | None = None
+
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
@@ -729,8 +1153,13 @@ class OperatorNotificationReadBody(pydantic.BaseModel):
 
 class ServeUpBody(RequestBody):
     """The request body for the serve up endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str
     service_name: str
+
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
@@ -749,9 +1178,14 @@ class ServeUpBody(RequestBody):
 
 class ServeUpdateBody(RequestBody):
     """The request body for the serve update endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str
     service_name: str
     mode: serve.UpdateMode
+
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
@@ -932,10 +1366,15 @@ class JobsDownloadLogsBody(RequestBody):
 
 class JobsPoolApplyBody(RequestBody):
     """The request body for the jobs pool apply endpoint."""
+    model_config = pydantic.ConfigDict(hide_input_in_errors=True)
+
     task: str | None = None
     workers: int | None = None
     pool_name: str
     mode: serve.UpdateMode
+
+    _validate_container_images = pydantic.field_validator('task')(
+        _validate_serialized_task_container_images)
 
     def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()

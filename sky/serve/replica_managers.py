@@ -303,23 +303,24 @@ class _UnfencedExternalLbLaunchError(RuntimeError):
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
 @context.contextual
-def launch_cluster(
-        replica_id: int,
-        yaml_content: str,
-        cluster_name: str,
-        log_file: str,
-        replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
-        replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
-        resources_override: dict[str, Any] | None = None,
-        retry_until_up: bool = True,
-        max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-        availability_max_retry: int | None = None,
-        exact_resources_override: bool = False,
-        pre_launch_guard: Callable[[], bool] | None = None,
-        cloud_launch_guard: Callable[[], bool] | None = None,
-        continue_guard: Callable[[], bool] | None = None,
-        launch_fence: dict[str, Any] | None = None,
-        service_spec: 'service_spec.SkyServiceSpec | None' = None) -> None:
+def launch_cluster(replica_id: int,
+                   yaml_content: str,
+                   cluster_name: str,
+                   log_file: str,
+                   replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
+                   replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
+                       int, bool],
+                   resources_override: dict[str, Any] | None = None,
+                   retry_until_up: bool = True,
+                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+                   availability_max_retry: int | None = None,
+                   exact_resources_override: bool = False,
+                   pre_launch_guard: Callable[[], bool] | None = None,
+                   cloud_launch_guard: Callable[[], bool] | None = None,
+                   continue_guard: Callable[[], bool] | None = None,
+                   launch_fence: dict[str, Any] | None = None,
+                   service_spec: 'service_spec.SkyServiceSpec | None' = None,
+                   workspace: str | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -481,11 +482,16 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             if launch_fence is not None:
                 launch_kwargs['_extra_launch_context'] = launch_fence
-            request_id = sdk.launch(task,
-                                    cluster_name,
-                                    retry_until_up=retry_until_up,
-                                    _is_launched_by_sky_serve_controller=True,
-                                    **launch_kwargs)
+            workspace_ctx: contextlib.AbstractContextManager = (
+                skypilot_config.local_active_workspace_ctx(workspace)
+                if workspace is not None else contextlib.nullcontext())
+            with workspace_ctx:
+                request_id = sdk.launch(
+                    task,
+                    cluster_name,
+                    retry_until_up=retry_until_up,
+                    _is_launched_by_sky_serve_controller=True,
+                    **launch_kwargs)
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
@@ -1838,6 +1844,14 @@ class ReplicaManager:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
         self._service_name: str = service_name
+        service_record = serve_state.get_service_from_name(service_name)
+        if service_record is not None:
+            self._workspace = serve_utils.resolve_service_workspace(
+                service_name, service_record,
+                skypilot_config.get_active_workspace())
+        else:
+            self._workspace = (skypilot_config.get_active_workspace() or
+                               constants.SKYPILOT_DEFAULT_WORKSPACE)
         self._resource_scope = resource_scope
         self._service_hash = service_hash
         self._controller_owner = ((controller_pid,
@@ -2194,7 +2208,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         ownership_lost = getattr(self, '_ownership_lost', None)
         return ownership_lost is None or not ownership_lost.is_set()
 
-    def _replica_launch_fence_context(self) -> dict[str, Any] | None:
+    def _replica_launch_fence_context(self,
+                                      service_version: int | None = None
+                                     ) -> dict[str, Any] | None:
         """Owner tuple validated by the API executor before provisioning."""
         if not getattr(self, '_enforce_launch_fence', True):
             # A legacy/non-consolidated controller owns a different Serve DB;
@@ -2213,12 +2229,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
         controller_ip_key = (
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
-        return {
+        fence_context = {
             service_name_key: self._service_name,
             service_hash_key: service_hash,
             controller_pid_key: controller_pid,
             controller_ip_key: controller_ip,
         }
+        if service_version is not None:
+            fence_context[
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY] = (
+                    service_version)
+        return fence_context
 
     def _service_owner_watchdog(self) -> None:
         """Trip one shared launch-cancellation fence on ownership loss."""
@@ -3221,8 +3242,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                       cost_rebalance_for_replica_id is None and
                       not prior_unknown_capacity_replacement) else None),
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
-                'launch_fence': self._replica_launch_fence_context(),
+                'launch_fence':
+                    self._replica_launch_fence_context(launch_version),
                 'service_spec': launch_spec,
+                'workspace': getattr(
+                    self, '_workspace',
+                    skypilot_config.get_active_workspace() or
+                    constants.SKYPILOT_DEFAULT_WORKSPACE),
             },
         )
         replica_port = _get_resources_ports(launch_yaml_content, launch_spec)

@@ -2,6 +2,8 @@
 
 import pickle
 
+import pytest
+
 from sky import exceptions
 from sky.utils import status_lib
 
@@ -19,16 +21,41 @@ def test_value_error():
     assert str(deserialized) == 'test'
 
 
+def test_exception_notes_are_restored_outside_constructor_kwargs():
+    error = TypeError('test')
+    setattr(error, '__notes__', ['when serializing dict item bad'])
+
+    serialized = exceptions.serialize_exception(error)
+    assert serialized['notes'] == ['when serializing dict item bad']
+    assert '__notes__' not in serialized['attributes']
+
+    restored = exceptions.deserialize_exception(serialized)
+    assert isinstance(restored, TypeError)
+    assert getattr(restored, '__notes__') == ['when serializing dict item bad']
+
+    legacy = dict(serialized)
+    legacy.pop('notes')
+    legacy['attributes'] = {
+        **serialized['attributes'],
+        '__notes__': ['legacy note'],
+    }
+    restored_legacy = exceptions.deserialize_exception(legacy)
+    assert isinstance(restored_legacy, TypeError)
+    assert getattr(restored_legacy, '__notes__') == ['legacy note']
+
+
 def test_builtin_exception_attributes():
     """Built-in exception attributes are restored after construction."""
     e = TypeError('test')
     e.add_note('when serializing a result')
+    e.request_context = {'request_id': 'request-1'}
 
     deserialized = _serialize_deserialize(e)
 
     assert isinstance(deserialized, TypeError)
     assert str(deserialized) == 'test'
     assert deserialized.__notes__ == ['when serializing a result']
+    assert deserialized.request_context == {'request_id': 'request-1'}
 
 
 def test_execution_control_errors_are_picklable():
@@ -222,6 +249,39 @@ def test_deserialize_partial_dict():
     assert 'NonExistent' in str(e)
 
 
+@pytest.mark.parametrize('bad_input', [
+    {
+        'type': 1,
+    },
+    {
+        'type': 'ValueError',
+        'attributes': None,
+    },
+    {
+        'type': 'ValueError',
+        'attributes': [('field', 'value')],
+    },
+    {
+        'type': 'ValueError',
+        'attributes': {
+            1: 'value'
+        },
+    },
+    {
+        'type': 'ValueError',
+        'args': None,
+    },
+    {
+        'type': 'int',
+    },
+])
+def test_deserialize_malformed_envelope_never_raises(bad_input):
+    restored = exceptions.deserialize_exception(bad_input)
+
+    assert isinstance(restored, RuntimeError)
+    assert str(restored) == 'Server error response is malformed.'
+
+
 def test_wrap_unsafe_exceptions():
     """Test that non-safe exceptions are wrapped properly."""
 
@@ -312,6 +372,7 @@ def test_attribute_that_cannot_be_set_does_not_lose_the_error():
         'attributes': {
             'context': 'while encoding',
             '__class__': int,
+            '__traceback__': 'not-a-traceback',
         },
     }
 

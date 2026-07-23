@@ -76,6 +76,7 @@ runs:
         TEST_PATH: ${{ inputs.test-path }}
         TEST_NAME: ${{ inputs.test-name }}
         BUILDKITE_ANALYTICS_TOKEN: ${{ inputs.buildkite-analytics-token }}
+        SKYPILOT_REQUIRE_CONTAINER_IMAGE_POSTGRES: ${{ inputs.test-name == 'Unit Tests' && '1' || '0' }}
       run: |
         source ~/test-env/bin/activate
         if [[ "$TEST_NAME" == "Resource Lifetime" ]]; then

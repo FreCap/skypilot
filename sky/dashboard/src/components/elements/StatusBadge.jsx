@@ -30,14 +30,22 @@ export const getStatusStyle = (status) => {
 
     // Job specific statuses
     case 'PENDING':
+    case 'MISSING':
       return 'bg-gray-100 text-gray-800';
     case 'SUCCEEDED':
       return 'bg-blue-50 text-blue-700';
     case 'FAILED':
+    case 'QUARANTINED':
       return 'bg-red-50 text-red-700';
     case 'CANCELLED':
       return 'bg-yellow-50 text-yellow-700';
     case 'RECOVERING':
+    case 'INSPECTING':
+    case 'COPYING':
+    case 'VERIFYING':
+    case 'EVICTING':
+    case 'QUALIFYING':
+    case 'WARMING':
       return 'bg-orange-50 text-orange-700';
     case 'WINDING_DOWN':
       return 'bg-purple-50 text-purple-700';
@@ -79,7 +87,13 @@ export const getStatusStyle = (status) => {
     case 'PREEMPTED':
       return 'bg-purple-50 text-purple-700';
     case 'UNKNOWN':
+    case 'EVICTED':
+    case 'RETIRED':
+    case 'SUPERSEDED':
       return 'bg-gray-100 text-gray-800';
+
+    case 'ACTIVE':
+      return 'bg-green-50 text-green-700';
 
     // Serve specific statuses - ServiceStatus
     case 'CONTROLLER_INIT':
@@ -101,6 +115,12 @@ export const getStatusIcon = (status) => {
   switch (status) {
     case 'LAUNCHING':
     case 'STARTING':
+    case 'INSPECTING':
+    case 'COPYING':
+    case 'VERIFYING':
+    case 'EVICTING':
+    case 'QUALIFYING':
+    case 'WARMING':
       return <CircularProgress size={12} className="w-3 h-3 mr-1" />;
     case 'RUNNING':
     case 'IN_USE':
@@ -111,7 +131,11 @@ export const getStatusIcon = (status) => {
       return <CircularProgress size={12} className="w-3 h-3 mr-1" />;
     case 'TERMINATED':
     case 'FAILED':
+    case 'QUARANTINED':
     case 'CANCELLED':
+    case 'EVICTED':
+    case 'RETIRED':
+    case 'SUPERSEDED':
       return <SquareIcon className="w-3 h-3 mr-1" />;
     case 'SUCCEEDED':
       return <TickIcon className="w-3 h-3 mr-1" />;
@@ -124,10 +148,12 @@ export const getStatusIcon = (status) => {
     case 'FAILED_NO_RESOURCE':
     case 'FAILED_CONTROLLER':
     case 'READY':
+    case 'ACTIVE':
     case 'NOT_READY':
     case 'CONTROLLER_INIT':
     case 'REPLICA_INIT':
     case 'NO_REPLICA':
+    case 'MISSING':
       return <CircleIcon className="w-3 h-3 mr-1" />;
     case 'WINDING_DOWN':
     case 'PROVISIONING':

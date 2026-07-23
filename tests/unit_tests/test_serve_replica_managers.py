@@ -24,11 +24,31 @@ from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
 from sky import exceptions
+from sky import skypilot_config
 from sky.serve import replica_managers
 from sky.serve import serve_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import thread_utils
+
+
+def test_replica_manager_rejects_legacy_service_without_workspace():
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_from_name',
+                           return_value={
+                               'workspace': None,
+                               'hash': 'incarnation-a'
+                           }), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[]), \
+         mock.patch.object(replica_managers.serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value={}), \
+         pytest.raises(RuntimeError, match='durable workspace'):
+        replica_managers.ReplicaManager('legacy-service',
+                                        mock.MagicMock(),
+                                        version=1)
 
 
 class TestSkyPilotReplicaManagerInitOrdering:
@@ -156,6 +176,10 @@ run: echo hi
         persisted_spec.pool = False
         persisted_spec.uses_logical_replicas = False
         with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_service_from_name',
+                return_value={'workspace': 'default'}), \
+             mock.patch(
                 'sky.serve.replica_managers.serve_state.get_yaml_content',
                 return_value=legacy_yaml), \
              mock.patch(
@@ -591,6 +615,7 @@ class TestLaunchClusterRetry:
         exception to raise from sdk.stream_and_get, or None for success.
         Returns (mock_sdk, mock_terminate, raised RuntimeError or None).
         """
+        observed_workspaces = kwargs.pop('observed_workspaces', None)
         raised = None
         with mock.patch(
                 'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
@@ -603,7 +628,16 @@ class TestLaunchClusterRetry:
                        ) as mock_backoff:
             mock_backoff.return_value.current_backoff.return_value = (
                 backoff_seconds)
-            mock_sdk.launch.return_value = 'request-id'
+            if observed_workspaces is None:
+                mock_sdk.launch.return_value = 'request-id'
+            else:
+
+                def _launch(*_args, **_kwargs):
+                    observed_workspaces.append(
+                        skypilot_config.get_active_workspace())
+                    return 'request-id'
+
+                mock_sdk.launch.side_effect = _launch
             mock_sdk.stream_and_get.side_effect = stream_side_effects
             if replica_to_launch_cancelled is None:
                 replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -733,6 +767,15 @@ run: echo hi
         assert mock_sdk.launch.call_count == 3
         assert mock_sdk.stream_and_get.call_count == 3
         assert mock_terminate.call_count == 2
+
+    def test_launch_worker_enters_durable_service_workspace(self, tmp_path):
+        observed_workspaces = []
+        _, _, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            workspace='research',
+            observed_workspaces=observed_workspaces)
+        assert raised is None
+        assert observed_workspaces == ['research']
 
     def test_capacity_failures_default_to_max_retry(self, tmp_path):
         """Without availability_max_retry, capacity failures keep the

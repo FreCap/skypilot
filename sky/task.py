@@ -186,11 +186,50 @@ def _check_docker_login_config(task_envs: dict[str, str],
     return True
 
 
+def _validate_container_image_docker_credentials(
+    resources: set['resources_lib.Resources'] | list['resources_lib.Resources'],
+    task_envs: dict[str, str],
+    task_secrets: dict[str, SecretStr],
+) -> None:
+    """Rejects inline registry credentials on the managed-image interface."""
+    uses_container_image = any(
+        getattr(resource, 'container_image', None) is not None and
+        not getattr(resource, 'container_image_from_legacy_image_id', False)
+        for resource in resources)
+    if not uses_container_image:
+        return
+
+    for resource in resources:
+        login_config = getattr(resource, 'docker_login_config', None)
+        if login_config is not None and (login_config.username or
+                                         login_config.password):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'container_image does not support inline Docker username '
+                    'or password credentials. Use a public source or a '
+                    'server-side workload identity.')
+
+    credential_keys = (constants.DOCKER_USERNAME_ENV_VAR,
+                       constants.DOCKER_PASSWORD_ENV_VAR)
+    for key in credential_keys:
+        env_value = task_envs.get(key)
+        secret_value = task_secrets.get(key)
+        if env_value or (secret_value is not None and
+                         secret_value.get_secret_value()):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'container_image does not support inline Docker username '
+                    'or password credentials. Use a public source or a '
+                    'server-side workload identity.')
+
+
 def _with_docker_login_config(
     resources: set['resources_lib.Resources'] | list['resources_lib.Resources'],
     task_envs: dict[str, str],
     task_secrets: dict[str, SecretStr],
 ) -> set['resources_lib.Resources'] | list['resources_lib.Resources']:
+    _validate_container_image_docker_credentials(resources, task_envs,
+                                                 task_secrets)
     if not _check_docker_login_config(task_envs, task_secrets):
         return resources
     envs = task_envs.copy()
@@ -200,23 +239,14 @@ def _with_docker_login_config(
 
     def _add_docker_login_config(resources: 'resources_lib.Resources'):
         docker_image = resources.extract_docker_image()
-        if docker_image is None:
+        if docker_image is None and resources.container_image is None:
             logger.warning(f'{colorama.Fore.YELLOW}Docker login configs '
                            f'{", ".join(constants.DOCKER_LOGIN_ENV_VARS)} '
                            'are provided, but no docker image is specified '
-                           'in `image_id`. The login configs will be '
+                           'in `container_image`. The login configs will be '
                            f'ignored.{colorama.Style.RESET_ALL}')
             return resources
-        # If docker image comes from the 'docker' key in image_id dict,
-        # don't overwrite image_id, just attach login config.
-        if resources._docker_image is not None:  # pylint: disable=protected-access
-            return resources.copy(_docker_login_config=docker_login_config)
-        # Legacy path: image_id contains docker: prefix
-        assert resources.image_id is not None and len(
-            resources.image_id) == 1, resources.image_id
-        region = list(resources.image_id.keys())[0]
-        return resources.copy(image_id={region: 'docker:' + docker_image},
-                              _docker_login_config=docker_login_config)
+        return resources.copy(_docker_login_config=docker_login_config)
 
     new_resources = []
     for r in resources:
@@ -1010,14 +1040,12 @@ class Task:
 
                 task = sky.Task.from_yaml_str('yaml_str')
         """
-        with ux_utils.print_exception_no_traceback():
-            yaml_utils.check_no_duplicate_keys(yaml_str)
-        config = yaml_utils.safe_load(yaml_str)
+        config = yaml_utils.read_yaml_str(yaml_str, reject_duplicate_keys=True)
 
         if isinstance(config, str):
             with ux_utils.print_exception_no_traceback():
-                raise ValueError('YAML loaded as str, not as dict. '
-                                 f'Is it correct? content:\n{yaml_str}')
+                raise ValueError('YAML loaded as a string instead of a task '
+                                 'mapping.')
 
         if config is None:
             config = {}
@@ -1227,11 +1255,18 @@ class Task:
                 raise ValueError(
                     'envs must be List[Tuple[str, str]] or Dict[str, str]: '
                     f'{envs}')
+        candidate_envs = self._envs.copy()
+        candidate_envs.update(envs)
+        _validate_container_image_docker_credentials(self.resources,
+                                                     candidate_envs,
+                                                     self._secrets)
+        has_docker_login = _check_docker_login_config(candidate_envs,
+                                                      self._secrets)
         self._envs.update(envs)
         # If the update_envs() is called after set_resources(), we need to
         # manually update docker login config in task resources, in case the
         # docker login envs are newly added.
-        if _check_docker_login_config(self._envs, self._secrets):
+        if has_docker_login:
             self.resources = _with_docker_login_config(self.resources,
                                                        self._envs,
                                                        self._secrets)
@@ -1275,10 +1310,19 @@ class Task:
                 raise ValueError(
                     'secrets must be List[Tuple[str, str]] or Dict[str, str]: '
                     f'{secrets}')
-        for key, value in secrets.items():
-            self._secrets[key] = SecretStr(value)
+        candidate_secrets = self._secrets.copy()
+        candidate_secrets.update({
+            key: SecretStr(value) for key, value in secrets.items()
+        })
+        _validate_container_image_docker_credentials(self.resources, self._envs,
+                                                     candidate_secrets)
+        has_docker_login = _check_docker_login_config(self._envs,
+                                                      candidate_secrets)
+        self._secrets.update({
+            key: SecretStr(value) for key, value in secrets.items()
+        })
         # Validate Docker login configuration if needed
-        if _check_docker_login_config(self._envs, self._secrets):
+        if has_docker_login:
             self.resources = _with_docker_login_config(self.resources,
                                                        self._envs,
                                                        self._secrets)
@@ -1962,6 +2006,8 @@ class Task:
 
         INTERNAL: this method is internal-facing.
         """
+        _validate_container_image_docker_credentials(self.resources, self._envs,
+                                                     self._secrets)
         if use_user_specified_yaml:
             if self._user_specified_yaml is None:
                 return self._to_yaml_config(redact_secrets=True)

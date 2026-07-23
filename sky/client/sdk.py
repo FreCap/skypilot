@@ -204,6 +204,23 @@ def stream_response(request_id: server_common.RequestId[T] | None,
         raise
 
 
+def _check_container_image_api_support(dag: 'sky.Dag') -> None:
+    """Fails clearly before serializing container_image to an old server."""
+    remote_api_version = versions.get_remote_api_version()
+    if (remote_api_version is None or remote_api_version
+            >= server_constants.MIN_CONTAINER_IMAGES_API_VERSION):
+        return
+    if any(resource.container_image is not None and
+           not getattr(resource, 'container_image_from_legacy_image_id', False)
+           for task in dag.tasks
+           for resource in task.resources):
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.APINotSupportedError(
+                'resources.container_image requires API server version '
+                f'{server_constants.MIN_CONTAINER_IMAGES_API_VERSION} or '
+                'newer. Please upgrade the remote server.')
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
@@ -442,6 +459,7 @@ def optimize(
             for a task.
         exceptions.NoCloudAccessError: if no public clouds are enabled.
     """
+    _check_container_image_api_support(dag)
     dag_str = dag_utils.dump_dag_to_yaml_str(dag)
 
     body = payloads.OptimizeBody(dag=dag_str,
@@ -570,6 +588,7 @@ def validate(
             validation. This is only required when a admin policy is in use,
             see: https://docs.skypilot.co/en/latest/cloud-setup/policy.html
     """
+    _check_container_image_api_support(dag)
     remote_api_version = versions.get_remote_api_version()
 
     def _omit(version: int) -> bool:

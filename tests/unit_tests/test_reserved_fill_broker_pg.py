@@ -256,6 +256,44 @@ class TestServiceLivenessSnapshotPG:
         assert records[0]['status'] == serve_state.ServiceStatus.READY
 
 
+class TestServiceWorkspaceBackfillPG:
+    """Legacy workspace adoption is a production-dialect fenced write."""
+
+    def test_backfill_is_null_only_and_incarnation_fenced(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        assert serve_state.add_service(name='svc-legacy',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=None,
+                                       yaml_content='service: {}',
+                                       workspace=None,
+                                       service_hash='incarnation-a')
+
+        assert not serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'research', 'incarnation-b')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] is None
+
+        assert serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'research', 'incarnation-a')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] == 'research'
+
+        assert not serve_state.set_service_workspace_if_owner(
+            'svc-legacy', 'other', 'incarnation-a')
+        assert serve_state.get_service_from_name(
+            'svc-legacy')['workspace'] == 'research'
+
+
 # TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
 # sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
 # SHARE row lock instead of returning False).
@@ -335,6 +373,7 @@ class TestMigrationChainPG:
                     'lifecycle_epoch',
                     'resource_scope',
                     'logical_replica_semantics',
+                    'workspace',
                     'lb_ha_enabled',
                     'lb_active_slot',
                     'lb_cutover_generation',
@@ -353,6 +392,7 @@ class TestMigrationChainPG:
                 assert {
                     'created_at',
                     'created_by',
+                    'submitted_yaml_content',
                     'quarantined_at',
                     'quarantine_reason',
                 } <= version_columns
@@ -394,6 +434,10 @@ class TestMigrationChainPG:
                     'status_4xx_counts',
                     'status_5xx_counts',
                 }.issubset(response_columns)
+                replica_indexes = {
+                    index['name'] for index in inspector.get_indexes('replicas')
+                }
+                assert 'replicas_service_version_idx' in replica_indexes
                 prediction_columns = {
                     column['name'] for column in inspector.get_columns(
                         'serve_prediction_time_history')
@@ -418,6 +462,483 @@ class TestMigrationChainPG:
                     'logical_stopping_count',
                     'logical_total_count',
                 }.issubset(status_columns)
+                with engine.connect() as connection:
+                    revision = connection.execute(
+                        sqlalchemy.text(
+                            'SELECT version_num FROM '
+                            'alembic_version_serve_state_db')).scalar_one()
+                assert revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    @pytest.mark.parametrize('layout', [
+        'upstream_022',
+        'upstream_023',
+        'upstream_024',
+        'managed_preview_022',
+        'managed_preview_023',
+        'managed_preview_024',
+    ])
+    def test_revision_025_converges_every_colliding_serve_layout(
+            self, pg_server, layout):
+        """Every deployed 022/023/024 lineage converges through revision 026."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '021')
+            with engine.begin() as connection:
+                # Revision 001 uses current model metadata. Remove fields and
+                # indexes that did not exist in the historical binaries before
+                # constructing each exact ambiguous stamp.
+                connection.execute(
+                    sqlalchemy.text(
+                        'ALTER TABLE services DROP COLUMN IF EXISTS workspace'))
+                connection.execute(
+                    sqlalchemy.text('ALTER TABLE version_specs DROP COLUMN '
+                                    'IF EXISTS quarantined_at'))
+                connection.execute(
+                    sqlalchemy.text('ALTER TABLE version_specs DROP COLUMN '
+                                    'IF EXISTS quarantine_reason'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'DROP INDEX IF EXISTS replicas_service_version_idx'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'DROP TABLE IF EXISTS serve_response_time_history'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'DROP TABLE IF EXISTS serve_prediction_time_history'))
+
+            managed_preview = layout.startswith('managed_preview')
+            if managed_preview:
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'ALTER TABLE services ADD COLUMN workspace TEXT'))
+            if layout.startswith(
+                    'upstream_') or layout == 'managed_preview_024':
+                serve_history.serve_response_time_history_table.create(
+                    engine, checkfirst=True)
+            if layout in ('upstream_023', 'upstream_024'):
+                serve_history.serve_prediction_time_history_table.create(
+                    engine, checkfirst=True)
+            if layout == 'upstream_024':
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text('ALTER TABLE version_specs ADD COLUMN '
+                                        'quarantined_at DOUBLE PRECISION'))
+                    connection.execute(
+                        sqlalchemy.text('ALTER TABLE version_specs ADD COLUMN '
+                                        'quarantine_reason TEXT'))
+            if layout in ('managed_preview_023', 'managed_preview_024'):
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'CREATE INDEX replicas_service_version_idx '
+                            'ON replicas (service_name, version)'))
+
+            revision = layout.rsplit('_', maxsplit=1)[-1]
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text('UPDATE '
+                                    'alembic_version_serve_state_db '
+                                    'SET version_num = :revision'),
+                    {'revision': revision})
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            assert 'workspace' in {
+                column['name'] for column in inspector.get_columns('services')
+            }
+            assert {
+                'quarantined_at',
+                'quarantine_reason',
+            } <= {
+                column['name']
+                for column in inspector.get_columns('version_specs')
+            }
+            assert {
+                'serve_response_time_history',
+                'serve_prediction_time_history',
+            } <= set(inspector.get_table_names())
+            assert 'replicas_service_version_idx' in {
+                index['name'] for index in inspector.get_indexes('replicas')
+            }
+            with engine.connect() as connection:
+                # Selecting the current model proves the formerly skipped
+                # workspace column no longer causes runtime reads to fail.
+                connection.execute(
+                    sqlalchemy.select(serve_state.services_table).limit(1))
+                final_revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert final_revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_026_rebuilds_invalid_concurrent_index_residue(
+            self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '025')
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'DROP INDEX IF EXISTS replicas_service_version_idx'))
+                connection.execute(
+                    sqlalchemy.text('CREATE INDEX replicas_service_version_idx '
+                                    'ON replicas (service_name, version)'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'UPDATE pg_index SET indisvalid = FALSE '
+                        "WHERE indexrelid = 'replicas_service_version_idx'"
+                        '::regclass'))
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '026')
+
+            with engine.connect() as connection:
+                is_valid = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT indisvalid FROM pg_index '
+                        "WHERE indexrelid = 'replicas_service_version_idx'"
+                        '::regclass')).scalar_one()
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert is_valid is True
+            assert revision == '026'
+        finally:
+            engine.dispose()
+
+    @pytest.mark.parametrize(
+        ('index_name', 'index_ddl'), [
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (replica_id)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             "ON replicas (service_name, version) WHERE status = 'READY'"),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, (version + 0))'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, version) INCLUDE (status)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name DESC, version)'),
+            ('replicas_service_version_idx',
+             'CREATE UNIQUE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, version)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas USING hash (service_name)'),
+            ('replicas_service_status_idx',
+             'CREATE INDEX replicas_service_status_idx '
+             'ON replicas (status, service_name)'),
+        ],
+        ids=('wrong-columns', 'partial', 'expression', 'included-column',
+             'descending', 'unique', 'wrong-method', 'status-order'))
+    def test_revision_026_rejects_malformed_same_name_indexes(
+            self, pg_server, index_name, index_ddl):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '025')
+            with engine.begin() as connection:
+                preparer = connection.dialect.identifier_preparer
+                connection.exec_driver_sql(
+                    f'DROP INDEX IF EXISTS {preparer.quote(index_name)}')
+                connection.exec_driver_sql(index_ddl)
+
+            with pytest.raises(RuntimeError, match='unexpected shape'):
+                migration_utils.safe_alembic_upgrade(
+                    engine, migration_utils.SERVE_DB_NAME, '026')
+
+            with engine.connect() as connection:
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert revision == '025'
+        finally:
+            engine.dispose()
+
+    @pytest.mark.parametrize('preview_workspace_016', [False, True])
+    def test_revision_022_reconciles_conflicting_revision_016_layouts(
+            self, pg_server, preview_workspace_016):
+        """Both pre-merge revision 016 schemas converge on PostgreSQL."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        metadata = sqlalchemy.MetaData()
+        service_columns = [
+            sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True)
+        ]
+        if preview_workspace_016:
+            service_columns.append(
+                sqlalchemy.Column('workspace', sqlalchemy.Text))
+        else:
+            service_columns.extend([
+                sqlalchemy.Column('lb_ha_enabled',
+                                  sqlalchemy.Integer,
+                                  nullable=False,
+                                  server_default='0'),
+                sqlalchemy.Column('lb_active_slot', sqlalchemy.Text),
+                sqlalchemy.Column('lb_cutover_generation',
+                                  sqlalchemy.Integer,
+                                  nullable=False,
+                                  server_default='0'),
+                sqlalchemy.Column('lb_pending_slot', sqlalchemy.Text),
+                sqlalchemy.Column('lb_cutover_phase',
+                                  sqlalchemy.Text,
+                                  nullable=False,
+                                  server_default='STABLE'),
+                sqlalchemy.Column('lb_drain_started_at', sqlalchemy.Float),
+                sqlalchemy.Column('lb_demand_handoff_generation',
+                                  sqlalchemy.Integer),
+                sqlalchemy.Column('lb_demand_handoff_snapshot',
+                                  sqlalchemy.Text),
+                sqlalchemy.Column('lb_demand_handoff_complete_at',
+                                  sqlalchemy.Float),
+                sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
+            ])
+        services = sqlalchemy.Table('services', metadata, *service_columns)
+        sqlalchemy.Table(
+            'version_specs', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+            sqlalchemy.Column('created_at', sqlalchemy.Float),
+            sqlalchemy.Column('created_by', sqlalchemy.Text))
+        sqlalchemy.Table(
+            'replicas', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('replica_id',
+                              sqlalchemy.Integer,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer))
+        sqlalchemy.Table(
+            'serve_replica_status_history', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+            sqlalchemy.Column('bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('ready_count', sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('provisioning_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('not_ready_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('errored_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('preempted_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('stopping_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('total_count', sqlalchemy.Integer,
+                              nullable=False))
+        sqlalchemy.Table(
+            'serve_request_activity_history', metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('reporter_session_id',
+                              sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('request_count',
+                              sqlalchemy.Integer,
+                              nullable=False))
+        metadata.create_all(engine)
+        try:
+            with engine.begin() as connection:
+                connection.execute(services.insert().values(name='legacy-svc'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'CREATE TABLE alembic_version_serve_state_db '
+                        '(version_num VARCHAR(32) NOT NULL)'))
+                connection.execute(
+                    sqlalchemy.text(
+                        "INSERT INTO alembic_version_serve_state_db "
+                        "VALUES ('016')"))
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            service_columns = {
+                column['name']: column
+                for column in inspector.get_columns('services')
+            }
+            assert service_columns['workspace']['nullable']
+            assert {
+                'lb_ha_enabled',
+                'lb_active_slot',
+                'lb_cutover_generation',
+                'lb_pending_slot',
+                'lb_cutover_phase',
+                'lb_drain_started_at',
+                'lb_demand_handoff_generation',
+                'lb_demand_handoff_snapshot',
+                'lb_demand_handoff_complete_at',
+                'lb_last_demand_snapshot',
+            } <= set(service_columns)
+            version_columns = {
+                column['name']
+                for column in inspector.get_columns('version_specs')
+            }
+            assert 'submitted_yaml_content' in version_columns
+            replica_columns = {
+                column['name'] for column in inspector.get_columns('replicas')
+            }
+            assert {
+                'replica_info',
+                'replica_state_version',
+                'status',
+                'sky_down_status',
+                'version',
+                'cluster_name',
+                'created_at',
+                'is_spot',
+                'replica_state',
+            } <= replica_columns
+            with engine.connect() as connection:
+                workspace = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT workspace FROM services WHERE name = :name'), {
+                            'name': 'legacy-svc'
+                        }).scalar_one()
+                connection.execute(
+                    sqlalchemy.select(serve_state.replicas_table).limit(1))
+            assert workspace is None
+        finally:
+            engine.dispose()
+
+    def test_revision_022_repairs_preview_revision_018_collision(
+            self, pg_server):
+        """A preview DB stamped 018 gains the current 018 placement table."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '017')
+            with engine.begin() as connection:
+                # The preview's revision 018 added ``workspace``.  Revision
+                # 001 creates tables from the current model metadata, so a
+                # fresh test database already has that column by revision 017.
+                # Stamping it 018 without running the current revision 018
+                # faithfully models the historical collision: workspace is
+                # present while the placement-events table is absent.
+                connection.execute(
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '018'"))
+
+            assert 'serve_placement_events' not in set(
+                sqlalchemy.inspect(engine).get_table_names())
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            assert 'serve_placement_events' in set(inspector.get_table_names())
+            assert 'workspace' in {
+                column['name'] for column in inspector.get_columns('services')
+            }
+            with engine.connect() as connection:
+                version = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert version == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_022_repairs_preview_revision_021_collision(
+            self, pg_server):
+        """A preview DB stamped 021 gains canonical revision 021 columns."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '020')
+            with engine.begin() as connection:
+                # The former feature revision 021 persisted workspace but did
+                # not contain the exact-accelerator columns now owned by the
+                # canonical revision 021. Remove metadata-created copies and
+                # stamp 021 to reproduce that deployed preview state.
+                connection.execute(
+                    sqlalchemy.text(
+                        'ALTER TABLE serve_autoscaler_history DROP COLUMN IF '
+                        'EXISTS accelerator_breakdown_observed_at'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'ALTER TABLE serve_autoscaler_history DROP COLUMN IF '
+                        'EXISTS accelerator_breakdown'))
+                connection.execute(
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '021'"))
+
+            before_columns = {
+                column['name'] for column in sqlalchemy.inspect(
+                    engine).get_columns('serve_autoscaler_history')
+            }
+            assert 'accelerator_breakdown' not in before_columns
+            assert 'accelerator_breakdown_observed_at' not in before_columns
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            after_columns = {
+                column['name'] for column in sqlalchemy.inspect(
+                    engine).get_columns('serve_autoscaler_history')
+            }
+            assert {
+                'accelerator_breakdown',
+                'accelerator_breakdown_observed_at',
+            } <= after_columns
+            with engine.connect() as connection:
+                version = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert version == migration_utils.SERVE_VERSION
         finally:
             engine.dispose()
 

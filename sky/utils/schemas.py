@@ -528,6 +528,57 @@ def _get_single_resources_schema():
                     'type': 'null',
                 }]
             },
+            'container_image': {
+                'anyOf': [
+                    {
+                        'type': 'string',
+                        'minLength': 1,
+                        'maxLength': 1024,
+                    },
+                    {
+                        'type': 'object',
+                        'anyOf': [{
+                            'required': ['ref'],
+                        }, {
+                            'required': ['release'],
+                        }, {
+                            'required': ['version'],
+                        }, {
+                            'required': ['artifact_id'],
+                        }],
+                        'additionalProperties': False,
+                        'properties': {
+                            'ref': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 1024,
+                            },
+                            'distribution': {
+                                'type': 'string',
+                                'minLength': 1,
+                            },
+                            'release': {
+                                'type': 'string',
+                            },
+                            'artifact_id': {
+                                'type': 'string',
+                                'minLength': 1,
+                            },
+                            # Pre-release compatibility aliases.
+                            'profile': {
+                                'type': 'string',
+                                'minLength': 1,
+                            },
+                            'version': {
+                                'type': 'string',
+                            },
+                        },
+                    },
+                    {
+                        'type': 'null',
+                    }
+                ]
+            },
             'autostop': _AUTOSTOP_SCHEMA,
             'priority': {
                 'type': 'integer',
@@ -554,6 +605,73 @@ def _get_single_resources_schema():
                         'type': 'string',
                     }
                 }
+            },
+            '_resolved_container_image': {
+                'type': 'object',
+                'required': [
+                    'image_id', 'reference', 'target_id', 'digest',
+                    'auth_strategy'
+                ],
+                'additionalProperties': False,
+                'properties': {
+                    'image_id': {
+                        'type': 'string',
+                    },
+                    'reference': {
+                        'type': 'string',
+                    },
+                    'target_id': {
+                        'type': 'string',
+                    },
+                    'digest': {
+                        'type': 'string',
+                    },
+                    'auth_strategy': {
+                        'type': 'string',
+                    },
+                    'location_id': {
+                        'anyOf': [{
+                            'type': 'string',
+                        }, {
+                            'type': 'null',
+                        }],
+                    },
+                    'distribution': {
+                        'anyOf': [{
+                            'type': 'string',
+                            'minLength': 1,
+                        }, {
+                            'type': 'null',
+                        }],
+                    },
+                    'profile_revision': {
+                        'anyOf': [{
+                            'type': 'integer',
+                            'minimum': 1,
+                        }, {
+                            'type': 'null',
+                        }],
+                    },
+                    'policy_fingerprint': {
+                        'anyOf': [{
+                            'type': 'string',
+                            'pattern': '^[0-9a-f]{64}$',
+                        }, {
+                            'type': 'null',
+                        }],
+                    },
+                    'status': {
+                        'type': 'string',
+                        'enum': ['READY', 'WARMING'],
+                    },
+                    'fallback_reason': {
+                        'anyOf': [{
+                            'type': 'string',
+                        }, {
+                            'type': 'null',
+                        }],
+                    },
+                },
             },
             '_is_image_managed': {
                 'type': 'boolean',
@@ -1573,6 +1691,427 @@ def get_config_schema():
     }
     resources_schema['properties'].pop('ports')
 
+    registry_target_properties = {
+        'region': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 64,
+        },
+        'registry': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 253,
+        },
+        'repository_prefix': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 255,
+        },
+        'shard_count': {
+            'type': 'integer',
+            'minimum': 1,
+            'maximum': 256,
+        },
+        'max_manifests_per_shard': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'max_declared_bytes_per_shard': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'max_in_flight': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'write_authority': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 128,
+        },
+        'delete_authority': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 128,
+        },
+        'qualification_delete_authority': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 128,
+        },
+        'runtime_pull': {
+            'type': 'object',
+            'minProperties': 1,
+            'maxProperties': 2,
+            'additionalProperties': False,
+            'properties': {
+                'aws_vm': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+                'aws_eks': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+            },
+        },
+    }
+    canonical_registry_target_schema = {
+        'type': 'object',
+        'required': list(registry_target_properties),
+        'additionalProperties': False,
+        'properties': registry_target_properties,
+    }
+    regional_registry_target_schema = {
+        'type': 'object',
+        'required': ['name', *registry_target_properties],
+        'additionalProperties': False,
+        'properties': {
+            'name': {
+                'type': 'string',
+                'minLength': 1,
+                'maxLength': 128,
+            },
+            **registry_target_properties,
+        },
+    }
+    binding_purposes_schema = {
+        'type': 'array',
+        'minItems': 1,
+        'maxItems': 6,
+        'uniqueItems': True,
+        'items': {
+            'type': 'string',
+            'enum': [
+                'source_read', 'destination_write', 'verify', 'runtime_pull',
+                'lifecycle_delete', 'canary_launch'
+            ],
+        },
+    }
+    access_binding_schema = {
+        'oneOf': [{
+            'type': 'object',
+            'required': ['kind', 'authority', 'purposes'],
+            'additionalProperties': False,
+            'properties': {
+                'kind': {
+                    'const': 'aws_assume_role',
+                },
+                'authority': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 2048,
+                },
+                'external_id': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 1024,
+                },
+                'purposes': binding_purposes_schema,
+            },
+        }, {
+            'type': 'object',
+            'required': [
+                'kind', 'principals', 'credential_helper',
+                'qualified_node_images', 'instance_profile', 'canary_authority',
+                'canary_instance_type', 'canary_subnets', 'purposes'
+            ],
+            'additionalProperties': False,
+            'properties': {
+                'kind': {
+                    'const': 'aws_ec2_instance_identity',
+                },
+                'principals': {
+                    'type': 'array',
+                    'minItems': 1,
+                    'maxItems': 256,
+                    'uniqueItems': True,
+                    'items': {
+                        'type': 'string',
+                        'minLength': 1,
+                        'maxLength': 2048,
+                    },
+                },
+                'credential_helper': {
+                    'const': 'amazon-ecr-credential-helper',
+                },
+                'instance_profile': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+                'qualified_node_images': {
+                    'type': 'object',
+                    'minProperties': 1,
+                    'maxProperties': 64,
+                    'additionalProperties': {
+                        'type': 'string',
+                        'minLength': 1,
+                        'maxLength': 128,
+                    },
+                },
+                'canary_authority': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+                'canary_instance_type': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+                'canary_subnets': {
+                    'type': 'object',
+                    'minProperties': 1,
+                    'maxProperties': 64,
+                    'additionalProperties': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'maxItems': 32,
+                        'uniqueItems': True,
+                        'items': {
+                            'type': 'string',
+                            'pattern': '^subnet-[A-Za-z0-9]+$',
+                        },
+                    },
+                },
+                'canary_security_groups': {
+                    'type': 'object',
+                    'maxProperties': 64,
+                    'additionalProperties': {
+                        'type': 'array',
+                        'maxItems': 32,
+                        'uniqueItems': True,
+                        'items': {
+                            'type': 'string',
+                            'pattern': '^sg-[A-Za-z0-9]+$',
+                        },
+                    },
+                },
+                'purposes': binding_purposes_schema,
+            },
+        }, {
+            'type': 'object',
+            'required': [
+                'kind', 'qualified_clusters', 'canary_authority', 'purposes'
+            ],
+            'additionalProperties': False,
+            'properties': {
+                'kind': {
+                    'const': 'aws_eks_kubelet_identity',
+                },
+                'canary_authority': {
+                    'type': 'string',
+                    'minLength': 1,
+                    'maxLength': 128,
+                },
+                'qualified_clusters': {
+                    'type': 'array',
+                    'minItems': 1,
+                    'maxItems': 256,
+                    'items': {
+                        'type': 'object',
+                        'required': [
+                            'context', 'cluster_arn', 'node_role', 'namespace',
+                            'node_selector'
+                        ],
+                        'additionalProperties': False,
+                        'properties': {
+                            'context': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 128,
+                            },
+                            'cluster_arn': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 2048,
+                            },
+                            'node_role': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 2048,
+                            },
+                            'namespace': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 253,
+                            },
+                            'node_selector': {
+                                'type': 'object',
+                                'minProperties': 1,
+                                'maxProperties': 16,
+                                'required': ['kubernetes.io/arch'],
+                                'properties': {
+                                    'kubernetes.io/arch': {
+                                        'const': 'amd64',
+                                    },
+                                },
+                                'propertyNames': {
+                                    'type': 'string',
+                                    'minLength': 1,
+                                    'maxLength': 317,
+                                },
+                                'additionalProperties': {
+                                    'type': 'string',
+                                    'minLength': 1,
+                                    'maxLength': 63,
+                                },
+                            },
+                        },
+                    },
+                },
+                'purposes': binding_purposes_schema,
+            },
+        }, {
+            'type': 'object',
+            'required': ['kind', 'reference', 'purposes'],
+            'additionalProperties': False,
+            'properties': {
+                'kind': {
+                    'const': 'kubernetes_dockerconfig_secret',
+                },
+                'reference': {
+                    'type': 'object',
+                    'required': ['namespace', 'name', 'key'],
+                    'additionalProperties': False,
+                    'properties': {
+                        field: {
+                            'type': 'string',
+                            'minLength': 1,
+                            'maxLength': 253,
+                        } for field in ('namespace', 'name', 'key')
+                    },
+                },
+                'purposes': binding_purposes_schema,
+            },
+        }],
+    }
+    container_registries_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'default_profile': {
+                'type': 'string',
+                'minLength': 1,
+                'maxLength': 128,
+            },
+            'access_bindings': {
+                'type': 'object',
+                'maxProperties': 256,
+                'additionalProperties': access_binding_schema,
+            },
+            'profiles': {
+                'type': 'object',
+                'maxProperties': 128,
+                'additionalProperties': {
+                    'type': 'object',
+                    'required': [
+                        'revision', 'ownership', 'provider', 'partition',
+                        'registry_account', 'realm', 'limits', 'qualification',
+                        'canonical', 'targets'
+                    ],
+                    'additionalProperties': False,
+                    'properties': {
+                        'revision': {
+                            'type': 'integer',
+                            'minimum': 1,
+                        },
+                        'ownership': {
+                            'const': 'managed',
+                        },
+                        'provider': {
+                            'const': 'aws',
+                        },
+                        'partition': {
+                            'type': 'string',
+                            'minLength': 1,
+                            'maxLength': 64,
+                        },
+                        'registry_account': {
+                            'type': 'string',
+                            'pattern': '^[0-9]{12}$',
+                        },
+                        'realm': {
+                            'type': 'string',
+                            'minLength': 1,
+                            'maxLength': 128,
+                        },
+                        'limits': {
+                            'type': 'object',
+                            'required': [
+                                'max_artifact_bytes',
+                                'max_releases_per_artifact',
+                                'max_regional_locations_per_artifact'
+                            ],
+                            'additionalProperties': False,
+                            'properties': {
+                                field: {
+                                    'type': 'integer',
+                                    'minimum': 1,
+                                } for field in (
+                                    'max_artifact_bytes',
+                                    'max_releases_per_artifact',
+                                    'max_regional_locations_per_artifact')
+                            },
+                        },
+                        'qualification': {
+                            'type': 'object',
+                            'required': [
+                                'runtime_attestation_max_age_seconds',
+                                'automatic_canaries',
+                                'max_daily_canary_cost_usd',
+                                'canary_worst_case_cost_usd',
+                                'canary_timeout_seconds', 'canary_ref',
+                                'canary_platform'
+                            ],
+                            'additionalProperties': False,
+                            'properties': {
+                                'runtime_attestation_max_age_seconds': {
+                                    'type': 'integer',
+                                    'minimum': 1,
+                                },
+                                'automatic_canaries': {
+                                    'type': 'boolean',
+                                },
+                                'max_daily_canary_cost_usd': {
+                                    'type': 'number',
+                                    'minimum': 0,
+                                },
+                                'canary_worst_case_cost_usd': {
+                                    'type': 'number',
+                                    'exclusiveMinimum': 0,
+                                },
+                                'canary_timeout_seconds': {
+                                    'type': 'integer',
+                                    'minimum': 60,
+                                    'maximum': 3600,
+                                },
+                                'canary_ref': {
+                                    'type': 'string',
+                                    'minLength': 1,
+                                    'maxLength': 2048,
+                                },
+                                'canary_platform': {
+                                    'const': 'linux/amd64',
+                                },
+                            },
+                        },
+                        'canonical': canonical_registry_target_schema,
+                        'targets': {
+                            'type': 'array',
+                            'maxItems': 255,
+                            'items': regional_registry_target_schema,
+                        },
+                    },
+                },
+            },
+        },
+    }
+
     def _get_controller_schema(
         extra_properties: dict[str, Any] | None = None,
         extra_controller_properties: dict[str, Any] | None = None,
@@ -2249,6 +2788,57 @@ def get_config_schema():
                         'type': 'string',
                     },
                 },
+                'container_images': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'mode': {
+                            'type': 'string',
+                            'enum': [
+                                'direct', 'managed_required',
+                                'managed_preferred'
+                            ],
+                        },
+                        'default_profile': {
+                            'type': 'string',
+                            'minLength': 1,
+                        },
+                        'allowed_profiles': {
+                            'type': 'array',
+                            'maxItems': 128,
+                            'items': {
+                                'type': 'string',
+                                'minLength': 1,
+                            },
+                            'uniqueItems': True,
+                        },
+                        'publishers': {
+                            'type': 'array',
+                            'maxItems': 256,
+                            'items': {
+                                'type': 'string',
+                                'minLength': 1,
+                                'maxLength': 256,
+                                'pattern': '^\\S+$',
+                            },
+                            'uniqueItems': True,
+                        },
+                        'locality': {
+                            'type': 'string',
+                            'enum': ['prefer', 'require', 'canonical'],
+                        },
+                        'regional_cache_retention_weeks': {
+                            'anyOf': [{
+                                'type': 'integer',
+                                'minimum': 1,
+                            }, {
+                                'type': 'null',
+                            }],
+                            'default': 8,
+                        },
+                    },
+                },
                 'gcp': {
                     'type': 'object',
                     'properties': {
@@ -2576,6 +3166,7 @@ def get_config_schema():
             'api_server': api_server,
             'active_workspace': workspace_schema,
             'workspaces': workspaces_schema,
+            'container_registries': container_registries_schema,
             'provision': provision_configs,
             'rbac': rbac_schema,
             'logs': logs_schema,

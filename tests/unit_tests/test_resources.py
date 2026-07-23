@@ -1,4 +1,8 @@
+"""Unit tests for resource configuration and compatibility."""
+# pylint: disable=protected-access,singleton-comparison,unused-argument
+
 import importlib
+import inspect
 import os
 import pickle
 from typing import Dict
@@ -430,6 +434,25 @@ def test_resources_any_of_spot_flag():
     assert r_ondemand.use_spot is False
 
 
+@pytest.mark.parametrize('alternatives_name', ['any_of', 'ordered'])
+def test_resource_alternatives_reject_server_managed_image_state_value_free(
+        alternatives_name):
+    secret = 'nested-server-plan-secret'
+    config = {
+        alternatives_name: [{
+            'cloud': 'aws',
+            '_resolved_container_image': {
+                'reference': secret,
+            },
+        }],
+    }
+
+    with pytest.raises(ValueError,
+                       match='server-managed launch state') as error:
+        Resources.from_yaml_config(config)
+    assert secret not in str(error.value)
+
+
 def test_resources_ordered_preference():
     """Test Resources creation with ordered preference correctly preserves order."""
     config = {
@@ -605,19 +628,20 @@ def test_resources_ordered_with_base_infra():
     assert resources_list[2].region is None
 
 
-def test_kubernetes_image_id_formats_in_resources(enable_all_clouds):
-    """Test Resources normalizes Kubernetes image_id to include 'docker:' prefix."""
+def test_kubernetes_legacy_image_id_normalizes_to_container_image(
+        enable_all_clouds):
+    """Legacy Kubernetes image_id values become container_image."""
     k8s_cloud = clouds.Kubernetes()
     test_cases = [
-        # (input_image_id, expected_stored_image_id_in_resources_object)
-        ('alpine', 'docker:alpine'),
-        ('docker:alpine', 'docker:alpine'),
-        ('myrepo/myimage:latest', 'docker:myrepo/myimage:latest'),
-        ('docker:myrepo/myimage:latest', 'docker:myrepo/myimage:latest'),
+        # (input_image_id, expected_container_image)
+        ('alpine', 'alpine'),
+        ('docker:alpine', 'alpine'),
+        ('myrepo/myimage:latest', 'myrepo/myimage:latest'),
+        ('docker:myrepo/myimage:latest', 'myrepo/myimage:latest'),
         ('another.registry.com/myrepo/myimage:tag',
-         'docker:another.registry.com/myrepo/myimage:tag'),
+         'another.registry.com/myrepo/myimage:tag'),
         ('docker:another.registry.com/myrepo/myimage:tag',
-         'docker:another.registry.com/myrepo/myimage:tag'),
+         'another.registry.com/myrepo/myimage:tag'),
     ]
 
     for input_id, expected_stored_id in test_cases:
@@ -627,25 +651,28 @@ def test_kubernetes_image_id_formats_in_resources(enable_all_clouds):
         res = Resources(cloud=k8s_cloud, image_id=input_id)
         res.validate(
         )  # Kubernetes cloud validate_resources currently just checks type
-        assert list(res.image_id.values())[0] == expected_stored_id, (
+        assert res.image_id is None
+        assert res.container_image.ref == expected_stored_id, (
             f'Input: {input_id}, Expected stored: {expected_stored_id}, '
-            f'Got: {res.image_id}')
+            f'Got: {res.container_image}')
 
         # Test YAML serialization and deserialization
         # Assumes to_yaml_config() serializes the (potentially prefixed)
         # internal value.
         yaml_config = res.to_yaml_config()
-        assert list(
-            yaml_config.get('image_id').values())[0] == expected_stored_id, (
-                f'Input: {input_id}, Expected in YAML: {expected_stored_id}, '
-                f'Got in YAML: {yaml_config}')
+        assert yaml_config.get('image_id') == {
+            'docker': expected_stored_id
+        }, (f'Input: {input_id}, Expected in YAML: {expected_stored_id}, '
+            f'Got in YAML: {yaml_config}')
+        assert 'container_image' not in yaml_config
 
         loaded_res_list = list(Resources.from_yaml_config(yaml_config))
         assert len(loaded_res_list) == 1, f"Load count for {input_id}"
         loaded_res = loaded_res_list[0]
-        assert list(loaded_res.image_id.values())[0] == expected_stored_id, (
+        assert loaded_res.image_id is None
+        assert loaded_res.container_image.ref == expected_stored_id, (
             f'Input: {input_id}, Expected from loaded YAML: {expected_stored_id}, '
-            f'Got: {loaded_res.image_id}')
+            f'Got: {loaded_res.container_image}')
         assert isinstance(
             loaded_res.cloud,
             clouds.Kubernetes), (f'Loaded cloud type mismatch for {input_id}')
@@ -715,10 +742,11 @@ def test_image_id_ambiguous_docker_spec_rejected():
     ])
 def test_image_id_legacy_docker_formats_unchanged(image_id, expected_docker,
                                                   expected_cloud):
-    """Existing docker: image_id formats keep their old semantics."""
+    """Legacy docker image_id formats keep their runtime semantics."""
     r = Resources(cloud='aws', image_id=image_id)
     assert r.extract_docker_image() == expected_docker
     assert r.get_cloud_image_id() == expected_cloud
+    assert r.container_image.ref == expected_docker
 
 
 def test_image_id_legacy_ami_unchanged():
@@ -741,6 +769,7 @@ def test_image_id_dual_yaml_round_trip():
         'us-east-1': 'ami-0abcdef',
         'docker': 'myimage:latest',
     }
+    assert 'container_image' not in config
     loaded = list(Resources.from_yaml_config(config))[0]
     assert loaded.extract_docker_image() == 'myimage:latest'
     assert loaded.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
@@ -778,6 +807,35 @@ def test_image_id_dual_pickle_round_trip():
     migrated.__setstate__(state)
     assert migrated._docker_image is None
 
+    # Version 34 stored Docker identity only in _docker_image.
+    legacy_with_docker = Resources(cloud='aws', image_id='docker:ubuntu:22.04')
+    state = dict(legacy_with_docker.__dict__)
+    state.pop('_container_image', None)
+    state.pop('_resolved_container_image', None)
+    state['_version'] = 34
+    migrated = Resources.__new__(Resources)
+    migrated.__setstate__(state)
+    assert migrated.container_image.ref == 'ubuntu:22.04'
+    assert migrated.extract_docker_image() == 'ubuntu:22.04'
+
+    # A concrete pre-v35 launch may have carried different Docker images per
+    # candidate region. Preserve the image selected by its committed region.
+    legacy_regional = Resources(cloud='aws', region='us-east-1')
+    state = dict(legacy_regional.__dict__)
+    state['_image_id'] = {
+        'us-east-1': 'docker:east.example/image:v1',
+        'us-west-2': 'docker:west.example/image:v1',
+    }
+    state['_docker_image'] = None
+    state.pop('_container_image', None)
+    state.pop('_resolved_container_image', None)
+    state['_version'] = 34
+    migrated = Resources.__new__(Resources)
+    migrated.__setstate__(state)
+    assert migrated.container_image.ref == 'east.example/image:v1'
+    assert migrated.extract_docker_image() == 'east.example/image:v1'
+    assert migrated.image_id is None
+
 
 @pytest.mark.parametrize(
     ('version', 'legacy_field'),
@@ -814,6 +872,16 @@ def test_network_tier_basic():
     # Test with NetworkTier enum directly
     r = Resources(network_tier=resources_utils.NetworkTier.BEST)
     assert r.network_tier == resources_utils.NetworkTier.BEST
+
+
+def test_gcp_best_network_tier_keeps_injected_docker_runtime_image():
+    """The GPU Direct default is a container, not a GCP machine image."""
+    resources = Resources(cloud=clouds.GCP(), network_tier='best')
+    resources.validate()
+    assert resources.extract_docker_image() == (
+        'us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpx/'
+        'nccl-plugin-gpudirecttcpx')
+    assert resources.get_cloud_image_id() is None
 
 
 def test_network_tier_validation():
@@ -1113,6 +1181,27 @@ def test_disk_size_conversion():
     # Test invalid format
     with pytest.raises(ValueError):
         Resources(disk_size='invalid')
+
+
+def test_resources_preserves_legacy_positional_argument_order():
+    positional_parameters = tuple(
+        parameter.name
+        for parameter in inspect.signature(Resources).parameters.values()
+        if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    assert positional_parameters == (
+        'cloud', 'instance_type', 'cpus', 'memory', 'accelerators',
+        'accelerator_args', 'infra', 'use_spot', 'job_recovery', 'region',
+        'zone', 'image_id', 'disk_size', 'ephemeral_storage', 'disk_tier',
+        'network_tier', 'local_disk', 'max_hourly_cost', 'ports', 'labels',
+        'autostop', 'hooks', 'priority', 'priority_class', 'volumes',
+        '_docker_login_config', '_docker_username_for_runpod',
+        '_is_image_managed', '_requires_fuse', '_cluster_config_overrides',
+        '_no_missing_accel_warnings')
+    assert inspect.signature(Resources).parameters[
+        'container_image'].kind == inspect.Parameter.KEYWORD_ONLY
+    resources = Resources(*([None] * 12 + [100]))
+    assert resources.disk_size == 100
+    assert resources.container_image is None
 
 
 def test_memory_conversion():

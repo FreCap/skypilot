@@ -106,6 +106,7 @@ def _add_minimal_service(name: str,
                          service_hash=None,
                          lifecycle_epoch=None,
                          resource_scope=None,
+                         workspace=None,
                          yaml_content='yaml: v1',
                          pool=False,
                          spec=None,
@@ -129,6 +130,7 @@ def _add_minimal_service(name: str,
         # fields instead of calling SkyServiceSpec methods on it.
         spec=spec,
         yaml_content=yaml_content,
+        workspace=workspace,
         controller_ip=controller_ip,
         service_hash=service_hash,
         lifecycle_epoch=lifecycle_epoch,
@@ -516,6 +518,148 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
     }
     assert 'logical_replica_semantics' in service_columns
     assert 'demand_capacity_observations' in inspector.get_table_names()
+    indexes = {
+        index['name']: index['column_names']
+        for index in inspector.get_indexes('replicas')
+    }
+    assert indexes['replicas_service_version_idx'] == [
+        'service_name', 'version'
+    ]
+
+
+def test_replica_index_migration_converges_predecessor_stamped_legacy_state(
+        tmp_path):
+    """Revision 026 repairs previews stamped past replica JSON revision 010."""
+    engine = create_engine(f'sqlite:///{tmp_path / "preview-serve.db"}')
+    metadata = sqlalchemy.MetaData()
+    legacy_replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('replica_info', sqlalchemy.LargeBinary),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    legacy = _replica(1, cluster_name='svc-1', version=3)
+    with engine.begin() as connection:
+        connection.execute(
+            legacy_replicas.insert().values(service_name='svc',
+                                            replica_id=1,
+                                            replica_info=pickle.dumps(legacy)))
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         '026')
+
+    inspector = sqlalchemy.inspect(engine)
+    columns = {column['name'] for column in inspector.get_columns('replicas')}
+    assert {
+        'replica_state_version',
+        'status',
+        'sky_down_status',
+        'version',
+        'cluster_name',
+        'created_at',
+        'is_spot',
+        'replica_state',
+    } <= columns
+    indexes = {
+        index['name']: index['column_names']
+        for index in inspector.get_indexes('replicas')
+    }
+    assert indexes['replicas_service_status_idx'] == ['service_name', 'status']
+    assert indexes['replicas_service_version_idx'] == [
+        'service_name', 'version'
+    ]
+    replicas = sqlalchemy.Table('replicas',
+                                sqlalchemy.MetaData(),
+                                autoload_with=engine)
+    with engine.connect() as connection:
+        row = connection.execute(sqlalchemy.select(replicas)).one()._mapping
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert row['version'] == 3
+    assert row['cluster_name'] == 'svc-1'
+    assert row['status'] == serve_state.ReplicaStatus.PENDING.value
+    assert row['replica_state_version'] == 1
+    assert row['replica_state'] is not None
+    assert revision == '026'
+
+
+def test_replica_index_migration_fails_closed_without_reconstructable_state(
+        tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "invalid-preview.db"}')
+    metadata = sqlalchemy.MetaData()
+    replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(replicas.insert().values(service_name='svc',
+                                                    replica_id=1,
+                                                    version=3))
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    with pytest.raises(RuntimeError, match='without legacy replica_info'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '026')
+
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert revision == '025'
+
+
+def test_replica_index_migration_rejects_same_name_with_wrong_columns(tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "wrong-index.db"}')
+    metadata = sqlalchemy.MetaData()
+    replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    sqlalchemy.Index('replicas_service_version_idx', replicas.c.service_name,
+                     replicas.c.replica_id)
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    with pytest.raises(RuntimeError, match='unexpected shape'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '026')
+
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert revision == '025'
 
 
 def test_elected_version_migration_backfills_latest_committed_version(
@@ -611,6 +755,55 @@ def test_submitted_version_yaml_migration_adds_nullable_column(
         for column in sqlalchemy.inspect(engine).get_columns('version_specs')
     }
     assert 'submitted_yaml_content' in columns
+
+
+def test_service_version_terminal_lookup_uses_only_exact_history_keys(
+        _mock_serve_db):
+    engine = _mock_serve_db
+    assert _add_minimal_service('svc-terminal',
+                                service_hash='incarnation-a') is True
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc-terminal',
+            'version': version,
+            'spec': pickle.dumps(None),
+            'yaml_content': f'yaml: v{version}',
+        } for version in range(2, 2001)])
+        connection.execute(serve_state.replicas_table.insert(), [{
+            'service_name': 'svc-terminal',
+            'replica_id': replica,
+            'replica_info': b'opaque',
+            'version': replica + 1,
+        } for replica in range(1, 2000)])
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context,
+               _executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', record)
+    try:
+        result = serve_state.get_service_version_terminal_states([
+            ('svc-terminal', 2000, 'incarnation-a'),
+            ('missing-service', 1, 'missing-incarnation'),
+        ])
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', record)
+
+    assert result == {
+        ('svc-terminal', 2000, 'incarnation-a'): False,
+        ('missing-service', 1, 'missing-incarnation'): True,
+    }
+    assert len(statements) == 2
+    probe_statement = next(statement for statement in statements
+                           if 'wanted_service_versions' in statement)
+    assert 'WITH wanted_service_versions(service_name, version) AS' in (
+        probe_statement)
+    assert probe_statement.count('EXISTS (SELECT') == 2
+    assert 'FROM version_specs' in probe_statement
+    assert 'FROM replicas' in probe_statement
+    assert 'SELECT replicas.service_name, replicas.version' not in (
+        probe_statement)
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -854,6 +1047,13 @@ def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
     assert record is not None
     assert record['policy'] == 'qps=2'
     assert record['load_balancing_policy'] == 'least_load'
+
+
+def test_service_workspace_survives_durable_round_trip(_mock_serve_db):
+    assert _add_minimal_service('svc-workspace', workspace='research') is True
+    record = serve_state.get_service_from_name('svc-workspace')
+    assert record is not None
+    assert record['workspace'] == 'research'
 
 
 def test_get_services_uses_single_query_for_multiple_rows(_mock_serve_db):

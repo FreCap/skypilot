@@ -1,0 +1,36 @@
+"""Entrypoint for the Helm-owned central database migration job."""
+
+import os
+
+from sky.skylet import constants
+
+
+def initialize_central_databases() -> None:
+    """Initializes every central Alembic schema under one ownership mode."""
+    # Import after the caller selects the mode so lazy engine initialization
+    # cannot observe another process role's deployment setting.
+    # pylint: disable=import-outside-toplevel
+    from sky import global_user_state
+    from sky.jobs import state_storage
+    from sky.serve import serve_state
+
+    # pylint: enable=import-outside-toplevel
+    # Global state must run first: explicit bootstrap proves the shared
+    # effective PostgreSQL schema is empty before any companion schema creates
+    # objects in it.
+    global_user_state.initialize_and_get_db()
+    serve_state.get_database_engine()
+    state_storage.initialize_and_get_db()
+
+
+def main() -> None:
+    """Upgrades central schemas before replicas enter verify-only mode."""
+    requested_mode = os.environ.get(constants.ENV_VAR_STATE_DB_MIGRATION_MODE,
+                                    'upgrade')
+    os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] = (
+        'bootstrap' if requested_mode == 'bootstrap' else 'upgrade')
+    initialize_central_databases()
+
+
+if __name__ == '__main__':
+    main()

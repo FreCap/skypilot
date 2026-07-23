@@ -309,6 +309,45 @@ When updating dependencies:
 | `sky/provision/provisioner.py` | Resource provisioning |
 | `sky/jobs/` | Managed jobs with recovery and scheduling |
 
+## Major Feature Designs
+
+Canonical designs are required only for major features and must be checked
+into `docs/designs/` as Markdown files before implementation begins. A major
+feature has at least one of these characteristics:
+
+- It introduces a new cross-cutting architecture or responsibility boundary
+  spanning multiple core subsystems, clouds, backends, or control/data planes.
+- It adds durable state, migrations, or an operational component that requires
+  a staged deployment and rollback strategy.
+- It adds a broad public interface or configuration contract whose adoption
+  requires coordinated compatibility, migration, or activation work.
+
+Do not add designs for localized features, bug fixes, routine refactors,
+tests, documentation-only work, or maintenance changes. Use a descriptive
+kebab-case filename such as
+`docs/designs/managed-container-image-distribution.md`.
+
+- Iterate on that file in place as decisions change. Do not create timestamped
+  replacement copies that can diverge from the implementation.
+- Treat the checked-in design as a living source of truth. Update it in the same
+  change whenever scope, architecture, public interfaces, compatibility,
+  migrations, rollout steps, or verification status changes.
+- Distinguish completed work from pending operational or follow-up work. Do not
+  mark a feature complete while its design still describes stale behavior or
+  unfinished required gates.
+- Include, at minimum, status and last-updated metadata, goals and non-goals,
+  the public contract, architecture and invariants, implementation phases,
+  deployment and rollback behavior, verification evidence, and open gates.
+- Record intentional implementation departures and their rationale in the
+  design instead of letting code and design silently diverge.
+- External planning locations such as `~/agent-plans` or
+  `agent/feature-plans/` may be scratch space or pointers, but are never
+  authoritative. Sync an accepted plan into `docs/designs/` and continue
+  editing only the repository copy.
+- Run adversarial review against the exact repository design. If review or
+  implementation changes the contract, update the design first and re-review
+  the updated version before proceeding.
+
 ## Pull Request Guidelines
 
 1. **Branch from master**, create descriptive branch name

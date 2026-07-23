@@ -12,6 +12,7 @@ import colorama
 from sky import catalog
 from sky import check as sky_check
 from sky import clouds
+from sky import container_images as container_images_lib
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
@@ -40,6 +41,7 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 DEFAULT_DISK_SIZE_GB = 256
+_LEGACY_CONTAINER_IMAGE_COPY_TOKEN = object()
 
 RESOURCE_CONFIG_ALIASES = {
     'gpus': 'accelerators',
@@ -156,7 +158,7 @@ class Resources:
     """
     # If any fields changed, increment the version. For backward compatibility,
     # modify the __setstate__ method to handle the old version.
-    _VERSION = 34  # add _docker_image from image_id dict 'docker' key.
+    _VERSION = 36  # preserve legacy Docker-image provenance for old servers.
 
     def __init__(
         self,
@@ -187,12 +189,20 @@ class Resources:
         volumes: list[dict[str, Any]] | None = None,
         # Internal use only.
         # pylint: disable=invalid-name
-        _docker_login_config: docker_utils.DockerLoginConfig | None = None,
+        _docker_login_config: (docker_utils.DockerLoginConfig | dict[str, str] |
+                               None) = None,
         _docker_username_for_runpod: str | None = None,
         _is_image_managed: bool | None = None,
         _requires_fuse: bool | None = None,
         _cluster_config_overrides: dict[str, Any] | None = None,
         _no_missing_accel_warnings: bool | None = None,
+        *,
+        container_image: (container_images_lib.ContainerImage | dict[str, Any] |
+                          str | None) = None,
+        _resolved_container_image: (container_images_lib.ResolvedContainerImage
+                                    | dict[str, Any] | None) = None,
+        _container_image_from_legacy_image_id: bool = False,
+        _legacy_container_image_copy_token: object | None = None,
     ):
         """Initialize a Resources object.
 
@@ -267,6 +277,12 @@ class Resources:
                 'us-east1': 'ami-1234567890abcdef0'
               }
 
+          container_image: the OCI container image to run. A string specifies
+            the image source directly. A dict selects immutable content with
+            ``ref``, ``release``, or ``artifact_id`` and may choose an allowed
+            registry ``distribution``. The legacy ``image_id: docker:...`` form
+            is accepted with a deprecation warning.
+
           disk_size: the size of the OS disk in GiB.
           disk_tier: the disk performance tier to use. If None, defaults to
             ``'medium'``.
@@ -297,6 +313,8 @@ class Resources:
           _docker_login_config: the docker configuration to use. This includes
             the docker username, password, and registry server. If None, skip
             docker login.
+          _resolved_container_image: an internal, secret-free, digest-pinned
+            pull plan selected by the API server for a concrete placement.
           _docker_username_for_runpod: the login username for the docker
             containers. This is used by RunPod to set the ssh user for the
             docker containers.
@@ -372,7 +390,7 @@ class Resources:
             self._ephemeral_storage = None
 
         self._image_id: dict[str | None, str] | None = None
-        self._docker_image: str | None = None
+        legacy_docker_image: str | None = None
         if isinstance(image_id, str):
             self._image_id = {self._region: image_id.strip()}
         elif isinstance(image_id, dict):
@@ -383,7 +401,7 @@ class Resources:
                 docker_val = image_id.pop('docker').strip()
                 if docker_val.startswith('docker:'):
                     docker_val = docker_val[len('docker:'):]
-                self._docker_image = docker_val
+                legacy_docker_image = docker_val
             if not image_id:
                 self._image_id = None
             elif None in image_id:
@@ -395,23 +413,88 @@ class Resources:
                 }
             # Reject ambiguous specs: docker key + docker:-prefixed region
             # values (e.g. {us-east-1: 'docker:img1', docker: 'img2'}).
-            if self._docker_image is not None and self._image_id is not None:
-                docker_prefixed = [
-                    f'{v} (region: {k})' for k, v in self._image_id.items()
-                    if v.startswith('docker:')
-                ]
-                if docker_prefixed:
+            if legacy_docker_image is not None and self._image_id is not None:
+                has_docker_prefixed_region = any(
+                    value.startswith('docker:')
+                    for value in self._image_id.values())
+                if has_docker_prefixed_region:
                     with ux_utils.print_exception_no_traceback():
                         raise ValueError(
                             'image_id has both a \'docker\' key and '
-                            'docker:-prefixed region values: '
-                            f'{", ".join(docker_prefixed)}. '
+                            'one or more docker:-prefixed region values. '
                             'Please use only one mechanism to specify '
                             'the Docker image.')
         else:
             self._image_id = image_id
         if isinstance(self._cloud, clouds.Kubernetes):
             _maybe_add_docker_prefix_to_image_id(self._image_id)
+
+        docker_image_ids: set[str] = set()
+        if self._image_id is not None:
+            docker_image_ids = {
+                value[len('docker:'):]
+                for value in self._image_id.values()
+                if value.startswith('docker:')
+            }
+        if len(docker_image_ids) > 1:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'container_image has one identity across placements, but '
+                    'legacy image_id specifies multiple distinct Docker '
+                    'images.')
+        if docker_image_ids:
+            assert legacy_docker_image is None
+            assert self._image_id is not None
+            legacy_docker_image = next(iter(docker_image_ids))
+            cloud_image_ids = {
+                key: value
+                for key, value in self._image_id.items()
+                if not value.startswith('docker:')
+            }
+            self._image_id = cloud_image_ids or None
+
+        if container_image is not None and legacy_docker_image is not None:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'Cannot specify both container_image and a Docker image '
+                    'through image_id. Move the Docker reference to '
+                    'container_image and keep image_id only for a cloud '
+                    'machine image.')
+
+        self._container_image: container_images_lib.ContainerImage | None
+        self._container_image_from_legacy_image_id = (
+            _container_image_from_legacy_image_id or
+            (container_image is None and legacy_docker_image is not None))
+        if container_image is not None:
+            self._container_image = (container_images_lib.ContainerImage.
+                                     from_config(container_image))
+        elif legacy_docker_image is not None:
+            # Validate before warning so a rejected legacy value can never be
+            # reflected into logs.  The warning itself is intentionally
+            # value-free because image references are an untrusted boundary.
+            self._container_image = (container_images_lib.ContainerImage.
+                                     from_legacy_ref(legacy_docker_image))
+            if (_legacy_container_image_copy_token
+                    is not _LEGACY_CONTAINER_IMAGE_COPY_TOKEN):
+                logger.warning(
+                    'Using image_id for a Docker image is deprecated. Use '
+                    'container_image instead.')
+        else:
+            self._container_image = None
+
+        self._resolved_container_image = (
+            container_images_lib.ResolvedContainerImage.from_dict(
+                _resolved_container_image)
+            if _resolved_container_image is not None else None)
+        if (self._resolved_container_image is not None and
+                self._container_image is None):
+            raise ValueError('_resolved_container_image requires '
+                             'container_image.')
+        self._docker_image = (self._resolved_container_image.reference
+                              if self._resolved_container_image is not None else
+                              self._container_image.ref if
+                              (self._container_image is not None and
+                               self._container_image.ref is not None) else None)
         self._is_image_managed = _is_image_managed
 
         if isinstance(disk_tier, str):
@@ -461,7 +544,10 @@ class Resources:
 
         self._labels = labels
 
-        self._docker_login_config = _docker_login_config
+        self._docker_login_config = (docker_utils.DockerLoginConfig(
+            **_docker_login_config) if isinstance(_docker_login_config, dict)
+                                     else _docker_login_config)
+        self._validate_container_image_docker_credentials()
 
         # TODO(andyl): This ctor param seems to be unused.
         # We always use `Task.set_resources` and `Resources.copy` to set the
@@ -558,16 +644,18 @@ class Resources:
             use_spot = '[Spot]'
 
         image_id = ''
-        image_parts = []
         if self.image_id is not None:
             if None in self.image_id:
-                image_parts.append(f'{self.image_id[None]}')
+                image_id = f', image_id={self.image_id[None]}'
             else:
-                image_parts.append(f'{self.image_id}')
-        if self._docker_image is not None:
-            image_parts.append(f'docker:{self._docker_image}')
-        if image_parts:
-            image_id = f', image_id={" | ".join(image_parts)}'
+                image_id = f', image_id={self.image_id}'
+
+        container_image = ''
+        if self.container_image is not None:
+            selector = (self.container_image.ref or
+                        self.container_image.release or
+                        self.container_image.artifact_id)
+            container_image = f', container_image={selector}'
 
         disk_tier = ''
         if self.disk_tier is not None:
@@ -609,6 +697,7 @@ class Resources:
         hardware_str = (
             f'{instance_type}{use_spot}'
             f'{cpus}{memory}{accelerators}{accelerator_args}{image_id}'
+            f'{container_image}'
             f'{disk_tier}{network_tier}{disk_size}{ephemeral_storage}'
             f'{local_disk}{max_hourly_cost}{ports}')
         # It may have leading ',' (for example, instance_type not set) or empty
@@ -745,6 +834,22 @@ class Resources:
         return self._image_id
 
     @property
+    def container_image(self) -> container_images_lib.ContainerImage | None:
+        """Returns the source image identity selected by the task."""
+        return self._container_image
+
+    @property
+    def resolved_container_image(
+            self) -> container_images_lib.ResolvedContainerImage | None:
+        """Returns the secret-free pull plan pinned for this launch."""
+        return self._resolved_container_image
+
+    @property
+    def container_image_from_legacy_image_id(self) -> bool:
+        """Whether this image can down-convert for an older API server."""
+        return self._container_image_from_legacy_image_id
+
+    @property
     def disk_tier(self) -> resources_utils.DiskTier | None:
         return self._disk_tier
 
@@ -846,6 +951,46 @@ class Resources:
     @property
     def docker_login_config(self) -> docker_utils.DockerLoginConfig | None:
         return self._docker_login_config
+
+    def _validate_container_image_docker_credentials(self) -> None:
+        """Revalidates image state and rejects inline credentials."""
+        container_image = getattr(self, '_container_image', None)
+        resolved_image = getattr(self, '_resolved_container_image', None)
+        if container_image is not None:
+            if getattr(self, '_container_image_from_legacy_image_id', False):
+                container_image = (
+                    container_images_lib.ContainerImage.from_legacy_ref(
+                        container_image.ref))
+            else:
+                container_image = (container_images_lib.ContainerImage.
+                                   from_config(container_image))
+        if resolved_image is not None:
+            resolved_image = (container_images_lib.ResolvedContainerImage.
+                              from_dict(resolved_image))
+            if container_image is None:
+                raise ValueError('_resolved_container_image requires '
+                                 'container_image.')
+        expected_docker_image = (
+            resolved_image.reference if resolved_image is not None else
+            container_image.ref if container_image is not None else None)
+        if getattr(self, '_docker_image', None) != expected_docker_image:
+            raise ValueError('Container image runtime state is inconsistent.')
+        from_legacy = getattr(self, '_container_image_from_legacy_image_id',
+                              False)
+        login_config = getattr(self, '_docker_login_config', None)
+        if isinstance(login_config, dict):
+            username = login_config.get('username')
+            password = login_config.get('password')
+        else:
+            username = getattr(login_config, 'username', None)
+            password = getattr(login_config, 'password', None)
+        if (container_image is not None and not from_legacy and
+            (username or password)):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'container_image does not support inline Docker username '
+                    'or password credentials. Use a public source or a '
+                    'server-side workload identity.')
 
     @property
     def docker_username_for_runpod(self) -> str | None:
@@ -1508,18 +1653,16 @@ class Resources:
                 raise
 
     def extract_docker_image(self) -> str | None:
+        """Returns the physical runtime image, if this is a container task."""
         if self._docker_image is not None:
             return self._docker_image
-        if self.image_id is None:
-            return None
-        # Handle dict image_id
-        if len(self.image_id) == 1:
-            # Check if the single key matches the region or is None (any region)
-            image_key = list(self.image_id.keys())[0]
-            if image_key == self.region or image_key is None:
-                image_id = self.image_id[image_key]
-                if image_id.startswith('docker:'):
-                    return image_id[len('docker:'):]
+        # Compatibility for a legacy unpickled resource whose image_id had
+        # multiple region-specific Docker values and no single logical image.
+        if self._image_id is not None:
+            image = (self._image_id.get(self.region) or
+                     self._image_id.get(None))
+            if image is not None and image.startswith('docker:'):
+                return image[len('docker:'):]
         return None
 
     def get_cloud_image_id(self) -> dict[str | None, str] | None:
@@ -1578,10 +1721,10 @@ class Resources:
                             f'(prefix with "docker:"), or '
                             f'(2) leave image_id empty to use the default')
 
-        if self._image_id is None and self._docker_image is None:
+        if self._image_id is None and self._container_image is None:
             return
 
-        if self._docker_image is not None:
+        if self._container_image is not None:
             if self.cloud is not None:
                 self.cloud.check_features_are_supported(
                     self, {clouds.CloudImplementationFeatures.DOCKER_IMAGE})
@@ -1590,12 +1733,10 @@ class Resources:
 
         if (self._image_id is not None and
                 self.extract_docker_image() is not None):
-            # Legacy docker: prefix in image_id (no separate _docker_image)
-            if self._docker_image is None:
-                if self.cloud is not None:
-                    self.cloud.check_features_are_supported(
-                        self, {clouds.CloudImplementationFeatures.DOCKER_IMAGE})
-                return
+            if self.cloud is not None:
+                self.cloud.check_features_are_supported(
+                    self, {clouds.CloudImplementationFeatures.DOCKER_IMAGE})
+            return
 
         if self._image_id is None:
             return
@@ -2036,6 +2177,10 @@ class Resources:
                 if this_image != other_image:
                     return False
 
+        if (self.container_image is not None and
+                self.container_image != other.container_image):
+            return False
+
         if (self._instance_type is not None and
                 self._instance_type != other.instance_type):
             return False
@@ -2145,7 +2290,7 @@ class Resources:
             self._disk_tier is None,
             self._network_tier is None,
             self._image_id is None,
-            self._docker_image is None,
+            self._container_image is None,
             self._ports is None,
             self._docker_login_config is None,
         ])
@@ -2273,13 +2418,39 @@ class Resources:
             hooks_override)
 
         override_configs = dict(override_configs) if override_configs else None
-        # Reconstruct the 'docker' key in image_id so _docker_image is preserved
-        # across the copy, since self.image_id excludes the popped 'docker' key.
         default_image_id = self.image_id
-        if self._docker_image is not None:
-            image_id_dict = dict(default_image_id) if default_image_id else {}
-            image_id_dict['docker'] = self._docker_image
-            default_image_id = image_id_dict
+        container_image_overridden = 'container_image' in override
+        image_id_overridden = 'image_id' in override
+        legacy_container_replaced = (image_id_overridden and
+                                     self._container_image_from_legacy_image_id
+                                     and not container_image_overridden)
+        placement_changed = (
+            ('cloud' in override and override['cloud'] != self.cloud) or
+            ('region' in override and override['region'] != self.region) or
+            ('instance_type' in override and
+             override['instance_type'] != self.instance_type))
+        pull_plan_invalidated = (container_image_overridden or
+                                 legacy_container_replaced or
+                                 (self._resolved_container_image is not None and
+                                  placement_changed))
+        default_container_image = (None if legacy_container_replaced else
+                                   self.container_image)
+        preserve_legacy_container = (self._container_image_from_legacy_image_id
+                                     and not container_image_overridden and
+                                     not image_id_overridden)
+        if preserve_legacy_container:
+            # Re-enter through the public legacy image_id path. Passing the
+            # internal legacy ContainerImage object as container_image would
+            # either bypass or fail the digest-pinned public validation.
+            assert self.container_image is not None
+            assert self.container_image.ref is not None
+            default_image_id = dict(default_image_id or {})
+            default_image_id['docker'] = self.container_image.ref
+            default_container_image = None
+        resolved_container_image = (None if pull_plan_invalidated else
+                                    self._resolved_container_image)
+        default_docker_login_config = (None if pull_plan_invalidated else
+                                       self._docker_login_config)
         resources = Resources(
             cloud=override.pop('cloud', self.cloud),
             instance_type=override.pop('instance_type', self.instance_type),
@@ -2299,6 +2470,8 @@ class Resources:
             region=override.pop('region', self.region),
             zone=override.pop('zone', self.zone),
             image_id=override.pop('image_id', default_image_id),
+            container_image=override.pop('container_image',
+                                         default_container_image),
             disk_tier=override.pop('disk_tier', self.disk_tier),
             network_tier=override.pop('network_tier', self.network_tier),
             local_disk=override.pop('local_disk', self._local_disk),
@@ -2313,7 +2486,16 @@ class Resources:
             volumes=override.pop('volumes', self.volumes),
             infra=override.pop('infra', None),
             _docker_login_config=override.pop('_docker_login_config',
-                                              self._docker_login_config),
+                                              default_docker_login_config),
+            _resolved_container_image=override.pop('_resolved_container_image',
+                                                   resolved_container_image),
+            _container_image_from_legacy_image_id=override.pop(
+                '_container_image_from_legacy_image_id',
+                self._container_image_from_legacy_image_id and
+                not container_image_overridden and not image_id_overridden),
+            _legacy_container_image_copy_token=(
+                _LEGACY_CONTAINER_IMAGE_COPY_TOKEN
+                if preserve_legacy_container else None),
             _docker_username_for_runpod=override.pop(
                 '_docker_username_for_runpod',
                 self._docker_username_for_runpod),
@@ -2350,7 +2532,7 @@ class Resources:
         if (self.network_tier is not None and
                 self.network_tier == resources_utils.NetworkTier.BEST):
             features.add(clouds.CloudImplementationFeatures.CUSTOM_NETWORK_TIER)
-        if self.extract_docker_image() is not None:
+        if self.container_image is not None:
             features.add(clouds.CloudImplementationFeatures.DOCKER_IMAGE)
         if self.get_cloud_image_id() is not None:
             features.add(clouds.CloudImplementationFeatures.IMAGE_ID)
@@ -2460,16 +2642,66 @@ class Resources:
         """
         if config is None:
             return {Resources()}
+        if not isinstance(config, dict):
+            raise ValueError(
+                'Invalid resources YAML: resources must be a mapping.'
+            ) from None
+
+        if '_resolved_container_image' in config:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    '_resolved_container_image is server-managed launch '
+                    'state and cannot be supplied in task YAML.')
+
+        anyof = config.get('any_of')
+        ordered = config.get('ordered')
+        for alternatives_name, alternatives in (('any_of', anyof), ('ordered',
+                                                                    ordered)):
+            if alternatives is not None and (
+                    not isinstance(alternatives, list) or not all(
+                        isinstance(candidate, dict)
+                        for candidate in alternatives)):
+                raise ValueError(
+                    f'Invalid resources YAML: {alternatives_name} has an '
+                    'invalid value.') from None
+
+        for candidate in [config, *(anyof or []), *(ordered or [])]:
+            if '_resolved_container_image' in candidate:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        '_resolved_container_image is server-managed launch '
+                        'state and cannot be supplied in task YAML.')
 
         Resources._apply_resource_config_aliases(config)
-        anyof = config.get('any_of')
-        if anyof is not None and isinstance(anyof, list):
+        if anyof is not None:
+            assert isinstance(anyof, list)
             for anyof_config in anyof:
                 Resources._apply_resource_config_aliases(anyof_config)
-        ordered = config.get('ordered')
-        if ordered is not None and isinstance(ordered, list):
+        if ordered is not None:
+            assert isinstance(ordered, list)
             for ordered_config in ordered:
                 Resources._apply_resource_config_aliases(ordered_config)
+
+        # Generic jsonschema errors include the rejected key/value in their
+        # message.  Container image inputs may be credential-shaped, so route
+        # every direct and alternative image value through the value-free
+        # parser before the generic resources schema can inspect it.
+        image_configs = [config]
+        if isinstance(anyof, list):
+            image_configs.extend(anyof)
+        if isinstance(ordered, list):
+            image_configs.extend(ordered)
+        for image_config in image_configs:
+            if (not isinstance(image_config, dict) or
+                    'container_image' not in image_config):
+                continue
+            try:
+                container_images_lib.ContainerImage.from_config(
+                    image_config['container_image'])
+            except (TypeError, ValueError):
+                raise ValueError(
+                    'Invalid resources YAML: container_image has an invalid '
+                    'value.') from None
         # `hooks` is task-scoped and lives at task.config.hooks. The
         # task-YAML loader (sky/task.py::Task.from_yaml_config) routes
         # it into resources_config['hooks'] so the existing
@@ -2603,7 +2835,17 @@ class Resources:
         return {Resources._from_yaml_config_single(config)}
 
     @classmethod
-    def _from_yaml_config_single(cls, config: dict[str, str]) -> 'Resources':
+    def _from_yaml_config_single(
+            cls,
+            config: dict[str, str],
+            *,
+            _allow_resolved_container_image: bool = False) -> 'Resources':
+        if (not _allow_resolved_container_image and
+                '_resolved_container_image' in config):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    '_resolved_container_image is server-managed launch '
+                    'state and cannot be supplied in task YAML.')
         resources_fields: dict[str, Any] = {}
 
         # Extract infra field if present
@@ -2639,6 +2881,8 @@ class Resources:
         resources_fields['ephemeral_storage'] = config.pop(
             'ephemeral_storage', None)
         resources_fields['image_id'] = config.pop('image_id', None)
+        resources_fields['container_image'] = config.pop(
+            'container_image', None)
         resources_fields['disk_tier'] = config.pop('disk_tier', None)
         resources_fields['network_tier'] = config.pop('network_tier', None)
         resources_fields['local_disk'] = config.pop('local_disk', None)
@@ -2653,6 +2897,8 @@ class Resources:
         resources_fields['volumes'] = config.pop('volumes', None)
         resources_fields['_docker_login_config'] = config.pop(
             '_docker_login_config', None)
+        resources_fields['_resolved_container_image'] = config.pop(
+            '_resolved_container_image', None)
         resources_fields['_docker_username_for_runpod'] = config.pop(
             '_docker_username_for_runpod', None)
         resources_fields['_is_image_managed'] = config.pop(
@@ -2687,6 +2933,7 @@ class Resources:
     def to_yaml_config(self,
                        redact_secrets: bool = False) -> dict[str, str | int]:
         """Returns a yaml-style dict of config for this resource bundle."""
+        self._validate_container_image_docker_credentials()
         config = {}
 
         def add_if_not_none(key, value):
@@ -2708,12 +2955,16 @@ class Resources:
         add_if_not_none('job_recovery', self.job_recovery)
         add_if_not_none('disk_size', self.disk_size)
         add_if_not_none('ephemeral_storage', self._ephemeral_storage)
-        image_id_config = self.image_id
-        if self._docker_image is not None:
-            image_id_dict = dict(image_id_config) if image_id_config else {}
-            image_id_dict['docker'] = self._docker_image
-            image_id_config = image_id_dict
-        add_if_not_none('image_id', image_id_config)
+        image_id = self.image_id
+        if (self._container_image_from_legacy_image_id and
+                self.container_image is not None and
+                self.container_image.ref is not None):
+            image_id = dict(image_id or {})
+            image_id['docker'] = self.container_image.ref
+        add_if_not_none('image_id', image_id)
+        if (self.container_image is not None and
+                not self._container_image_from_legacy_image_id):
+            config['container_image'] = self.container_image.to_yaml_config()
         if self.disk_tier is not None:
             config['disk_tier'] = self.disk_tier.value
         if self.network_tier is not None:
@@ -2755,6 +3006,9 @@ class Resources:
                 self._docker_login_config)
             if redact_secrets:
                 config['_docker_login_config']['password'] = '<redacted>'
+        if self._resolved_container_image is not None:
+            config['_resolved_container_image'] = (
+                self._resolved_container_image.to_dict())
         if self._docker_username_for_runpod is not None:
             config['_docker_username_for_runpod'] = (
                 self._docker_username_for_runpod)
@@ -2765,6 +3019,28 @@ class Resources:
         if self._requires_fuse is not None:
             config['_requires_fuse'] = self._requires_fuse
         return config
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Returns pickle state without requiring new model classes to load.
+
+        Handles are sent from newer API servers to older clients. Keeping the
+        v35 fields as plain builtins lets an old client unpickle the Resources
+        object and continue using ``_docker_image`` without importing the new
+        ``sky.container_images`` package.
+        """
+        self._validate_container_image_docker_credentials()
+        state = self.__dict__.copy()
+        if self._container_image is not None:
+            if self._container_image_from_legacy_image_id:
+                state['_container_image'] = self._container_image.ref
+            else:
+                state[
+                    '_container_image'] = self._container_image.to_yaml_config(
+                    )
+        if self._resolved_container_image is not None:
+            state['_resolved_container_image'] = (
+                self._resolved_container_image.to_dict())
+        return state
 
     def __setstate__(self, state):
         """Set state from pickled state, for backward compatibility."""
@@ -2947,6 +3223,62 @@ class Resources:
         if version < 34:
             self._docker_image = None
 
+        if version < 35:
+            docker_image = state.get('_docker_image')
+            legacy_image_id = state.get('_image_id')
+            if isinstance(legacy_image_id, dict):
+                docker_values = {
+                    value[len('docker:'):]
+                    for value in legacy_image_id.values()
+                    if value.startswith('docker:')
+                }
+                if docker_image is None and len(docker_values) == 1:
+                    docker_image = next(iter(docker_values))
+                if docker_image is None:
+                    region_image = (legacy_image_id.get(state.get('_region')) or
+                                    legacy_image_id.get(None))
+                    if (region_image is not None and
+                            region_image.startswith('docker:')):
+                        docker_image = region_image[len('docker:'):]
+                if docker_image is not None:
+                    state['_image_id'] = {
+                        key: value
+                        for key, value in legacy_image_id.items()
+                        if not value.startswith('docker:')
+                    } or None
+            state['_container_image'] = (
+                container_images_lib.ContainerImage.from_legacy_ref(
+                    docker_image) if docker_image is not None else None)
+            state['_resolved_container_image'] = None
+            state['_docker_image'] = (state['_container_image'].ref
+                                      if state['_container_image'] is not None
+                                      else None)
+        else:
+            container_image = state.get('_container_image')
+            if container_image is not None:
+                legacy_container_image = bool(
+                    state.get('_container_image_from_legacy_image_id', False))
+                if legacy_container_image:
+                    if not isinstance(container_image, str):
+                        raise ValueError('Legacy Docker image state must be a '
+                                         'string reference.')
+                    state['_container_image'] = (
+                        container_images_lib.ContainerImage.from_legacy_ref(
+                            container_image))
+                else:
+                    state['_container_image'] = (
+                        container_images_lib.ContainerImage.from_config(
+                            container_image))
+            resolved = state.get('_resolved_container_image')
+            if resolved is not None:
+                state['_resolved_container_image'] = (
+                    container_images_lib.ResolvedContainerImage.from_dict(
+                        resolved))
+
+        if version < 36:
+            state['_container_image_from_legacy_image_id'] = (
+                version < 35 and state.get('_container_image') is not None)
+
         if version < 33:
             # Route legacy AutostopConfig.hook / hook_timeout attrs into the
             # new _hooks list, and scrub them from AutostopConfig.
@@ -2976,6 +3308,14 @@ class Resources:
             state['_hooks'] = hooks or None
 
         self.__dict__.update(state)
+        docker_login_config = getattr(self, '_docker_login_config', None)
+        if isinstance(docker_login_config, dict):
+            login_config_dict = typing.cast(dict[str, str], docker_login_config)
+            self._docker_login_config = docker_utils.DockerLoginConfig(
+                username=login_config_dict['username'],
+                password=login_config_dict['password'],
+                server=login_config_dict['server'])
+        self._validate_container_image_docker_credentials()
 
 
 class LaunchableResources(Resources):

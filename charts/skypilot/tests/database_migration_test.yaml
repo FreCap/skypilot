@@ -1,0 +1,234 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: database_migration_test
+templates:
+  - templates/database-migration-job.yaml
+tests:
+  - it: should create one revision-scoped migration job for an external secret
+    set:
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Job
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-db-migration-0
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+      - equal:
+          path: spec.template.spec.restartPolicy
+          value: Never
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - python
+            - -m
+            - sky.server.database_migrations
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: upgrade
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_DB_CONNECTION_URI
+            valueFrom:
+              secretKeyRef:
+                name: external-db
+                key: connection_string
+
+  - it: should use the chart-managed connection secret
+    set:
+      apiService.dbConnectionString: postgresql://user:pass@host:5432/db
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_DB_CONNECTION_URI
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-db-connection
+                key: connection_string
+
+  - it: should bootstrap only when fresh-schema isolation is explicit
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.bootstrapFreshSchema: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: bootstrap
+
+  - it: should preserve the revision suffix within the Kubernetes name limit
+    set:
+      fullnameOverride: a-very-long-skypilot-release-name-that-fills-the-kubernetes-name-limit
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: ^.{1,49}-db-migration-0$
+      - equal:
+          path: metadata.labels.app
+          value: a-very-long-skypilot-release-name-that-fills-the-db-migration-0
+      - equal:
+          path: spec.template.metadata.labels.app
+          value: a-very-long-skypilot-release-name-that-fills-the-db-migration-0
+
+  - it: should inherit image policy scheduling but exclude API-only inputs
+    set:
+      global.imageRegistry: registry.example.com/cache
+      global.imagePullSecrets:
+        - name: pull-secret
+      apiService.image: upstream.example/skypilot:test
+      apiService.dbConnectionSecretName: external-db
+      apiService.nodeSelector:
+        pool: control
+      apiService.tolerations:
+        - key: control
+          operator: Exists
+      apiService.extraEnvs:
+        - name: API_ONLY_SECRET
+          value: must-not-leak
+      apiService.extraVolumes:
+        - name: api-only-secret
+          secret:
+            secretName: api-only-secret
+      apiService.extraVolumeMounts:
+        - name: api-only-secret
+          mountPath: /etc/api-only
+          readOnly: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/cache/skypilot:test
+      - contains:
+          path: spec.template.spec.imagePullSecrets
+          content:
+            name: pull-secret
+      - equal:
+          path: spec.template.spec.nodeSelector.pool
+          value: control
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: control
+            operator: Exists
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: API_ONLY_SECRET
+            value: must-not-leak
+      - isNull:
+          path: spec.template.spec.containers[0].volumeMounts
+      - isNull:
+          path: spec.template.spec.volumes
+
+  - it: should receive shared database connection settings
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      databaseConnection.extraVolumes:
+        - name: shared-db-ca
+          secret:
+            secretName: shared-db-ca
+      databaseConnection.extraVolumeMounts:
+        - name: shared-db-ca
+          mountPath: /etc/shared-db
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: shared-db-ca
+            mountPath: /etc/shared-db
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: shared-db-ca
+            secret:
+              secretName: shared-db-ca
+
+  - it: should be absent without an external database
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should be absent when migration ownership is disabled
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should reject an extra environment override of migration ownership
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: auto
+    asserts:
+      - failedTemplate:
+          errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject duplicate shared environment names
+    set:
+      apiService.dbConnectionSecretName: external-db
+      global.extraEnvs:
+        - name: PGSSLMODE
+          value: require
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "PGSSLMODE" is duplicated or reserved by the chart'
+
+  - it: should reject the chart-owned database URI environment
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_DB_CONNECTION_URI
+          value: postgresql://unexpected
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_DB_CONNECTION_URI" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate shared volume names
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraVolumes:
+        - name: db-material
+          secret:
+            secretName: first
+        - name: db-material
+          secret:
+            secretName: second
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "db-material" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate shared mount paths
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraVolumeMounts:
+        - name: first-db-material
+          mountPath: /etc/database
+        - name: second-db-material
+          mountPath: /etc/database
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/etc/database" is duplicated or reserved by the chart'

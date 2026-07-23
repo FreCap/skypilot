@@ -6,7 +6,7 @@ using RESTful admin policy servers with FastAPI.
 
 Key areas tested:
 - JSON/YAML serialization through REST policy servers via admin_policy_utils.apply()
-- None key preservation during encoding/decoding in real usage scenarios
+- Legacy Docker image preservation during encoding/decoding
 - FastAPI integration and request/response handling
 - Server lifecycle management and port allocation
 - Full policy application flow (like real SkyPilot usage)
@@ -257,19 +257,11 @@ class PolicyServer:
 
 
 def create_test_task() -> sky.Task:
-    """Create a test task with Kubernetes infra and docker image.
-    
-    This creates the scenario that triggers the None key serialization issue:
-    - Kubernetes infrastructure (no regions, so None key in image_id)
-    - Docker image specified (creates image_id mapping)
-    
-    Returns:
-        sky.Task: A task configured to reproduce the serialization issue
-    """
+    """Create a test task with Kubernetes infra and a legacy Docker image."""
     # Inline YAML content instead of reading from file
     task_config = {
         'resources': {
-            'infra': 'k8s',  # This creates None keys in image_id
+            'infra': 'k8s',
             'image_id': 'docker:ubuntu:22.04'
         }
     }
@@ -277,29 +269,28 @@ def create_test_task() -> sky.Task:
     return sky.Task.from_yaml_config(task_config)
 
 
-def test_none_key_serialization_through_real_policy_flow(monkeypatch):
-    """Test None key preservation through the real admin policy application flow.
-    
-    This test verifies that the YAML-based serialization approach correctly
-    preserves None keys in image_id mappings when using the actual admin_policy_utils.apply()
-    flow that real SkyPilot usage follows.
-    
-    The test PASSES when the serialization preserves None keys and FAILS
-    when None keys are converted to string 'None' keys.
-    """
+def _assert_legacy_docker_image(resource, expected_ref: str) -> None:
+    """Assert the normalized model and its old-server YAML representation."""
+    assert resource.image_id is None
+    assert resource.container_image is not None
+    assert resource.container_image.ref == expected_ref
+    assert resource.container_image_from_legacy_image_id
+    assert resource.to_yaml_config()['image_id'] == {'docker': expected_ref}
+
+
+def test_legacy_docker_image_serialization_through_real_policy_flow(
+        monkeypatch):
+    """Test legacy Docker preservation through the real policy flow."""
     # Use context manager for automatic cleanup
     with PolicyServer() as server:
         # Clear previous requests
         ImageIdInspectorPolicy.received_requests.clear()
 
-        # Create task with None key in image_id (k8s + docker scenario)
+        # Legacy Docker syntax is normalized internally but must still
+        # down-convert for an old API server after the policy round trip.
         task = create_test_task()
         resources = list(task.resources)[0]
-        original_image_id = resources.image_id
-
-        # Verify setup: original should have None key
-        assert None in original_image_id, "Setup: Expected None key in original image_id"
-        assert original_image_id[None] == 'docker:ubuntu:22.04'
+        _assert_legacy_docker_image(resources, 'ubuntu:22.04')
 
         # Create a temporary config file with our policy URL (like real usage)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
@@ -323,40 +314,14 @@ def test_none_key_serialization_through_real_policy_flow(monkeypatch):
             assert received_request.request_options.cluster_name == 'test'
             assert received_request.request_options.dryrun is False
 
-            # Check the image_id preservation in the received request
+            # Check legacy image preservation in the received request.
             received_resources = list(received_request.task.resources)[0]
-            received_image_id = received_resources.image_id
-
-            # EXPECT CORRECT BEHAVIOR: Policy should receive None keys, not 'None' strings
-            assert None in received_image_id, (
-                f"REST POLICY BUG: Policy server received string 'None' instead of None key. "
-                f"Server received keys: {list(received_image_id.keys())}. "
-                f"This breaks policies that expect image_id[None] to work.")
-
-            assert 'None' not in received_image_id, (
-                f"REST POLICY BUG: None key became string 'None' in policy server. "
-                f"Server received keys: {list(received_image_id.keys())}. "
-                f"This corruption happens during REST policy JSON processing.")
+            _assert_legacy_docker_image(received_resources, 'ubuntu:22.04')
 
             # Check what we get back from the full admin policy application
             mutated_task = dag.tasks[0]
             final_resources = list(mutated_task.resources)[0]
-            final_image_id = final_resources.image_id
-
-            # EXPECT CORRECT BEHAVIOR: Final result should have None keys preserved
-            assert None in final_image_id, (
-                f"ADMIN POLICY BUG: None key lost in full admin policy application. "
-                f"Final keys: {list(final_image_id.keys())}. "
-                f"This is the root cause of ResourcesUnavailableError with k8s+docker."
-            )
-
-            assert final_image_id[None] == 'docker:ubuntu:22.04', (
-                f"ADMIN POLICY BUG: Cannot access image_id[None] after admin policy. "
-                f"Available keys: {list(final_image_id.keys())}")
-
-            assert 'None' not in final_image_id, (
-                f"ADMIN POLICY BUG: None key became string 'None' in final result. "
-                f"Final keys: {list(final_image_id.keys())}")
+            _assert_legacy_docker_image(final_resources, 'ubuntu:22.04')
         finally:
             # Clean up temp file
             os.unlink(config_path)
@@ -503,11 +468,9 @@ def test_task_without_run_command(monkeypatch):
             assert request.task.run is None
             assert request.task.resources is not None
 
-            # Check that image_id serialization still works correctly
+            # Check that legacy Docker serialization still works correctly.
             received_resources = list(request.task.resources)[0]
-            received_image_id = received_resources.image_id
-            assert None in received_image_id
-            assert received_image_id[None] == 'docker:ubuntu:22.04'
+            _assert_legacy_docker_image(received_resources, 'ubuntu:22.04')
 
             # Check final result
             assert dag is not None
@@ -586,11 +549,9 @@ def test_task_without_skypilot_config(monkeypatch):
             # Check that skypilot_config handling works (should have default config)
             assert request.skypilot_config is not None
 
-            # Check that serialization still preserves None keys
+            # Check that serialization preserves the legacy Docker syntax.
             received_resources = list(request.task.resources)[0]
-            received_image_id = received_resources.image_id
-            assert None in received_image_id
-            assert received_image_id[None] == 'docker:ubuntu:22.04'
+            _assert_legacy_docker_image(received_resources, 'ubuntu:22.04')
 
             # Check final result
             assert dag is not None
@@ -697,11 +658,9 @@ def test_complex_task_serialization(monkeypatch):
             resources_list = list(received_task.resources)
             assert len(resources_list) == 1
 
-            # Check k8s resource (with None key preservation)
+            # Check the normalized k8s resource and old-server representation.
             k8s_resource = resources_list[0]
-            assert None in k8s_resource.image_id
-            assert k8s_resource.image_id[
-                None] == 'docker:pytorch/pytorch:latest'
+            _assert_legacy_docker_image(k8s_resource, 'pytorch/pytorch:latest')
             assert k8s_resource.cpus == '4+'
             assert k8s_resource.memory == '16+'
             assert k8s_resource.accelerators == {'A100': 2}
@@ -712,10 +671,9 @@ def test_complex_task_serialization(monkeypatch):
             assert final_task.run == 'python train.py --epochs 100'
             assert len(list(final_task.resources)) == 1
 
-            # Verify None key preservation in final result
+            # Verify legacy Docker preservation in the final result.
             final_resource = list(final_task.resources)[0]
-            assert None in final_resource.image_id
-            assert final_resource.image_id[
-                None] == 'docker:pytorch/pytorch:latest'
+            _assert_legacy_docker_image(final_resource,
+                                        'pytorch/pytorch:latest')
         finally:
             os.unlink(config_path)

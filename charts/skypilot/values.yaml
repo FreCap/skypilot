@@ -264,6 +264,186 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Environment and files required by every central PostgreSQL client. Use these
+# for private CA bundles, client certificates, or shared libpq settings instead
+# of apiService.extra* so the migration Job and managed image workers receive
+# the same connection material without receiving unrelated API-only volumes.
+databaseConnection:
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+
+# Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
+# API replicas verify the resulting revision and never execute deployment DDL.
+# The Job is a regular Helm resource, so chart-managed database Secrets exist
+# before it starts and Helm does not add a hook-induced deploy-time wait.
+databaseMigration:
+  # @schema type: [boolean]
+  enabled: true
+  # Allow the migration Job to initialize a new, isolated, empty PostgreSQL
+  # schema. Leave false for every existing database and staged upgrade.
+  # @schema type: [boolean]
+  bootstrapFreshSchema: false
+  # @schema type: [integer]; minimum: 0
+  backoffLimit: 3
+  # @schema type: [integer]; minimum: 1
+  activeDeadlineSeconds: 600
+  # @schema type: [integer]; minimum: 0
+  ttlSecondsAfterFinished: 86400
+  # @schema type: [object, null]
+  annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# Managed container image distribution workers. All services are inert unless
+# explicitly enabled and require the same external PostgreSQL database as the
+# API server. They intentionally use independent Kubernetes service accounts so
+# AWS workload identity can grant copy, lifecycle, and canary permissions
+# separately.
+imageCopyWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # Maximum provider-I/O claims handled concurrently by each replica.
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 4
+  # Dedicated dependency-free probe and Prometheus port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Optional ConfigMap whose JSON entries are secret-free Terraform
+  # qualification manifests. Entries are ingested asynchronously.
+  # @schema type: [string, null]
+  qualificationManifestConfigMapName: null
+  # Exact source dockerconfig Secrets this process may read. The chart grants
+  # resourceNames-scoped RBAC only for chart-created service accounts.
+  # @schema type: [array]; item: object; maxItems: 64; itemProperties: {"namespace": {"type": "string", "minLength": 1, "maxLength": 253}, "name": {"type": "string", "minLength": 1, "maxLength": 253}}
+  sourceCredentialSecrets: []
+  serviceAccount:
+    # Create the worker service account. Set false with name to use an existing
+    # Terraform-managed account.
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # For example, an eks.amazonaws.com/role-arn IRSA annotation.
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+imageLifecycleWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 4
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Regional cache retention. Canonical manifests are never evicted.
+  # @schema type: [integer]; minimum: 1
+  retentionSeconds: 4838400
+  serviceAccount:
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+imageCanaryWorker:
+  # @schema type: [boolean]
+  enabled: false
+  # @schema type: [integer]; minimum: 1
+  replicaCount: 1
+  # Maximum temporary compute canaries handled concurrently by each replica.
+  # @schema type: [integer]; minimum: 1
+  maxInFlight: 2
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 8081
+  # @schema type: [integer]; minimum: 5
+  livenessDeadlineSeconds: 30
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Optional Secret containing a `config` key with the qualified EKS contexts.
+  # In-cluster-only qualification does not require it.
+  # @schema type: [string, null]
+  kubeconfigSecretName: null
+  serviceAccount:
+    # @schema type: [boolean]
+    create: true
+    # @schema type: [string, null]
+    name: null
+    # @schema type: [object, null]
+    annotations: null
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # SkyServe (model serving) configuration.
 serve:
   # Portable external load balancer support for controller-owned SkyServe LBs.

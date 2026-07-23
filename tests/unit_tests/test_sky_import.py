@@ -5,6 +5,7 @@ and that heavy modules are not eagerly imported at startup.
 """
 import copy
 import gc
+import importlib
 import os
 import subprocess
 import sys
@@ -17,6 +18,9 @@ from sky.adaptors import common as adaptors_common
 # These are expensive imports (100ms+) that should only load when needed.
 # Add heavy modules here to prevent performance regressions.
 FORBIDDEN_EAGER_IMPORTS = frozenset({
+    # Internal SDK/database graphs
+    'sky.container_images.api_models',
+    'sky.container_images.client',
     # Data/ML libraries
     'pandas',
     # TODO: Add 'numpy' after fixing sky/optimizer.py to use lazy import
@@ -44,7 +48,7 @@ FORBIDDEN_EAGER_IMPORTS = frozenset({
 def lazy_import_modules():
     """Get list of lazy-imported module names."""
     return [
-        obj._module_name
+        obj._module_name  # pylint: disable=protected-access
         for obj in gc.get_objects()
         if isinstance(obj, adaptors_common.LazyImport) and
         hasattr(obj, '_module_name')
@@ -73,10 +77,11 @@ def mock_delete_modules(request, monkeypatch):
     # monkeypatch automatically restores sys.modules after the test
 
 
-def test_sky_import(lazy_import_modules, mock_delete_modules):
+def test_sky_import(lazy_import_modules, mock_delete_modules):  # pylint: disable=redefined-outer-name
+    del mock_delete_modules
     # Import sky
     try:
-        import sky
+        importlib.import_module('sky')
     except Exception as e:
         print(f"Failed to import sky: {e}")
         raise
@@ -124,7 +129,8 @@ else:
     result = subprocess.run([sys.executable, '-c', check_script],
                             capture_output=True,
                             text=True,
-                            env=env)
+                            env=env,
+                            check=False)
 
     # Look for FORBIDDEN_IMPORTS anywhere in output (debug logs may precede it)
     stdout = result.stdout
@@ -138,3 +144,26 @@ else:
                     f'{loaded_modules}\n'
                     f'These imports slow down CLI startup time significantly. '
                     f'Use LazyImport from sky.adaptors.common instead.')
+
+
+def test_container_image_sdk_facade_loads_on_first_use():
+    """The public image SDK stays compatible while loading on demand."""
+    check_script = '''
+import sys
+import sky
+
+assert "sky.container_images.client" not in sys.modules
+assert callable(sky.image.publish)
+assert "sky.container_images.client" in sys.modules
+print("OK")
+'''
+
+    env = dict(os.environ)
+    env['SKYPILOT_DEBUG'] = '0'
+    result = subprocess.run([sys.executable, '-c', check_script],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith('OK')

@@ -1,0 +1,85 @@
+{{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- if and $databaseConfigured .Values.databaseMigration.enabled }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
+{{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
+{{- $migrationName := printf "%s%s" ($fullName | trunc $migrationBaseLength | trimSuffix "-") $migrationSuffix -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $migrationName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $migrationName }}
+  {{- with .Values.databaseMigration.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  backoffLimit: {{ .Values.databaseMigration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.databaseMigration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.databaseMigration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        app: {{ $migrationName }}
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      runtimeClassName: {{ .Values.runtimeClassName }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: migrate
+        image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
+        imagePullPolicy: {{ .Values.apiService.imagePullPolicy }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        command: ["python", "-m", "sky.server.database_migrations"]
+        resources:
+          {{- toYaml .Values.databaseMigration.resources | nindent 10 }}
+        env:
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- if .Values.databaseConnection.extraVolumeMounts }}
+        volumeMounts:
+          {{- with .Values.databaseConnection.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        {{- end }}
+      {{- if .Values.databaseConnection.extraVolumes }}
+      volumes:
+        {{- with .Values.databaseConnection.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- include "skypilot.apiPodScheduling" . }}
+{{- end }}

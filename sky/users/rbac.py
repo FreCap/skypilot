@@ -78,6 +78,12 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'GET'
     },
     {
+        # Managed image catalog reads remain workspace-authorized in the
+        # endpoint. Viewer POST mutations are intentionally absent.
+        'path': '/images/*',
+        'method': 'GET'
+    },
+    {
         'path': '/token',
         'method': 'GET'
     },

@@ -208,7 +208,7 @@ def load_chain_dag_from_yaml_str(
       A chain Dag with 1 or more tasks (an empty entrypoint would create a
       trivial task).
     """
-    configs = yaml_utils.read_yaml_all_str(yaml_str)
+    configs = yaml_utils.read_yaml_all_str(yaml_str, reject_duplicate_keys=True)
     return _load_chain_dag(configs, env_overrides, secrets_overrides)
 
 
@@ -412,13 +412,13 @@ def is_job_group_yaml(path: str) -> bool:
     Returns:
         True if this is a JobGroup YAML, False otherwise.
     """
-    configs = yaml_utils.read_yaml_all(path)
+    configs = yaml_utils.read_yaml_all(path, reject_duplicate_keys=True)
     return _is_job_group_configs(configs)
 
 
 def is_job_group_yaml_str(yaml_str: str) -> bool:
     """Check if a YAML string defines a JobGroup."""
-    configs = yaml_utils.read_yaml_all_str(yaml_str)
+    configs = yaml_utils.read_yaml_all_str(yaml_str, reject_duplicate_keys=True)
     return _is_job_group_configs(configs)
 
 
@@ -541,7 +541,7 @@ def load_job_group_from_yaml(
     Raises:
         ValueError: If the YAML is not a valid JobGroup format.
     """
-    configs = yaml_utils.read_yaml_all(path)
+    configs = yaml_utils.read_yaml_all(path, reject_duplicate_keys=True)
     return _load_job_group(configs, env_overrides, secrets_overrides)
 
 
@@ -551,7 +551,7 @@ def load_job_group_from_yaml_str(
     secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Load a JobGroup from a multi-document YAML string."""
-    configs = yaml_utils.read_yaml_all_str(yaml_str)
+    configs = yaml_utils.read_yaml_all_str(yaml_str, reject_duplicate_keys=True)
     return _load_job_group(configs, env_overrides, secrets_overrides)
 
 

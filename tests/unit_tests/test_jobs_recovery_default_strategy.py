@@ -10,7 +10,12 @@ full-fleet teardown, so unspecified-strategy multi-node jobs must default
 to FAILOVER (same-cluster relaunch first). An explicit user choice always
 wins, and pool jobs are excluded.
 """
+import concurrent.futures
+from unittest import mock
+
 import sky
+from sky import skypilot_config
+from sky.jobs import recovery_strategy
 from sky.resources import Resources
 from sky.utils import dag_utils
 from sky.utils import registry
@@ -76,3 +81,39 @@ def test_refill_is_idempotent():
     dag_utils.fill_default_config_in_dag_for_job_launch(dag)
     filled = list(dag.tasks[0].resources)[0].job_recovery
     assert filled['strategy'] == 'FAILOVER'
+
+
+def test_recovery_sdk_calls_enter_workspace_inside_worker_thread():
+    executor = recovery_strategy.StrategyExecutor.__new__(
+        recovery_strategy.StrategyExecutor)
+    executor.workspace = 'research'
+
+    def _active_workspace(*_args, **_kwargs):
+        return skypilot_config.get_active_workspace()
+
+    def _launch_from_outer_workspace():
+        with skypilot_config.local_active_workspace_ctx('outer'):
+            result = executor._launch_in_workspace()  # pylint: disable=protected-access
+            return result, skypilot_config.get_active_workspace()
+
+    def _exec_from_outer_workspace():
+        with skypilot_config.local_active_workspace_ctx('outer'):
+            result = executor._exec_in_workspace()  # pylint: disable=protected-access
+            return result, skypilot_config.get_active_workspace()
+
+    with mock.patch.object(recovery_strategy.sdk,
+                           'launch',
+                           side_effect=_active_workspace), \
+         mock.patch.object(recovery_strategy.sdk,
+                           'exec',
+                           side_effect=_active_workspace), \
+         concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        launched_workspace, after_launch = pool.submit(
+            _launch_from_outer_workspace).result()
+        exec_workspace, after_exec = pool.submit(
+            _exec_from_outer_workspace).result()
+
+    assert launched_workspace == 'research'
+    assert exec_workspace == 'research'
+    assert after_launch == 'outer'
+    assert after_exec == 'outer'

@@ -105,6 +105,39 @@ tests:
             name: GLOBAL_ENV
             value: global
 
+  - it: should receive shared database connection settings
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      databaseConnection.extraVolumes:
+        - name: db-ca
+          secret:
+            secretName: db-ca
+      databaseConnection.extraVolumeMounts:
+        - name: db-ca
+          mountPath: /etc/db
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: db-ca
+            mountPath: /etc/db
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: db-ca
+            secret:
+              secretName: db-ca
+
   - it: should prefix gcp credentials init container image with the global registry override
     set:
       global.imageRegistry: registry.example.com/custom
@@ -443,6 +476,11 @@ tests:
               secretKeyRef:
                 name: my-db-secret
                 key: connection_string
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
 
   # Test cases for dbConnectionString configuration
   - it: should set database connection environment variable from connection string
@@ -464,6 +502,20 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: SKYPILOT_DB_CONNECTION_URI
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+
+  - it: should retain API auto-migration fallback when migration job is disabled
+    set:
+      apiService.dbConnectionSecretName: my-db-secret
+      databaseMigration.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
 
   - it: should enable service accounts when auth.serviceAccount.enabled is explicitly true
     set:
@@ -1367,3 +1419,47 @@ tests:
       - lengthEqual:
           path: spec.template.spec.containers[0].env
           count: 11
+
+  - it: should reject duplicate database and API volume names
+    set:
+      databaseConnection.extraVolumes:
+        - name: connection-material
+          secret:
+            secretName: database-material
+      apiService.extraVolumes:
+        - name: connection-material
+          secret:
+            secretName: api-material
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "connection-material" is duplicated or reserved by the chart'
+
+  - it: should reject duplicate database and API mount paths
+    set:
+      databaseConnection.extraVolumeMounts:
+        - name: database-material
+          mountPath: /etc/shared-material
+      apiService.extraVolumeMounts:
+        - name: api-material
+          mountPath: /etc/shared-material
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/etc/shared-material" is duplicated or reserved by the chart'
+
+  - it: should reject an extra volume using a chart-owned API volume name
+    set:
+      apiService.extraVolumes:
+        - name: state-volume
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "state-volume" is duplicated or reserved by the chart'
+
+  - it: should reject an extra mount using a chart-owned API path
+    set:
+      apiService.extraVolumeMounts:
+        - name: unexpected-config
+          mountPath: /var/skypilot/config
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume mount path "/var/skypilot/config" is duplicated or reserved by the chart'

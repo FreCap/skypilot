@@ -90,6 +90,7 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     attributes = e.__dict__.copy()
     if 'stacktrace' in attributes:
         del attributes['stacktrace']
+    notes = attributes.pop('__notes__', None)
     for attr_k in list(attributes.keys()):
         attr_v = attributes[attr_k]
         if isinstance(attr_v, types.TracebackType):
@@ -108,6 +109,10 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     }
     if isinstance(e, SkyPilotExcludeArgsBaseException):
         data['args'] = tuple()
+    if notes is not None:
+        # Keep Python 3.11+ exception notes out of constructor kwargs so older
+        # clients can continue deserializing the payload.
+        data['notes'] = notes
     return data
 
 
@@ -123,7 +128,7 @@ def _restore_exception_attributes(e: BaseException,
     for attribute, value in attributes.items():
         try:
             setattr(e, attribute, value)
-        except (AttributeError, TypeError):
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
 
 
@@ -138,44 +143,68 @@ def deserialize_exception(serialized: Any) -> Exception:
     if isinstance(serialized, str):
         return RuntimeError(serialized)
     if not isinstance(serialized, dict) or 'type' not in serialized:
-        return RuntimeError(f'Server error: {serialized}')
+        return RuntimeError('Server error response is malformed.')
     exception_type = serialized['type']
+    if not isinstance(exception_type, str):
+        return RuntimeError('Server error response is malformed.')
+    args = serialized.get('args', ())
+    if not isinstance(args, (list, tuple)):
+        return RuntimeError('Server error response is malformed.')
+    raw_attributes = serialized.get('attributes', {})
+    if (not isinstance(raw_attributes, dict) or
+            not all(isinstance(key, str) for key in raw_attributes)):
+        return RuntimeError('Server error response is malformed.')
     if hasattr(builtins, exception_type):
         exception_class = getattr(builtins, exception_type)
     else:
         exception_class = globals().get(exception_type, None)
     if exception_class is None:
         # Unknown exception type.
-        return Exception(
-            f'{exception_type}: {serialized.get("message", serialized)}')
-    args = serialized.get('args', ())
-    attributes = dict(serialized.get('attributes') or {})
+        message = serialized.get('message')
+        detail = message if isinstance(message, str) else 'Unknown server error'
+        return Exception(f'{exception_type}: {detail}')
+    if (not isinstance(exception_class, type) or
+            not issubclass(exception_class, BaseException)):
+        return RuntimeError('Server error response is malformed.')
+    attributes = dict(raw_attributes)
+    legacy_notes = attributes.pop('__notes__', None)
     # Dunder entries are never constructor arguments, for a built-in or a
-    # SkyPilot exception alike. Python 3.14 attaches ``__notes__`` to some
-    # exceptions, so pull those out and restore them after construction.
+    # SkyPilot exception alike. Restore them independently after construction.
     dunder_attributes = {
         key: attributes.pop(key)
         for key in list(attributes)
-        if isinstance(key, str) and key.startswith('__')
+        if key.startswith('__')
     }
-    if hasattr(builtins, exception_type):
-        # Built-in exception constructors reject keyword arguments, so
-        # restore their serialized attributes after construction instead.
-        e = exception_class(*args)
-        _restore_exception_attributes(e, attributes)
-    else:
-        try:
+    try:
+        if hasattr(builtins, exception_type):
+            # Built-in exception constructors reject keyword arguments. Restore
+            # validated ordinary attributes after construction instead.
+            e = exception_class(*args)
+        else:
             e = exception_class(*args, **attributes)
-        except Exception:  # pylint: disable=broad-except
-            # An attribute the constructor does not accept must not replace
-            # the original error with an unrelated failure, which would
-            # contradict this function's tolerant contract.
-            return Exception(
-                f'{exception_type}: {serialized.get("message", serialized)}')
+    except Exception:  # pylint: disable=broad-exception-caught
+        # An attribute the constructor does not accept must not replace the
+        # original error with an unrelated failure.
+        message = serialized.get('message')
+        detail = message if isinstance(message, str) else 'Unknown server error'
+        return Exception(f'{exception_type}: {detail}')
+    if not isinstance(e, Exception):
+        return RuntimeError('Server error response is malformed.')
+    if hasattr(builtins, exception_type):
+        _restore_exception_attributes(e, attributes)
     _restore_exception_attributes(e, dunder_attributes)
+    notes = serialized.get('notes', legacy_notes)
+    if (isinstance(notes, list) and
+            all(isinstance(note, str) for note in notes)):
+        add_note = getattr(e, 'add_note', None)
+        if add_note is None:
+            _restore_exception_attributes(e, {'__notes__': list(notes)})
+        else:
+            for note in notes:
+                add_note(note)
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
-        setattr(e, 'stacktrace', stacktrace)
+        _restore_exception_attributes(e, {'stacktrace': stacktrace})
     return e
 
 

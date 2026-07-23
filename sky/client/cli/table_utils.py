@@ -6,6 +6,7 @@ from typing import Any
 import prettytable
 
 from sky import sky_logging
+from sky.container_images import api_models as container_image_api_models
 from sky.jobs import utils as managed_jobs
 from sky.schemas.api import responses
 from sky.skylet import constants
@@ -371,3 +372,46 @@ def format_volume_table(volumes: list[responses.VolumeRecord],
         return table_str
     else:
         return 'No existing volumes.'
+
+
+def format_container_image_table(
+        images: list[container_image_api_models.ArtifactView]) -> str:
+    """Formats immutable catalog artifacts without implicit child reads."""
+    table = log_utils.create_table(
+        ['ARTIFACT', 'DIGEST', 'PLATFORM', 'SIZE (BYTES)', 'UPDATED'])
+    for image in images:
+        table.add_row([
+            image.id,
+            image.runtime_digest,
+            image.platform,
+            image.declared_size_bytes,
+            log_utils.readable_time_duration(image.updated_at),
+        ])
+    return str(table) if images else 'No managed container images.'
+
+
+def format_container_image_mutation(
+        result: container_image_api_models.MutationResult) -> str:
+    """Formats the durable current state returned by one image mutation."""
+    table = log_utils.create_table(
+        ['OPERATION', 'KIND', 'STATE', 'RESULT', 'RESULT STATE', 'ERROR'])
+    result_id = '-'
+    result_state = '-'
+    if result.publication is not None:
+        result_id = result.publication.id
+        result_state = result.publication.state
+    elif result.location is not None:
+        result_id = result.location.id
+        result_state = result.location.state
+    elif result.profile is not None:
+        result_id = result.profile.id
+        result_state = result.profile.state
+    table.add_row([
+        result.operation.id,
+        result.operation.kind,
+        result.operation.state,
+        result_id,
+        result_state,
+        result.operation.error_code or '',
+    ])
+    return str(table)

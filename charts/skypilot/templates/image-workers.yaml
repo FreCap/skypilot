@@ -1,0 +1,587 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- if and (or .Values.imageCopyWorker.enabled .Values.imageLifecycleWorker.enabled .Values.imageCanaryWorker.enabled) (not $databaseConfigured) -}}
+{{- fail "Managed image workers require external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
+{{- end -}}
+{{- if and .Values.imageCopyWorker.enabled (not .Values.imageCopyWorker.serviceAccount.create) (not .Values.imageCopyWorker.serviceAccount.name) -}}
+{{- fail "imageCopyWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- if and .Values.imageLifecycleWorker.enabled (not .Values.imageLifecycleWorker.serviceAccount.create) (not .Values.imageLifecycleWorker.serviceAccount.name) -}}
+{{- fail "imageLifecycleWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
+{{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
+{{- end -}}
+{{- $sourceCredentialIdentities := dict -}}
+{{- range .Values.imageCopyWorker.sourceCredentialSecrets -}}
+{{- if or (not .namespace) (not .name) -}}
+{{- fail "Every imageCopyWorker.sourceCredentialSecrets entry requires namespace and name" -}}
+{{- end -}}
+{{- $identity := printf "%s/%s" .namespace .name -}}
+{{- if hasKey $sourceCredentialIdentities $identity -}}
+{{- fail (printf "imageCopyWorker.sourceCredentialSecrets contains duplicate identity %s" $identity) -}}
+{{- end -}}
+{{- $_ := set $sourceCredentialIdentities $identity true -}}
+{{- end -}}
+{{- $workerReservedEnvNames := list "IS_SKYPILOT_SERVER" "KUBECONFIG" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_GLOBAL_CONFIG" "SKYPILOT_IMAGE_HEALTH_PORT" "SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS" "SKYPILOT_IMAGE_MAX_IN_FLIGHT" "SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR" "SKYPILOT_IMAGE_RETENTION_SECONDS" "SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST" "SKYPILOT_IMAGE_WORKER_ID" "SKYPILOT_IMAGE_WORKER_VERSION" "SKYPILOT_RELEASE_NAME" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+
+{{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+  {{- with .Values.imageCopyWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+{{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
+{{- range $secret := .Values.imageCopyWorker.sourceCredentialSecrets }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "skypilot.imageSourceRbacName" (dict "root" $ "namespace" $secret.namespace "name" $secret.name) }}
+  namespace: {{ $secret.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: [{{ $secret.name | quote }}]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "skypilot.imageSourceRbacName" (dict "root" $ "namespace" $secret.namespace "name" $secret.name) }}
+  namespace: {{ $secret.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "skypilot.imageSourceRbacName" (dict "root" $ "namespace" $secret.namespace "name" $secret.name) }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "skypilot.imageCopyWorkerServiceAccountName" $ }}
+  namespace: {{ $.Release.Namespace }}
+---
+{{- end }}
+{{- end }}
+{{- if .Values.imageCopyWorker.enabled }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCopyWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config" "qualification-manifests") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config" "/var/skypilot/image-qualification")) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-copy-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-copy-worker
+spec:
+  replicas: {{ .Values.imageCopyWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-copy-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-copy-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageCopyWorker.healthPort | quote }}
+    spec:
+      serviceAccountName: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-copy-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageCopyWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCopyWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.copy_worker_service"]
+        env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageCopyWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageCopyWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageCopyWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageCopyWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageCopyWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        - name: SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST
+          value: {{ toJson .Values.imageCopyWorker.sourceCredentialSecrets | quote }}
+        {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+        - name: SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR
+          value: /var/skypilot/image-qualification
+        {{- end }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageCopyWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          {{- toYaml .Values.imageCopyWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+        - name: qualification-manifests
+          mountPath: /var/skypilot/image-qualification
+          readOnly: true
+        {{- end }}
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+      - name: qualification-manifests
+        configMap:
+          name: {{ .Values.imageCopyWorker.qualificationManifestConfigMapName }}
+      {{- end }}
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCopyWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- end }}
+
+{{- if and .Values.imageLifecycleWorker.enabled .Values.imageLifecycleWorker.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-lifecycle-worker
+  {{- with .Values.imageLifecycleWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+{{- if .Values.imageLifecycleWorker.enabled }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageLifecycleWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config")) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-lifecycle-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-lifecycle-worker
+spec:
+  replicas: {{ .Values.imageLifecycleWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-lifecycle-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-lifecycle-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageLifecycleWorker.healthPort | quote }}
+    spec:
+      serviceAccountName: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-lifecycle-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageLifecycleWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageLifecycleWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.lifecycle_worker_service"]
+        env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageLifecycleWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageLifecycleWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageLifecycleWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageLifecycleWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageLifecycleWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_IMAGE_RETENTION_SECONDS
+          value: {{ .Values.imageLifecycleWorker.retentionSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageLifecycleWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          {{- toYaml .Values.imageLifecycleWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.imageLifecycleWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageLifecycleWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageLifecycleWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+
+{{- if and .Values.imageCanaryWorker.enabled .Values.imageCanaryWorker.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-canary-worker
+  {{- with .Values.imageCanaryWorker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+{{- end }}
+{{- if .Values.imageCanaryWorker.enabled }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCanaryWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config" "kubeconfig") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config" "/var/skypilot/kubeconfig")) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-image-canary-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+    app.kubernetes.io/component: image-canary-worker
+spec:
+  replicas: {{ .Values.imageCanaryWorker.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+      app.kubernetes.io/component: image-canary-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $fullName }}
+        app.kubernetes.io/component: image-canary-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ .Values.imageCanaryWorker.healthPort | quote }}
+    spec:
+      serviceAccountName: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: image-canary-worker
+        image: {{ include "common.image" (dict "root" . "image" (default .Values.apiService.image .Values.imageCanaryWorker.image)) }}
+        imagePullPolicy: {{ default .Values.apiService.imagePullPolicy .Values.imageCanaryWorker.imagePullPolicy }}
+        command: ["tini", "--", "python", "-m", "sky.container_images.canary_worker_service"]
+        env:
+        {{- range concat (default (list) $.Values.global.extraEnvs) (default (list) .Values.databaseConnection.extraEnvs) (default (list) .Values.imageCanaryWorker.extraEnvs) }}
+        {{- if eq .name "SKYPILOT_STATE_DB_MIGRATION_MODE" }}
+        {{- fail "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs" }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.global.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.databaseConnection.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.imageCanaryWorker.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: IS_SKYPILOT_SERVER
+          value: "true"
+        - name: SKYPILOT_GLOBAL_CONFIG
+          value: /var/skypilot/config/config.yaml
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_VERSION
+          value: {{ .Chart.AppVersion | quote }}
+        - name: SKYPILOT_IMAGE_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_IMAGE_MAX_IN_FLIGHT
+          value: {{ .Values.imageCanaryWorker.maxInFlight | quote }}
+        - name: SKYPILOT_IMAGE_HEALTH_PORT
+          value: {{ .Values.imageCanaryWorker.healthPort | quote }}
+        - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
+          value: {{ .Values.imageCanaryWorker.livenessDeadlineSeconds | quote }}
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+        - name: KUBECONFIG
+          value: /var/skypilot/kubeconfig/config
+        {{- end }}
+        {{- if .Values.apiService.dbConnectionSecretName }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        {{- else }}
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $fullName }}-db-connection
+              key: connection_string
+        {{- end }}
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        ports:
+        - name: health
+          containerPort: {{ .Values.imageCanaryWorker.healthPort }}
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          {{- toYaml .Values.imageCanaryWorker.resources | nindent 10 }}
+        volumeMounts:
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+        - name: kubeconfig
+          mountPath: /var/skypilot/kubeconfig
+          readOnly: true
+        {{- end }}
+        {{- with .Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
+      - name: kubeconfig
+        secret:
+          secretName: {{ .Values.imageCanaryWorker.kubeconfigSecretName }}
+      {{- end }}
+      {{- with .Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imageCanaryWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

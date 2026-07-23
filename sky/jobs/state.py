@@ -48,6 +48,7 @@ _DB_RETRY_TIMES = 30
 
 # Bound parameters per token upsert while keeping all chunks in one transaction.
 _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
+_TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 # Keep the historical schema facade for migrations and external callers.
 Base = state_schema.Base
@@ -2183,6 +2184,33 @@ def get_job_status_with_task_id(job_id: int,
         return ManagedJobStatus(status[0]) if status else None
 
 
+def get_job_task_terminal_states(
+    identities: list[tuple[int, int]],) -> dict[tuple[int, int], bool]:
+    """Returns terminal state for a bounded set of durable job-task owners."""
+    if not identities:
+        return {}
+    if len(identities) > 1000:
+        raise ValueError('Managed-job terminal-state batch is too large.')
+    wanted = sorted(set(identities))
+    engine = _db_manager.get_engine()
+    rows = []
+    with orm.Session(engine) as session:
+        for start in range(0, len(wanted), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            batch = wanted[start:start + _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        spot_table.c.spot_job_id, spot_table.c.task_id,
+                        spot_table.c.status).where(
+                            sqlalchemy.tuple_(
+                                spot_table.c.spot_job_id,
+                                spot_table.c.task_id).in_(batch))).all())
+    return {
+        (int(row[0]), int(row[1])): ManagedJobStatus(row[2]).is_terminal()
+        for row in rows
+    }
+
+
 @db_retries.retry_async
 async def get_job_status_with_task_id_async(
         job_id: int, task_id: int) -> ManagedJobStatus | None:
@@ -2194,6 +2222,24 @@ async def get_job_status_with_task_id_async(
                                 spot_table.c.task_id == task_id)))
         status = result.fetchone()
         return ManagedJobStatus(status[0]) if status else None
+
+
+@db_retries.retry_async
+async def get_image_recovery_generation_async(job_id: int, task_id: int) -> int:
+    """Returns the durable launch generation for managed image ownership."""
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        row = (await session.execute(
+            sqlalchemy.select(spot_table.c.status,
+                              spot_table.c.recovery_count).where(
+                                  spot_table.c.spot_job_id == job_id,
+                                  spot_table.c.task_id == task_id))).first()
+    if row is None:
+        raise ValueError('Managed job task does not exist.')
+    generation = int(row.recovery_count or 0)
+    if ManagedJobStatus(row.status) == ManagedJobStatus.RECOVERING:
+        generation += 1
+    return generation
 
 
 async def set_recovering_async(

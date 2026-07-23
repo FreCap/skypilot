@@ -55,7 +55,6 @@ DEFAULT_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 DEBUG_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 TERMINAL_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 MIN_CLUSTER_EVENT_DAEMON_INTERVAL_SECONDS = 3600
-
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
     'UNIQUE constraint failed',
@@ -129,6 +128,17 @@ cluster_table = sqlalchemy.Table(
                       sqlalchemy.Text,
                       server_default=None),
     sqlalchemy.Column('is_managed', sqlalchemy.Integer, server_default='0'),
+    # Exact managed-image owner bound by the INIT transaction. A false known bit
+    # means pre-binding or indeterminate; true plus NULL fields means no owner.
+    sqlalchemy.Column('container_image_binding_known',
+                      sqlalchemy.Integer,
+                      server_default='0'),
+    sqlalchemy.Column('container_image_consumer_kind',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('container_image_consumer_owner',
+                      sqlalchemy.Text,
+                      server_default=None),
     # Best-effort cost attribution. These scalar fields are populated during
     # launch without adding a separate lifecycle write or lookup.
     sqlalchemy.Column('workload_type', sqlalchemy.Text, server_default=None),
@@ -186,6 +196,142 @@ volume_table = sqlalchemy.Table(
     sqlalchemy.Column('usedby_clusters', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('creation_yaml', sqlalchemy.Text, server_default=None),
 )
+
+
+def lock_container_image_cluster_lifecycle_in_session(
+        session: orm.Session, cluster_name: str) -> None:
+    """Serializes cluster-row presence with image-owner reconciliation."""
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return
+    lock_key = json.dumps(('container_image_cluster_lifecycle', cluster_name),
+                          separators=(',', ':'))
+    session.execute(
+        sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                        'hashtextextended(CAST(:lock_key AS text), 0))'),
+        {'lock_key': lock_key})
+
+
+# Container image catalog tables live exclusively in
+# sky.container_images.schema. Cluster state stores only a validated resolved
+# plan and its demand ID; it does not mirror image-plane tables.
+def _container_image_execution_state(resources: Any) -> tuple[Any, ...]:
+    """Returns every image field that may affect one runtime pull."""
+    if resources is None:
+        return (None, None, None, None, None, None)
+    cloud = getattr(resources, 'cloud', None)
+    return (
+        getattr(resources, 'container_image', None),
+        getattr(resources, 'resolved_container_image', None),
+        str(cloud).lower() if cloud is not None else None,
+        getattr(resources, 'region', None),
+        getattr(resources, 'instance_type', None),
+        getattr(resources, 'docker_login_config', None),
+    )
+
+
+def _validate_container_image_resolution(
+    session: orm.Session,
+    launched_resources: Any,
+    resolved_image: Any,
+    workspace: str,
+) -> tuple[str, str] | None:
+    """Rejects forged or stale managed pull plans before persistence."""
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as container_image_config
+    from sky.container_images import models as container_image_models
+    from sky.container_images import schema as container_image_schema
+
+    image_spec = launched_resources.container_image
+    if image_spec is None:
+        return None
+    if resolved_image is not None:
+        if (resolved_image.location_id is None or
+                resolved_image.demand_id is None or
+                resolved_image.demand_generation is None or
+                resolved_image.controller_epoch is None or
+                resolved_image.owner_epoch is None or
+                resolved_image.profile_revision_id is None or
+                resolved_image.target_fingerprint is None):
+            raise ValueError('Managed container image pull plan is incomplete.')
+        demand = container_image_schema.demands
+        location = container_image_schema.locations
+        profile = container_image_schema.profile_revisions
+        artifact = container_image_schema.images
+        watermark = container_image_schema.consumer_watermarks
+        row = session.execute(
+            sqlalchemy.select(
+                demand.c.id,
+                demand.c.consumer_kind,
+                demand.c.consumer_owner,
+            ).join(location, location.c.id == demand.c.location_id).join(
+                profile, profile.c.id == demand.c.profile_revision_id).
+            join(artifact, artifact.c.id == demand.c.image_id).where(
+                demand.c.id == resolved_image.demand_id,
+                demand.c.workspace == workspace, demand.c.consumer_generation
+                == resolved_image.demand_generation, demand.c.state ==
+                container_image_models.ImageDemandState.READY.value,
+                demand.c.image_id == resolved_image.image_id,
+                demand.c.runtime_digest == resolved_image.digest,
+                demand.c.profile_revision_id
+                == resolved_image.profile_revision_id,
+                demand.c.target_fingerprint
+                == resolved_image.target_fingerprint,
+                demand.c.owner_epoch == resolved_image.owner_epoch,
+                sqlalchemy.exists().where(
+                    watermark.c.workspace == demand.c.workspace,
+                    watermark.c.consumer_kind == demand.c.consumer_kind,
+                    watermark.c.consumer_owner == demand.c.consumer_owner,
+                    watermark.c.controller_epoch ==
+                    resolved_image.controller_epoch,
+                    watermark.c.owner_epoch == resolved_image.owner_epoch),
+                location.c.id == resolved_image.location_id,
+                location.c.target_ref == resolved_image.reference,
+                location.c.state ==
+                container_image_models.ImageLocationState.READY.value,
+                location.c.lease_token.is_(None),
+                profile.c.profile == resolved_image.distribution,
+                artifact.c.runtime_digest == resolved_image.digest)).first()
+        if row is None:
+            raise ValueError('Managed container image pull plan is stale.')
+        return str(row.consumer_kind), str(row.consumer_owner)
+    if launched_resources.container_image_from_legacy_image_id:
+        return None
+    profile, _ = container_image_config.resolve_profile(image_spec.distribution,
+                                                        workspace)
+    if profile is not None:
+        raise ValueError('A managed container selector requires a resolved '
+                         'runtime pull plan before cluster persistence.')
+    if image_spec.ref is None:
+        raise ValueError('A release or artifact container selector requires a '
+                         'managed resolved runtime pull plan.')
+    return None
+
+
+def _validate_container_image_inline_credentials(resources: Any) -> None:
+    """Fences cluster-handle persistence against restored unsafe resources."""
+    resource_validator = getattr(
+        resources, '_validate_container_image_docker_credentials', None)
+    if resource_validator is not None:
+        resource_validator()
+    image_spec = getattr(resources, 'container_image', None)
+    from_legacy = getattr(resources, 'container_image_from_legacy_image_id',
+                          False)
+    login_config = getattr(resources, 'docker_login_config', None)
+    if image_spec is None or from_legacy or login_config is None:
+        return
+    if isinstance(login_config, dict):
+        username = login_config.get('username')
+        password = login_config.get('password')
+    else:
+        username = getattr(login_config, 'username', None)
+        password = getattr(login_config, 'password', None)
+    if username or password:
+        raise ValueError(
+            'container_image does not support inline Docker username or '
+            'password credentials. Use a public source or a server-side '
+            'workload identity.')
+
 
 # Table for Cluster History
 # usage_intervals: List[Tuple[int, int]]
@@ -486,8 +632,10 @@ def create_table(engine: sqlalchemy.engine.Engine):
             # is not critical and is likely to be enabled by other processes.
 
     migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.GLOBAL_USER_STATE_DB_NAME,
-        migration_utils.GLOBAL_USER_STATE_VERSION)
+        engine,
+        migration_utils.GLOBAL_USER_STATE_DB_NAME,
+        migration_utils.GLOBAL_USER_STATE_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 @annotations.lru_cache(scope='global', maxsize=1)
@@ -842,6 +990,12 @@ def add_or_update_cluster(cluster_name: str,
     """
     engine = _db_manager.get_engine()
 
+    # Restored or internally constructed handles can bypass current Resources
+    # construction. Fence them before pickle allocates any durable bytes.
+    pre_pickle_resources = getattr(cluster_handle, 'launched_resources', None)
+    if pre_pickle_resources is not None:
+        _validate_container_image_inline_credentials(pre_pickle_resources)
+
     # FIXME: launched_at will be changed when `sky launch -c` is called.
     handle = pickle.dumps(cluster_handle)
     cluster_launched_at = int(time.time()) if is_launch else None
@@ -855,12 +1009,25 @@ def add_or_update_cluster(cluster_name: str,
     cloud = None
     region = None
     zone = None
+    resolved_image = None
+    launched_resources = None
     if hasattr(cluster_handle, 'launched_resources'):
-        lr = cluster_handle.launched_resources
-        if lr is not None:
-            cloud = str(lr.cloud) if getattr(lr, 'cloud', None) else None
-            region = str(lr.region) if getattr(lr, 'region', None) else None
-            zone = str(lr.zone) if getattr(lr, 'zone', None) else None
+        launched_resources = cluster_handle.launched_resources
+        if launched_resources is not None:
+            cloud = (str(launched_resources.cloud) if getattr(
+                launched_resources, 'cloud', None) else None)
+            region = (str(launched_resources.region) if getattr(
+                launched_resources, 'region', None) else None)
+            zone = (str(launched_resources.zone) if getattr(
+                launched_resources, 'zone', None) else None)
+            resolved_image = getattr(launched_resources,
+                                     'resolved_container_image', None)
+
+    if (resolved_image is not None and
+            engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError(
+            'Managed container image state requires the central PostgreSQL '
+            'database.')
 
     # Extract node_names from cached_cluster_info and merge with lineage.
     # Also opportunistically compute cloud-provider instance console URLs for
@@ -920,6 +1087,9 @@ def add_or_update_cluster(cluster_name: str,
     active_workspace = skypilot_config.get_active_workspace()
     history_workspace = active_workspace
     history_hash = user_hash
+    container_image_binding_known = True
+    container_image_consumer_kind: str | None = None
+    container_image_consumer_owner: str | None = None
 
     conditional_values: dict[str, Any] = {}
     if is_launch:
@@ -939,10 +1109,30 @@ def add_or_update_cluster(cluster_name: str,
         })
 
     with orm.Session(engine) as session:
+        lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
         # with_for_update() locks the row until commit() or rollback()
         # is called, or until the code escapes the with block.
         cluster_row = session.query(cluster_table).filter_by(
             name=cluster_name).with_for_update().first()
+        if cluster_row is not None and launched_resources is None:
+            # A partial handle cannot prove that an existing binding vanished.
+            container_image_binding_known = bool(
+                cluster_row.container_image_binding_known)
+            container_image_consumer_kind = (
+                cluster_row.container_image_consumer_kind)
+            container_image_consumer_owner = (
+                cluster_row.container_image_consumer_owner)
+        cluster_workspace = (cluster_row.workspace
+                             if cluster_row is not None and
+                             cluster_row.workspace else active_workspace or
+                             constants.SKYPILOT_DEFAULT_WORKSPACE)
+        if (launched_resources is not None and getattr(
+                launched_resources, 'container_image', None) is not None):
+            container_image_consumer = _validate_container_image_resolution(
+                session, launched_resources, resolved_image, cluster_workspace)
+            if container_image_consumer is not None:
+                (container_image_consumer_kind,
+                 container_image_consumer_owner) = container_image_consumer
 
         # Merge current node names into existing lineage
         existing_node_names = (cluster_row.node_names if cluster_row else None)
@@ -1005,16 +1195,21 @@ def add_or_update_cluster(cluster_name: str,
 
         if existing_cluster_hash is not None:
             count = session.query(cluster_table).filter_by(
-                name=cluster_name, cluster_hash=existing_cluster_hash).update({
-                    **conditional_values,
-                    cluster_table.c.handle: handle,
-                    cluster_table.c.status: status.value,
-                    cluster_table.c.status_updated_at: status_updated_at,
-                    cluster_table.c.cloud: cloud,
-                    cluster_table.c.region: region,
-                    cluster_table.c.zone: zone,
-                    cluster_table.c.node_names: node_names,
-                })
+                name=cluster_name, cluster_hash=existing_cluster_hash
+            ).update({
+                **conditional_values,
+                cluster_table.c.handle: handle,
+                cluster_table.c.status: status.value,
+                cluster_table.c.status_updated_at: status_updated_at,
+                cluster_table.c.cloud: cloud,
+                cluster_table.c.region: region,
+                cluster_table.c.zone: zone,
+                cluster_table.c.node_names: node_names,
+                cluster_table.c.container_image_binding_known:
+                    int(container_image_binding_known),
+                cluster_table.c.container_image_consumer_kind: container_image_consumer_kind,
+                cluster_table.c.container_image_consumer_owner: container_image_consumer_owner,
+            })
             assert count <= 1
             if count == 0:
                 raise ValueError(f'Cluster {cluster_name} with hash '
@@ -1035,6 +1230,10 @@ def add_or_update_cluster(cluster_name: str,
                 region=region,
                 zone=zone,
                 node_names=node_names,
+                container_image_binding_known=int(
+                    container_image_binding_known),
+                container_image_consumer_kind=container_image_consumer_kind,
+                container_image_consumer_owner=container_image_consumer_owner,
             )
             insert_or_update_stmt = insert_stmnt.on_conflict_do_update(
                 index_elements=[cluster_table.c.name],
@@ -1052,6 +1251,10 @@ def add_or_update_cluster(cluster_name: str,
                     cluster_table.c.region: region,
                     cluster_table.c.zone: zone,
                     cluster_table.c.node_names: node_names,
+                    cluster_table.c.container_image_binding_known:
+                        int(container_image_binding_known),
+                    cluster_table.c.container_image_consumer_kind: container_image_consumer_kind,
+                    cluster_table.c.container_image_consumer_owner: container_image_consumer_owner,
                 })
             session.execute(insert_or_update_stmt)
 
@@ -1144,6 +1347,19 @@ def add_or_update_cluster(cluster_name: str,
         session.execute(do_update_stmt)
 
         session.commit()
+
+    if (resolved_image is not None and resolved_image.demand_id is not None):
+        # The READY demand already fences eviction before this cluster commit.
+        # Attachment is a post-commit lifecycle hint, so a process crash cannot
+        # produce a cluster handle without an eviction fence.
+        # Import locally because demand_state -> catalog_state imports this
+        # module for the central engine during module initialization.
+        # pylint: disable=import-outside-toplevel
+        from sky.container_images import demand_state as image_demand_state
+
+        # pylint: enable=import-outside-toplevel
+        image_demand_state.attach_consumer(resolved_image.demand_id,
+                                           cluster_workspace)
     return cluster_hash
 
 
@@ -1639,19 +1855,34 @@ def update_cluster_handle(cluster_name: str,
         query = session.query(cluster_table).filter_by(name=cluster_name)
         if existing_cluster_hash is not None:
             query = query.filter_by(cluster_hash=existing_cluster_hash)
-        if current_names is not None:
-            node_names_query = session.query(
-                cluster_table.c.node_names).filter_by(name=cluster_name)
-            if existing_cluster_hash is not None:
-                node_names_query = node_names_query.filter_by(
-                    cluster_hash=existing_cluster_hash)
-            row = node_names_query.with_for_update().first()
-            existing_json = row.node_names if row else None
-            node_names = common_utils.merge_node_names_lineage(
-                existing_json, current_names)
-            update_dict[cluster_table.c.node_names] = node_names
+        cluster_row = query.with_for_update().first()
+        if cluster_row is None:
+            count = 0
+        else:
+            try:
+                stored_handle = pickle.loads(cluster_row.handle)
+            except Exception as e:  # pylint: disable=broad-except
+                raise ValueError(
+                    'Cannot safely apply a metadata-only cluster handle '
+                    'update because the stored handle is unreadable.') from e
+            stored_resources = getattr(stored_handle, 'launched_resources',
+                                       None)
+            updated_resources = getattr(cluster_handle, 'launched_resources',
+                                        None)
+            if (_container_image_execution_state(stored_resources)
+                    != _container_image_execution_state(updated_resources)):
+                raise ValueError(
+                    'update_cluster_handle() is metadata-only and cannot '
+                    'change container image execution state. Use '
+                    'add_or_update_cluster() so the durable image reference '
+                    'is updated atomically.')
 
-        count = query.update(update_dict)
+            if current_names is not None:
+                node_names = common_utils.merge_node_names_lineage(
+                    cluster_row.node_names, current_names)
+                update_dict[cluster_table.c.node_names] = node_names
+
+            count = query.update(update_dict)
         session.commit()
     assert count <= 1, count
     if count == 0 and existing_cluster_hash is not None:
@@ -1681,19 +1912,52 @@ def remove_cluster(cluster_name: str,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
         query = session.query(
             cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
-            cluster_table.c.handle).filter_by(name=cluster_name)
+            cluster_table.c.handle, cluster_table.c.workspace,
+            cluster_table.c.container_image_binding_known,
+            cluster_table.c.container_image_consumer_kind,
+            cluster_table.c.container_image_consumer_owner).filter_by(
+                name=cluster_name)
         if existing_cluster_hash is not None:
             query = query.filter_by(cluster_hash=existing_cluster_hash)
-        row = query.first()
+        row = query.with_for_update().first()
         if row is None and existing_cluster_hash is not None:
             return
         cluster_hash = row.cluster_hash if row is not None else None
         provision_log_path = (row.provision_log_path
                               if row is not None else None)
+        terminal_demand_id = None
+        terminal_workspace = None
+        terminal_binding_known = False
+        terminal_consumer_kind = None
+        terminal_consumer_owner = None
+        if terminate and row is not None:
+            terminal_workspace = (row.workspace or
+                                  constants.SKYPILOT_DEFAULT_WORKSPACE)
+            terminal_binding_known = bool(row.container_image_binding_known)
+            terminal_consumer_kind = row.container_image_consumer_kind
+            terminal_consumer_owner = row.container_image_consumer_owner
+        binding_valid = ((terminal_consumer_kind
+                          is None) == (terminal_consumer_owner is None))
+        if (terminate and row is not None and row.handle and
+            (not terminal_binding_known or not binding_valid)):
+            try:
+                prior_handle = pickle.loads(row.handle)
+                prior_resources = getattr(prior_handle, 'launched_resources',
+                                          None)
+                prior_resolution = getattr(prior_resources,
+                                           'resolved_container_image', None)
+                terminal_demand_id = getattr(prior_resolution, 'demand_id',
+                                             None)
+            except Exception:  # pylint: disable=broad-except
+                # A corrupt pre-binding handle cannot prove which owner to
+                # retire. Deleting the cluster row is safe; the independent
+                # two-observation reconciler will later release its fence.
+                terminal_demand_id = None
         usage_intervals = _get_cluster_usage_intervals(cluster_hash)
 
         # usage_intervals is not None and not empty
@@ -1720,6 +1984,31 @@ def remove_cluster(cluster_name: str,
             mutation_query = mutation_query.filter_by(
                 cluster_hash=existing_cluster_hash)
         if terminate:
+            if (terminal_workspace is not None and
+                ((terminal_binding_known and terminal_consumer_kind == 'cluster'
+                  and terminal_consumer_owner is not None) or
+                 terminal_demand_id is not None)):
+                # Import locally to avoid global_user_state -> demand_state ->
+                # catalog_state -> global_user_state initialization recursion.
+                # pylint: disable=import-outside-toplevel
+                from sky.container_images import demand_state
+
+                # pylint: enable=import-outside-toplevel
+                if (terminal_binding_known and
+                        terminal_consumer_kind == 'cluster' and
+                        terminal_consumer_owner is not None):
+                    demand_state.release_owner_authoritatively_in_session(
+                        session, terminal_workspace, terminal_consumer_kind,
+                        terminal_consumer_owner)
+                else:
+                    assert terminal_demand_id is not None
+                    # Compatibility for pre-binding cluster rows. The kind
+                    # guard leaves shared job and Serve owners untouched.
+                    demand_state.release_demand_authoritatively_in_session(
+                        session,
+                        terminal_demand_id,
+                        terminal_workspace,
+                        expected_consumer_kind='cluster')
             count = mutation_query.delete()
         else:
             if row is None or row.handle is None:
@@ -2441,6 +2730,64 @@ def get_cluster_status_fields(
             for row in rows:
                 result[row.name] = (row.status, row.status_updated_at)
     return result
+
+
+@metrics_lib.time_me
+def get_cluster_image_consumers(
+    cluster_names: list[str],
+) -> dict[str, tuple[str | None, str | None] | None]:
+    """Returns exact managed-image bindings without decoding cluster handles.
+
+    Mapping membership is the authoritative cluster-row existence check. A
+    ``None`` value denotes a pre-binding or indeterminate row; a pair of
+    ``None`` fields denotes a current writer's validated absence of a consumer.
+    """
+    result: dict[str, tuple[str | None, str | None] | None] = {}
+    if not cluster_names:
+        return result
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = session.query(cluster_table.c.name,
+                              cluster_table.c.container_image_binding_known,
+                              cluster_table.c.container_image_consumer_kind,
+                              cluster_table.c.container_image_consumer_owner)
+        for offset in range(0, len(cluster_names),
+                            _CLUSTER_IN_QUERY_CHUNK_SIZE):
+            batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
+            rows = query.filter(cluster_table.c.name.in_(batch)).all()
+            for row in rows:
+                result[str(row.name)] = _cluster_image_consumer_binding(row)
+    return result
+
+
+def _cluster_image_consumer_binding(
+        row: Any) -> tuple[str | None, str | None] | None:
+    kind = row.container_image_consumer_kind
+    owner = row.container_image_consumer_owner
+    binding_valid = (kind is None) == (owner is None)
+    if not row.container_image_binding_known or not binding_valid:
+        return None
+    return kind, owner
+
+
+def get_cluster_image_consumer_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    *,
+    for_update: bool = False,
+) -> tuple[bool, tuple[str | None, str | None] | None]:
+    """Returns row existence and its binding inside a caller transaction."""
+    query = session.query(
+        cluster_table.c.container_image_binding_known,
+        cluster_table.c.container_image_consumer_kind,
+        cluster_table.c.container_image_consumer_owner).filter(
+            cluster_table.c.name == cluster_name)
+    if for_update:
+        query = query.with_for_update()
+    row = query.first()
+    if row is None:
+        return False, None
+    return True, _cluster_image_consumer_binding(row)
 
 
 @metrics_lib.time_me

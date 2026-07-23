@@ -44,26 +44,56 @@ _DOCKER_SOCKET_WAIT_TIMEOUT_SECONDS = 30
 INSTALL_AWS_CLI_CMD = (
     'which aws || ((command -v unzip >/dev/null 2>&1 || '
     '(sudo apt-get update && sudo apt-get install -y unzip)) && '
-    'curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" '
+    'AWS_CLI_MACHINE="$(uname -m)" && '
+    'case "$AWS_CLI_MACHINE" in '
+    'x86_64|amd64) AWS_CLI_ARCH=x86_64 ;; '
+    'aarch64|arm64) AWS_CLI_ARCH=aarch64 ;; '
+    '*) echo "Unsupported AWS CLI architecture" >&2; exit 1 ;; esac && '
+    'curl -fsSL "https://awscli.amazonaws.com/'
+    'awscli-exe-linux-${AWS_CLI_ARCH}.zip" '
     '-o "/tmp/awscliv2.zip" && '
     'unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install '
     '&& rm -rf /tmp/awscliv2.zip /tmp/aws)')
 
 # Pattern to extract SSH user from command output, handling MOTD contamination
 _DOCKER_USER_PATTERN = re.compile(r'SKYPILOT_DOCKER_USER: ([^\s\n]+)')
+_ECR_SERVER_PATTERN = re.compile(
+    r'^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$')
 
 
 def _extract_region_from_ecr_server(server: str) -> str:
     """Extract AWS region from ECR server URL.
 
-    ECR server format: <account-id>.dkr.ecr.<region>.amazonaws.com
+    ECR server format: <account-id>.dkr.ecr.<region>.amazonaws.com[.cn]
     Returns the region part from the URL.
     """
-    # Split: ['<account-id>', 'dkr', 'ecr', '<region>', 'amazonaws', 'com']
-    parts = server.split('.')
-    if len(parts) >= 6 and parts[1] == 'dkr' and parts[2] == 'ecr':
-        return parts[3]
+    match = _ECR_SERVER_PATTERN.fullmatch(server)
+    if match is not None:
+        return match.group(1)
     raise ValueError(f'Invalid ECR server format: {server}')
+
+
+def _credential_helper_config_cmd(server: str) -> str:
+    """Atomically merges one value-free helper route into root's config."""
+    if _ECR_SERVER_PATTERN.fullmatch(server) is None:
+        raise ValueError(
+            'Managed Docker credential helper registry is invalid.')
+    script = ('import json, os, tempfile; '
+              'p="/root/.docker/config.json"; '
+              'c=json.load(open(p)) if os.path.exists(p) else {}; '
+              'assert isinstance(c, dict); '
+              'h=c.setdefault("credHelpers", {}); '
+              'assert isinstance(h, dict); '
+              f'h[{server!r}]="ecr-login"; '
+              'f=tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(p), '
+              'delete=False); '
+              'json.dump(c, f, sort_keys=True, separators=(",", ":")); '
+              'f.write("\\n"); f.flush(); os.fsync(f.fileno()); f.close(); '
+              'os.chmod(f.name, 0o600); os.replace(f.name, p)')
+    return ('command -v docker-credential-ecr-login >/dev/null && '
+            'command -v python3 >/dev/null && '
+            'sudo install -d -m 0700 /root/.docker && '
+            f'sudo python3 -c {shlex.quote(script)}')
 
 
 @dataclasses.dataclass
@@ -72,6 +102,7 @@ class DockerLoginConfig:
     username: str
     password: str
     server: str
+    credential_helper: str | None = None
 
     def format_image(self, image: str) -> str:
         """Format the image name with the server prefix."""
@@ -302,7 +333,19 @@ class DockerInitializer:
             docker_login_config = DockerLoginConfig(
                 **self.docker_config['docker_login_config'])
 
-            if docker_login_config.password:
+            if docker_login_config.credential_helper is not None:
+                if (docker_login_config.credential_helper != 'ecr-login' or
+                        _ECR_SERVER_PATTERN.fullmatch(
+                            docker_login_config.server) is None):
+                    raise ValueError('Managed Docker credential helper is not '
+                                     'supported for this registry.')
+                # The qualified host image already contains this helper. Only
+                # write its value-free Docker routing entry here. Never install
+                # AWS CLI or persist an ECR bearer token on the workload node.
+                self._run(_credential_helper_config_cmd(
+                    docker_login_config.server),
+                          wait_for_docker_daemon=True)
+            elif docker_login_config.password:
                 # Password is allowed to be empty, in that case, we will not run
                 # the login command, and assume that the image pulling is
                 # authenticated by the IAM permission on the VM.
@@ -312,10 +355,9 @@ class DockerInitializer:
                     f'--password {shlex.quote(docker_login_config.password)} '
                     f'{shlex.quote(docker_login_config.server)}',
                     wait_for_docker_daemon=True)
-            elif (docker_login_config.server.endswith('.amazonaws.com') and
-                  '.dkr.ecr.' in docker_login_config.server):
+            elif _ECR_SERVER_PATTERN.fullmatch(docker_login_config.server):
                 # AWS ECR: Use aws ecr get-login-password for authentication
-                # ECR format: <account-id>.dkr.ecr.<region>.amazonaws.com
+                # ECR format: <account-id>.dkr.ecr.<region>.amazonaws.com[.cn]
                 # This command uses the IAM credentials from the EC2 instance
                 # Ref: https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html # pylint: disable=line-too-long
                 region = _extract_region_from_ecr_server(

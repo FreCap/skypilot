@@ -49,6 +49,10 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
+from sky.container_images import consumers as container_image_consumers
+from sky.container_images import errors as container_image_errors
+from sky.container_images import placement as container_image_placement
+from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import storage as storage_lib
 from sky.provision import capacity_cache
@@ -144,6 +148,54 @@ SKY_REMOTE_APP_DIR = backend_utils.SKY_REMOTE_APP_DIR
 SKY_REMOTE_WORKDIR = constants.SKY_REMOTE_WORKDIR
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _resolve_container_image_for_placement(
+    resources: resources_lib.Resources,
+    *,
+    consumer_kind: str,
+    consumer_owner: str,
+    controller_epoch: str,
+    controller_sequence: int | None,
+    allow_epoch_advance: bool,
+    consumer_metadata: dict[str, Any],
+    ensure: bool = True,
+) -> resources_lib.Resources:
+    """Pins a managed image after optimization and before provisioning."""
+    if resources.container_image is None:
+        return resources
+    workspace = (skypilot_config.get_active_workspace() or
+                 constants.SKYPILOT_DEFAULT_WORKSPACE)
+    try:
+        placement = container_image_placement.classify(resources, workspace)
+        return container_image_runtime.resolve_for_placement(
+            resources,
+            placement,
+            workspace=workspace,
+            consumer_kind=consumer_kind,
+            consumer_owner=consumer_owner,
+            controller_epoch=controller_epoch,
+            controller_sequence=controller_sequence,
+            allow_epoch_advance=allow_epoch_advance,
+            consumer_metadata=consumer_metadata,
+            ensure=ensure)
+    except container_image_runtime.ContainerImageWarmingError as e:
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
+                                                   no_failover=True) from e
+    except container_image_runtime.ContainerImagePreparationFailedError as e:
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
+                                                   no_failover=False) from e
+    except Exception as e:  # pylint: disable=broad-except
+        # Catalog, profile, and policy errors are not capacity failures. A
+        # different placement cannot repair them, so fail without cycling the
+        # fleet through every candidate. Convert at this boundary so provider,
+        # registry, and credential values never enter request state or logs.
+        safe_error = container_image_errors.from_exception(e)
+        raise exceptions.ResourcesUnavailableError(str(safe_error),
+                                                   no_failover=True) from e
+
 
 # Timeout (seconds) for provision progress: if in this duration no new nodes
 # are launched, abort and failover.
@@ -1043,6 +1095,10 @@ def _get_workload_attribution(
         service_name = (launch_context or {}).get(
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
         if isinstance(service_name, str) and service_name:
+            service_version = (launch_context or {}).get(
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+            if type(service_version) is int and service_version > 0:
+                workload_task_id = service_version
             return service_name, workload_task_id
         replica_id = task_envs.get(serve_constants.REPLICA_ID_ENV_VAR)
         replica_suffix = f'-{replica_id}' if replica_id is not None else None
@@ -1061,6 +1117,15 @@ def _get_workload_attribution(
     if task_id_match is not None:
         workload_task_id = int(task_id_match.group(1))
     return workload_id, workload_task_id
+
+
+def _get_image_demand_attribution(
+    task: task_lib.Task, cluster_name: str, workload_type: str,
+    launch_context: dict[str, Any] | None
+) -> container_image_consumers.ImageConsumerContext:
+    """Collapses physical launches onto one logical image target owner."""
+    return container_image_consumers.derive(task, cluster_name, workload_type,
+                                            launch_context)
 
 
 def _placement_error_code(error: BaseException) -> str | None:
@@ -1500,6 +1565,31 @@ class RetryingVmProvisioner:
                 f'To request quotas, check the instruction: '
                 f'https://docs.skypilot.co/en/latest/cloud-setup/quota.html.')
 
+        # Quota has passed and the region is now a real launch attempt. This
+        # is the first point where ensure-on-use may create materialization
+        # intents. Dry runs remain read-only.
+        launch_context = self._extra_launch_context
+        if self._workload_type == 'cluster' and prev_handle is not None:
+            previous_resources = prev_handle.launched_resources
+            previous_resolution = previous_resources.resolved_container_image
+            launch_context = (
+                container_image_consumers.reuse_persisted_cluster_epoch(
+                    launch_context, previous_resolution))
+        image_demand = _get_image_demand_attribution(task, cluster_name,
+                                                     self._workload_type,
+                                                     launch_context)
+        to_provision = typing.cast(
+            resources_lib.LaunchableResources,
+            _resolve_container_image_for_placement(
+                to_provision,
+                consumer_kind=image_demand.consumer_kind,
+                consumer_owner=image_demand.consumer_owner,
+                controller_epoch=image_demand.controller_epoch,
+                controller_sequence=image_demand.controller_sequence,
+                allow_epoch_advance=image_demand.allow_epoch_advance,
+                consumer_metadata=image_demand.metadata,
+                ensure=not dryrun))
+
         insufficient_resources = None
         last_error_reason: str | None = None
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
@@ -1672,19 +1762,24 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
-                self._active_cluster_hash = (
-                    global_user_state.add_or_update_cluster(
-                        cluster_name,
-                        cluster_handle=handle,
-                        requested_resources=requested_resources,
-                        ready=False,
-                        is_managed=self._is_managed,
-                        provision_log_path=log_abs_path,
-                        workload_type=self._workload_type,
-                        workload_id=workload_id,
-                        workload_task_id=workload_task_id,
-                        existing_cluster_hash=self._active_cluster_hash,
-                    ))
+                try:
+                    self._active_cluster_hash = (
+                        global_user_state.add_or_update_cluster(
+                            cluster_name,
+                            cluster_handle=handle,
+                            requested_resources=requested_resources,
+                            ready=False,
+                            is_managed=self._is_managed,
+                            provision_log_path=log_abs_path,
+                            workload_type=self._workload_type,
+                            workload_id=workload_id,
+                            workload_task_id=workload_task_id,
+                            existing_cluster_hash=self._active_cluster_hash,
+                        ))
+                except ValueError as e:
+                    raise exceptions.ResourcesUnavailableError(
+                        'The selected image route changed before the launch '
+                        f'was committed: {e}') from e
                 config_dict['cluster_hash'] = self._active_cluster_hash
 
                 # Add cluster event for actual provisioning start.
@@ -3348,7 +3443,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         if resources_dict is not None:
             launched_resources = (
                 resources_lib.Resources._from_yaml_config_single(  # pylint: disable=protected-access
-                    resources_dict.copy()))
+                    resources_dict.copy(),
+                    _allow_resolved_container_image=True))
         else:
             launched_resources = None
 
@@ -4481,6 +4577,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             user_specified_task_config = task.to_yaml_config(
                 use_user_specified_yaml=True)
 
+        # The INIT transaction pinned the pull plan before it was rendered
+        # into the runtime. The READY transaction preserves that exact plan;
+        # a newer distribution revision applies on a later launch or restart.
         with timeline.Event('backend.provision.post_process'):
             global_user_state.add_or_update_cluster(
                 handle.cluster_name,

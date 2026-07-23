@@ -1,14 +1,66 @@
 """Unit tests for sky.jobs.recovery_strategy helpers."""
 # pylint: disable=protected-access
+import contextlib
 from unittest import mock
 
 import pytest
 
+from sky.container_images import consumers as container_image_consumers
 from sky.jobs import recovery_strategy
 from sky.jobs import runtime as managed_job_runtime
 from sky.jobs import utils as managed_job_utils
 from sky.skylet import job_lib
 from sky.utils import status_lib
+
+
+@pytest.mark.asyncio
+async def test_launch_persists_recovery_generation_in_inner_context(
+        monkeypatch):
+    executor = recovery_strategy.StrategyExecutor.__new__(
+        recovery_strategy.StrategyExecutor)
+    executor.job_id = 42
+    executor.task_id = 0
+    executor.pool = None
+    executor.cluster_name = 'job-cluster'
+    executor.file_mounts_blob_id = None
+    executor.dag = mock.sentinel.dag
+    executor.starting = set()
+    executor.starting_lock = mock.sentinel.lock
+    executor.starting_signal = mock.sentinel.signal
+    executor.extra_launch_context = mock.Mock(
+        return_value={'strategy_epoch': 'stable'})
+    launch = mock.Mock(return_value='launch-request')
+    executor._launch_in_workspace = launch
+    executor._wait_until_job_starts_on_cluster = mock.AsyncMock(
+        return_value=123.0)
+
+    @contextlib.asynccontextmanager
+    async def scheduled_launch(*args, **kwargs):
+        del args, kwargs
+        yield
+
+    monkeypatch.setattr(recovery_strategy.scheduler, 'scheduled_launch',
+                        scheduled_launch)
+    monkeypatch.setattr(recovery_strategy.state,
+                        'get_image_recovery_generation_async',
+                        mock.AsyncMock(return_value=3))
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_start', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.sdk, 'stream_and_get', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.global_user_state,
+                        'get_handle_from_cluster_name',
+                        mock.Mock(return_value=None))
+    monkeypatch.setattr(recovery_strategy.usage_lib.messages.usage,
+                        'set_internal', mock.Mock())
+    monkeypatch.setattr(recovery_strategy.logger, 'debug', mock.Mock())
+    monkeypatch.setattr(recovery_strategy, 'ENV_VARS_TO_CLEAR', ())
+
+    assert await executor._launch(max_retry=1) == 123.0
+    launch.assert_called_once()
+    context = launch.call_args.kwargs['_extra_launch_context']
+    assert context == {
+        'strategy_epoch': 'stable',
+        container_image_consumers.MANAGED_JOB_RECOVERY_GENERATION_KEY: 3,
+    }
 
 
 def test_is_oom_failure_detects_oomkilled():

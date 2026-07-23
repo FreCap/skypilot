@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import threading
+from typing import cast, Literal
 
 from alembic import command as alembic_command
 from alembic.config import Config
@@ -28,16 +29,27 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 # the same process.
 _alembic_thread_lock = threading.Lock()
 
+MigrationMode = Literal['auto', 'upgrade', 'bootstrap', 'verify']
+
+
+def configured_migration_mode() -> MigrationMode:
+    """Returns the process-wide central database migration ownership mode."""
+    return cast(
+        MigrationMode,
+        os.environ.get(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'auto'))
+
+
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '023'  # shared auth sessions
+GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions
+GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
-SPOT_JOBS_VERSION = '024'  # index shared managed-job API tokens
+SPOT_JOBS_VERSION = '025'  # exact managed-job task identity lookups
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '024'  # durable SkyServe version quarantine
+SERVE_VERSION = '026'  # managed-image workspace and replica lookup
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
@@ -98,6 +110,21 @@ def get_alembic_config(engine: sqlalchemy.engine.Engine,
     return alembic_cfg
 
 
+def get_current_alembic_revision(
+    engine: sqlalchemy.engine.Engine,
+    section: str,
+    alembic_ini_path: str | None = None,
+) -> str | None:
+    """Returns the current revision without creating or mutating schema."""
+    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
+    version_table = alembic_config.get_section_option(
+        alembic_config.config_ini_section, 'version_table', 'alembic_version')
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(
+            connection, opts={'version_table': version_table})
+        return context.get_current_revision()
+
+
 def needs_upgrade(engine: sqlalchemy.engine.Engine,
                   section: str,
                   target_revision: str,
@@ -111,17 +138,8 @@ def needs_upgrade(engine: sqlalchemy.engine.Engine,
         target_revision: Target revision to upgrade to (e.g., '001').
         alembic_ini_path: Optional path to a custom alembic.ini file.
     """
-    current_rev = None
-
-    # get alembic config for the given section
-    alembic_config = get_alembic_config(engine, section, alembic_ini_path)
-    version_table = alembic_config.get_section_option(
-        alembic_config.config_ini_section, 'version_table', 'alembic_version')
-
-    with engine.connect() as connection:
-        context = migration.MigrationContext.configure(
-            connection, opts={'version_table': version_table})
-        current_rev = context.get_current_revision()
+    current_rev = get_current_alembic_revision(engine, section,
+                                               alembic_ini_path)
 
     target_rev_num = int(target_revision)
     if current_rev is None:
@@ -141,12 +159,138 @@ def needs_upgrade(engine: sqlalchemy.engine.Engine,
     return current_rev_num < target_rev_num
 
 
+def verify_alembic_revision(engine: sqlalchemy.engine.Engine,
+                            section: str,
+                            target_revision: str,
+                            alembic_ini_path: str | None = None) -> None:
+    """Refuses startup until another process has applied the target revision."""
+    current_revision = get_current_alembic_revision(engine, section,
+                                                    alembic_ini_path)
+    if current_revision is None or int(current_revision) < int(target_revision):
+        observed = current_revision or 'uninitialized'
+        raise RuntimeError(
+            f'{section} database is at revision {observed}, but this process '
+            f'requires revision {target_revision}. Run the database migration '
+            'job before starting API replicas.')
+
+
+@contextlib.contextmanager
+def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
+    """Serializes Alembic across hosts sharing one PostgreSQL database."""
+    if engine.dialect.name != 'postgresql':
+        yield
+        return
+    lock_name = f'skypilot:alembic:{section}'
+    with engine.connect() as connection:
+        connection.execute(
+            sqlalchemy.text('SELECT pg_advisory_lock(hashtext(:name))'),
+            {'name': lock_name})
+        try:
+            yield
+        finally:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_advisory_unlock(hashtext(:name))'),
+                {'name': lock_name})
+
+
+def _validate_global_user_state_upgrade_start(
+    engine: sqlalchemy.engine.Engine,
+    section: str,
+    target_revision: str,
+    alembic_ini_path: str | None,
+    mode: MigrationMode,
+) -> None:
+    """Prevents revision 024 racing migration code that predates its lock."""
+    if (engine.dialect.name != 'postgresql' or
+            section != GLOBAL_USER_STATE_DB_NAME or
+            int(target_revision) < int(GLOBAL_USER_STATE_VERSION)):
+        return
+    current_revision = get_current_alembic_revision(engine, section,
+                                                    alembic_ini_path)
+    if (current_revision is not None and int(current_revision)
+            >= int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
+        return
+    if (mode == 'bootstrap' and current_revision is None and
+            _postgres_effective_schema_is_empty(engine)):
+        return
+    observed = current_revision or 'uninitialized nonempty schema'
+    if current_revision is None and mode != 'bootstrap':
+        observed = 'uninitialized schema'
+    raise RuntimeError(
+        f'{section} database is at revision {observed}. Revision '
+        f'{target_revision} requires a staged upgrade through revision '
+        f'{GLOBAL_USER_STATE_JOB_MINIMUM_REVISION} before the migration job can '
+        'run. Drain older API binaries, complete that predecessor migration, '
+        'then retry the job. For a new isolated empty schema, explicitly use '
+        'bootstrap mode.')
+
+
+def _postgres_effective_schema_is_empty(
+        engine: sqlalchemy.engine.Engine) -> bool:
+    """Proves the connection's target schema owns no user objects."""
+    query = sqlalchemy.text("""
+        WITH target AS (
+            SELECT oid
+            FROM pg_catalog.pg_namespace
+            WHERE nspname = current_schema()
+        ), owned_object AS (
+            SELECT 1 FROM pg_catalog.pg_class, target
+            WHERE relnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_type, target
+            WHERE typnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_proc, target
+            WHERE pronamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_operator, target
+            WHERE oprnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_collation, target
+            WHERE collnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_conversion, target
+            WHERE connamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opclass, target
+            WHERE opcnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opfamily, target
+            WHERE opfnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_config, target
+            WHERE cfgnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_dict, target
+            WHERE dictnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_parser, target
+            WHERE prsnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_template, target
+            WHERE tmplnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_statistic_ext, target
+            WHERE stxnamespace = target.oid
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_extension, target
+            WHERE extnamespace = target.oid
+        )
+        SELECT current_schema(), EXISTS (SELECT 1 FROM owned_object)
+    """)
+    with engine.connect() as connection:
+        schema_name, has_objects = connection.execute(query).one()
+    # A search path with no valid target schema is not a provably empty target.
+    return schema_name is not None and not bool(has_objects)
+
+
 def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
                          section: str,
                          target_revision: str,
-                         alembic_ini_path: str | None = None):
-    """Upgrade the database if needed. Uses a file lock to ensure
-    that only one process tries to upgrade the database at a time.
+                         alembic_ini_path: str | None = None,
+                         *,
+                         mode: MigrationMode = 'auto'):
+    """Verify or upgrade one schema under local and distributed locks.
 
     Args:
         engine: SQLAlchemy engine for the database.
@@ -154,10 +298,21 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
         'spot_jobs_db').
         target_revision: Target revision to upgrade to (e.g., '001').
         alembic_ini_path: Optional path to a custom alembic.ini file.
+        mode: ``verify`` performs no DDL. ``auto`` and ``upgrade`` converge an
+            initialized schema. ``bootstrap`` additionally permits the central
+            state schema to start from a proven-empty isolated PostgreSQL
+            schema; the distinct names make deployment intent explicit.
     """
+    if mode not in ('auto', 'upgrade', 'bootstrap', 'verify'):
+        raise ValueError(f'Invalid database migration mode: {mode!r}.')
     # set alembic logger to warning level
     alembic_logger = logging.getLogger('alembic')
     alembic_logger.setLevel(logging.WARNING)
+
+    if mode == 'verify':
+        verify_alembic_revision(engine, section, target_revision,
+                                alembic_ini_path)
+        return
 
     alembic_config = get_alembic_config(engine, section, alembic_ini_path)
 
@@ -165,8 +320,13 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
     if needs_upgrade(engine, section, target_revision, alembic_ini_path):
         with _alembic_thread_lock:
             with db_lock(section):
-                # check again if db needs upgrade in case another
-                # process upgraded it while we were waiting for the lock
-                if needs_upgrade(engine, section, target_revision,
-                                 alembic_ini_path):
-                    alembic_command.upgrade(alembic_config, target_revision)
+                with _distributed_migration_lock(engine, section):
+                    # Check again after the cross-host lock. The migration Job
+                    # or a transitional auto-mode API pod may have completed
+                    # the same migration while this process was waiting.
+                    if needs_upgrade(engine, section, target_revision,
+                                     alembic_ini_path):
+                        _validate_global_user_state_upgrade_start(
+                            engine, section, target_revision, alembic_ini_path,
+                            mode)
+                        alembic_command.upgrade(alembic_config, target_revision)

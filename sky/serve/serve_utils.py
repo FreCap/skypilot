@@ -37,6 +37,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.client import sdk
+from sky.container_images import task_utils as container_image_task_utils
 from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
@@ -1346,6 +1347,108 @@ def validate_external_lb_service_spec(
                 'external SkyServe load balancer. Terminate TLS at the '
                 'platform ingress/load balancer and remove tls_credential '
                 'from the service specification.')
+
+
+def snapshot_service_container_images(
+    task: 'sky.Task',
+    workspace: str | None = None,
+) -> str | None:
+    """Pins every candidate in one service version to one artifact.
+
+    Managed selectors may retain different distribution profiles for
+    placement, but their content identity must converge. Explicit direct
+    selectors must also converge. Legacy image_id candidates remain outside
+    the catalog and retain their historical heterogeneous behavior. The
+    rewritten task YAML is the durable per-version snapshot.
+    """
+    try:
+        artifact_ids = container_image_task_utils.snapshot_task_container_images(
+            [task], workspace)
+    except ValueError:
+        with ux_utils.print_exception_no_traceback():
+            raise
+    return next(iter(artifact_ids), None)
+
+
+def resolve_service_workspace(
+    service_name: str,
+    service_record: dict[str, Any],
+    requested_workspace: str | None = None,
+    *,
+    trusted_recovery_hint: bool = False,
+) -> str:
+    """Returns and, when necessary, safely backfills a service workspace.
+
+    Existing service rows predate durable workspace storage. Replica cluster
+    rows are authoritative evidence because every launch already persisted its
+    active workspace. A controller's service-scoped recovery script is also a
+    valid hint when no replica has ever been launched; an ordinary update
+    request is not.
+    """
+    stored_workspace = service_record.get('workspace')
+    if isinstance(stored_workspace, str) and stored_workspace:
+        if (requested_workspace is not None and
+                requested_workspace != stored_workspace):
+            raise RuntimeError(
+                f'Service {service_name!r} belongs to workspace '
+                f'{stored_workspace!r}, not {requested_workspace!r}.')
+        return stored_workspace
+
+    expected_service_hash = service_record.get('hash')
+    if (not isinstance(expected_service_hash, str) or
+            not expected_service_hash):
+        raise RuntimeError(
+            f'Cannot safely recover legacy service {service_name!r} without '
+            'a durable incarnation hash.')
+
+    replica_infos = serve_state.get_replica_infos(service_name)
+    cluster_names = list(
+        dict.fromkeys(
+            info.cluster_name
+            for info in replica_infos
+            if isinstance(info.cluster_name, str) and info.cluster_name))
+    cluster_records = global_user_state.get_clusters_from_names(cluster_names)
+    evidenced_workspaces = {
+        record['workspace']
+        for record in cluster_records.values()
+        if record is not None and isinstance(record.get('workspace'), str) and
+        record['workspace']
+    }
+    if len(evidenced_workspaces) > 1:
+        raise RuntimeError(
+            f'Cannot safely recover legacy service {service_name!r}: its '
+            'replica clusters belong to multiple workspaces.')
+
+    inferred_workspace = next(iter(evidenced_workspaces), None)
+    if inferred_workspace is not None:
+        if (requested_workspace is not None and
+                requested_workspace != inferred_workspace):
+            raise RuntimeError(
+                f'Service {service_name!r} replica evidence belongs to '
+                f'workspace {inferred_workspace!r}, not '
+                f'{requested_workspace!r}.')
+        workspace = inferred_workspace
+    elif (trusted_recovery_hint and isinstance(requested_workspace, str) and
+          requested_workspace):
+        workspace = requested_workspace
+    else:
+        raise RuntimeError(
+            f'Cannot safely recover legacy service {service_name!r} without '
+            'a durable workspace or replica-cluster workspace evidence. '
+            'Recreate it in the intended workspace.')
+
+    if not serve_state.set_service_workspace_if_owner(service_name, workspace,
+                                                      expected_service_hash):
+        refreshed = serve_state.get_service_from_name(service_name)
+        if (refreshed is None or
+                refreshed.get('hash') != expected_service_hash or
+                refreshed.get('workspace') != workspace):
+            raise RuntimeError(
+                f'Lost ownership while backfilling workspace for service '
+                f'{service_name!r}.')
+    logger.warning(f'Backfilled legacy service {service_name!r} workspace '
+                   f'to {workspace!r}.')
+    return workspace
 
 
 def validate_logical_replica_task(

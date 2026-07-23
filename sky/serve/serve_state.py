@@ -34,12 +34,16 @@ if typing.TYPE_CHECKING:
 replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
 
 Base = declarative.declarative_base()
+_TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 # === Database schema ===
 services_table = sqlalchemy.Table(
     'services',
     Base.metadata,
     sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+    # Durable user workspace for every replica launch and recovery. The
+    # controller itself may run in the system/default workspace.
+    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('controller_job_id',
                       sqlalchemy.Integer,
                       server_default=None),
@@ -141,6 +145,8 @@ replicas_table = sqlalchemy.Table(
 )
 sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
                  replicas_table.c.status)
+sqlalchemy.Index('replicas_service_version_idx', replicas_table.c.service_name,
+                 replicas_table.c.version)
 
 version_specs_table = sqlalchemy.Table(
     'version_specs',
@@ -353,8 +359,11 @@ def create_table(engine: sqlalchemy.engine.Engine):
             # If the database is locked, it is OK to continue, as the WAL mode
             # is not critical and is likely to be enabled by other processes.
 
-    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         migration_utils.SERVE_VERSION)
+    migration_utils.safe_alembic_upgrade(
+        engine,
+        migration_utils.SERVE_DB_NAME,
+        migration_utils.SERVE_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 def claim_service_lifecycle_epoch(service_name: str,
@@ -699,6 +708,7 @@ def add_service(name: str,
                 entrypoint: str,
                 spec: Optional['service_spec.SkyServiceSpec'],
                 yaml_content: str,
+                workspace: str | None = None,
                 controller_ip: str | None = None,
                 service_hash: str | None = None,
                 lifecycle_epoch: int | None = None,
@@ -814,6 +824,7 @@ def add_service(name: str,
             session.execute(
                 insert_func(services_table).values(
                     name=name,
+                    workspace=workspace,
                     controller_job_id=controller_job_id,
                     status=status.value,
                     policy=policy,
@@ -885,6 +896,26 @@ def add_service(name: str,
                 return False
         raise RuntimeError('Unexpected database error') from e
     return True
+
+
+def set_service_workspace_if_owner(service_name: str, workspace: str,
+                                   expected_service_hash: str) -> bool:
+    """Backfills one legacy service workspace under an incarnation fence."""
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError('Service workspace must be a non-empty string.')
+    if (not isinstance(expected_service_hash, str) or
+            not expected_service_hash):
+        raise ValueError('Expected service hash must be a non-empty string.')
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            sqlalchemy.or_(services_table.c.workspace.is_(None),
+                           services_table.c.workspace == '')).update(
+                               {services_table.c.workspace: workspace})
+        session.commit()
+    return count > 0
 
 
 def update_service_controller_pid_if_owner(service_name: str,
@@ -1492,6 +1523,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
         'pool': bool(r['pool']),
         'controller_pid': r['controller_pid'],
         'controller_ip': r['controller_ip'],
+        'workspace': r['workspace'],
         'hash': r['hash'],
         'lifecycle_epoch': r['lifecycle_epoch'],
         'resource_scope': r['resource_scope'],
@@ -1666,6 +1698,98 @@ def get_service_runtime_snapshot(
         'active_versions': json.loads(mapping['active_versions'])
                            if mapping['active_versions'] else [],
     }
+
+
+def get_service_version_terminal_states(
+    identities: list[tuple[str, int,
+                           str]],) -> dict[tuple[str, int, str], bool]:
+    """Returns authoritative terminal state for bounded service versions.
+
+    Missing entries are intentionally unknown. A service version is live while
+    it is current, routed, or owns any replica row. It becomes terminal only
+    after Serve's own rollout/drain state has moved past it, or after its exact
+    service incarnation is gone.
+    """
+    if not identities:
+        return {}
+    if len(identities) > 1000:
+        raise ValueError('Service-version terminal-state batch is too large.')
+    names = sorted({identity[0] for identity in identities})
+    version_identities = sorted({
+        (identity[0], identity[1]) for identity in identities
+    })
+    engine = _db_manager.get_engine()
+    service_rows = []
+    version_probes = []
+    with orm.Session(engine) as session:
+        for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            name_batch = names[start:start +
+                               _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            service_rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        services_table.c.name,
+                        services_table.c.hash,
+                        services_table.c.status,
+                        services_table.c.current_version,
+                        services_table.c.active_versions,
+                    ).where(services_table.c.name.in_(
+                        name_batch))).mappings().all())
+        for start in range(0, len(version_identities),
+                           _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            version_batch = version_identities[
+                start:start + _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            wanted = sqlalchemy.values(
+                sqlalchemy.column('service_name', sqlalchemy.Text),
+                sqlalchemy.column('version', sqlalchemy.Integer),
+            ).data(version_batch).cte('wanted_service_versions')
+            version_exists = sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).where(
+                    version_specs_table.c.service_name == wanted.c.service_name,
+                    version_specs_table.c.version == wanted.c.version))
+            replica_exists = sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).where(
+                    replicas_table.c.service_name == wanted.c.service_name,
+                    replicas_table.c.version == wanted.c.version))
+            version_probes.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        wanted.c.service_name,
+                        wanted.c.version,
+                        version_exists.label('version_exists'),
+                        replica_exists.label('replica_exists'),
+                    ).select_from(wanted)).mappings().all())
+    services = {str(row['name']): row for row in service_rows}
+    versions = {(str(row['service_name']), int(row['version']))
+                for row in version_probes
+                if row['version_exists']}
+    replicas = {(str(row['service_name']), int(row['version']))
+                for row in version_probes
+                if row['replica_exists']}
+    result: dict[tuple[str, int, str], bool] = {}
+    for identity in identities:
+        name, version, service_hash = identity
+        row = services.get(name)
+        if row is None or row['hash'] != service_hash:
+            result[identity] = True
+            continue
+        if ServiceStatus[str(
+                row['status'])] in ServiceStatus.terminal_statuses():
+            result[identity] = True
+            continue
+        if (name, version) not in versions:
+            # A matching live incarnation without the claimed immutable version
+            # is inconsistent, not proof that the owner is terminal.
+            continue
+        current_version = row['current_version']
+        active_versions = (json.loads(row['active_versions'])
+                           if row['active_versions'] else [])
+        if (current_version == version or version in active_versions or
+            (name, version) in replicas):
+            result[identity] = False
+        elif current_version is not None and version < int(current_version):
+            result[identity] = True
+    return result
 
 
 def get_service_status_snapshot(
