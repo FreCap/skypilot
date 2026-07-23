@@ -8,6 +8,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -30,7 +31,6 @@ from sky.serve import serve_utils
 from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
 from sky.serve.load_balancer_http import _ReleasingStreamingResponse
-from sky.serve.load_balancer_http import _ResponseTimeMiddleware
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -40,7 +40,6 @@ logger = sky_logging.init_logger(__name__)
 _DrainableServer.__module__ = __name__
 _InboundAuthMiddleware.__module__ = __name__
 _ReleasingStreamingResponse.__module__ = __name__
-_ResponseTimeMiddleware.__module__ = __name__
 
 # Per-client in-flight request counter attribute. Attached to the
 # httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
@@ -63,6 +62,19 @@ _REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
 _REQUEST_ACCELERATORS_ATTR = '_skyserve_compatible_accelerators'
 _REQUEST_GRANTED_ACCELERATOR_ATTR = '_skyserve_granted_accelerator'
 _REQUEST_DEMAND_RECORDED_ATTR = '_skyserve_request_demand_recorded'
+_REQUEST_ACTION_ATTR = '_skyserve_request_action'
+
+_ASYNC_ACTION_PREDICT = 'async_predict'
+_ASYNC_ACTION_STATUS = 'async_status'
+_ASYNC_ACTIONS = frozenset((_ASYNC_ACTION_PREDICT, _ASYNC_ACTION_STATUS,
+                            'async_capacity', 'async_cancel'))
+_ASYNC_TERMINAL_OUTCOMES = {
+    'SUCCEEDED': 'succeeded',
+    'FAILED': 'failed',
+    'EXPIRED': 'failed',
+    'CANCELED': 'failed',
+    'CANCELLED': 'failed',
+}
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
 # transport failure cannot create a second logical operation. POST/PATCH are
@@ -311,6 +323,8 @@ class SkyServeLoadBalancer:
         # a process incarnation too; otherwise a restarted LB in the same
         # minute could send a lower cumulative count under the old DB key.
         self._request_history_session_id = uuid.uuid4().hex
+        self._completed_async_prediction_ids: collections.OrderedDict[
+            str, None] = collections.OrderedDict()
         self._stream_timeout_seconds = constants.DEFAULT_LB_STREAM_TIMEOUT
         # Replica responses with these statuses are re-routed like
         # transport failures (empty = never, the default). Safe only for
@@ -1875,7 +1889,7 @@ class SkyServeLoadBalancer:
         self._retain_background_task(
             loop.create_task(self._notify_request_queue()))
         if (self._request_aggregator.request_history_snapshot() is not None or
-                self._request_aggregator.response_time_history_snapshot()
+                self._request_aggregator.prediction_time_history_snapshot()
                 is not None):
             self._retain_background_task(
                 loop.create_task(self._flush_request_history_on_drain()))
@@ -2115,6 +2129,11 @@ class SkyServeLoadBalancer:
         } for (priority, compatible), (count, recent_count) in sorted(
             grouped.items(), key=lambda item: (-item[0][0], item[0][1]))]
 
+    @staticmethod
+    def _request_has_stable_job_id(request: fastapi.Request) -> bool:
+        stable_job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
+        return isinstance(stable_job_id, str) and bool(stable_job_id)
+
     async def _request_uses_async_occupancy(self,
                                             request: fastapi.Request) -> bool:
         """Infer the deployed fast-ack request contract for compatibility.
@@ -2126,17 +2145,81 @@ class SkyServeLoadBalancer:
         contract. JSON parsing is skipped on the platform path and for all
         non-JSON requests.
         """
-        stable_job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
-        if isinstance(stable_job_id, str) and stable_job_id:
+        if self._request_has_stable_job_id(request):
             return True
+        return await self._request_action(request) == _ASYNC_ACTION_PREDICT
+
+    async def _request_action(self,
+                              request: fastapi.Request,
+                              body: bytes | None = None) -> str | None:
+        """Return and cache the established JSON async action, if present."""
+        request_state = vars(request)
+        if _REQUEST_ACTION_ATTR in request_state:
+            return request_state[_REQUEST_ACTION_ATTR]
+        action = None
         content_type = request.headers.get('content-type', '')
-        if 'application/json' not in content_type.lower():
-            return False
+        if 'application/json' in content_type.lower():
+            try:
+                content_length = request.headers.get('content-length')
+                if (content_length is not None and int(content_length)
+                        > constants.LB_ASYNC_ACTION_BODY_MAX_BYTES):
+                    request_state[_REQUEST_ACTION_ATTR] = None
+                    return None
+            except ValueError:
+                pass
+            try:
+                if body is None:
+                    bounded_body = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
+                    body = (bounded_body if bounded_body is not None else await
+                            self._request_body(request))
+                if len(body) <= constants.LB_ASYNC_ACTION_BODY_MAX_BYTES:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict) and isinstance(
+                            payload.get('action'), str):
+                        action = payload['action']
+            except (UnicodeDecodeError, ValueError, TypeError):
+                pass
+        request_state[_REQUEST_ACTION_ATTR] = action
+        return action
+
+    def _record_prediction_time(self, duration_seconds: float,
+                                outcome: str) -> None:
+        """Record observability without allowing it to affect inference."""
         try:
-            body = await request.json()
+            self._request_aggregator.add_prediction_time(
+                duration_seconds, outcome)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to record prediction-time history: %s', e)
+
+    def _record_async_prediction_status(self, body: bytes,
+                                        content_encoding: str) -> None:
+        """Record one terminal async status using its model-reported time."""
+        if content_encoding.strip().lower() not in ('', 'identity'):
+            return
+        try:
+            payload = json.loads(body)
         except (UnicodeDecodeError, ValueError, TypeError):
-            return False
-        return isinstance(body, dict) and body.get('action') == 'async_predict'
+            return
+        if not isinstance(payload, dict):
+            return
+        request_id = payload.get('request_id')
+        status = payload.get('status')
+        outcome = (_ASYNC_TERMINAL_OUTCOMES.get(status) if isinstance(
+            status, str) else None)
+        duration_ms = payload.get('processing_time_ms')
+        if (not isinstance(request_id, str) or not request_id or
+                outcome is None or not isinstance(duration_ms, (int, float)) or
+                isinstance(duration_ms, bool) or
+                not math.isfinite(duration_ms) or duration_ms < 0):
+            return
+        completed = self._completed_async_prediction_ids
+        if request_id in completed:
+            completed.move_to_end(request_id)
+            return
+        self._record_prediction_time(float(duration_ms) / 1000.0, outcome)
+        completed[request_id] = None
+        if len(completed) > constants.LB_ASYNC_PREDICTION_DEDUP_CAP:
+            completed.popitem(last=False)
 
     def _begin_async_occupancy_attempt_locked(self, url: str,
                                               request: fastapi.Request) -> None:
@@ -3164,8 +3247,8 @@ class SkyServeLoadBalancer:
             request_batch = self._request_aggregator.drain()
             request_history = (
                 self._request_aggregator.request_history_snapshot())
-            response_time_history = (
-                self._request_aggregator.response_time_history_snapshot())
+            prediction_time_history = (
+                self._request_aggregator.prediction_time_history_snapshot())
             request_batch_accepted = False
             sync_payload = {
                 # Catalog/version fence for compatibility gauges. This is the
@@ -3174,7 +3257,7 @@ class SkyServeLoadBalancer:
                 'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
-                'response_time_history': response_time_history,
+                'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'in_flight': in_flight,
                 'routing_urls': routing_urls,
@@ -3247,9 +3330,9 @@ class SkyServeLoadBalancer:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
                         if response_json.get(
-                                'response_time_history_accepted') is True:
-                            self._request_aggregator.mark_response_time_history_accepted(
-                                response_time_history)
+                                'prediction_time_history_accepted') is True:
+                            self._request_aggregator.mark_prediction_time_history_accepted(
+                                prediction_time_history)
                         replica_info = response_json.get('replica_info', {})
                         # Count of READY, active replicas the controller has,
                         # which can exceed len(replica_info) when endpoints are
@@ -3806,16 +3889,16 @@ class SkyServeLoadBalancer:
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
         request_history = self._request_aggregator.request_history_snapshot()
-        response_time_history = (
-            self._request_aggregator.response_time_history_snapshot())
-        if request_history is None and response_time_history is None:
+        prediction_time_history = (
+            self._request_aggregator.prediction_time_history_snapshot())
+        if request_history is None and prediction_time_history is None:
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
             session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
-                'response_time_history': response_time_history,
+                'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'lb_session_id': session_id,
             }
@@ -3850,9 +3933,9 @@ class SkyServeLoadBalancer:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
                         if response_json.get(
-                                'response_time_history_accepted') is True:
-                            self._request_aggregator.mark_response_time_history_accepted(
-                                response_time_history)
+                                'prediction_time_history_accepted') is True:
+                            self._request_aggregator.mark_prediction_time_history_accepted(
+                                prediction_time_history)
                         return
         except Exception as e:  # pylint: disable=broad-except
             # Shutdown must remain bounded even when the controller, token
@@ -3914,11 +3997,19 @@ class SkyServeLoadBalancer:
             setattr(client, _INFLIGHT_ATTR, inflight + 1)
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
+            request_body = await self._request_body(request)
+            if self._request_has_stable_job_id(request):
+                request_action = None
+                is_async_request = True
+            else:
+                request_action = await self._request_action(
+                    request, request_body)
+                is_async_request = request_action in _ASYNC_ACTIONS
             proxy_request = client.build_request(
                 request.method,
                 worker_url,
                 headers=self._headers_without_request_priority(request),
-                content=await self._request_body(request),
+                content=request_body,
                 # A scalar here would ALSO set the connect timeout: with a
                 # long stream timeout (sync model servers send no bytes
                 # until compute completes, so read must cover the whole
@@ -3928,6 +4019,8 @@ class SkyServeLoadBalancer:
                 timeout=httpx.Timeout(
                     self._stream_timeout_seconds,
                     connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
+            prediction_started_at = (None
+                                     if is_async_request else time.monotonic())
             proxy_response = await client.send(proxy_request, stream=True)
 
             if proxy_response.status_code in self._retriable_status_codes:
@@ -3938,6 +4031,13 @@ class SkyServeLoadBalancer:
                 # not-released finally below.
                 await proxy_response.aclose()
                 return _RetriableStatusError(proxy_response.status_code, url)
+
+            if prediction_started_at is not None:
+                outcome = ('succeeded'
+                           if 200 <= proxy_response.status_code < 300 else
+                           'failed')
+                self._record_prediction_time(
+                    time.monotonic() - prediction_started_at, outcome)
 
             # The slot is owned by the stream now. Starlette runs
             # BackgroundTasks strictly AFTER a successful stream — a
@@ -3960,11 +4060,34 @@ class SkyServeLoadBalancer:
                     await self._notify_request_queue()
 
             async def _stream_with_release():
+                status_body = (
+                    bytearray() if request_action == _ASYNC_ACTION_STATUS and
+                    200 <= proxy_response.status_code < 300 else None)
+                stream_completed = False
                 try:
                     async for chunk in proxy_response.aiter_raw():
+                        if status_body is not None:
+                            if (len(status_body) + len(chunk) <=
+                                    constants.LB_ASYNC_STATUS_BODY_MAX_BYTES):
+                                status_body.extend(chunk)
+                            else:
+                                status_body = None
                         yield chunk
+                    stream_completed = True
                 finally:
-                    await _release_slot()
+                    try:
+                        await _release_slot()
+                    finally:
+                        if stream_completed and status_body is not None:
+                            try:
+                                self._record_async_prediction_status(
+                                    bytes(status_body),
+                                    proxy_response.headers.get(
+                                        'content-encoding', ''))
+                            except Exception as e:  # pylint: disable=broad-except
+                                logger.warning(
+                                    'Failed to record async prediction-time '
+                                    'history: %s', e)
 
             response = _ReleasingStreamingResponse(
                 content=_stream_with_release(),
@@ -4352,11 +4475,6 @@ class SkyServeLoadBalancer:
         # Pure-ASGI so it wraps the catch-all proxy without buffering streaming
         # responses; exempts the readiness probe by method+path.
         self._app.add_middleware(_InboundAuthMiddleware)
-        # Register after auth so Starlette makes this the outer user
-        # middleware. Authentication failures are customer-visible response
-        # completions too; operational /_lb/* traffic is excluded internally.
-        self._app.add_middleware(_ResponseTimeMiddleware,
-                                 aggregator=self._request_aggregator)
         # Register the readiness route BEFORE the catch-all proxy route so it
         # is matched first (Starlette matches in registration order) instead of
         # being proxied to a replica.

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 import json
 from typing import Any
@@ -91,7 +92,16 @@ def validate_controller_sequence(value: int | None) -> int | None:
 def _encode_placement(placement: dict[str, Any]) -> str:
     """Validates and encodes the immutable v0 runtime placement fence."""
     required = {'provider', 'region', 'backend', 'platform'}
-    allowed = required | {'consumer'}
+    identity_fields = {
+        'runtime_binding_fingerprint',
+        'host_image_id',
+        'runtime_principal',
+        'instance_profile',
+        'kubernetes_cluster_arn',
+        'kubernetes_node_role',
+        'kubernetes_node_selector',
+    }
+    allowed = required | identity_fields | {'consumer'}
     if (not isinstance(placement, dict) or
             not required <= set(placement) <= allowed or
             placement['provider'] != 'aws' or
@@ -101,6 +111,27 @@ def _encode_placement(placement: dict[str, Any]) -> str:
                                              'Demand placement region')
     models.validate_oci_platform(placement['platform'],
                                  'Demand placement platform')
+    fingerprint = placement.get('runtime_binding_fingerprint')
+    if fingerprint is not None:
+        models.validate_fingerprint(fingerprint,
+                                    'Demand runtime binding fingerprint')
+    for field in identity_fields - {
+            'runtime_binding_fingerprint', 'kubernetes_node_selector'
+    }:
+        value = placement.get(field)
+        if (value is not None and
+            (not isinstance(value, str) or not value or len(value) > 2048 or
+             any(character.isspace() for character in value))):
+            raise ValueError('Demand runtime identity is invalid.')
+    node_selector = placement.get('kubernetes_node_selector')
+    if (node_selector is not None and
+        (not isinstance(node_selector, list) or not node_selector or
+         len(node_selector) > 16 or
+         any(not isinstance(item, (list, tuple)) or len(item) != 2 or not all(
+             isinstance(value, str)
+             for value in item)
+             for item in node_selector))):
+        raise ValueError('Demand Kubernetes node selector is invalid.')
     consumer = placement.get('consumer')
     if consumer is not None and not isinstance(consumer, dict):
         raise ValueError('Demand consumer metadata must be an object.')
@@ -345,7 +376,8 @@ def create_demand_for_controller_epoch_in_session(
         location_id: str,
         placement: dict[str, Any],
         now: int | None = None,
-        require_existing: bool = False) -> DemandRecord:
+        require_existing: bool = False,
+        before_create: Callable[[int], None] | None = None) -> DemandRecord:
     """Maps a controller epoch and converges its durable target fence."""
     controller_epoch = validate_controller_epoch(controller_epoch)
     controller_sequence = validate_controller_sequence(controller_sequence)
@@ -460,6 +492,9 @@ def create_demand_for_controller_epoch_in_session(
                   int(watermark['max_seen_generation']) + 1)
     if generation > _MAX_POSTGRES_BIGINT:
         raise ValueError('Consumer generation is exhausted.')
+    current = catalog_state.database_epoch(session, now=now)
+    if before_create is not None:
+        before_create(current)
     return create_demand_in_session(session,
                                     authority_id=authority_id,
                                     workspace=workspace,
@@ -476,7 +511,7 @@ def create_demand_for_controller_epoch_in_session(
                                     placement=placement,
                                     controller_epoch=controller_epoch,
                                     controller_sequence=controller_sequence,
-                                    now=now)
+                                    now=current)
 
 
 def get_demand(demand_id: str, workspace: str) -> DemandRecord | None:

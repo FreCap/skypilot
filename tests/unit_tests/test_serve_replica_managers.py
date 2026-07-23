@@ -202,6 +202,68 @@ run: echo hi
         assert manager._default_planned_capacity == 1
 
 
+class TestGetResourcesPorts:
+
+    def test_infers_common_port_from_heterogeneous_resources(self):
+        yaml_content = """
+resources:
+  any_of:
+    - cpus: 1
+      ports: 8080
+    - cpus: 2
+      ports: 8080
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 2
+    target_qps_per_replica: 1
+run: echo hi
+"""
+
+        assert replica_managers._get_resources_ports(yaml_content) == '8080'
+
+    def test_authoritative_spec_can_omit_service_port(self):
+        yaml_content = """
+resources:
+  cpus: 1
+  ports: 8080
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 2
+    target_qps_per_replica: 1
+run: echo hi
+"""
+        task = replica_managers.task_lib.Task.from_yaml_str(yaml_content)
+        assert task.service is not None
+        assert task.service.ports is None
+
+        assert replica_managers._get_resources_ports(yaml_content,
+                                                     task.service) == '8080'
+
+    def test_rejects_inconsistent_resource_ports(self):
+        yaml_content = """
+resources:
+  any_of:
+    - cpus: 1
+      ports: 8080
+    - cpus: 2
+      ports: 8081
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 2
+    target_qps_per_replica: 1
+run: echo hi
+"""
+
+        with pytest.raises(ValueError, match='multiple ports'):
+            replica_managers._get_resources_ports(yaml_content)
+
+
 def _make_manager(service_name='svc', next_replica_id=1):
     """Build a bare SkyPilotReplicaManager with only the attributes the
     recovery / scale-up id-allocator and version-spec lookup paths touch,

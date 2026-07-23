@@ -4,7 +4,7 @@ Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 ## Decision
 
@@ -562,6 +562,16 @@ the rows that authorize the mutation are locked. A scheduler may decide when to
 attempt reconciliation using monotonic process time, but it does not pass that
 time into the final PostgreSQL decision.
 
+A new managed demand additionally validates the exact runtime attestation under
+the locked profile revision and consumer watermark. The transaction samples one
+database epoch only after those locks and the existing-demand lookup, validates
+the target, binding fingerprint, runtime identity, and proof age at that epoch,
+then persists that same value as `demand.created_at`. If the proof expires while
+the transaction waits, the complete transaction rolls back, including a newly
+inserted watermark. An exact existing demand returns before this new-admission
+gate and keeps its original creation-time authorization, so an in-flight
+deployment remains replayable after the current proof ages out.
+
 Canary failure classification follows the same rule. The worker does not choose
 ordinary failure versus deadline-expired timeout from an application timestamp.
 One transaction locks the exact operation, samples the database wall clock, and
@@ -577,13 +587,18 @@ and teardown deadline. The canary resource is tagged with operation/profile/
 generation, may exercise only one target/backend, and always auto-terminates. A
 continuous lease heartbeat starts before credential acquisition. The actual STS,
 EC2, EKS, IAM, and Kubernetes call boundaries synchronously prove ownership both
-before and after each call. A provider create uses a stronger ordered fence: it
-renews exact ownership, rechecks the teardown deadline after that potentially
-blocking renewal, immediately invokes the raw provider create, then rechecks
-ownership. Initial child attachment and successful evidence require the exact
-live lease and a future teardown deadline; terminal failure requires the live
-lease, while an already-expired deadline has a separate timeout/teardown-only
-transition that cannot launch or qualify a child. An initial persisted intent
+before and after each call. A provider create uses a stronger ordered fence.
+Immediately before every EC2 or EKS create attempt, one transaction locks the
+operation and validates the exact child ID, lease token, live lease, RUNNING
+state, and future teardown deadline against `clock_timestamp()`. It returns only
+the conservative remaining duration, which the worker maps from the start of
+that database round trip onto `time.monotonic()`. The fenced provider wrapper
+rechecks ownership and that monotonic deadline immediately before the raw
+create, then rechecks ownership afterward. Host wall-clock skew cannot extend
+the database deadline. Initial child attachment and successful evidence require
+the exact live lease and a future teardown deadline; terminal failure requires
+the live lease, while an already-expired deadline has a separate timeout/
+teardown-only transition that cannot launch or qualify a child. An initial persisted intent
 does not falsely imply a provider child: if the same owner has not attempted a
 create, a client or discovery failure can terminalize without teardown. After a
 crash, the next claimant reads the persisted child identity before deciding
@@ -723,6 +738,10 @@ optimization, while a user-supplied host image or role outside that tuple is not
 silently trusted. EKS eligibility maps the selected SkyPilot Kubernetes context
 to one exact cluster ARN, node role, namespace, and immutable nonempty node
 selector. The canary and every managed workload pod receive that same selector.
+When one EKS binding serves clusters in multiple target regions, resolution
+parses the configured EKS ARN and requires its region to equal the candidate
+registry target region. A context present in a shared binding therefore cannot
+make every target appear eligible or select the first cluster in that binding.
 Qualification enumerates every schedulable node matching the selector, resolves
 each node's EC2 instance profile, and requires the declared role for the complete
 eligible set before recording READY. A selector that matches zero nodes, more
@@ -815,8 +834,10 @@ demand rows. The advisory lock has no persistent per-cluster table cardinality.
 Serve replicas, task ranks, nodes, and GPU processes point to that demand and do
 not create independent rows or eviction fences. The demand contains catalog
 authority, artifact/runtime digest, exact profile revision, target fingerprint,
-location, bounded placement constraint, owner epoch, retry epoch, and a bounded
-server request ID used only for unattached cluster cleanup. The request ID has a
+location, runtime-binding fingerprint, exact qualified EC2 AMI/principal/profile
+or EKS cluster/role/selector tuple, bounded placement constraint, owner epoch,
+retry epoch, and a bounded server request ID used only for unattached cluster
+cleanup. The request ID has a
 partial PostgreSQL index; terminal request handling never scans or parses every
 live demand. The row contains no credential or raw user-controlled registry
 value, and users cannot supply it in YAML.
@@ -873,11 +894,12 @@ stores only the demand ID and generation.
 Restarts keep a still-valid plan or explicitly supersede it after a real capacity
 failure. They never persist a WARMING fallback as managed locality.
 An owner epoch with a live demand reloads that demand's exact immutable profile
-snapshot and target even after the revision becomes RETIRED. It evaluates
-qualification freshness at the demand creation timestamp and accepts only an
-exact replay. A retired revision cannot admit a new owner or select a new target,
-so a profile rollout cannot strand an in-flight deployment or reopen old
-capacity.
+snapshot and target even after the revision becomes RETIRED. It evaluates the
+immutable authorization recorded when the demand was created and accepts only
+an exact placement replay. Current proof age is a new-admission condition, not a
+reason to invalidate that already-authorized deployment. A retired revision
+cannot admit a new owner or select a new target, so a profile rollout cannot
+strand an in-flight deployment or reopen old capacity.
 
 Eviction treats every WARMING or READY demand as the fence and locks its shard,
 location, and demand state in the canonical order. Retention is evaluated per
@@ -1248,6 +1270,31 @@ replicas or workers and is not a general empty-schema shortcut. New Job,
 `bootstrap`, and `auto` processes share the advisory lock once every participant
 is at least revision 023.
 
+The independent Serve database has one linear head at revision 026. Upstream
+owns revision 022 response-time history, revision 023 prediction-time history,
+and revision 024 version quarantine. Managed image distribution follows with
+revision 025 workspace convergence and revision 026 exact replica-version
+lookup. Preview builds used the same 022, 023, and 024 numbers for workspace,
+the replica index, and response history respectively. Revision 025 is therefore
+the first common successor for every ambiguous stamp. It idempotently restores
+both upstream history tables, quarantine columns, the earlier accelerator and
+placement collision state, and workspace state. Revision 026 also repairs the
+complete replica JSON state and both replica lookup indexes for predecessor-
+stamped preview databases that skipped canonical revision 010, then creates the
+exact service-version index. This convergence is required for local/controller
+SQLite as well as central PostgreSQL; skipping only the index would leave those
+legacy replicas unreadable by the current model. Empty projection-only preview
+tables gain the complete current column set. A nonempty row missing both
+authoritative JSON and the legacy pickle fails closed because its replica state
+cannot be reconstructed without inventing control-plane state. Real-PostgreSQL tests construct
+upstream-022 and managed-preview 022/023/024 layouts independently, upgrade each
+through 026, and prove the full model projection is readable. A SQLite
+regression starts with a legacy three-column replica table stamped at revision
+025, upgrades through 026, and proves the JSON backfill plus both indexes. The
+matrix covers upstream 022, 023, and 024 plus managed-preview 022, 023, and 024
+independently. Revision-only verification is safe only because all known same-
+numbered shapes converge through that common successor.
+
 ## Registry profiles
 
 ### Provider-neutral access contract
@@ -1470,8 +1517,13 @@ an unused architecture.
 Each service writes a bounded attestation through its authenticated internal
 endpoint. A canary result includes a single-use nonce and actual-principal
 evidence, never credentials: the canonicalized EC2 STS role ARN, or the EKS node
-UID/node-group role paired with successful kubelet pull and pod start. Copy
-workers may coordinate aggregation but cannot assume or simulate lifecycle or
+UID/node-group role paired with successful kubelet pull and pod start. EC2
+evidence must also equal the configured regional AMI and exact
+compute-account instance-profile ARN. EKS evidence must equal the configured
+context, cluster ARN, role, selector, positive qualified-node count, and bounded
+node-set hash. The binding fingerprint alone never substitutes for those
+observed identity fields. Copy workers may coordinate aggregation but cannot
+assume or simulate lifecycle or
 runtime roles. `transactions.activate_profile()` locks the
 current desired row and promotes it only after rechecking desired generation,
 config and Terraform hashes, target fingerprints, and fresh required
@@ -2320,6 +2372,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   confirmation, unattached-cluster retention, worker cleanup, and terminal
   compaction derive shared epochs from PostgreSQL, while local grant expiry and
   worker housekeeping use only monotonic process time;
+- locked new-demand tests proving that runtime-proof validation and
+  `demand.created_at` use the same database epoch, stale proof rejection rolls
+  back both demand and watermark, and an exact existing replay survives later
+  proof expiry without changing its original creation time;
 - source-reader tests for private and multicast literals, DNS rebinding to
   private or multicast peers before TLS bytes,
   off-authority bearer realms, private and chained redirects, disabled token
@@ -2335,7 +2391,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
-  pre/post lease fences, renewal-crosses-deadline rejection for EC2/EKS, and a
+  pre/post lease fences, database authorization immediately before both EC2 and
+  EKS creates, slow-host-clock denial after database expiry,
+  renewal-crosses-deadline rejection for EC2/EKS, and a
   production failure caller blocked past lease expiry without stale-clock
   terminalization;
 - idempotency collision-matrix, canonical publication fan-out, controller
@@ -2362,6 +2420,12 @@ drained and every image table is empty; it is never part of Helm rollback.
   sequences, user-defined types, and routines each make an unversioned target
   schema nonempty and block revision 024 before DDL, while a separate empty
   search-path schema upgrades directly;
+- Serve migration convergence tests constructing all six known upstream and
+  managed-preview layouts stamped 022, 023, and 024, then proving each reaches
+  the sole revision-026 head with response and prediction history, quarantine,
+  workspace, and exact replica-version lookup intact, plus a predecessor-
+  stamped legacy SQLite replica layout proving revision 026 restores the full
+  JSON state and both lookup indexes;
 - workspace-publication history and operational-profile readiness scale fixtures
   proving the former uses its `(workspace, created_at, id)` keyset index and the
   latter uses both ACTIVE and QUALIFYING partial indexes despite more than 1,001
@@ -2950,3 +3014,23 @@ migration-chain test now proves the revision-023 index, revision-024 response
 history table, and final declared Serve head together. The acceptance streak
 remains zero until both reviewers accept one immutable current-base head three
 consecutive times.
+
+Restarted paired final-acceptance round 1 at
+`0c1256e78f037c3df6d28bd315c8a97369aac11c` returned Codex `RESHAPE` and Fable
+`RESHAPE`, resetting the streak. The paired review proved four cross-component
+blockers: new runtime demand admission trusted host time instead of validating
+the exact locked proof at its persisted creation epoch; EC2 and EKS canary
+creates compared a durable deadline to host wall time; a shared multi-region EKS
+binding could make the wrong registry target eligible; and `origin/improvements`
+had independently assigned Serve revisions 022 through 024, colliding with this
+feature's deployed preview lineage. This revision adds the database-authorized
+demand and provider-create fences, strict observed EC2/EKS identity matching,
+target-region EKS ARN resolution, and the 025 convergence plus 026 index chain
+described above. Real PostgreSQL boundary tests prove stale new admission rolls
+back without durable residue while exact replay survives, and provider tests
+prove expired database authorization cannot reach either create API despite a
+slow host clock. During repair, `origin/improvements` advanced again to
+`fd3ee5d7c3d9814248027a3da83c23a41360e647`; integrating that exact base also
+invalidated the earlier review identity. The acceptance streak remains zero
+until both reviewers accept one immutable current-base head three consecutive
+times.

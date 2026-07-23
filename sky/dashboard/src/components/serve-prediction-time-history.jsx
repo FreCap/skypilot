@@ -20,7 +20,7 @@ import {
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
-const STATUS_OPTIONS = ['all', '2xx', '3xx', '4xx', '5xx'];
+const OUTCOME_OPTIONS = ['all', 'succeeded', 'failed'];
 
 function addCounts(target, source) {
   source.forEach((count, index) => {
@@ -28,14 +28,14 @@ function addCounts(target, source) {
   });
 }
 
-function sampleCounts(sample, statusClass, bucketCount) {
+function sampleCounts(sample, outcome, bucketCount) {
   const counts = Array(bucketCount).fill(0);
-  if (statusClass === 'all') {
-    Object.values(sample.statusClassCounts || {}).forEach((values) =>
+  if (outcome === 'all') {
+    Object.values(sample.outcomeCounts || {}).forEach((values) =>
       addCounts(counts, values)
     );
-  } else if (sample.statusClassCounts?.[statusClass]) {
-    addCounts(counts, sample.statusClassCounts[statusClass]);
+  } else if (sample.outcomeCounts?.[outcome]) {
+    addCounts(counts, sample.outcomeCounts[outcome]);
   }
   return counts;
 }
@@ -57,31 +57,31 @@ function histogramQuantile(counts, upperBounds, quantile) {
   return null;
 }
 
-export function formatResponseTime(seconds) {
+export function formatPredictionTime(seconds) {
   if (!Number.isFinite(seconds)) return 'N/A';
   if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
   if (seconds < 60) return `${Number(seconds.toFixed(1))} s`;
   return `${Number((seconds / 60).toFixed(1))} min`;
 }
 
-export function buildResponseTimeHistoryView(
+export function buildPredictionTimeHistoryView(
   history,
   range,
-  statusClass = 'all'
+  outcome = 'all'
 ) {
-  const upperBounds = history?.responseTimeBucketUpperBoundsSeconds || [];
+  const upperBounds = history?.predictionTimeBucketUpperBoundsSeconds || [];
   if (
     !history?.available ||
     !range ||
-    history.responseTimeHistogramVersion !== 1 ||
+    history.predictionTimeHistogramVersion !== 1 ||
     !upperBounds.length ||
-    !STATUS_OPTIONS.includes(statusClass)
+    !OUTCOME_OPTIONS.includes(outcome)
   ) {
     return { supported: false, samples: 0 };
   }
   const bucketCount = upperBounds.length + 1;
   const bucketSeconds = history.bucketSeconds || 60;
-  const selectedSamples = (history.responseTimeSamples || []).filter(
+  const selectedSamples = (history.predictionTimeSamples || []).filter(
     (sample) => sample.timestamp >= range.start && sample.timestamp <= range.end
   );
   const samplesByTimestamp = new Map(
@@ -103,7 +103,7 @@ export function buildResponseTimeHistoryView(
     timestamps.push(timestamp);
     const sample = samplesByTimestamp.get(timestamp);
     const counts = sample
-      ? sampleCounts(sample, statusClass, bucketCount)
+      ? sampleCounts(sample, outcome, bucketCount)
       : Array(bucketCount).fill(0);
     addCounts(aggregateCounts, counts);
     const estimates = [0.5, 0.95, 0.99].map((quantile) =>
@@ -143,21 +143,21 @@ export function buildResponseTimeHistoryView(
 
 function bucketLabel(upperBounds, index) {
   if (index >= upperBounds.length) {
-    return `> ${formatResponseTime(upperBounds[upperBounds.length - 1])}`;
+    return `> ${formatPredictionTime(upperBounds[upperBounds.length - 1])}`;
   }
-  return `<= ${formatResponseTime(upperBounds[index])}`;
+  return `<= ${formatPredictionTime(upperBounds[index])}`;
 }
 
-export function ResponseTimeHistoryCard({
+export function PredictionTimeHistoryCard({
   history,
   range,
   onRangeSelect,
   loading = false,
 }) {
-  const [statusClass, setStatusClass] = useState('all');
+  const [outcome, setOutcome] = useState('all');
   const view = useMemo(
-    () => buildResponseTimeHistoryView(history, range, statusClass),
-    [history, range, statusClass]
+    () => buildPredictionTimeHistoryView(history, range, outcome),
+    [history, range, outcome]
   );
   if (!view.supported) return null;
 
@@ -189,7 +189,7 @@ export function ResponseTimeHistoryCard({
     interaction: { mode: 'index', intersect: false },
     scales: historyLinearScale(range, {
       beginAtZero: true,
-      title: { display: true, text: 'Approximate response time (seconds)' },
+      title: { display: true, text: 'Approximate prediction time (seconds)' },
     }),
     plugins: {
       legend: { position: 'bottom' },
@@ -198,7 +198,7 @@ export function ResponseTimeHistoryCard({
           label: (context) =>
             `${context.dataset.label}: ${
               context.raw?.overflow ? '> ' : ''
-            }${formatResponseTime(context.raw?.y)}`,
+            }${formatPredictionTime(context.raw?.y)}`,
         },
       },
     },
@@ -209,7 +209,7 @@ export function ResponseTimeHistoryCard({
     ),
     datasets: [
       {
-        label: 'Completed responses',
+        label: 'Completed predictions',
         data: view.aggregateCounts,
         backgroundColor: 'rgba(2, 132, 199, 0.65)',
       },
@@ -221,12 +221,12 @@ export function ResponseTimeHistoryCard({
     scales: {
       x: {
         ticks: { maxRotation: 65, minRotation: 45 },
-        title: { display: true, text: 'Response-time bucket' },
+        title: { display: true, text: 'Prediction-time bucket' },
       },
       y: {
         beginAtZero: true,
         ticks: { precision: 0 },
-        title: { display: true, text: 'Completed responses' },
+        title: { display: true, text: 'Completed predictions' },
       },
     },
     plugins: { legend: { display: false } },
@@ -236,9 +236,10 @@ export function ResponseTimeHistoryCard({
     <div className="mb-6">
       <div className="flex items-center justify-between gap-3 mb-2">
         <div>
-          <h3 className="text-lg font-semibold">Response time</h3>
+          <h3 className="text-lg font-semibold">Prediction time</h3>
           <div className="text-sm text-gray-500">
-            Full SkyServe HTTP completion time, including queueing and retries
+            Replica execution time, excluding SkyServe queueing and retries.
+            Async jobs use model-reported processing time.
           </div>
         </div>
         {loading && <CircularProgress size={16} />}
@@ -246,19 +247,21 @@ export function ResponseTimeHistoryCard({
       <Card>
         <div className="p-4">
           <div className="flex flex-wrap gap-2 mb-4">
-            {STATUS_OPTIONS.map((option) => (
+            {OUTCOME_OPTIONS.map((option) => (
               <button
                 key={option}
                 type="button"
-                aria-pressed={statusClass === option}
-                onClick={() => setStatusClass(option)}
+                aria-pressed={outcome === option}
+                onClick={() => setOutcome(option)}
                 className={`px-3 py-1 rounded border text-sm ${
-                  statusClass === option
+                  outcome === option
                     ? 'bg-sky-600 text-white border-sky-600'
                     : 'bg-white text-gray-700 border-gray-300'
                 }`}
               >
-                {option === 'all' ? 'All' : option}
+                {option === 'all'
+                  ? 'All'
+                  : option.charAt(0).toUpperCase() + option.slice(1)}
               </button>
             ))}
           </div>
@@ -276,14 +279,14 @@ export function ResponseTimeHistoryCard({
                 <div className="text-gray-500">{label}</div>
                 <div className="font-semibold">
                   {overflow ? '> ' : ''}
-                  {formatResponseTime(value)}
+                  {formatPredictionTime(value)}
                 </div>
               </div>
             ))}
           </div>
           {view.samples === 0 ? (
             <div className="py-8 text-sm text-gray-500 text-center">
-              No completed responses in the selected range.
+              No completed predictions in the selected range.
             </div>
           ) : (
             <>
@@ -293,9 +296,9 @@ export function ResponseTimeHistoryCard({
                 range={range}
                 bucketSeconds={history.bucketSeconds || 60}
                 onRangeSelect={onRangeSelect}
-                ariaLabel="Response time trend chart"
+                ariaLabel="Prediction time trend chart"
               />
-              <div className="h-72 mt-6" aria-label="Response time histogram">
+              <div className="h-72 mt-6" aria-label="Prediction time histogram">
                 <Bar data={histogramData} options={histogramOptions} />
               </div>
             </>

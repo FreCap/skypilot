@@ -290,6 +290,45 @@ def _activate_profile(
             expected_generation=revision.desired_generation,
             expected_config_hash=profile.config_hash,
             now=12)
+    for target in (profile.canonical,) + profile.targets:
+        for backend, binding_id in target.runtime_pull:
+            binding = profile.bindings[binding_id]
+            for runtime_id in qualification.runtime_ids(target, backend,
+                                                        binding):
+                evidence: dict[str, Any] = {
+                    'status': 'READY',
+                    'observed_at': 12,
+                    'target_fingerprint': target.target_fingerprint,
+                    'binding_fingerprint': binding.fingerprint,
+                    'backend': backend,
+                    'runtime_id': runtime_id,
+                }
+                if backend == 'aws_vm':
+                    evidence.update(
+                        host_image_id=dict(
+                            binding.qualified_node_images)[target.region],
+                        instance_profile_arn=(
+                            models.ec2_instance_profile_arn(binding)),
+                        actual_principal=binding.principals[0])
+                else:
+                    qualified = models.qualified_eks_cluster_for_target(
+                        target, binding, runtime_id)
+                    evidence.update(context=qualified.context,
+                                    cluster_arn=qualified.cluster_arn,
+                                    node_role=qualified.node_role,
+                                    node_selector=dict(qualified.node_selector),
+                                    qualified_node_count=1,
+                                    qualified_node_set_hash='d' * 64)
+                attested = topology_state.record_profile_attestation(
+                    profile_revision_id=revision.id,
+                    kind=models.profile_attestation_key('runtime', target.name,
+                                                        backend,
+                                                        binding.fingerprint,
+                                                        runtime_id),
+                    evidence=evidence,
+                    expected_generation=revision.desired_generation,
+                    expected_config_hash=profile.config_hash,
+                    now=12)
     assert attested.attestations_hash is not None
     active = transactions.activate_profile(
         profile_revision_id=revision.id,
@@ -651,6 +690,22 @@ def test_deadline_expired_canary_is_teardown_only(
                                              original.lease_token,
                                              persisted_child,
                                              now=301)
+    assert qualification.authorize_canary_launch(
+        original.id, original.lease_token, persisted_child,
+        now=301) == original.teardown_deadline - 301
+    assert qualification.authorize_canary_launch(original.id,
+                                                 'wrong-lease',
+                                                 persisted_child,
+                                                 now=301) is None
+    assert qualification.authorize_canary_launch(original.id,
+                                                 original.lease_token,
+                                                 'wrong-child',
+                                                 now=301) is None
+    assert qualification.authorize_canary_launch(
+        original.id,
+        original.lease_token,
+        persisted_child,
+        now=original.teardown_deadline) is None
     cleanup_owner = qualification.claim_canary(worker_id='worker-b',
                                                lease_seconds=2000,
                                                now=original.teardown_deadline)
@@ -2258,6 +2313,39 @@ def _runtime_resolution(
         current_demand=current_demand)
 
 
+def _runtime_placement(
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+    *,
+    backend: str,
+    region: str,
+    consumer: dict[str, Any],
+) -> dict[str, Any]:
+    binding_id = target.runtime_binding(backend)
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    placement: dict[str, Any] = {
+        'provider': 'aws',
+        'region': region,
+        'backend': backend,
+        'platform': 'linux/amd64',
+        'runtime_binding_fingerprint': binding.fingerprint,
+        'consumer': consumer,
+    }
+    if backend == 'aws_vm':
+        placement.update(host_image_id=dict(
+            binding.qualified_node_images)[region],
+                         runtime_principal=binding.principals[0],
+                         instance_profile=binding.instance_profile)
+    else:
+        qualified = models.qualified_eks_cluster_for_target(
+            target, binding, region)
+        placement.update(kubernetes_cluster_arn=qualified.cluster_arn,
+                         kubernetes_node_role=qualified.node_role,
+                         kubernetes_node_selector=list(qualified.node_selector))
+    return placement
+
+
 def _warming_demand(
     active: topology_state.ProfileRevisionRecord,
     publication_record: catalog_state.PublicationRecord,
@@ -2283,6 +2371,7 @@ def _warming_demand(
     consumer = {'request_id': request_id}
     if consumer_metadata is not None:
         consumer.update(consumer_metadata)
+    region = placement_region or target.region
     return transactions.create_warming_demand_for_controller_epoch(
         authority_id=authority,
         workspace='research',
@@ -2298,13 +2387,36 @@ def _warming_demand(
         profile_revision_id=active.id,
         target_fingerprint=target.target_fingerprint,
         location_id=location.id,
-        placement={
-            'provider': 'aws',
-            'region': placement_region or target.region,
-            'backend': backend,
-            'platform': 'linux/amd64',
-            'consumer': consumer,
-        },
+        placement=_runtime_placement(profile,
+                                     target,
+                                     backend=backend,
+                                     region=region,
+                                     consumer=consumer),
+        now=now)
+
+
+def _refresh_runtime_attestation(
+    active: topology_state.ProfileRevisionRecord,
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+    *,
+    backend: str,
+    runtime_id: str,
+    now: int,
+) -> topology_state.ProfileRevisionRecord:
+    binding_id = target.runtime_binding(backend)
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    key = models.profile_attestation_key('runtime', target.name, backend,
+                                         binding.fingerprint, runtime_id)
+    evidence = dict(active.attestations[key])
+    evidence['observed_at'] = now
+    return topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=key,
+        evidence=evidence,
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
         now=now)
 
 
@@ -2472,15 +2584,11 @@ def test_demand_fences_eviction_until_two_terminal_observations(
         profile_revision_id=active.id,
         target_fingerprint=west.target_fingerprint,
         location_id=regional.id,
-        placement={
-            'provider': 'aws',
-            'region': west.region,
-            'backend': 'aws_vm',
-            'platform': 'linux/amd64',
-            'consumer': {
-                'request_id': 'request-1',
-            },
-        },
+        placement=_runtime_placement(profile,
+                                     west,
+                                     backend='aws_vm',
+                                     region=west.region,
+                                     consumer={'request_id': 'request-1'}),
         now=51)
     assert replay.id == demand.id and replay.consumer_generation == 0
     demand = transactions.commit_ready_demand(
@@ -2691,6 +2799,71 @@ def test_cluster_request_terminal_lookup_is_index_bounded(
             """)).one()
     assert observed == 1
     assert unrelated == 0
+
+
+def test_new_demand_uses_locked_database_qualification_time_and_replay_skips_age(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    observed_at = 12
+    last_qualified_at = (
+        observed_at + profile.qualification.runtime_attestation_max_age_seconds)
+    validation_times: list[int] = []
+    original_validate = transactions._validate_runtime_attestation
+
+    def capture_validation_time(**kwargs: Any) -> None:
+        validation_times.append(kwargs['now'])
+        original_validate(**kwargs)
+
+    monkeypatch.setattr(transactions, '_validate_runtime_attestation',
+                        capture_validation_time)
+    demand = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='clock-boundary:v1',
+                             controller_epoch='service:clock-boundary:v1',
+                             controller_sequence=1,
+                             now=last_qualified_at)
+
+    assert validation_times == [last_qualified_at]
+    assert demand.created_at == last_qualified_at
+
+    replay = _warming_demand(active,
+                             publication_record,
+                             regional,
+                             profile,
+                             owner='clock-boundary:v1',
+                             controller_epoch='service:clock-boundary:v1',
+                             controller_sequence=1,
+                             now=last_qualified_at + 1)
+    assert replay.id == demand.id
+    assert replay.created_at == last_qualified_at
+    assert validation_times == [last_qualified_at]
+
+    stale_owner = 'clock-boundary:v2'
+    with pytest.raises(ValueError, match='QUALIFICATION_STALE'):
+        _warming_demand(active,
+                        publication_record,
+                        regional,
+                        profile,
+                        owner=stale_owner,
+                        controller_epoch='service:clock-boundary:v2',
+                        controller_sequence=2,
+                        now=last_qualified_at + 1)
+    assert validation_times == [last_qualified_at, last_qualified_at + 1]
+    with image_database.connect() as connection:
+        demand_rows = connection.execute(
+            sqlalchemy.select(schema.demands.c.id).where(
+                schema.demands.c.consumer_owner == stale_owner)).all()
+        watermark_rows = connection.execute(
+            sqlalchemy.select(
+                schema.consumer_watermarks.c.consumer_owner).where(
+                    schema.consumer_watermarks.c.consumer_owner ==
+                    stale_owner)).all()
+    assert demand_rows == []
+    assert watermark_rows == []
 
 
 def test_unattached_request_terminal_proof_survives_age_gate(
@@ -4458,32 +4631,12 @@ def test_locked_oldest_shard_does_not_block_global_eviction(
     target = profile.targets[0]
     older_image_id = str(uuid.uuid4())
     older_location_id = str(uuid.uuid4())
-    physical_fingerprint = hashlib.sha256(
-        f'{target.target_fingerprint}:1'.encode()).hexdigest()
+    older_shard = next(
+        shard for shard in topology_state.list_shards('research', profile.name)
+        if shard.target_id == target.name and shard.id != regional.shard_id)
+    older_shard_id = older_shard.id
+    physical_fingerprint = older_shard.physical_fingerprint
     with orm.Session(image_database) as session, session.begin():
-        older_shard = topology_state.upsert_qualified_shard(
-            session,
-            workspace='research',
-            profile=profile.name,
-            target_id=target.name,
-            provider='aws',
-            partition=profile.partition,
-            account=profile.registry_account,
-            region=target.region,
-            shard_generation=0,
-            shard_index=1,
-            target_fingerprint=target.target_fingerprint,
-            physical_fingerprint=physical_fingerprint,
-            registry=target.registry,
-            repository_name=f'{target.repository_prefix}/test/s01',
-            repository_arn=(f'arn:{profile.partition}:ecr:{target.region}:'
-                            f'{profile.registry_account}:repository/'
-                            f'{target.repository_prefix}/test/s01'),
-            max_manifests=100,
-            max_declared_bytes=1_000_000,
-            max_in_flight=4,
-            now=1)
-        older_shard_id = older_shard.id
         session.execute(schema.registry_shards.update().where(
             schema.registry_shards.c.id == older_shard_id).values(
                 state=models.ImageShardState.READY.value,
@@ -4514,8 +4667,8 @@ def test_locked_oldest_shard_does_not_block_global_eviction(
             runtime_digest=_OTHER_DIGEST,
             canonical=False,
             canonical_location_id=canonical.id,
-            target_ref=(f'{target.registry}/'
-                        f'{target.repository_prefix}/test/s01@{_OTHER_DIGEST}'),
+            target_ref=(f'{target.registry}/{older_shard.repository_name}'
+                        f'@{_OTHER_DIGEST}'),
             state=models.ImageLocationState.READY.value,
             attempt_count=1,
             last_verified_at=1,
@@ -4710,6 +4863,13 @@ def test_inflight_delete_expiry_quarantines_before_late_completion(
         assert provider_call_started.wait(timeout=5)
         intent = topology_state.get_location(regional.id)
         assert intent is not None and intent.lease_kind == 'DELETE'
+        active = _refresh_runtime_attestation(
+            active,
+            profile,
+            profile.targets[0],
+            backend='aws_vm',
+            runtime_id=profile.targets[0].region,
+            now=current + 1)
         demand = _warming_demand(active,
                                  publication_record,
                                  regional,
@@ -4801,6 +4961,17 @@ def test_new_runtime_demand_readmits_evicted_location(
     assert evicted.state == models.ImageLocationState.EVICTED
     assert evicted.reserved_declared_bytes == 0
     target = profile.targets[0]
+    with image_database.connect() as connection:
+        current = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
+    active = _refresh_runtime_attestation(active,
+                                          profile,
+                                          target,
+                                          backend='aws_vm',
+                                          runtime_id=target.region,
+                                          now=current)
     resources = types.SimpleNamespace(container_image=models.ContainerImage(
         release='boltz-l4', distribution=profile.name))
     metadata = _runtime_resolution(resources, profile, active,

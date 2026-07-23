@@ -1208,6 +1208,87 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(len(scale_downs), 2)
         self.assertTrue(set(scale_downs).issubset({1, 2, 3, 4, 5}))
 
+    def test_logical_rolling_update_uses_old_exact_card_evidence(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      min_replicas=1,
+                                      max_replicas=64,
+                                      replica_unit='logical',
+                                      reserved_capacity_fill=True,
+                                      max_scale_up_rate_percentage=20,
+                                      scale_up_rate_min_replicas=10,
+                                      scale_up_rate_period_seconds=60)
+        catalog = {
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        }
+        autoscaler.set_configured_accelerator_shapes(catalog)
+        now = time.time()
+        old = [_replica(i, card='L4', version=1) for i in range(1, 58)]
+        for info in old:
+            info.created_at = now - 10
+            info.get_spot_location.return_value = None
+        in_flight = {info.replica_id: 1 for info in old}
+        observed_slots = {info.replica_id: 1 for info in old}
+        _report(autoscaler,
+                in_flight=in_flight,
+                observed_slots=observed_slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        self.assertEqual(_decisions(autoscaler, old), [])
+        self.assertEqual(autoscaler.target_num_replicas, 57)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 57})
+
+        autoscaler.update_version_and_accelerator_shapes(
+            2,
+            _spec(knob=1,
+                  min_replicas=1,
+                  max_replicas=64,
+                  replica_unit='logical',
+                  reserved_capacity_fill=True,
+                  max_scale_up_rate_percentage=20,
+                  scale_up_rate_min_replicas=10,
+                  scale_up_rate_period_seconds=60),
+            serve_utils.UpdateMode.ROLLING, catalog)
+        reserved_keys = [{
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+            'accelerators': {
+                card: 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        } for card in ('A100', 'A100-80GB')]
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 7})
+        for _ in range(2):
+            autoscaler.collect_reserved_capacity(7, reserved_keys, now, grant=7)
+        _report(autoscaler,
+                in_flight=in_flight,
+                observed_slots=observed_slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=2)
+
+        decisions = _decisions(autoscaler, old, active_versions=(1,))
+
+        self.assertEqual(_scale_downs(decisions), [])
+        scale_ups = _scale_ups(decisions)
+        self.assertEqual(len(scale_ups), 1)
+        self.assertEqual(
+            scale_ups[0].target,
+            autoscalers.LogicalScaleTarget(
+                version=2,
+                reconcile_generation=2,
+                target_capacity=10,
+                target_capacity_by_accelerator=(('L4', 10),),
+                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
+        self.assertEqual(autoscaler.info()['fill_target'], 7)
+
     def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
         autoscaler = _make_autoscaler(max_replicas=20,
                                       reserved_capacity_fill=True)
@@ -1409,10 +1490,10 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 generation=2)
         decisions = _decisions(autoscaler, replicas)
 
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 5,
-            'A100': 5,
-        })
+        # Demand attribution changes immediately. Only the private actuation
+        # target is wave-limited while replacement A100s are cold.
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 10})
         self.assertEqual(len(decisions), 1)
         target = decisions[0].target
         self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
@@ -1438,10 +1519,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                     compatibility_complete=True,
                     generation=3)
             cooldown = _decisions(autoscaler, transition_replicas)
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 5,
-            'A100': 5,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 10})
         self.assertEqual(cooldown, [])
 
         with mock.patch.object(autoscalers.time, 'time', return_value=161.0):
@@ -1485,10 +1564,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         decisions = _decisions(autoscaler, replicas)
 
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 5,
-            'A100': 5,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 10})
         self.assertEqual(len(decisions), 1)
         self.assertEqual(
             dict(decisions[0].target.target_capacity_by_accelerator), {
@@ -2036,6 +2113,52 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertGreaterEqual(
             autoscaler.target_num_replicas_by_accelerator['A100'], 1)
 
+    def test_all_compatible_restart_does_not_rebuild_a100_demand(self):
+        autoscaler = _make_autoscaler(max_replicas=1000,
+                                      replica_unit='logical',
+                                      downscale_delay_seconds=300,
+                                      max_scale_up_rate_percentage=20,
+                                      scale_up_rate_min_replicas=10,
+                                      scale_up_rate_period_seconds=60,
+                                      max_scale_down_rate_percentage=50)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+
+        # Production recovery shape: 47 demand-owned slots survive across all
+        # three cards, while the rest of the large warm fleet is independent
+        # reserved-fill supply. The controller-local card map starts empty.
+        replicas = []
+        replica_id = 1
+        demand_owned_left = {'L4': 20, 'A100': 18, 'A100-80GB': 9}
+        for card, count in [('L4', 122), ('A100', 55), ('A100-80GB', 22)]:
+            for _ in range(count):
+                replicas.append(
+                    _replica(replica_id,
+                             card=card,
+                             reserved_fill=demand_owned_left[card] <= 0))
+                demand_owned_left[card] -= 1
+                replica_id += 1
+        idle = {replica.replica_id: 0 for replica in replicas}
+        slots = {replica.replica_id: 1 for replica in replicas}
+        _report(autoscaler,
+                in_flight=idle,
+                observed_slots=slots,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 47)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 47})
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator, {})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(_scale_ups(decisions), [])
+
     def test_logical_ramped_restart_does_not_stall_empty_card_map(self):
         autoscaler = _make_autoscaler(max_replicas=20,
                                       replica_unit='logical',
@@ -2108,10 +2231,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                     compatibility_complete=True)
             first = _decisions(autoscaler, replicas)
 
-            self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-                'L4': 5,
-                'A100': 5,
-            })
+            self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                             {'A100': 10})
             self.assertEqual(len(first), 1)
             self.assertEqual(
                 dict(first[0].target.target_capacity_by_accelerator), {
@@ -2130,10 +2251,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                     generation=2)
             cooldown = _decisions(autoscaler, replicas)
 
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
-            'L4': 5,
-            'A100': 5,
-        })
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 10})
         self.assertEqual(len(cooldown), 1)
         self.assertEqual(
             dict(cooldown[0].target.target_capacity_by_accelerator), {
@@ -2370,6 +2489,42 @@ class TestLogicalScalingWaves(unittest.TestCase):
 
         self.assertEqual(autoscaler.target_num_replicas, 20)
 
+    def test_restart_adopts_old_version_capacity_before_latest_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.latest_version = 2
+        replicas = [_replica(i + 1, version=1) for i in range(50)]
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_restart_total_excludes_fill_and_retiring_rows(self):
+        autoscaler = self._ramped_autoscaler()
+        replicas = [
+            _replica(1, version=1),
+            _replica(2, version=1, reserved_fill=True),
+            _replica(3, version=2),
+        ]
+        replicas[2].status_property.is_scale_down = True
+
+        self.assertEqual(
+            autoscaler._total_demand_owned_logical_capacity(replicas), 1)
+
+    def test_held_target_completes_exact_card_map_past_current_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        old = [_replica(i + 1, card='L4', version=1) for i in range(50)]
+
+        limited, added = autoscaler._limit_logical_actuation_transition(
+            {'L4': 50}, 50, old, wave_budget=10)
+
+        self.assertEqual(limited, {'L4': 50})
+        self.assertEqual(added, 50)
+
     def test_twenty_percent_dominates_floor_for_large_fleet(self):
         autoscaler = self._ramped_autoscaler()
         autoscaler.target_num_replicas = 100
@@ -2401,10 +2556,18 @@ class TestLogicalScalingWaves(unittest.TestCase):
                 compatibility_complete=True)
 
         candidate = {'L4': 103, 'A100': 106}
+
+        def calculate_target(*_args, **kwargs):
+            result = dict(candidate)
+            adopted = kwargs.get('min_replicas_override')
+            if adopted is not None and sum(result.values()) < adopted:
+                result['L4'] += adopted - sum(result.values())
+            return result, True
+
         with mock.patch.object(
                 autoscaler,
                 '_calculate_concurrency_target_by_accelerator',
-                return_value=(candidate, True)), mock.patch.object(
+                side_effect=calculate_target), mock.patch.object(
                     autoscaler, '_outstanding_work', return_value=188.1
                 ), mock.patch.object(
                     autoscaler,
@@ -2462,10 +2625,18 @@ class TestLogicalScalingWaves(unittest.TestCase):
                 compatibility_complete=True)
 
         candidate = {'A100': 106}
+
+        def calculate_target(*_args, **kwargs):
+            result = dict(candidate)
+            adopted = kwargs.get('min_replicas_override')
+            if adopted is not None and sum(result.values()) < adopted:
+                result['L4'] = adopted - sum(result.values())
+            return result, True
+
         with mock.patch.object(
                 autoscaler,
                 '_calculate_concurrency_target_by_accelerator',
-                return_value=(candidate, True)), mock.patch.object(
+                side_effect=calculate_target), mock.patch.object(
                     autoscaler, '_outstanding_work', return_value=106.0
                 ), mock.patch.object(
                     autoscaler,

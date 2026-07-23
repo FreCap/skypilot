@@ -17,12 +17,14 @@ Logic-only: no assertions on log or exception message text.
 # pylint: disable=unused-argument,use-implicit-booleaness-not-comparison
 import asyncio
 import inspect
+import json
 import pickle
 from unittest import mock
 
 import aiohttp
 import fastapi
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 from sky.serve import constants
@@ -553,35 +555,6 @@ def test_stack_streaming_response_passes_through(monkeypatch):
     assert client.get('/stream').status_code == 401
 
 
-def test_response_time_stack_includes_auth_and_excludes_operations(monkeypatch):
-    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
-    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
-    lb = _make_lb()
-    lb._app.add_middleware(load_balancer._InboundAuthMiddleware)
-    lb._app.add_middleware(load_balancer._ResponseTimeMiddleware,
-                           aggregator=lb._request_aggregator)
-
-    async def _predict():
-        return {'ok': True}
-
-    async def _health():
-        return {'ok': True}
-
-    lb._app.add_api_route('/predict', _predict, methods=['GET'])
-    lb._app.add_api_route('/_lb/health', _health, methods=['GET'])
-    client = TestClient(lb._app)
-
-    assert client.get('/predict',
-                      headers=_edge_auth('s3cret')).status_code == 200
-    assert client.get('/predict').status_code == 401
-    assert client.get('/_lb/health').status_code == 200
-
-    bucket = lb._request_aggregator.response_time_history_snapshot(
-    )['buckets'][0]
-    assert sum(bucket['status_class_counts']['2xx']) == 1
-    assert sum(bucket['status_class_counts']['4xx']) == 1
-
-
 def test_request_aggregator_is_bounded():
     # Regression: retaining the batch across a failed sync must not grow without
     # bound. The aggregator keeps at most LB_REQUEST_TIMESTAMP_CAP samples.
@@ -663,40 +636,256 @@ def test_rejection_history_is_acknowledged_independently(monkeypatch):
     }]
 
 
-def test_response_time_history_uses_fixed_status_histograms(monkeypatch):
+def test_prediction_time_history_uses_fixed_outcome_histograms(monkeypatch):
     monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
     agg = serve_utils.RequestTimestamp()
 
-    agg.add_response_time(0.1, 200)
-    agg.add_response_time(0.11, 204)
-    agg.add_response_time(30.0, 404)
-    agg.add_response_time(3601.0, 503)
+    agg.add_prediction_time(0.1, 'succeeded')
+    agg.add_prediction_time(0.11, 'succeeded')
+    agg.add_prediction_time(30.0, 'failed')
+    agg.add_prediction_time(3601.0, 'failed')
 
-    snapshot = agg.response_time_history_snapshot()
+    snapshot = agg.prediction_time_history_snapshot()
     assert snapshot['bucket_seconds'] == 60
     assert snapshot['histogram_version'] == 1
     bucket = snapshot['buckets'][0]
     assert bucket['bucket_start'] == 120
-    assert bucket['status_class_counts']['2xx'][:2] == [1, 1]
-    assert sum(bucket['status_class_counts']['2xx']) == 2
-    assert bucket['status_class_counts']['4xx'][7] == 1
-    assert bucket['status_class_counts']['5xx'][-1] == 1
+    assert bucket['outcome_counts']['succeeded'][:2] == [1, 1]
+    assert sum(bucket['outcome_counts']['succeeded']) == 2
+    assert bucket['outcome_counts']['failed'][7] == 1
+    assert bucket['outcome_counts']['failed'][-1] == 1
 
-    agg.mark_response_time_history_accepted(snapshot)
-    assert agg.response_time_history_snapshot() is None
+    agg.mark_prediction_time_history_accepted(snapshot)
+    assert agg.prediction_time_history_snapshot() is None
 
 
-def test_response_time_ack_preserves_completion_during_sync(monkeypatch):
+def test_prediction_time_ack_preserves_completion_during_sync(monkeypatch):
     monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
     agg = serve_utils.RequestTimestamp()
-    agg.add_response_time(1.0, 200)
-    snapshot = agg.response_time_history_snapshot()
+    agg.add_prediction_time(1.0, 'succeeded')
+    snapshot = agg.prediction_time_history_snapshot()
 
-    agg.add_response_time(2.0, 200)
-    agg.mark_response_time_history_accepted(snapshot)
+    agg.add_prediction_time(2.0, 'succeeded')
+    agg.mark_prediction_time_history_accepted(snapshot)
 
-    pending = agg.response_time_history_snapshot()['buckets'][0]
-    assert sum(pending['status_class_counts']['2xx']) == 2
+    pending = agg.prediction_time_history_snapshot()['buckets'][0]
+    assert sum(pending['outcome_counts']['succeeded']) == 2
+
+
+def test_async_prediction_status_uses_reported_time_and_deduplicates(
+        monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    body = (b'{"request_id":"job-1","status":"SUCCEEDED",'
+            b'"processing_time_ms":5000}')
+
+    lb._record_async_prediction_status(body, '')
+    lb._record_async_prediction_status(body, '')
+    lb._record_async_prediction_status(
+        b'{"request_id":"job-2","status":"FAILED",'
+        b'"processing_time_ms":30000}', '')
+    lb._record_async_prediction_status(
+        b'{"request_id":"job-3","status":"IN_PROGRESS",'
+        b'"processing_time_ms":1}', '')
+
+    counts = lb._request_aggregator.prediction_time_history_snapshot(
+    )['buckets'][0]['outcome_counts']
+    assert counts['succeeded'][5] == 1
+    assert counts['failed'][7] == 1
+    assert sum(counts['succeeded']) + sum(counts['failed']) == 2
+
+
+def test_request_action_skips_oversized_json_without_parsing(monkeypatch):
+    lb = _make_lb()
+    body = b'x' * (constants.LB_ASYNC_ACTION_BODY_MAX_BYTES + 1)
+    delivered = False
+
+    async def _receive():
+        nonlocal delivered
+        if delivered:
+            return {'type': 'http.disconnect'}
+        delivered = True
+        return {
+            'type': 'http.request',
+            'body': body,
+            'more_body': False,
+        }
+
+    request = fastapi.Request(
+        {
+            'type': 'http',
+            'method': 'POST',
+            'scheme': 'http',
+            'server': ('load-balancer', 80),
+            'path': '/predict',
+            'raw_path': b'/predict',
+            'query_string': b'',
+            'headers': [
+                (b'content-type', b'application/json'),
+                (b'content-length', str(len(body)).encode()),
+            ],
+        }, _receive)
+    monkeypatch.setattr(load_balancer.json, 'loads',
+                        lambda _: pytest.fail('oversized body was parsed'))
+
+    assert _run(lb._request_action(request)) is None
+    assert _run(request.body()) == body
+
+
+def test_proxy_records_sync_and_terminal_async_but_not_async_ack(monkeypatch):
+
+    async def _run_test():
+        monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+        lb = _make_lb()
+        url = 'http://worker:8000'
+        responses = [
+            (200, {
+                'result': 'ok'
+            }),
+            (202, {
+                'request_id': 'job-1',
+                'status': 'QUEUED',
+            }),
+            (202, {
+                'request_id': 'job-header',
+                'status': 'QUEUED',
+            }),
+            (200, {
+                'request_id': 'job-1',
+                'status': 'SUCCEEDED',
+                'processing_time_ms': 5000,
+            }),
+            (200, {
+                'request_id': 'job-2',
+                'status': 'SUCCEEDED',
+                'processing_time_ms': 1,
+                'padding': 'x' * constants.LB_ASYNC_STATUS_BODY_MAX_BYTES,
+            }),
+            (400, {
+                'request_id': 'job-3',
+                'status': 'FAILED',
+                'processing_time_ms': 1,
+            }),
+            (500, {
+                'error': 'prediction failed',
+            }),
+            (503, {
+                'error': 'warming',
+            }),
+            (200, {
+                'request_id': 'job-gzip',
+                'status': 'SUCCEEDED',
+                'processing_time_ms': 1,
+            }, {
+                'content-encoding': 'gzip',
+            }),
+        ]
+
+        async def _handler(request):
+            del request
+            response_spec = responses.pop(0)
+            status_code, payload = response_spec[:2]
+            headers = {'content-type': 'application/json'}
+            if len(response_spec) == 3:
+                headers.update(response_spec[2])
+            return httpx.Response(status_code,
+                                  headers=headers,
+                                  stream=httpx.ByteStream(
+                                      json.dumps(payload).encode('utf-8')))
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(_handler),
+                                   base_url=url)
+        lb._client_pool[url] = client
+        lb._load_balancing_policy.set_ready_replicas([url])
+
+        def _request(body, *, job_id=None):
+            delivered = False
+
+            async def _receive():
+                nonlocal delivered
+                if delivered:
+                    return {'type': 'http.disconnect'}
+                delivered = True
+                return {
+                    'type': 'http.request',
+                    'body': body,
+                    'more_body': False,
+                }
+
+            headers = [(b'content-type', b'application/json')]
+            if job_id is not None:
+                headers.append((constants.LB_JOB_ID_HEADER.lower().encode(),
+                                job_id.encode()))
+            return fastapi.Request(
+                {
+                    'type': 'http',
+                    'method': 'POST',
+                    'scheme': 'http',
+                    'server': ('load-balancer', 80),
+                    'path': '/predict',
+                    'raw_path': b'/predict',
+                    'query_string': b'',
+                    'headers': headers,
+                }, _receive)
+
+        sync_response = await lb._proxy_request_to(url, _request(b'{"x":1}'))
+        assert not isinstance(sync_response, Exception)
+        async for _ in sync_response.body_iterator:
+            pass
+
+        async_ack = await lb._proxy_request_to(
+            url, _request(b'{"action":"async_predict","request_id":"job-1"}'))
+        assert not isinstance(async_ack, Exception)
+        async for _ in async_ack.body_iterator:
+            pass
+        header_async_ack = await lb._proxy_request_to(
+            url, _request(b'{"request_id":"job-header"}', job_id='job-header'))
+        assert not isinstance(header_async_ack, Exception)
+        async for _ in header_async_ack.body_iterator:
+            pass
+        async_status = await lb._proxy_request_to(
+            url, _request(b'{"action":"async_status","request_id":"job-1"}'))
+        assert not isinstance(async_status, Exception)
+        async for _ in async_status.body_iterator:
+            pass
+        oversized_status = await lb._proxy_request_to(
+            url, _request(b'{"action":"async_status","request_id":"job-2"}'))
+        assert not isinstance(oversized_status, Exception)
+        forwarded_body = bytearray()
+        async for chunk in oversized_status.body_iterator:
+            forwarded_body.extend(chunk)
+        assert len(forwarded_body) > constants.LB_ASYNC_STATUS_BODY_MAX_BYTES
+        rejected_status = await lb._proxy_request_to(
+            url, _request(b'{"action":"async_status","request_id":"job-3"}'))
+        assert not isinstance(rejected_status, Exception)
+        assert rejected_status.status_code == 400
+        async for _ in rejected_status.body_iterator:
+            pass
+        failed_sync = await lb._proxy_request_to(url, _request(b'{"x":2}'))
+        assert not isinstance(failed_sync, Exception)
+        assert failed_sync.status_code == 500
+        async for _ in failed_sync.body_iterator:
+            pass
+        lb._retriable_status_codes = frozenset({503})
+        retriable_sync = await lb._proxy_request_to(url, _request(b'{"x":3}'))
+        assert isinstance(retriable_sync, load_balancer._RetriableStatusError)
+        lb._retriable_status_codes = frozenset()
+        compressed_status = await lb._proxy_request_to(
+            url,
+            _request(b'{"action":"async_status",'
+                     b'"request_id":"job-gzip"}'))
+        assert not isinstance(compressed_status, Exception)
+        async for _ in compressed_status.body_iterator:
+            pass
+        await client.aclose()
+
+        snapshot = lb._request_aggregator.prediction_time_history_snapshot()
+        counts = snapshot['buckets'][0]['outcome_counts']
+        assert sum(counts['succeeded']) == 2
+        assert counts['succeeded'][5] == 1
+        assert sum(counts['failed']) == 1
+
+    asyncio.run(_run_test())
 
 
 def test_terminal_rejection_feeds_exact_history(monkeypatch):
@@ -789,26 +978,26 @@ def test_request_history_requires_independent_controller_ack(monkeypatch):
     assert lb._request_aggregator.request_history_snapshot() is None
 
 
-def test_response_time_history_requires_new_controller_ack(monkeypatch):
+def test_prediction_time_history_requires_new_controller_ack(monkeypatch):
     monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
     lb = _make_lb()
-    lb._request_aggregator.add_response_time(1.0, 200)
+    lb._request_aggregator.add_prediction_time(1.0, 'succeeded')
     captured = {}
 
     _sync_once(monkeypatch, lb, 200, captured)
 
-    assert captured['json']['response_time_history'] is not None
-    assert lb._request_aggregator.response_time_history_snapshot() is not None
+    assert captured['json']['prediction_time_history'] is not None
+    assert lb._request_aggregator.prediction_time_history_snapshot() is not None
 
     captured = {
         'response_json': {
             'replica_info': {},
             'routing_spec': None,
-            'response_time_history_accepted': True,
+            'prediction_time_history_accepted': True,
         }
     }
     _sync_once(monkeypatch, lb, 200, captured)
-    assert lb._request_aggregator.response_time_history_snapshot() is None
+    assert lb._request_aggregator.prediction_time_history_snapshot() is None
 
 
 def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
@@ -849,7 +1038,7 @@ def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
         '/controller/load_balancer_request_history_sync')
     assert set(captured['json']) == {
         'request_history',
-        'response_time_history',
+        'prediction_time_history',
         'request_history_session_id',
         'lb_session_id',
     }

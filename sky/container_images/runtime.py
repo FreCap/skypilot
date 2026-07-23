@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import time
 import typing
 
 from sky.container_images import catalog_state
@@ -56,6 +55,8 @@ class _MetadataResolution:
     binding: models.RegistryAccessBinding | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
+    kubernetes_cluster_arn: str | None = None
+    kubernetes_node_role: str | None = None
     kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
     locality_rank: int = 0
     current_demand: demand_state.DemandRecord | None = None
@@ -132,9 +133,16 @@ def _target_for_placement(
             if binding_id is None:
                 continue
             binding = profile.bindings[binding_id]
-            if any(cluster.context == placement.region
-                   for cluster in binding.qualified_clusters):
-                matching_targets.append(candidate)
+            try:
+                models.qualified_eks_cluster_for_target(
+                    candidate,
+                    binding,
+                    placement.region,
+                    cluster_arn=placement.kubernetes_cluster_arn,
+                    node_role=placement.kubernetes_node_role)
+            except ValueError:
+                continue
+            matching_targets.append(candidate)
         if len(matching_targets) != 1:
             raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
         target = matching_targets[0]
@@ -157,7 +165,7 @@ def _runtime_binding(
     profile: models.ManagedRegistryProfile,
     target: models.ManagedRegistryTarget, placement: models.Placement
 ) -> tuple[models.RegistryAccessBinding, str | None, str | None, str | None,
-           tuple[tuple[str, str], ...]]:
+           str | None, str | None, tuple[tuple[str, str], ...]]:
     binding_id = target.runtime_binding(placement.backend)
     if binding_id is None:
         raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
@@ -165,6 +173,8 @@ def _runtime_binding(
     expected_host_image: str | None = None
     runtime_principal: str | None = None
     instance_profile: str | None = None
+    kubernetes_cluster_arn: str | None = None
+    kubernetes_node_role: str | None = None
     kubernetes_node_selector: tuple[tuple[str, str], ...] = ()
     if placement.backend == 'aws_vm':
         if (binding.kind
@@ -186,18 +196,21 @@ def _runtime_binding(
         if (binding.kind
                 != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY):
             raise ValueError('QUALIFICATION_FAILED')
-        qualified = next((item for item in binding.qualified_clusters
-                          if item.context == placement.region), None)
-        if qualified is None:
-            raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
-        expected_cluster_arn = qualified.cluster_arn
-        expected_node_role = qualified.node_role
+        try:
+            qualified = models.qualified_eks_cluster_for_target(
+                target,
+                binding,
+                placement.region,
+                cluster_arn=placement.kubernetes_cluster_arn,
+                node_role=placement.kubernetes_node_role)
+        except ValueError as error:
+            raise ValueError(
+                'QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED') from error
+        kubernetes_cluster_arn = qualified.cluster_arn
+        kubernetes_node_role = qualified.node_role
         kubernetes_node_selector = qualified.node_selector
-        if (placement.kubernetes_cluster_arn not in (None, expected_cluster_arn)
-                or placement.kubernetes_node_role
-                not in (None, expected_node_role)):
-            raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
     return (binding, expected_host_image, runtime_principal, instance_profile,
+            kubernetes_cluster_arn, kubernetes_node_role,
             kubernetes_node_selector)
 
 
@@ -288,30 +301,26 @@ def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
                                          placement.backend, binding.fingerprint,
                                          runtime_id)
     evidence = active.attestations.get(key)
-    current = int(time.time()) if now is None else now
-    eks_identity_matches = True
+    qualified_cluster: models.QualifiedKubernetesCluster | None = None
     if placement.backend == 'aws_eks':
-        qualified = next((item for item in binding.qualified_clusters
-                          if item.context == runtime_id), None)
-        eks_identity_matches = (
-            qualified is not None and isinstance(evidence, dict) and
-            evidence.get('cluster_arn') == qualified.cluster_arn and
-            evidence.get('node_role') == qualified.node_role and
-            evidence.get('node_selector') == dict(qualified.node_selector) and
-            isinstance(evidence.get('qualified_node_count'), int) and
-            evidence['qualified_node_count'] > 0 and
-            isinstance(evidence.get('qualified_node_set_hash'), str))
-    return (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
-            evidence.get('target_fingerprint') == target.target_fingerprint and
-            evidence.get('binding_fingerprint') == binding.fingerprint and
-            evidence.get('backend') == placement.backend and
-            evidence.get('runtime_id') == runtime_id and
-            eks_identity_matches and
-            (placement.kubernetes_cluster_arn is None or
-             evidence.get('cluster_arn') == placement.kubernetes_cluster_arn)
-            and isinstance(evidence.get('observed_at'), int) and
-            0 <= current - evidence['observed_at'] <=
-            profile.qualification.runtime_attestation_max_age_seconds)
+        try:
+            qualified_cluster = models.qualified_eks_cluster_for_target(
+                target,
+                binding,
+                runtime_id,
+                cluster_arn=placement.kubernetes_cluster_arn,
+                node_role=placement.kubernetes_node_role)
+        except ValueError:
+            return False
+    return models.runtime_attestation_matches(
+        profile,
+        target,
+        binding,
+        placement.backend,
+        runtime_id,
+        evidence,
+        as_of=now,
+        qualified_cluster=qualified_cluster)
 
 
 def _resolve_metadata(
@@ -432,6 +441,7 @@ def _resolve_metadata(
                 raise ValueError('IMAGE_DEMAND_TARGET_MISMATCH')
             target = matching_targets[0]
         (binding, expected_host_image, runtime_principal, instance_profile,
+         kubernetes_cluster_arn, kubernetes_node_role,
          kubernetes_node_selector) = _runtime_binding(profile, target,
                                                       placement)
         prepared = _pin_host_image(resources, placement, expected_host_image)
@@ -504,6 +514,8 @@ def _resolve_metadata(
         binding=binding,
         runtime_principal=runtime_principal,
         instance_profile=instance_profile,
+        kubernetes_cluster_arn=kubernetes_cluster_arn,
+        kubernetes_node_role=kubernetes_node_role,
         kubernetes_node_selector=(kubernetes_node_selector),
         locality_rank=locality_rank,
         current_demand=current_demand)
@@ -618,6 +630,8 @@ def resolve_for_placement(resources: resources_lib.Resources,
     binding = metadata.binding
     runtime_principal = metadata.runtime_principal
     instance_profile = metadata.instance_profile
+    kubernetes_cluster_arn = metadata.kubernetes_cluster_arn
+    kubernetes_node_role = metadata.kubernetes_node_role
     kubernetes_node_selector = metadata.kubernetes_node_selector
     platform = placement.platform or 'linux/amd64'
     location = metadata.location
@@ -655,7 +669,22 @@ def resolve_for_placement(resources: resources_lib.Resources,
         'region': placement.region,
         'backend': placement.backend,
         'platform': platform,
+        'runtime_binding_fingerprint': binding.fingerprint,
     }
+    if expected_host_image := dict(binding.qualified_node_images).get(
+            placement.region):
+        placement_payload['host_image_id'] = expected_host_image
+    if runtime_principal is not None:
+        placement_payload['runtime_principal'] = runtime_principal
+    if instance_profile is not None:
+        placement_payload['instance_profile'] = instance_profile
+    if kubernetes_cluster_arn is not None:
+        placement_payload['kubernetes_cluster_arn'] = kubernetes_cluster_arn
+    if kubernetes_node_role is not None:
+        placement_payload['kubernetes_node_role'] = kubernetes_node_role
+    if kubernetes_node_selector:
+        placement_payload['kubernetes_node_selector'] = list(
+            kubernetes_node_selector)
     if consumer.metadata:
         placement_payload['consumer'] = consumer.metadata
     demand = transactions.create_warming_demand_for_controller_epoch(

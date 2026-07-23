@@ -110,7 +110,7 @@ const OPTIONAL_ACCELERATOR_HISTORY_FIELDS = [
   ['cold_launch_authority', 'coldLaunchAuthority'],
 ];
 
-const RESPONSE_TIME_STATUS_CLASSES = ['1xx', '2xx', '3xx', '4xx', '5xx'];
+const PREDICTION_TIME_OUTCOMES = ['succeeded', 'failed'];
 
 export function normalizeAcceleratorBreakdown(value) {
   if (!value || typeof value !== 'object' || value.version !== 1) return null;
@@ -217,32 +217,33 @@ export function normalizeReplicaHistory(history) {
         })
         .filter(Boolean)
     : [];
-  const responseTimeHistogramVersion = Number(
-    history.response_time_histogram_version
+  const predictionTimeHistogramVersion = Number(
+    history.prediction_time_histogram_version
   );
-  const responseTimeBucketUpperBoundsSeconds = Array.isArray(
-    history.response_time_bucket_upper_bounds_seconds
+  const predictionTimeBucketUpperBoundsSeconds = Array.isArray(
+    history.prediction_time_bucket_upper_bounds_seconds
   )
-    ? history.response_time_bucket_upper_bounds_seconds.map(Number)
+    ? history.prediction_time_bucket_upper_bounds_seconds.map(Number)
     : [];
-  const responseTimeHistogramSupported =
-    responseTimeHistogramVersion === 1 &&
-    responseTimeBucketUpperBoundsSeconds.length > 0 &&
-    responseTimeBucketUpperBoundsSeconds.every(
+  const predictionTimeHistogramSupported =
+    predictionTimeHistogramVersion === 1 &&
+    predictionTimeBucketUpperBoundsSeconds.length > 0 &&
+    predictionTimeBucketUpperBoundsSeconds.every(
       (value, index) =>
         Number.isFinite(value) &&
         value > 0 &&
-        (index === 0 || value > responseTimeBucketUpperBoundsSeconds[index - 1])
+        (index === 0 ||
+          value > predictionTimeBucketUpperBoundsSeconds[index - 1])
     );
-  const responseTimeBucketCount =
-    responseTimeBucketUpperBoundsSeconds.length + 1;
-  const responseTimeSamples =
-    responseTimeHistogramSupported &&
-    Array.isArray(history.response_time_samples)
-      ? history.response_time_samples
+  const predictionTimeBucketCount =
+    predictionTimeBucketUpperBoundsSeconds.length + 1;
+  const predictionTimeSamples =
+    predictionTimeHistogramSupported &&
+    Array.isArray(history.prediction_time_samples)
+      ? history.prediction_time_samples
           .map((sample) => {
             const timestamp = Number(sample.timestamp);
-            const rawCounts = sample.status_class_counts;
+            const rawCounts = sample.outcome_counts;
             if (
               !Number.isFinite(timestamp) ||
               !rawCounts ||
@@ -251,17 +252,15 @@ export function normalizeReplicaHistory(history) {
             ) {
               return null;
             }
-            const statusClassCounts = {};
-            for (const statusClass of RESPONSE_TIME_STATUS_CLASSES) {
-              if (
-                !Object.prototype.hasOwnProperty.call(rawCounts, statusClass)
-              ) {
+            const outcomeCounts = {};
+            for (const outcome of PREDICTION_TIME_OUTCOMES) {
+              if (!Object.prototype.hasOwnProperty.call(rawCounts, outcome)) {
                 continue;
               }
-              const counts = rawCounts[statusClass];
+              const counts = rawCounts[outcome];
               if (
                 !Array.isArray(counts) ||
-                counts.length !== responseTimeBucketCount
+                counts.length !== predictionTimeBucketCount
               ) {
                 return null;
               }
@@ -273,10 +272,10 @@ export function normalizeReplicaHistory(history) {
               ) {
                 return null;
               }
-              statusClassCounts[statusClass] = normalizedCounts;
+              outcomeCounts[outcome] = normalizedCounts;
             }
-            return Object.keys(statusClassCounts).length
-              ? { timestamp, statusClassCounts }
+            return Object.keys(outcomeCounts).length
+              ? { timestamp, outcomeCounts }
               : null;
           })
           .filter(Boolean)
@@ -353,13 +352,13 @@ export function normalizeReplicaHistory(history) {
     windowEnd: Number(history.window_end) || null,
     samples,
     requestSamples,
-    responseTimeHistogramVersion: responseTimeHistogramSupported
-      ? responseTimeHistogramVersion
+    predictionTimeHistogramVersion: predictionTimeHistogramSupported
+      ? predictionTimeHistogramVersion
       : null,
-    responseTimeBucketUpperBoundsSeconds: responseTimeHistogramSupported
-      ? responseTimeBucketUpperBoundsSeconds
+    predictionTimeBucketUpperBoundsSeconds: predictionTimeHistogramSupported
+      ? predictionTimeBucketUpperBoundsSeconds
       : [],
-    responseTimeSamples,
+    predictionTimeSamples,
     autoscalerSamples,
     rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:

@@ -69,7 +69,7 @@ def _setup(monkeypatch,
                         lambda name, service_hash, pid, ip, port: owns_row)
     if latest_snapshot is _DEFAULT_SNAPSHOT:
         latest_snapshot = (1, _spec())
-    monkeypatch.setattr(serve_state, 'get_latest_committed_version_spec',
+    monkeypatch.setattr(serve_state, 'get_latest_applicable_version_spec',
                         lambda unused_name: latest_snapshot)
 
     spawn_calls = []
@@ -179,7 +179,7 @@ def test_respawn_db_error_retries_without_stale_spec(monkeypatch):
     def _db_error(unused_name):
         raise RuntimeError('db unavailable')
 
-    monkeypatch.setattr(serve_state, 'get_latest_committed_version_spec',
+    monkeypatch.setattr(serve_state, 'get_latest_applicable_version_spec',
                         _db_error)
     result = service._respawn_controller('svc',
                                          '127.0.0.1',
@@ -225,7 +225,7 @@ def test_respawn_refuses_live_child_before_any_side_effect(monkeypatch):
                                  killed=[])
     snapshot_calls = []
     monkeypatch.setattr(
-        serve_state, 'get_latest_committed_version_spec',
+        serve_state, 'get_latest_applicable_version_spec',
         lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
 
     result = service._respawn_controller('svc',
@@ -247,7 +247,7 @@ def test_respawn_refuses_missing_child_handle_before_any_side_effect(
                                  killed=[])
     snapshot_calls = []
     monkeypatch.setattr(
-        serve_state, 'get_latest_committed_version_spec',
+        serve_state, 'get_latest_applicable_version_spec',
         lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
 
     result = service._respawn_controller('svc',
@@ -287,7 +287,7 @@ def test_respawn_join_failure_is_fail_closed(monkeypatch):
                                  killed=[])
     snapshot_calls = []
     monkeypatch.setattr(
-        serve_state, 'get_latest_committed_version_spec',
+        serve_state, 'get_latest_applicable_version_spec',
         lambda unused_name: snapshot_calls.append(unused_name) or (1, _spec()))
 
     result = service._respawn_controller('svc',

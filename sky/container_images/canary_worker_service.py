@@ -61,10 +61,10 @@ class _FencedClient:
               args: tuple[Any, ...],
               kwargs: dict[str, Any],
               *,
-              deadline: int | None = None,
+              deadline: float | None = None,
               on_start: Callable[[], None] | None = None) -> Any:
         self._heartbeat.assert_owned()
-        if deadline is not None and int(time.time()) >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise ValueError('CANARY_TIMEOUT')
         if on_start is not None:
             on_start()
@@ -86,7 +86,7 @@ class _FencedClient:
 
         return call
 
-    def call_before_deadline(self, name: str, deadline: int,
+    def call_before_deadline(self, name: str, deadline: float,
                              on_start: Callable[[], None], *args: Any,
                              **kwargs: Any) -> Any:
         """Fences ownership, then deadline, immediately before create."""
@@ -153,6 +153,22 @@ def _attach_canary_child(operation: catalog_state.OperationRecord,
         raise worker_lease.LeaseLostError(
             'Canary operation lease or launch deadline was lost.')
     heartbeat.assert_owned()
+
+
+def _authorized_launch_deadline(
+        operation: catalog_state.OperationRecord, child_id: str,
+        heartbeat: worker_lease.LeaseHeartbeat) -> float:
+    """Maps the locked database deadline onto this process's monotonic clock."""
+    assert operation.lease_token is not None
+    started_at = time.monotonic()
+    heartbeat.assert_owned()
+    remaining = qualification.authorize_canary_launch(operation.id,
+                                                      operation.lease_token,
+                                                      child_id)
+    if remaining is None:
+        raise ValueError('CANARY_TIMEOUT')
+    heartbeat.assert_owned()
+    return started_at + remaining
 
 
 def _preflight_error(operation: catalog_state.OperationRecord,
@@ -319,6 +335,10 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             binding.canary_instance_type is None):
         raise _preflight_error(operation, 'QUALIFICATION_FAILED')
     try:
+        expected_profile_arn = models.ec2_instance_profile_arn(binding)
+    except ValueError as error:
+        raise _preflight_error(operation, 'QUALIFICATION_FAILED') from error
+    try:
         role = _canary_role(profile, binding)
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
@@ -327,7 +347,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     child_id = f'ec2:{target.region}:{operation.id}'
     persisted_child = operation.child_launch_id is not None
     _attach_canary_child(operation, child_id, heartbeat)
-    deadline = operation.teardown_deadline or int(time.time())
+    deadline: float | None = None
     ec2: _FencedClient | None = None
     instances: list[dict[str, Any]] = []
     instance_id: str | None = None
@@ -349,8 +369,9 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         launch_confirmed = bool(instances)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
-        if int(time.time()) >= deadline:
-            raise ValueError('CANARY_TIMEOUT')
+        if instances:
+            deadline = _authorized_launch_deadline(operation, child_id,
+                                                   heartbeat)
         iam = _assumed_client(role, 'iam', target.region, heartbeat)
         actual_role = _instance_profile_role(iam, binding.instance_profile)
         if actual_role != binding.principals[0]:
@@ -389,8 +410,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'SecurityGroupIds': list(
                     dict(binding.canary_security_groups)[target.region]),
             }
-            if int(time.time()) >= deadline:
-                raise ValueError('CANARY_TIMEOUT')
+            deadline = _authorized_launch_deadline(operation, child_id,
+                                                   heartbeat)
             response: dict[str, Any] = {}
             try:
                 response = ec2.call_before_deadline('run_instances', deadline,
@@ -403,6 +424,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             except Exception:  # pylint: disable=broad-except
                 # The stable ClientToken turns one bounded retry and every
                 # successor replay into readback of the same provider child.
+                deadline = _authorized_launch_deadline(operation, child_id,
+                                                       heartbeat)
                 response = ec2.call_before_deadline('run_instances', deadline,
                                                     mark_launch_attempted,
                                                     **kwargs)
@@ -413,7 +436,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             instances = [launched[0]]
             launch_confirmed = True
         instance_id = str(instances[0]['InstanceId'])
-        while int(time.time()) < deadline:
+        assert deadline is not None
+        while time.monotonic() < deadline:
             heartbeat.assert_owned()
             matching_instances = _tagged_instances(ec2, operation.id)
             if len(matching_instances) != 1:
@@ -421,9 +445,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             instance = matching_instances[0]
             actual_profile_arn = (instance.get('IamInstanceProfile') or
                                   {}).get('Arn')
-            if (not isinstance(actual_profile_arn, str) or
-                    not actual_profile_arn.endswith('/' +
-                                                    binding.instance_profile)):
+            if actual_profile_arn != expected_profile_arn:
                 raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             state = (instance.get('State') or {}).get('Name')
             if state in ('stopped', 'terminated'):
@@ -616,12 +638,12 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
     del revision
     if binding.kind != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
         raise _preflight_error(operation, 'QUALIFICATION_FAILED')
-    qualified = next((item for item in binding.qualified_clusters
-                      if item.context == payload['runtime_id'] and
-                      f':{target.region}:' in item.cluster_arn), None)
-    if qualified is None:
-        raise _preflight_error(operation,
-                               'QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
+    try:
+        qualified = models.qualified_eks_cluster_for_target(
+            target, binding, payload['runtime_id'])
+    except ValueError as error:
+        raise _preflight_error(
+            operation, 'QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED') from error
     context = qualified.context
     cluster_arn = qualified.cluster_arn
     namespace = qualified.namespace
@@ -641,7 +663,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
     core: _FencedClient | None = None
     create_attempted = False
     create_confirmed = False
-    deadline = operation.teardown_deadline or int(time.time())
+    deadline: float | None = None
     body = {
         'apiVersion': 'v1',
         'kind': 'Pod',
@@ -683,8 +705,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
 
     try:
         core = _kubernetes_core(context, heartbeat)
-        if int(time.time()) >= deadline:
-            raise ValueError('CANARY_TIMEOUT')
+        deadline = _authorized_launch_deadline(operation, child_id, heartbeat)
         eks = _assumed_client(role, 'eks', target.region, heartbeat)
         actual_cluster = eks.describe_cluster(name=cluster_name).get(
             'cluster', {})
@@ -699,8 +720,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
         node_count, node_set_hash = _qualified_eks_nodes(
             core, role, target, qualified, heartbeat)
-        if int(time.time()) >= deadline:
-            raise ValueError('CANARY_TIMEOUT')
+        deadline = _authorized_launch_deadline(operation, child_id, heartbeat)
         try:
             core.call_before_deadline('create_namespaced_pod',
                                       deadline,
@@ -716,7 +736,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
                 raise
             create_confirmed = True
         pod = None
-        while int(time.time()) < deadline:
+        while time.monotonic() < deadline:
             heartbeat.assert_owned()
             pod = core.read_namespaced_pod(
                 pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
@@ -816,11 +836,6 @@ def run_canary(operation: catalog_state.OperationRecord,
                         # and tear down its provider resource safely.
                         return False
                     raise
-                if (operation.teardown_deadline is not None and
-                        int(time.time()) >= operation.teardown_deadline and
-                        operation.child_launch_id is None):
-                    _fail_owned_canary(operation, 'CANARY_TIMEOUT', heartbeat)
-                    return False
                 if payload['backend'] == 'aws_vm':
                     evidence = _run_ec2_canary(operation, payload, revision,
                                                profile, target, binding, digest,

@@ -49,7 +49,7 @@ SPOT_JOBS_VERSION = '025'  # exact managed-job task identity lookups
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '024'  # SkyServe response-time history after image lookup
+SERVE_VERSION = '026'  # managed-image workspace and replica lookup
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

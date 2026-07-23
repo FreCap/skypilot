@@ -1,7 +1,7 @@
 """Add PostgreSQL SkyServe response-time history.
 
-Revision ID: 024
-Revises: 023
+Revision ID: 022
+Revises: 021
 Create Date: 2026-07-22
 
 """
@@ -13,8 +13,8 @@ from alembic import op
 from sky.serve import serve_history
 from sky.utils.db import db_utils
 
-revision: str = '024'
-down_revision: str | Sequence[str] | None = '023'
+revision: str = '022'
+down_revision: str | Sequence[str] | None = '021'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

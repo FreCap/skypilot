@@ -38,9 +38,10 @@ def runtime_ids(target: models.ManagedRegistryTarget, backend: str,
         return ((target.region,)
                 if target.region in dict(binding.qualified_node_images) else ())
     if backend == 'aws_eks':
-        return tuple(cluster.context
-                     for cluster in binding.qualified_clusters
-                     if f':{target.region}:' in cluster.cluster_arn)
+        return tuple(
+            cluster.context
+            for cluster in binding.qualified_clusters
+            if models.eks_cluster_region(cluster.cluster_arn) == target.region)
     return ()
 
 
@@ -417,6 +418,32 @@ def attach_canary_child(operation_id: str,
         return changed == 1
 
 
+def authorize_canary_launch(operation_id: str,
+                            lease_token: str,
+                            child_launch_id: str,
+                            *,
+                            now: int | None = None) -> int | None:
+    """Returns DB-authoritative launch time for the exact durable child."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = session.execute(
+            sqlalchemy.select(schema.operations).where(
+                schema.operations.c.id ==
+                operation_id).with_for_update()).mappings().first()
+        if row is None:
+            return None
+        current = catalog_state.database_epoch(session, now=now)
+        deadline = row['teardown_deadline']
+        if (str(row['kind']) != 'PROFILE_CANARY' or
+                str(row['state']) != models.ImageOperationState.RUNNING.value or
+                row['lease_token'] != lease_token or
+                row['child_launch_id'] != child_launch_id or
+                row['lease_expires_at'] is None or
+                int(row['lease_expires_at']) <= current or deadline is None or
+                int(deadline) <= current):
+            return None
+        return int(deadline) - current
+
+
 def complete_canary(operation: catalog_state.OperationRecord,
                     evidence: dict[str, Any],
                     *,
@@ -463,7 +490,10 @@ def complete_canary(operation: catalog_state.OperationRecord,
             session,
             profile_revision_id=revision.id,
             kind=key,
-            evidence=evidence,
+            evidence={
+                **evidence,
+                'observed_at': current,
+            },
             expected_generation=payload['desired_generation'],
             expected_config_hash=payload['config_hash'],
             now=current)

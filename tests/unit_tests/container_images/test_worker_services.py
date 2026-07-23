@@ -333,7 +333,7 @@ def test_canary_persists_only_closed_error_codes(
     failed.assert_called_once_with(operation, expected, teardown_verified=True)
 
 
-def test_deadline_expired_canary_without_child_terminalizes_without_provider(
+def test_database_expired_canary_terminalizes_as_timeout(
         monkeypatch: pytest.MonkeyPatch) -> None:
     operation = dataclasses.replace(_canary_operation(), teardown_deadline=1)
     monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
@@ -344,14 +344,14 @@ def test_deadline_expired_canary_without_child_terminalizes_without_provider(
             'backend': 'aws_vm'
         }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
          mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
-    run_ec2 = mock.Mock()
+    run_ec2 = mock.Mock(side_effect=ValueError('CANARY_TIMEOUT'))
     monkeypatch.setattr(canary_worker_service, '_run_ec2_canary', run_ec2)
     failed = mock.Mock(return_value=True)
     monkeypatch.setattr(canary_worker_service.qualification,
                         'fail_owned_canary', failed)
 
     assert not canary_worker_service.run_canary(operation)
-    run_ec2.assert_not_called()
+    run_ec2.assert_called_once()
     failed.assert_called_once_with(operation,
                                    'CANARY_TIMEOUT',
                                    teardown_verified=True)
@@ -763,7 +763,8 @@ def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
 def test_canary_create_rechecks_deadline_after_ownership_renewal(
         monkeypatch: pytest.MonkeyPatch, method_name: str) -> None:
     current = [99]
-    monkeypatch.setattr(canary_worker_service.time, 'time', lambda: current[0])
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
     provider = mock.Mock()
     heartbeat = mock.Mock(spec=['assert_owned'])
     heartbeat.assert_owned.side_effect = lambda: current.__setitem__(0, 100)
@@ -776,6 +777,96 @@ def test_canary_create_rechecks_deadline_after_ownership_renewal(
     started.assert_not_called()
     getattr(provider, method_name).assert_not_called()
     heartbeat.assert_owned.assert_called_once_with()
+
+
+def test_expired_database_authorization_blocks_ec2_create_with_slow_host_clock(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0]
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    authorize = mock.Mock(return_value=None)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch', authorize)
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: -1_000_000.0)
+
+    with pytest.raises(ValueError, match='CANARY_TIMEOUT'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    authorize.assert_called_once()
+    ec2.run_instances.assert_not_called()
+
+
+def test_expired_database_authorization_blocks_eks_create_with_slow_host_clock(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_eks')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    qualified = binding.qualified_clusters[0]
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+    }
+    core = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.kubernetes, 'core_api',
+                        lambda _context: core)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    assumed_client = mock.Mock(side_effect=AssertionError(
+        'provider preflight must not run after DB authorization expires'))
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
+                        assumed_client)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    authorize = mock.Mock(return_value=None)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch', authorize)
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: -1_000_000.0)
+
+    with pytest.raises(ValueError, match='CANARY_TIMEOUT'):
+        canary_worker_service._run_eks_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    authorize.assert_called_once()
+    assumed_client.assert_not_called()
+    core.create_namespaced_pod.assert_not_called()
 
 
 def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
@@ -796,8 +887,7 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
     instance = {
         'InstanceId': 'i-canary',
         'IamInstanceProfile': {
-            'Arn': ('arn:aws:iam::123456789012:instance-profile/' +
-                    binding.instance_profile),
+            'Arn': models.ec2_instance_profile_arn(binding),
         },
         'State': {
             'Name': 'stopped'
@@ -863,6 +953,9 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
                         'get_catalog_authority_id', lambda: 'catalog')
     monkeypatch.setattr(canary_worker_service.qualification,
                         'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
     heartbeat = _OwnedHeartbeat()
 
     evidence = canary_worker_service._run_ec2_canary(
@@ -968,6 +1061,9 @@ def test_eks_canary_fences_clients_and_verifies_teardown(
                         'get_catalog_authority_id', lambda: 'catalog')
     monkeypatch.setattr(canary_worker_service.qualification,
                         'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
     heartbeat = _OwnedHeartbeat()
 
     evidence = canary_worker_service._run_eks_canary(operation, payload,

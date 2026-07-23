@@ -12,7 +12,7 @@ import { DemandPressureCard } from '@/components/serve-demand-pressure';
 import { AcceleratorHistoryCard } from '@/components/serve-accelerator-history';
 import { ReplicaHistoryCard } from '@/components/serve-replica-history';
 import { RequestHistoryCard } from '@/components/serve-request-history';
-import { ResponseTimeHistoryCard } from '@/components/serve-response-time-history';
+import { PredictionTimeHistoryCard } from '@/components/serve-prediction-time-history';
 
 export function ServeHistorySection({ history, loading = false }) {
   const [selection, setSelection] = useState({
@@ -44,7 +44,7 @@ export function ServeHistorySection({ history, loading = false }) {
         }
         loading={loading}
       />
-      <ResponseTimeHistoryCard
+      <PredictionTimeHistoryCard
         history={history}
         range={range}
         onRangeSelect={({ start, end }) =>

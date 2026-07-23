@@ -111,6 +111,9 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     bindings = config.parse_access_bindings(registry_config['access_bindings'])
     assert set(config.parse_profiles(registry_config['profiles'],
                                      bindings)) == {'gpu-production'}
+    ec2_binding = bindings['aws-vm-pullers']
+    assert models.ec2_instance_profile_arn(ec2_binding) == (
+        'arn:aws:iam::210987654321:instance-profile/SkyPilotNodeProfile')
 
     invalid = copy.deepcopy(registry_config)
     invalid['profiles']['gpu-production']['targets'][0]['runtime_pull'][
@@ -125,6 +128,13 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
         invalid_bindings = config.parse_access_bindings(
             invalid['access_bindings'])
         config.parse_profiles(invalid['profiles'], invalid_bindings)
+
+    invalid = copy.deepcopy(registry_config)
+    invalid['access_bindings']['aws-vm-pullers']['principals'] = [
+        'arn:aws:iam::not-an-account:role/SkyPilotNodeRole'
+    ]
+    with pytest.raises(ValueError, match='principal ARN'):
+        config.parse_access_bindings(invalid['access_bindings'])
 
 
 @pytest.mark.parametrize('mutation', ['empty', 'missing-region'])

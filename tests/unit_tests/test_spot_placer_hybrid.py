@@ -561,6 +561,16 @@ class TestMixedValidation:
                                                      k8s_spot=False),
                                           pool=False)
 
+    def test_validation_persists_inferred_resource_port(self):
+        from sky.serve import serve_utils
+        task = self._task('dynamic_fallback_per_gpu', k8s_spot=False)
+        assert task.service is not None
+        assert task.service.ports is None
+
+        serve_utils.validate_service_task(task, pool=False)
+
+        assert task.service.ports == '8080'
+
     def test_per_gpu_placer_rejects_multi_node_before_submission(self):
         from sky.serve import serve_utils
         task = self._task('dynamic_fallback_per_gpu', k8s_spot=False)

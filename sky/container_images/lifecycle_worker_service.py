@@ -415,15 +415,8 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
             runtime_ready = True
             for backend, binding_id in target.runtime_pull:
                 binding = profile.bindings[binding_id]
-                runtime_ids: tuple[str, ...]
-                if backend == 'aws_vm':
-                    runtime_ids = (target.region,)
-                else:
-                    runtime_ids = tuple(
-                        cluster.context
-                        for cluster in binding.qualified_clusters
-                        if f':{target.region}:' in cluster.cluster_arn)
-                for runtime_id in runtime_ids:
+                for runtime_id in qualification.runtime_ids(
+                        target, backend, binding):
                     runtime_key = models.profile_attestation_key(
                         'runtime', target.name, backend, binding.fingerprint,
                         runtime_id)

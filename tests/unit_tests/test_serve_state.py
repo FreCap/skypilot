@@ -527,6 +527,108 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
     ]
 
 
+def test_replica_index_migration_converges_predecessor_stamped_legacy_state(
+        tmp_path):
+    """Revision 026 repairs previews stamped past replica JSON revision 010."""
+    engine = create_engine(f'sqlite:///{tmp_path / "preview-serve.db"}')
+    metadata = sqlalchemy.MetaData()
+    legacy_replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('replica_info', sqlalchemy.LargeBinary),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    legacy = _replica(1, cluster_name='svc-1', version=3)
+    with engine.begin() as connection:
+        connection.execute(
+            legacy_replicas.insert().values(service_name='svc',
+                                            replica_id=1,
+                                            replica_info=pickle.dumps(legacy)))
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         '026')
+
+    inspector = sqlalchemy.inspect(engine)
+    columns = {column['name'] for column in inspector.get_columns('replicas')}
+    assert {
+        'replica_state_version',
+        'status',
+        'sky_down_status',
+        'version',
+        'cluster_name',
+        'created_at',
+        'is_spot',
+        'replica_state',
+    } <= columns
+    indexes = {
+        index['name']: index['column_names']
+        for index in inspector.get_indexes('replicas')
+    }
+    assert indexes['replicas_service_status_idx'] == ['service_name', 'status']
+    assert indexes['replicas_service_version_idx'] == [
+        'service_name', 'version'
+    ]
+    replicas = sqlalchemy.Table('replicas',
+                                sqlalchemy.MetaData(),
+                                autoload_with=engine)
+    with engine.connect() as connection:
+        row = connection.execute(sqlalchemy.select(replicas)).one()._mapping
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert row['version'] == 3
+    assert row['cluster_name'] == 'svc-1'
+    assert row['status'] == serve_state.ReplicaStatus.PENDING.value
+    assert row['replica_state_version'] == 1
+    assert row['replica_state'] is not None
+    assert revision == '026'
+
+
+def test_replica_index_migration_fails_closed_without_reconstructable_state(
+        tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "invalid-preview.db"}')
+    metadata = sqlalchemy.MetaData()
+    replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(replicas.insert().values(service_name='svc',
+                                                    replica_id=1,
+                                                    version=3))
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    with pytest.raises(RuntimeError, match='without legacy replica_info'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '026')
+
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert revision == '025'
+
+
 def test_elected_version_migration_backfills_latest_committed_version(
         tmp_path, monkeypatch):
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
@@ -2308,6 +2410,8 @@ class TestRecoveryVersionSelection:
             'submitted_yaml_content': 'submitted: v1',
             'created_at': 1001.0,
             'created_by': 'alice',
+            'quarantined_at': None,
+            'quarantine_reason': None,
         }, {
             'version': 2,
             'spec': 'spec-2',
@@ -2315,7 +2419,80 @@ class TestRecoveryVersionSelection:
             'submitted_yaml_content': 'submitted: v2',
             'created_at': 1002.0,
             'created_by': 'bob',
+            'quarantined_at': None,
+            'quarantine_reason': None,
         }]
+
+    def test_quarantine_is_durable_and_applicable_snapshot_skips_it(
+            self, _mock_serve_db):
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+
+        assert serve_state.quarantine_version('svc',
+                                              2,
+                                              'deterministic port failure',
+                                              quarantined_at=123.0)
+        assert serve_state.get_latest_committed_version('svc') == 2
+        assert serve_state.get_latest_committed_version_spec('svc') == (
+            2, 'spec-2')
+        assert serve_state.get_latest_applicable_version_spec('svc') == (
+            1, 'spec-1')
+        assert serve_state.get_latest_quarantined_version('svc') == {
+            'version': 2,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'deterministic port failure',
+        }
+
+        serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
+        assert serve_state.get_latest_applicable_version_spec('svc') == (
+            3, 'spec-3')
+
+    def test_quarantine_rejects_placeholder_and_is_idempotent(
+            self, _mock_serve_db):
+        assert serve_state.add_version('svc') == 1
+        assert not serve_state.quarantine_version('svc', 1, 'not committed')
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        assert serve_state.quarantine_version('svc',
+                                              1,
+                                              'first reason',
+                                              quarantined_at=123.0)
+        assert serve_state.quarantine_version('svc',
+                                              1,
+                                              'second reason',
+                                              quarantined_at=456.0)
+        assert serve_state.get_latest_quarantined_version('svc') == {
+            'version': 1,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'first reason',
+        }
+
+    def test_quarantine_is_fenced_by_controller_ownership(self, _mock_serve_db):
+        assert _add_minimal_service('svc-owner',
+                                    service_hash='incarnation-a',
+                                    controller_pid=123,
+                                    controller_ip='10.0.0.1')
+        serve_state.add_or_update_version('svc-owner', 2, 'spec-2', 'yaml: v2')
+
+        assert not serve_state.quarantine_version(
+            'svc-owner',
+            2,
+            'stale controller',
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(456, '10.0.0.2'))
+        assert serve_state.get_latest_quarantined_version('svc-owner') is None
+
+        assert serve_state.quarantine_version(
+            'svc-owner',
+            2,
+            'current controller',
+            quarantined_at=123.0,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(123, '10.0.0.1'))
+        assert serve_state.get_latest_quarantined_version('svc-owner') == {
+            'version': 2,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'current controller',
+        }
 
     def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
         serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')

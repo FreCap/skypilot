@@ -33,9 +33,9 @@ overprovisioned.
 
 ## Non-goals
 
-- Request latency percentiles, response-code histograms, and completion
-  counts. Those require request-completion instrumentation and a separate HA
-  aggregation contract.
+- Full HTTP latency and response-code histograms. Customer-facing prediction
+  duration is defined by the separate
+  `serve-prediction-time-history.md` contract.
 - A Prometheus dependency or a new background poller.
 - Historical reconstruction before this migration is deployed.
 
@@ -170,10 +170,9 @@ outages the history should expose. Adding target columns to physical replica
 snapshots was rejected because targets use logical capacity units for some
 services and are authored by the controller, not the API-server snapshotter.
 
-Latency, response outcomes, and completion throughput were deferred because
-they require completion-path hooks, streaming semantics, and histogram merge
-rules. They are not comparable in cost to the signals already carried by the
-sync channel.
+Prediction duration and outcomes were implemented later under the separate
+`serve-prediction-time-history.md` contract. They remain observability-only and
+are not autoscaler inputs.
 
 ## Changed-path-to-test matrix
 

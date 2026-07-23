@@ -122,11 +122,14 @@ def _select_and_lock_shard(
                 'REGISTRY_CAPACITY_EXHAUSTED')
 
 
-def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,
-                        location: sqlalchemy.engine.RowMapping,
-                        artifact: sqlalchemy.engine.RowMapping,
-                        demand: sqlalchemy.engine.RowMapping) -> dict[str, Any]:
-    """Reconstructs the only runtime plan allowed by durable catalog state."""
+def _runtime_contract(
+    *,
+    profile_row: sqlalchemy.engine.RowMapping,
+    target_fingerprint: str,
+    placement: dict[str, Any],
+) -> tuple[models.ManagedRegistryProfile, models.ManagedRegistryTarget, models.
+           RegistryAccessBinding, models.QualifiedKubernetesCluster | None]:
+    """Reconstructs one exact runtime tuple from locked durable state."""
     profile = models.ManagedRegistryProfile.from_snapshot(
         json.loads(str(profile_row['config_json'])))
     if (profile.name != str(profile_row['profile']) or
@@ -135,18 +138,98 @@ def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,
         raise ValueError('Runtime pull plan profile snapshot is inconsistent.')
     matching_targets = [
         target for target in (profile.canonical,) + profile.targets
-        if target.target_fingerprint == str(demand['target_fingerprint'])
+        if target.target_fingerprint == target_fingerprint
     ]
     if len(matching_targets) != 1:
         raise ValueError('Runtime pull plan target is not uniquely configured.')
     target = matching_targets[0]
-    placement = json.loads(str(demand['placement_json']))
-    backend = placement.get('backend')
+    backend_value = placement.get('backend')
     region = placement.get('region')
+    if (placement.get('provider') != 'aws' or not isinstance(region, str) or
+            not isinstance(backend_value, str) or
+            backend_value not in ('aws_vm', 'aws_eks')):
+        raise ValueError('Runtime pull plan placement is invalid.')
+    backend = backend_value
     binding_id = target.runtime_binding(backend)
     if binding_id is None:
         raise ValueError('Runtime pull plan binding is not configured.')
     binding = profile.bindings[binding_id]
+    if placement.get('runtime_binding_fingerprint') != binding.fingerprint:
+        raise ValueError('Runtime pull plan binding fingerprint changed.')
+    qualified: models.QualifiedKubernetesCluster | None = None
+    if backend == 'aws_vm':
+        expected_host_image = dict(binding.qualified_node_images).get(region)
+        if (binding.kind
+                != models.RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY or
+                expected_host_image is None or
+                placement.get('host_image_id') != expected_host_image or
+                placement.get('runtime_principal') != binding.principals[0] or
+                placement.get('instance_profile') != binding.instance_profile):
+            raise ValueError('Runtime pull plan EC2 tuple is not qualified.')
+    elif backend == 'aws_eks':
+        cluster_arn = placement.get('kubernetes_cluster_arn')
+        node_role = placement.get('kubernetes_node_role')
+        if not isinstance(cluster_arn, str) or not isinstance(node_role, str):
+            raise ValueError('Runtime pull plan EKS identity is incomplete.')
+        try:
+            qualified = models.qualified_eks_cluster_for_target(
+                target,
+                binding,
+                region,
+                cluster_arn=cluster_arn,
+                node_role=node_role)
+        except ValueError as error:
+            raise ValueError(
+                'Runtime pull plan EKS target is not qualified.') from error
+        durable_selector = placement.get('kubernetes_node_selector')
+        if (not isinstance(durable_selector, list) or
+                tuple(tuple(item) for item in durable_selector)
+                != qualified.node_selector):
+            raise ValueError('Runtime pull plan EKS node selector changed.')
+    else:
+        raise ValueError('Runtime pull plan backend is invalid.')
+    return profile, target, binding, qualified
+
+
+def _validate_runtime_attestation(
+    *,
+    profile_row: sqlalchemy.engine.RowMapping,
+    target_fingerprint: str,
+    placement: dict[str, Any],
+    now: int,
+) -> None:
+    """Authorizes a new demand against the exact locked runtime proof."""
+    profile, target, binding, qualified = _runtime_contract(
+        profile_row=profile_row,
+        target_fingerprint=target_fingerprint,
+        placement=placement)
+    backend = str(placement['backend'])
+    runtime_id = str(placement['region'])
+    key = models.profile_attestation_key('runtime', target.name, backend,
+                                         binding.fingerprint, runtime_id)
+    attestations = json.loads(str(profile_row['attestations_json']))
+    if not models.runtime_attestation_matches(profile,
+                                              target,
+                                              binding,
+                                              backend,
+                                              runtime_id,
+                                              attestations.get(key),
+                                              as_of=now,
+                                              qualified_cluster=qualified):
+        raise ValueError('QUALIFICATION_STALE')
+
+
+def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,
+                        location: sqlalchemy.engine.RowMapping,
+                        artifact: sqlalchemy.engine.RowMapping,
+                        demand: sqlalchemy.engine.RowMapping) -> dict[str, Any]:
+    """Reconstructs the only runtime plan allowed by durable catalog state."""
+    placement = json.loads(str(demand['placement_json']))
+    profile, target, binding, qualified = _runtime_contract(
+        profile_row=profile_row,
+        target_fingerprint=str(demand['target_fingerprint']),
+        placement=placement)
+    backend = placement['backend']
     runtime_principal: str | None = None
     instance_profile: str | None = None
     node_selector: list[tuple[str, str]] = []
@@ -156,13 +239,8 @@ def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,
         instance_profile = binding.instance_profile
         credential_helper = 'ecr-login'
     elif backend == 'aws_eks':
-        qualified = next((cluster for cluster in binding.qualified_clusters
-                          if cluster.context == region), None)
-        if qualified is None:
-            raise ValueError('Runtime pull plan EKS target is not qualified.')
+        assert qualified is not None
         node_selector = list(qualified.node_selector)
-    else:
-        raise ValueError('Runtime pull plan backend is invalid.')
     return {
         'version': 1,
         'reference': str(location['target_ref']),
@@ -1061,6 +1139,13 @@ def create_warming_demand_for_controller_epoch(
         if str(location['target_fingerprint']) != target_fingerprint:
             raise ValueError(
                 'Demand target fingerprint does not match location.')
+
+        def validate_runtime_attestation(current: int) -> None:
+            _validate_runtime_attestation(profile_row=profile_row,
+                                          target_fingerprint=target_fingerprint,
+                                          placement=placement,
+                                          now=current)
+
         return demand_state.create_demand_for_controller_epoch_in_session(
             session,
             authority_id=authority_id,
@@ -1080,7 +1165,8 @@ def create_warming_demand_for_controller_epoch(
             now=now,
             require_existing=(str(
                 profile_row['state']) == models.ImageProfileState.RETIRED.value
-                             ))
+                             ),
+            before_create=validate_runtime_attestation)
 
 
 def commit_ready_demand(*,

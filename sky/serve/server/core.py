@@ -239,6 +239,10 @@ def status(
               error for the pending version,
             'update_apply_failures': (Optional[int]) consecutive apply
               failures for the pending version,
+            'quarantined_version': (Optional[int]) latest deterministically
+              rejected committed version,
+            'quarantined_at': (Optional[float]) quarantine timestamp,
+            'quarantine_reason': (Optional[str]) deterministic failure reason,
             'replica_info': (List[Dict[str, Any]]) replica information,
         }
 

@@ -140,11 +140,8 @@ LB_REQUEST_HISTORY_BUCKET_SECONDS = 60
 LB_REQUEST_HISTORY_WINDOW_SECONDS = 60 * 60
 LB_REQUEST_HISTORY_MAX_BUCKETS = (
     LB_REQUEST_HISTORY_WINDOW_SECONDS // LB_REQUEST_HISTORY_BUCKET_SECONDS + 1)
-# Full SkyServe HTTP completion-time histogram. Bounds are deliberately fixed
-# and coarse: the product needs minute-level distributions, not exact
-# per-request durations. The final implicit bucket contains values above one
-# hour. Changing these values requires a new histogram version because stored
-# arrays are interpreted by index.
+# Legacy full-HTTP completion histogram retained for migration 022 and rolling
+# rollback compatibility. New load balancers do not emit this history.
 LB_RESPONSE_TIME_HISTOGRAM_VERSION = 1
 LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS = (
     0.1,
@@ -166,6 +163,44 @@ LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS = (
 LB_RESPONSE_TIME_STATUS_CLASSES = ('1xx', '2xx', '3xx', '4xx', '5xx')
 LB_RESPONSE_TIME_BUCKET_COUNT = (
     len(LB_RESPONSE_TIME_BUCKET_UPPER_BOUNDS_SECONDS) + 1)
+
+# Replica prediction-time histogram. Bounds are deliberately fixed and coarse:
+# the dashboard needs minute-level distributions, not exact per-request
+# durations. The final implicit bucket contains values above one hour. Changing
+# these values requires a new histogram version because stored arrays are
+# interpreted by index.
+LB_PREDICTION_TIME_HISTOGRAM_VERSION = 1
+LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS = (
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1200.0,
+    1800.0,
+    3600.0,
+)
+LB_PREDICTION_TIME_OUTCOMES = ('succeeded', 'failed')
+LB_PREDICTION_TIME_BUCKET_COUNT = (
+    len(LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS) + 1)
+# Header-free async protocol actions use small JSON envelopes. Bound action
+# detection so observability never parses a model-sized input on the LB event
+# loop. Platform-held async submissions are identified by their stable job
+# header and do not inspect the body at all.
+LB_ASYNC_ACTION_BODY_MAX_BYTES = 64 * 1024
+# Terminal async status bodies are small JSON objects. Forward larger bodies
+# unchanged, but do not retain them for observability parsing.
+LB_ASYNC_STATUS_BODY_MAX_BYTES = 64 * 1024
+# Bound process-local terminal request deduplication independently from request
+# rate and the model runtime's own completed-job cache.
+LB_ASYNC_PREDICTION_DEDUP_CAP = 100_000
 
 # [boltz fork] Compatibility time budget for controllers predating the
 # commit-then-reconcile update protocol. Their handler can wait on the

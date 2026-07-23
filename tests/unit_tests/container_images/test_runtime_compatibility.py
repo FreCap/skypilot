@@ -17,9 +17,11 @@ from sky import resources as resources_lib
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.container_images import catalog_state
+from sky.container_images import config
 from sky.container_images import consumers
 from sky.container_images import demand_state
 from sky.container_images import models
+from sky.container_images import qualification
 from sky.container_images import runtime
 from sky.container_images import topology_state
 from sky.container_images import transactions
@@ -139,6 +141,9 @@ def _active_revision(
             'binding_fingerprint': binding.fingerprint,
             'backend': 'aws_vm',
             'runtime_id': 'us-west-2',
+            'host_image_id': dict(binding.qualified_node_images)['us-west-2'],
+            'instance_profile_arn': models.ec2_instance_profile_arn(binding),
+            'actual_principal': binding.principals[0],
         }
     return topology_state.ProfileRevisionRecord(
         id=_REVISION_ID,
@@ -265,7 +270,6 @@ def test_qualifying_config_keeps_active_runtime_snapshot(
         allowed_profiles=(profile.name,),
         locality=models.Locality.PREFER)
     _wire_metadata(monkeypatch, configured, policy, active)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 1001)
     monkeypatch.setattr(
         runtime.topology_state, 'get_location_for_target',
         lambda **_kwargs: _location(profile, models.ImageLocationState.READY))
@@ -302,7 +306,6 @@ def test_ready_resolution_pins_exact_ami_helper_and_one_durable_demand(
         created,
         state=models.ImageDemandState.READY,
         pull_plan={'reference': location.target_ref}))
-    monkeypatch.setattr(runtime.time, 'time', lambda: now)
     monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
                         lambda **kwargs: location)
     monkeypatch.setattr(runtime.catalog_state,
@@ -358,7 +361,6 @@ def test_ready_snapshot_state_change_remains_typed(
     _wire_metadata(monkeypatch, profile, policy, active)
     location = _location(profile, models.ImageLocationState.READY)
     demand = _demand(profile)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
     monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
                         lambda **kwargs: location)
     monkeypatch.setattr(runtime.catalog_state,
@@ -427,7 +429,7 @@ def test_terminal_location_readmission_matches_demand_lifecycle(
         retry.assert_not_called()
 
 
-def test_metadata_filter_is_mutation_free_and_fails_closed_on_stale_binding(
+def test_metadata_filter_defers_attestation_age_to_demand_transaction(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     active = _active_revision(profile, observed_at=1)
@@ -440,7 +442,9 @@ def test_metadata_filter_is_mutation_free_and_fails_closed_on_stale_binding(
     reserve = mock.Mock(side_effect=AssertionError('metadata path mutated'))
     monkeypatch.setattr(runtime.transactions, 'reserve_regional_location',
                         reserve)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 100000)
+    monkeypatch.setattr(
+        runtime.topology_state, 'get_location_for_target',
+        lambda **_kwargs: _location(profile, models.ImageLocationState.READY))
     resources = _FakeResources(
         models.ContainerImage(release='boltz-l4', distribution=profile.name))
 
@@ -450,8 +454,53 @@ def test_metadata_filter_is_mutation_free_and_fails_closed_on_stale_binding(
                          region='us-west-2',
                          backend='aws_vm',
                          platform='linux/amd64'), 'research')
-    assert result is None
+    assert result is not None
     reserve.assert_not_called()
+
+
+def test_shared_multi_region_eks_binding_resolves_target_by_cluster_arn_region(
+        registry_config: dict[str, Any]) -> None:
+    west_cluster = registry_config['access_bindings']['aws-eks-pullers'][
+        'qualified_clusters'][0]
+    east_cluster = {
+        **west_cluster,
+        'context': 'boltz-east',
+        'cluster_arn': west_cluster['cluster_arn'].replace(
+            ':us-west-2:', ':us-east-1:').replace('/boltz-west', '/boltz-east'),
+    }
+    registry_config['access_bindings']['aws-eks-pullers'][
+        'qualified_clusters'].insert(0, east_cluster)
+    registry_config['profiles']['gpu-production']['canonical']['runtime_pull'][
+        'aws_eks'] = 'aws-eks-pullers'
+    bindings = config.parse_access_bindings(registry_config['access_bindings'])
+    shared_profile = config.parse_profiles(registry_config['profiles'],
+                                           bindings)['gpu-production']
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=shared_profile.name,
+        allowed_profiles=(shared_profile.name,),
+        locality=models.Locality.PREFER)
+
+    west = runtime._target_for_placement(
+        shared_profile, policy,
+        models.Placement(provider='aws',
+                         region='boltz-west',
+                         backend='aws_eks',
+                         platform='linux/amd64'))
+    east = runtime._target_for_placement(
+        shared_profile, policy,
+        models.Placement(provider='aws',
+                         region='boltz-east',
+                         backend='aws_eks',
+                         platform='linux/amd64'))
+
+    assert west.region == 'us-west-2'
+    assert east.region == 'us-east-1'
+    shared_binding = shared_profile.bindings['aws-eks-pullers']
+    assert qualification.runtime_ids(shared_profile.canonical, 'aws_eks',
+                                     shared_binding) == ('boltz-east',)
+    assert qualification.runtime_ids(west, 'aws_eks',
+                                     shared_binding) == ('boltz-west',)
 
 
 def test_managed_preferred_stale_route_preserves_direct_digest_path(
@@ -493,7 +542,6 @@ def test_managed_preferred_warming_route_preserves_original_aws_candidate(
         locality=models.Locality.PREFER)
     _wire_metadata(monkeypatch, profile, policy, active)
     warming = _location(profile, models.ImageLocationState.PENDING)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
     monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
                         lambda **_kwargs: warming)
     resources = _FakeResources(
@@ -542,7 +590,6 @@ def test_managed_preferred_readmitted_ready_route_applies_qualified_ami(
                                 state=models.ImageLocationState.READY,
                                 last_verified_at=1000)
     demand = _demand(profile)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
     monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
                         lambda **_kwargs: missing)
     monkeypatch.setattr(runtime.topology_state, 'retry_location',
@@ -596,7 +643,6 @@ def test_managed_preferred_locked_readiness_loss_returns_direct_resources(
     _wire_metadata(monkeypatch, profile, policy, active)
     location = _location(profile, models.ImageLocationState.READY)
     demand = _demand(profile)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 1000)
     monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
                         lambda **_kwargs: location)
     monkeypatch.setattr(runtime.catalog_state,
@@ -824,7 +870,6 @@ def test_live_demand_replays_its_retired_immutable_profile_snapshot(
         dataclasses.replace(pinned,
                             state=models.ImageDemandState.READY,
                             pull_plan=kwargs['pull_plan']))
-    monkeypatch.setattr(runtime.time, 'time', lambda: 100_000)
 
     resources = _FakeResources(
         models.ContainerImage(release='boltz-l4', distribution=profile.name))
@@ -859,7 +904,6 @@ def test_exact_host_image_mismatch_is_rejected_before_demand_mutation(
     mutate = mock.Mock(side_effect=AssertionError('unexpected demand'))
     monkeypatch.setattr(runtime.transactions,
                         'create_warming_demand_for_controller_epoch', mutate)
-    monkeypatch.setattr(runtime.time, 'time', lambda: 101)
     resources = _FakeResources(models.ContainerImage(release='boltz-l4',
                                                      distribution=profile.name),
                                image_id={'us-west-2': 'ami-unqualified'})

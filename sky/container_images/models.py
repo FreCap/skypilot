@@ -336,6 +336,18 @@ class QualifiedKubernetesCluster:
         object.__setattr__(self, 'node_selector', tuple(sorted(normalized)))
 
 
+def eks_cluster_region(cluster_arn: str) -> str | None:
+    """Returns the exact AWS region from a structurally valid EKS ARN."""
+    if not isinstance(cluster_arn, str):
+        return None
+    arn = cluster_arn.split(':', 5)
+    if (len(arn) != 6 or arn[0] != 'arn' or arn[2] != 'eks' or not arn[3] or
+            not arn[4] or not arn[5].startswith('cluster/') or
+            len(arn[5]) == len('cluster/')):
+        return None
+    return arn[3]
+
+
 _ACCESS_PURPOSES = frozenset({
     'source_read',
     'destination_write',
@@ -404,6 +416,13 @@ class RegistryAccessBinding:
                     'EC2 runtime binding requires one principal, '
                     'an instance profile, the ECR helper, regional '
                     'AMIs, and a canary launch authority.')
+            principal_arn = self.principals[0].split(':', 5)
+            if (len(principal_arn) != 6 or principal_arn[0] != 'arn' or
+                    principal_arn[2] != 'iam' or principal_arn[3] or
+                    re.fullmatch(r'[0-9]{12}', principal_arn[4]) is None or
+                    not principal_arn[5].startswith('role/') or
+                    len(principal_arn[5]) == len('role/')):
+                raise ValueError('Qualified EC2 principal ARN is invalid.')
             validate_control_plane_identifier(self.instance_profile,
                                               'Qualified EC2 instance profile')
             validate_control_plane_identifier(self.canary_authority,
@@ -463,6 +482,18 @@ class RegistryAccessBinding:
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True,
                        separators=(',', ':')).encode()).hexdigest()
+
+
+def ec2_instance_profile_arn(binding: RegistryAccessBinding) -> str:
+    """Returns the exact instance-profile ARN for a qualified EC2 binding."""
+    if (binding.kind != RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY or
+            binding.instance_profile is None or len(binding.principals) != 1):
+        raise ValueError('Registry runtime binding is not an EC2 binding.')
+    principal_arn = binding.principals[0].split(':', 5)
+    if len(principal_arn) != 6:
+        raise ValueError('Qualified EC2 principal ARN is invalid.')
+    return (':'.join(principal_arn[:5]) +
+            f':instance-profile/{binding.instance_profile}')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -684,9 +715,9 @@ class ManagedRegistryProfile:
                         runtime.qualified_node_images)):
                     raise ValueError('Registry EC2 runtime binding has no '
                                      'qualified tuple for the target region.')
-                if (backend == 'aws_eks' and
-                        not any(f':{target.region}:' in cluster.cluster_arn
-                                for cluster in runtime.qualified_clusters)):
+                if (backend == 'aws_eks' and not any(
+                        eks_cluster_region(cluster.cluster_arn) == target.region
+                        for cluster in runtime.qualified_clusters)):
                     raise ValueError('Registry EKS runtime binding has no '
                                      'qualified cluster in the target region.')
                 canary = (bindings.get(runtime.canary_authority)
@@ -799,6 +830,90 @@ class ManagedRegistryProfile:
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True,
                        separators=(',', ':')).encode()).hexdigest()
+
+
+def qualified_eks_cluster_for_target(
+    target: ManagedRegistryTarget,
+    binding: RegistryAccessBinding,
+    context: str,
+    *,
+    cluster_arn: str | None = None,
+    node_role: str | None = None,
+) -> QualifiedKubernetesCluster:
+    """Resolves one EKS runtime tuple by context and target AWS region."""
+    if binding.kind != RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
+        raise ValueError('Registry runtime binding is not an EKS binding.')
+    matches: list[QualifiedKubernetesCluster] = []
+    for candidate in binding.qualified_clusters:
+        if (eks_cluster_region(candidate.cluster_arn) != target.region or
+                candidate.context != context or
+                cluster_arn not in (None, candidate.cluster_arn) or
+                node_role not in (None, candidate.node_role)):
+            continue
+        matches.append(candidate)
+    if len(matches) != 1:
+        raise ValueError(
+            'EKS runtime context does not identify one target-region tuple.')
+    return matches[0]
+
+
+def runtime_attestation_matches(
+    profile: ManagedRegistryProfile,
+    target: ManagedRegistryTarget,
+    binding: RegistryAccessBinding,
+    backend: str,
+    runtime_id: str,
+    evidence: Any,
+    *,
+    as_of: int | None,
+    qualified_cluster: QualifiedKubernetesCluster | None = None,
+) -> bool:
+    """Checks one exact runtime proof, optionally at an authoritative time."""
+    if not isinstance(evidence, dict):
+        return False
+    observed_at = evidence.get('observed_at')
+    if (not isinstance(observed_at, int) or isinstance(observed_at, bool) or
+            evidence.get('status') != 'READY' or
+            evidence.get('target_fingerprint') != target.target_fingerprint or
+            evidence.get('binding_fingerprint') != binding.fingerprint or
+            evidence.get('backend') != backend or
+            evidence.get('runtime_id') != runtime_id):
+        return False
+    if (as_of is not None and not 0 <= as_of - observed_at <=
+            profile.qualification.runtime_attestation_max_age_seconds):
+        return False
+    if backend == 'aws_vm':
+        if (binding.kind != RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY
+                or binding.instance_profile is None or
+                len(binding.principals) != 1):
+            return False
+        try:
+            expected_profile_arn = ec2_instance_profile_arn(binding)
+        except ValueError:
+            return False
+        return (evidence.get('host_image_id') == dict(
+            binding.qualified_node_images).get(target.region) and
+                evidence.get('instance_profile_arn') == expected_profile_arn and
+                evidence.get('actual_principal') == binding.principals[0])
+    if backend != 'aws_eks' or binding.kind != (
+            RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY):
+        return False
+    if qualified_cluster is None:
+        try:
+            qualified_cluster = qualified_eks_cluster_for_target(
+                target, binding, runtime_id)
+        except ValueError:
+            return False
+    return (evidence.get('context') == qualified_cluster.context and
+            evidence.get('cluster_arn') == qualified_cluster.cluster_arn and
+            evidence.get('node_role') == qualified_cluster.node_role and
+            evidence.get('node_selector') == dict(
+                qualified_cluster.node_selector) and
+            isinstance(evidence.get('qualified_node_count'), int) and
+            not isinstance(evidence.get('qualified_node_count'), bool) and
+            evidence['qualified_node_count'] > 0 and
+            isinstance(evidence.get('qualified_node_set_hash'), str) and
+            bool(evidence['qualified_node_set_hash']))
 
 
 class WorkspaceImageMode(enum.Enum):
