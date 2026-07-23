@@ -10,6 +10,7 @@ import json
 import pathlib
 import socket
 import threading
+import types
 from types import SimpleNamespace
 from unittest import mock
 import urllib.error
@@ -824,18 +825,16 @@ def test_eks_dynamic_credential_refresh_observes_drain_before_raw_call(
     drain_event = threading.Event()
     initial = SimpleNamespace(api_client=mock.Mock(), list_node=mock.Mock())
     replacement = SimpleNamespace(api_client=mock.Mock(), list_node=mock.Mock())
-    build_count = 0
 
-    def build(*_args, **_kwargs):
-        nonlocal build_count
-        build_count += 1
-        if build_count == 1:
-            return initial, None
+    def build_isolated(*_args, **_kwargs):
         drain_event.set()
-        return replacement, None
+        return canary_worker_service.kubernetes._BoundedCoreApiResult(
+            replacement, None, None, None)
 
     monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
-                        build)
+                        lambda *_args, **_kwargs: (initial, None))
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        '_bounded_core_api_isolated', build_isolated)
     core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
         'bounded-context',
         exec_credential_timeout_seconds=2,
@@ -849,6 +848,7 @@ def test_eks_dynamic_credential_refresh_observes_drain_before_raw_call(
 
     initial.list_node.assert_not_called()
     replacement.list_node.assert_not_called()
+    initial.api_client.close.assert_called_once_with()
     replacement.api_client.close.assert_called_once_with()
 
 
@@ -861,18 +861,16 @@ def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(
                               delete_namespaced_pod=mock.Mock())
     replacement = SimpleNamespace(api_client=mock.Mock(),
                                   delete_namespaced_pod=mock.Mock())
-    build_count = 0
 
-    def build(*_args, **_kwargs):
-        nonlocal build_count
-        build_count += 1
-        if build_count == 1:
-            return initial, None
+    def build_isolated(*_args, **_kwargs):
         current[0] = 61.0
-        return replacement, None
+        return canary_worker_service.kubernetes._BoundedCoreApiResult(
+            replacement, None, None, None)
 
     monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
-                        build)
+                        lambda *_args, **_kwargs: (initial, None))
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        '_bounded_core_api_isolated', build_isolated)
     core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
         'bounded-context',
         exec_credential_timeout_seconds=2,
@@ -888,6 +886,7 @@ def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(
 
     initial.delete_namespaced_pod.assert_not_called()
     replacement.delete_namespaced_pod.assert_not_called()
+    initial.api_client.close.assert_called_once_with()
     replacement.api_client.close.assert_called_once_with()
 
 
@@ -1218,6 +1217,61 @@ class _OwnedHeartbeat(contextlib.AbstractContextManager['_OwnedHeartbeat']):
         return None
 
 
+def _canary_object_graph_contains(root: object, marker: str) -> bool:
+    seen: set[int] = set()
+    pending = [root]
+    while pending:
+        if len(seen) >= 50000:
+            raise AssertionError('Canary object-graph traversal exceeded.')
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, str):
+            if marker in current:
+                return True
+            continue
+        if isinstance(current, bytes):
+            if marker.encode() in current:
+                return True
+            continue
+        if current is None or isinstance(current, (bool, int, float, complex)):
+            continue
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+            continue
+        if isinstance(current, (list, tuple, set, frozenset)):
+            pending.extend(current)
+            continue
+        if isinstance(current, BaseException):
+            pending.extend(current.args)
+            pending.extend((current.__cause__, current.__context__))
+            pending.extend(vars(current).values())
+            continue
+        if isinstance(current, types.MethodType):
+            pending.append(current.__self__)
+            continue
+        if isinstance(current, (types.ModuleType, types.FunctionType, type)):
+            continue
+        try:
+            pending.extend(vars(current).values())
+        except TypeError:
+            continue
+    return False
+
+
+def _assert_canary_traceback_value_free(error: BaseException,
+                                        marker: str) -> None:
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_globals.get('__name__') == canary_worker_service.__name__:
+            for value in frame.f_locals.values():
+                assert not _canary_object_graph_contains(value, marker)
+        traceback = traceback.tb_next
+
+
 def test_canary_provider_call_rechecks_lease_after_response() -> None:
     provider = mock.Mock()
     provider.describe_instances.return_value = {'Reservations': []}
@@ -1231,6 +1285,35 @@ def test_canary_provider_call_rechecks_lease_after_response() -> None:
 
     provider.describe_instances.assert_called_once_with()
     assert heartbeat.assert_owned.call_count == 2
+
+
+@pytest.mark.parametrize('provider_fails', (False, True),
+                         ids=('response', 'failure'))
+def test_canary_control_error_drops_losing_provider_state(
+        provider_fails: bool) -> None:
+    marker = 'LOSING_PROVIDER_SECRET'
+
+    class _Provider:
+
+        def describe_instances(self):
+            if provider_fails:
+                raise RuntimeError(marker)
+            return {'secret': marker}
+
+    provider = _Provider()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = (
+        None, worker_lease.LeaseLostError('canary lease lost'))
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(worker_lease.LeaseLostError) as exc_info:
+        client.describe_instances()
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
 
 
 def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
@@ -1283,6 +1366,32 @@ def test_canary_client_acquisition_rechecks_drain_inside_provider_fence(
                                               drain_event=drain_event)
 
     raw_started.assert_not_called()
+
+
+def test_canary_client_acquisition_drain_drops_losing_credential_error(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = 'LOSING_CREDENTIAL_SECRET'
+    drain_event = threading.Event()
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        del provider_fence
+        drain_event.set()
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested) as exc_info:
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              drain_event=drain_event)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_canary_traceback_value_free(error, marker)
 
 
 def test_canary_cleanup_client_acquisition_rechecks_shared_deadline(

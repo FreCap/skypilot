@@ -71,6 +71,19 @@ def _wait_for_canary_poll(drain_event: threading.Event | None) -> None:
         raise _CanaryDrainRequested()
 
 
+def _capture_provider_fence_error(
+        provider_fence: Callable[[], None]) -> BaseException | None:
+    """Returns a control error detached from any losing provider failure."""
+    try:
+        provider_fence()
+    except BaseException as error:  # pylint: disable=broad-exception-caught
+        error = error.with_traceback(None)
+        error.__cause__ = None
+        error.__context__ = None
+        return error
+    return None
+
+
 class _FencedClient:
     """Proves the canary lease around every provider SDK call."""
 
@@ -79,9 +92,18 @@ class _FencedClient:
         self._client = client
         self._heartbeat = heartbeat
 
+    def _call_target(self, method_name: str) -> Callable[..., Any] | None:
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            return None
+        value = getattr(self._client, method_name)
+        if not callable(value):
+            raise TypeError(
+                f'Provider attribute {method_name!r} is not callable.')
+        return value
+
     def _call(self,
               method_name: str,
-              value: Callable[..., Any],
+              value: Callable[..., Any] | None,
               args: tuple[Any, ...],
               kwargs: dict[str, Any],
               *,
@@ -102,34 +124,56 @@ class _FencedClient:
         if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
             return self._client.call_with_provider_fence(
                 method_name, provider_fence, on_start, *args, **kwargs)
+        assert value is not None
         if on_start is not None:
             on_start()
+        provider_error: Exception | None = None
+        result: Any = None
         try:
             result = value(*args, **kwargs)
-        except Exception:  # pylint: disable=broad-except
-            provider_fence()
-            raise
-        provider_fence()
+        except Exception as error:  # pylint: disable=broad-except
+            provider_error = error
+        if provider_error is not None:
+            control_error = _capture_provider_fence_error(provider_fence)
+            if control_error is not None:
+                provider_error = None
+                del value
+                args = ()
+                kwargs = {}
+                raise control_error.with_traceback(None) from None
+            raise provider_error
+        control_error = _capture_provider_fence_error(provider_fence)
+        if control_error is not None:
+            result = None
+            del value
+            args = ()
+            kwargs = {}
+            raise control_error.with_traceback(None) from None
         return result
 
     def __getattr__(self, name: str) -> Any:
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            if name == 'api_client':
+                return self._client.api_client
+
+            def kubernetes_call(*args: Any, **kwargs: Any) -> Any:
+                return self._call(name, None, args, kwargs)
+
+            return kubernetes_call
         value = getattr(self._client, name)
         if not callable(value):
             return value
 
-        def call(*args: Any, **kwargs: Any) -> Any:
+        def provider_call(*args: Any, **kwargs: Any) -> Any:
             return self._call(name, value, args, kwargs)
 
-        return call
+        return provider_call
 
     def call_while_not_draining(self, method_name: str,
                                 drain_event: threading.Event | None, *args: Any,
                                 **kwargs: Any) -> Any:
         """Rechecks drain after the lease fence and before the raw call."""
-        value = getattr(self._client, method_name)
-        if not callable(value):
-            raise TypeError(
-                f'Provider attribute {method_name!r} is not callable.')
+        value = self._call_target(method_name)
         return self._call(method_name,
                           value,
                           args,
@@ -140,10 +184,7 @@ class _FencedClient:
                              on_start: Callable[[], None], *args: Any,
                              **kwargs: Any) -> Any:
         """Fences ownership, then deadline, immediately before create."""
-        value = getattr(self._client, method_name)
-        if not callable(value):
-            raise TypeError(
-                f'Provider attribute {method_name!r} is not callable.')
+        value = self._call_target(method_name)
         return self._call(method_name,
                           value,
                           args,
@@ -154,10 +195,7 @@ class _FencedClient:
     def call_before_cleanup_deadline(self, method_name: str, deadline: float,
                                      *args: Any, **kwargs: Any) -> Any:
         """Fences ownership and cleanup budget immediately before the call."""
-        value = getattr(self._client, method_name)
-        if not callable(value):
-            raise TypeError(
-                f'Provider attribute {method_name!r} is not callable.')
+        value = self._call_target(method_name)
         return self._call(method_name,
                           value,
                           args,
@@ -206,15 +244,26 @@ def _assumed_client(role: aws.AwsRoleBinding,
             raise _CanaryCleanupDeadlineExceeded()
 
     provider_fence()
+    provider_error: Exception | None = None
+    client: Any | None = None
     try:
         client = aws.assumed_client(role,
                                     service,
                                     region,
                                     provider_fence=provider_fence)
-    except Exception:  # pylint: disable=broad-except
-        provider_fence()
-        raise
-    provider_fence()
+    except Exception as error:  # pylint: disable=broad-except
+        provider_error = error
+    if provider_error is not None:
+        control_error = _capture_provider_fence_error(provider_fence)
+        if control_error is not None:
+            provider_error = None
+            raise control_error.with_traceback(None) from None
+        raise provider_error
+    control_error = _capture_provider_fence_error(provider_fence)
+    if control_error is not None:
+        client = None
+        raise control_error.with_traceback(None) from None
+    assert client is not None
     return _FencedClient(client, heartbeat)
 
 
@@ -232,16 +281,13 @@ def _kubernetes_core(context: str,
             raise _CanaryCleanupDeadlineExceeded()
 
     provider_fence()
-    try:
-        core = kubernetes.provider_fenced_core_api(
-            context,
-            exec_credential_timeout_seconds=(
-                _KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS),
-            provider_fence=provider_fence)
-    except Exception:  # pylint: disable=broad-except
-        provider_fence()
-        raise
-    provider_fence()
+    # The bounded adaptor rechecks this fence after any credential failure and
+    # returns only a sanitized control exception when drain/deadline wins.
+    core = kubernetes.provider_fenced_core_api(
+        context,
+        exec_credential_timeout_seconds=(
+            _KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS),
+        provider_fence=provider_fence)
     return _FencedClient(core, heartbeat)
 
 

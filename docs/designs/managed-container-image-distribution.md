@@ -2292,26 +2292,65 @@ cleanup applies the same call-start ordering to its own bounded delete/read
 settling deadline. Its canary-specific Kubernetes client executes kubeconfig
 `exec` credentials with a 15-second subprocess timeout in an isolated process
 group. Concurrent bounded readers retain at most 1 MiB each from stdout and
-stderr; either overflow terminates the complete group. Timeout and overflow use
-bounded terminate-then-kill waits and always reap the direct child. No plugin
-stdout, stderr, decoder payload, or decoder exception may survive in the public
-exception, its cause, or its context; decode failures leave the handler before a
-fixed value-free error is raised. A descendant that inherited a pipe therefore
-cannot extend the credential budget or leak a credential or diagnostic secret.
+stderr. Each reader reports clean EOF, overflow, and read failure separately;
+overflow or any read failure terminates the complete group and fails closed.
+Timeout, overflow, and read failure use bounded terminate-then-kill waits and
+always reap the direct child. Reader threads catch every exception category, so
+no unexpected reader failure can accept a buffered prefix or reach
+`threading.excepthook` with plugin diagnostics.
+
+Subprocess capture, complete `ExecCredential` validation, declared-expiration
+parsing, loader application, Kubernetes client construction, and the final
+provider fence form one credential-isolation boundary. It accepts only the
+requested exact `apiVersion`, `kind: ExecCredential`, a mapping `status`, and
+either one nonempty token or a complete nonempty certificate and key pair.
+Malformed expiration values and credentials without enough declared lifetime
+for one bounded API call fail with a fixed value-free classification. On any
+failure the boundary clears byte buffers and credential-bearing references,
+detaches control exceptions from sensitive tracebacks, exits every active
+exception handler, and returns only a value-free failure classification or the
+original sanitized drain/deadline control exception. The outer caller alone
+raises that result. No transient plugin stdout, stderr, decoded payload,
+credential value generated or parsed inside the boundary, decoder or loader
+exception, or prior credential failure may survive in the public exception
+message, cause, context, traceback-frame object graph, serialized envelope, or
+logs. This does not prohibit a successfully returned Kubernetes client from
+owning its installed credential while the client remains usable. Before any
+refresh, provider, or control exception escapes a provider-wrapper frame, that
+wrapper scrubs installed API keys, authentication prefixes, username/password,
+certificate/key references, cookies, and authentication headers, closes the
+client, and replaces it with a credential-free invalid state. The next
+lease-valid call must rebuild it under the existing deadline. Provider
+exceptions are detached from dependency tracebacks before propagation, so
+request-local authorization headers cannot remain reachable. A later
+drain/deadline fence that wins during refresh is invoked with no credential
+exception active, so it cannot acquire that failure as hidden context. A
+descendant that inherited a pipe therefore cannot extend the credential budget
+or leak a credential or diagnostic secret.
 Transparent library-side refresh is removed from the raw API call path. The
-wrapper caches a kubeconfig credential only until its declared expiry or the
-configured kubeconfig refresh interval. In-cluster projected service-account
-credentials
-have no exposed token expiry, so the wrapper explicitly rebuilds that client on
-the Kubernetes library's one-minute token-refresh cadence under the same fence.
+wrapper converts a kubeconfig credential's declared wall-clock expiry into one
+monotonic refresh deadline when the credential is accepted, preserving the
+existing API-timeout headroom. Configured refresh intervals are monotonic too.
+Later wall-clock jumps cannot extend or prematurely reset either deadline.
+In-cluster projected service-account credentials have no exposed token expiry,
+so the wrapper explicitly rebuilds that client on the Kubernetes library's
+one-minute monotonic token-refresh cadence under the same fence.
+The wrapper revalidates the monotonic deadline after the final acquisition
+fence, after refresh admission, and immediately before the raw method. A
+credential that loses its API-call headroom during loader or fence work is
+scrubbed and rejected without a provider call.
 Every refresh receives the current ordinary drain fence or cleanup deadline,
 rechecks that fence after credential acquisition, and only then invokes the raw
 Kubernetes method. Cleanup establishes its one 60-second deadline before any
 replacement client acquisition, so a missing or expired client cannot create a
 fresh auth budget outside teardown. Unsupported legacy auth-provider commands
 are rejected on this bounded EKS canary path rather than executed without a
-timeout. The canary Deployment enforces a termination grace of at least 600
-seconds. The grace covers cancellation
+timeout. Every canary provider wrapper also leaves a failed SDK call's exception
+handler before rechecking drain, lease, or deadline state. If that control fence
+wins, the wrapper clears the losing provider error and response before raising
+the detached control exception, so it cannot acquire provider diagnostics as
+hidden context. The canary Deployment enforces a termination grace of at least
+600 seconds. The grace covers cancellation
 observation, that 300-second EC2 settling budget, bounded provider-call overhead,
 and margin. The process exits immediately when cleanup completes, so the
 configured ceiling does not add a fixed rollout delay. The same drain applies to
@@ -2772,9 +2811,18 @@ drained and every image table is empty; it is never part of Helm rollback.
   client inherits 10/60/one-attempt defaults without making a network request;
   real kubeconfig exec tests proving bounded success, whole-process-group
   termination when a descendant inherits a pipe, early stdout and stderr flood
-  rejection, value-free stderr and malformed-output failures with empty cause
-  and context chains, direct-child reaping, no transparent API-client refresh
-  hook, explicit in-cluster projected-token rotation,
+  rejection, fail-closed injected stdout and stderr reader failures before and
+  after partial or syntactically valid output, exact API version and kind,
+  complete credential shape, fixed invalid-expiration handling, and value-free
+  failures with empty cause and context chains; tests traverse every public
+  exception's traceback locals through a bounded cycle-safe object-graph walk,
+  plus the nested exception graph, serialized envelope, and captured logs for
+  unpredictable child-generated secrets; installed-client invalidation on
+  refresh, provider, and control failures; direct-child reaping, no transparent
+  API-client refresh hook, one-minute monotonic
+  in-cluster projected-token rotation, monotonic declared-expiry conversion,
+  rejection when a final fence or pre-call callback consumes the remaining
+  headroom, backward and forward wall-clock jump immunity,
   ordinary refresh stopped before a raw call, cleanup refresh stopped at the
   shared deadline, and persisted-child drain entering cleanup-only before
   ordinary auth acquisition;
@@ -3772,3 +3820,32 @@ returned HTTP 429 with zero input or output tokens, so no paired acceptance was
 recorded. This revision makes malformed output leave the exception handler
 before raising the fixed error and requires an empty exception chain as part of
 the value-free credential boundary. The acceptance streak remains zero.
+
+Codex final-acceptance round 3 at
+`6b50f1d10b87ddb32d4a8ffbaa21105881a6b971` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request again returned HTTP 429 with zero
+input or output tokens, so no paired acceptance was recorded. Codex confirmed
+all 26 exact-head checks and the empty decoder cause/context repair, then
+reproduced one P1 and two P2 residual boundaries. Credential bytes, decoded
+status, loader state, and a losing refresh exception remained reachable through
+public traceback locals or hidden context; untrusted API-version and expiration
+values could also enter public or serialized errors. Pipe-reader failures were
+treated as clean EOF, allowing a valid prefix to be accepted, and projected
+token rotation used adjustable wall time instead of a monotonic deadline. This
+revision defines the single credential-isolation boundary, fail-closed reader
+state, exact response validation, and monotonic refresh contract above. The
+acceptance streak remains zero.
+
+Codex precommit review round 4 reproduced three remaining boundary failures:
+an installed exec credential remained reachable through the later wrapper
+exception's `self` object graph, reader exceptions outside `OSError` and
+`ValueError` could accept a valid buffered prefix and reach
+`threading.excepthook`, and loader or fence time could consume a credential's
+API-call headroom before the raw call. Its verdict was `RESHAPE`. This revision
+adds credential-scrubbing invalidation on every exceptional provider-wrapper
+exit, detaches provider dependency tracebacks, makes reader failures total and
+fail closed, and revalidates monotonic headroom at client admission, refresh,
+and immediately before the raw method. Tests now use bounded cycle-safe
+object-graph traversal rather than shallow local-value representations. This
+was a precommit review of a moving worktree, so it is repair evidence rather
+than an exact-head acceptance; the acceptance streak remains zero.
