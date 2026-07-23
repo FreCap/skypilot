@@ -338,17 +338,23 @@ def _terminate_ec2_instances(ec2: Any, operation_id: str,
         if to_terminate:
             ec2.terminate_instances(InstanceIds=to_terminate)
             termination_requested.update(to_terminate)
+        all_known_terminated = False
         if known_ids:
             states = _instance_states(ec2, known_ids)
-            if (set(states) == known_ids and
-                    all(state == 'terminated' for state in states.values())):
+            all_known_terminated = (set(states) == known_ids and all(
+                state == 'terminated' for state in states.values()))
+            if all_known_terminated and not settle_absence:
                 return True
         elif not settle_absence:
             return True
-        elif attempt == _EC2_TEARDOWN_ATTEMPTS - 1:
+        if attempt == _EC2_TEARDOWN_ATTEMPTS - 1:
             # A full provider-settle window with repeated exact tag absence is
-            # the only safe conclusion after a predecessor's ambiguous launch.
-            return True
+            # the only safe no-child conclusion after an ambiguous launch. If
+            # any child appeared, the final exact-state read must cover every
+            # retained ID and prove all of them terminated. A child appearing
+            # too late remains successor-owned cleanup instead of being
+            # terminalized as an ordinary qualification failure.
+            return not known_ids or all_known_terminated
         time.sleep(_EC2_TEARDOWN_POLL_SECONDS)
     return False
 

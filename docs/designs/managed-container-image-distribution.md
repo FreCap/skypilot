@@ -686,6 +686,16 @@ when AWS returned a nominal response. Cleanup must then replay the stable client
 token or run the full repeated tag-absence settling window; one empty discovery
 cannot terminalize the operation. A child that becomes visible during that
 window is added to the retained set and followed through verified termination.
+Ambiguity settling consumes every bounded discovery attempt even after the
+currently retained IDs have all reached `terminated`; ordinary confirmed-child
+teardown may still return as soon as exact termination is proved. Every settling
+attempt refreshes the complete operation-tag inventory, retains and terminates
+new IDs, and reads the exact state of the complete retained set. The final
+attempt succeeds only when no child appeared during the whole window, or when
+the exact-state response covers every retained ID and every state is
+`terminated`. A child that appears too late to prove termination makes cleanup
+fail closed, so `CANARY_TEARDOWN_FAILED` preserves the RUNNING operation for a
+successor instead of discarding custody.
 
 Canary intent creation locks the desired profile row and reserves its conservative
 worst-case cost in a UTC daily window before committing the operation. Concurrent
@@ -3398,3 +3408,16 @@ missing versus explicit-null policy state unambiguous, validates model
 collections before shape-dependent operations, and treats every create without
 a retained concrete instance ID as ambiguous until replay or bounded verified
 absence. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`b192aa8579bf6e1659f4d6450145dad61ab3690f` returned `RESHAPE`; Fable again
+could not start because its exact-model request returned HTTP 429 with zero
+tokens. Codex re-proved the policy-custody, direct-fallback, PostgreSQL,
+migration, provider, UI, Helm, and Terraform contracts and found one remaining
+EC2 custody race. Ambiguity settling returned as soon as the first retained
+child reached `terminated`, so another operation-tagged child becoming visible
+on the next poll could escape discovery before `run_canary()` terminalized the
+ordinary qualification failure. This revision requires the entire bounded
+settling window after an ambiguous create, accumulates every late child, and
+preserves successor custody whenever the final poll cannot prove the complete
+retained set terminated. The acceptance streak remains zero.
