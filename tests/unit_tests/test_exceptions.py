@@ -295,3 +295,28 @@ def test_deserialize_tolerates_attribute_the_constructor_rejects():
         },
     })
     assert 'boom' in str(deserialized)
+
+
+def test_attribute_that_cannot_be_set_does_not_lose_the_error():
+    """An unsettable attribute must not fail the whole deserialization.
+
+    deserialize_exception runs on the error path, so an attribute that
+    cannot be assigned (read-only, slotted, or type-checked like
+    ``__class__``) must not replace the caller's real error with an
+    unrelated one.
+    """
+    serialized = {
+        'type': 'ValueError',
+        'message': 'boom',
+        'args': ('boom',),
+        'attributes': {
+            'context': 'while encoding',
+            '__class__': int,
+        },
+    }
+
+    deserialized = exceptions.deserialize_exception(serialized)
+
+    assert isinstance(deserialized, ValueError)
+    assert str(deserialized) == 'boom'
+    assert getattr(deserialized, 'context') == 'while encoding'

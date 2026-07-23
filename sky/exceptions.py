@@ -111,6 +111,22 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     return data
 
 
+def _restore_exception_attributes(e: BaseException,
+                                  attributes: dict[str, Any]) -> None:
+    """Re-apply serialized attributes onto an already constructed exception.
+
+    deserialize_exception runs on the error path, so it must not raise: an
+    attribute that cannot be assigned (read-only, slotted, or type-checked
+    like ``__class__``) would otherwise replace the caller's real error with
+    an unrelated one.
+    """
+    for attribute, value in attributes.items():
+        try:
+            setattr(e, attribute, value)
+        except (AttributeError, TypeError):
+            pass
+
+
 def deserialize_exception(serialized: Any) -> Exception:
     """Deserialize the exception.
 
@@ -146,8 +162,7 @@ def deserialize_exception(serialized: Any) -> Exception:
         # Built-in exception constructors reject keyword arguments, so
         # restore their serialized attributes after construction instead.
         e = exception_class(*args)
-        for key, value in attributes.items():
-            setattr(e, key, value)
+        _restore_exception_attributes(e, attributes)
     else:
         try:
             e = exception_class(*args, **attributes)
@@ -157,8 +172,7 @@ def deserialize_exception(serialized: Any) -> Exception:
             # contradict this function's tolerant contract.
             return Exception(
                 f'{exception_type}: {serialized.get("message", serialized)}')
-    for key, value in dunder_attributes.items():
-        setattr(e, key, value)
+    _restore_exception_attributes(e, dunder_attributes)
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         setattr(e, 'stacktrace', stacktrace)
