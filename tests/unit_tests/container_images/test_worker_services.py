@@ -990,15 +990,20 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
     ec2.describe_instances.assert_called_once_with(InstanceIds=['i-primary'])
 
 
-@pytest.mark.parametrize(('architecture', 'image_id_case', 'expected_error'),
-                         (('x86_64', 'expected', None),
-                          ('arm64', 'expected', 'QUALIFICATION_FAILED'),
-                          (None, 'expected', 'QUALIFICATION_FAILED'),
-                          ('x86_64', 'other', 'QUALIFICATION_FAILED'),
-                          ('x86_64', None, 'QUALIFICATION_FAILED')))
+@pytest.mark.parametrize(
+    ('architecture', 'image_id_case', 'profile_case', 'expected_error'),
+    (('x86_64', 'expected', 'expected', None),
+     ('x86_64', 'expected', 'delayed', None),
+     ('x86_64', 'expected', 'missing', 'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('x86_64', 'expected', 'conflicting',
+      'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('arm64', 'expected', 'expected', 'QUALIFICATION_FAILED'),
+     (None, 'expected', 'expected', 'QUALIFICATION_FAILED'),
+     ('x86_64', 'other', 'expected', 'QUALIFICATION_FAILED'),
+     ('x86_64', None, 'expected', 'QUALIFICATION_FAILED')))
 def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        architecture: str | None, image_id_case: str | None,
+        architecture: str | None, image_id_case: str | None, profile_case: str,
         expected_error: str | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
@@ -1039,36 +1044,43 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         instance['ImageId'] = 'ami-other'
     if architecture is not None:
         instance['Architecture'] = architecture
+    if profile_case == 'missing':
+        instance.pop('IamInstanceProfile')
+    elif profile_case == 'conflicting':
+        instance['IamInstanceProfile'] = {
+            'Arn': 'arn:aws:iam::210987654321:instance-profile/Other',
+        }
     terminated_instance = {
         **instance,
         'State': {
             'Name': 'terminated'
         },
     }
+    poll_observations = [instance]
+    if profile_case == 'delayed':
+        delayed_instance = {
+            **instance,
+            'State': {
+                'Name': 'running'
+            },
+        }
+        delayed_instance.pop('IamInstanceProfile')
+        poll_observations.insert(0, delayed_instance)
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        if not instances:
+            return {'Reservations': []}
+        return {'Reservations': [{'Instances': list(instances)}]}
+
     ec2 = mock.Mock()
-    ec2.describe_instances.side_effect = ({
-        'Reservations': []
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [terminated_instance]
-        }]
-    })
+    describe_responses = [response()]
+    for observation in poll_observations:
+        describe_responses.extend(
+            (response(tagged_instance), response(observation)))
+    describe_responses.extend(
+        (response(tagged_instance), response(tagged_instance),
+         response(terminated_instance)))
+    ec2.describe_instances.side_effect = describe_responses
     ec2.run_instances.side_effect = (
         TimeoutError('ambiguous EC2 launch response'), {
             'Instances': [{
@@ -1104,6 +1116,7 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     monkeypatch.setattr(canary_worker_service.qualification,
                         'authorize_canary_launch',
                         lambda *_args, **_kwargs: 1000)
+    monkeypatch.setattr(canary_worker_service, '_POLL_SECONDS', 0)
     heartbeat = _OwnedHeartbeat()
 
     if expected_error is None:

@@ -1686,6 +1686,10 @@ the launched or replay-discovered child ID. The worker then performs an ID-scope
 and profile tags, and derives host AMI, architecture, instance profile, and
 lifecycle state from that one response. The observed AMI must equal the qualified
 regional AMI. The console marker is read from that same child.
+An absent instance-profile ARN while that exact child is still pending or
+running is retried within the same bounded deadline because EC2 may expose the
+instance before its profile attachment. A conflicting nonempty ARN, or an
+absent ARN once the child is stopped or terminated, fails qualification.
 Before the pull, EC2 canary user data configures the same exact value-free
 `credHelpers[registry] = ecr-login` route used by normal managed workload
 initialization. Merely finding the helper binary in the AMI is not runtime-pull
@@ -2649,7 +2653,7 @@ drained and every image table is empty; it is never part of Helm rollback.
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
   exact shared EC2 helper-route configuration, plaintext and strict-base64
   console marker responses, malformed console rejection, guest failure
-  self-termination,
+  self-termination, delayed EC2 instance-profile visibility,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
   pre/post lease fences, database authorization immediately before both EC2 and
