@@ -570,6 +570,98 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
     assert counts['n'] == 1, counts
 
 
+def test_get_job_cancellation_state_rows_use_latest_task_only(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    completed_job = state.set_job_info_without_job_id(
+        name='completed',
+        workspace='team-b',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    legacy_job = _insert_job_info(engine)
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    _set_controller_process(engine, completed_job, -202, None)
+
+    for task_id in range(50):
+        _insert_task(
+            engine,
+            active_job,
+            task_id,
+            status=(state.ManagedJobStatus.SUCCEEDED
+                    if task_id == 0 else state.ManagedJobStatus.RUNNING
+                    if task_id == 1 else state.ManagedJobStatus.PENDING),
+        )
+    for task_id in range(30):
+        _insert_task(
+            engine,
+            completed_job,
+            task_id,
+            status=(state.ManagedJobStatus.FAILED
+                    if task_id == 29 else state.ManagedJobStatus.SUCCEEDED),
+        )
+    _insert_task(engine, legacy_job, 0, status=state.ManagedJobStatus.STARTING)
+
+    with _count_sql_statements(engine) as counts:
+        rows = state._fetch_job_cancellation_state_rows(
+            [active_job, completed_job, legacy_job, 999999, active_job])
+
+    assert rows == [
+        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a', 101,
+         1001.5),
+        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b', -202,
+         None),
+        (legacy_job, 0, state.ManagedJobStatus.STARTING.value, None, None,
+         None),
+    ]
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_states_chunking_preserves_snapshots(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    completed_job = state.set_job_info_without_job_id(
+        name='completed',
+        workspace='team-b',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _insert_task(engine, active_job, 0, status=state.ManagedJobStatus.RUNNING)
+    _insert_task(engine,
+                 completed_job,
+                 0,
+                 status=state.ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, completed_job, 1, status=state.ManagedJobStatus.FAILED)
+
+    full = state.get_job_cancellation_states([active_job, completed_job])
+
+    monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+    chunked = state.get_job_cancellation_states(
+        [active_job, completed_job, 999999, active_job])
+
+    assert chunked == full
+
+
 def test_get_job_cancellation_states_empty_input_uses_no_query(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
