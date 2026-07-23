@@ -23,6 +23,7 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.server import database_migrations
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
@@ -490,7 +491,6 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     assert actual_role is not None
     return {
         'status': 'READY',
-        'observed_at': int(time.time()),
         'target': target.name,
         'target_fingerprint': target.target_fingerprint,
         'backend': 'aws_vm',
@@ -771,7 +771,6 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
         evidence = {
             'status': 'READY',
-            'observed_at': int(time.time()),
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
             'backend': 'aws_eks',
@@ -933,6 +932,8 @@ def main() -> None:
     max_in_flight = int(os.environ.get('SKYPILOT_IMAGE_MAX_IN_FLIGHT', '4'))
     if max_in_flight <= 0:
         raise ValueError('SKYPILOT_IMAGE_MAX_IN_FLIGHT must be positive.')
+    # Do not launch paid runtime canaries while any central schema is stale.
+    database_migrations.initialize_central_databases()
     health = worker_health.WorkerHealth(
         'canary',
         liveness_deadline_seconds=int(

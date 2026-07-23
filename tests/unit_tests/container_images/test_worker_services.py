@@ -2202,28 +2202,53 @@ def test_worker_health_http_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         health_server.stop()
 
 
-def test_lifecycle_main_verifies_all_databases_before_advertising_health(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(('worker_module', 'service_name'),
+                         ((copy_worker_service, 'CopyWorkerService'),
+                          (lifecycle_worker_service, 'LifecycleWorkerService'),
+                          (canary_worker_service, 'CanaryWorkerService')),
+                         ids=('copy', 'lifecycle', 'canary'))
+def test_worker_main_verifies_all_databases_before_advertising_health(
+        monkeypatch: pytest.MonkeyPatch, worker_module,
+        service_name: str) -> None:
     calls: list[str] = []
     health = mock.Mock()
     health_server = mock.Mock()
     service = mock.Mock()
-    monkeypatch.setattr(lifecycle_worker_service.database_migrations,
+    monkeypatch.setattr(worker_module.database_migrations,
                         'initialize_central_databases',
                         lambda: calls.append('databases'))
     monkeypatch.setattr(
-        lifecycle_worker_service.worker_health, 'WorkerHealth',
+        worker_module.worker_health, 'WorkerHealth',
         mock.Mock(side_effect=lambda *_args, **_kwargs:
                   (calls.append('health') or health)))
-    monkeypatch.setattr(lifecycle_worker_service.worker_health, 'HealthServer',
+    monkeypatch.setattr(worker_module.worker_health, 'HealthServer',
                         mock.Mock(return_value=health_server))
-    monkeypatch.setattr(lifecycle_worker_service, 'LifecycleWorkerService',
+    monkeypatch.setattr(worker_module, service_name,
                         mock.Mock(return_value=service))
-    monkeypatch.setattr(lifecycle_worker_service.signal, 'signal', mock.Mock())
+    monkeypatch.setattr(worker_module.signal, 'signal', mock.Mock())
 
-    lifecycle_worker_service.main()
+    worker_module.main()
 
     assert calls == ['databases', 'health']
     health_server.start.assert_called_once_with()
     service.run_forever.assert_called_once_with()
     health_server.stop.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    'worker_module',
+    (copy_worker_service, lifecycle_worker_service, canary_worker_service),
+    ids=('copy', 'lifecycle', 'canary'))
+def test_worker_main_fails_before_health_when_central_schema_is_stale(
+        monkeypatch: pytest.MonkeyPatch, worker_module) -> None:
+    health_factory = mock.Mock()
+    monkeypatch.setattr(
+        worker_module.database_migrations, 'initialize_central_databases',
+        mock.Mock(side_effect=RuntimeError('Serve schema is stale')))
+    monkeypatch.setattr(worker_module.worker_health, 'WorkerHealth',
+                        health_factory)
+
+    with pytest.raises(RuntimeError, match='Serve schema is stale'):
+        worker_module.main()
+
+    health_factory.assert_not_called()

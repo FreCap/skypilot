@@ -108,9 +108,7 @@ export function Images() {
   const [activeTab, setActiveTab] = useState(initialTab);
   const [workspaceInput, setWorkspaceInput] = useState(requestedWorkspace);
   const [workspaceNames, setWorkspaceNames] = useState([]);
-  const [capabilities, setCapabilities] = useState(null);
-  const [capabilityError, setCapabilityError] = useState(null);
-  const [oldServer, setOldServer] = useState(false);
+  const [capabilityResult, setCapabilityResult] = useState(null);
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [draftFilters, setDraftFilters] = useState(EMPTY_FILTERS);
   const [cursorStack, setCursorStack] = useState(firstImageCursorHistory);
@@ -130,6 +128,7 @@ export function Images() {
   const [readinessError, setReadinessError] = useState(null);
   const [publishOpen, setPublishOpen] = useState(false);
   const [retryPublication, setRetryPublication] = useState(null);
+  const lastWorkspace = useRef(requestedWorkspace);
   const capabilityGeneration = useRef(0);
   const catalogGeneration = useRef(0);
   const failedPublicationGeneration = useRef(0);
@@ -137,6 +136,17 @@ export function Images() {
   const catalogController = useRef(null);
   const failedPublicationController = useRef(null);
   const readinessController = useRef(null);
+  const capabilityController = useRef(null);
+  const capabilityResultIsCurrent =
+    capabilityResult?.scope === requestedWorkspace;
+  const capabilities = capabilityResultIsCurrent
+    ? capabilityResult.value
+    : null;
+  const capabilityError = capabilityResultIsCurrent
+    ? capabilityResult.error
+    : null;
+  const oldServer =
+    capabilityResultIsCurrent && capabilityResult.oldServer === true;
   const cursorEntry = currentImageCursorEntry(cursorStack);
   const cursor = cursorEntry.cursor;
   const failedPublicationCursorEntry = currentImageCursorEntry(
@@ -150,36 +160,83 @@ export function Images() {
       .catch(() => setWorkspaceNames([]));
   }, []);
 
+  const invalidateWorkspaceState = useCallback(() => {
+    capabilityGeneration.current += 1;
+    capabilityController.current?.abort();
+    capabilityController.current = null;
+    catalogGeneration.current += 1;
+    catalogController.current?.abort();
+    catalogController.current = null;
+    failedPublicationGeneration.current += 1;
+    failedPublicationController.current?.abort();
+    failedPublicationController.current = null;
+    readinessGeneration.current += 1;
+    readinessController.current?.abort();
+    readinessController.current = null;
+    setCapabilityResult(null);
+    setFilters(EMPTY_FILTERS);
+    setDraftFilters(EMPTY_FILTERS);
+    setCursorStack(firstImageCursorHistory());
+    setCatalog(null);
+    setCatalogLoading(false);
+    setCatalogError(null);
+    setCursorNotice(null);
+    setFailedPublicationCursorStack(firstImageCursorHistory());
+    setFailedPublicationPage(null);
+    setFailedPublicationLoading(false);
+    setFailedPublicationError(null);
+    setFailedPublicationNotice(null);
+    setReadiness(null);
+    setReadinessLoading(false);
+    setReadinessError(null);
+    setPublishOpen(false);
+    setRetryPublication(null);
+  }, []);
+
   const selectWorkspace = useCallback(
     (nextWorkspace) => {
+      if (nextWorkspace === requestedWorkspace) {
+        setWorkspaceInput(nextWorkspace);
+        return;
+      }
+      invalidateWorkspaceState();
+      setActiveTab('catalog');
       const query = { ...router.query };
       if (nextWorkspace) query.workspace = nextWorkspace;
       else delete query.workspace;
       delete query.image;
+      delete query.tab;
       router.replace({ pathname: '/images', query }, undefined, {
         shallow: true,
       });
-      setCursorStack(firstImageCursorHistory());
-      setFailedPublicationCursorStack(firstImageCursorHistory());
-      setCatalog(null);
-      setFailedPublicationPage(null);
-      setCursorNotice(null);
-      setFailedPublicationNotice(null);
-      setReadiness(null);
     },
-    [router]
+    [invalidateWorkspaceState, requestedWorkspace, router]
   );
 
   useEffect(() => {
+    const workspaceChanged = lastWorkspace.current !== requestedWorkspace;
+    lastWorkspace.current = requestedWorkspace;
     setWorkspaceInput(requestedWorkspace);
+    invalidateWorkspaceState();
+    if (workspaceChanged) setActiveTab('catalog');
     const generation = ++capabilityGeneration.current;
     const controller = new AbortController();
-    setCapabilityError(null);
-    setOldServer(false);
+    capabilityController.current = controller;
+    setCapabilityResult({
+      scope: requestedWorkspace,
+      value: null,
+      error: null,
+      oldServer: false,
+    });
     getImageCapabilities(requestedWorkspace || null, controller.signal)
       .then((value) => {
         if (capabilityGeneration.current !== generation) return;
-        setCapabilities(value);
+        setCapabilityResult({
+          scope: requestedWorkspace,
+          value,
+          error: null,
+          oldServer: false,
+        });
         if (!requestedWorkspace) setWorkspaceInput(value.workspace);
       })
       .catch((error) => {
@@ -188,14 +245,24 @@ export function Images() {
           capabilityGeneration.current !== generation
         )
           return;
-        if (error.status === 404 || error.status === 426) setOldServer(true);
-        else setCapabilityError(error.code || error.message);
+        setCapabilityResult({
+          scope: requestedWorkspace,
+          value: null,
+          error:
+            error.status === 404 || error.status === 426
+              ? null
+              : error.code || error.message,
+          oldServer: error.status === 404 || error.status === 426,
+        });
       });
     return () => {
       capabilityGeneration.current += 1;
       controller.abort();
+      if (capabilityController.current === controller) {
+        capabilityController.current = null;
+      }
     };
-  }, [requestedWorkspace]);
+  }, [invalidateWorkspaceState, requestedWorkspace]);
 
   const loadCatalog = useCallback(async () => {
     if (!capabilities) return;
@@ -400,6 +467,20 @@ export function Images() {
         className="rounded-md border border-red-200 bg-red-50 p-4 text-red-800"
       >
         {capabilityError}
+      </div>
+    );
+  }
+
+  if (!capabilities) {
+    return (
+      <div className="mx-auto max-w-5xl space-y-4">
+        <h1 className="text-2xl font-semibold text-gray-900">Images</h1>
+        <div
+          role="status"
+          className="rounded-md border border-gray-200 bg-white p-4 text-gray-600"
+        >
+          Loading image workspace capabilities…
+        </div>
       </div>
     );
   }
@@ -957,7 +1038,7 @@ export function Images() {
         />
       )}
       <RetryImageDialog
-        open={Boolean(retryPublication)}
+        open={Boolean(retryPublication && capabilities)}
         onOpenChange={(open) => {
           if (!open) {
             setRetryPublication(null);

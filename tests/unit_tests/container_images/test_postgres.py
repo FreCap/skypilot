@@ -31,6 +31,7 @@ from sky.container_images import builder_prototype
 from sky.container_images import canary_worker_service
 from sky.container_images import catalog_state
 from sky.container_images import config
+from sky.container_images import copy_worker_service
 from sky.container_images import demand_state
 from sky.container_images import lifecycle_worker_service
 from sky.container_images import models
@@ -5947,6 +5948,69 @@ def test_profile_staging_is_serialized_by_transaction_advisory_lock(
            ].count(models.ImageProfileState.QUALIFYING) == 1
     assert [revision.state for revision in revisions
            ].count(models.ImageProfileState.SUPERSEDED) == 1
+
+
+def test_profile_attestation_is_serialized_by_transaction_advisory_lock(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    revision = _activate_profile(image_database, profile)
+    lock_key = json.dumps(['research', profile.name], separators=(',', ':'))
+    lock_connection = image_database.connect()
+    lock_transaction = lock_connection.begin()
+    lock_connection.execute(
+        sqlalchemy.text(
+            'SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))'),
+        {'key': f'skypilot:container-image-profile:{lock_key}'})
+
+    def attest() -> topology_state.ProfileRevisionRecord:
+        return topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind='blocking-profile-lock-proof',
+            evidence={
+                'status': 'READY',
+                'observed_at': -1
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=revision.updated_at + 1)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(attest)
+            time.sleep(0.2)
+            assert not future.done()
+            lock_transaction.commit()
+            recorded = future.result(timeout=10)
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_connection.close()
+
+    assert recorded.attestations['blocking-profile-lock-proof'][
+        'observed_at'] == revision.updated_at + 1
+
+
+@pytest.mark.parametrize('host_offset', (-86_400, 86_400))
+def test_copy_qualification_due_check_uses_database_clock_under_host_skew(
+        image_database, profile: models.ManagedRegistryProfile,
+        monkeypatch: pytest.MonkeyPatch, host_offset: int) -> None:
+    revision = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    database_now = copy_worker_service._qualification_database_epoch()
+    attestations = dict(revision.attestations)
+    attestations[models.profile_attestation_key('copy', target.name)] = {
+        'status': 'READY',
+        'observed_at': database_now,
+    }
+    qualifying = dataclasses.replace(revision,
+                                     state=models.ImageProfileState.QUALIFYING,
+                                     attestations=attestations)
+    monkeypatch.setattr(copy_worker_service.time, 'time',
+                        lambda: database_now + host_offset)
+
+    due_now = copy_worker_service._qualification_database_epoch()
+
+    assert not copy_worker_service._qualification_copy_needed(
+        qualifying, profile, target, due_now)
 
 
 def _short_lived_qualifying_profile(

@@ -328,6 +328,32 @@ def lock_profile_mutation_in_session(session: orm.Session, *, workspace: str,
         {'key': f'skypilot:container-image-profile:{lock_key}'})
 
 
+def lock_profile_revision_mutation_in_session(
+        session: orm.Session,
+        profile_revision_id: str) -> sqlalchemy.engine.RowMapping:
+    """Locks one revision behind its immutable profile advisory lock."""
+    table = schema.profile_revisions
+    identity = session.execute(
+        sqlalchemy.select(table.c.workspace, table.c.profile).where(
+            table.c.id == profile_revision_id)).mappings().first()
+    if identity is None:
+        raise StaleProfileRevisionError(
+            'The image profile revision no longer exists.')
+    workspace = str(identity['workspace'])
+    profile = str(identity['profile'])
+    lock_profile_mutation_in_session(session,
+                                     workspace=workspace,
+                                     profile=profile)
+    row = session.execute(
+        sqlalchemy.select(table).where(table.c.id == profile_revision_id).
+        with_for_update()).mappings().first()
+    if (row is None or str(row['workspace']) != workspace or
+            str(row['profile']) != profile):
+        raise StaleProfileRevisionError(
+            'The image profile revision no longer exists.')
+    return row
+
+
 def lock_profile_custody_for_revision_in_session(
         session: orm.Session,
         profile_revision_id: str) -> sqlalchemy.engine.RowMapping:
@@ -641,9 +667,8 @@ def record_profile_attestation_in_session(
     if len(encoded_evidence.encode()) > 16 * 1024:
         raise ValueError('Profile attestation exceeds 16 KiB.')
     table = schema.profile_revisions
-    row = session.execute(
-        sqlalchemy.select(table).where(table.c.id == profile_revision_id).
-        with_for_update()).mappings().one()
+    row = lock_profile_revision_mutation_in_session(session,
+                                                    profile_revision_id)
     current = catalog_state.database_epoch(session, now=now)
     if (str(row['state']) not in (models.ImageProfileState.QUALIFYING.value,
                                   models.ImageProfileState.ACTIVE.value) or
@@ -696,10 +721,8 @@ def record_candidate_shard_attestation(
     profiles = schema.profile_revisions
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        candidate = session.execute(
-            sqlalchemy.select(profiles).where(
-                profiles.c.id ==
-                profile_revision_id).with_for_update()).mappings().one()
+        candidate = lock_profile_revision_mutation_in_session(
+            session, profile_revision_id)
         if (str(candidate['state']) != models.ImageProfileState.QUALIFYING.value
                 or
                 int(candidate['desired_generation']) != expected_generation or
@@ -728,9 +751,9 @@ def record_candidate_shard_attestation(
                 profiles.c.id == expected_operational_revision_id)).scalar()
         if operational_state != models.ImageProfileState.ACTIVE.value:
             return None
-        # The candidate row is already locked. The shared helper's repeated
-        # SELECT FOR UPDATE is reentrant and preserves profile-before-shard
-        # ordering for every competing transaction.
+        # The profile advisory lock and candidate row are already held. The
+        # shared helper's repeated lock calls are reentrant in this transaction
+        # and preserve profile-before-shard ordering for every competitor.
         return record_profile_attestation_in_session(
             session,
             profile_revision_id=profile_revision_id,
@@ -1364,14 +1387,12 @@ def record_inventory_attestation_and_release(
     now: int | None = None,
 ) -> ProfileRevisionRecord | None:
     """Publishes evidence only after finalization, then releases atomically."""
-    profiles = schema.profile_revisions
     shards = schema.registry_shards
     with orm.Session(catalog_state.engine()) as session, session.begin():
-        revision = session.execute(
-            sqlalchemy.select(profiles).where(
-                profiles.c.id ==
-                profile_revision_id).with_for_update()).mappings().first()
-        if revision is None:
+        try:
+            revision = lock_profile_revision_mutation_in_session(
+                session, profile_revision_id)
+        except StaleProfileRevisionError:
             return None
         shard = session.execute(
             sqlalchemy.select(shards).where(

@@ -17,6 +17,8 @@ import time
 from typing import Any
 import uuid
 
+from sqlalchemy import orm
+
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes
@@ -32,6 +34,7 @@ from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.server import database_migrations
 
 _ECR_AUTHORITY = re.compile(
     r'^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.'
@@ -45,6 +48,12 @@ _QUALIFICATION_ACTOR_HASH = hashlib.sha256(
     b'skypilot-image-qualification-manifest-ingestor').hexdigest()
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _qualification_database_epoch(*, now: int | None = None) -> int:
+    """Returns the shared clock used by qualification freshness checks."""
+    with orm.Session(catalog_state.engine()) as session:
+        return catalog_state.database_epoch(session, now=now)
 
 
 def _ingest_qualification_manifests(directory: str) -> int:
@@ -668,7 +677,6 @@ def _reconcile_candidate_shard_attestation(
             kind=live_key,
             evidence={
                 'status': 'READY',
-                'observed_at': now,
                 'physical_fingerprint': shard.physical_fingerprint,
                 'target_fingerprint': shard.target_fingerprint,
                 **metadata,
@@ -719,7 +727,6 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
                                  limiter: budgets.ProviderBudgetLimiter,
                                  now: int | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
-    observed_at = int(time.time()) if now is None else now
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
     shard = topology_state.get_target_shard(revision.workspace, profile.name,
@@ -745,7 +752,6 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         kind=models.profile_attestation_key('infrastructure', target.name),
         evidence={
             'status': 'READY',
-            'observed_at': observed_at,
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
             'repository_arn': repository_arn,
@@ -757,13 +763,15 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=now)
+    candidate_now = _qualification_database_epoch(now=now)
     _reconcile_candidate_shard_attestation(revision,
                                            profile,
                                            target,
                                            limiter=limiter,
-                                           now=observed_at,
+                                           now=candidate_now,
                                            state_now=now)
-    if not _qualification_copy_needed(revision, profile, target, observed_at):
+    copy_due_now = _qualification_database_epoch(now=now)
+    if not _qualification_copy_needed(revision, profile, target, copy_due_now):
         return True
     reader = providers.RegistryV2Source(profile.qualification.canary_ref,
                                         lambda: None)
@@ -782,7 +790,6 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         kind=models.profile_attestation_key('copy', target.name),
         evidence={
             'status': 'READY',
-            'observed_at': observed_at,
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
             'repository_arn': repository_arn,
@@ -909,7 +916,6 @@ def reconcile_inventory(
                 kind=live_key,
                 evidence={
                     'status': 'READY',
-                    'observed_at': int(time.time()),
                     'physical_fingerprint': shard.physical_fingerprint,
                     'target_fingerprint': shard.target_fingerprint,
                     **metadata,
@@ -1070,6 +1076,9 @@ def main() -> None:
     max_in_flight = int(os.environ.get('SKYPILOT_IMAGE_MAX_IN_FLIGHT', '4'))
     if max_in_flight <= 0:
         raise ValueError('SKYPILOT_IMAGE_MAX_IN_FLIGHT must be positive.')
+    # Provider-mutating workers must observe the same atomic deployment gate as
+    # the API and lifecycle worker before they advertise health.
+    database_migrations.initialize_central_databases()
     health = worker_health.WorkerHealth(
         'copy',
         liveness_deadline_seconds=int(

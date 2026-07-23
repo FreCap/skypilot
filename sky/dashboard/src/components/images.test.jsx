@@ -37,8 +37,10 @@ jest.mock('@/data/connectors/workspaces', () => ({
 }));
 
 jest.mock('@/components/image-action-dialogs', () => ({
-  PublishImageDialog: () => null,
-  RetryImageDialog: () => null,
+  PublishImageDialog: ({ open, workspace }) =>
+    open ? <div data-testid="publish-dialog">{workspace}</div> : null,
+  RetryImageDialog: ({ open, workspace }) =>
+    open ? <div data-testid="retry-dialog">{workspace}</div> : null,
 }));
 
 const capabilities = (overrides = {}) => ({
@@ -296,5 +298,97 @@ describe('Images dashboard', () => {
     await Promise.resolve();
     expect(screen.queryByText('old-workspace')).toBeNull();
     expect(screen.getByText('new-workspace')).toBeVisible();
+  });
+
+  it('immediately hides rendered workspace actions while replacement capabilities are pending', async () => {
+    const replacement = deferred();
+    mockRouter.query = { workspace: 'workspace-a' };
+    getImageCapabilities
+      .mockResolvedValueOnce(
+        capabilities({ workspace: 'workspace-a', publish: true })
+      )
+      .mockReturnValueOnce(replacement.promise);
+    getImagePublications.mockResolvedValue({
+      items: [
+        {
+          id: 'failed-a',
+          requested_release: 'failed-release-a',
+          source_ref: 'registry/source-a',
+          error_code: 'SOURCE_FAILED',
+        },
+      ],
+      next_cursor: null,
+    });
+
+    const view = render(<Images />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+    expect(screen.getByTestId('publish-dialog')).toHaveTextContent(
+      'workspace-a'
+    );
+    expect(screen.getByTestId('retry-dialog')).toHaveTextContent('workspace-a');
+
+    mockRouter.query = { workspace: 'workspace-b' };
+    view.rerender(<Images />);
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Loading image workspace capabilities'
+    );
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.queryByTestId('publish-dialog')).toBeNull();
+    expect(screen.queryByTestId('retry-dialog')).toBeNull();
+    expect(screen.queryByText('failed-release-a')).toBeNull();
+    expect(
+      getImageCatalog.mock.calls.every(
+        ([query]) => query.workspace === 'workspace-a'
+      )
+    ).toBe(true);
+
+    replacement.resolve(capabilities({ workspace: 'workspace-b' }));
+    expect(await screen.findByText('workspace-b')).toBeVisible();
+  });
+
+  it('shows a replacement capability failure without restoring the old workspace', async () => {
+    const replacement = deferred();
+    mockRouter.query = { workspace: 'workspace-a' };
+    getImageCapabilities
+      .mockResolvedValueOnce(
+        capabilities({ workspace: 'workspace-a', publish: true })
+      )
+      .mockReturnValueOnce(replacement.promise);
+
+    const view = render(<Images />);
+    expect(
+      await screen.findByRole('button', { name: 'Publish' })
+    ).toBeVisible();
+
+    mockRouter.query = { workspace: 'workspace-b' };
+    view.rerender(<Images />);
+    replacement.reject({ status: 403, code: 'WORKSPACE_FORBIDDEN' });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'WORKSPACE_FORBIDDEN'
+    );
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByText('workspace-a')).toBeNull();
+  });
+
+  it('keeps the current capability state when applying the same workspace', async () => {
+    mockRouter.query = { workspace: 'workspace-a' };
+    getImageCapabilities.mockResolvedValue(
+      capabilities({ workspace: 'workspace-a', publish: true })
+    );
+
+    render(<Images />);
+    expect(
+      await screen.findByRole('button', { name: 'Publish' })
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeVisible();
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
   });
 });

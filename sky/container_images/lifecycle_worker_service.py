@@ -388,7 +388,6 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                                       limit: int = 8,
                                       now: int | None = None) -> bool:
     """Deletes canaries only after every declared runtime tuple proved pull."""
-    observed_at = int(time.time()) if now is None else now
     for revision in topology_state.list_qualifying_profiles(include_active=True,
                                                             limit=limit):
         profile = models.ManagedRegistryProfile.from_snapshot(
@@ -454,7 +453,6 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 kind=lifecycle_key,
                 evidence={
                     'status': 'READY',
-                    'observed_at': observed_at,
                     'target': target.name,
                     'target_fingerprint': target.target_fingerprint,
                     'repository_arn': repository_arn,

@@ -541,16 +541,27 @@ attachment, success, failure, and timeout. Tests may substitute an explicit
 literal epoch, but production finalizers use the database wall clock after the
 wait and roll back every earlier write when the fence fails.
 
-PostgreSQL also owns every persisted qualification observation time. The shared
-profile-attestation transaction locks the candidate revision, samples
+PostgreSQL also owns every qualification freshness decision and every persisted
+qualification observation time. The shared profile-attestation transaction
+resolves the revision's immutable workspace/profile identity, acquires that
+profile's transaction advisory lock, locks the candidate revision, samples
 `clock_timestamp()`, and overwrites any producer-supplied `observed_at` before
-hashing and storing the evidence. Producer clocks remain useful only for local
-diagnostics and never determine freshness or ordering. Automatic-canary
-scheduling and activation preflight sample the database clock too; the final
-activation transaction still repeats freshness validation after acquiring its
-complete lock set. A slow or fast worker therefore cannot make a fresh proof
-immediately stale, place a proof in the future, or wedge a profile in
-QUALIFYING.
+hashing and storing the evidence. Candidate-shard and inventory finalizers take
+the profile lock before their revision and shard rows. Runtime-canary completion
+retains the documented operation-before-profile exception: canary claims already
+lock operation rows before their profile cost row, while no profile-lock owner
+subsequently requests a canary-operation row, so the exception serializes
+activation without introducing the inverse cycle.
+
+Producer clocks remain useful only for local diagnostics and never determine
+freshness, ordering, or whether provider work is due. Copy-role infrastructure,
+candidate-shard, and canary-copy reconciliation sample the database clock before
+comparing database-stamped evidence or inventory epochs. Automatic-canary
+scheduling and activation preflight do the same; the final activation
+transaction still repeats freshness validation after acquiring its complete
+lock set. A slow or fast worker therefore cannot make a fresh proof immediately
+stale, place a proof in the future, repeatedly trigger paid/provider work, or
+wedge a profile in QUALIFYING.
 
 The same database-clock rule governs shared work admission and retention, not
 only result finalization. Copy and eviction claims use the database clock for
@@ -2101,6 +2112,16 @@ responses. Stop waiting is labelled `Detach`, because it never cancels committed
 provider work. A stale cursor prompts a clean first-page reload without replaying
 an action.
 
+Workspace capability state is request-scoped, not merely generation-fenced.
+Changing the workspace immediately invalidates the previous capability object,
+aborts every catalog, failed-publication, readiness, and capability request,
+closes mutation dialogs, clears retries and scoped errors/data, and resets each
+cursor history. Rendering and mutations require the capability response's
+request workspace to equal the current route workspace exactly. A pending or
+failed A-to-B capability request therefore cannot leave workspace A controls,
+rows, dialogs, or errors visible or actionable, even when the same user is
+authorized in both workspaces.
+
 Status labels never conflate layers:
 
 - publication `PENDING|INSPECTING|READY|FAILED`;
@@ -2279,9 +2300,10 @@ CLI or Dashboard locates such a publication for explicit retry.
    normal chart resource rather than a hook, so chart-managed database Secrets
    exist before it starts and Helm adds no hook wait to deployment latency. API
    pods start concurrently in `verify` mode, refuse to serve unless all three
-   central schemas are current, and become ready after the Job commits. The
-   lifecycle worker performs the same eager three-schema verification before
-   advertising health. For a nonempty global-state database below 023, first
+   central schemas are current, and become ready after the Job commits. Every
+   enabled copy, lifecycle, and runtime-canary worker performs the same eager
+   three-schema verification before constructing or advertising health and
+   before any provider work. For a nonempty global-state database below 023, first
    deploy revision 023 and drain every older binary; the 024 Job refuses that
    unsafe starting state. A fresh isolated database must explicitly set
    `databaseMigration.bootstrapFreshSchema: true`; the resulting `bootstrap`
@@ -2419,7 +2441,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - fast and slow qualification-producer tests proving profile-attestation
   `observed_at`, automatic-canary scheduling, activation preflight, and final
   freshness checks use PostgreSQL time rather than any worker or scheduler wall
-  clock;
+  clock, plus copy-role due-check tests proving fast and slow worker clocks
+  cannot re-probe fresh copy or inventory evidence and a real-PostgreSQL
+  blocking test proving every attestation writer serializes behind the exact
+  profile advisory lock;
 - locked new-demand tests proving that runtime-proof validation and
   `demand.created_at` use the same database epoch, stale proof rejection rolls
   back both demand and watermark, and an exact existing replay survives both
@@ -2489,6 +2514,12 @@ drained and every image table is empty; it is never part of Helm rollback.
   history trimming, bounded page replacement rather than eager row
   accumulation, local stale-cursor recovery, and continued retry access beyond
   the first failed-publication page;
+- worker-entrypoint tests proving copy, lifecycle, and runtime-canary processes
+  verify global state, Serve, and Managed Jobs before health construction and
+  fail before health or provider work when any central schema is stale;
+- Dashboard A-to-B workspace-switch tests with workspace A already rendered,
+  proving both pending and failed capability replacement immediately remove A's
+  data, mutation controls, open dialogs, retries, and hidden errors;
 - managed-runtime architecture tests rejecting ARM64 and unknown EC2
   placements, rejecting missing or non-AMD64 EKS selectors, accepting an
   unknown EKS placement only with its exact qualified AMD64 selector, and
@@ -3108,3 +3139,20 @@ escape. During repair, `origin/improvements` advanced to `252c30d4e4`; that base
 was integrated before implementation and independently invalidated the reviewed
 identity. The acceptance streak remains zero until both reviewers accept one
 immutable current-base head three consecutive times.
+
+Paired final-acceptance round 1 at
+`53378acf19284a66c2ba94e3ebf8fb5e88040c69` returned Codex `RESHAPE` and Fable
+`PURSUE`, so the acceptance streak remained zero. Both reviewers independently
+proved the PostgreSQL-owned stored observation time, AMD64-bound managed runtime,
+and bounded cursor-history repairs. Codex additionally reproduced three
+cross-component gaps: copy-role qualification still compared database-stamped
+proofs and inventory epochs to worker wall time; copy and runtime-canary
+entrypoints could advertise health without eagerly verifying the Serve and
+Managed Jobs schemas; and an already-rendered workspace capability object
+remained actionable while replacement workspace capabilities were pending or
+failed. This revision extends the database-clock and profile-lock contract to
+all qualification due checks and attestation writers, makes all three worker
+entrypoints verify every central schema before health, and request-scopes plus
+synchronously invalidates all Dashboard workspace state. The acceptance streak
+remains zero until both reviewers accept one immutable current-base head three
+consecutive times.
