@@ -400,6 +400,13 @@ PENDING rows that fit the remaining target. Rows launched for reserved fill
 remain governed by the independent broker-grant fence and are not charged to
 this demand budget.
 
+An ordinary unpinned launch has no per-replica resources override before that
+first mutation. When the complete configured catalog contains exactly one
+card, that card is nevertheless authoritative for every such row and is used
+for the budget check. An unpinned row remains unclassifiable and fails closed
+when the catalog contains multiple cards; the controller must not guess which
+optimizer alternative a future launch will select.
+
 A reconciliation generation is an observation stamp, not by itself a semantic
 target change. A queued launch may remain authorized across a newer generation
 only when the fresh current target has the same service version, aggregate

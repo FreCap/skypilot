@@ -3235,6 +3235,51 @@ class TestLogicalPendingLaunchAdmission:
                                return_value=[candidate, ready]):
             assert not mgr._queued_logical_launch_fence_holds(1)
 
+    def test_single_card_unpinned_candidate_is_authorized(self):
+        mgr = self._manager({'L4': 1})
+        shapes = (('L4', 1),)
+        mgr._logical_exact_accelerator_shapes = dict(shapes)
+        mgr._logical_target = (1, 7, 1, shapes, shapes)
+        candidate = self._info(
+            1, 'L4', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        candidate.resources_override = None
+        mgr._replica_to_logical_launch_fence[1] = mgr._logical_target
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert mgr._queued_logical_launch_fence_holds(1)
+
+    def test_single_card_unpinned_ready_supply_blocks_duplicate(self):
+        mgr = self._manager({'L4': 1})
+        shapes = (('L4', 1),)
+        mgr._logical_exact_accelerator_shapes = dict(shapes)
+        mgr._logical_target = (1, 7, 1, shapes, shapes)
+        ready = self._info(1, 'L4',
+                           replica_managers.serve_state.ReplicaStatus.READY)
+        ready.resources_override = None
+        candidate = self._info(
+            2, 'L4', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        candidate.resources_override = None
+        mgr._replica_to_logical_launch_fence[2] = mgr._logical_target
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[ready, candidate]):
+            assert not mgr._queued_logical_launch_fence_holds(2)
+
+    def test_multi_card_unpinned_candidate_remains_ambiguous(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        candidate.resources_override = None
+        mgr._replica_to_logical_launch_fence[1] = mgr._logical_target
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert not mgr._queued_logical_launch_fence_holds(1)
+
     def test_final_cloud_guard_accepts_equivalent_newer_generation(self):
         mgr = self._manager({'A100': 1})
         candidate = self._info(

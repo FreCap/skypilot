@@ -6072,6 +6072,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             resources = getattr(getattr(info, 'handle', None),
                                 'launched_resources', None)
             accelerators = getattr(resources, 'accelerators', None)
+        if not accelerators and len(canonical_by_name) == 1:
+            # An ordinary single-resource service has no placer-selected
+            # resources_override before its first cloud mutation. Its exact
+            # card is still deterministic when the complete service catalog
+            # contains one card. Preserve fail-closed behavior for a
+            # multi-card catalog, where an unpinned optimizer launch has no
+            # authoritative pre-launch card identity.
+            return next(iter(canonical_by_name.values()))
         if not isinstance(accelerators, dict) or len(accelerators) != 1:
             return None
         return canonical_by_name.get(str(next(iter(accelerators))).casefold())
