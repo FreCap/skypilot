@@ -49,6 +49,7 @@ class SkyServiceSpec:
         target_utilization_percentage: int | None = None,
         expected_request_duration_seconds: float | None = None,
         provision_lead_time_seconds: float | None = None,
+        adaptive_demand_estimation: bool | None = None,
         max_scale_up_rate_percentage: int | None = None,
         scale_up_rate_min_replicas: int | None = None,
         scale_up_rate_period_seconds: int | None = None,
@@ -83,6 +84,7 @@ class SkyServiceSpec:
                 'target_utilization_percentage',
                 'expected_request_duration_seconds',
                 'provision_lead_time_seconds',
+                'adaptive_demand_estimation',
                 'max_scale_up_rate_percentage',
                 'scale_up_rate_min_replicas',
                 'scale_up_rate_period_seconds',
@@ -326,6 +328,12 @@ class SkyServiceSpec:
                     'expected_request_duration_seconds must be a finite '
                     'number > 0. Got: '
                     f'{expected_request_duration_seconds!r}')
+        if (adaptive_demand_estimation is not None and
+                not isinstance(adaptive_demand_estimation, bool)):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'adaptive_demand_estimation must be a boolean. Got: '
+                    f'{adaptive_demand_estimation!r}')
         if (provision_lead_time_seconds is not None and
             (not isinstance(provision_lead_time_seconds, (int, float)) or
              isinstance(provision_lead_time_seconds, bool) or
@@ -400,6 +408,7 @@ class SkyServiceSpec:
             'target_utilization_percentage': target_utilization_percentage,
             'expected_request_duration_seconds': expected_request_duration_seconds,
             'provision_lead_time_seconds': provision_lead_time_seconds,
+            'adaptive_demand_estimation': adaptive_demand_estimation,
             'max_scale_up_rate_percentage': max_scale_up_rate_percentage,
             'scale_up_rate_min_replicas': scale_up_rate_min_replicas,
             'scale_up_rate_period_seconds': scale_up_rate_period_seconds,
@@ -670,6 +679,8 @@ class SkyServiceSpec:
             expected_request_duration_seconds)
         self._provision_lead_time_seconds: float | None = (
             provision_lead_time_seconds)
+        self._adaptive_demand_estimation: bool | None = (
+            adaptive_demand_estimation)
         self._max_scale_up_rate_percentage: int | None = (
             max_scale_up_rate_percentage)
         self._scale_up_rate_min_replicas: int | None = (
@@ -732,6 +743,7 @@ class SkyServiceSpec:
         state.setdefault('_target_utilization_percentage', None)
         state.setdefault('_expected_request_duration_seconds', None)
         state.setdefault('_provision_lead_time_seconds', None)
+        state.setdefault('_adaptive_demand_estimation', None)
         state.setdefault('_max_scale_up_rate_percentage', None)
         state.setdefault('_scale_up_rate_min_replicas', None)
         state.setdefault('_scale_up_rate_period_seconds', None)
@@ -956,6 +968,7 @@ class SkyServiceSpec:
             service_config['target_utilization_percentage'] = None
             service_config['expected_request_duration_seconds'] = None
             service_config['provision_lead_time_seconds'] = None
+            service_config['adaptive_demand_estimation'] = None
             service_config['max_scale_up_rate_percentage'] = None
             service_config['scale_up_rate_min_replicas'] = None
             service_config['scale_up_rate_period_seconds'] = None
@@ -978,6 +991,7 @@ class SkyServiceSpec:
             for field in ('target_utilization_percentage',
                           'expected_request_duration_seconds',
                           'provision_lead_time_seconds',
+                          'adaptive_demand_estimation',
                           'max_scale_up_rate_percentage',
                           'scale_up_rate_min_replicas',
                           'scale_up_rate_period_seconds', 'adaptive_scale_up',
@@ -1194,6 +1208,7 @@ class SkyServiceSpec:
         for field in ('target_utilization_percentage',
                       'expected_request_duration_seconds',
                       'provision_lead_time_seconds',
+                      'adaptive_demand_estimation',
                       'max_scale_up_rate_percentage',
                       'scale_up_rate_min_replicas',
                       'scale_up_rate_period_seconds', 'adaptive_scale_up',
@@ -1432,6 +1447,10 @@ class SkyServiceSpec:
         return getattr(self, '_provision_lead_time_seconds', None)
 
     @property
+    def adaptive_demand_estimation(self) -> bool:
+        return getattr(self, '_adaptive_demand_estimation', None) is True
+
+    @property
     def max_scale_up_rate_percentage(self) -> int | None:
         return getattr(self, '_max_scale_up_rate_percentage', None)
 
@@ -1594,6 +1613,8 @@ class SkyServiceSpec:
             'provision_lead_time_seconds': override.pop(
                 'provision_lead_time_seconds',
                 self._provision_lead_time_seconds),
+            'adaptive_demand_estimation': override.pop(
+                'adaptive_demand_estimation', self._adaptive_demand_estimation),
             'max_scale_up_rate_percentage': override.pop(
                 'max_scale_up_rate_percentage',
                 self._max_scale_up_rate_percentage),
@@ -1656,6 +1677,9 @@ class SkyServiceSpec:
             provision_lead_time_seconds=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['provision_lead_time_seconds']),
+            adaptive_demand_estimation=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['adaptive_demand_estimation']),
             max_scale_up_rate_percentage=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['max_scale_up_rate_percentage']),

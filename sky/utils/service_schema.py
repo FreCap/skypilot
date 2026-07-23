@@ -289,6 +289,9 @@ def get_service_schema():
                         'type': 'number',
                         'minimum': 0,
                     },
+                    'adaptive_demand_estimation': {
+                        'type': 'boolean',
+                    },
                     'max_scale_up_rate_percentage': {
                         'type': 'integer',
                         'minimum': 1,

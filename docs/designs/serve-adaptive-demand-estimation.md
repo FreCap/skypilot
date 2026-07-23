@@ -1,0 +1,143 @@
+# SkyServe: adaptive demand estimation
+
+## Problem
+
+The concurrency autoscaler sizes every target from two hand-set numbers:
+
+- `replica_policy.expected_request_duration_seconds` converts queued,
+  rejected, and arriving requests into concurrent work. It multiplies into
+  every demand estimate.
+- `replica_policy.provision_lead_time_seconds` (see
+  [SLA-aware scale-up](serve-sla-aware-scaleup.md)) sets how much of a
+  request's SLA budget is already spent before new capacity can serve.
+
+Both drift. boltz-l4-fleet configures a 30 s duration against an observed
+45-60 s, so every target it computes is undersized by roughly half. The lead
+is worse: it is a property of spot capacity and cloud provisioning latency
+that changes hour to hour, and no operator re-tunes it.
+
+Meanwhile the system already measures both facts and throws them away for
+sizing purposes:
+
+- The load balancer reports per-minute prediction-time histograms
+  (`prediction_time_history`), which the controller persists for the
+  dashboard. It never reaches the autoscaler.
+- Every replica row carries `created_at` and
+  `status_property.first_ready_time`, and `time_to_ready_seconds` is already
+  derived from them for status reporting. The autoscaler receives those rows
+  each tick and ignores the timing.
+
+There is precedent for preferring measurement over declaration in this same
+autoscaler: probed `observed_slots_by_replica_id` already supersede the
+controller's planned per-replica capacity.
+
+## Behavior contract
+
+Under `replica_policy.adaptive_demand_estimation: true` (default `false`):
+
+1. **Measured request duration supersedes the configured duration.** The
+   autoscaler folds newly completed requests from the load balancer's
+   prediction-time histograms into an EMA (alpha 0.2). Each histogram bucket
+   contributes its upper bound, so the estimate errs long rather than short.
+   Only `succeeded` outcomes count: a fast failure describes an error path,
+   not how long serving occupies a slot.
+2. **Observed launch-to-ready supersedes the configured lead.** Each replica
+   that reaches ready contributes one `first_ready_time - created_at`
+   sample, capped at the 50 most recent; the estimate is their p75. Sizing
+   against the median would leave the slower half of launches arriving after
+   the budget they were sized for.
+3. **Configuration is the fallback, never overridden blindly.** A measured
+   value supersedes only while it holds enough evidence
+   (20 completions, 5 launches) and is fresh (6 h). Otherwise the configured
+   value stands, which is also the cold-start behavior.
+4. **Estimates survive a controller restart.** Both are persisted in the
+   autoscaler's dynamic states. Re-learning from zero would silently revert
+   to configuration during warm-up, precisely when a restart under load can
+   least afford an undersized target.
+5. **Each replica is sampled once**, and the dedup ledgers are bounded (live
+   replica ids only; histogram buckets pruned to the freshness window). A
+   load balancer re-reports a histogram bucket until the controller durably
+   accepts it, so only the positive delta may contribute.
+
+Effective values are exposed in `autoscaler.info()`
+(`effective_request_duration_seconds`, `effective_provision_lead_seconds`,
+`measured_duration_samples`, `provision_lead_samples`) so an operator can see
+what the fleet is actually sizing against.
+
+## Evidence (simulation)
+
+Same simulator as the SLA-aware design, extended so the configured duration
+and the true service time can differ, with estimators that mirror the
+implementation (EMA of completions, p75 of observed leads). Failure rate is
+offered-request-weighted, 3 seeds.
+
+**Configuration correct (config 30 s, truth 30 s): adaptive is neutral.**
+Failure rates match the static policy within noise (e.g. slow ramp 0.5% vs
+0.4%), at up to +13% replica-hours from tracking reality more closely.
+
+**Configuration wrong (config 30 s, truth 60 s: the fleet's real state):**
+
+| scenario | static config | adaptive | mean wait, static -> adaptive |
+|---|---|---|---|
+| slow ramp | 0.1% | **0.0%** | 24 s -> 11 s |
+| fast ramp | 2.9% | **1.9%** | 52 s -> 23 s |
+| mixed priority burst | 7.7% | **6.9%** | 42 s -> 21 s |
+| sustained | 5.1% | **4.4%** | 31 s -> 21 s |
+| step burst | 9.2% | **8.3%** | 44 s -> 22 s |
+
+Cost is +11-17% replica-hours, which is the fleet being correctly sized for
+work that was always there.
+
+**The knob stops needing to be right.** A policy with no configured lead at
+all (`provision_lead_time_seconds` unset) that learns it from scratch
+reaches 0.0% on the slow ramp and 2.3% on the fast ramp, against 0.0% and
+1.9% for a correctly hand-tuned 540 s. Operators no longer have to guess a
+value that only a measurement can know.
+
+## Alternatives considered
+
+- **Default-on.** Rejected: enabling measurement silently re-sizes every
+  existing service on upgrade, including ones whose configuration is
+  deliberately conservative. Opt-in keeps the upgrade inert.
+- **Bucket midpoints instead of upper bounds.** More accurate on average,
+  but biases the estimate short inside a bucket. Sizing prefers to run long.
+- **Percentile duration (p75) instead of an EMA mean.** The duration feeds
+  aggregate work (count x duration), where the mean is the correct
+  aggregate; a percentile would systematically over-size. The lead is a
+  latency to beat, not an aggregate, so it uses p75.
+- **Clamping the measured value to a multiple of configuration.** Rejected
+  as re-introducing the stale number the feature exists to escape. Blast
+  radius is already bounded by `max_replicas` and the scale-up wave limiter.
+
+## Test plan
+
+Unit tests in `tests/unit_tests/test_concurrency_autoscaler.py`
+(`TestAdaptiveDemandEstimation`) and `test_serve_concurrency_spec.py`:
+
+- measured duration supersedes config; below the sample floor it does not;
+  disabled feature never supersedes; a stale measurement falls back.
+- a re-reported histogram bucket is not double counted; a histogram version
+  mismatch is dropped; `failed` outcomes never define service time.
+- measured lead supersedes config at p75; never-ready sentinels are ignored;
+  each replica is sampled once.
+- both estimates survive a dump/load restart cycle.
+- an end-to-end sizing case: measured 60 s duration weights a 600 s-timeout
+  queue at 1.0 where the configured 30 s would weight it at 0.5.
+- spec YAML round-trip and strict boolean validation for the new knob.
+
+Manual: enable on boltz-l4-fleet, then confirm via `autoscaler.info()` that
+`effective_request_duration_seconds` converges toward the dashboard's
+prediction-time distribution and `effective_provision_lead_seconds` toward
+observed launch-to-ready, and that the demand target rises accordingly.
+
+## Rollout
+
+Opt-in per service. No API version bump: the new demand-feed field is
+additive and an older controller simply never sends it, leaving the
+autoscaler on configured values. Enable on boltz-l4-fleet in the same fleet
+update that sets `provision_lead_time_seconds`; the configured values then
+act as the cold-start seed and the permanent fallback.
+
+TODO(FreCap): once the fleet has run on measured values, revisit whether
+`expected_request_duration_seconds` should become optional rather than
+required for logical services.

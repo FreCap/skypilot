@@ -34,6 +34,7 @@ def _spec(knob=1.0,
           target_utilization_percentage=100,
           expected_request_duration_seconds=None,
           provision_lead_time_seconds=None,
+          adaptive_demand_estimation=None,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
           scale_up_rate_period_seconds=None,
@@ -57,6 +58,7 @@ def _spec(knob=1.0,
         target_utilization_percentage=target_utilization_percentage,
         expected_request_duration_seconds=expected_request_duration_seconds,
         provision_lead_time_seconds=provision_lead_time_seconds,
+        adaptive_demand_estimation=adaptive_demand_estimation,
         max_scale_up_rate_percentage=max_scale_up_rate_percentage,
         scale_up_rate_min_replicas=scale_up_rate_min_replicas,
         scale_up_rate_period_seconds=scale_up_rate_period_seconds,
@@ -126,7 +128,8 @@ def _report(autoscaler,
             headerless_arrivals_60s=None,
             headerless_arrivals_300s=None,
             arrival_tracking_saturated=False,
-            pressure_report_is_floored=False):
+            pressure_report_is_floored=False,
+            prediction_time_history=None):
     report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
@@ -163,6 +166,8 @@ def _report(autoscaler,
         report['offered_arrival_tracking_saturated'] = True
     if pressure_report_is_floored:
         report['pressure_report_is_floored'] = True
+    if prediction_time_history is not None:
+        report['prediction_time_history'] = prediction_time_history
     autoscaler.collect_request_information(report)
 
 
@@ -5286,3 +5291,202 @@ class TestSharedGpuShapeResolver(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _histogram(counts_by_index, bucket_start=None, outcome='succeeded'):
+    """Build one LB prediction-time report from {bucket_index: count}."""
+    if bucket_start is None:
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(time.time() // bucket_seconds) * bucket_seconds
+    counts = [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT
+    for index, count in counts_by_index.items():
+        counts[index] = count
+    return {
+        'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
+        'histogram_version': constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+        'buckets': [{
+            'bucket_start': bucket_start,
+            'outcome_counts': {
+                outcome: counts
+            },
+        }],
+    }
+
+
+class TestAdaptiveDemandEstimation(unittest.TestCase):
+    """Measured duration and lead supersede configuration when trusted."""
+
+    @staticmethod
+    def _autoscaler(**kwargs):
+        kwargs.setdefault('adaptive_demand_estimation', True)
+        return _make_autoscaler(knob=1,
+                                min_replicas=0,
+                                max_replicas=1000,
+                                replica_unit='logical',
+                                expected_request_duration_seconds=30,
+                                provision_lead_time_seconds=540,
+                                **kwargs)
+
+    # Bucket index 8 has upper bound 60s; index 7 is 30s.
+    _SIXTY_SECOND_BUCKET = 8
+
+    def test_measured_duration_supersedes_config(self):
+        autoscaler = self._autoscaler()
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+
+    def test_measured_duration_needs_enough_samples(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 3}))
+
+        # Three completions cannot redefine the sizing constant.
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+        self.assertEqual(autoscaler._measured_duration_samples, 3)
+
+    def test_measured_duration_ignored_when_feature_disabled(self):
+        autoscaler = self._autoscaler(adaptive_demand_estimation=False)
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 540)
+
+    def test_stale_measurement_falls_back_to_config(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+
+        autoscaler._measured_duration_at = (
+            time.time() - constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS -
+            1)
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_repeated_histogram_report_is_not_double_counted(self):
+        autoscaler = self._autoscaler()
+        histogram = _histogram({self._SIXTY_SECOND_BUCKET: 50})
+
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+
+        # The load balancer re-reports a bucket until it is durably
+        # accepted; only the delta may count.
+        self.assertEqual(autoscaler._measured_duration_samples, 50)
+
+    def test_histogram_version_mismatch_is_dropped(self):
+        autoscaler = self._autoscaler()
+        histogram = _histogram({self._SIXTY_SECOND_BUCKET: 50})
+        histogram['histogram_version'] = (
+            constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION + 1)
+
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+
+        self.assertEqual(autoscaler._measured_duration_samples, 0)
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_failed_outcomes_do_not_define_service_time(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram({0: 50}, outcome='failed'))
+
+        self.assertEqual(autoscaler._measured_duration_samples, 0)
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_measured_lead_supersedes_config(self):
+        autoscaler = self._autoscaler()
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+
+        autoscaler._observe_provision_leads(replicas)
+
+        # Eight samples of 60..480s; the p75 index is 6 -> 420s.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 420.0)
+
+    def test_lead_needs_enough_samples_and_ignores_never_ready(self):
+        autoscaler = self._autoscaler()
+        ready = _replica(1)
+        ready.created_at = 1000.0
+        ready.status_property.first_ready_time = 1600.0
+        never_ready = _replica(2)
+        never_ready.created_at = 1000.0
+        never_ready.status_property.first_ready_time = -1
+
+        autoscaler._observe_provision_leads([ready, never_ready])
+
+        self.assertEqual(autoscaler._provision_lead_samples, [600.0])
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 540)
+
+    def test_lead_sample_is_taken_once_per_replica(self):
+        autoscaler = self._autoscaler()
+        replica = _replica(1)
+        replica.created_at = 1000.0
+        replica.status_property.first_ready_time = 1600.0
+
+        autoscaler._observe_provision_leads([replica])
+        autoscaler._observe_provision_leads([replica])
+
+        self.assertEqual(autoscaler._provision_lead_samples, [600.0])
+
+    def test_estimates_survive_controller_restart(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+        autoscaler._observe_provision_leads(replicas)
+
+        restored = self._autoscaler()
+        restored.load_dynamic_states(autoscaler.dump_dynamic_states())
+
+        self.assertEqual(restored.effective_request_duration_seconds, 60.0)
+        self.assertEqual(restored.effective_provision_lead_seconds, 420.0)
+
+    def test_measured_values_drive_queue_sizing(self):
+        autoscaler = self._autoscaler(
+            target_utilization_percentage=100,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=100,
+                queue_depth_by_priority={0: 100},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        autoscaler._set_target_num_replicas_with_concurrency_logic([])
+
+        # Measured 60s duration against the 60s budget left by the
+        # configured 540s lead weights every queued request at 1.0, where
+        # the configured 30s duration would have weighted them at 0.5.
+        self.assertEqual(autoscaler._weighted_queue_work, 100)

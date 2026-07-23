@@ -3548,6 +3548,21 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             spec, 'expected_request_duration_seconds', None)
         self.provision_lead_time_seconds: float | None = getattr(
             spec, 'provision_lead_time_seconds', None)
+        self.adaptive_demand_estimation: bool = (getattr(
+            spec, 'adaptive_demand_estimation', False) is True)
+        # Live demand-estimation state. Both estimators supersede their
+        # configured counterpart only while they hold enough fresh evidence;
+        # configuration remains the fallback and the cold-start value.
+        self._measured_duration_seconds: float | None = None
+        self._measured_duration_samples: int = 0
+        self._measured_duration_at: float | None = None
+        # Cumulative per-bucket counts already folded into the estimate, so
+        # a repeated (unacknowledged) histogram report is not double counted.
+        self._prediction_counts_seen: dict[int, list[int]] = {}
+        self._provision_lead_samples: list[float] = []
+        self._provision_lead_at: float | None = None
+        # Replica rows whose launch-to-ready has already been sampled.
+        self._provision_lead_seen_replica_ids: set[int] = set()
         self.max_scale_up_rate_percentage: int | None = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas: int | None = getattr(
@@ -4059,6 +4074,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._offered_arrival_tracking_saturated = (
             request_aggregator_info.get('offered_arrival_tracking_saturated')
             is True)
+        self._ingest_prediction_time_history(
+            request_aggregator_info.get('prediction_time_history'))
         report_is_floored = request_aggregator_info.get(
             'pressure_report_is_floored') is True
         arrival_60 = self._offered_arrival_count(60)
@@ -4354,7 +4371,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _queue_work(self) -> float:
         if (self.replica_unit != 'logical' or
-                self.expected_request_duration_seconds is None or
+                self.effective_request_duration_seconds is None or
                 not self._queue_timeout_thresholds or
                 self._queue_depth_by_priority is None or
                 sum(self._queue_depth_by_priority.values())
@@ -4369,8 +4386,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # plans delivery exactly at the deadline assuming instant capacity;
         # subtracting the lead sizes against the budget that actually
         # remains once capacity can exist.
-        lead = self.provision_lead_time_seconds or 0.0
-        duration = self.expected_request_duration_seconds
+        lead = self.effective_provision_lead_seconds
+        duration = self.effective_request_duration_seconds
         work = 0.0
         for priority, count in self._queue_depth_by_priority.items():
             timeout = self._priority_timeout(priority)
@@ -4394,7 +4411,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(typing.cast(int, value) for value in values)
 
     def _arrival_work(self) -> float:
-        duration = self.expected_request_duration_seconds
+        duration = self.effective_request_duration_seconds
         if duration is None:
             return 0.0
         if (self._unique_job_arrivals_60s is None or
@@ -4424,7 +4441,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if arrival_gap <= 0:
             return []
 
-        duration = self.expected_request_duration_seconds
+        duration = self.effective_request_duration_seconds
         offered_counts_complete = (duration is not None and
                                    self._unique_job_arrivals_60s is not None and
                                    self._unique_job_arrivals_300s is not None
@@ -4458,6 +4475,151 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return [(priority, compatible, work * scale)
                 for priority, compatible, work in evidence]
 
+    def _adaptive_sample_is_fresh(self, observed_at: float | None) -> bool:
+        if observed_at is None:
+            return False
+        age = time.time() - observed_at
+        # Tolerate a small negative age from clock adjustment rather than
+        # discarding an otherwise usable estimate.
+        return -60.0 <= age <= constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS
+
+    @property
+    def effective_request_duration_seconds(self) -> float | None:
+        """Measured request duration, falling back to configuration.
+
+        Configuration is a hand-set estimate that silently mis-sizes every
+        target it feeds once the workload drifts. A measured duration backed
+        by enough fresh completions is strictly better evidence, so it wins
+        while it holds; otherwise the configured value stands.
+        """
+        if (self.adaptive_demand_estimation and
+                self._measured_duration_seconds is not None and
+                self._measured_duration_samples
+                >= constants.AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES and
+                self._adaptive_sample_is_fresh(self._measured_duration_at)):
+            return self._measured_duration_seconds
+        return self.expected_request_duration_seconds
+
+    @property
+    def effective_provision_lead_seconds(self) -> float:
+        """Observed launch-to-ready quantile, falling back to configuration."""
+        if (self.adaptive_demand_estimation and
+                len(self._provision_lead_samples)
+                >= constants.AUTOSCALER_ADAPTIVE_LEAD_MIN_SAMPLES and
+                self._adaptive_sample_is_fresh(self._provision_lead_at)):
+            ordered = sorted(self._provision_lead_samples)
+            index = min(
+                len(ordered) - 1,
+                int(constants.AUTOSCALER_ADAPTIVE_LEAD_QUANTILE * len(ordered)))
+            return ordered[index]
+        return self.provision_lead_time_seconds or 0.0
+
+    def _ingest_prediction_time_history(self,
+                                        prediction_time_history: Any) -> None:
+        """Fold newly completed request durations into the EMA.
+
+        The load balancer reports per-minute cumulative histograms and keeps
+        re-reporting a bucket until the controller durably accepts it, so
+        only the positive delta against what this estimator already folded
+        in may contribute.
+        """
+        if not isinstance(prediction_time_history, dict):
+            return
+        if (prediction_time_history.get('histogram_version')
+                != constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION):
+            # Bucket arrays are interpreted by index; a different version
+            # is not comparable and is dropped rather than guessed.
+            return
+        buckets = prediction_time_history.get('buckets')
+        if not isinstance(buckets, list):
+            return
+        bounds = constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS
+        total_new = 0
+        weighted_new = 0.0
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            bucket_start = bucket.get('bucket_start')
+            outcome_counts = bucket.get('outcome_counts')
+            if (not isinstance(bucket_start, int) or
+                    isinstance(bucket_start, bool) or
+                    not isinstance(outcome_counts, dict)):
+                continue
+            # Only successful requests describe how long serving a request
+            # occupies a slot. A fast failure would drag the estimate down
+            # and undersize the fleet.
+            counts = outcome_counts.get('succeeded')
+            if not isinstance(counts, list):
+                continue
+            seen = self._prediction_counts_seen.setdefault(
+                bucket_start, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
+            for index, count in enumerate(counts):
+                if index >= len(seen):
+                    break
+                if (not isinstance(count, int) or isinstance(count, bool) or
+                        count <= seen[index]):
+                    continue
+                delta = count - seen[index]
+                seen[index] = count
+                # Represent a bucket by its upper bound: sizing may run
+                # slightly long, never short. The final implicit bucket has
+                # no upper bound, so it is represented by the last one.
+                representative = bounds[min(index, len(bounds) - 1)]
+                total_new += delta
+                weighted_new += delta * representative
+        if total_new <= 0:
+            return
+        self._prune_prediction_counts_seen()
+        sample = weighted_new / total_new
+        alpha = constants.AUTOSCALER_ADAPTIVE_DURATION_EMA_ALPHA
+        if self._measured_duration_seconds is None:
+            self._measured_duration_seconds = sample
+        else:
+            self._measured_duration_seconds = (
+                (1.0 - alpha) * self._measured_duration_seconds +
+                alpha * sample)
+        self._measured_duration_samples += total_new
+        self._measured_duration_at = time.time()
+
+    def _prune_prediction_counts_seen(self) -> None:
+        """Bound the per-bucket dedup ledger to the freshness window."""
+        cutoff = (time.time() -
+                  constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS)
+        for bucket_start in list(self._prediction_counts_seen):
+            if bucket_start < cutoff:
+                del self._prediction_counts_seen[bucket_start]
+
+    def _observe_provision_leads(
+            self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
+        """Sample launch-to-ready for replicas that just became ready."""
+        live_ids = set()
+        for info in replica_infos:
+            replica_id = info.replica_id
+            live_ids.add(replica_id)
+            if replica_id in self._provision_lead_seen_replica_ids:
+                continue
+            created_at = getattr(info, 'created_at', None)
+            ready_at = getattr(getattr(info, 'status_property', None),
+                               'first_ready_time', None)
+            if (not isinstance(created_at,
+                               (int, float)) or isinstance(created_at, bool) or
+                    not isinstance(ready_at,
+                                   (int, float)) or isinstance(ready_at, bool)):
+                continue
+            lead = ready_at - created_at
+            if lead <= 0:
+                # -1 is the never-ready sentinel; a non-positive span is
+                # not a launch measurement.
+                continue
+            self._provision_lead_seen_replica_ids.add(replica_id)
+            self._provision_lead_samples.append(float(lead))
+            del self._provision_lead_samples[:-constants.
+                                             AUTOSCALER_ADAPTIVE_LEAD_SAMPLE_CAP]
+            self._provision_lead_at = time.time()
+        # Terminated rows can never be sampled again, so the ledger tracks
+        # the live fleet rather than growing for the service's lifetime.
+        self._provision_lead_seen_replica_ids &= live_ids
+
     def _adaptive_scale_up_active(self) -> bool:
         return (self.adaptive_scale_up is not None and
                 self._adaptive_until is not None and
@@ -4465,16 +4627,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _rejected_work(self) -> float:
         """Convert the retained rejection population to concurrent work."""
-        if (self.replica_unit != 'logical' or
-                self.expected_request_duration_seconds is None):
+        duration = self.effective_request_duration_seconds
+        if self.replica_unit != 'logical' or duration is None:
             return float(self._rejected_in_window)
-        retained_work = (self._rejected_in_window *
-                         self.expected_request_duration_seconds /
+        retained_work = (self._rejected_in_window * duration /
                          constants.LB_REJECT_WINDOW_SECONDS)
         if self._rejected_in_recent_window is None:
             return retained_work
-        recent_work = (self._rejected_in_recent_window *
-                       self.expected_request_duration_seconds /
+        recent_work = (self._rejected_in_recent_window * duration /
                        self.qps_window_size)
         return max(retained_work, recent_work)
 
@@ -4955,11 +5115,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         raw: list[tuple[int, tuple[str, ...], float]] = []
         for profile in self.rejected_compatibility_profiles:
             count = int(profile['count'])
-            if (self.replica_unit != 'logical' or
-                    self.expected_request_duration_seconds is None):
+            duration = self.effective_request_duration_seconds
+            if self.replica_unit != 'logical' or duration is None:
                 work = float(count)
             else:
-                duration = self.expected_request_duration_seconds
                 retained = (count * duration /
                             constants.LB_REJECT_WINDOW_SECONDS)
                 recent = (int(profile.get('recent_count', 0)) * duration /
@@ -5377,9 +5536,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             arrivals = len(self.request_timestamps)
             if arrivals > 0 and best_capacity > 0:
                 arrival_work = float(arrivals)
-                if self.expected_request_duration_seconds is not None:
-                    arrival_work *= (self.expected_request_duration_seconds /
-                                     self.qps_window_size)
+                duration = self.effective_request_duration_seconds
+                if duration is not None:
+                    arrival_work *= (duration / self.qps_window_size)
                 arrival_floor = self._clip_target_num_replicas(
                     math.ceil(arrival_work / best_capacity))
                 if arrival_floor > self.target_num_replicas:
@@ -5650,6 +5809,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # marrying a blind target to fresh-mode kills. All three
         # consumers read this snapshot instead of re-evaluating.
         self._tick_fresh = self.has_fresh_demand_report()
+        # Sample launch-to-ready before sizing, so a wave that just landed
+        # informs this tick's lead estimate.
+        self._observe_provision_leads(replica_infos)
         self._logical_actuation_wave_is_new = False
         self._logical_actuation_wave_budget = self._logical_scale_up_budget(
             replica_infos)
@@ -5757,6 +5919,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             spec, 'expected_request_duration_seconds', None)
         self.provision_lead_time_seconds = getattr(
             spec, 'provision_lead_time_seconds', None)
+        # Measurements describe the workload, not the spec revision, so an
+        # update keeps them. Disabling the feature must take effect at once.
+        self.adaptive_demand_estimation = (getattr(
+            spec, 'adaptive_demand_estimation', False) is True)
         self.max_scale_up_rate_percentage = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas = getattr(spec,
@@ -6403,6 +6569,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                      self._adaptive_until - time.monotonic())
         info.update({
             'replica_unit': self.replica_unit,
+            'adaptive_demand_estimation': self.adaptive_demand_estimation,
+            'effective_request_duration_seconds':
+                self.effective_request_duration_seconds,
+            'effective_provision_lead_seconds':
+                self.effective_provision_lead_seconds,
+            'measured_duration_seconds': self._measured_duration_seconds,
+            'measured_duration_samples': self._measured_duration_samples,
+            'provision_lead_samples': len(self._provision_lead_samples),
             'in_flight_total': in_flight_total,
             'queue_depth': self._queue_depth,
             'queue_depth_by_priority': self._queue_depth_by_priority,
@@ -6474,6 +6648,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'headerless_arrivals_300s': self._headerless_arrivals_300s,
             'offered_arrival_tracking_saturated':
                 self._offered_arrival_tracking_saturated,
+            'measured_duration_seconds': self._measured_duration_seconds,
+            'measured_duration_samples': self._measured_duration_samples,
+            'measured_duration_at': self._measured_duration_at,
+            'provision_lead_samples': list(self._provision_lead_samples),
+            'provision_lead_at': self._provision_lead_at,
             'pressure_baseline': self._pressure_baseline,
             'pressure_latched': self._pressure_latched,
             'pressure_reasons': self._pressure_reasons,
@@ -6526,6 +6705,39 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 dynamic_states.pop('compatibility_profiles'))
         if 'request_timestamps' in dynamic_states:
             self.request_timestamps = dynamic_states.pop('request_timestamps')
+        # Estimator state survives a controller restart: re-learning a
+        # duration from zero would silently fall back to the configured
+        # value for the whole warm-up, which is exactly when a restart
+        # under load can least afford an undersized target.
+        measured_duration = dynamic_states.pop('measured_duration_seconds',
+                                               None)
+        if (isinstance(measured_duration, (int, float)) and
+                not isinstance(measured_duration, bool) and
+                math.isfinite(measured_duration) and measured_duration > 0):
+            self._measured_duration_seconds = float(measured_duration)
+            samples = dynamic_states.pop('measured_duration_samples', 0)
+            self._measured_duration_samples = (
+                int(samples) if isinstance(samples, int) and
+                not isinstance(samples, bool) and samples >= 0 else 0)
+            observed_at = dynamic_states.pop('measured_duration_at', None)
+            self._measured_duration_at = (float(observed_at) if isinstance(
+                observed_at,
+                (int, float)) and not isinstance(observed_at, bool) else None)
+        else:
+            dynamic_states.pop('measured_duration_samples', None)
+            dynamic_states.pop('measured_duration_at', None)
+        lead_samples = dynamic_states.pop('provision_lead_samples', None)
+        if isinstance(lead_samples, list):
+            self._provision_lead_samples = [
+                float(sample)
+                for sample in lead_samples
+                if (isinstance(sample, (int, float)) and not isinstance(
+                    sample, bool) and math.isfinite(sample) and sample > 0)
+            ][-constants.AUTOSCALER_ADAPTIVE_LEAD_SAMPLE_CAP:]
+        lead_at = dynamic_states.pop('provision_lead_at', None)
+        if (isinstance(lead_at, (int, float)) and
+                not isinstance(lead_at, bool)):
+            self._provision_lead_at = float(lead_at)
         if 'in_flight_by_replica_id' in dynamic_states:
             self._in_flight_by_replica_id = dynamic_states.pop(
                 'in_flight_by_replica_id')
