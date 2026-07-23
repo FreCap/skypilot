@@ -116,6 +116,22 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     return data
 
 
+def _restore_exception_attributes(e: BaseException,
+                                  attributes: dict[str, Any]) -> None:
+    """Re-apply serialized attributes onto an already constructed exception.
+
+    deserialize_exception runs on the error path, so it must not raise: an
+    attribute that cannot be assigned (read-only, slotted, or type-checked
+    like ``__class__``) would otherwise replace the caller's real error with
+    an unrelated one.
+    """
+    for attribute, value in attributes.items():
+        try:
+            setattr(e, attribute, value)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+
 def deserialize_exception(serialized: Any) -> Exception:
     """Deserialize the exception.
 
@@ -152,32 +168,43 @@ def deserialize_exception(serialized: Any) -> Exception:
         return RuntimeError('Server error response is malformed.')
     attributes = dict(raw_attributes)
     legacy_notes = attributes.pop('__notes__', None)
+    # Dunder entries are never constructor arguments, for a built-in or a
+    # SkyPilot exception alike. Restore them independently after construction.
+    dunder_attributes = {
+        key: attributes.pop(key)
+        for key in list(attributes)
+        if key.startswith('__')
+    }
     try:
         if hasattr(builtins, exception_type):
             # Built-in exception constructors reject keyword arguments. Restore
-            # validated custom attributes after construction instead.
+            # validated ordinary attributes after construction instead.
             e = exception_class(*args)
-            for key, value in attributes.items():
-                setattr(e, key, value)
         else:
             e = exception_class(*args, **attributes)
-        if not isinstance(e, Exception):
-            return RuntimeError('Server error response is malformed.')
-        notes = serialized.get('notes', legacy_notes)
-        if (isinstance(notes, list) and
-                all(isinstance(note, str) for note in notes)):
-            add_note = getattr(e, 'add_note', None)
-            if add_note is None:
-                setattr(e, '__notes__', list(notes))
-            else:
-                for note in notes:
-                    add_note(note)
-        stacktrace = serialized.get('stacktrace')
-        if stacktrace is not None:
-            setattr(e, 'stacktrace', stacktrace)
     except Exception:  # pylint: disable=broad-exception-caught
-        # A malformed wire envelope must never escape the decoder boundary.
+        # An attribute the constructor does not accept must not replace the
+        # original error with an unrelated failure.
+        message = serialized.get('message')
+        detail = message if isinstance(message, str) else 'Unknown server error'
+        return Exception(f'{exception_type}: {detail}')
+    if not isinstance(e, Exception):
         return RuntimeError('Server error response is malformed.')
+    if hasattr(builtins, exception_type):
+        _restore_exception_attributes(e, attributes)
+    _restore_exception_attributes(e, dunder_attributes)
+    notes = serialized.get('notes', legacy_notes)
+    if (isinstance(notes, list) and
+            all(isinstance(note, str) for note in notes)):
+        add_note = getattr(e, 'add_note', None)
+        if add_note is None:
+            _restore_exception_attributes(e, {'__notes__': list(notes)})
+        else:
+            for note in notes:
+                add_note(note)
+    stacktrace = serialized.get('stacktrace')
+    if stacktrace is not None:
+        _restore_exception_attributes(e, {'stacktrace': stacktrace})
     return e
 
 

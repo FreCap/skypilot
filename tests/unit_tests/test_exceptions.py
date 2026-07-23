@@ -274,12 +274,6 @@ def test_deserialize_partial_dict():
     {
         'type': 'int',
     },
-    {
-        'type': 'ValueError',
-        'attributes': {
-            '__traceback__': 'not-a-traceback'
-        },
-    },
 ])
 def test_deserialize_malformed_envelope_never_raises(bad_input):
     restored = exceptions.deserialize_exception(bad_input)
@@ -321,3 +315,69 @@ def test_wrap_unsafe_exceptions():
     sky_safe = _serialize_deserialize(sky_error)
     assert isinstance(sky_safe, exceptions.ClusterNotUpError)
     assert str(sky_safe) == 'test cluster'
+
+
+def test_skypilot_exception_with_notes_round_trips():
+    """Notes must not be passed to a SkyPilot exception's constructor.
+
+    Built-in exceptions are constructed positionally, but SkyPilot ones are
+    rebuilt from keyword attributes, and Python 3.14 attaches ``__notes__``
+    to exceptions raised through some stdlib paths.
+    """
+    e = exceptions.ResourcesUnavailableError('no capacity')
+    e.__notes__ = ['context added by the interpreter']
+
+    deserialized = _serialize_deserialize(e)
+    assert isinstance(deserialized, exceptions.ResourcesUnavailableError)
+    assert str(deserialized) == 'no capacity'
+    assert deserialized.__notes__ == ['context added by the interpreter']
+    # Ordinary attributes still round-trip.
+    assert deserialized.no_failover is False
+
+
+def test_builtin_exception_with_notes_round_trips():
+    e = TypeError('Object of type set is not JSON serializable')
+    e.__notes__ = ["when serializing dict item 'bad'"]
+
+    deserialized = _serialize_deserialize(e)
+    assert isinstance(deserialized, TypeError)
+    assert deserialized.__notes__ == ["when serializing dict item 'bad'"]
+
+
+def test_deserialize_tolerates_attribute_the_constructor_rejects():
+    """An unusable attribute must not mask the original error."""
+    deserialized = exceptions.deserialize_exception({
+        'type': 'ResourcesUnavailableError',
+        'message': 'boom',
+        'args': ('boom',),
+        'attributes': {
+            'not_a_constructor_argument': 1
+        },
+    })
+    assert 'boom' in str(deserialized)
+
+
+def test_attribute_that_cannot_be_set_does_not_lose_the_error():
+    """An unsettable attribute must not fail the whole deserialization.
+
+    deserialize_exception runs on the error path, so an attribute that
+    cannot be assigned (read-only, slotted, or type-checked like
+    ``__class__``) must not replace the caller's real error with an
+    unrelated one.
+    """
+    serialized = {
+        'type': 'ValueError',
+        'message': 'boom',
+        'args': ('boom',),
+        'attributes': {
+            'context': 'while encoding',
+            '__class__': int,
+            '__traceback__': 'not-a-traceback',
+        },
+    }
+
+    deserialized = exceptions.deserialize_exception(serialized)
+
+    assert isinstance(deserialized, ValueError)
+    assert str(deserialized) == 'boom'
+    assert getattr(deserialized, 'context') == 'while encoding'

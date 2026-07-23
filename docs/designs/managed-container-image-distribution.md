@@ -1119,8 +1119,13 @@ arguments, and a dictionary with string attribute keys. Unknown types retain
 the existing generic fallback, while malformed fields or a constructor that
 rejects the supplied shape return a generic built-in error. Invalid envelopes
 never raise a secondary decoder exception or reflect the complete untrusted
-payload into an error message. Valid Python 3.11 exception notes continue to be
-restored outside constructor keyword arguments.
+payload into an error message. Built-in exceptions are constructed from
+positional arguments only, after which ordinary string-key attributes are
+restored independently; an attribute that is read-only, slotted, or otherwise
+unsettable is skipped without replacing the original error. Dunder attributes
+are never constructor arguments. Valid Python 3.11 exception notes are emitted
+outside the attribute map for old-client compatibility, while the decoder also
+accepts the legacy attribute form and restores notes only after construction.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -3473,3 +3478,16 @@ proof is incomplete. During repair, `origin/improvements` advanced to
 reconciles built-in exception attribute restoration with this feature's
 constructor-safe note serialization and total malformed-envelope decoder. The
 acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`d01d7e3cefeec17778ce3d0eb056555aa538c4c8` returned `PURSUE`; Fable again
+could not start because its exact-model request returned HTTP 429 with zero
+tokens, so no paired acceptance was recorded. Codex independently re-proved
+the malformed EC2 inventory repair, all 155 PostgreSQL tests, all 83 worker
+tests, the combined 352-test feature matrix, and the complete 26-check GitHub
+rollup without finding a blocker. During that round, `origin/improvements`
+advanced to `1f34d599a1`, independently invalidating the reviewed base. This
+revision integrates that base's GCP capacity classification, SQLite contention
+retry, and landed exception-compatibility fixes while retaining strict envelope
+shape validation, constructor-safe note serialization, tolerant attribute
+restoration, and sanitized fallbacks. The acceptance streak remains zero.
