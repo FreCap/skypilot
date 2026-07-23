@@ -40,10 +40,21 @@ Four structural causes:
    request with a 540 s lead counts as 0.5 replicas, not 0.05. This orders
    capacity ahead of saturation, which on gradually rising load keeps the
    queue away from its cap entirely.
-2. **The scale-up wave base counts the whole demand-owned fleet.** Budget
-   base and ceiling use non-terminal, non-scale-down capacity across *all*
-   versions. Rolling updates no longer reset ramp speed; the rolling
-   surge/drain machinery still bounds replacement pacing separately.
+2. **The scale-up target ceiling counts the whole fleet.** The aggregate
+   ceiling (`committed + budget`) uses non-terminal, non-retiring capacity
+   across *all* versions, so a saturated old-version fleet can grow to meet
+   demand instead of being pinned below itself while the new version ramps.
+   The wave *rate* deliberately stays on the latest-version base: it also
+   paces rollout replacement launches, and ramping a new version from its
+   own committed capacity is an existing contract that this change
+   preserves. Consequence to note: across a version boundary the new
+   version's `target_capacity` now reflects real demand rather than the
+   ramped value, so a rollout under load reaches its surge sooner. Actual
+   launches remain bounded by the unchanged per-wave `launch_budget`.
+   The retained-cooldown ceiling introduced by "Preserve unspent rollout
+   waves" is derived from the same all-version base at every recording
+   site, since a mixed base would leave the ceiling below its own
+   subtrahend and silently zero retained authority.
 3. **Saturation is pressure.** A pressure observation also latches when the
    reported queue depth holds at or above its previous value while at or
    above `scale_up_rate_min_replicas` (a plateaued queue). A draining queue

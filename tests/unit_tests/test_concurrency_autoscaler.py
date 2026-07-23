@@ -1382,14 +1382,18 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(_scale_downs(decisions), [])
         scale_ups = _scale_ups(decisions)
         self.assertEqual(len(scale_ups), 1)
+        # The aggregate target is no longer pinned below the old fleet it is
+        # replacing: 57 slots of live work keep the demand target at 57
+        # across the version boundary. Replacement pacing is unchanged and
+        # still owned by launch_budget, which stays at one wave minimum.
         self.assertEqual(
             scale_ups[0].target,
             autoscalers.LogicalScaleTarget(
                 version=2,
                 reconcile_generation=2,
-                target_capacity=10,
+                target_capacity=57,
                 launch_budget=10,
-                target_capacity_by_accelerator=(('L4', 10),),
+                target_capacity_by_accelerator=(('L4', 57),),
                 accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
 
@@ -2603,7 +2607,12 @@ class TestLogicalScalingWaves(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
+        # The restart baseline is still adopted from the old-version fleet
+        # (50), and saturated demand is no longer deferred behind it: one
+        # wave minimum lands in the same tick. The wave rate itself remains
+        # latest-version based, so this is a bounded +10, not a jump to the
+        # raw target.
+        self.assertEqual(autoscaler.target_num_replicas, 60)
 
     def test_restart_total_excludes_fill_retiring_and_pending_rows(self):
         autoscaler = self._ramped_autoscaler()
@@ -2939,11 +2948,13 @@ class TestLogicalScalingWaves(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic(
                 old_fleet)
 
-        # Latest-version committed capacity is zero mid-rollout, but the
-        # saturated 100-slot serving fleet is the honest growth base:
-        # budget max(10, 20% of 100) = 20, ceiling 100 + 20. A latest-only
-        # base would freeze the target at 100 for the whole rollout.
-        self.assertEqual(autoscaler.target_num_replicas, 120)
+        # Latest-version committed capacity is zero mid-rollout. The target
+        # ceiling counts the saturated 100-slot serving fleet, so the wave
+        # lands at 100 + max(10, 20% of 0) = 110. A latest-only ceiling
+        # would freeze the target at 100 for the whole rollout, which is the
+        # production incident. The wave rate stays latest-version based so
+        # rollout replacement pacing is unchanged.
+        self.assertEqual(autoscaler.target_num_replicas, 110)
 
     def test_saturated_plateau_progresses_adaptive_waves_to_max(self):
         """Incident regression: a flat saturated queue must keep doubling.
