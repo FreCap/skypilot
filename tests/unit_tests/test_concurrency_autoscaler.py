@@ -4660,6 +4660,88 @@ class TestRollingDrain(unittest.TestCase):
         self.assertTrue(
             set(retired).issubset({info.replica_id for info in old}))
 
+    def test_logical_exact_card_rollout_retires_matching_partial_coverage(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 40}
+        old = [_replica(i, version=1, card='L4') for i in range(1, 41)]
+        new_ready = _replica(101, version=2, card='L4', planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5},
+                compatibility_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['L4'],
+                    'count': 40,
+                }],
+                compatibility_complete=True)
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(len(retired), 5)
+        self.assertTrue(
+            set(retired).issubset({info.replica_id for info in old}))
+
+    def test_logical_exact_card_rollout_keeps_uncovered_old_card(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 40}
+        old = [_replica(i, version=1, card='L4') for i in range(1, 41)]
+        new_ready = _replica(101, version=2, card='A100', planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5},
+                compatibility_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['L4'],
+                    'count': 40,
+                }],
+                compatibility_complete=True)
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(retired, [])
+
+    def test_logical_exact_card_rollout_retires_removed_old_card(self):
+        autoscaler = self._logical_mid_update(target=40, raw_target=40)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 40}
+        old = [_replica(i, version=1, card='L4') for i in range(1, 41)]
+        new_ready = _replica(101, version=2, card='A100', planned_capacity=5)
+        _report(autoscaler,
+                in_flight={
+                    **{
+                        info.replica_id: 0 for info in old
+                    },
+                    101: 0,
+                },
+                observed_slots={101: 5},
+                compatibility_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 40,
+                }],
+                compatibility_complete=True)
+
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            old + [new_ready], [1, 2])
+
+        self.assertEqual(len(retired), 5)
+        self.assertTrue(
+            set(retired).issubset({info.replica_id for info in old}))
+
     def test_preempted_latest_logical_capacity_cannot_cover_rolling_drain(self):
         autoscaler = self._logical_mid_update(target=5, raw_target=5)
         old = [_replica(i, version=1) for i in range(1, 6)]
