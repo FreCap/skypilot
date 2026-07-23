@@ -728,6 +728,16 @@ created resource classes with the required request tags. A separate
 `ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
 not combined with launch conditions. The role never relies on an implicit VPC
 default security group.
+EC2 qualification canaries use one-time Spot capacity with terminate-on-
+interruption by default. `canary_use_spot: false` is the explicit escape hatch
+for an account or region that requires on-demand qualification. A failed Spot
+launch remains a retryable canary operation; the worker does not silently
+change market type under the same idempotent client token or launch a second
+fallback child. The configured worst-case reservation remains the cost ceiling,
+so Spot savings never weaken the daily budget fence. EKS qualification uses an
+existing declared cluster and does not choose that cluster's capacity type.
+Serve and job placement remain owned by their normal SkyPilot resource policy,
+not by the image plane.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -1577,6 +1587,7 @@ container_registries:
         us-west-2: ami-0fedcba9876543210
       canary_authority: compute-canary
       canary_instance_type: t3.micro
+      canary_use_spot: true  # defaults to true; set false for on-demand
       canary_subnets:
         us-east-1: [subnet-0123456789abcdef0]
         us-west-2: [subnet-0fedcba9876543210]

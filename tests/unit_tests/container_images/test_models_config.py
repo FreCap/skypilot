@@ -7,10 +7,12 @@ import pickle
 from typing import Any
 import uuid
 
+import jsonschema
 import pytest
 
 from sky.container_images import config
 from sky.container_images import models
+from sky.utils import schemas
 
 ACCOUNT = '123456789012'
 DIGEST = 'sha256:' + 'a' * 64
@@ -100,9 +102,20 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
     assert restored.canonical.target_fingerprint != (
         restored.targets[0].target_fingerprint)
 
+    legacy = copy.deepcopy(snapshot)
+    for binding in legacy['access_bindings']:
+        binding.pop('canary_use_spot')
+    assert models.ManagedRegistryProfile.from_snapshot(legacy) == profile
+
     forged = copy.deepcopy(snapshot)
     forged['canonical']['registry'] = 'attacker.example'
     with pytest.raises(ValueError):
+        models.ManagedRegistryProfile.from_snapshot(forged)
+
+    forged = copy.deepcopy(snapshot)
+    next(binding for binding in forged['access_bindings'] if binding['kind'] ==
+         'aws_ec2_instance_identity')['canary_use_spot'] = 1
+    with pytest.raises(ValueError, match='Spot preference'):
         models.ManagedRegistryProfile.from_snapshot(forged)
 
 
@@ -114,6 +127,13 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     ec2_binding = bindings['aws-vm-pullers']
     assert models.ec2_instance_profile_arn(ec2_binding) == (
         'arn:aws:iam::210987654321:instance-profile/SkyPilotNodeProfile')
+    assert ec2_binding.canary_use_spot
+
+    on_demand = copy.deepcopy(registry_config)
+    on_demand['access_bindings']['aws-vm-pullers']['canary_use_spot'] = False
+    on_demand_bindings = config.parse_access_bindings(
+        on_demand['access_bindings'])
+    assert not on_demand_bindings['aws-vm-pullers'].canary_use_spot
 
     invalid = copy.deepcopy(registry_config)
     invalid['profiles']['gpu-production']['targets'][0]['runtime_pull'][
@@ -135,6 +155,23 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     ]
     with pytest.raises(ValueError, match='principal ARN'):
         config.parse_access_bindings(invalid['access_bindings'])
+
+    invalid = copy.deepcopy(registry_config)
+    invalid['access_bindings']['aws-vm-pullers']['canary_use_spot'] = 1
+    with pytest.raises(ValueError, match='Spot preference'):
+        config.parse_access_bindings(invalid['access_bindings'])
+
+
+def test_ec2_canary_spot_schema_accepts_boolean_only(
+        registry_config: dict[str, Any]) -> None:
+    schema = schemas.get_config_schema()['properties']['container_registries']
+    explicit = copy.deepcopy(registry_config)
+    explicit['access_bindings']['aws-vm-pullers']['canary_use_spot'] = False
+    jsonschema.validate(explicit, schema)
+
+    explicit['access_bindings']['aws-vm-pullers']['canary_use_spot'] = 1
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(explicit, schema)
 
 
 @pytest.mark.parametrize('architecture', [None, 'arm64'])

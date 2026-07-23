@@ -1862,6 +1862,10 @@ def get_config_schema():
                     'minLength': 1,
                     'maxLength': 128,
                 },
+                'canary_use_spot': {
+                    'type': 'boolean',
+                    'default': True,
+                },
                 'canary_subnets': {
                     'type': 'object',
                     'minProperties': 1,

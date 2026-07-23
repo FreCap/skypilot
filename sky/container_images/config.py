@@ -132,7 +132,7 @@ def _binding_from_config(name: str,
         allowed = common | {
             'principals', 'instance_profile', 'credential_helper',
             'qualified_node_images', 'canary_authority', 'canary_instance_type',
-            'canary_subnets', 'canary_security_groups'
+            'canary_use_spot', 'canary_subnets', 'canary_security_groups'
         }
         node_images = value.get('qualified_node_images', {})
         if not isinstance(node_images, dict):
@@ -156,6 +156,7 @@ def _binding_from_config(name: str,
                        for region, ami in node_images.items())),
             canary_authority=value.get('canary_authority'),
             canary_instance_type=value.get('canary_instance_type'),
+            canary_use_spot=value.get('canary_use_spot', True),
             canary_subnets=tuple(
                 sorted((str(region), tuple(str(item)
                                            for item in items))

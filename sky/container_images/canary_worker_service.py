@@ -790,6 +790,14 @@ def _run_ec2_canary_inner(
                 'SecurityGroupIds': list(
                     dict(binding.canary_security_groups)[target.region]),
             }
+            if binding.canary_use_spot:
+                kwargs['InstanceMarketOptions'] = {
+                    'MarketType': 'spot',
+                    'SpotOptions': {
+                        'SpotInstanceType': 'one-time',
+                        'InstanceInterruptionBehavior': 'terminate',
+                    },
+                }
             _raise_if_draining(drain_event)
             deadline = _authorized_launch_deadline(operation,
                                                    child_id,

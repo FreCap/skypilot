@@ -2026,15 +2026,17 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
                           (None, 'expected', 'QUALIFICATION_FAILED'),
                           ('x86_64', 'other', 'QUALIFICATION_FAILED'),
                           ('x86_64', None, 'QUALIFICATION_FAILED')))
+@pytest.mark.parametrize('use_spot', [True, False])
 def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
         architecture: str | None, image_id_case: str | None,
-        expected_error: str | None) -> None:
+        expected_error: str | None, use_spot: bool) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=use_spot)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -2164,6 +2166,16 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         InstanceIds=['i-canary']) in (ec2.describe_instances.call_args_list)
     launch = ec2.run_instances.call_args.kwargs
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
+    if use_spot:
+        assert launch['InstanceMarketOptions'] == {
+            'MarketType': 'spot',
+            'SpotOptions': {
+                'SpotInstanceType': 'one-time',
+                'InstanceInterruptionBehavior': 'terminate',
+            },
+        }
+    else:
+        assert 'InstanceMarketOptions' not in launch
     assert launch['SecurityGroupIds'] == list(
         dict(binding.canary_security_groups)[target.region])
     assert {item['ResourceType'] for item in launch['TagSpecifications']

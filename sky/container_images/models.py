@@ -379,11 +379,14 @@ class RegistryAccessBinding:
     instance_profile: str | None = None
     canary_authority: str | None = None
     canary_instance_type: str | None = None
+    canary_use_spot: bool = True
     canary_subnets: tuple[tuple[str, tuple[str, ...]], ...] = ()
     canary_security_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
     qualified_clusters: tuple[QualifiedKubernetesCluster, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.canary_use_spot, bool):
+            raise ValueError('EC2 canary Spot preference must be a boolean.')
         object.__setattr__(
             self, 'id',
             validate_control_plane_identifier(self.id,
