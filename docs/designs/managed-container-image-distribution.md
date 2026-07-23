@@ -737,7 +737,10 @@ fallback child. The configured worst-case reservation remains the cost ceiling,
 so Spot savings never weaken the daily budget fence. EKS qualification uses an
 existing declared cluster and does not choose that cluster's capacity type.
 Serve and job placement remain owned by their normal SkyPilot resource policy,
-not by the image plane.
+not by the image plane. The default `true` is omitted from persisted profile and
+binding-fingerprint projections so existing default-behavior revisions retain
+their identities. An explicit `false` is projected and therefore requires the
+normal profile revision increment.
 
 An ECR destination claim executes this fenced algorithm:
 

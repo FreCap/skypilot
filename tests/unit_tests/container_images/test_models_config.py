@@ -101,11 +101,8 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
     assert restored.physical_manifest_hash == profile.physical_manifest_hash
     assert restored.canonical.target_fingerprint != (
         restored.targets[0].target_fingerprint)
-
-    legacy = copy.deepcopy(snapshot)
-    for binding in legacy['access_bindings']:
-        binding.pop('canary_use_spot')
-    assert models.ManagedRegistryProfile.from_snapshot(legacy) == profile
+    assert all('canary_use_spot' not in binding
+               for binding in snapshot['access_bindings'])
 
     forged = copy.deepcopy(snapshot)
     forged['canonical']['registry'] = 'attacker.example'
@@ -118,12 +115,19 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
     with pytest.raises(ValueError, match='Spot preference'):
         models.ManagedRegistryProfile.from_snapshot(forged)
 
+    forged = copy.deepcopy(snapshot)
+    next(binding for binding in forged['access_bindings'] if binding['kind'] !=
+         'aws_ec2_instance_identity')['canary_use_spot'] = False
+    with pytest.raises(ValueError, match='Only EC2 runtime bindings'):
+        models.ManagedRegistryProfile.from_snapshot(forged)
+
 
 def test_profile_requires_exact_runtime_and_canary_bindings(
         registry_config: dict[str, Any]) -> None:
     bindings = config.parse_access_bindings(registry_config['access_bindings'])
-    assert set(config.parse_profiles(registry_config['profiles'],
-                                     bindings)) == {'gpu-production'}
+    profiles = config.parse_profiles(registry_config['profiles'], bindings)
+    assert set(profiles) == {'gpu-production'}
+    profile = profiles['gpu-production']
     ec2_binding = bindings['aws-vm-pullers']
     assert models.ec2_instance_profile_arn(ec2_binding) == (
         'arn:aws:iam::210987654321:instance-profile/SkyPilotNodeProfile')
@@ -134,6 +138,18 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     on_demand_bindings = config.parse_access_bindings(
         on_demand['access_bindings'])
     assert not on_demand_bindings['aws-vm-pullers'].canary_use_spot
+    on_demand_profile = config.parse_profiles(
+        on_demand['profiles'], on_demand_bindings)['gpu-production']
+    on_demand_snapshot = on_demand_profile.to_snapshot()
+    on_demand_binding = next(
+        binding for binding in on_demand_snapshot['access_bindings']
+        if binding['kind'] == 'aws_ec2_instance_identity')
+    assert on_demand_binding['canary_use_spot'] is False
+    assert (models.ManagedRegistryProfile.from_snapshot(on_demand_snapshot) ==
+            on_demand_profile)
+    assert on_demand_profile.config_hash != profile.config_hash
+    assert (on_demand_profile.bindings['aws-vm-pullers'].fingerprint
+            != ec2_binding.fingerprint)
 
     invalid = copy.deepcopy(registry_config)
     invalid['profiles']['gpu-production']['targets'][0]['runtime_pull'][

@@ -387,6 +387,10 @@ class RegistryAccessBinding:
     def __post_init__(self) -> None:
         if not isinstance(self.canary_use_spot, bool):
             raise ValueError('EC2 canary Spot preference must be a boolean.')
+        if (self.kind != RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY and
+                not self.canary_use_spot):
+            raise ValueError('Only EC2 runtime bindings accept an on-demand '
+                             'canary override.')
         object.__setattr__(
             self, 'id',
             validate_control_plane_identifier(self.id,
@@ -487,6 +491,8 @@ class RegistryAccessBinding:
     def fingerprint(self) -> str:
         payload = dataclasses.asdict(self)
         payload['kind'] = self.kind.value
+        if self.canary_use_spot:
+            payload.pop('canary_use_spot')
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True,
                        separators=(',', ':')).encode()).hexdigest()
@@ -753,10 +759,14 @@ class ManagedRegistryProfile:
             if isinstance(value, enum.Enum):
                 return value.value
             if dataclasses.is_dataclass(value):
-                return {
+                normalized = {
                     field.name: normalize(getattr(value, field.name))
                     for field in dataclasses.fields(value)
                 }
+                if (isinstance(value, RegistryAccessBinding) and
+                        value.canary_use_spot):
+                    normalized.pop('canary_use_spot')
+                return normalized
             if isinstance(value, tuple):
                 return [normalize(item) for item in value]
             if isinstance(value, dict):
