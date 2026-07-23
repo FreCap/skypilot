@@ -134,7 +134,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
 
     def test_returns_none_without_committed_snapshot(self):
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_committed_version_spec',
+                        'get_latest_applicable_version_spec',
                         return_value=None), \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -155,7 +155,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
         spec.graceful_drain_seconds = 23
 
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_committed_version_spec',
+                        'get_latest_applicable_version_spec',
                         return_value=(7, spec)) as snapshot, \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -719,7 +719,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
                            'get_service_from_name',
                            return_value=record), \
          mock.patch.object(service.serve_state,
-                           'get_latest_committed_version_spec',
+                           'get_latest_applicable_version_spec',
                            return_value=(3, persisted)), \
          mock.patch.object(service.serve_state,
                            'get_yaml_content',

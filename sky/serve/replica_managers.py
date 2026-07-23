@@ -822,15 +822,41 @@ def _get_resources_ports(
     yaml_content: str,
     service_spec: 'service_spec.SkyServiceSpec | None' = None,
 ) -> str:
-    """Get the resources ports used by the task."""
+    """Get the replica ingress port from the service or its resources."""
     task = load_task_with_service_spec(yaml_content, service_spec)
     # Already checked all ports are valid in sky.serve.core.up
     assert task.resources, task
     assert task.service is not None, task
-    if task.service.pool:
-        return '-'
-    assert task.service.ports is not None, task
-    return task.service.ports
+    return serve_utils.resolve_replica_ingress_port(task,
+                                                    pool=task.service.pool)
+
+
+def validate_service_update_preflight(
+        service_name: str, version: int,
+        service_spec: 'service_spec.SkyServiceSpec') -> None:
+    """Run immutable candidate calculations needed before replica launch."""
+    yaml_content = serve_state.get_yaml_content(service_name, version)
+    if yaml_content is None:
+        raise ValueError(
+            f'YAML content not found for {service_name} version {version}.')
+    task = load_task_with_service_spec(yaml_content, service_spec)
+    if task.service is None:
+        raise ValueError(
+            f'Service spec not found for {service_name} version {version}.')
+    serve_utils.resolve_replica_ingress_port(task, pool=task.service.pool)
+
+    uses_logical_replicas = (getattr(service_spec, 'uses_logical_replicas',
+                                     False) is True)
+    default_planned_capacity = _uniform_whole_gpu_capacity(task.resources)
+    if uses_logical_replicas:
+        _exact_accelerator_shapes(task.resources)
+    placer_name = getattr(service_spec, 'spot_placer', None)
+    candidate_placer = None
+    if uses_logical_replicas or isinstance(placer_name, str):
+        candidate_placer = spot_placer.SpotPlacer.from_task(service_spec, task)
+    if uses_logical_replicas:
+        _validate_logical_capacity_sources(default_planned_capacity,
+                                           candidate_placer, task.num_nodes)
 
 
 def _should_use_spot(

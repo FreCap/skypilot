@@ -974,19 +974,19 @@ def _respawn_controller(
     if not _reap_dead_controller_for_respawn(service_name, dead_controller):
         return None
 
-    # Snapshot the latest COMMITTED version + spec so a respawn after
-    # /update_service uses the current config.  The parent loop's captured
-    # values may be stale after an in-place update, so absence or a DB error
-    # must defer to the next tick rather than resurrecting them.
+    # Snapshot the latest applicable committed version + spec so a respawn
+    # after /update_service uses the current safe config. The parent loop's
+    # captured values may be stale after an in-place update, while a durably
+    # quarantined version must not crash-loop the replacement controller.
     try:
-        snapshot = serve_state.get_latest_committed_version_spec(service_name)
+        snapshot = serve_state.get_latest_applicable_version_spec(service_name)
     except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to reload the latest committed version/spec for '
+        logger.error(f'Failed to reload the latest applicable version/spec for '
                      f'{service_name}: {common_utils.format_exception(e)}; '
                      f'will retry on the next tick.')
         return None
     if snapshot is None:
-        logger.error(f'No committed version/spec found for {service_name}; '
+        logger.error(f'No applicable version/spec found for {service_name}; '
                      'will retry on the next tick.')
         return None
     version, service_spec = snapshot
@@ -1056,7 +1056,7 @@ def _get_latest_committed_lb_termination_grace_seconds(
     it should reuse the one-row committed `(version, spec)` snapshot instead of
     re-issuing separate latest-version and spec reads on every upkeep round.
     """
-    snapshot = serve_state.get_latest_committed_version_spec(service_name)
+    snapshot = serve_state.get_latest_applicable_version_spec(service_name)
     if snapshot is None:
         return None
     _, latest_spec = snapshot
@@ -1359,15 +1359,11 @@ def _start(service_name: str,
         with open(os.path.expanduser(yaml_path), encoding='utf-8') as f:
             return f.read()
 
-    # On recovery, resume the latest COMMITTED service version (one whose yaml
-    # was persisted), NOT raw MAX(version). An interrupted `sky serve update`
-    # can leave a NULL-yaml placeholder version as MAX (add_version writes the
-    # row before the controller fills in the yaml via add_or_update_version);
-    # booting the controller at it crash-loops forever (SkyPilotReplicaManager
-    # asserts the yaml is not None). The interrupted update is unrecoverable
-    # (its yaml was never persisted), so resume the last committed version.
+    # On recovery, resume the latest applicable committed version, not raw
+    # MAX(version). This skips both interrupted NULL-yaml placeholders and
+    # versions whose deterministic preflight failure was durably quarantined.
     recovery_snapshot = (
-        serve_state.get_latest_committed_version_spec(service_name)
+        serve_state.get_latest_applicable_version_spec(service_name)
         if is_recovery else None)
     recovery_version = (recovery_snapshot[0]
                         if recovery_snapshot is not None else None)

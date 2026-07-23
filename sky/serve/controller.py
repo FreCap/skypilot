@@ -221,6 +221,10 @@ class _PendingServiceUpdate(NamedTuple):
 _UPDATE_RETRY_BACKOFF_SECONDS = 5
 
 
+class DeterministicServiceUpdateError(ValueError):
+    """An immutable committed spec cannot be applied by this controller."""
+
+
 class SkyServeController:
     """SkyServeController: control everything about replica.
 
@@ -263,10 +267,20 @@ class SkyServeController:
         self._update_lock = threading.Lock()
         self._update_condition = threading.Condition()
         self._pending_update: _PendingServiceUpdate | None = None
-        # A controller child always boots from the latest committed version,
-        # so its initial runtime and durable state agree.
-        self._committed_version = version
+        # Recovery boots the latest applicable version. Preserve the highest
+        # committed version separately so a quarantined candidate remains
+        # visible without becoming runtime authority.
+        self._committed_version = (
+            serve_state.get_latest_committed_version(service_name) or version)
         self._applied_version = version
+        latest_quarantine = serve_state.get_latest_quarantined_version(
+            service_name)
+        self._quarantined_version = (latest_quarantine['version']
+                                     if latest_quarantine is not None else None)
+        self._quarantined_at = (latest_quarantine['quarantined_at']
+                                if latest_quarantine is not None else None)
+        self._quarantine_reason = (latest_quarantine['quarantine_reason']
+                                   if latest_quarantine is not None else None)
         # Publish the autoscaler catalog, routing spec, and applied version as
         # one compatibility epoch.  LB demand ingestion takes the same lock so
         # an old-version report can never be validated before an update and
@@ -2957,6 +2971,9 @@ class SkyServeController:
                 'update_apply_lag_seconds': apply_lag,
                 'update_apply_error': self._update_apply_error,
                 'update_apply_failures': self._update_apply_failures,
+                'quarantined_version': self._quarantined_version,
+                'quarantined_at': self._quarantined_at,
+                'quarantine_reason': self._quarantine_reason,
             }
 
     def _update_still_authorized(self) -> bool:
@@ -2980,6 +2997,34 @@ class SkyServeController:
                 self._pending_update = None
         self._replica_manager.clear_pending_version(update.version)
 
+    def _record_retryable_update_failure(self,
+                                         update: _PendingServiceUpdate,
+                                         error: Exception,
+                                         wait: bool,
+                                         context: str = 'apply') -> bool:
+        """Record a retryable failure and preserve the pending-version fence."""
+        exception_str = common_utils.format_exception(error)
+        with self._update_condition:
+            retry_same_update = self._pending_update is update
+            if retry_same_update:
+                self._update_apply_error = exception_str
+                self._update_apply_failures += 1
+        # _apply_service_update clears its pending-version signal in a finally
+        # block. Re-publish it while this durable version waits for a retry.
+        self._replica_manager.notify_version_pending(update.version)
+        retry_message = ('will retry'
+                         if retry_same_update else 'was superseded')
+        logger.error(f'Failed to {context} committed service version '
+                     f'{update.version}; {retry_message}: {exception_str}')
+        with ux_utils.enable_traceback():
+            logger.error(f'  Traceback: {traceback.format_exc()}')
+        if retry_same_update and wait:
+            with self._update_condition:
+                self._update_condition.wait_for(
+                    lambda: self._pending_update is not update,
+                    timeout=_UPDATE_RETRY_BACKOFF_SECONDS)
+        return not retry_same_update
+
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
         """Apply one pending update; optionally wait through retry backoff."""
         with self._update_condition:
@@ -2999,32 +3044,46 @@ class SkyServeController:
                 return True
             self._apply_service_update(update.version, update.service,
                                        update.update_mode)
-        except Exception as e:  # pylint: disable=broad-except
+        except DeterministicServiceUpdateError as e:
             exception_str = common_utils.format_exception(e)
+            quarantined_at = time.time()
+            try:
+                quarantined = serve_state.quarantine_version(
+                    self._service_name,
+                    update.version,
+                    exception_str,
+                    quarantined_at=quarantined_at,
+                    expected_service_hash=self._service_hash,
+                    expected_controller_owner=self._controller_owner)
+            except Exception as quarantine_error:  # pylint: disable=broad-except
+                return self._record_retryable_update_failure(
+                    update, quarantine_error, wait, context='quarantine')
+            if not quarantined:
+                # Do not fail open until the rejection is durable. A missing
+                # or uncommitted row is treated like a transient apply failure.
+                return self._record_retryable_update_failure(
+                    update,
+                    RuntimeError(
+                        'The committed version row could not be quarantined.'),
+                    wait,
+                    context='quarantine')
             with self._update_condition:
-                retry_same_update = self._pending_update is update
-                if retry_same_update:
-                    self._update_apply_error = exception_str
-                    self._update_apply_failures += 1
-            # _apply_service_update clears the pending-version signal in a
-            # finally block. Re-publish it while this durable version waits for
-            # a retry, unless a newer commit has already replaced the signal.
-            self._replica_manager.notify_version_pending(update.version)
-            retry_message = ('will retry'
-                             if retry_same_update else 'was superseded')
-            logger.error(f'Failed to apply committed service version '
-                         f'{update.version}; {retry_message}: {exception_str}')
-            with ux_utils.enable_traceback():
-                logger.error(f'  Traceback: {traceback.format_exc()}')
-            if retry_same_update and wait:
-                # Release the condition during backoff and wake immediately if
-                # a newer commit supersedes this failed update. wait_for()
-                # also closes the commit-before-wait lost-wakeup window.
-                with self._update_condition:
-                    self._update_condition.wait_for(
-                        lambda: self._pending_update is not update,
-                        timeout=_UPDATE_RETRY_BACKOFF_SECONDS)
-            return not retry_same_update
+                if self._pending_update is update:
+                    self._pending_update = None
+                self._update_apply_error = exception_str
+                self._update_apply_failures = 1
+                self._quarantined_version = update.version
+                self._quarantined_at = quarantined_at
+                self._quarantine_reason = exception_str
+                self._update_condition.notify()
+            self._replica_manager.clear_pending_version(update.version)
+            logger.error(
+                f'Quarantined committed service version {update.version}; '
+                f'continuing applied version {self._applied_version}: '
+                f'{exception_str}')
+            return True
+        except Exception as e:  # pylint: disable=broad-except
+            return self._record_retryable_update_failure(update, e, wait)
 
         with self._update_condition:
             self._applied_version = max(self._applied_version, update.version)
@@ -3044,11 +3103,19 @@ class SkyServeController:
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
         """Apply a persisted update to the live controller state."""
-        if (getattr(self._autoscaler, 'replica_unit', None) == 'logical' and
-                getattr(service, 'uses_logical_replicas', False) is not True):
-            raise ValueError(
-                'Refusing to apply a physical-backend version after logical '
-                'replica semantics were activated.')
+        try:
+            if (getattr(self._autoscaler, 'replica_unit', None) == 'logical' and
+                    getattr(service, 'uses_logical_replicas',
+                            False) is not True):
+                raise ValueError(
+                    'Refusing to apply a physical-backend version after '
+                    'logical replica semantics were activated.')
+            replica_managers.validate_service_update_preflight(
+                self._service_name, version, service)
+        except (AssertionError, RuntimeError, TypeError, ValueError) as e:
+            raise DeterministicServiceUpdateError(
+                f'Version {version} failed deterministic launch preflight: '
+                f'{common_utils.format_exception(e)}') from e
         # add_or_update_version commits before this method runs.  Announce the
         # new version without acquiring the replica-manager lock: a large
         # placer-backed scale-up batch may currently hold that lock while

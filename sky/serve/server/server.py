@@ -72,6 +72,8 @@ def _service_version_history(service_name: str) -> dict:
                 version_record['yaml_content'], stable_order=True),
             'created_at': version_record['created_at'],
             'created_by': version_record['created_by'],
+            'quarantined_at': version_record['quarantined_at'],
+            'quarantine_reason': version_record['quarantine_reason'],
             'policy':
                 (spec.autoscaling_policy_str() if spec is not None else None),
             'elected': version == elected_version,

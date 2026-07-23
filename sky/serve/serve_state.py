@@ -154,6 +154,9 @@ version_specs_table = sqlalchemy.Table(
                       server_default=None),
     sqlalchemy.Column('created_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('created_by', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('quarantined_at', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('quarantine_reason', sqlalchemy.Text,
+                      server_default=None),
 )
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
@@ -3382,6 +3385,8 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
                 version_specs_table.c.submitted_yaml_content,
                 version_specs_table.c.created_at,
                 version_specs_table.c.created_by,
+                version_specs_table.c.quarantined_at,
+                version_specs_table.c.quarantine_reason,
             ).where(
                 version_specs_table.c.service_name == service_name,
                 version_specs_table.c.yaml_content.isnot(None),
@@ -3393,7 +3398,95 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
         'submitted_yaml_content': row.submitted_yaml_content,
         'created_at': row.created_at,
         'created_by': row.created_by,
+        'quarantined_at': row.quarantined_at,
+        'quarantine_reason': row.quarantine_reason,
     } for row in rows]
+
+
+def quarantine_version(
+    service_name: str,
+    version: int,
+    reason: str,
+    quarantined_at: float | None = None,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
+) -> bool:
+    """Durably make one committed version ineligible for application."""
+    if quarantined_at is None:
+        quarantined_at = time.time()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        predicates = [
+            version_specs_table.c.service_name == service_name,
+            version_specs_table.c.version == version,
+            version_specs_table.c.yaml_content.isnot(None),
+            version_specs_table.c.quarantined_at.is_(None),
+        ]
+        if (expected_service_hash is not None or
+                expected_controller_owner is not None):
+            owner_predicates = [services_table.c.name == service_name]
+            if expected_service_hash is not None:
+                owner_predicates.append(
+                    services_table.c.hash == expected_service_hash)
+            if expected_controller_owner is not None:
+                expected_pid, expected_ip = expected_controller_owner
+                owner_predicates.extend([
+                    services_table.c.controller_pid == expected_pid,
+                    services_table.c.controller_ip == expected_ip,
+                ])
+            predicates.append(sqlalchemy.exists().where(*owner_predicates))
+        result = session.execute(
+            sqlalchemy.update(version_specs_table).where(*predicates).values(
+                quarantined_at=quarantined_at, quarantine_reason=reason))
+        if result.rowcount == 0:
+            if (expected_service_hash is not None or
+                    expected_controller_owner is not None):
+                owner = session.execute(
+                    sqlalchemy.select(
+                        services_table.c.hash,
+                        services_table.c.controller_pid,
+                        services_table.c.controller_ip,
+                    ).where(services_table.c.name == service_name)).fetchone()
+                if (owner is None or (expected_service_hash is not None and
+                                      owner.hash != expected_service_hash) or
+                    (expected_controller_owner is not None and
+                     (owner.controller_pid, owner.controller_ip)
+                     != expected_controller_owner)):
+                    session.rollback()
+                    return False
+            existing = session.execute(
+                sqlalchemy.select(version_specs_table.c.quarantined_at).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.isnot(None))).fetchone()
+            if existing is None or existing.quarantined_at is None:
+                session.rollback()
+                return False
+        session.commit()
+    return True
+
+
+def get_latest_quarantined_version(service_name: str) -> dict[str, Any] | None:
+    """Return the newest quarantined version's durable diagnostics."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.quarantined_at,
+                version_specs_table.c.quarantine_reason,
+            ).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.quarantined_at.isnot(None),
+            ).order_by(
+                version_specs_table.c.version.desc()).limit(1)).fetchone()
+    if row is None:
+        return None
+    return {
+        'version': row.version,
+        'quarantined_at': row.quarantined_at,
+        'quarantine_reason': row.quarantine_reason,
+    }
 
 
 def get_yaml_content(service_name: str, version: int) -> str | None:
@@ -3485,6 +3578,28 @@ def get_latest_committed_version_spec(
                     sqlalchemy.and_(
                         version_specs_table.c.service_name == service_name,
                         version_specs_table.c.yaml_content.isnot(None))).
+            order_by(version_specs_table.c.version.desc()).limit(1)).fetchone()
+    if result is None:
+        return None
+    spec = pickle.loads(result[1])
+    if spec is None:
+        return None
+    return result[0], spec
+
+
+def get_latest_applicable_version_spec(
+        service_name: str) -> tuple[int, 'service_spec.SkyServiceSpec'] | None:
+    """Return the newest committed version not durably quarantined."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.spec).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.yaml_content.isnot(None),
+                        version_specs_table.c.quarantined_at.is_(None))).
             order_by(version_specs_table.c.version.desc()).limit(1)).fetchone()
     if result is None:
         return None

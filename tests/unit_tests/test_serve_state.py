@@ -2243,6 +2243,8 @@ class TestRecoveryVersionSelection:
             'submitted_yaml_content': 'submitted: v1',
             'created_at': 1001.0,
             'created_by': 'alice',
+            'quarantined_at': None,
+            'quarantine_reason': None,
         }, {
             'version': 2,
             'spec': 'spec-2',
@@ -2250,7 +2252,80 @@ class TestRecoveryVersionSelection:
             'submitted_yaml_content': 'submitted: v2',
             'created_at': 1002.0,
             'created_by': 'bob',
+            'quarantined_at': None,
+            'quarantine_reason': None,
         }]
+
+    def test_quarantine_is_durable_and_applicable_snapshot_skips_it(
+            self, _mock_serve_db):
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+
+        assert serve_state.quarantine_version('svc',
+                                              2,
+                                              'deterministic port failure',
+                                              quarantined_at=123.0)
+        assert serve_state.get_latest_committed_version('svc') == 2
+        assert serve_state.get_latest_committed_version_spec('svc') == (
+            2, 'spec-2')
+        assert serve_state.get_latest_applicable_version_spec('svc') == (
+            1, 'spec-1')
+        assert serve_state.get_latest_quarantined_version('svc') == {
+            'version': 2,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'deterministic port failure',
+        }
+
+        serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
+        assert serve_state.get_latest_applicable_version_spec('svc') == (
+            3, 'spec-3')
+
+    def test_quarantine_rejects_placeholder_and_is_idempotent(
+            self, _mock_serve_db):
+        assert serve_state.add_version('svc') == 1
+        assert not serve_state.quarantine_version('svc', 1, 'not committed')
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        assert serve_state.quarantine_version('svc',
+                                              1,
+                                              'first reason',
+                                              quarantined_at=123.0)
+        assert serve_state.quarantine_version('svc',
+                                              1,
+                                              'second reason',
+                                              quarantined_at=456.0)
+        assert serve_state.get_latest_quarantined_version('svc') == {
+            'version': 1,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'first reason',
+        }
+
+    def test_quarantine_is_fenced_by_controller_ownership(self, _mock_serve_db):
+        assert _add_minimal_service('svc-owner',
+                                    service_hash='incarnation-a',
+                                    controller_pid=123,
+                                    controller_ip='10.0.0.1')
+        serve_state.add_or_update_version('svc-owner', 2, 'spec-2', 'yaml: v2')
+
+        assert not serve_state.quarantine_version(
+            'svc-owner',
+            2,
+            'stale controller',
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(456, '10.0.0.2'))
+        assert serve_state.get_latest_quarantined_version('svc-owner') is None
+
+        assert serve_state.quarantine_version(
+            'svc-owner',
+            2,
+            'current controller',
+            quarantined_at=123.0,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(123, '10.0.0.1'))
+        assert serve_state.get_latest_quarantined_version('svc-owner') == {
+            'version': 2,
+            'quarantined_at': 123.0,
+            'quarantine_reason': 'current controller',
+        }
 
     def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
         serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')

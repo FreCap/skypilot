@@ -1213,7 +1213,10 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                                       min_replicas=1,
                                       max_replicas=64,
                                       replica_unit='logical',
-                                      reserved_capacity_fill=True)
+                                      reserved_capacity_fill=True,
+                                      max_scale_up_rate_percentage=20,
+                                      scale_up_rate_min_replicas=10,
+                                      scale_up_rate_period_seconds=60)
         catalog = {
             'L4': 1,
             'A100': 1,
@@ -1244,8 +1247,11 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                   min_replicas=1,
                   max_replicas=64,
                   replica_unit='logical',
-                  reserved_capacity_fill=True), serve_utils.UpdateMode.ROLLING,
-            catalog)
+                  reserved_capacity_fill=True,
+                  max_scale_up_rate_percentage=20,
+                  scale_up_rate_min_replicas=10,
+                  scale_up_rate_period_seconds=60),
+            serve_utils.UpdateMode.ROLLING, catalog)
         reserved_keys = [{
             'cloud': 'Kubernetes',
             'region': 'research-ctx',
@@ -1278,8 +1284,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             autoscalers.LogicalScaleTarget(
                 version=2,
                 reconcile_generation=2,
-                target_capacity=57,
-                target_capacity_by_accelerator=(('L4', 57),),
+                target_capacity=10,
+                target_capacity_by_accelerator=(('L4', 10),),
                 accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
 
@@ -2482,6 +2488,42 @@ class TestLogicalScalingWaves(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler.target_num_replicas, 20)
+
+    def test_restart_adopts_old_version_capacity_before_latest_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.latest_version = 2
+        replicas = [_replica(i + 1, version=1) for i in range(50)]
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
+        self.assertEqual(autoscaler.target_num_replicas, 50)
+
+    def test_restart_total_excludes_fill_and_retiring_rows(self):
+        autoscaler = self._ramped_autoscaler()
+        replicas = [
+            _replica(1, version=1),
+            _replica(2, version=1, reserved_fill=True),
+            _replica(3, version=2),
+        ]
+        replicas[2].status_property.is_scale_down = True
+
+        self.assertEqual(
+            autoscaler._total_demand_owned_logical_capacity(replicas), 1)
+
+    def test_held_target_completes_exact_card_map_past_current_wave(self):
+        autoscaler = self._ramped_autoscaler()
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        old = [_replica(i + 1, card='L4', version=1) for i in range(50)]
+
+        limited, added = autoscaler._limit_logical_actuation_transition(
+            {'L4': 50}, 50, old, wave_budget=10)
+
+        self.assertEqual(limited, {'L4': 50})
+        self.assertEqual(added, 50)
 
     def test_twenty_percent_dominates_floor_for_large_fleet(self):
         autoscaler = self._ramped_autoscaler()

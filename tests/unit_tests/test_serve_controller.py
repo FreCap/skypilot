@@ -502,7 +502,9 @@ class TestGetRoutingSpec:
             _block_runtime_transition)
 
         new_autoscaler = mock.MagicMock()
-        with mock.patch.object(controller.serve_state,
+        with mock.patch.object(controller.replica_managers,
+                               'validate_service_update_preflight'), \
+             mock.patch.object(controller.serve_state,
                                'get_service_from_name',
                                return_value={'version': 2}), \
              mock.patch.object(controller.serve_state,
@@ -562,6 +564,9 @@ def _make_update_controller() -> controller.SkyServeController:
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._update_apply_error = None  # pylint: disable=protected-access
     ctrl._update_apply_failures = 0  # pylint: disable=protected-access
+    ctrl._quarantined_version = None  # pylint: disable=protected-access
+    ctrl._quarantined_at = None  # pylint: disable=protected-access
+    ctrl._quarantine_reason = None  # pylint: disable=protected-access
     ctrl._update_still_authorized = mock.Mock(  # pylint: disable=protected-access
         return_value=True)
     return ctrl
@@ -1103,6 +1108,56 @@ class TestServiceUpdateReconciler:
         assert recovered_status['applied_version'] == 2
         assert not recovered_status['update_apply_pending']
         assert recovered_status['update_apply_error'] is None
+
+    def test_deterministic_failure_quarantines_and_keeps_old_runtime(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=controller.DeterministicServiceUpdateError(
+                'invalid ingress port'))
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        with mock.patch.object(controller.serve_state,
+                               'quarantine_version',
+                               return_value=True) as quarantine:
+            assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+
+        quarantine.assert_called_once()
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 2
+        assert status['applied_version'] == 1
+        assert not status['update_apply_pending']
+        assert status['quarantined_version'] == 2
+        assert 'invalid ingress port' in status['quarantine_reason']
+        ctrl._replica_manager.clear_pending_version.assert_called_with(2)  # pylint: disable=line-too-long
+
+        ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 3
+        assert status['applied_version'] == 3
+        assert not status['update_apply_pending']
+        assert status['quarantined_version'] == 2
+
+    def test_failed_quarantine_write_preserves_pending_fence(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=controller.DeterministicServiceUpdateError(
+                'invalid ingress port'))
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        with mock.patch.object(controller.serve_state,
+                               'quarantine_version',
+                               return_value=False):
+            assert not ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['update_apply_pending']
+        assert status['quarantined_version'] is None
+        ctrl._replica_manager.notify_version_pending.assert_called_with(2)  # pylint: disable=line-too-long
 
     def test_newer_commit_resets_previous_apply_failure(self):
         ctrl = _make_update_controller()

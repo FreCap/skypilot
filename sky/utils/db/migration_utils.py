@@ -37,7 +37,7 @@ SPOT_JOBS_VERSION = '024'  # index shared managed-job API tokens
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '023'  # SkyServe prediction-time history
+SERVE_VERSION = '024'  # durable SkyServe version quarantine
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

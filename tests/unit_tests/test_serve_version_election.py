@@ -71,6 +71,10 @@ def test_version_history_marks_elected_and_active_versions():
                                    f'submitted-yaml-{version}',
                                'created_at': 1000.0 + version,
                                'created_by': f'user-{version}',
+                               'quarantined_at':
+                                   (1003.5 if version == 3 else None),
+                               'quarantine_reason':
+                                   ('invalid port' if version == 3 else None),
                            } for version in (1, 2, 3)]), \
          mock.patch.object(server.debug_dump_helpers,
                            'redact_task_yaml',
@@ -85,6 +89,8 @@ def test_version_history_marks_elected_and_active_versions():
         'compiled_yaml_content': 'redacted-value: yaml-3\n',
         'created_at': 1003.0,
         'created_by': 'user-3',
+        'quarantined_at': 1003.5,
+        'quarantine_reason': 'invalid port',
         'policy': 'policy-3',
         'elected': True,
         'active': True,
@@ -94,6 +100,8 @@ def test_version_history_marks_elected_and_active_versions():
         'compiled_yaml_content': 'redacted-value: yaml-2\n',
         'created_at': 1002.0,
         'created_by': 'user-2',
+        'quarantined_at': None,
+        'quarantine_reason': None,
         'policy': 'policy-2',
         'elected': False,
         'active': True,
@@ -103,6 +111,8 @@ def test_version_history_marks_elected_and_active_versions():
         'compiled_yaml_content': 'redacted-value: yaml-1\n',
         'created_at': 1001.0,
         'created_by': 'user-1',
+        'quarantined_at': None,
+        'quarantine_reason': None,
         'policy': 'policy-1',
         'elected': False,
         'active': False,

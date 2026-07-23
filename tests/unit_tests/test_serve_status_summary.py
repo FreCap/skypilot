@@ -205,6 +205,9 @@ class TestGetServiceStatusSummary:
             'update_apply_lag_seconds': 12,
             'update_apply_error': 'manager lock unavailable',
             'update_apply_failures': 2,
+            'quarantined_version': 5,
+            'quarantined_at': 1000.0,
+            'quarantine_reason': 'invalid ingress port',
         }
         autoscaler = mock.Mock(return_value=autoscaler_resp)
         monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
@@ -231,6 +234,9 @@ class TestGetServiceStatusSummary:
         assert record['update_apply_lag_seconds'] == 12
         assert record['update_apply_error'] == 'manager lock unavailable'
         assert record['update_apply_failures'] == 2
+        assert record['quarantined_version'] == 5
+        assert record['quarantined_at'] == 1000.0
+        assert record['quarantine_reason'] == 'invalid ingress port'
 
     def test_default_call_has_no_counts(self, patched_state, monkeypatch):
         # Internal callers that only want the service row

@@ -350,7 +350,12 @@ class TestMigrationChainPG:
                     column['name']
                     for column in inspector.get_columns('version_specs')
                 }
-                assert {'created_at', 'created_by'} <= version_columns
+                assert {
+                    'created_at',
+                    'created_by',
+                    'quarantined_at',
+                    'quarantine_reason',
+                } <= version_columns
                 cleanup_intent_columns = {
                     column['name'] for column in inspector.get_columns(
                         'ephemeral_storage_cleanup_intents')

@@ -3638,6 +3638,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # exists: snapping on stale data would just re-assert the blind
         # minimum.
         self._snap_target_on_next_recompute: bool = True
+        # Construction means controller restart: the first fresh report may
+        # recover the demand-owned target from every surviving version. An
+        # in-process version update also arms the snap above, but explicitly
+        # clears this flag so its cold replacement still enters through the
+        # configured rollout wave.
+        self._adopt_total_capacity_on_next_recompute: bool = True
         # Per-tick freshness snapshot (see _fresh_for_tick). None outside
         # a tick.
         self._tick_fresh: bool | None = None
@@ -4430,6 +4436,18 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 getattr(info.status_property, 'is_scale_down', False)
                 is not True and not getattr(info, 'reserved_fill', False)))
 
+    def _total_demand_owned_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Demand-owned planned slots across every active rollout version."""
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if (not info.is_terminal and getattr(
+                info.status_property, 'is_scale_down', False) is not True and
+                not getattr(info, 'reserved_fill', False)))
+
     def _limit_logical_scale_up(
         self,
         raw_target: int,
@@ -5029,10 +5047,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             current[card] -= removed
             reusable -= removed
 
-        additions_left = (sum(
+        desired_additions = sum(
             max(0,
-                desired.get(card, 0) - current.get(card, 0))
-            for card in cards) if wave_budget is None else max(0, wave_budget))
+                desired.get(card, 0) - current.get(card, 0)) for card in cards)
+        # The aggregate target may have been recovered from healthy old
+        # versions or adopted by an earlier demand wave. Its exact-card map
+        # must be complete even when latest-version committed supply plus this
+        # tick's card budget is smaller. Completing that held target does not
+        # create demand; target and max_replicas remain the hard ceilings.
+        required_to_complete = max(0, target - sum(current.values()))
+        additions_left = (desired_additions if wave_budget is None else max(
+            0, wave_budget, required_to_complete))
         added = 0
         for card in cards:
             increase = max(0, desired.get(card, 0) - current.get(card, 0))
@@ -5266,7 +5291,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             sum(candidate_target_by_accelerator.values())
             >= target_num_replicas)
         if (self.replica_unit == 'logical' and
-                self._snap_target_on_next_recompute):
+                self._snap_target_on_next_recompute and
+                self._adopt_total_capacity_on_next_recompute):
             # The adopted target is controller-local and rebuilds at
             # min_replicas, while the latest-version demand-owned fleet may
             # already be much larger. Re-establish that traffic fleet as the
@@ -5278,8 +5304,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # tiny target and retire the whole live fleet in one tick. Do not
             # repeat this after the one-shot snap: an adopted downscale target
             # must remain below committed capacity while retirement catches up.
-            committed = self._latest_demand_owned_logical_capacity(
-                replica_infos)
+            committed = self._total_demand_owned_logical_capacity(replica_infos)
             self.target_num_replicas = max(
                 self.target_num_replicas,
                 self._clip_concurrency_demand_target(committed))
@@ -5323,6 +5348,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # immediate downward snap would tear down the live fleet before
             # the configured downscale delay has proved sustained idleness.
             self._snap_target_on_next_recompute = False
+            self._adopt_total_capacity_on_next_recompute = False
             self.upscale_counter = 0
             self._reset_downscale_hysteresis()
             self._downscale_veto_streak = 0
@@ -5604,6 +5630,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.target_num_replicas = 0
             self.target_num_replicas_by_accelerator = {}
         self._snap_target_on_next_recompute = True
+        self._adopt_total_capacity_on_next_recompute = False
         self._last_logical_target_state = None
 
     def _select_outdated_replicas_to_scale_down(

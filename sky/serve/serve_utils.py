@@ -1364,6 +1364,36 @@ def validate_logical_replica_task(
                 'safe logical capacity contract.')
 
 
+def resolve_replica_ingress_port(task: 'sky.Task', pool: bool) -> str:
+    """Resolve the one ingress port accepted by Serve validation and launch."""
+    if task.service is None:
+        raise RuntimeError('Service or pool section not found.')
+    if pool:
+        if (task.service.ports is not None or any(
+                resources.ports is not None for resources in task.resources)):
+            raise ValueError('Cannot specify ports in a pool.')
+        return '-'
+    if task.service.ports is not None:
+        return task.service.ports
+
+    inferred_ports: set[int] = set()
+    for resources in task.resources:
+        ports = list(resources_utils.port_ranges_to_set(resources.ports))
+        if len(ports) != 1:
+            raise ValueError(
+                'To open multiple ports on the replica, please set the '
+                '`service.ports` field to specify a main service port. '
+                'Must only specify one port in resources otherwise. '
+                'Each replica will use the port specified as application '
+                f'ingress port. Got {ports!r}.')
+        inferred_ports.add(ports[0])
+    if len(inferred_ports) != 1:
+        raise ValueError('Got multiple ports in different resources: '
+                         f'{sorted(inferred_ports)!r}. Please specify the '
+                         'same port instead.')
+    return str(next(iter(inferred_ports)))
+
+
 def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     """Validate the task for Sky Serve.
 
@@ -1479,8 +1509,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     # rather than leaking NaN/Inf into cloud feasibility code.
     spot_placer.SpotPlacer.from_task(task.service, task)
 
-    replica_ingress_port: int | None = int(
-        task.service.ports) if (task.service.ports is not None) else None
+    replica_ingress_port = resolve_replica_ingress_port(task, pool)
     for requested_resources in task.resources:
         if (task.service.use_ondemand_fallback and
                 not requested_resources.use_spot):
@@ -1498,31 +1527,8 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                 raise ValueError(
                     '`spot_placer` requires at least one spot resource. '
                     'Please specify `use_spot: true` on the cloud entries.')
-        if not pool and task.service.ports is None:
-            requested_ports = list(
-                resources_utils.port_ranges_to_set(requested_resources.ports))
-            if len(requested_ports) != 1:
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        'To open multiple ports on the replica, please set the '
-                        '`service.ports` field to specify a main service port. '
-                        'Must only specify one port in resources otherwise. '
-                        'Each replica will use the port specified as '
-                        'application ingress port.')
-            service_port = requested_ports[0]
-            if replica_ingress_port is None:
-                replica_ingress_port = service_port
-            elif service_port != replica_ingress_port:
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        f'Got multiple ports: {service_port} and '
-                        f'{replica_ingress_port} in different resources. '
-                        'Please specify the same port instead.')
-        if pool:
-            if (task.service.ports is not None or
-                    requested_resources.ports is not None):
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError('Cannot specify ports in a pool.')
+    if not pool and task.service.ports is None:
+        task.service.set_ports(replica_ingress_port)
 
 
 def generate_service_name(pool: bool = False):
@@ -2173,6 +2179,9 @@ def _get_service_status(
                 'update_apply_lag_seconds': 'update_apply_lag_seconds',
                 'update_apply_error': 'update_apply_error',
                 'update_apply_failures': 'update_apply_failures',
+                'quarantined_version': 'quarantined_version',
+                'quarantined_at': 'quarantined_at',
+                'quarantine_reason': 'quarantine_reason',
             }
             for record_field, autoscaler_field in request_field_map.items():
                 if autoscaler_field in autoscaler_info:
