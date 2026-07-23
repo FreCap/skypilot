@@ -132,6 +132,39 @@ def test_placement_classification_tolerates_malformed_provider_response():
     assert backend._placement_outcome(error) == 'failed'
 
 
+def test_placement_outcome_reads_gcp_capacity_code_behind_summary_code():
+    # GCP bulk insert reports the uninformative summary code first, so a
+    # first-code-only check mislabels real exhaustion as a generic failure.
+    error = _aggregate_error('VM_MIN_COUNT_NOT_REACHED',
+                             'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')
+    assert backend._placement_outcome(error) == 'capacity_failed'
+
+
+def test_placement_outcome_prefers_quota_over_capacity_in_mixed_batch():
+    error = _aggregate_error('VM_MIN_COUNT_NOT_REACHED',
+                             'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+                             'QUOTA_EXCEEDED')
+    assert backend._placement_outcome(error) == 'quota_failed'
+
+
+def test_placement_outcome_ignores_non_capacity_codes():
+    # UNSUPPORTED_OPERATION blocks the zone on failover but means preemption
+    # during creation, not an exhausted pool.
+    assert backend._placement_outcome(
+        _aggregate_error('VM_MIN_COUNT_NOT_REACHED',
+                         'UNSUPPORTED_OPERATION')) == 'failed'
+
+
+def test_gcp_capacity_codes_do_not_reach_the_aws_capacity_cache():
+    # The wider placement set must not leak into the AWS-only cache gate.
+    assert backend._classify_capacity_error(
+        clouds.GCP(),
+        _aggregate_error('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')) is None
+    assert backend._classify_capacity_error(
+        clouds.AWS(),
+        _aggregate_error('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')) is None
+
+
 @pytest.mark.parametrize('code', [
     'VcpuLimitExceeded',
     'quotaExceeded',

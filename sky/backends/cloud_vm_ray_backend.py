@@ -816,6 +816,18 @@ _PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
     'quotaExceeded',
     'type.googleapis.com/google.rpc.QuotaFailure',
 })
+# Codes that identify physical capacity exhaustion across providers, used to
+# label recorded placement outcomes. This is deliberately wider than
+# `_CAPACITY_ERROR_CODES`, which stays AWS-only because it also gates the
+# AWS capacity cache. UNSUPPORTED_OPERATION is excluded: the failover zone
+# blocker treats it as capacity-like, but it is observed on preemption during
+# creation rather than on an exhausted pool.
+_PLACEMENT_CAPACITY_ERROR_CODES = _CAPACITY_ERROR_CODES | frozenset({
+    'ZONE_RESOURCE_POOL_EXHAUSTED',
+    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+    'RESOURCE_EXHAUSTED',
+    'insufficientCapacity',
+})
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -1051,11 +1063,12 @@ def _placement_outcome(error: Exception,
         return f'{capacity_reason}_failed'
     if _is_quota_error(error):
         return 'quota_failed'
-    if _placement_error_code(error) in {
-            'ZONE_RESOURCE_POOL_EXHAUSTED',
-            'RESOURCE_EXHAUSTED',
-            'InsufficientInstanceCapacity',
-    }:
+    # Every code is examined, not just the first: GCP's bulk insert reports
+    # the generic VM_MIN_COUNT_NOT_REACHED summary ahead of the code that
+    # says why the minimum was not reached. Quota is checked above, so a
+    # mixed batch still reports the regional quota denial.
+    if any(code in _PLACEMENT_CAPACITY_ERROR_CODES
+           for code in _provider_error_codes(error)):
         return 'capacity_failed'
     return 'failed'
 
