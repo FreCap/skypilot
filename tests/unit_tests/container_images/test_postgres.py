@@ -2835,6 +2835,121 @@ def test_cluster_request_terminal_lookup_is_index_bounded(
     assert unrelated == 0
 
 
+def test_artifact_demand_history_is_index_bounded_for_sparse_and_dense_images(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    seed = _warming_demand(active,
+                           publication_record,
+                           regional,
+                           profile,
+                           owner='demand-history-sparse',
+                           controller_epoch='service:demand-history-sparse',
+                           controller_sequence=1)
+    other_image_id = 'demand-history-dense-image'
+    other_location_id = 'demand-history-dense-location'
+    other_digest = 'sha256:' + 'd' * 64
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_images (
+                    id, workspace, runtime_digest, platform, config_digest,
+                    manifest_media_type, manifest_size_bytes,
+                    declared_size_bytes, creator_user_hash, producer_kind,
+                    producer_spec_hash, builder_version, created_at, updated_at
+                )
+                SELECT :other_image_id, workspace, :other_digest, platform,
+                       :other_config_digest, manifest_media_type,
+                       manifest_size_bytes, declared_size_bytes,
+                       creator_user_hash, producer_kind, producer_spec_hash,
+                       builder_version, created_at, updated_at
+                FROM container_images
+                WHERE id = :seed_image_id
+            """), {
+                'other_image_id': other_image_id,
+                'other_digest': other_digest,
+                'other_config_digest': 'sha256:' + 'e' * 64,
+                'seed_image_id': seed.image_id,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_locations (
+                    id, workspace, image_id, shard_id, target_fingerprint,
+                    physical_fingerprint, runtime_digest, canonical,
+                    canonical_location_id, target_ref, state, attempt_count,
+                    last_verified_at, reserved_declared_bytes, created_at,
+                    updated_at
+                )
+                SELECT :other_location_id, workspace, :other_image_id,
+                       shard_id, target_fingerprint, physical_fingerprint,
+                       :other_digest, TRUE, NULL,
+                       'registry.example/demand-history@' || :other_digest,
+                       'READY', 0, 10, reserved_declared_bytes, 10, 10
+                FROM container_image_locations
+                WHERE id = :seed_location_id
+            """), {
+                'other_location_id': other_location_id,
+                'other_image_id': other_image_id,
+                'other_digest': other_digest,
+                'seed_location_id': seed.location_id,
+            })
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_demands (
+                    id, authority_id, workspace, consumer_kind,
+                    consumer_owner, consumer_generation, target_key,
+                    owner_epoch, image_id, runtime_digest,
+                    profile_revision_id, target_fingerprint, location_id,
+                    placement_json, state, consumer_attached, created_at,
+                    updated_at
+                )
+                SELECT md5('demand-history-' || series::text), authority_id,
+                       workspace, 'service_version',
+                       'demand-history-' || series::text, 0,
+                       :other_image_id || ':' || target_fingerprint, series,
+                       :other_image_id, :other_digest, profile_revision_id,
+                       target_fingerprint, :other_location_id, placement_json,
+                       'WARMING', FALSE, series, series
+                FROM container_image_demands
+                CROSS JOIN generate_series(1, 100000) AS series
+                WHERE id = :seed_demand_id
+            """), {
+                'other_image_id': other_image_id,
+                'other_digest': other_digest,
+                'other_location_id': other_location_id,
+                'seed_demand_id': seed.id,
+            })
+        connection.execute(sqlalchemy.text('ANALYZE container_image_demands'))
+        plans = []
+        for image_id in (seed.image_id, other_image_id):
+            plans.append(
+                connection.execute(
+                    sqlalchemy.text("""
+                        EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+                        SELECT id
+                        FROM container_image_demands
+                        WHERE workspace = 'research' AND image_id = :image_id
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 51
+                    """), {
+                        'image_id': image_id
+                    }).scalars().all())
+
+    for plan in plans:
+        rendered = '\n'.join(plan)
+        assert 'ix_container_image_demands_artifact_history' in rendered
+        assert 'Sort' not in rendered
+    assert [
+        record.id for record in demand_state.list_demands(
+            seed.image_id, 'research', limit=51)
+    ] == [seed.id]
+    dense = demand_state.list_demands(other_image_id, 'research', limit=51)
+    assert len(dense) == 51
+    assert [record.created_at for record in dense
+           ] == list(range(100000, 99949, -1))
+
+
 def test_new_demand_uses_locked_database_qualification_time_and_replay_skips_age(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -2888,7 +3003,8 @@ def test_new_demand_uses_locked_database_qualification_time_and_replay_skips_age
     stale_owner = 'clock-boundary:v2'
     stale_now = (refreshed_at +
                  profile.qualification.runtime_attestation_max_age_seconds + 1)
-    with pytest.raises(ValueError, match='QUALIFICATION_STALE'):
+    with pytest.raises(transactions.DemandQualificationStaleError,
+                       match='QUALIFICATION_STALE'):
         _warming_demand(refreshed_active,
                         publication_record,
                         regional,

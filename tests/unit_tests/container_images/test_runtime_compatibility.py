@@ -248,6 +248,8 @@ def _wire_metadata(monkeypatch: pytest.MonkeyPatch,
         (_artifact(), _publication()))
     monkeypatch.setattr(runtime.topology_state, 'get_profile_revision',
                         lambda revision_id: active)
+    monkeypatch.setattr(runtime.catalog_state, 'read_database_epoch',
+                        lambda: 1000)
     monkeypatch.setattr(runtime.demand_state,
                         'get_current_demand_for_controller_epoch',
                         lambda **kwargs: None)
@@ -430,16 +432,19 @@ def test_terminal_location_readmission_matches_demand_lifecycle(
         retry.assert_not_called()
 
 
-def test_metadata_filter_defers_attestation_age_to_demand_transaction(
+def test_metadata_filter_uses_one_request_cached_database_epoch(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
-    active = _active_revision(profile, observed_at=1)
+    active = _active_revision(profile, observed_at=999)
     policy = models.WorkspaceImagePolicy(
         mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
         default_profile=profile.name,
         allowed_profiles=(profile.name,),
         locality=models.Locality.PREFER)
     _wire_metadata(monkeypatch, profile, policy, active)
+    database_epoch = mock.Mock(return_value=1000)
+    monkeypatch.setattr(runtime.catalog_state, 'read_database_epoch',
+                        database_epoch)
     reserve = mock.Mock(side_effect=AssertionError('metadata path mutated'))
     monkeypatch.setattr(runtime.transactions, 'reserve_regional_location',
                         reserve)
@@ -449,14 +454,50 @@ def test_metadata_filter_defers_attestation_age_to_demand_transaction(
     resources = _FakeResources(
         models.ContainerImage(release='boltz-l4', distribution=profile.name))
 
-    result = runtime.prepare_metadata_only(
+    placement = models.Placement(provider='aws',
+                                 region='us-west-2',
+                                 backend='aws_vm',
+                                 platform='linux/amd64')
+    cache: dict[tuple[Any, ...], Any] = {}
+    assert runtime.prepare_metadata_only(resources, placement, 'research',
+                                         cache) is not None
+    assert runtime.prepare_metadata_only(resources, placement, 'research',
+                                         cache) is not None
+    database_epoch.assert_called_once_with()
+    reserve.assert_not_called()
+
+
+def test_managed_preferred_expired_metadata_uses_original_direct_resources(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _active_revision(profile, observed_at=1)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    expired_at = 2 + profile.qualification.runtime_attestation_max_age_seconds
+    monkeypatch.setattr(runtime.catalog_state, 'read_database_epoch',
+                        lambda: expired_at)
+    location_lookup = mock.Mock(
+        side_effect=AssertionError('expired route consulted location state'))
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        location_lookup)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+
+    resolution = runtime._resolve_metadata(
         resources,
         models.Placement(provider='aws',
                          region='us-west-2',
                          backend='aws_vm',
                          platform='linux/amd64'), 'research')
-    assert result is not None
-    reserve.assert_not_called()
+
+    assert resolution.direct
+    assert resolution.resources is resources
+    assert resolution.locality_rank == 1
+    location_lookup.assert_not_called()
 
 
 @pytest.mark.parametrize('platform', [None, 'linux/arm64'])
@@ -706,6 +747,55 @@ def test_managed_preferred_readmitted_ready_route_applies_qualified_ami(
     assert resolved.resolved_container_image.reference == ready.target_ref
 
 
+@pytest.mark.parametrize('mode', [
+    models.WorkspaceImageMode.MANAGED_PREFERRED,
+    models.WorkspaceImageMode.MANAGED_REQUIRED,
+])
+def test_locked_qualification_expiry_uses_only_authorized_direct_fallback(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        mode: models.WorkspaceImageMode) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(mode=mode,
+                                         default_profile=profile.name,
+                                         allowed_profiles=(profile.name,),
+                                         locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    location = _location(profile, models.ImageLocationState.READY)
+    monkeypatch.setattr(runtime.topology_state, 'get_location_for_target',
+                        lambda **_kwargs: location)
+    monkeypatch.setattr(runtime.catalog_state,
+                        'get_catalog_authority_id',
+                        lambda create=False: _AUTHORITY_ID)
+    create = mock.Mock(side_effect=transactions.DemandQualificationStaleError(
+        'QUALIFICATION_STALE'))
+    monkeypatch.setattr(runtime.transactions,
+                        'create_warming_demand_for_controller_epoch', create)
+    commit = mock.Mock(side_effect=AssertionError('stale demand committed'))
+    monkeypatch.setattr(runtime.transactions, 'commit_ready_demand', commit)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+    arguments = dict(workspace='research',
+                     consumer_kind='cluster',
+                     consumer_owner='cluster',
+                     controller_epoch='cluster:request',
+                     controller_sequence=None,
+                     allow_epoch_advance=False)
+    placement = models.Placement(provider='aws',
+                                 region='us-west-2',
+                                 backend='aws_vm',
+                                 platform='linux/amd64')
+
+    if mode == models.WorkspaceImageMode.MANAGED_PREFERRED:
+        assert runtime.resolve_for_placement(resources, placement, **
+                                             arguments) is resources
+    else:
+        with pytest.raises(transactions.DemandQualificationStaleError,
+                           match='QUALIFICATION_STALE'):
+            runtime.resolve_for_placement(resources, placement, **arguments)
+    create.assert_called_once()
+    commit.assert_not_called()
+
+
 @pytest.mark.parametrize('changed_state', [
     models.ImageLocationState.EVICTING,
     models.ImageLocationState.FAILED,
@@ -788,6 +878,47 @@ def test_unsupported_runtime_keeps_exact_ref_direct_before_managed_policy(
     assert resolution.locality_rank == 1
     resolve_profile.assert_not_called()
     demand_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize('demand_result', [
+    catalog_state.ManagedImageDatabaseRequiredError(
+        'Managed container image state requires PostgreSQL.'),
+    mock.sentinel.existing_amd64_demand,
+])
+def test_arm64_exact_ref_is_direct_before_consumer_demand_lookup(
+        monkeypatch: pytest.MonkeyPatch, demand_result: Any) -> None:
+    context = consumers.ImageConsumerContext(consumer_kind='cluster',
+                                             consumer_owner='cluster',
+                                             controller_epoch='request',
+                                             controller_sequence=None,
+                                             allow_epoch_advance=False,
+                                             metadata={})
+    if isinstance(demand_result, Exception):
+        demand_lookup = mock.Mock(side_effect=demand_result)
+    else:
+        demand_lookup = mock.Mock(return_value=demand_result)
+    monkeypatch.setattr(runtime.demand_state,
+                        'get_current_demand_for_controller_epoch',
+                        demand_lookup)
+    profile_lookup = mock.Mock(
+        side_effect=AssertionError('managed profile was consulted'))
+    monkeypatch.setattr(runtime.config, 'resolve_profile', profile_lookup)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution='gpu-production'))
+
+    with consumers.use(context):
+        resolution = runtime._resolve_metadata(
+            resources,
+            models.Placement(provider='aws',
+                             region='us-west-2',
+                             backend='aws_vm',
+                             platform='linux/arm64'), 'research')
+
+    assert resolution.direct
+    assert resolution.resources is resources
+    assert resolution.locality_rank == 1
+    demand_lookup.assert_not_called()
+    profile_lookup.assert_not_called()
 
 
 def test_unsupported_runtime_preserves_direct_mode_locality_rank(

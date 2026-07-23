@@ -37,6 +37,10 @@ class DemandLocationNotReadyError(ValueError):
         super().__init__('Demand location is not READY.')
 
 
+class DemandQualificationStaleError(ValueError):
+    """The locked new-demand runtime qualification is no longer fresh."""
+
+
 class ImageLimitExceededError(ValueError):
     """A bounded per-artifact release or location ceiling was reached."""
 
@@ -216,7 +220,7 @@ def _validate_runtime_attestation(
                                               attestations.get(key),
                                               as_of=now,
                                               qualified_cluster=qualified):
-        raise ValueError('QUALIFICATION_STALE')
+        raise DemandQualificationStaleError('QUALIFICATION_STALE')
 
 
 def _expected_pull_plan(*, profile_row: sqlalchemy.engine.RowMapping,

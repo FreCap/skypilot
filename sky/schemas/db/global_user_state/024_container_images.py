@@ -60,6 +60,7 @@ _CLUSTER_BINDING_COLUMN_NAMES = (
 )
 _PUBLICATION_HISTORY_INDEX = (
     'ix_container_image_publications_workspace_history')
+_DEMAND_HISTORY_INDEX = 'ix_container_image_demands_artifact_history'
 _CANARY_QUEUE_INDEX = 'ix_container_image_operations_canary_queue'
 _CANARY_CLAIMABLE_EXPRESSION = (
     "CASE WHEN kind = 'PROFILE_CANARY' AND state = 'PENDING' THEN updated_at "
@@ -95,6 +96,8 @@ _PREVIEW_COMPATIBLE_INDEXES = (
     ('ix_container_image_publications_ready_history',
      'container_image_publications', ('image_id', 'updated_at', 'id'),
      "state = 'READY' AND reservation_active IS TRUE"),
+    (_DEMAND_HISTORY_INDEX, 'container_image_demands',
+     ('workspace', 'image_id', 'created_at', 'id'), None),
     ('ix_container_image_demands_reconciliation_queue',
      'container_image_demands', ('updated_at', 'id'),
      "state IN ('WARMING', 'READY', 'FAILED')"),
@@ -1289,6 +1292,8 @@ def _create_tables() -> None:
                         'workspace', 'consumer_kind', 'consumer_owner',
                         'consumer_generation', 'target_key'
                     ])
+    op.create_index(_DEMAND_HISTORY_INDEX, 'container_image_demands',
+                    ['workspace', 'image_id', 'created_at', 'id'])
     op.create_index('ix_container_image_demands_owner_epoch',
                     'container_image_demands',
                     ['consumer_kind', 'owner_epoch', 'state'])

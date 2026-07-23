@@ -175,6 +175,12 @@ def database_epoch(session: orm.Session, *, now: int | None = None) -> int:
             database_epoch_expression())).scalar_one())
 
 
+def read_database_epoch(*, now: int | None = None) -> int:
+    """Samples the central clock for a non-mutating eligibility decision."""
+    with orm.Session(engine()) as session:
+        return database_epoch(session, now=now)
+
+
 def _operation(row: sqlalchemy.engine.RowMapping) -> OperationRecord:
     result_json = row['result_json']
     return OperationRecord(
@@ -804,9 +810,6 @@ def list_artifacts(
     release: str | None = None,
     runtime_digest: str | None = None,
     source_ref: str | None = None,
-    distribution: str | None = None,
-    target_id: str | None = None,
-    location_state: models.ImageLocationState | None = None,
 ) -> list[ArtifactRecord]:
     if not 1 <= limit <= 101:
         raise ValueError('Internal catalog page size must be 1 through 101.')
@@ -819,7 +822,7 @@ def list_artifacts(
             schema.sources.c.image_id == table.c.id,
             schema.sources.c.workspace == workspace,
             schema.sources.c.source_ref == source_ref))
-    if release is not None or distribution is not None:
+    if release is not None:
         publication_filter = [
             schema.publications.c.image_id == table.c.id,
             schema.publications.c.workspace == workspace,
@@ -827,42 +830,10 @@ def list_artifacts(
             models.ImagePublicationState.READY.value,
             schema.publications.c.reservation_active.is_(True),
         ]
-        publication_from: sqlalchemy.FromClause = schema.publications
-        if release is not None:
-            publication_filter.append(
-                schema.publications.c.requested_release == release)
-        if distribution is not None:
-            publication_from = schema.publications.join(
-                schema.profile_revisions,
-                schema.publications.c.profile_revision_id ==
-                schema.profile_revisions.c.id)
-            publication_filter.append(
-                schema.profile_revisions.c.profile == distribution)
+        publication_filter.append(
+            schema.publications.c.requested_release == release)
         statement = statement.where(
-            sqlalchemy.exists(
-                sqlalchemy.select(
-                    sqlalchemy.literal(1)).select_from(publication_from).where(
-                        *publication_filter)))
-    if target_id is not None or location_state is not None:
-        location_filter = [
-            schema.locations.c.image_id == table.c.id,
-            schema.locations.c.workspace == workspace,
-        ]
-        location_from: sqlalchemy.FromClause = schema.locations
-        if target_id is not None:
-            location_from = schema.locations.join(
-                schema.registry_shards,
-                schema.locations.c.shard_id == schema.registry_shards.c.id)
-            location_filter.append(
-                schema.registry_shards.c.target_id == target_id)
-        if location_state is not None:
-            location_filter.append(
-                schema.locations.c.state == location_state.value)
-        statement = statement.where(
-            sqlalchemy.exists(
-                sqlalchemy.select(
-                    sqlalchemy.literal(1)).select_from(location_from).where(
-                        *location_filter)))
+            sqlalchemy.exists().where(*publication_filter))
     if after is not None:
         statement = statement.where(
             sqlalchemy.tuple_(table.c.created_at, table.c.id) < after)

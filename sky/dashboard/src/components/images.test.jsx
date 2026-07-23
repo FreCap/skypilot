@@ -107,6 +107,9 @@ describe('Images dashboard', () => {
     expect(await screen.findByText('Read-only')).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Readiness' })).toBeNull();
+    expect(screen.queryByText('All distributions')).toBeNull();
+    expect(screen.queryByText('All targets')).toBeNull();
+    expect(screen.queryByText('All location states')).toBeNull();
     await waitFor(() => expect(getImageCatalog).toHaveBeenCalledTimes(1));
     expect(getImagePublications).not.toHaveBeenCalled();
   });

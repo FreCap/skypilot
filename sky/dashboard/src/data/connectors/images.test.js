@@ -34,7 +34,8 @@ describe('managed image connectors', () => {
         workspace: 'research / west',
         release: 'boltz+l4',
         cursor: '',
-        state: null,
+        state: 'FAILED',
+        target: 'aws-us-east-1',
         limit: 30,
       },
       controller.signal
@@ -42,7 +43,7 @@ describe('managed image connectors', () => {
 
     const [path, options] = apiClient.get.mock.calls[0];
     expect(path).toBe(
-      '/images/catalog?workspace=research+%2F+west&release=boltz%2Bl4&limit=30'
+      '/images/catalog?workspace=research+%2F+west&limit=30&release=boltz%2Bl4'
     );
     expect(options.signal).toBe(controller.signal);
   });

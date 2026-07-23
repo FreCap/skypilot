@@ -307,13 +307,13 @@ def _runtime_binding_matches(active: topology_state.ProfileRevisionRecord,
                              profile: models.ManagedRegistryProfile,
                              target: models.ManagedRegistryTarget,
                              placement: models.Placement,
-                             binding: models.RegistryAccessBinding) -> bool:
-    """Checks structural runtime identity without re-admitting a demand.
+                             binding: models.RegistryAccessBinding, *,
+                             as_of: int | None) -> bool:
+    """Checks runtime identity and optional new-demand proof freshness.
 
-    Freshness for a new demand is checked against PostgreSQL time inside the
-    locked demand transaction.  An existing demand is the durable admission
-    record, so a later automatic-canary refresh must not revoke its replay by
-    replacing the attestation with an ``observed_at`` after ``created_at``.
+    An existing demand is the durable admission record, so its replay passes
+    ``as_of=None``. A new demand passes one request-cached PostgreSQL epoch;
+    locked admission samples the database again and remains authoritative.
     """
     runtime_id = placement.region
     key = models.profile_attestation_key('runtime', target.name,
@@ -338,8 +338,16 @@ def _runtime_binding_matches(active: topology_state.ProfileRevisionRecord,
         placement.backend,
         runtime_id,
         evidence,
-        as_of=None,
+        as_of=as_of,
         qualified_cluster=qualified_cluster)
+
+
+def _metadata_database_epoch(
+    cache: dict[tuple[typing.Any, ...], typing.Any],) -> int:
+    key = ('database_epoch',)
+    if key not in cache:
+        cache[key] = catalog_state.read_database_epoch()
+    return int(cache[key])
 
 
 def _resolve_metadata(
@@ -364,6 +372,17 @@ def _resolve_metadata(
                 locality_rank=(_unsupported_direct_locality_rank(
                     image, workspace)))
         raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+    try:
+        platform = _managed_runtime_platform(placement)
+    except ValueError:
+        if (image.ref is not None and image.release is None and
+                image.artifact_id is None):
+            return _MetadataResolution(
+                resources=resources,
+                direct=True,
+                locality_rank=(_unsupported_direct_locality_rank(
+                    image, workspace)))
+        raise
     try:
         current_demand = _current_consumer_demand(workspace, placement, cache)
     except catalog_state.ManagedImageDatabaseRequiredError:
@@ -424,17 +443,6 @@ def _resolve_metadata(
             active.config_snapshot)
         if profile.name != configured_profile.name:
             raise ValueError('PROFILE_NOT_ACTIVE')
-    try:
-        platform = _managed_runtime_platform(placement)
-    except ValueError:
-        if (_direct_fallback_allowed(policy, image) and current_demand is None):
-            return _MetadataResolution(resources=resources,
-                                       direct=True,
-                                       profile=profile,
-                                       policy=policy,
-                                       active=active,
-                                       locality_rank=1)
-        raise
     identity_key = ('identity', workspace, image.ref, image.release,
                     image.artifact_id, platform)
     if identity_key not in cache:
@@ -474,8 +482,14 @@ def _resolve_metadata(
          kubernetes_node_selector) = _runtime_binding(profile, target,
                                                       placement)
         prepared = _pin_host_image(resources, placement, expected_host_image)
-        if not _runtime_binding_matches(active, profile, target, placement,
-                                        binding):
+        qualification_epoch = (None if current_demand is not None else
+                               _metadata_database_epoch(cache))
+        if not _runtime_binding_matches(active,
+                                        profile,
+                                        target,
+                                        placement,
+                                        binding,
+                                        as_of=qualification_epoch):
             raise ValueError('QUALIFICATION_STALE')
     except ValueError:
         if (_direct_fallback_allowed(policy, image) and current_demand is None):
@@ -713,21 +727,26 @@ def resolve_for_placement(resources: resources_lib.Resources,
             kubernetes_node_selector)
     if consumer.metadata:
         placement_payload['consumer'] = consumer.metadata
-    demand = transactions.create_warming_demand_for_controller_epoch(
-        authority_id=authority_id,
-        workspace=workspace,
-        consumer_kind=consumer.consumer_kind,
-        consumer_owner=consumer.consumer_owner,
-        controller_epoch=consumer.controller_epoch,
-        controller_sequence=consumer.controller_sequence,
-        allow_epoch_advance=consumer.allow_epoch_advance,
-        target_key=f'{artifact.id}:{target.target_fingerprint}',
-        image_id=artifact.id,
-        runtime_digest=artifact.runtime_digest,
-        profile_revision_id=active.id,
-        target_fingerprint=target.target_fingerprint,
-        location_id=location.id,
-        placement=placement_payload)
+    try:
+        demand = transactions.create_warming_demand_for_controller_epoch(
+            authority_id=authority_id,
+            workspace=workspace,
+            consumer_kind=consumer.consumer_kind,
+            consumer_owner=consumer.consumer_owner,
+            controller_epoch=consumer.controller_epoch,
+            controller_sequence=consumer.controller_sequence,
+            allow_epoch_advance=consumer.allow_epoch_advance,
+            target_key=f'{artifact.id}:{target.target_fingerprint}',
+            image_id=artifact.id,
+            runtime_digest=artifact.runtime_digest,
+            profile_revision_id=active.id,
+            target_fingerprint=target.target_fingerprint,
+            location_id=location.id,
+            placement=placement_payload)
+    except transactions.DemandQualificationStaleError:
+        if direct_fallback_resources is not None:
+            return direct_fallback_resources
+        raise
     if location.state in (models.ImageLocationState.FAILED,
                           models.ImageLocationState.QUARANTINED):
         demand_state.fail_and_supersede_demand(

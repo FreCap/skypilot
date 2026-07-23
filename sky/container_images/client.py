@@ -108,10 +108,7 @@ def catalog(*,
             cursor: str | None = None,
             release: str | None = None,
             digest: str | None = None,
-            source_ref: str | None = None,
-            distribution: str | None = None,
-            target: str | None = None,
-            state: str | None = None) -> api_models.Page:
+            source_ref: str | None = None) -> api_models.Page:
     """Returns one synchronous keyset-paginated catalog page."""
     params = {
         key: value for key, value in {
@@ -121,9 +118,6 @@ def catalog(*,
             'release': release,
             'digest': digest,
             'source_ref': source_ref,
-            'distribution': distribution,
-            'target': target,
-            'state': state,
         }.items() if value is not None
     }
     return _request('GET', '/images/catalog', api_models.Page, params=params)

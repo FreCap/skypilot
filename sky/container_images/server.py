@@ -437,12 +437,14 @@ def list_catalog(request: fastapi.Request,
                  cursor: str | None = None,
                  release: str | None = None,
                  digest: str | None = None,
-                 source_ref: str | None = None,
-                 distribution: str | None = None,
-                 target: str | None = None,
-                 state: str | None = None) -> api_models.Page:
+                 source_ref: str | None = None) -> api_models.Page:
     resolved = _resolve_workspace(request, workspace)
     limit = _limit(limit)
+    removed_filters = {'distribution', 'target', 'state'
+                      }.intersection(getattr(request, 'query_params', {}))
+    if removed_filters:
+        raise fastapi.HTTPException(status_code=422,
+                                    detail={'code': 'INVALID_IMAGE_FILTER'})
     try:
         release = (models.validate_release_label(release, 'Release filter')
                    if release is not None else None)
@@ -450,13 +452,6 @@ def list_catalog(request: fastapi.Request,
                   if digest is not None else None)
         source_ref = (models.validate_oci_reference(source_ref, 'Source filter')
                       if source_ref is not None else None)
-        distribution = (models.validate_control_plane_identifier(
-            distribution, 'Distribution filter')
-                        if distribution is not None else None)
-        target = (models.validate_control_plane_identifier(
-            target, 'Target filter') if target is not None else None)
-        location_state = (models.ImageLocationState(state)
-                          if state is not None else None)
     except ValueError:
         raise fastapi.HTTPException(status_code=422,
                                     detail={'code': 'INVALID_IMAGE_FILTER'
@@ -465,9 +460,6 @@ def list_catalog(request: fastapi.Request,
         'release': release,
         'digest': digest,
         'source_ref': source_ref,
-        'distribution': distribution,
-        'target': target,
-        'state': state,
     }
     after = _after(cursor, scope='catalog', workspace=resolved, filters=filters)
     try:
@@ -476,10 +468,7 @@ def list_catalog(request: fastapi.Request,
                                                after=after,
                                                release=release,
                                                runtime_digest=digest,
-                                               source_ref=source_ref,
-                                               distribution=distribution,
-                                               target_id=target,
-                                               location_state=location_state)
+                                               source_ref=source_ref)
         summaries = catalog_state.catalog_summaries(
             {record.id for record in records}, resolved)
     except (RuntimeError, ValueError) as error:

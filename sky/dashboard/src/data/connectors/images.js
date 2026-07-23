@@ -57,8 +57,14 @@ export function newIdempotencyKey() {
 export const getImageCapabilities = (workspace, signal) =>
   get('/images/capabilities', { workspace }, signal);
 
-export const getImageCatalog = (options = {}, signal) =>
-  get('/images/catalog', options, signal);
+export const getImageCatalog = (options = {}, signal) => {
+  const { workspace, limit, cursor, release, digest, source_ref } = options;
+  return get(
+    '/images/catalog',
+    { workspace, limit, cursor, release, digest, source_ref },
+    signal
+  );
+};
 
 export const getImagePublications = (options = {}, signal) =>
   get('/images/publications', options, signal);

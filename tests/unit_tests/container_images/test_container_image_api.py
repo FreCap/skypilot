@@ -543,6 +543,23 @@ def test_catalog_page_is_bounded_and_cursor_is_last_returned_item(
                                              records[1].id)
 
 
+def test_catalog_rejects_removed_unbounded_child_facets(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    request = _request()
+    request.query_params = {'target': 'aws-us-east-1', 'state': 'FAILED'}
+    monkeypatch.setattr(server, '_resolve_workspace',
+                        lambda _request, _workspace: 'research')
+    catalog = mock.Mock()
+    monkeypatch.setattr(server.catalog_state, 'list_artifacts', catalog)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        server.list_catalog(request, workspace='research')
+
+    assert error.value.status_code == 422
+    assert error.value.detail == {'code': 'INVALID_IMAGE_FILTER'}
+    catalog.assert_not_called()
+
+
 def test_sdk_status_projects_catalog_summary_without_extra_field_failure(
         monkeypatch: pytest.MonkeyPatch) -> None:
     artifact = _artifact()
@@ -601,6 +618,13 @@ def test_router_exposes_only_direct_image_api_contract() -> None:
     }
     assert required <= paths
     assert all('/api/get' not in path for path, _ in paths)
+    catalog_route = next(
+        route for route in server.router.routes if route.path == '/catalog')
+    catalog_parameters = {
+        parameter.name for parameter in catalog_route.dependant.query_params
+    }
+    assert {'release', 'digest', 'source_ref'} <= catalog_parameters
+    assert not {'distribution', 'target', 'state'} & catalog_parameters
 
 
 def test_readiness_uses_operational_profiles_and_drops_partial_boundary(

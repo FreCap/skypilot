@@ -19,6 +19,29 @@ def test_value_error():
     assert str(deserialized) == 'test'
 
 
+def test_exception_notes_are_restored_outside_constructor_kwargs():
+    error = TypeError('test')
+    setattr(error, '__notes__', ['when serializing dict item bad'])
+
+    serialized = exceptions.serialize_exception(error)
+    assert serialized['notes'] == ['when serializing dict item bad']
+    assert '__notes__' not in serialized['attributes']
+
+    restored = exceptions.deserialize_exception(serialized)
+    assert isinstance(restored, TypeError)
+    assert getattr(restored, '__notes__') == ['when serializing dict item bad']
+
+    legacy = dict(serialized)
+    legacy.pop('notes')
+    legacy['attributes'] = {
+        **serialized['attributes'],
+        '__notes__': ['legacy note'],
+    }
+    restored_legacy = exceptions.deserialize_exception(legacy)
+    assert isinstance(restored_legacy, TypeError)
+    assert getattr(restored_legacy, '__notes__') == ['legacy note']
+
+
 def test_execution_control_errors_are_picklable():
     """Retry and pause exceptions preserve their constructor state."""
     retryable = exceptions.ExecutionRetryableError('retry', 'later', 3)

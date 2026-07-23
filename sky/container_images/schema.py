@@ -718,6 +718,8 @@ demands = sqlalchemy.Table(
     sqlalchemy.Index('ix_container_image_demands_consumer', 'workspace',
                      'consumer_kind', 'consumer_owner', 'consumer_generation',
                      'target_key'),
+    sqlalchemy.Index('ix_container_image_demands_artifact_history', 'workspace',
+                     'image_id', 'created_at', 'id'),
     sqlalchemy.Index('ix_container_image_demands_owner_epoch', 'consumer_kind',
                      'owner_epoch', 'state'),
     sqlalchemy.Index(

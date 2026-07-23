@@ -341,6 +341,13 @@ supported managed runtime binding. An exact request-supplied digest `ref` on
 GCP, Nebius, generic Kubernetes, or another unsupported runtime keeps direct OCI
 behavior even when the workspace is `managed_required`; a `release` or
 `artifact_id` selector still fails closed because it has no direct identity.
+Runtime and platform classification precedes consumer-demand, profile, catalog,
+and central-database access. The same rule applies to an AWS placement whose
+architecture is unsupported by v0: an exact ref with no release or artifact
+selector returns through the direct path immediately, whereas managed-only
+selectors fail closed. A prior AMD64 demand for the same controller epoch
+cannot turn an ARM64 candidate into a managed lookup or revoke that direct
+compatibility path.
 In a `direct` workspace these unsupported candidates keep the ordinary direct
 locality rank, so enabling this code does not bias a multicloud optimization
 toward AWS. Under a managed policy they form the direct fallback class behind a
@@ -742,16 +749,29 @@ concurrent shard-selection races. The loser rolls back its shard reservation
 and reloads the winning location. An implicit workload request cannot fan out
 beyond the one selected placement.
 
-Before the first optimization, a metadata-only eligibility pass maps each
-candidate placement to the active profile's declared runtime binding, locality,
-and selected artifact platform. `locality: require` removes unsupported
-candidates. `prefer` is a lexicographic class ahead of the ordinary optimizer:
-READY managed routes rank first, an authorized direct source fallback ranks
-second, and a managed route that still needs warming ranks third. Cost, time,
-reservations, and egress preserve their existing ordering within the winning
-class. Exact indexed location reads supply this rank without provider calls. No
-eligible target fails with `IMAGE_LOCALITY_UNSUPPORTED` before provisioning
-rather than warming an impossible placement.
+Before the first optimization, placement architecture is classified without
+managed state, then a metadata-only eligibility pass maps each supported
+candidate to the active profile's declared runtime binding, locality, and
+selected artifact platform. `locality: require` removes unsupported candidates.
+`prefer` is a lexicographic class ahead of the ordinary optimizer: READY managed
+routes rank first, an authorized direct source fallback ranks second, and a
+managed route that still needs warming ranks third. Cost, time, reservations,
+and egress preserve their existing ordering within the winning class. Exact
+indexed location reads supply this rank without provider calls. No eligible
+target fails with `IMAGE_LOCALITY_UNSUPPORTED` before provisioning rather than
+warming an impossible placement.
+
+For a new demand, the metadata pass samples PostgreSQL `clock_timestamp()` once
+per optimization request and reuses that epoch across candidates. Runtime proof
+age is checked at that epoch, so an already-expired managed route cannot win the
+READY locality class or suppress a direct alternative. An exact existing-demand
+replay deliberately uses structural matching without an age check because its
+durable creation-time admission remains authoritative. The locked demand
+transaction still samples a later database epoch and is the final authority. If
+qualification expires between ranking and that transaction, it returns a typed
+qualification-stale result; `managed_preferred` resumes with the byte-for-byte
+original direct resources after rollback, while strict managed resolution fails
+closed.
 
 For managed EC2, that metadata includes the exact planned host AMI and instance
 profile. Both must match the binding's qualified regional AMI and principal; a
@@ -923,10 +943,11 @@ target, binding fingerprint, principal, host image, and exact EKS tuple, but it
 does not re-evaluate proof age from the mutable profile attestation map. This is
 important both after proof expiry and after a successful automatic canary
 replaces the attestation with a later `observed_at`: neither event can revoke an
-already-authorized deployment. Current proof age is exclusively a new-admission
-condition inside the locked demand transaction. A retired revision cannot admit
-a new owner or select a new target, so a profile rollout cannot strand an
-in-flight deployment or reopen old capacity.
+already-authorized deployment. Current proof age is a new-admission condition in
+both the request-cached metadata eligibility check and the locked demand
+transaction. Only the latter authorizes and persists the demand. A retired
+revision cannot admit a new owner or select a new target, so a profile rollout
+cannot strand an in-flight deployment or reopen old capacity.
 
 Eviction treats every WARMING or READY demand as the fence and locks its shard,
 location, and demand state in the canonical order. Retention is evaluated per
@@ -1214,7 +1235,10 @@ Operational reads follow the same rule. ACTIVE/QUALIFYING profile readiness,
 live and terminal demand pages, expired reservations, canonical publication
 fan-out, worker heartbeat cleanup, and state-filtered workspace publication
 history each use an exact partial or composite index matching their predicate
-and ordering. Inventory matching has a shard-and-runtime-digest lookup index.
+and ordering. Artifact demand history uses a bidirectionally scanned B-tree on
+`(workspace, image_id, created_at, id)`, matching its newest-first keyset page
+without a population sort for either sparse or dense artifacts. Inventory
+matching has a shard-and-runtime-digest lookup index.
 Cross-state pages use one matching partial index for the precise state set or a
 fixed number of per-state indexed heads followed by an in-memory bounded merge;
 they never sort the full table to return a bounded page. Canonical completion
@@ -2092,7 +2116,7 @@ Authorized users can:
 
 - select a workspace;
 - page artifacts with digest, releases, platforms, size, and updated time;
-- filter by release, digest, distribution, target, and location state;
+- filter by release, digest, and exact source reference;
 - open artifact detail with sources, release reservations, locations, errors,
   demands, and publication history;
 - start Publish, Prepare, Retry publication, and Retry location actions when
@@ -2222,7 +2246,7 @@ response. Detaching leaves the same operation ID available through the read API.
 ### Direct read API
 
 ```text
-GET /images/catalog?workspace=W&limit=50&cursor=C
+GET /images/catalog?workspace=W&release=R&digest=D&source_ref=S&limit=50&cursor=C
 GET /images/publications?workspace=W&state=S&release=R&limit=50&cursor=C
 GET /images/artifacts/{id}?workspace=W
 GET /images/artifacts/{id}/releases?workspace=W&limit=50&cursor=C
@@ -2249,6 +2273,13 @@ served by its partial unique index. It fetches at most 1,001 operational rows,
 never lets SUPERSEDED or RETIRED history consume the window, and removes the
 last profile as a complete boundary if the cap splits its ACTIVE/QUALIFYING
 pair.
+The v0 catalog exposes only release, digest, and exact source-reference filters,
+whose unique or prefix-bounded identity paths lead directly to an artifact.
+Distribution, registry target, and location-state remain visible in bounded
+page summaries and paginated artifact detail, but are not catalog filters in v0.
+They require a transactionally maintained artifact-ordered facet projection
+before becoming filterable; a child-table `EXISTS` plus response `LIMIT` is not
+an acceptable million-artifact access path.
 Each catalog page loads at most ten active-publication, source, and location
 samples per artifact through three fixed lateral-limit statements and matching
 artifact indexes. `publications_truncated`, `sources_truncated`, and
@@ -3227,3 +3258,22 @@ malformed or partial production shape. This revision fences every asynchronous
 detail state write before mutation and gives both new companion migration heads
 exact PostgreSQL index-shape validation, invalid-residue recovery, collision
 tests, and production-plan evidence. The acceptance streak remains zero.
+
+Three independent Codex final-acceptance rounds at
+`53430099fe6d5dac8bd4bf0ea9e455a6084de31f` returned `RESHAPE`; Fable still
+could not start because its zero-token quota probe returned HTTP 429. All three
+rounds independently re-proved the Dashboard stale-cursor fence and exact
+companion-migration index contracts. Round 1 found that expired runtime
+qualification could win metadata ranking and then bypass the saved
+managed-preferred direct fallback at locked demand admission. Rounds 2 and 3
+both found the missing artifact-demand history index and the unbounded catalog
+distribution, target, and location-state facets. Round 3 additionally proved
+that AWS ARM64 exact refs consulted managed demand and profile state before
+being classified as direct. Exact-head CI exposed an adjacent Python 3.14
+compatibility change that serializes exception notes into `__dict__`; old
+deserialization treated those notes as constructor keywords. This revision
+classifies unsupported exact refs before managed state, checks new-demand proof
+age at both metadata and locked admission with typed fallback, adds and validates
+the exact artifact-demand index, removes the three unbounded v0 facets, and
+round-trips exception notes outside constructor kwargs. The acceptance streak
+remains zero until both reviewers accept one immutable repaired head.

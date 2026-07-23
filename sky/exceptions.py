@@ -90,6 +90,7 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     attributes = e.__dict__.copy()
     if 'stacktrace' in attributes:
         del attributes['stacktrace']
+    notes = attributes.pop('__notes__', None)
     for attr_k in list(attributes.keys()):
         attr_v = attributes[attr_k]
         if isinstance(attr_v, types.TracebackType):
@@ -108,6 +109,10 @@ def serialize_exception(e: BaseException) -> dict[str, Any]:
     }
     if isinstance(e, SkyPilotExcludeArgsBaseException):
         data['args'] = tuple()
+    if notes is not None:
+        # Keep Python 3.11+ exception notes out of constructor kwargs so older
+        # clients can continue deserializing the payload.
+        data['notes'] = notes
     return data
 
 
@@ -132,8 +137,18 @@ def deserialize_exception(serialized: Any) -> Exception:
         # Unknown exception type.
         return Exception(
             f'{exception_type}: {serialized.get("message", serialized)}')
-    e = exception_class(*serialized.get('args', ()),
-                        **serialized.get('attributes', {}))
+    attributes = dict(serialized.get('attributes', {}))
+    legacy_notes = attributes.pop('__notes__', None)
+    e = exception_class(*serialized.get('args', ()), **attributes)
+    notes = serialized.get('notes', legacy_notes)
+    if (isinstance(notes, list) and
+            all(isinstance(note, str) for note in notes)):
+        add_note = getattr(e, 'add_note', None)
+        if add_note is None:
+            setattr(e, '__notes__', list(notes))
+        else:
+            for note in notes:
+                add_note(note)
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         setattr(e, 'stacktrace', stacktrace)

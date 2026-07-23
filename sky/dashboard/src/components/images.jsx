@@ -1,10 +1,4 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Box, RefreshCw, Search, Upload } from 'lucide-react';
@@ -44,9 +38,6 @@ const EMPTY_FILTERS = {
   release: '',
   digest: '',
   source_ref: '',
-  distribution: '',
-  target: '',
-  state: '',
 };
 
 function timestamp(value) {
@@ -445,16 +436,6 @@ export function Images() {
     };
   }, [activeTab, loadReadiness]);
 
-  const distributionTargets = useMemo(
-    () =>
-      capabilities?.distributions.flatMap((distribution) =>
-        distribution.targets.map((target) => ({
-          distribution: distribution.name,
-          target: target.name,
-        }))
-      ) || [],
-    [capabilities]
-  );
   const failedPublications = failedPublicationPage?.items || [];
   const showFailedPublicationFeed = Boolean(
     capabilities?.publish &&
@@ -609,7 +590,7 @@ export function Images() {
         <TabsContent active={activeTab === 'catalog'}>
           <div className="space-y-4">
             <section className="rounded-lg border border-gray-200 bg-white p-4">
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+              <div className="grid gap-3 md:grid-cols-3">
                 <Input
                   placeholder="Release"
                   value={draftFilters.release}
@@ -640,70 +621,6 @@ export function Images() {
                     })
                   }
                 />
-                <select
-                  className="h-10 rounded-md border border-gray-300 bg-white px-3 text-sm"
-                  value={draftFilters.distribution}
-                  onChange={(event) =>
-                    setDraftFilters({
-                      ...draftFilters,
-                      distribution: event.target.value,
-                    })
-                  }
-                >
-                  <option value="">All distributions</option>
-                  {capabilities?.distributions.map((item) => (
-                    <option key={item.name} value={item.name}>
-                      {item.name}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  className="h-10 rounded-md border border-gray-300 bg-white px-3 text-sm"
-                  value={draftFilters.target}
-                  onChange={(event) =>
-                    setDraftFilters({
-                      ...draftFilters,
-                      target: event.target.value,
-                    })
-                  }
-                >
-                  <option value="">All targets</option>
-                  {distributionTargets.map((item) => (
-                    <option
-                      key={`${item.distribution}:${item.target}`}
-                      value={item.target}
-                    >
-                      {item.distribution} / {item.target}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  className="h-10 rounded-md border border-gray-300 bg-white px-3 text-sm"
-                  value={draftFilters.state}
-                  onChange={(event) =>
-                    setDraftFilters({
-                      ...draftFilters,
-                      state: event.target.value,
-                    })
-                  }
-                >
-                  <option value="">All location states</option>
-                  {[
-                    'PENDING',
-                    'COPYING',
-                    'VERIFYING',
-                    'READY',
-                    'FAILED',
-                    'MISSING',
-                    'EVICTING',
-                    'EVICTED',
-                    'QUARANTINED',
-                  ].map((state) => (
-                    <option key={state} value={state}>
-                      {state}
-                    </option>
-                  ))}
-                </select>
               </div>
               <div className="mt-3 flex justify-end gap-2">
                 <Button
