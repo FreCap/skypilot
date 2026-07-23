@@ -102,22 +102,69 @@ Today's `boltz-l4-fleet` traffic is entirely `a2-highgpu-1g` + `A100:1` and
 `g2-standard-4` + `L4:1`, so the collision is not currently exercised, but it is
 reachable as soon as an N1 shape enters the fleet.
 
-Cache keys gain a cloud discriminator, so namespaces become `gcp:capacity_exhausted:v1:`
-alongside the existing `aws:` ones. Because the capacity TTL is 120s, no
-migration is needed: any key written under the old namespace expires within two
-minutes of rollout.
+Cache keys gain a cloud discriminator. As implemented, the cloud lives inside
+the key payload and the prefixes drop their `aws:` scope, becoming
+`capacity_exhausted:v2:` and friends. Keeping one prefix per kind means a single
+prefix scan still returns every provider's hints for a service, which the
+observations API depends on. Because the capacity TTL is 120s, no migration is
+needed: any key written under the old namespace expires within two minutes of
+rollout.
 
-The project identity is already available. `capacity_cache_account` is derived
+The project identity is already available. `capacity_cache_account` derives it
 from `cloud_user_identity`, which is fetched regardless of cloud, so the GCP
-path needs no additional API call.
+path needs no additional provider call. GCP formats that identity as
+`<account> [project_id=<project>]`; only the project is extracted, both because
+the project is what scopes capacity and because it keeps the user's email
+address out of the cache key. An identity with no parseable project yields no
+key, so that demand simply does not participate.
+
+### Marking requires a proven full-demand failure
+
+`mark_exhausted` and `mark_quota_failure` only run when
+`_failure_requested_full_demand` can prove the failure covered every requested
+node, which it reads from `requested_count` on the provisioner error. Only the
+AWS provisioner set that attribute, so GCP failures silently never populated
+either cache and the feature was a no-op end to end.
+
+The GCP bulk-insert path now sets `requested_count` to the number of nodes that
+attempt asked for. The outer API-level handler in `run_instances` deliberately
+leaves it unset: it can fire before any create is attempted, so it cannot prove
+what the failure covered, and an unset value keeps that failure out of the
+cache.
+
+### Success beats a delayed failure
+
+A failed provision is torn down before its exception surfaces, so a worker that
+failed can write its hint after a sibling worker has already succeeded on the
+identical demand and cleared it. `clear` is an unconditional delete with no
+ordering, so without a guard the stale failure would win and re-suppress a zone
+that was just proven to have capacity.
+
+A success therefore records a short tombstone keyed the same way, and
+`mark_exhausted` and `mark_quota_failure` drop a write while it is live. The
+window only has to cover the teardown delay. A genuine new failure inside it is
+simply not cached, which is the fail-open direction.
+
+This race pre-existed in the AWS cache; the guard fixes it there too.
 
 ### Presentation
 
-`active_service_observations` returns hints described as AWS-specific, and the
-Serve placement page renders them under an "AWS launch suppression" heading. Both
-become provider-neutral, with the provider carried per hint so the UI can label
-each row. This is a visible API shape change on the placement endpoint and is
-the main reason this work is separated from PR #874.
+`active_service_observations` returned hints described as AWS-specific, and the
+Serve placement page rendered them under an "AWS launch suppression" heading.
+Both are now provider-neutral, with `cloud` and `accelerators` carried per hint
+so the UI can attribute each row. The observation payload moved to version 2
+and carries an explicit object rather than a positional list, which removes the
+index arithmetic that previously decoded it.
+
+The account is excluded when the observation is written rather than redacted
+when it is read, and canonical cache keys are stored as SHA-256 digests rather
+than as their JSON payload. Together those mean no account or project
+identifier enters any stored key or value, not merely that it is absent from
+the returned hint. Keys are only ever compared for equality, never parsed, so a
+digest loses nothing.
+
+This is a visible API shape change on the placement endpoint and is the main
+reason this work was separated from PR #874.
 
 ## Alternatives
 
@@ -148,19 +195,32 @@ hint would refuse zones that still have capacity.
 4. Provider-neutral observations in the placement API and the dashboard label.
 
 Milestones 1 and 2 are independently landable and carry no behavior change,
-which keeps the risky gate-opening step small.
+which keeps the risky gate-opening step small. They were implemented as
+separate commits in one change set for review, since the key-shape change in
+milestone 2 has no consumer until milestone 3.
 
 ## Rollout
 
-The suppression gates ship behind a config flag defaulting to off, so the cache
-can be enabled per deployment after the classification has been observed to be
-correct in production. Because outcome classification landed first, the
-placement history already labels GCP exhaustion as `capacity_failed`, so the
-`capacity failed` counter can be compared before and after enabling the gates to
-confirm suppression is not hiding real failures.
+The suppression gates are controlled by `provision.gcp_capacity_cache`, a
+boolean **enabled by default**, with `false` as the escape hatch.
 
-Rollback is a flag flip. Since hints expire in 120s, disabling the flag returns
-behavior to the current state within two minutes with no cleanup.
+An earlier revision of this design defaulted it to off. That was reconsidered
+because the measured evidence is unambiguous (216 of 216 GCP failures over 24h
+were genuine zonal exhaustion, with no quota codes mixed in) and because the
+surrounding guards already bound the blast radius: a hint lasts 120s, matches
+one exact demand including its accelerators, applies only to single-zone Spot
+attempts, fails open on any cache error, and is cleared by a successful
+provision of the same shape.
+
+Because outcome classification landed first, the placement history already
+labels GCP exhaustion as `capacity_failed`, so that counter can be compared
+before and after rollout to confirm suppression is not hiding real failures.
+Watch that `capacity_failed` falls while `succeeded` holds steady: a drop in
+`succeeded` would mean suppression is skipping attempts that would have worked.
+
+Rollback is a flag flip to `false`. Since hints expire in 120s, disabling
+returns behavior to pre-cache provisioning within two minutes and needs no
+cleanup.
 
 ## Test Plan
 

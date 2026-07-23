@@ -12,6 +12,8 @@ from sky.backends import cloud_vm_ray_backend as backend
 from sky.provision import capacity_cache
 from sky.provision import common as provision_common
 from sky.provision.aws import instance as aws_instance
+from sky.provision.gcp import instance as gcp_instance
+from sky.provision.gcp import instance_utils as gcp_instance_utils
 
 
 class _FakeClientError(Exception):
@@ -180,14 +182,38 @@ def test_placement_outcome_separates_tpu_quota_from_tpu_capacity():
         _aggregate_error('CapacityExceeded')) == 'capacity_failed'
 
 
-def test_gcp_capacity_codes_do_not_reach_the_aws_capacity_cache():
-    # The wider placement set must not leak into the AWS-only cache gate.
+def test_capacity_codes_do_not_cross_providers():
+    """One cloud's capacity code must never classify another cloud's failure."""
+    gcp_code = _aggregate_error('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')
+    aws_code = _aggregate_error('InsufficientInstanceCapacity')
+    assert backend._classify_capacity_error(clouds.AWS(), gcp_code) is None
+    assert backend._classify_capacity_error(clouds.GCP(), aws_code) is None
+    # Each still classifies its own.
+    assert backend._classify_capacity_error(clouds.GCP(),
+                                            gcp_code) == 'capacity'
+    assert backend._classify_capacity_error(clouds.AWS(),
+                                            aws_code) == 'capacity'
+
+
+def test_gcp_classification_reads_past_the_summary_code():
     assert backend._classify_capacity_error(
         clouds.GCP(),
-        _aggregate_error('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')) is None
+        _aggregate_error(
+            'VM_MIN_COUNT_NOT_REACHED',
+            'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')) == 'capacity'
+    # Quota dominates a mixed known batch because it is regional.
     assert backend._classify_capacity_error(
-        clouds.AWS(),
-        _aggregate_error('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS')) is None
+        clouds.GCP(),
+        _aggregate_error('VM_MIN_COUNT_NOT_REACHED',
+                         'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+                         'QUOTA_EXCEEDED')) == 'quota'
+    # An unknown code keeps the conservative failover path.
+    assert backend._classify_capacity_error(
+        clouds.GCP(),
+        _aggregate_error('VM_MIN_COUNT_NOT_REACHED', 'SOMETHING_ELSE')) is None
+    # A summary code alone says nothing.
+    assert backend._classify_capacity_error(
+        clouds.GCP(), _aggregate_error('VM_MIN_COUNT_NOT_REACHED')) is None
 
 
 @pytest.mark.parametrize('code', [
@@ -234,10 +260,12 @@ def test_cache_key_is_exact_aws_spot_zone_only():
     zone_b = clouds.Zone('us-east-1b')
     key = backend._capacity_cache_key(_to_provision(), region, [zone_a], 4,
                                       'acct')
-    assert key == capacity_cache.ResourceKey(account='acct',
+    assert key == capacity_cache.ResourceKey(cloud='aws',
+                                             account='acct',
                                              region='us-east-1',
                                              zone='us-east-1a',
                                              instance_type='g6.4xlarge',
+                                             accelerators='L4:1',
                                              num_nodes=4)
 
     assert backend._capacity_cache_key(_to_provision(use_spot=False), region,
@@ -246,21 +274,24 @@ def test_cache_key_is_exact_aws_spot_zone_only():
                                        [zone_a, zone_b], 4, 'acct') is None
     assert backend._capacity_cache_key(_to_provision(), region, [zone_a], 4,
                                        None) is None
-    assert backend._capacity_cache_key(_to_provision(cloud=clouds.GCP()),
+    # A cloud with no structured capacity codes never participates.
+    assert backend._capacity_cache_key(_to_provision(cloud=clouds.Azure()),
                                        region, [zone_a], 4, 'acct') is None
 
 
 def test_quota_cooldown_key_is_exact_spot_regional_demand():
     region = clouds.Region('us-east-1')
     key = backend._quota_cooldown_key(_to_provision(), region, 4, 'acct')
-    assert key == capacity_cache.QuotaCooldownKey(account='acct',
+    assert key == capacity_cache.QuotaCooldownKey(cloud='aws',
+                                                  account='acct',
                                                   region='us-east-1',
                                                   instance_type='g6.4xlarge',
+                                                  accelerators='L4:1',
                                                   num_nodes=4)
     assert backend._quota_cooldown_key(_to_provision(), region, 4, None) is None
     assert backend._quota_cooldown_key(_to_provision(use_spot=False), region, 4,
                                        'acct') is None
-    assert backend._quota_cooldown_key(_to_provision(cloud=clouds.GCP()),
+    assert backend._quota_cooldown_key(_to_provision(cloud=clouds.Azure()),
                                        region, 4, 'acct') is None
 
 
@@ -287,9 +318,11 @@ def test_consult_failure_falls_back_to_real_probe(monkeypatch):
 
 
 def test_quota_consult_hit_and_failure(monkeypatch):
-    key = capacity_cache.QuotaCooldownKey(account='acct',
+    key = capacity_cache.QuotaCooldownKey(cloud='aws',
+                                          account='acct',
                                           region='us-east-1',
                                           instance_type='g6.4xlarge',
+                                          accelerators='L4:1',
                                           num_nodes=1)
     monkeypatch.setattr(capacity_cache, 'is_quota_cooldown_active',
                         lambda _: True)
@@ -333,9 +366,11 @@ def test_retry_zones_spot_quota_cooldown_precedes_quota_check_and_zone_yield(
         tmp_path, monkeypatch):
     provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
     to_provision = _to_provision()
-    expected_key = capacity_cache.QuotaCooldownKey(account='acct',
+    expected_key = capacity_cache.QuotaCooldownKey(cloud='aws',
+                                                   account='acct',
                                                    region='us-east-1',
                                                    instance_type='g6.4xlarge',
+                                                   accelerators='L4:1',
                                                    num_nodes=1)
     cooldown_active = mock.Mock(return_value=True)
     check_quota = mock.Mock(return_value=False)
@@ -450,3 +485,177 @@ def test_fully_created_fresh_demand_clear_eligibility(record, num_nodes,
                                                       cluster_exists, expected):
     assert backend._fully_created_fresh_demand(record, num_nodes,
                                                cluster_exists) is expected
+
+
+def _enable_gcp_cache(monkeypatch, enabled: bool = True):
+    real_get_nested = backend.skypilot_config.get_nested
+
+    def fake_get_nested(keys, *args, **kwargs):
+        if tuple(keys) == ('provision', 'gcp_capacity_cache'):
+            return enabled
+        return real_get_nested(keys, *args, **kwargs)
+
+    monkeypatch.setattr(backend.skypilot_config, 'get_nested', fake_get_nested)
+
+
+def _gcp_provision(*, accelerators=None, instance_type='g2-standard-4'):
+    return resources_lib.Resources(cloud=clouds.GCP(),
+                                   region='asia-northeast3',
+                                   zone='asia-northeast3-b',
+                                   instance_type=instance_type,
+                                   accelerators=accelerators,
+                                   use_spot=True)
+
+
+def test_gcp_cache_key_is_on_by_default_and_can_be_disabled(monkeypatch):
+    region = clouds.Region('asia-northeast3')
+    zone = clouds.Zone('asia-northeast3-b')
+
+    # Disabling is the escape hatch: no key means nothing is written or read.
+    _enable_gcp_cache(monkeypatch, enabled=False)
+    assert backend._capacity_cache_key(_gcp_provision(), region, [zone], 1,
+                                       'proj') is None
+    assert backend._quota_cooldown_key(_gcp_provision(), region, 1,
+                                       'proj') is None
+
+    # With no configuration at all, GCP participates.
+    monkeypatch.undo()
+    key = backend._capacity_cache_key(_gcp_provision(accelerators={'L4': 1}),
+                                      region, [zone], 1, 'proj')
+    assert key == capacity_cache.ResourceKey(cloud='gcp',
+                                             account='proj',
+                                             region='asia-northeast3',
+                                             zone='asia-northeast3-b',
+                                             instance_type='g2-standard-4',
+                                             accelerators='L4:1',
+                                             num_nodes=1)
+
+
+def test_gcp_key_separates_accelerators_on_the_same_machine_type(monkeypatch):
+    """N1 attaches accelerators separately, so the machine type is not enough."""
+    _enable_gcp_cache(monkeypatch)
+    region = clouds.Region('asia-northeast3')
+    zone = clouds.Zone('asia-northeast3-b')
+    t4 = backend._capacity_cache_key(
+        _gcp_provision(instance_type='n1-standard-8', accelerators={'T4': 1}),
+        region, [zone], 1, 'proj')
+    v100 = backend._capacity_cache_key(
+        _gcp_provision(instance_type='n1-standard-8', accelerators={'V100': 1}),
+        region, [zone], 1, 'proj')
+    assert t4 is not None and v100 is not None
+    assert t4 != v100
+
+
+def test_cache_keys_separate_clouds(monkeypatch):
+    _enable_gcp_cache(monkeypatch)
+    region = clouds.Region('us-east-1')
+    zone = clouds.Zone('us-east-1a')
+    aws_key = backend._capacity_cache_key(_to_provision(), region, [zone], 1,
+                                          'same')
+    gcp_key = backend._capacity_cache_key(
+        _gcp_provision(instance_type='g6.4xlarge'), region, [zone], 1, 'same')
+    assert aws_key is not None and gcp_key is not None
+    assert aws_key != gcp_key
+
+
+def test_capacity_cache_account_scopes_by_project_without_the_email():
+    aws = backend._capacity_cache_account(clouds.AWS(), ['user-id', '1234567'])
+    assert aws == '1234567'
+
+    gcp = backend._capacity_cache_account(
+        clouds.GCP(), ['someone@example.com [project_id=my-project]'])
+    assert gcp == 'my-project'
+
+    # An identity that does not carry a project must not be cached under the
+    # raw string, which would also leak the account email into the key.
+    assert backend._capacity_cache_account(clouds.GCP(),
+                                           ['someone@example.com']) is None
+    assert backend._capacity_cache_account(clouds.GCP(), None) is None
+    assert backend._capacity_cache_account(clouds.Azure(), ['x']) is None
+
+
+def test_gcp_touches_no_cache_entry_point_when_flag_is_off(monkeypatch):
+    """With the flag off, GCP must not read or write the cache at all."""
+    _enable_gcp_cache(monkeypatch, enabled=False)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError('cache must not be touched when the flag is off')
+
+    for name in ('mark_exhausted', 'active_exhausted_keys', 'clear',
+                 'mark_quota_failure', 'is_quota_cooldown_active',
+                 'clear_quota_cooldown'):
+        monkeypatch.setattr(capacity_cache, name, _boom)
+
+    region = clouds.Region('asia-northeast3')
+    zones = [clouds.Zone('asia-northeast3-b')]
+    to_provision = _gcp_provision(accelerators={'L4': 1})
+
+    assert backend._capacity_cache_key(to_provision, region, zones, 1,
+                                       'proj') is None
+    quota_key = backend._quota_cooldown_key(to_provision, region, 1, 'proj')
+    assert quota_key is None
+    # The consult helpers must short-circuit on the absent key rather than
+    # reaching the cache.
+    assert backend._capacity_cache_exhausted_zone_names(to_provision, region,
+                                                        zones, 1,
+                                                        'proj') == set()
+    assert not backend._quota_cooldown_is_active(quota_key)
+
+
+def test_gcp_provisioner_sets_requested_count_so_failures_can_cache(
+        monkeypatch):
+    """A GCP bulk-insert failure must prove it covered the whole demand.
+
+    Without `requested_count`, `_failure_requested_full_demand` is False and
+    the failure is silently never cached, making the GCP cache a no-op.
+    """
+    codes = [
+        'VM_MIN_COUNT_NOT_REACHED', 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS'
+    ]
+
+    class _FakeCompute:
+        """Minimal stand-in for the GCP compute resource."""
+
+        STOPPING_STATES: list = []
+        NON_TERMINATED_STATES: list = []
+        PENDING_STATES: list = []
+
+        @classmethod
+        def filter(cls, *args, **kwargs):
+            del args, kwargs
+            return {}
+
+        @classmethod
+        def create_instances(cls, *args, **kwargs):
+            del args, kwargs
+            return ([{'code': code, 'message': code} for code in codes], [])
+
+    monkeypatch.setattr(gcp_instance_utils, 'GCPComputeInstance', _FakeCompute)
+    monkeypatch.setattr(gcp_instance.instance_utils, 'GCPComputeInstance',
+                        _FakeCompute)
+    monkeypatch.setattr(gcp_instance.instance_utils, 'get_node_type',
+                        lambda _: gcp_instance_utils.GCPNodeType.COMPUTE)
+
+    config = provision_common.ProvisionConfig(
+        provider_config={
+            'project_id': 'proj',
+            'availability_zone': 'asia-northeast3-b',
+        },
+        authentication_config={},
+        docker_config={},
+        node_config={},
+        count=2,
+        tags={},
+        resume_stopped_nodes=True,
+        ports_to_open_on_launch=None,
+    )
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        gcp_instance._run_instances('asia-northeast3', 'cluster', config)
+
+    error = exc_info.value
+    assert [entry['code'] for entry in error.errors] == codes
+    # The wiring under test: without this the failure can never be cached.
+    assert error.requested_count == 2
+    assert backend._failure_requested_full_demand(error, 2)
+    assert backend._classify_capacity_error(clouds.GCP(), error) == 'capacity'

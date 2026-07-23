@@ -101,9 +101,11 @@ const placement = {
     hints: [
       {
         kind: 'capacity',
-        region: 'us-east-1',
-        zone: 'us-east-1a',
-        instanceType: 'g6.4xlarge',
+        cloud: 'gcp',
+        region: 'asia-northeast3',
+        zone: 'asia-northeast3-b',
+        instanceType: 'g2-standard-4',
+        accelerators: 'L4:1',
         numNodes: 1,
         expiresAt: 1120,
       },
@@ -199,7 +201,11 @@ it('loads once on mount and only refreshes manually', async () => {
     expect(
       screen.getByLabelText(/Availability: Unavailable[\s\S]*Next probe:/)
     ).toBeTruthy();
-    expect(screen.getByText('AZ capacity')).toBeTruthy();
+    expect(screen.getByText('Zonal capacity')).toBeTruthy();
+    // The provider is shown so a hint is attributable once more than one
+    // cloud can contribute suppression.
+    expect(screen.getByText('gcp')).toBeTruthy();
+    expect(screen.getByText('g2-standard-4 (L4:1)')).toBeTruthy();
     expect(screen.getByText(/exact instance demand/)).toBeTruthy();
     expect(getServicePlacement).toHaveBeenCalledTimes(1);
 
