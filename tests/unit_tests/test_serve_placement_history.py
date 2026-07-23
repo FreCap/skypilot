@@ -18,6 +18,20 @@ def _reset_buffer():
     placement_history.reset_request_buffer()
 
 
+def test_event_fields_match_table_columns():
+    """EVENT_FIELDS must track the table schema (minus service_hash)."""
+    column_names = [
+        str(column.name)
+        for column in placement_history.serve_placement_events_table.columns
+        if str(column.name) != 'service_hash'
+    ]
+    assert list(placement_history.EVENT_FIELDS) == column_names
+    # History payloads are persisted with orjson, which only accepts exact
+    # str dict keys; the literals guarantee that.
+    for field in placement_history.EVENT_FIELDS:
+        assert type(field) is str  # pylint: disable=unidiomatic-typecheck
+
+
 def _record(**overrides):
     values = {
         'service_name': 'svc',

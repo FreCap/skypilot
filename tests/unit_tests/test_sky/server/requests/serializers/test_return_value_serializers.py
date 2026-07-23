@@ -133,6 +133,12 @@ class TestDefaultSerializer:
         result = return_value_serializers.default_serializer(data)
         assert json.loads(result) == data
 
+    def test_serialize_falls_back_when_orjson_rejects(self):
+        """Payloads orjson rejects still serialize via the stdlib fallback."""
+        data = {'outer': {1: 'one'}}
+        result = return_value_serializers.default_serializer(data)
+        assert json.loads(result) == {'outer': {'1': 'one'}}
+
 
 class TestSerializeKubernetesNodeInfo:
     """Tests for the serialize_kubernetes_node_info function."""
