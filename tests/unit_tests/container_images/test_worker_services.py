@@ -1066,6 +1066,7 @@ def test_eks_success_scrubs_installed_credential_before_return(
     ('winner', 'expected_type', 'expected_message'),
     [
         ('provider', RuntimeError, 'LOSING_EKS_PROVIDER_SECRET'),
+        ('provider-code-collision', ValueError, 'CANARY_TEARDOWN_FAILED'),
         ('teardown', ValueError, 'CANARY_TEARDOWN_FAILED'),
         ('lease', worker_lease.LeaseLostError, 'cleanup lease lost'),
         ('drain', canary_worker_service._CanaryDrainRequested, ''),
@@ -1092,7 +1093,10 @@ def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
     fenced, core, configuration, api_client, raw_core = (
         _installed_eks_fenced_client('INSTALLED_EXEC_TOKEN', heartbeat))
     monkeypatch.setattr(core, '_should_refresh', lambda: False)
-    provider_error = RuntimeError(marker)
+    if winner == 'provider-code-collision':
+        provider_error = ValueError('CANARY_TEARDOWN_FAILED')
+    else:
+        provider_error = RuntimeError(marker)
     provider_error.response = {  # type: ignore[attr-defined]
         'headers': {
             'Authorization': f'Bearer {marker}',
@@ -1123,7 +1127,7 @@ def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
                         lambda *_args, **_kwargs: (1, 'f' * 64))
 
     def cleanup(*_args, **_kwargs):
-        if winner == 'provider':
+        if winner in ('provider', 'provider-code-collision'):
             return True
         if winner == 'teardown':
             return False
@@ -1153,7 +1157,7 @@ def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
                           sort_keys=True)
     assert error.__cause__ is None
     assert error.__context__ is None
-    if winner == 'provider':
+    if winner in ('provider', 'provider-code-collision'):
         assert error is provider_error
         assert marker in rendered
     else:

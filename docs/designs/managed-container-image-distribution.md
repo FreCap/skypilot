@@ -2344,11 +2344,13 @@ EC2 and EKS also separate work failure from the final cleanup winner. If
 teardown failure, drain, or lease loss replaces an active provider failure, the
 worker exits the losing exception handler, drops its traceback and response
 state, and only then raises the deterministic winning error with no cause or
-context. The same boundary preserves the original provider exception when
-teardown succeeds, so useful ordinary diagnostics are not erased. Cleanup may
-therefore determine custody without making a losing provider response,
-request-local authorization header, or other provider state reachable from the
-winning exception or its serialized envelope.
+context. An internal typed teardown signal distinguishes that winner from an
+unrelated provider `ValueError` with the same message. The same boundary
+preserves the original provider exception when teardown succeeds, so useful
+ordinary diagnostics are not erased. Cleanup may therefore determine custody
+without making a losing provider response, request-local authorization header,
+or other provider state reachable from the winning exception or its serialized
+envelope.
 Transparent library-side refresh is removed from the raw API call path. The
 wrapper converts a kubeconfig credential's declared wall-clock expiry into one
 monotonic refresh deadline when the credential is accepted, preserving the
@@ -3914,10 +3916,12 @@ installed Kubernetes credential was correctly scrubbed and closed. This
 revision puts both EC2 and EKS canary lifetimes behind one detached cleanup
 winner contract. Successful cleanup preserves the ordinary provider exception;
 teardown failure, cleanup lease loss, and cleanup-time drain discard the losing
-provider graph before raising their deterministic winner. Exact object-graph
-and serialized-envelope regressions cover all four EKS precedence outcomes and
-the equivalent EC2 teardown-failure schedule. The acceptance streak remains
-zero. Before the repaired-head acceptance run, `origin/improvements` advanced
+provider graph before raising their deterministic winner. A typed internal
+teardown signal prevents an unrelated provider `ValueError` with the same
+message from being reclassified. Exact object-graph and serialized-envelope
+regressions cover the EKS precedence and message-collision outcomes plus the
+equivalent EC2 teardown-failure schedule. The acceptance streak remains zero.
+Before the repaired-head acceptance run, `origin/improvements` advanced
 to `0758b9b32e5828a0befd6cde1fe09dce62e6f605`. Integrating it preserves the
 new managed-job cancellation attribution and transient-INIT recovery contracts
 without changing this feature's 22-file base-relative diff; all gates are rerun

@@ -59,6 +59,13 @@ class _CanaryCleanupDeadlineExceeded(Exception):
     """Stops mandatory cleanup before a provider call can exceed its budget."""
 
 
+class _CanaryTeardownFailed(ValueError):
+    """Identifies a custody-preserving teardown failure before detachment."""
+
+    def __init__(self) -> None:
+        super().__init__('CANARY_TEARDOWN_FAILED')
+
+
 def _raise_if_draining(drain_event: threading.Event | None) -> None:
     if drain_event is not None and drain_event.is_set():
         raise _CanaryDrainRequested()
@@ -322,10 +329,10 @@ def _attach_canary_child(operation: catalog_state.OperationRecord,
                                                      child_id)
     except ValueError as error:
         # A different durable child cannot be discarded by terminal failure.
-        raise ValueError('CANARY_TEARDOWN_FAILED') from error
+        raise _CanaryTeardownFailed() from error
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     if not attached:
         raise worker_lease.LeaseLostError(
@@ -358,14 +365,13 @@ def _authorized_launch_deadline(
 def _preflight_error(operation: catalog_state.OperationRecord,
                      error_code: str) -> ValueError:
     if operation.child_launch_id is not None:
-        return ValueError('CANARY_TEARDOWN_FAILED')
+        return _CanaryTeardownFailed()
     return ValueError(error_code)
 
 
 def _detached_cleanup_winner(error: Exception) -> Exception | None:
     """Returns a cleanup/control winner detached from losing provider state."""
-    if (isinstance(error, ValueError) and
-            str(error) == 'CANARY_TEARDOWN_FAILED'):
+    if isinstance(error, _CanaryTeardownFailed):
         return ValueError('CANARY_TEARDOWN_FAILED')
     if isinstance(error, (_CanaryDrainRequested, _CanaryCleanupDeadlineExceeded,
                           worker_lease.LeaseLostError)):
@@ -681,7 +687,7 @@ def _run_ec2_canary_inner(
         role = _canary_role(profile, binding)
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     child_id = f'ec2:{target.region}:{operation.id}'
     persisted_child = operation.child_launch_id is not None
@@ -915,7 +921,7 @@ def _run_ec2_canary_inner(
         except Exception:  # pylint: disable=broad-except
             teardown_verified = False
         if not teardown_verified:
-            raise ValueError('CANARY_TEARDOWN_FAILED')
+            raise _CanaryTeardownFailed()
         _raise_if_draining(drain_event)
     if not success:
         raise ValueError('CANARY_PULL_FAILED')
@@ -1165,7 +1171,7 @@ def _run_eks_canary_inner(
         role = _canary_role(profile, binding)
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     if ':cluster/' not in cluster_arn:
         raise _preflight_error(operation, 'CANARY_PRINCIPAL_UNVERIFIED')
@@ -1365,7 +1371,7 @@ def _run_eks_canary_inner(
                                          not create_confirmed)),
                         cleanup_deadline=cleanup_deadline)
             if not teardown_verified:
-                raise ValueError('CANARY_TEARDOWN_FAILED')
+                raise _CanaryTeardownFailed()
             _raise_if_draining(drain_event)
         finally:
             if core is not None:
