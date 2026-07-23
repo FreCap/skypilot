@@ -3370,13 +3370,16 @@ class SkyServeController:
                 # iteration that (re)binds pending_scale_up, so capturing the
                 # loop-scoped list is intentional (B023 false positive).
                 def _flush_scale_up(
-                        expected_version: int = decision_version) -> None:
+                    expected_version: int = decision_version,
+                    producer_autoscaler: autoscalers.
+                    Autoscaler = decision_autoscaler,
+                ) -> None:
                     if not pending_scale_up:  # noqa: B023
                         return
                     aggregate_priority = (
-                        decision_autoscaler.current_launch_priority())
+                        producer_autoscaler.current_launch_priority())
                     if not isinstance(
-                            decision_autoscaler,
+                            producer_autoscaler,
                             autoscalers.InstanceAwareRequestRateAutoscaler):
                         self._replica_manager.scale_up_batch(
                             list(pending_scale_up),  # noqa: B023
@@ -3405,7 +3408,7 @@ class SkyServeController:
                         card for card, _ in card_batches if card is not None
                     ]
                     priorities_by_card = (
-                        decision_autoscaler.
+                        producer_autoscaler.
                         current_launch_priorities_by_accelerator(targeted_cards)
                     )
                     for card, resources_overrides in card_batches:
