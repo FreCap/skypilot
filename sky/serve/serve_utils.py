@@ -1949,7 +1949,8 @@ def update_service_encoded(service_name: str,
     service_status = _get_service_status(service_name,
                                          pool=pool,
                                          with_replica_info=False,
-                                         with_yaml=False)
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
@@ -2011,7 +2012,8 @@ def set_load_balancer_high_availability_encoded(
     service_status = _get_service_status(service_name,
                                          pool=False,
                                          with_replica_info=False,
-                                         with_yaml=False)
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Service {service_name!r} does not exist.')
@@ -2051,10 +2053,13 @@ def set_load_balancer_high_availability_encoded(
 
 def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
     # TODO(tian): Currently pool does not support terminating replica.
-    # Only existence is consumed here; skip the YAML render.
+    # Only existence and the incarnation hash are consumed here; avoid the
+    # full service-row read and the fleet-sized replica serialization.
     service_status = _get_service_status(service_name,
                                          pool=False,
-                                         with_yaml=False)
+                                         with_replica_info=False,
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Service {service_name!r} does not exist.')
