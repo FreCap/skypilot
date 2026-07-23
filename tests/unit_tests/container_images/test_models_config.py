@@ -175,6 +175,47 @@ def test_workspace_policy_defaults_to_unchanged_direct_behavior() -> None:
     assert policy.regional_cache_retention_weeks == 8
 
 
+def test_workspace_policy_distinguishes_missing_from_explicit_null(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    def missing(_keys: tuple[str, ...],
+                default_value: Any = None,
+                **_kwargs: Any) -> Any:
+        return default_value
+
+    monkeypatch.setattr(config.skypilot_config, 'get_nested', missing)
+    assert config.get_workspace_policy(
+        'research') == models.WorkspaceImagePolicy()
+
+    monkeypatch.setattr(config.skypilot_config, 'get_nested',
+                        lambda *_args, **_kwargs: None)
+    with pytest.raises(ValueError, match='must be an object'):
+        config.get_workspace_policy('research')
+    with pytest.raises(ValueError, match='must be an object'):
+        config.parse_workspace_policy(None)
+
+
+def test_workspace_policy_list_distinguishes_missing_from_explicit_null(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config.skypilot_config, 'get_nested',
+                        lambda *_args, **_kwargs: {'research': {}})
+    assert config.list_workspace_policies(
+    )['research'] == models.WorkspaceImagePolicy()
+
+    monkeypatch.setattr(
+        config.skypilot_config, 'get_nested',
+        lambda *_args, **_kwargs: {'research': {
+            'container_images': None
+        }})
+    with pytest.raises(ValueError, match='must be an object'):
+        config.list_workspace_policies()
+
+    monkeypatch.setattr(config.skypilot_config, 'get_nested',
+                        lambda *_args, **_kwargs: None)
+    with pytest.raises(ValueError, match='workspaces configuration'):
+        config.list_workspace_policies()
+
+
 @pytest.mark.parametrize(('field', 'value'), [
     ('allowed_profiles', None),
     ('allowed_profiles', 'gpu-production'),
@@ -191,6 +232,52 @@ def test_workspace_policy_collections_reject_malformed_shapes_as_value_errors(
         field: str, value: Any) -> None:
     with pytest.raises(ValueError):
         config.parse_workspace_policy({field: value})
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('allowed_profiles', None),
+    ('allowed_profiles', 'gpu-production'),
+    ('allowed_profiles', ['gpu-production', None]),
+    ('allowed_profiles', ['gpu-production', {}]),
+    ('allowed_profiles', ['gpu-production', 'gpu-production']),
+    ('allowed_profiles', [f'profile-{index}' for index in range(129)]),
+    ('publishers', None),
+    ('publishers', 'user-id'),
+    ('publishers', ['user-id', None]),
+    ('publishers', ['user-id', {}]),
+    ('publishers', ['user-id', 'user-id']),
+    ('publishers', [f'user-{index}' for index in range(257)]),
+])
+def test_workspace_policy_model_collections_are_total_and_bounded(
+        field: str, value: Any) -> None:
+    with pytest.raises(ValueError):
+        models.WorkspaceImagePolicy(**{field: value})
+
+
+def test_workspace_policy_model_normalizes_valid_collection_lists() -> None:
+    raw: dict[str, Any] = {
+        'allowed_profiles': ['gpu-production'],
+        'publishers': ['publisher-1'],
+    }
+    policy = models.WorkspaceImagePolicy(**raw)
+    assert policy.allowed_profiles == ('gpu-production',)
+    assert policy.publishers == ('publisher-1',)
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('mode', None),
+    ('mode', 'direct'),
+    ('default_profile', []),
+    ('locality', None),
+    ('locality', 'prefer'),
+    ('regional_cache_retention_weeks', True),
+    ('regional_cache_retention_weeks', 0),
+    ('regional_cache_retention_weeks', '8'),
+])
+def test_workspace_policy_model_rejects_all_malformed_field_shapes(
+        field: str, value: Any) -> None:
+    with pytest.raises(ValueError):
+        models.WorkspaceImagePolicy(**{field: value})
 
 
 def test_workspace_policy_selection_and_allowlist(
@@ -243,8 +330,8 @@ def test_managed_preferred_allows_explicit_direct_escape(
 
     def preferred(keys: tuple[str, ...], default_value=None, **kwargs):
         value = original(keys, default_value, **kwargs)
-        if keys == ('workspaces', 'research', 'container_images'):
-            value['mode'] = 'managed_preferred'
+        if keys == ('workspaces',):
+            value['research']['container_images']['mode'] = 'managed_preferred'
         return value
 
     monkeypatch.setattr(config.skypilot_config, 'get_nested', preferred)

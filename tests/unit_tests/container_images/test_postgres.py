@@ -2852,6 +2852,12 @@ def test_artifact_demand_history_is_index_bounded_for_sparse_and_dense_images(
     other_location_id = 'demand-history-dense-location'
     other_digest = 'sha256:' + 'd' * 64
     with image_database.begin() as connection:
+        # The 100,000-row population is test-fixture setup rather than the
+        # bounded production query under proof.  Shared CI PostgreSQL can exceed
+        # the connection's 15-second default while enforcing the foreign keys
+        # under parallel load, so bound this setup transaction independently.
+        connection.execute(
+            sqlalchemy.text("SET LOCAL statement_timeout = '60s'"))
         connection.execute(
             sqlalchemy.text("""
                 INSERT INTO container_images (

@@ -293,6 +293,45 @@ def test_lifecycle_policy_refresh_keeps_last_valid_retentions(
     assert reload_config.call_count == 2
 
 
+@pytest.mark.parametrize('invalid_workspaces', [
+    None,
+    {
+        'research': {
+            'container_images': None,
+        },
+    },
+])
+def test_lifecycle_policy_refresh_rejects_null_and_keeps_last_valid_map(
+        monkeypatch: pytest.MonkeyPatch, invalid_workspaces: object) -> None:
+    previous = {'research': None, 'other': 123}
+    reload_config = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.skypilot_config,
+                        'safe_reload_config', reload_config)
+    monkeypatch.setattr(lifecycle_worker_service.config.skypilot_config,
+                        'get_nested',
+                        lambda *_args, **_kwargs: invalid_workspaces)
+
+    refreshed = (lifecycle_worker_service.
+                 _refresh_workspace_eviction_retentions(previous))
+
+    assert refreshed is previous
+    reload_config.assert_called_once_with()
+
+
+def test_lifecycle_policy_refresh_defaults_only_a_missing_policy_key(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lifecycle_worker_service.skypilot_config,
+                        'safe_reload_config', mock.Mock())
+    monkeypatch.setattr(lifecycle_worker_service.config.skypilot_config,
+                        'get_nested',
+                        lambda *_args, **_kwargs: {'research': {}})
+
+    refreshed = lifecycle_worker_service._refresh_workspace_eviction_retentions(
+        {'research': None})
+
+    assert refreshed == {'research': 8 * 7 * 24 * 60 * 60}
+
+
 def test_provider_budget_limiter_uses_only_monotonic_local_expiry(
         monkeypatch: pytest.MonkeyPatch) -> None:
     limiter = budgets.ProviderBudgetLimiter('copy-worker')
@@ -1088,6 +1127,198 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotProfile': profile.name,
         }
     assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
+
+
+@pytest.mark.parametrize('invalid_instance_id', [None, 7],
+                         ids=['missing-id', 'non-string-id'])
+def test_ec2_canary_malformed_launch_identity_settles_and_terminates_late_child(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        invalid_instance_id: object) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    assert binding.instance_profile is not None
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        if not instances:
+            return {'Reservations': []}
+        return {'Reservations': [{'Instances': list(instances)}]}
+
+    late = {
+        'InstanceId': 'i-late',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    terminated = {
+        'InstanceId': 'i-late',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        response(),  # Initial operation-tag discovery.
+        response(),  # Immediate discovery in finally.
+        response(),  # First settling attempt still observes tag propagation.
+        response(late),  # The paid child becomes visible later.
+        response(terminated),  # Exact ID-scoped termination proof.
+    )
+    ec2.run_instances.return_value = {
+        'Instances': [{
+            'InstanceId': invalid_instance_id,
+        }]
+    }
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0],
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    ec2.run_instances.assert_called_once()
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-late'])
+    assert mock.call(
+        InstanceIds=['i-late']) in ec2.describe_instances.call_args_list
+    ec2.get_console_output.assert_not_called()
+
+
+def test_ec2_canary_malformed_discovered_identity_uses_settling_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        if not instances:
+            return {'Reservations': []}
+        return {'Reservations': [{'Instances': list(instances)}]}
+
+    malformed = {'State': {'Name': 'running'}}
+    late = {'InstanceId': 'i-late', 'State': {'Name': 'running'}}
+    terminated = {
+        'InstanceId': 'i-late',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        response(malformed),
+        response(),
+        response(),
+        response(late),
+        response(terminated),
+    )
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
+                        lambda *_args, **_kwargs: ec2)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    ec2.run_instances.assert_not_called()
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-late'])
+
+
+def test_ec2_teardown_retains_late_child_after_partial_termination(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        return {'Reservations': [{'Instances': list(instances)}]}
+
+    known_running = {
+        'InstanceId': 'i-known',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    known_stopping = {
+        'InstanceId': 'i-known',
+        'State': {
+            'Name': 'shutting-down',
+        },
+    }
+    known_terminated = {
+        'InstanceId': 'i-known',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+    late_running = {
+        'InstanceId': 'i-late',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    late_terminated = {
+        'InstanceId': 'i-late',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        response(known_running),
+        response(known_stopping),
+        response(known_terminated, late_running),
+        response(known_terminated, late_terminated),
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(ec2,
+                                                          'operation',
+                                                          ['i-known'],
+                                                          settle_absence=False)
+
+    assert ec2.terminate_instances.call_args_list == [
+        mock.call(InstanceIds=['i-known']),
+        mock.call(InstanceIds=['i-late']),
+    ]
 
 
 @pytest.mark.parametrize('persisted_child', [False, True],

@@ -420,10 +420,12 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         }
         instances = _tagged_instances(ec2, operation.id)
         _remember_instance_ids(instances, known_instance_ids)
-        launch_confirmed = bool(instances)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
         if instances:
+            instance_id = _instance_id(instances[0])
+            known_instance_ids.add(instance_id)
+            launch_confirmed = True
             deadline = _authorized_launch_deadline(operation, child_id,
                                                    heartbeat)
         iam = _assumed_client(role, 'iam', target.region, heartbeat)
@@ -482,9 +484,15 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 raise RuntimeError(
                     'EC2 canary launch returned no unique child.')
             instances = [launched[0]]
-            _remember_instance_ids(instances, known_instance_ids)
+            # A provider response is not confirmation until it supplies one
+            # concrete child identity. If validation fails, launch_attempted
+            # remains the durable ambiguity signal and teardown must run the
+            # full discovery-settling path.
+            instance_id = _instance_id(instances[0])
+            known_instance_ids.add(instance_id)
             launch_confirmed = True
-        instance_id = _instance_id(instances[0])
+        if instance_id is None:
+            instance_id = _instance_id(instances[0])
         assert deadline is not None
         while time.monotonic() < deadline:
             heartbeat.assert_owned()
@@ -534,8 +542,9 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                     ec2,
                     operation.id,
                     sorted(known_instance_ids),
-                    settle_absence=(persisted_child or (launch_attempted and
-                                                        not launch_confirmed)))
+                    settle_absence=(persisted_child or
+                                    ((launch_attempted or bool(instances)) and
+                                     not launch_confirmed)))
         except worker_lease.LeaseLostError:
             raise
         except Exception:  # pylint: disable=broad-except

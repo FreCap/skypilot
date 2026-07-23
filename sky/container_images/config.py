@@ -9,12 +9,26 @@ from sky.skylet import constants
 DIRECT_PROFILE = 'direct'
 _MAX_WORKSPACE_PROFILES = 128
 _MAX_WORKSPACE_PUBLISHERS = 256
+_MISSING_WORKSPACE_POLICY = object()
 
 
 def _workspace_policy_config(workspace: str) -> Any:
-    value = skypilot_config.get_nested(
-        ('workspaces', workspace, 'container_images'), default_value={})
-    return {} if value is None else value
+    workspaces = skypilot_config.get_nested(
+        ('workspaces',), default_value=_MISSING_WORKSPACE_POLICY)
+    if workspaces is _MISSING_WORKSPACE_POLICY:
+        return {}
+    if not isinstance(workspaces, dict):
+        raise ValueError('SkyPilot workspaces configuration must be an object.')
+    workspace_config = workspaces.get(workspace, _MISSING_WORKSPACE_POLICY)
+    if workspace_config is _MISSING_WORKSPACE_POLICY:
+        return {}
+    if not isinstance(workspace_config, dict):
+        raise ValueError('SkyPilot workspace configuration is invalid.')
+    raw_policy = workspace_config.get('container_images',
+                                      _MISSING_WORKSPACE_POLICY)
+    if raw_policy is _MISSING_WORKSPACE_POLICY:
+        return {}
+    return raw_policy
 
 
 def _parse_string_collection(value: Any, subject: str,
@@ -34,8 +48,6 @@ def _parse_string_collection(value: Any, subject: str,
 
 def parse_workspace_policy(value: Any) -> models.WorkspaceImagePolicy:
     """Parses one strict workspace image policy from a config snapshot."""
-    if value is None:
-        value = {}
     if not isinstance(value, dict):
         raise ValueError('Workspace container_images must be an object.')
     unknown = set(value) - {
@@ -80,8 +92,9 @@ def get_workspace_policy(
 
 def list_workspace_policies() -> dict[str, models.WorkspaceImagePolicy]:
     """Returns every explicitly configured workspace image policy."""
-    workspaces = skypilot_config.get_nested(('workspaces',), default_value={})
-    if workspaces is None:
+    workspaces = skypilot_config.get_nested(
+        ('workspaces',), default_value=_MISSING_WORKSPACE_POLICY)
+    if workspaces is _MISSING_WORKSPACE_POLICY:
         workspaces = {}
     if not isinstance(workspaces, dict):
         raise ValueError('SkyPilot workspaces configuration must be an object.')
@@ -90,8 +103,11 @@ def list_workspace_policies() -> dict[str, models.WorkspaceImagePolicy]:
         if not isinstance(workspace, str) or not isinstance(
                 workspace_config, dict):
             raise ValueError('SkyPilot workspace configuration is invalid.')
-        policies[workspace] = parse_workspace_policy(
-            workspace_config.get('container_images'))
+        raw_policy = workspace_config.get('container_images',
+                                          _MISSING_WORKSPACE_POLICY)
+        if raw_policy is _MISSING_WORKSPACE_POLICY:
+            raw_policy = {}
+        policies[workspace] = parse_workspace_policy(raw_policy)
     return policies
 
 

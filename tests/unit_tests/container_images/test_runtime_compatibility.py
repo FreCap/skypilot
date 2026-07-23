@@ -1222,11 +1222,15 @@ def test_final_backend_preserves_exact_ref_on_malformed_policy_collection(
                         'get_active_workspace', lambda: 'research')
 
     def get_nested(path, default_value=None):
-        if tuple(path) == ('workspaces', 'research', 'container_images'):
+        if tuple(path) == ('workspaces',):
             return {
-                'mode': mode.value,
-                'default_profile': selected_profile,
-                'allowed_profiles': None,
+                'research': {
+                    'container_images': {
+                        'mode': mode.value,
+                        'default_profile': selected_profile,
+                        'allowed_profiles': None,
+                    }
+                }
             }
         return default_value
 

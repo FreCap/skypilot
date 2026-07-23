@@ -396,11 +396,15 @@ def test_kubernetes_exact_ref_preserves_direct_on_malformed_policy_collection(
             ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64))
 
     def get_nested(path, default_value=None):
-        if tuple(path) == ('workspaces', 'research', 'container_images'):
+        if tuple(path) == ('workspaces',):
             return {
-                'mode': mode.value,
-                'default_profile': selected_profile,
-                'allowed_profiles': None,
+                'research': {
+                    'container_images': {
+                        'mode': mode.value,
+                        'default_profile': selected_profile,
+                        'allowed_profiles': None,
+                    }
+                }
             }
         return default_value
 

@@ -392,6 +392,12 @@ failure while computing locality: it keeps the executable direct candidate in
 the conservative managed-fallback rank and returns before managed database or
 profile access. These boundaries do not catch provider, database, or arbitrary
 runtime failures.
+An absent workspace `container_images` key alone selects the unchanged default
+policy. The parser distinguishes that absence with a private sentinel; an
+explicit `container_images: null` is malformed and cannot silently become the
+default. The model constructor is independently total over raw snapshots: it
+validates list or tuple shape, size, string members, and uniqueness before any
+`len`, iteration, or hashing that could leak `TypeError`.
 
 The workspace opt-in is explicit configuration, not task YAML:
 
@@ -673,6 +679,13 @@ worker rotates that expired queue row without clearing its child identity so a
 compatible worker or rollback can reclaim it. EC2 canaries set guest-initiated
 shutdown behavior to terminate, not stop. Other operation kinds project their
 publication, location, or profile work and carry no provider lease.
+An EC2 create response confirms a launch only after its one child record yields
+a nonempty string `InstanceId` that is retained in the teardown set. A missing,
+non-string, or otherwise malformed child record leaves the create ambiguous even
+when AWS returned a nominal response. Cleanup must then replay the stable client
+token or run the full repeated tag-absence settling window; one empty discovery
+cannot terminalize the operation. A child that becomes visible during that
+window is added to the retained set and followed through verified termination.
 
 Canary intent creation locks the desired profile row and reserves its conservative
 worst-case cost in a UTC daily window before committing the operation. Concurrent
@@ -2107,6 +2120,9 @@ valid cutoff map and logs a bounded warning instead of terminating eviction,
 lease reconciliation, or compaction. Before the first valid map has loaded,
 retention eviction is disabled for every workspace while the worker continues
 non-destructive reconciliation and retries configuration refresh.
+Explicit `container_images: null` is one such malformed refresh. It cannot be
+interpreted as the eight-week default and cannot replace a prior null retention
+opt-out; only a genuinely absent key produces the default policy.
 
 Worker budgets do not pretend to control calls made by remote container
 runtimes. Node pulls use per-node credential reuse plus bounded exponential
@@ -3367,3 +3383,18 @@ tag to one exact child ID, retains all observed IDs through verified teardown,
 validates workspace policy collection shapes before normalization, and preserves
 the direct fallback through downstream locality ranking. The acceptance streak
 remains zero.
+
+Codex final-acceptance round 1 at
+`8f1d516a7b03b2191f3a94b82b241a1e7a269526` returned `RESHAPE`; Fable again
+could not start because its exact-model request returned HTTP 429 with zero
+tokens. Codex re-proved the immutable head and newest repair paths, then found
+two remaining boundary failures. Explicit `container_images: null` still became
+the default policy and could replace the lifecycle worker's last valid retention
+opt-out, while direct model construction could raise incidental type errors.
+Separately, EC2 launch confirmation preceded child-ID validation, so a malformed
+successful `RunInstances` response could skip the ambiguous-launch settling
+window and strand a paid child during tag-visibility delay. This revision makes
+missing versus explicit-null policy state unambiguous, validates model
+collections before shape-dependent operations, and treats every create without
+a retained concrete instance ID as ambiguous until replay or bounded verified
+absence. The acceptance streak remains zero.

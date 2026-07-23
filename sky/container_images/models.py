@@ -1459,27 +1459,54 @@ class WorkspaceImagePolicy:
     regional_cache_retention_weeks: int | None = 8
 
     def __post_init__(self) -> None:
+        if not isinstance(self.mode, WorkspaceImageMode):
+            raise ValueError('Workspace image mode must be a supported mode.')
+        if (self.default_profile is not None and
+                not isinstance(self.default_profile, str)):
+            raise ValueError(
+                'Workspace default distribution must be a string or null.')
         if self.default_profile is not None:
             validate_control_plane_identifier(self.default_profile,
                                               'Workspace default distribution')
-        if len(self.allowed_profiles) > 128:
+        allowed_profiles = self.allowed_profiles
+        if (not isinstance(allowed_profiles, (list, tuple)) or
+                len(allowed_profiles) > 128 or not all(
+                    isinstance(profile, str) for profile in allowed_profiles)):
             raise ValueError(
-                'Workspace allowed distributions must be at most 128.')
-        for profile in self.allowed_profiles:
+                'Workspace allowed distributions must be a list of at most '
+                '128 strings.')
+        normalized_profiles = tuple(allowed_profiles)
+        if len(set(normalized_profiles)) != len(normalized_profiles):
+            raise ValueError('Workspace allowed distributions must be unique.')
+        for profile in normalized_profiles:
             validate_control_plane_identifier(profile,
                                               'Workspace allowed distribution')
-        if len(set(self.allowed_profiles)) != len(self.allowed_profiles):
-            raise ValueError('Workspace allowed distributions must be unique.')
-        if len(self.publishers) > 256 or len(set(self.publishers)) != len(
-                self.publishers):
+        publishers = self.publishers
+        if (not isinstance(publishers,
+                           (list, tuple)) or len(publishers) > 256 or
+                not all(isinstance(publisher, str)
+                        for publisher in publishers)):
+            raise ValueError('Workspace image publishers must be a list of at '
+                             'most 256 strings.')
+        normalized_publishers = tuple(publishers)
+        if len(set(normalized_publishers)) != len(normalized_publishers):
             raise ValueError(
                 'Workspace image publishers must be unique and at most 256.')
-        for publisher in self.publishers:
-            if (not isinstance(publisher, str) or not publisher or
-                    len(publisher) > 256 or
+        for publisher in normalized_publishers:
+            if (not publisher or len(publisher) > 256 or
                     any(character.isspace() for character in publisher)):
                 raise ValueError('Workspace image publishers must be bounded '
                                  'stable user IDs without whitespace.')
+        if not isinstance(self.locality, Locality):
+            raise ValueError('Workspace image locality must be supported.')
+        retention_weeks = self.regional_cache_retention_weeks
+        if (retention_weeks is not None and
+            (not isinstance(retention_weeks, int) or
+             isinstance(retention_weeks, bool) or retention_weeks <= 0)):
+            raise ValueError('Workspace regional cache retention must be a '
+                             'positive integer or null.')
+        object.__setattr__(self, 'allowed_profiles', normalized_profiles)
+        object.__setattr__(self, 'publishers', normalized_publishers)
 
 
 @dataclasses.dataclass(frozen=True)
