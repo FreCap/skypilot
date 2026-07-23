@@ -113,6 +113,41 @@ class TestProbeRoundBatching(unittest.TestCase):
                 handle=handle,
                 provider_config=provider_config['provider'])
 
+    def test_probe_url_resolution_dedupes_shared_cluster_yaml_reads(self):
+        manager = self._make_manager()
+        del manager._resolve_probe_urls
+        infos = [_replica_info(1, True), _replica_info(2, True)]
+        shared_yaml = '/tmp/shared.yaml'
+        shared_provider = {'provider': {'context': 'shared'}}
+        cluster_records = {}
+        handles = []
+        for info in infos:
+            handle = mock.Mock()
+            handle.cluster_yaml = shared_yaml
+            handles.append(handle)
+            cluster_records[info.cluster_name] = {'handle': handle}
+            info.handle.return_value = handle
+            info._resolve_url.return_value = info.url
+
+        with mock.patch.object(replica_managers.global_user_state,
+                               'get_clusters_from_names',
+                               return_value=cluster_records), mock.patch.object(
+                                   replica_managers.global_user_state,
+                                   'get_cluster_yaml_dict_multiple',
+                                   return_value=[shared_provider]) as get_yamls:
+            urls = manager._resolve_probe_urls(infos)
+
+        self.assertEqual(urls, {
+            1: 'http://10.0.0.1:8080',
+            2: 'http://10.0.0.2:8080',
+        })
+        get_yamls.assert_called_once_with([shared_yaml])
+        for info, handle in zip(infos, handles):
+            info._resolve_url.assert_called_once_with(
+                cluster_record=cluster_records[info.cluster_name],
+                handle=handle,
+                provider_config=shared_provider['provider'])
+
     def test_probe_reuses_supplied_url_without_resolving_again(self):
         info = object.__new__(replica_managers.ReplicaInfo)
         info.replica_id = 7
