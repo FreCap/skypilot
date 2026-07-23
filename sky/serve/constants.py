@@ -4,11 +4,13 @@ CONTROLLER_TEMPLATE = 'sky-serve-controller.yaml.j2'
 
 SKYSERVE_METADATA_DIR = '~/.sky/serve'
 
-# The filelock for selecting service ports when starting a service. Two
+# The filelock for reserving service ports when starting a service. Two
 # requirements:
-#  (1) Same-pod sky.serve.service subprocesses must serialize so they don't
-#      both pick the same just-freed port between their respective
-#      `find_free_port` and the controller subprocess actually `bind()`-ing.
+#  (1) Same-pod sky.serve.service subprocesses briefly serialize socket
+#      reservation and child spawn. The bound socket then owns exclusivity
+#      while controller initialization continues outside the lock. Retaining
+#      the lock also keeps rolling coexistence safe with older processes that
+#      still use a select-then-bind sequence.
 #  (2) The lock must NOT live on a network filesystem. fcntl/flock over NFS
 #      requires a working NLM server (rpc.statd/lockd); many K8s NFS PVC
 #      setups mount with `local_lock=none` and the server has no lockd, so

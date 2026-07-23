@@ -2,11 +2,13 @@
 
 ## Status
 
-Proposed emergency correctness fix after a production recovery loop on
-2026-07-22. This design must receive adversarial review before implementation.
-The fix is intentionally separate from the proposed 40-second/one-veto scaling
-policy. Production remains at 300 seconds and the compatibility default of two
-vetoes while this change is deployed and observed.
+Implementation and verification in progress. The dead-child-only supervision
+contract was implemented after a production recovery loop on 2026-07-22. The
+2026-07-23 extension removes a separate controller-start serialization failure
+without changing the supervision policy. This design remains intentionally
+separate from the proposed 40-second/one-veto scaling policy. Production
+remains at 300 seconds and the compatibility default of two vetoes while these
+changes are deployed and observed.
 
 ## Problem
 
@@ -38,6 +40,16 @@ During this incident, raw demand fell from 71 to 30 and then 1 while the
 retained demand target stayed 356. The 300-second downscale window could not
 complete because supervision kept reconstructing the child. This explains the
 plateau without requiring a stale or wrong load balancer.
+
+A second production failure on 2026-07-23 exposed excessive serialization in
+controller startup. Every service parent selects a local controller port under
+one pod-local file lock. The lock correctly closes the gap between observing a
+free port and the child binding it, but it is currently held while waiting up
+to 420 seconds for the controller to finish reconstruction and start listening.
+One slow `boltz-l4-fleet` recovery held the lock while an OpenDDE controller
+queued behind it; an older OpenDDE recovery then acquired it and repeated the
+same wait. Unrelated `sky serve up` operations could not register even though
+they needed different local ports.
 
 ## Load-balancer authority and target separation
 
@@ -73,6 +85,8 @@ include only latest-version, nonterminal, non-retiring demand-origin capacity:
 - Keep demand restart baseline and reserved fill strictly separate.
 - Expose enough state to distinguish slow recovery, dead child, stale demand,
   and intentional reserved fill.
+- Let independent controller children initialize concurrently without
+  reintroducing a port-selection race.
 
 ## Non-goals
 
@@ -82,6 +96,8 @@ include only latest-version, nonterminal, non-retiring demand-origin capacity:
   scale-up rate.
 - Changing HA load-balancer promotion or Service routing.
 - Changing replica launch or cleanup concurrency.
+- Shortening the 420-second service registration budget.
+- Adding a new public port allocator, database column, or Kubernetes Service.
 
 ## Behavior contract
 
@@ -135,6 +151,49 @@ owner-loss behavior remains unchanged: a stale parent and child exit without
 destructive cleanup. A real child death still creates a new controller session
 and resets process-local autoscaler state.
 
+### Concurrent startup with a reserved socket
+
+Initial startup and dead-child respawn use the same socket-handoff primitive:
+
+```text
+acquire pod-local compatibility lock
+create an IPv4 stream socket
+bind it to the controller host and first available controller port
+spawn the controller child with that bound, non-listening socket
+release the compatibility lock
+wait for child TCP readiness
+CAS-publish the ready owner tuple and port
+close the parent reservation copy
+```
+
+Binding the real socket, rather than selecting and releasing a temporary one,
+keeps the port exclusively reserved while the child reconstructs state. The
+socket is intentionally not put into listening mode in the parent, so the
+existing TCP readiness probe cannot succeed until the child has installed the
+socket into Uvicorn's event loop. The child starts Uvicorn with the inherited
+socket instead of asking Uvicorn to bind the host and port again.
+
+The parent retains its descriptor copy as a reservation lease through the
+readiness check and owner-fenced database publication. Without that lease, a
+child could die between the parent's liveness check and TCP probe, another
+service could reuse the just-freed port, and the first parent could mistake the
+other controller's listener for its own. The retained duplicate prevents reuse
+through the complete decision window. Once the exact owner tuple and port are
+published, the parent closes its copy and the live child becomes the sole
+socket owner. A later child death is handled by the existing supervision path.
+
+A failed `Process.start()` closes the parent reservation before propagating the
+error. A readiness or publication failure closes it in the caller's cleanup
+path; `os._exit` also closes it at the process boundary. Readiness waiting,
+owner publication, and all database work happen after the file lock is
+released.
+
+The file lock remains around reservation and spawn for rolling compatibility.
+An older same-pod starter still holds that lock until its child binds. Once a
+new starter releases it, the new child's bound socket makes the port unavailable
+to old `find_free_port` callers. The socket is node-local and process-owned; it
+adds no central allocator, durable lease, or cross-pod coordination.
+
 ### Demand-only reconstruction
 
 Controller reconstruction restores a conservative demand actuation baseline
@@ -182,8 +241,13 @@ out-of-band heartbeat design. They are not promised by this patch.
 ## Compatibility and rollback
 
 This patch adds no public service field and requires no schema migration. Old
-and new service specs behave the same. A control-plane rollback restores live
-health-timeout replacement, so rollback is unsafe while a large recovery is in
+and new service specs behave the same. Socket transfer uses Python
+`multiprocessing`'s supported socket reduction on spawn platforms and ordinary
+descriptor inheritance on fork platforms. The compatibility lock makes a
+rolling mix with the prior selection implementation safe on the same pod.
+
+A control-plane rollback restores live health-timeout replacement and the
+long-held startup lock, so rollback is unsafe while a large recovery is in
 progress. Verify one healthy child and no replacement attempt before rollback.
 
 The service policy stays at 300 seconds/two vetoes throughout this rollout.
@@ -204,6 +268,24 @@ The 40-second/one-veto canary is a later, separately reviewed service update.
   behavior; absence is not authoritative proof of process death.
 - Simulate join/reap failure for a dead child. Assert fail-closed retry and no
   replacement.
+- Reserve a controller socket. Assert a second bind to its host and port fails,
+  and assert a TCP connection does not succeed until the socket is listening.
+- Start a child through the socket-handoff helper. Assert a failed
+  `Process.start()` closes the parent copy, while success returns a live
+  reservation lease to the caller.
+- Block controller readiness for one service while starting another. Assert the
+  port-selection lock is released before either readiness wait and both
+  services receive distinct reserved ports.
+- Kill a child during readiness, then start another controller. Assert the
+  first parent's retained socket prevents port reuse and no foreign listener
+  can satisfy its readiness/publication path.
+- Assert initial startup and respawn close the parent reservation only after
+  successful owner-fenced port publication, and close it on every ordinary
+  failure path.
+- Run the handoff under both `fork` and `spawn` multiprocessing contexts where
+  the platform supports them.
+- Assert the controller passes the inherited socket to Uvicorn; the legacy
+  no-socket path remains covered for direct controller tests.
 - Set the unrelated LB/degraded-status retry deadline far in the future, then
   transition a concrete child from live to dead. Assert the first dead-child
   observation attempts exactly one immediate replacement. Only a failed
@@ -226,11 +308,10 @@ The 40-second/one-veto canary is a later, separately reviewed service update.
 
 ## Rollout
 
-1. Obtain a Fable `PURSUE` verdict on this exact design.
-2. Implement the smallest dead-child-only and no-overlap change on the latest
-   `origin/improvements` head.
-3. Run focused tests and formatting, then obtain Fable review of the exact
-   tested commit.
+1. Obtain a `PURSUE` verdict on this exact design.
+2. Implement the smallest socket-reservation extension on the latest
+   `origin/improvements` head without changing controller supervision policy.
+3. Run focused tests and formatting, then review the exact tested commit.
 4. Merge only after the full visible GitHub check rollup is green.
 5. Build an immutable control-plane image from the merge commit and deploy with
    Helm `--reuse-values`.

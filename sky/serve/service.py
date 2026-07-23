@@ -6,6 +6,7 @@ controller child; it never starts an in-pod load balancer.
 """
 import argparse
 from collections.abc import Callable
+from collections.abc import Iterator
 import contextlib
 import dataclasses
 import json
@@ -554,10 +555,7 @@ def _wait_for_controller_ready(
     the new pod's IP before its uvicorn binds and get ECONNREFUSED.
 
     If `process` is given, fail as soon as it is no longer alive instead of
-    burning the full timeout: this wait runs while holding the host-global
-    port-selection lock, so a controller child that dies at boot would
-    otherwise hold that lock for the entire timeout on every (5s-cadence)
-    respawn retry, starving other services' boot/recovery on the same host.
+    burning the full timeout and delaying the next recovery attempt.
     """
     # When binding 0.0.0.0, probe via loopback.
     probe_host = '127.0.0.1' if host == '0.0.0.0' else host
@@ -661,10 +659,9 @@ def _bail_on_boot_failure(service_name: str,
             logger.warning(
                 'Failed to kill controller subprocess during boot-failure '
                 'bailout; proceeding with os._exit anyway.')
-    # os._exit() bypasses the outer try/finally; the
-    # PORT_SELECTION_FILE_LOCK_PATH filelock held by the surrounding
-    # `with` block is released by the kernel when our FDs close on
-    # process exit (fcntl advisory lock).
+    # os._exit() bypasses the outer try/finally. The short-lived port lock was
+    # already released after socket transfer; process exit closes the child's
+    # reserved socket if controller startup did not consume it.
     os._exit(1)  # pylint: disable=protected-access
 
 
@@ -677,11 +674,16 @@ def _spawn_controller(
         service_hash: str,
         controller_ip: str | None,
         resource_scope: str | None = None,
-        enforce_launch_fence: bool = False) -> multiprocessing.Process:
+        enforce_launch_fence: bool = False,
+        controller_socket: socket.socket | None = None
+) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
     controller (on a fresh port) if it dies. See `_respawn_controller`.
+
+    If a bound controller socket is supplied, `Process.start()` transfers it to
+    the child. The caller retains the parent copy as a reservation lease.
     """
     owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
         service_hash, os.getpid(), controller_ip, controller_port)
@@ -689,22 +691,69 @@ def _spawn_controller(
         target=controller.run_controller,
         args=(service_name, service_spec, version, controller_host,
               controller_port, owner_fingerprint, resource_scope, service_hash,
-              os.getpid(), controller_ip, enforce_launch_fence))
+              os.getpid(), controller_ip, enforce_launch_fence,
+              controller_socket))
     process.start()
     return process
 
 
-def _select_controller_port(service_name: str) -> int:
-    """Choose a free controller port on this API pod.
+def _reserve_controller_socket(
+        controller_host: str) -> tuple[socket.socket, int]:
+    """Bind and reserve one local controller port without listening.
 
-    The external LB talks to the stable API-service proxy, which resolves the
-    current owner IP and port from the service row for every sync.  Controller
-    ports therefore do not need to be stable, globally allocated, or exposed
-    through a Kubernetes Service.  The caller holds the node-local port lock,
-    which is the only serialization required for a local socket.
+    A bound socket closes the select-then-bind race while still making the
+    readiness probe wait for the child to install the socket into Uvicorn's
+    event loop. The caller owns the returned socket.
     """
-    del service_name
-    return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
+    for controller_port in range(constants.CONTROLLER_PORT_START, 65535):
+        controller_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            controller_socket.bind((controller_host, controller_port))
+        except OSError:
+            controller_socket.close()
+            continue
+        return controller_socket, controller_port
+    raise OSError('No free controller ports are available.')
+
+
+@contextlib.contextmanager
+def _spawn_controller_on_reserved_port(
+    service_name: str,
+    service_spec: 'service_spec_lib.SkyServiceSpec',
+    version: int,
+    controller_host: str,
+    service_hash: str,
+    controller_ip: str | None,
+    resource_scope: str | None = None,
+    enforce_launch_fence: bool = False
+) -> Iterator[tuple[multiprocessing.Process, int]]:
+    """Yield a child while retaining its parent-side socket reservation."""
+    controller_socket = None
+    try:
+        with filelock.FileLock(
+                os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
+            controller_socket, controller_port = _reserve_controller_socket(
+                controller_host)
+            spawn_args = (service_name, service_spec, version, controller_host,
+                          controller_port, service_hash, controller_ip)
+            if resource_scope is None:
+                process = _spawn_controller(
+                    *spawn_args,
+                    enforce_launch_fence=enforce_launch_fence,
+                    controller_socket=controller_socket)
+            else:
+                process = _spawn_controller(
+                    *spawn_args,
+                    resource_scope=resource_scope,
+                    enforce_launch_fence=enforce_launch_fence,
+                    controller_socket=controller_socket)
+        # The lock is released before readiness and owner publication. Keep
+        # the parent duplicate open so child death cannot free and cross-wire
+        # the port during that decision window.
+        yield process, controller_port
+    finally:
+        if controller_socket is not None:
+            controller_socket.close()
 
 
 def _kill_process(process: multiprocessing.Process | None) -> None:
@@ -995,22 +1044,19 @@ def _respawn_controller(
 
     new_controller = None
     try:
-        with filelock.FileLock(
-                os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            controller_port = _select_controller_port(service_name)
-            spawn_args = (service_name, service_spec, version, controller_host,
-                          controller_port, service_hash, controller_ip)
-            if resource_scope is None:
-                new_controller = _spawn_controller(
-                    *spawn_args, enforce_launch_fence=enforce_launch_fence)
-            else:
-                new_controller = _spawn_controller(
-                    *spawn_args,
-                    resource_scope=resource_scope,
-                    enforce_launch_fence=enforce_launch_fence)
-            # `process=` fails this wait fast if the replacement dies at boot,
-            # instead of holding the port-selection lock for the full timeout
-            # on every retry of a crash-looping controller.
+        with _spawn_controller_on_reserved_port(
+                service_name,
+                service_spec,
+                version,
+                controller_host,
+                service_hash,
+                controller_ip,
+                resource_scope=resource_scope,
+                enforce_launch_fence=enforce_launch_fence) as (new_controller,
+                                                               controller_port):
+            # The parent reservation remains open while we wait outside the
+            # host-global lock, so child death cannot let another service
+            # reuse this port before publication finishes.
             _wait_for_controller_ready(
                 controller_host,
                 controller_port,
@@ -1589,67 +1635,51 @@ def _start(service_name: str,
     # the finally returns (None, None, None) for the caught path.
     shutdown_via_user_signal = False
     try:
-        with filelock.FileLock(
-                os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            # Pick a fresh free port on this pod. The stable API-service proxy
-            # resolves the current owner tuple from DB, so the port itself is
-            # deliberately ephemeral and never exposed by a Kubernetes
-            # Service.
-            controller_port = _select_controller_port(service_name)
 
-            def _get_controller_host():
-                """Get the controller host address.
-                We expose the controller to the public network when running
-                inside a kubernetes cluster to allow external load balancers
-                (example, for high availability load balancers) to communicate
-                with the controller.
-                """
-                if 'KUBERNETES_SERVICE_HOST' in os.environ:
-                    return '0.0.0.0'
-                # Not using localhost to avoid using ipv6 address and causing
-                # the following error:
-                # ERROR:    [Errno 99] error while attempting to bind on address
-                # ('::1', 20001, 0, 0): cannot assign requested address
-                return '127.0.0.1'
+        def _get_controller_host():
+            """Get the controller host address.
+            We expose the controller to the public network when running
+            inside a kubernetes cluster to allow external load balancers
+            (example, for high availability load balancers) to communicate
+            with the controller.
+            """
+            if 'KUBERNETES_SERVICE_HOST' in os.environ:
+                return '0.0.0.0'
+            # Not using localhost to avoid using ipv6 address and causing
+            # the following error:
+            # ERROR:    [Errno 99] error while attempting to bind on address
+            # ('::1', 20001, 0, 0): cannot assign requested address
+            return '127.0.0.1'
 
-            controller_host = _get_controller_host()
-            controller_process = _spawn_controller(service_name, service_spec,
-                                                   version, controller_host,
-                                                   controller_port,
-                                                   service_incarnation, pod_ip,
-                                                   resource_scope,
-                                                   enforce_launch_fence)
+        controller_host = _get_controller_host()
+        with _spawn_controller_on_reserved_port(
+                service_name, service_spec, version, controller_host,
+                service_incarnation, pod_ip, resource_scope,
+                enforce_launch_fence) as (controller_process, controller_port):
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
 
-            # NOTE: do NOT write controller_port to DB before the subprocess
-            # actually binds. If the spawn races with another service for
-            # the same port and our subprocess fails to bind, we don't want
-            # DB to advertise an unbound port to clients. Move the DB write
-            # to after `_wait_for_controller_ready` succeeds (below).
-
-            # Wait for the uvicorn server inside the controller subprocess to
-            # be listening before we (potentially) flip DB to point at us.
-            # Recovery preclaim already made the proxy fail closed by clearing
-            # the port. This publication moves it atomically from unavailable
-            # to our ready controller; fresh up moves from an unpublished row
-            # to the same ready tuple.
+            # The parent duplicate reserves `controller_port`, so independent
+            # services can select other ports while this controller
+            # reconstructs. Do not publish until Uvicorn is listening.
             try:
                 _wait_for_controller_ready(
                     controller_host,
                     controller_port,
                     timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS,
                     process=controller_process)
+                if not controller_process.is_alive():
+                    raise RuntimeError(
+                        'controller exited during startup publication')
             except RuntimeError as boot_err:
-                # Bail without falling through to the outer try/finally,
-                # which would enter destructive cleanup and possibly remove
-                # the service incarnation. See helper for details.
+                # Bail without falling through to the outer try/finally, which
+                # would enter destructive cleanup and possibly remove the
+                # service incarnation. See helper for details.
                 _bail_on_boot_failure(
                     service_name, controller_process,
                     constants.SERVICE_REGISTER_TIMEOUT_SECONDS, boot_err)
 
-            # Now we know the subprocess is bound on `controller_port`.
             # Publish the complete owner tuple only if the exact row inserted
             # or preclaimed above still belongs to this process. This protects
             # both recovery and fresh-up from a purge + same-name re-up during
@@ -1658,25 +1688,23 @@ def _start(service_name: str,
                          f'controller_ip -> {pod_ip}, controller_port -> '
                          f'{controller_port}, service_hash -> '
                          f'{service_incarnation}')
-            published = serve_state.update_service_controller_pid_ip_and_port(
+            published = (serve_state.update_service_controller_pid_ip_and_port(
                 service_name,
                 controller_pid=os.getpid(),
                 controller_ip=pod_ip,
                 controller_port=controller_port,
                 expected_service_hash=service_incarnation,
                 expected_controller_pid=os.getpid(),
-                expected_controller_ip=pod_ip)
+                expected_controller_ip=pod_ip))
             _exit_on_ownership_loss(published, service_name,
                                     'publishing the ready controller',
                                     controller_process)
 
-            # Keep the historical load_balancer_port field as the registration
-            # sentinel/API compatibility value. Real services expose this
-            # fixed port on their per-service Kubernetes Service; pools have
-            # no endpoint but still need a non-null registration sentinel.
-            # Nothing binds an in-pod LB port anymore, so probing for a free
-            # local port (or restoring one from an old row) is meaningless.
-            load_balancer_port = constants.LOAD_BALANCER_PORT_START
+        # Keep the historical load_balancer_port field as the registration
+        # sentinel/API compatibility value. Real services expose this fixed
+        # port on their per-service Kubernetes Service; pools have no endpoint
+        # but still need a non-null registration sentinel.
+        load_balancer_port = constants.LOAD_BALANCER_PORT_START
 
         # In external load balancer mode, ensure the controller-owned per-
         # service LB Deployment + Service exist BEFORE the load_balancer_port
@@ -1685,9 +1713,8 @@ def _start(service_name: str,
         # `sky serve up` report the endpoint before the LB Service exists.
         # Creating the LB objects first closes that window. Idempotent (409 ==
         # already exists), so it is safe on the recovery path too. No-op outside
-        # external-LB + in-cluster mode. Done outside the port-selection
-        # filelock to avoid holding a host-global lock across k8s API calls;
-        # controller owner tuple is already recorded in DB.
+        # external-LB + in-cluster mode. The controller owner tuple is already
+        # recorded in DB.
         if external_lb:
             try:
 
