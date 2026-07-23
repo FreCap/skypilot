@@ -567,3 +567,31 @@ def test_capacity_cache_account_scopes_by_project_without_the_email():
                                            ['someone@example.com']) is None
     assert backend._capacity_cache_account(clouds.GCP(), None) is None
     assert backend._capacity_cache_account(clouds.Azure(), ['x']) is None
+
+
+def test_gcp_touches_no_cache_entry_point_when_flag_is_off(monkeypatch):
+    """With the flag off, GCP must not read or write the cache at all."""
+    _enable_gcp_cache(monkeypatch, enabled=False)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError('cache must not be touched when the flag is off')
+
+    for name in ('mark_exhausted', 'active_exhausted_keys', 'clear',
+                 'mark_quota_failure', 'is_quota_cooldown_active',
+                 'clear_quota_cooldown'):
+        monkeypatch.setattr(capacity_cache, name, _boom)
+
+    region = clouds.Region('asia-northeast3')
+    zones = [clouds.Zone('asia-northeast3-b')]
+    to_provision = _gcp_provision(accelerators={'L4': 1})
+
+    assert backend._capacity_cache_key(to_provision, region, zones, 1,
+                                       'proj') is None
+    quota_key = backend._quota_cooldown_key(to_provision, region, 1, 'proj')
+    assert quota_key is None
+    # The consult helpers must short-circuit on the absent key rather than
+    # reaching the cache.
+    assert backend._capacity_cache_exhausted_zone_names(to_provision, region,
+                                                        zones, 1,
+                                                        'proj') == set()
+    assert not backend._quota_cooldown_is_active(quota_key)
