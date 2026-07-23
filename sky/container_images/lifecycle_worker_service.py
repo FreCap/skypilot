@@ -747,10 +747,14 @@ class LifecycleWorkerService:
                         len(futures) < self.max_in_flight):
                     if self._stop.is_set():
                         break
-                    qualification_future = executor.submit(
+                    qualification_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
                         reconcile_qualification_lifecycle,
                         self._budget_limiter,
                         should_stop=self._stop.is_set)
+                    if qualification_future is None:
+                        break
                     futures.add(qualification_future)
                     last_qualification_reconciliation = schedule_now
                 if self._stop.is_set():
@@ -761,10 +765,14 @@ class LifecycleWorkerService:
                         len(futures) < self.max_in_flight):
                     if self._stop.is_set():
                         break
-                    canonical_future = executor.submit(
+                    canonical_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
                         reconcile_failed_canonical_reservations,
                         self._budget_limiter,
                         should_stop=self._stop.is_set)
+                    if canonical_future is None:
+                        break
                     futures.add(canonical_future)
                     last_canonical_reconciliation = schedule_now
                 if self._stop.is_set():
@@ -791,11 +799,16 @@ class LifecycleWorkerService:
                         break
                     if self._stop.is_set():
                         break
-                    futures.add(
-                        executor.submit(evict_location,
-                                        claim,
-                                        self._budget_limiter,
-                                        lease_seconds=self.lease_seconds))
+                    submitted_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
+                        evict_location,
+                        claim,
+                        self._budget_limiter,
+                        lease_seconds=self.lease_seconds)
+                    if submitted_future is None:
+                        break
+                    futures.add(submitted_future)
                 self._stop.wait(1 if futures else 5)
 
 

@@ -1176,10 +1176,14 @@ class CopyWorkerService:
                         len(futures) < self.max_in_flight):
                     if self._stop.is_set():
                         break
-                    qualification_future = executor.submit(
+                    qualification_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
                         _qualification_maintenance,
                         self._budget_limiter,
                         should_stop=self._stop.is_set)
+                    if qualification_future is None:
+                        break
                     futures.add(qualification_future)
                     last_qualification_refresh = schedule_now
                 while len(futures
@@ -1191,22 +1195,31 @@ class CopyWorkerService:
                         break
                     kind, record = claim
                     if kind == 'publication':
-                        futures.add(
-                            executor.submit(inspect_publication,
-                                            record,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            inspect_publication,
+                            record,
+                            lease_seconds=self.lease_seconds)
                     elif kind == 'location':
-                        futures.add(
-                            executor.submit(copy_location,
-                                            record,
-                                            limiter=self._budget_limiter,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            copy_location,
+                            record,
+                            limiter=self._budget_limiter,
+                            lease_seconds=self.lease_seconds)
                     else:
-                        futures.add(
-                            executor.submit(reconcile_inventory,
-                                            record,
-                                            limiter=self._budget_limiter,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            reconcile_inventory,
+                            record,
+                            limiter=self._budget_limiter,
+                            lease_seconds=self.lease_seconds)
+                    if submitted_future is None:
+                        break
+                    futures.add(submitted_future)
                 self._stop.wait(1 if futures else 5)
 
 

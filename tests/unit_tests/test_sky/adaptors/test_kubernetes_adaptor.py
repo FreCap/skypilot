@@ -285,6 +285,29 @@ def test_bounded_core_api_exec_credential_has_no_transparent_refresh(
         core.api_client.close()
 
 
+def test_bounded_in_cluster_core_api_schedules_explicit_token_rotation(
+        monkeypatch):
+    configuration = SimpleNamespace(refresh_api_key_hook=object())
+    api_client = SimpleNamespace(configuration=configuration)
+    core = SimpleNamespace(api_client=api_client)
+    fences = []
+    monkeypatch.setattr(kubernetes, '_get_api_client',
+                        lambda _context: api_client)
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        lambda api_client: core)
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: 100.0)
+
+    result, expires_at = kubernetes._bounded_core_api(
+        kubernetes.in_cluster_context_name(),
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: fences.append('fence'))
+
+    assert result is core
+    assert configuration.refresh_api_key_hook is None
+    assert expires_at == 160.0
+    assert fences == ['fence', 'fence']
+
+
 def test_bounded_core_api_terminates_timed_out_exec_credential(
         monkeypatch, tmp_path):
     path = _write_exec_kubeconfig(tmp_path, 'import time; time.sleep(60)')
@@ -300,6 +323,81 @@ def test_bounded_core_api_terminates_timed_out_exec_credential(
             provider_fence=lambda: None)
 
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(os.name == 'nt',
+                    reason='POSIX process-group descendant regression')
+def test_bounded_core_api_terminates_timed_out_exec_credential_group(
+        monkeypatch, tmp_path):
+    parent_pid = tmp_path / 'parent-pid'
+    child_started = tmp_path / 'child-started'
+    child_survived = tmp_path / 'child-survived'
+    child_script = (
+        'import pathlib,time; time.sleep(0.5); '
+        f'pathlib.Path({str(child_survived)!r}).write_text("survived")')
+    parent_script = (
+        'import os,pathlib,subprocess,sys,time; '
+        f'p=subprocess.Popen([sys.executable,"-c",{child_script!r}]); '
+        f'pathlib.Path({str(parent_pid)!r}).write_text(str(os.getpid())); '
+        f'pathlib.Path({str(child_started)!r}).write_text(str(p.pid)); '
+        'time.sleep(60)')
+    path = _write_exec_kubeconfig(tmp_path, parent_script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception, match='bounded timeout'):
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=0.2,
+                                     provider_fence=lambda: None)
+
+    assert parent_pid.exists()
+    assert child_started.exists()
+    with pytest.raises(ChildProcessError):
+        os.waitpid(int(parent_pid.read_text()), os.WNOHANG)
+    time.sleep(0.6)
+    assert not child_survived.exists()
+
+
+@pytest.mark.parametrize(
+    ('stream', 'message'),
+    ((1, 'response exceeds 1 MiB'), (2, 'diagnostics exceed 1 MiB')),
+    ids=('stdout', 'stderr'))
+def test_bounded_core_api_stops_exec_credential_output_flood(
+        monkeypatch, tmp_path, stream, message):
+    script = (f'import os,time; os.write({stream}, '
+              f'b"x" * {kubernetes._MAX_EXEC_CREDENTIAL_OUTPUT_BYTES + 1}); '
+              'time.sleep(60)')
+    path = _write_exec_kubeconfig(tmp_path, script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    started = time.monotonic()
+
+    with pytest.raises(config_exception, match=message):
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=5,
+                                     provider_fence=lambda: None)
+
+    assert time.monotonic() - started < 2
+
+
+def test_bounded_core_api_does_not_reflect_exec_credential_stderr(
+        monkeypatch, tmp_path):
+    path = _write_exec_kubeconfig(
+        tmp_path,
+        'import sys; sys.stderr.write("credential=secret"); sys.exit(7)')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    assert str(exc_info.value) == 'exec: process returned 7'
+    assert 'credential=secret' not in str(exc_info.value)
 
 
 def test_provider_fenced_core_refresh_observes_new_stop_before_raw_call(

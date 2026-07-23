@@ -1149,10 +1149,15 @@ and rendered message before accepting it. Remaining forward-version attributes
 are restored after construction, so an older client preserves the known
 exception type when a newer server adds an ordinary attribute. An attribute that
 is read-only, slotted, or otherwise unsettable is skipped without replacing the
-original error. Dunder attributes are never constructor arguments. Valid Python
-3.11 exception notes are emitted outside the attribute map for old-client
-compatibility, while the decoder also accepts the legacy attribute form and
-restores notes only after construction. The real `BaseException.__context__`
+original error. `args` is reserved wire state and is never admissible inside the
+ordinary attribute map; a contradictory duplicate is malformed rather than
+being allowed to replace the constructed exception's message. Dunder attributes
+are never constructor arguments. Valid Python 3.11 exception notes are emitted
+outside the attribute map for old-client compatibility, while the decoder also
+accepts the legacy attribute form and restores notes only after construction. A
+forward attribute that shadows `add_note` is dropped and cannot be invoked;
+notes fall back to the validated `__notes__` slot so malformed input never
+raises a secondary exception. The real `BaseException.__context__`
 slot is a separate optional envelope field rather than an ordinary attribute.
 Context serialization applies the same safe-exception wrapping and canonical
 decoder rules recursively, stops at eight levels, and replaces a cycle,
@@ -1717,9 +1722,11 @@ after all observed children are verified terminated.
 
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
 before any child launch. It is a conservative operator-set ceiling for one run,
-not an observed bill. `canary_timeout_seconds` bounds launch, pull, observation,
-and teardown. Once that deadline passes, an exact live owner may only discover
-and tear down the already-persisted deterministic child and record
+not an observed bill. `canary_timeout_seconds` bounds ordinary launch, pull, and
+observation. Mandatory custody teardown has the separate absolute EC2 or EKS
+cleanup budget below, so an ordinary timeout cannot prevent child removal. Once
+the ordinary deadline passes, an exact live owner may only discover and tear
+down the already-persisted deterministic child and record
 `CANARY_TIMEOUT` after verified teardown; an unverified teardown remains
 reclaimable work. It cannot attach a new child, publish success, or perform
 another launch. V0 supports only `linux/amd64`;
@@ -2218,7 +2225,15 @@ of every destructive provider call.
 
 Shutdown is a no-new-work fence. Every worker rechecks its process stop event
 after heartbeat or configuration work and immediately before each maintenance
-call, queue claim, and executor submission. Copy checks before and after every
+call, queue claim, and executor submission. Copy and lifecycle route every
+executor submission through one shared stop-aware admission helper. The helper
+submits only an entry wrapper, whose single stop-event read is the admission
+linearization point. If shutdown wins that read, the wrapper returns before
+invoking the task, so no database or provider boundary starts and the durable
+claim remains safely lease-recoverable. If the wrapper wins, the operation was
+admitted before shutdown and is treated as already in flight. This closes a
+signal arriving after the caller's final check or inside `Executor.submit`
+without holding a lock across provider work. Copy checks before and after every
 independently blocking inventory, publication, and location claim; it cannot
 begin a later claim after an earlier claim observes shutdown. It also checks
 between configuration reload and qualification-manifest ingestion, and the
@@ -2262,18 +2277,30 @@ token. The replacement worker can reclaim it immediately without waiting for the
 normal 15-minute lease. A failed release remains safe and falls back to ordinary
 lease-expiry recovery.
 
-EC2 teardown uses one absolute 300-second deadline. It checks that deadline
-immediately before and after every preliminary discovery, tag discovery,
-termination, and exact-state provider call. The shared deadline is passed into
-the provider wrapper. That wrapper proves the lease first, rechecks the deadline
-after any blocking heartbeat database round trip, and only then invokes the raw
-SDK call. A call that crosses the deadline makes cleanup unverified and no later
-provider call starts. EKS cleanup applies the same call-start ordering to its own
-bounded delete/read settling deadline. Its canary-specific Kubernetes client
-executes kubeconfig `exec` credentials with a 15-second subprocess timeout,
-terminates a timed-out command, and removes transparent library-side exec
-refresh from the raw API call path. The wrapper caches the resulting credential
-only until its declared expiry or the configured kubeconfig refresh interval.
+EC2 teardown uses one absolute 300-second deadline. It establishes that deadline
+before acquiring a fresh cleanup-only EC2 client and never reuses the ordinary
+runtime client, whose fixed one-hour assumed credentials may expire at the
+allowed 3,600-second runtime limit. Ambient credential materialization, STS role
+assumption, and service-client creation all receive the same lease and cleanup
+deadline fence. Teardown checks that deadline immediately before and after every
+preliminary discovery, tag discovery, termination, and exact-state provider
+call. The shared deadline is passed into the provider wrapper. That wrapper
+proves the lease first, rechecks the deadline after any blocking heartbeat
+database round trip, and only then invokes the raw SDK call. A call that crosses
+the deadline makes cleanup unverified and no later provider call starts. EKS
+cleanup applies the same call-start ordering to its own bounded delete/read
+settling deadline. Its canary-specific Kubernetes client executes kubeconfig
+`exec` credentials with a 15-second subprocess timeout in an isolated process
+group. Concurrent bounded readers retain at most 1 MiB each from stdout and
+stderr; either overflow terminates the complete group. Timeout and overflow use
+bounded terminate-then-kill waits, always reap the direct child, and never copy
+plugin stderr into an exception. A descendant that inherited a pipe therefore
+cannot extend the credential budget or leak a diagnostic secret. Transparent
+library-side refresh is removed from the raw API call path. The wrapper caches a
+kubeconfig credential only until its declared expiry or the configured
+kubeconfig refresh interval. In-cluster projected service-account credentials
+have no exposed token expiry, so the wrapper explicitly rebuilds that client on
+the Kubernetes library's one-minute token-refresh cadence under the same fence.
 Every refresh receives the current ordinary drain fence or cleanup deadline,
 rechecks that fence after credential acquisition, and only then invokes the raw
 Kubernetes method. Cleanup establishes its one 60-second deadline before any
@@ -2717,7 +2744,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   workers proving that shutdown begins no later maintenance, internal copy
   claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
   transaction, terminal-consumer query or transaction, qualification item, or
-  executor submission; per-target copy and per-shard qualification tests prove
+  executor submission; stop-aware admission tests set shutdown inside the
+  submission boundary after the caller's final check and prove the entry wrapper
+  never invokes the claimed task; per-target copy and per-shard qualification
+  tests prove
   stop after a provider proof cannot start the next database transaction or
   shard, the source reader receives the live predicate, transfer cancellation
   observes it without a snapshot, and lifecycle stop after a concluded delete
@@ -2728,18 +2758,22 @@ drained and every image table is empty; it is never part of Helm rollback.
   failure when shutdown arrives during verified cleanup; slow-provider tests
   proving EC2 settling passes one absolute deadline through the real fenced
   client, rechecks it after a heartbeat that crosses the deadline, treats an
-  over-budget result as unverified, and cannot start that or any later provider
-  call after its 300-second wall-clock budget;
+  over-budget result as unverified, cannot start that or any later provider call
+  after its 300-second wall-clock budget, and acquires fresh cleanup credentials
+  under that deadline instead of reusing a one-hour runtime session;
   PostgreSQL tests proving a verified drain is immediately reclaimable while a
   stale token cannot release its successor; plus Helm rendering and schema tests
   enforcing the canary's 600-second minimum custody-cleanup grace and legacy
   `--reuse-values` defaults of 30/30/600;
 - real deferred-IRSA credential-provider tests proving its nested unsigned STS
   client inherits 10/60/one-attempt defaults without making a network request;
-  real kubeconfig exec tests proving bounded success, hard timeout and process
-  termination, no transparent API-client refresh hook, ordinary refresh stopped
-  before a raw call, cleanup refresh stopped at the shared deadline, and
-  persisted-child drain entering cleanup-only before ordinary auth acquisition;
+  real kubeconfig exec tests proving bounded success, whole-process-group
+  termination when a descendant inherits a pipe, early stdout and stderr flood
+  rejection, value-free stderr failures, direct-child reaping, no transparent
+  API-client refresh hook, explicit in-cluster projected-token rotation,
+  ordinary refresh stopped before a raw call, cleanup refresh stopped at the
+  shared deadline, and persisted-child drain entering cleanup-only before
+  ordinary auth acquisition;
 - worker-clock skew and blocking-lock tests proving that copy and eviction
   claims, provider grants and throttles, retry delays, consumer terminal
   confirmation, unattached-cluster retention, worker cleanup, and terminal
@@ -2833,8 +2867,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - exception-envelope tests proving unknown and known non-exception types share
   one value-free sanitized result, forward-version ordinary attributes preserve
   a known SkyPilot exception type, unsettable attributes cannot replace the
-  original error, and every currently defined SkyPilot exception class has an
-  exact serialize/deserialize round trip for type, arguments, message, notes,
+  original error, a duplicate `attributes.args` cannot replace canonical wire
+  state, a shadowed `add_note` cannot raise or reflect its value, and every
+  currently defined SkyPilot exception class has an exact serialize/deserialize
+  round trip for type, arguments, message, notes,
   restorable ordinary state, and the real raised-inside-except context slot;
   unsafe nested types use the safe wrapper, while cycles, malformed nested
   envelopes, and chains beyond eight levels end in the fixed sanitized error;
@@ -3705,3 +3741,20 @@ transparent refresh were outside EKS drain and cleanup fences; the real
 silently treated explicit zero as an omitted canary grace. This revision closes
 those boundaries together with one bounded credential design rather than adding
 caller-only checks. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`9f722c8ecd2f7e06cb1775dc2e84c211d944b6ab` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request returned HTTP 429 before using any
+token, so no paired acceptance was recorded. Codex independently confirmed the
+complete 26-check GitHub rollup and prior five-boundary repair, then reproduced
+two P1 gaps: a kubeconfig exec descendant could retain a pipe beyond the nominal
+timeout while unbounded stdout or stderr exhausted memory, and copy or lifecycle
+could submit a claimed operation when shutdown arrived after the caller's final
+check. The adjacent exact-tree audit found that in-cluster projected tokens lost
+rotation when transparent refresh was removed, EC2 cleanup could reuse an
+expired one-hour runtime session, and malformed exception attributes could
+replace canonical `args` or crash a shadowed `add_note` call. This revision
+defines one stop-aware executor admission point, bounded process-group exec,
+explicit in-cluster rotation, fresh deadline-fenced cleanup credentials, and a
+total canonical exception boundary as one repair batch. The acceptance streak
+remains zero.

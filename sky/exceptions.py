@@ -289,7 +289,8 @@ def _deserialize_exception(serialized: Any, *, depth: int,
         return RuntimeError(_MALFORMED_SERVER_ERROR)
     raw_attributes = serialized.get('attributes', {})
     if (not isinstance(raw_attributes, dict) or
-            not all(isinstance(key, str) for key in raw_attributes)):
+            not all(isinstance(key, str) for key in raw_attributes) or
+            'args' in raw_attributes):
         return RuntimeError(_MALFORMED_SERVER_ERROR)
     if hasattr(builtins, exception_type):
         exception_class = getattr(builtins, exception_type)
@@ -302,6 +303,9 @@ def _deserialize_exception(serialized: Any, *, depth: int,
             not issubclass(exception_class, BaseException)):
         return RuntimeError(_MALFORMED_SERVER_ERROR)
     attributes = dict(raw_attributes)
+    # `add_note` is an exception API, not ordinary forward-version state. Drop
+    # an attempted shadow before note restoration can invoke untrusted data.
+    attributes.pop('add_note', None)
     legacy_notes = attributes.pop('__notes__', None)
     # Dunder entries are never constructor arguments, for a built-in or a
     # SkyPilot exception alike. Restore them independently after construction.
@@ -342,11 +346,14 @@ def _deserialize_exception(serialized: Any, *, depth: int,
     if (isinstance(notes, list) and
             all(isinstance(note, str) for note in notes)):
         add_note = getattr(e, 'add_note', None)
-        if add_note is None:
+        if not callable(add_note):
             _restore_exception_attributes(e, {'__notes__': list(notes)})
         else:
-            for note in notes:
-                add_note(note)
+            try:
+                for note in notes:
+                    add_note(note)
+            except Exception:  # pylint: disable=broad-exception-caught
+                _restore_exception_attributes(e, {'__notes__': list(notes)})
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         _restore_exception_attributes(e, {'stacktrace': stacktrace})

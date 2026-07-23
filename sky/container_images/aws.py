@@ -785,13 +785,13 @@ def assumed_client(
         aws_secret_access_key=credentials['SecretAccessKey'],
         aws_session_token=credentials['SessionToken'],
         region_name=region)
-    return cast(Any, session).client(
+    return fenced_provider_call(lambda: cast(Any, session).client(
         service,
         region_name=region,
         config=aws_adaptor.botocore.config.Config(
             connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
             read_timeout=_AWS_READ_TIMEOUT_SECONDS,
-            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS}))
+            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS})))
 
 
 def _assumed_ecr_client(

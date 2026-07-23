@@ -288,6 +288,38 @@ def test_deserialize_malformed_envelope_never_raises(bad_input):
     assert str(restored) == 'Server error response is malformed.'
 
 
+def test_exception_attribute_cannot_replace_canonical_args():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'safe',
+        'args': ('safe',),
+        'attributes': {
+            'args': ('credential=secret',),
+        },
+    })
+
+    assert type(restored) is RuntimeError
+    assert str(restored) == 'Server error response is malformed.'
+    assert 'credential=secret' not in str(restored)
+
+
+def test_exception_attribute_cannot_shadow_add_note():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'safe',
+        'args': ('safe',),
+        'attributes': {
+            'add_note': 'credential=secret',
+        },
+        'notes': ['validated note'],
+    })
+
+    assert type(restored) is ValueError
+    assert str(restored) == 'safe'
+    assert restored.__notes__ == ['validated note']
+    assert callable(restored.add_note)
+
+
 def test_wrap_unsafe_exceptions():
     """Test that non-safe exceptions are wrapped properly."""
 

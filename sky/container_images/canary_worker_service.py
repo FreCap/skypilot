@@ -190,17 +190,20 @@ def _cleanup_provider_call(client: Any, method_name: str, deadline: float,
     return getattr(client, method_name)(*args, **kwargs)
 
 
-def _assumed_client(
-        role: aws.AwsRoleBinding,
-        service: str,
-        region: str,
-        heartbeat: worker_lease.LeaseHeartbeat,
-        *,
-        drain_event: threading.Event | None = None) -> _FencedClient:
+def _assumed_client(role: aws.AwsRoleBinding,
+                    service: str,
+                    region: str,
+                    heartbeat: worker_lease.LeaseHeartbeat,
+                    *,
+                    drain_event: threading.Event | None = None,
+                    cleanup_deadline: float | None = None) -> _FencedClient:
 
     def provider_fence() -> None:
         heartbeat.assert_owned()
         _raise_if_draining(drain_event)
+        if (cleanup_deadline is not None and
+                time.monotonic() >= cleanup_deadline):
+            raise _CanaryCleanupDeadlineExceeded()
 
     provider_fence()
     try:
@@ -639,8 +642,7 @@ def _run_ec2_canary(
         launch_attempted = True
 
     try:
-        if not persisted_child:
-            _raise_if_draining(drain_event)
+        _raise_if_draining(drain_event)
         ec2 = _assumed_client(
             role,
             'ec2',
@@ -806,16 +808,21 @@ def _run_ec2_canary(
         try:
             if (not persisted_child and not launch_attempted and not instances):
                 teardown_verified = True
-            elif ec2 is None:
-                heartbeat.assert_owned()
-                raise RuntimeError('EC2 canary teardown authority unavailable.')
             else:
                 cleanup_deadline = (time.monotonic() + _EC2_TEARDOWN_SECONDS)
                 if time.monotonic() >= cleanup_deadline:
                     teardown_verified = False
                 else:
+                    cleanup_ec2 = _assumed_client(
+                        role,
+                        'ec2',
+                        target.region,
+                        heartbeat,
+                        cleanup_deadline=cleanup_deadline)
                     live_instances = _tagged_instances(
-                        ec2, operation.id, cleanup_deadline=cleanup_deadline)
+                        cleanup_ec2,
+                        operation.id,
+                        cleanup_deadline=cleanup_deadline)
                     if time.monotonic() >= cleanup_deadline:
                         teardown_verified = False
                     else:
@@ -823,7 +830,7 @@ def _run_ec2_canary(
                             _remember_instance_ids(live_instances,
                                                    known_instance_ids))
                         teardown_verified = _terminate_ec2_instances(
-                            ec2,
+                            cleanup_ec2,
                             operation.id,
                             sorted(known_instance_ids),
                             settle_absence=(persisted_child or (

@@ -715,10 +715,16 @@ def test_ec2_drain_of_persisted_child_runs_uncancelled_teardown(
     drain_event.set()
     heartbeat = _OwnedHeartbeat()
     ec2 = mock.Mock()
+    acquisitions = []
     tagged_instances = mock.Mock(return_value=[])
     terminate = mock.Mock(return_value=True)
+
+    def assumed_client(*_args, **kwargs):
+        acquisitions.append(kwargs)
+        return ec2
+
     monkeypatch.setattr(canary_worker_service, '_assumed_client',
-                        lambda *_args, **_kwargs: ec2)
+                        assumed_client)
     monkeypatch.setattr(canary_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
     monkeypatch.setattr(canary_worker_service.qualification,
@@ -742,6 +748,10 @@ def test_ec2_drain_of_persisted_child_runs_uncancelled_teardown(
             drain_event=drain_event)
 
     ec2.run_instances.assert_not_called()
+    assert len(acquisitions) == 1
+    assert acquisitions[0]['cleanup_deadline'] == (
+        tagged_instances.call_args.kwargs['cleanup_deadline'])
+    assert 'drain_event' not in acquisitions[0]
     tagged_instances.assert_called_once()
     assert tagged_instances.call_args.args == (ec2, operation.id)
     assert isinstance(tagged_instances.call_args.kwargs['cleanup_deadline'],
@@ -1275,6 +1285,32 @@ def test_canary_client_acquisition_rechecks_drain_inside_provider_fence(
     raw_started.assert_not_called()
 
 
+def test_canary_cleanup_client_acquisition_rechecks_shared_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [99.0]
+    raw_started = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        current[0] = 100.0
+        provider_fence()
+        raw_started()
+        return mock.sentinel.client
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryCleanupDeadlineExceeded):
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              cleanup_deadline=100.0)
+
+    raw_started.assert_not_called()
+
+
 @pytest.mark.parametrize('method_name',
                          ['run_instances', 'create_namespaced_pod'])
 def test_canary_create_rechecks_deadline_after_ownership_renewal(
@@ -1544,12 +1580,14 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         }
     }
     provider_fences: list[object] = []
+    acquired_services: list[str] = []
 
     def assumed_client(_role: object,
                        service: str,
                        _region: str,
                        *,
                        provider_fence: object = None) -> object:
+        acquired_services.append(service)
         provider_fences.append(provider_fence)
         return ec2 if service == 'ec2' else iam
 
@@ -1600,7 +1638,8 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotCatalog': 'catalog',
             'SkyPilotProfile': profile.name,
         }
-    assert len(provider_fences) == 2
+    assert acquired_services == ['ec2', 'iam', 'ec2']
+    assert len(provider_fences) == 3
     assert all(callable(fence) for fence in provider_fences)
 
 
@@ -4174,6 +4213,88 @@ def test_lifecycle_worker_stop_during_claim_prevents_submission(
                                   workspace_retention_seconds={},
                                   lease_seconds=service.lease_seconds)
     executor.submit.assert_not_called()
+
+
+def test_copy_worker_stop_inside_submission_gate_never_invokes_claimed_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    target = mock.Mock(return_value=True)
+
+    def submit(entry, *args, **kwargs):
+        service.stop()
+        assert entry(*args, **kwargs) is False
+        return future
+
+    executor.submit.side_effect = submit
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(copy_worker_service.topology_state, 'heartbeat_worker',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(copy_worker_service.time, 'monotonic', lambda: 1.0)
+    monkeypatch.setattr(
+        service, '_claim',
+        mock.Mock(return_value=('publication', mock.sentinel.record)))
+    monkeypatch.setattr(copy_worker_service, 'inspect_publication', target)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    executor.submit.assert_called_once()
+    target.assert_not_called()
+
+
+def test_lifecycle_worker_stop_inside_submission_gate_never_invokes_claimed_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    target = mock.Mock(return_value=True)
+
+    def submit(entry, *args, **kwargs):
+        service.stop()
+        assert entry(*args, **kwargs) is False
+        return future
+
+    executor.submit.side_effect = submit
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    monkeypatch.setattr(lifecycle_worker_service.time, 'monotonic',
+                        lambda: 61.0)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_CONSUMER_RECONCILIATION_SECONDS', 1000)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        mock.Mock(return_value={}))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction',
+                        mock.Mock(return_value=mock.sentinel.record))
+    monkeypatch.setattr(lifecycle_worker_service, 'evict_location', target)
+
+    service.run_forever()
+
+    executor.submit.assert_called_once()
+    target.assert_not_called()
 
 
 def test_canary_worker_stop_during_claim_prevents_submission(

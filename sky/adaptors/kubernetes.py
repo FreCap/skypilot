@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import subprocess
 import sys
 import threading
@@ -62,6 +63,10 @@ IN_CLUSTER_CONTEXT_NAME_ENV_VAR = 'SKYPILOT_IN_CLUSTER_CONTEXT_NAME'
 KUBECONFIG_REFRESH_INTERVAL_ENV_VAR = (
     'SKYPILOT_KUBECONFIG_REFRESH_INTERVAL_SECONDS')
 _MAX_EXEC_CREDENTIAL_OUTPUT_BYTES = 1024 * 1024
+_EXEC_CREDENTIAL_IO_CHUNK_BYTES = 64 * 1024
+_EXEC_CREDENTIAL_POLL_SECONDS = 0.05
+_EXEC_CREDENTIAL_TERMINATION_SECONDS = 1
+_IN_CLUSTER_CREDENTIAL_REFRESH_SECONDS = 60
 
 logger = sky_logging.init_logger(__name__)
 
@@ -211,6 +216,71 @@ def _get_api_client(context: str | None = None) -> Any:
     return _get_api_client_from_kubeconfig(context)
 
 
+def _read_bounded_exec_credential_output(pipe: Any, output: bytearray,
+                                         overflow: threading.Event) -> None:
+    """Reads one process pipe without retaining more than the hard limit."""
+    try:
+        while True:
+            remaining = _MAX_EXEC_CREDENTIAL_OUTPUT_BYTES - len(output)
+            if remaining == 0:
+                if pipe.read(1):
+                    overflow.set()
+                return
+            chunk = pipe.read(min(_EXEC_CREDENTIAL_IO_CHUNK_BYTES, remaining))
+            if not chunk:
+                return
+            output.extend(chunk)
+    except (OSError, ValueError):
+        # Process-group termination may close a pipe while its daemon reader is
+        # blocked. The caller already owns the bounded error classification.
+        return
+
+
+def _signal_exec_credential_process_group(process: Any, *, force: bool) -> None:
+    """Signals the isolated plugin tree without ever waiting unboundedly."""
+    if platform.system() == 'Windows':
+        command = ['taskkill', '/PID', str(process.pid), '/T']
+        if force:
+            command.append('/F')
+        try:
+            subprocess.run(command,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=_EXEC_CREDENTIAL_TERMINATION_SECONDS,
+                           check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _terminate_exec_credential_process_group(process: Any) -> None:
+    """Terminates the complete plugin group and reaps its direct child."""
+    _signal_exec_credential_process_group(process, force=False)
+    try:
+        process.wait(timeout=_EXEC_CREDENTIAL_TERMINATION_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    # Signal the group even when the direct child exited after SIGTERM: a
+    # descendant may still own an inherited stdout or stderr pipe.
+    _signal_exec_credential_process_group(process, force=True)
+    try:
+        process.wait(timeout=_EXEC_CREDENTIAL_TERMINATION_SECONDS)
+    except subprocess.TimeoutExpired:
+        # SIGKILL should make this unreachable. Keep the worker bound even if a
+        # platform process API fails to report the reaped child promptly.
+        pass
+
+
 def _run_bounded_exec_credential(
         exec_config: Any, cluster: Any, cwd: str | None, *,
         timeout_seconds: float,
@@ -247,39 +317,73 @@ def _run_bounded_exec_credential(
         exec_info['spec']['cluster'] = cluster_value
     env['KUBERNETES_EXEC_INFO'] = json.dumps(exec_info)
     provider_fence()
-    process = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=(sys.stderr if is_interactive else subprocess.PIPE),
-        stdin=sys.stdin if is_interactive else None,
-        cwd=cwd or None,
-        env=env,
-        text=True,
-        shell=platform.system() == 'Windows')
-    try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as error:
-        process.terminate()
-        try:
-            process.communicate(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+    is_windows = platform.system() == 'Windows'
+    popen_kwargs: dict[str, Any] = {}
+    if is_windows:
+        popen_kwargs['creationflags'] = getattr(subprocess,
+                                                'CREATE_NEW_PROCESS_GROUP', 0)
+    else:
+        popen_kwargs['start_new_session'] = True
+    process = subprocess.Popen(args,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               stdin=sys.stdin if is_interactive else None,
+                               cwd=cwd or None,
+                               env=env,
+                               shell=is_windows,
+                               **popen_kwargs)
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_overflow = threading.Event()
+    stderr_overflow = threading.Event()
+    readers = [
+        threading.Thread(target=_read_bounded_exec_credential_output,
+                         args=(process.stdout, stdout, stdout_overflow),
+                         name='kubernetes-exec-stdout',
+                         daemon=True),
+        threading.Thread(target=_read_bounded_exec_credential_output,
+                         args=(process.stderr, stderr, stderr_overflow),
+                         name='kubernetes-exec-stderr',
+                         daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    while True:
+        if stdout_overflow.is_set() or stderr_overflow.is_set():
+            break
+        if process.poll() is not None and all(
+                not reader.is_alive() for reader in readers):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        time.sleep(min(_EXEC_CREDENTIAL_POLL_SECONDS, remaining))
+    if (timed_out or stdout_overflow.is_set() or stderr_overflow.is_set()):
+        _terminate_exec_credential_process_group(process)
+    for reader in readers:
+        reader.join(timeout=_EXEC_CREDENTIAL_TERMINATION_SECONDS)
+    if timed_out:
         raise config_error_cls(
-            'exec: credential command exceeded its bounded timeout') from error
+            'exec: credential command exceeded its bounded timeout')
+    if stdout_overflow.is_set():
+        raise config_error_cls('exec: credential response exceeds 1 MiB')
+    if stderr_overflow.is_set():
+        raise config_error_cls('exec: credential diagnostics exceed 1 MiB')
     provider_fence()
     if process.returncode != 0:
-        message = f'exec: process returned {process.returncode}'
-        if isinstance(stderr, str) and stderr.strip():
-            message += f'. {stderr.strip()}'
-        raise config_error_cls(message)
-    if len(stdout.encode()) > _MAX_EXEC_CREDENTIAL_OUTPUT_BYTES:
-        raise config_error_cls('exec: credential response exceeds 1 MiB')
+        # Exec plugin diagnostics may contain credential material. Preserve only
+        # the bounded status, never raw stderr, in the exception surface.
+        raise config_error_cls(f'exec: process returned {process.returncode}')
     try:
-        payload = json.loads(stdout)
-    except ValueError as error:
+        payload = json.loads(stdout.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as error:
         raise config_error_cls(
-            f'exec: failed to decode process output: {error}') from error
+            'exec: failed to decode process output') from error
     if not isinstance(payload, dict):
         raise config_error_cls('exec: malformed response object')
     for key in ('apiVersion', 'kind', 'status'):
@@ -306,7 +410,7 @@ def _bounded_core_api(
         client_api.configuration.refresh_api_key_hook = None
         core = kubernetes.client.CoreV1Api(api_client=client_api)
         provider_fence()
-        return core, None
+        return core, time.time() + _IN_CLUSTER_CREDENTIAL_REFRESH_SECONDS
 
     kube_config = kubernetes.config.kube_config
     loader = kube_config._get_kube_config_loader_for_yaml_file(  # pylint: disable=protected-access

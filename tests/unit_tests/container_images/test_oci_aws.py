@@ -774,7 +774,13 @@ def test_assumed_client_bounds_sts_and_service_sdk_attempts(
     sts_session = mock.Mock()
     sts_session.client.return_value = sts
     service_session = mock.Mock()
-    service_session.client.return_value = mock.sentinel.ecr
+    events: list[str] = []
+
+    def service_client(*_args: object, **_kwargs: object) -> object:
+        events.append('service-client')
+        return mock.sentinel.ecr
+
+    service_session.client.side_effect = service_client
     boto_session = mock.Mock(side_effect=[sts_session, service_session])
     monkeypatch.setattr(aws.aws_adaptor.boto3, 'Session', boto_session)
     binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
@@ -783,7 +789,12 @@ def test_assumed_client_bounds_sts_and_service_sdk_attempts(
                                  catalog_tag='catalog',
                                  profile_tag='profile')
 
-    assert aws.assumed_client(binding, 'ecr', 'us-east-1') is mock.sentinel.ecr
+    assert aws.assumed_client(
+        binding,
+        'ecr',
+        'us-east-1',
+        provider_fence=lambda: events.append('fence')) is mock.sentinel.ecr
+    assert events[-3:] == ['fence', 'service-client', 'fence']
 
     session_with_defaults.assert_called_once_with(connect_timeout=10,
                                                   read_timeout=60,
