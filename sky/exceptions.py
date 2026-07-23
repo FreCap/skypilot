@@ -133,16 +133,32 @@ def deserialize_exception(serialized: Any) -> Exception:
         return Exception(
             f'{exception_type}: {serialized.get("message", serialized)}')
     args = serialized.get('args', ())
-    attributes = serialized.get('attributes', {})
+    attributes = dict(serialized.get('attributes') or {})
+    # Dunder entries are never constructor arguments, for a built-in or a
+    # SkyPilot exception alike. Python 3.14 attaches ``__notes__`` to some
+    # exceptions, so pull those out and restore them after construction.
+    dunder_attributes = {
+        key: attributes.pop(key)
+        for key in list(attributes)
+        if isinstance(key, str) and key.startswith('__')
+    }
     if hasattr(builtins, exception_type):
-        # Built-in exception constructors reject keyword arguments. Python
-        # 3.14 adds contextual ``__notes__`` to some built-in exceptions, so
+        # Built-in exception constructors reject keyword arguments, so
         # restore their serialized attributes after construction instead.
         e = exception_class(*args)
         for key, value in attributes.items():
             setattr(e, key, value)
     else:
-        e = exception_class(*args, **attributes)
+        try:
+            e = exception_class(*args, **attributes)
+        except Exception:  # pylint: disable=broad-except
+            # An attribute the constructor does not accept must not replace
+            # the original error with an unrelated failure, which would
+            # contradict this function's tolerant contract.
+            return Exception(
+                f'{exception_type}: {serialized.get("message", serialized)}')
+    for key, value in dunder_attributes.items():
+        setattr(e, key, value)
     stacktrace = serialized.get('stacktrace')
     if stacktrace is not None:
         setattr(e, 'stacktrace', stacktrace)
