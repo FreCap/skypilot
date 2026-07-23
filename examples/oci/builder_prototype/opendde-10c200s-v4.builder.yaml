@@ -1,0 +1,31 @@
+base: docker.io/aurekaresearch/opendde@sha256:a9404f76df1cd965a80447ee30c9c440af48b199581d9bd44ee157c18109a9d6
+setup:
+  - run: >-
+      install -D -m 0444 /inputs/marker.txt
+      /opt/skypilot-builder/opendde-10c200s-v4
+    inputs:
+      - marker.txt
+  - run: |-
+      python3 -m venv --system-site-packages /opt/opendde-serve-venv
+      /opt/opendde-serve-venv/bin/python -m pip install --no-cache-dir \
+        boto3==1.43.0 fastapi==0.116.1 uvicorn==0.35.0
+      git clone --filter=blob:none \
+        https://github.com/aurekaresearch/OpenDDE.git /opt/opendde-src
+      git -C /opt/opendde-src checkout --detach "$OPENDDE_COMMIT"
+      test "$(git -C /opt/opendde-src rev-parse HEAD)" = "$OPENDDE_COMMIT"
+    inputs: []
+context:
+  include:
+    - marker.txt
+source:
+  mode: late_bound
+  include: []
+build_args:
+  OPENDDE_COMMIT: 8ecf46b6b2dce498286ed804c239d99a18a3ebc4
+platform: linux/amd64
+output:
+  workspace: default
+  distribution: direct
+  release: opendde-10c200s-v4-builder-20260723
+  staging_repository: 699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-platform-models
+  source_auth: null

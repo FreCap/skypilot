@@ -44,6 +44,13 @@ def _spec(*, source_mode: str = 'late_bound') -> dict:
     }
 
 
+def _direct_spec(*, source_mode: str = 'late_bound') -> dict:
+    spec = _spec(source_mode=source_mode)
+    spec['output']['distribution'] = 'direct'
+    spec['output']['source_auth'] = None
+    return spec
+
+
 def _context(root: Path) -> None:
     (root / 'src').mkdir()
     (root / 'requirements.txt').write_text('numpy==2.0.0 --hash=sha256:abc\n',
@@ -240,6 +247,171 @@ def test_upload_detects_context_toctou(tmp_path: Path,
                                                        credential_profile=None)
     with pytest.raises(RuntimeError, match='BUILD_CONTEXT_CHANGED'):
         store.upload(tmp_path, manifest)
+
+
+class _DirectExecutor:
+    """Records a direct evidence build without invoking Buildx."""
+
+    def __init__(self) -> None:
+        self.record: builder_prototype.BuildRecord | None = None
+        self.verified: builder_prototype.BuildOutput | None = None
+
+    def execute(
+        self,
+        record: builder_prototype.BuildRecord,
+        spec: builder_prototype.BuildSpec,
+        root: Path,
+        manifest: builder_prototype.ContextManifest,
+        heartbeat,
+    ) -> builder_prototype.BuildOutput:
+        del spec, root, manifest
+        assert heartbeat()
+        self.record = record
+        return builder_prototype.BuildOutput(
+            staging_ref=f'{record.staging_repository}:sky-build-{record.id}',
+            digest='sha256:' + '2' * 64,
+            cache_hits=3,
+            log_path='/tmp/prototype-build.log')
+
+    def verify(self, output: builder_prototype.BuildOutput) -> None:
+        self.verified = output
+
+
+def test_direct_evidence_build_returns_verified_digest_pinned_result(
+        tmp_path: Path) -> None:
+    _context(tmp_path)
+    spec = builder_prototype.BuildSpec.from_dict(_direct_spec())
+    executor = _DirectExecutor()
+
+    result = builder_prototype.run_direct_build(
+        spec=spec,
+        root=tmp_path,
+        executor=executor,  # type: ignore[arg-type]
+    )
+
+    assert result.mode == 'execute-direct'
+    assert result.reference == (
+        '123456789012.dkr.ecr.us-east-1.amazonaws.com/skypilot/staging@'
+        'sha256:' + '2' * 64)
+    assert result.cache_hits == 3
+    assert result.files == 2
+    assert executor.record is not None
+    assert executor.record.state == 'BUILDING'
+    assert executor.verified is not None
+    assert executor.verified.digest == result.digest
+
+
+def test_direct_evidence_build_rejects_managed_publication_spec(
+        tmp_path: Path) -> None:
+    _context(tmp_path)
+    spec = builder_prototype.BuildSpec.from_dict(_spec())
+
+    with pytest.raises(ValueError, match='distribution direct'):
+        builder_prototype.run_direct_build(
+            spec=spec,
+            root=tmp_path,
+            executor=_DirectExecutor(),  # type: ignore[arg-type]
+        )
+
+
+def test_buildx_executor_writes_immutable_cache_tag_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _context(tmp_path)
+    spec = builder_prototype.BuildSpec.from_dict(_direct_spec())
+    manifest = builder_prototype.create_context_manifest(tmp_path, spec)
+    now = 1_700_000_000
+    record = builder_prototype.BuildRecord(
+        id='11111111-1111-1111-1111-111111111111',
+        idempotency_key='direct-evidence-idempotency',
+        spec_hash=spec.spec_hash,
+        context_digest=manifest.digest,
+        dependency_cache_key=builder_prototype.dependency_cache_key(
+            spec, manifest),
+        state='BUILDING',
+        staging_repository=spec.staging_repository,
+        output_digest=None,
+        publication_id=None,
+        artifact_id=None,
+        error_code=None,
+        lease_token='lease',
+        lease_expires_at=now + 1800,
+        created_at=now,
+        updated_at=now)
+    monkeypatch.setattr(builder_prototype.shutil, 'which',
+                        lambda executable: f'/usr/bin/{executable}')
+    executor = builder_prototype.DockerBuildxExecutor()
+    monkeypatch.setattr(executor, '_ensure_builder', lambda: None)
+    monkeypatch.setattr(executor, '_reference_exists', lambda reference: False)
+    commands: list[list[str]] = []
+
+    class _Process:
+        """Immediate successful Buildx process for command assertions."""
+
+        returncode = 0
+
+        def __init__(self, command: list[str], **kwargs) -> None:
+            del kwargs
+            commands.append(command)
+            metadata_path = Path(command[command.index('--metadata-file') + 1])
+            metadata_path.write_text(json.dumps(
+                {'containerimage.digest': 'sha256:' + '3' * 64}),
+                                     encoding='utf-8')
+
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setattr(builder_prototype.subprocess, 'Popen', _Process)
+
+    output = executor.execute(record,
+                              spec,
+                              tmp_path,
+                              manifest,
+                              heartbeat=lambda: True)
+
+    assert output.digest == 'sha256:' + '3' * 64
+    assert '--cache-from' in commands[0]
+    assert '--cache-to' in commands[0]
+    assert commands[0][-1].endswith('/context')
+
+    monkeypatch.setattr(executor, '_reference_exists', lambda reference: True)
+    executor.execute(record, spec, tmp_path, manifest, heartbeat=lambda: True)
+    assert '--cache-from' in commands[1]
+    assert '--cache-to' not in commands[1]
+
+
+def test_buildx_executor_creates_and_bootstraps_missing_builder(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(builder_prototype.shutil, 'which',
+                        lambda executable: f'/usr/bin/{executable}')
+    executor = builder_prototype.DockerBuildxExecutor()
+    commands: list[list[str]] = []
+
+    def _run(command: list[str], **kwargs):
+        del kwargs
+        commands.append(command)
+        if command[2:4] == ['inspect', 'skypilot-image-builder-prototype']:
+            return mock.Mock(returncode=1,
+                             stdout=b'',
+                             stderr=b'no builder found')
+        return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+
+    monkeypatch.setattr(builder_prototype.subprocess, 'run', _run)
+
+    executor._ensure_builder()  # pylint: disable=protected-access
+
+    assert commands == [[
+        '/usr/bin/docker', 'buildx', 'inspect',
+        'skypilot-image-builder-prototype'
+    ],
+                        [
+                            '/usr/bin/docker', 'buildx', 'create', '--name',
+                            'skypilot-image-builder-prototype', '--driver',
+                            'docker-container'
+                        ],
+                        [
+                            '/usr/bin/docker', 'buildx', 'inspect',
+                            '--bootstrap', 'skypilot-image-builder-prototype'
+                        ]]
 
 
 def test_prototype_cli_is_disabled_without_explicit_gate(

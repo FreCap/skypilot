@@ -4,7 +4,7 @@ Status: post-v0 seam and prototype gate, not a v0 public product
 
 Owner: image build service
 
-Last updated: 2026-07-20
+Last updated: 2026-07-23
 
 ## Decision
 
@@ -237,10 +237,65 @@ The repository prototype lives in `sky/container_images/builder_prototype.py`.
 It is absent from the public API, SDK, YAML schema, and Dashboard, and its
 maintainer CLI refuses to run unless
 `SKYPILOT_IMAGE_BUILDER_PROTOTYPE=1` is set. The CLI currently validates and
-content-addresses a context only. The coordinator, isolated PostgreSQL schema,
-S3-compatible uploader, fenced BuildKit executor, staging verification, and
-ordinary publication handoff are exercised through the internal harness and
-tests, not enabled as a production service.
+content-addresses a context.
+
+### Executable direct-evidence runner
+
+The maintainer CLI also has an explicitly selected `--execute-direct` evidence
+mode. It uses the same closed build specification, filtered context, dependency
+cache key, Dockerfile generator, and BuildKit semantics as the durable
+coordinator, but executes through a locally configured Docker Buildx worker and
+pushes directly to the specification's staging repository. It verifies the
+result through its digest-pinned registry reference before reporting success.
+
+This mode exists to measure real images before standing up the coordinator and
+worker service. It has the following intentionally narrow contract:
+
+- `SKYPILOT_IMAGE_BUILDER_PROTOTYPE=1` remains mandatory;
+- the build specification must select `distribution: direct` and no source
+  authorization binding;
+- registry authentication is an operator prerequisite, never a command-line
+  secret argument;
+- the explicit execution path creates and bootstraps one named local
+  `docker-container` Buildx worker when it does not already exist, so registry
+  cache export does not depend on the Docker daemon's image-store setting;
+- output is one immutable digest-pinned OCI reference, not a named SkyPilot
+  release;
+- the runner has no cancellation recovery or durable state, so it must never
+  be used as the production publication path; and
+- a digest-keyed registry cache is created once and then treated as read-only,
+  which is compatible with immutable-tag ECR repositories.
+
+`--validate-only` remains the safe default operation. The CLI requires exactly
+one of `--validate-only` or `--execute-direct`, so validation cannot
+accidentally trigger a build. The executable result reports build duration,
+cache hits, context identity, dependency-cache identity, log path, staging tag,
+and digest-pinned reference without returning credentials.
+
+The first live evidence pair uses isolated one-replica Serve services derived
+from `boltz-l4-fleet` and `opendde-10c200s-v4`. Both use Linux AMD64 images in
+one AWS region. A same-region baseline and built-image run measure
+replica `time_to_ready_seconds`; image publication time is reported separately
+and is never hidden inside deployment readiness. The target is at least 120
+seconds lower readiness for each service when its existing runtime setup has
+that much removable work. A smaller improvement is a measured gate failure,
+not rounded up to success.
+
+The coordinator, isolated PostgreSQL schema, S3-compatible uploader, fenced
+BuildKit executor, staging verification, and ordinary publication handoff
+remain exercised through the internal harness and tests. They are not enabled
+as a production service by the direct-evidence runner.
+
+Chart upgrades must merge the new chart defaults before applying the previous
+release's values. Provider-specific environment variables, volume names, and
+mount paths are reserved only when the corresponding native chart credential
+block is enabled and actually emits those fields. This preserves existing
+custom workload-identity integrations, including projected GCP credentials and
+Nebius credentials, while still rejecting real duplicate fields.
+The PostgreSQL migration Job sets server mode in both its process entrypoint
+and Pod environment before resolving any database engine. A Job that upgrades
+ephemeral SQLite while the central PostgreSQL revision remains unchanged is a
+deployment failure, never a successful rollout.
 
 ## Productization gate
 
