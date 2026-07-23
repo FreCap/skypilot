@@ -516,6 +516,120 @@ class TestTargetMath(unittest.TestCase):
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
 
+    def test_launch_priority_uses_highest_active_demand(self):
+        autoscaler = _make_autoscaler(knob=1, max_replicas=1000)
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=101,
+                queue_depth_by_priority={
+                    20: 100,
+                    50: 1,
+                },
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['L4'],
+                    'count': 100,
+                }, {
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                compatibility_complete=True)
+
+        self.assertEqual(autoscaler.current_launch_priority(), 50)
+
+    def test_launch_priority_defaults_and_clamps(self):
+        autoscaler = _make_autoscaler(knob=1)
+        self.assertEqual(autoscaler.current_launch_priority(),
+                         constants.LB_REQUEST_PRIORITY_MIN)
+        autoscaler._queue_depth_by_priority = {1000: 1}
+        autoscaler._launch_priority_report_received_at = time.time()
+        self.assertEqual(autoscaler.current_launch_priority(),
+                         constants.LB_REQUEST_PRIORITY_MAX)
+
+    def test_launch_priority_is_specific_to_compatible_accelerator(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queued_profiles=[{
+                    'priority': 20,
+                    'compatible_accelerators': ['L4'],
+                    'count': 100,
+                }, {
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'count': 1,
+                }],
+                compatibility_complete=True)
+
+        assert autoscaler.current_launch_priorities_by_accelerator(
+            ['L4', 'A100']) == {
+                'L4': 20,
+                'A100': 50,
+            }
+        assert isinstance(
+            autoscaler.queued_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
+
+    def test_launch_priority_missing_compatibility_applies_to_every_card(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler._launch_priority_report_received_at = time.time()
+        autoscaler.queued_compatibility_profiles = [{
+            'priority': 50,
+            'count': 1,
+        }]
+
+        assert autoscaler.current_launch_priorities_by_accelerator(
+            ['A100', 'A100-80GB']) == {
+                'A100': 50,
+                'A100-80GB': 50,
+            }
+
+    def test_launch_priority_does_not_fall_back_across_excluded_card(self):
+        autoscaler = _make_autoscaler(knob=1)
+        autoscaler._launch_priority_report_received_at = time.time()
+        autoscaler._queue_depth_by_priority = {50: 1}
+        autoscaler.queued_compatibility_profiles = [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'count': 1,
+        }]
+
+        assert autoscaler.current_launch_priorities_by_accelerator(['L4']) == {
+            'L4': constants.LB_REQUEST_PRIORITY_MIN,
+        }
+
+    def test_launch_priority_evidence_expires(self):
+        autoscaler = _make_autoscaler(knob=1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100):
+            _report(autoscaler,
+                    in_flight={},
+                    queue_depth=1,
+                    queue_depth_by_priority={50: 1},
+                    queued_profiles=[{
+                        'priority': 50,
+                        'compatible_accelerators': ['A100'],
+                        'count': 1,
+                    }],
+                    compatibility_complete=True)
+            assert autoscaler.current_launch_priority() == 50
+            assert autoscaler.current_launch_priorities_by_accelerator(
+                ['A100']) == {
+                    'A100': 50,
+                }
+
+        expired_at = 101 + autoscaler._staleness_threshold_seconds()
+        with mock.patch.object(autoscalers.time,
+                               'time',
+                               return_value=expired_at):
+            assert autoscaler.current_launch_priority() == (
+                constants.LB_REQUEST_PRIORITY_MIN)
+            assert autoscaler.current_launch_priorities_by_accelerator(
+                ['A100']) == {
+                    'A100': constants.LB_REQUEST_PRIORITY_MIN,
+                }
+
     def test_default_assumed_lead_removes_deadline_discount(self):
         autoscaler = _make_autoscaler(
             knob=1,
@@ -715,6 +829,37 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
         autoscaler._snap_target_on_next_recompute = False
         return autoscaler
+
+    def test_qps_launch_priority_uses_tuple_backed_queue_and_rejections(self):
+        autoscaler = self._instance_aware_autoscaler()
+        autoscaler.collect_request_information({
+            'timestamps': [],
+            'compatibility_profiles': [],
+            'queued_requests_by_compatibility': [{
+                'priority': 20,
+                'compatible_accelerators': ['L4'],
+                'count': 100,
+            }],
+            'rejected_requests_by_compatibility': [{
+                'priority': 50,
+                'compatible_accelerators': ['A100'],
+                'recent_count': 1,
+            }],
+            'compatibility_demand_complete': True,
+        })
+
+        self.assertEqual(
+            autoscaler.current_launch_priorities_by_accelerator(['L4', 'A100']),
+            {
+                'L4': 20,
+                'A100': 50,
+            })
+        self.assertIsInstance(
+            autoscaler.queued_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
+        self.assertIsInstance(
+            autoscaler.rejected_compatibility_profiles[0]
+            ['compatible_accelerators'], tuple)
 
     def test_logical_exact_card_preserves_production_arrival_floor(self):
         autoscaler = _make_autoscaler(
@@ -1440,7 +1585,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 target_capacity=57,
                 launch_budget=10,
                 target_capacity_by_accelerator=(('L4', 57),),
-                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
+                accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1)),
+                launch_priority_by_accelerator=(('L4', 0),)))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
 
     def test_free_reserved_slot_cannot_back_paid_rollout_authority(self):

@@ -11,12 +11,12 @@ could make the migrated JSON state stale after this backfill.
 # pylint: disable=invalid-name
 from collections.abc import Sequence
 import pickle
+from typing import Any
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from sky.serve import serve_state
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
@@ -26,6 +26,33 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _BACKFILL_BATCH_SIZE = 500
+_JSON_ROW_KEYS = (
+    'replica_state_version',
+    'status',
+    'sky_down_status',
+    'version',
+    'cluster_name',
+    'created_at',
+    'is_spot',
+    'replica_state',
+)
+
+
+def _legacy_replica_row_values(replica_info: Any) -> dict[str, Any]:
+    """Convert one legacy pickle using this migration's frozen projection."""
+    replica_state = replica_info.to_storage_dict()
+    sky_down_status = replica_info.status_property.sky_down_status
+    return {
+        'replica_state_version': 1,
+        'status': replica_info.status.value,
+        'sky_down_status':
+            (sky_down_status.value if sky_down_status is not None else None),
+        'version': replica_info.version,
+        'cluster_name': replica_info.cluster_name,
+        'created_at': getattr(replica_info, 'created_at', None),
+        'is_spot': replica_info.is_spot,
+        'replica_state': replica_state,
+    }
 
 
 def _replicas_table() -> sa.Table:
@@ -89,13 +116,12 @@ def _backfill_and_verify() -> None:
         values = []
         for service_name, replica_id, replica_info_bytes in batch:
             replica_info = pickle.loads(replica_info_bytes)
-            row_values = serve_state._replica_row_values(  # pylint: disable=protected-access
-                service_name, replica_id, replica_info)
+            row_values = _legacy_replica_row_values(replica_info)
             values.append({
                 '_service_name': service_name,
                 '_replica_id': replica_id,
                 **{
-                    key: value for key, value in row_values.items() if key not in ('service_name', 'replica_id', 'replica_info')
+                    key: row_values[key] for key in _JSON_ROW_KEYS
                 },
             })
         bind.execute(update, values)
@@ -127,8 +153,7 @@ def _backfill_and_verify() -> None:
             break
         for row in batch:
             legacy = pickle.loads(row.replica_info)
-            expected = serve_state._replica_row_values(  # pylint: disable=protected-access
-                row.service_name, row.replica_id, legacy)
+            expected = _legacy_replica_row_values(legacy)
             actual = {
                 'replica_state_version': row.replica_state_version,
                 'status': row.status,
@@ -140,9 +165,7 @@ def _backfill_and_verify() -> None:
                 'replica_state': row.replica_state,
             }
             expected_without_legacy = {
-                key: value
-                for key, value in expected.items()
-                if key not in ('service_name', 'replica_id', 'replica_info')
+                key: expected[key] for key in _JSON_ROW_KEYS
             }
             if actual != expected_without_legacy:
                 raise RuntimeError(

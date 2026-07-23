@@ -59,6 +59,8 @@ class LogicalScaleTarget:
     accelerator_shapes: tuple[tuple[str, int], ...] = ()
     replace_unknown_replica_ids: tuple[int, ...] = ()
     launch_budget: int | None = None
+    launch_priority: int = constants.LB_REQUEST_PRIORITY_MIN
+    launch_priority_by_accelerator: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -410,12 +412,106 @@ class Autoscaler:
                                                          spot_placer.Location],
                                                    float] = {}
         self._cost_rebalance_replica_cost_cache: dict[int, float] = {}
+        # Freshness fence for priority-only gauges. A stale LB report may keep
+        # a conservative scale-up target, but it must not keep refreshing a
+        # high-priority paid-capacity waiter indefinitely.
+        self._launch_priority_report_received_at: float | None = None
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
         if self.num_overprovision is None:
             return self.target_num_replicas
         return self.target_num_replicas + self.num_overprovision
+
+    def current_launch_priority(self) -> int:
+        """Highest recent demand priority that may require fresh capacity."""
+        if not self._launch_priority_evidence_is_fresh():
+            return constants.LB_REQUEST_PRIORITY_MIN
+        priorities = [constants.LB_REQUEST_PRIORITY_MIN]
+        by_priority = getattr(self, '_queue_depth_by_priority', None)
+        if isinstance(by_priority, dict):
+            priorities.extend(
+                int(priority)
+                for priority, count in by_priority.items()
+                if isinstance(priority, int) and
+                not isinstance(priority, bool) and isinstance(count, int) and
+                not isinstance(count, bool) and count > 0)
+        for field in ('queued_compatibility_profiles',
+                      'rejected_compatibility_profiles',
+                      'compatibility_profiles'):
+            profiles = getattr(self, field, ())
+            if not isinstance(profiles, list):
+                continue
+            for profile in profiles:
+                if not isinstance(profile, dict):
+                    continue
+                priority = profile.get('priority')
+                count = profile.get('recent_count', profile.get('count', 0))
+                if (isinstance(priority, int) and
+                        not isinstance(priority, bool) and
+                        isinstance(count, (int, float)) and
+                        not isinstance(count, bool) and count > 0):
+                    priorities.append(priority)
+        return max(constants.LB_REQUEST_PRIORITY_MIN,
+                   min(constants.LB_REQUEST_PRIORITY_MAX, max(priorities)))
+
+    def _launch_priority_evidence_is_fresh(self) -> bool:
+        received_at = self._launch_priority_report_received_at
+        if received_at is None:
+            return False
+        threshold = 3.0 * constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS
+        return time.time() - received_at <= threshold
+
+    def current_launch_priorities_by_accelerator(
+            self, accelerators: Iterable[str]) -> dict[str, int]:
+        """Highest active priority whose compatibility includes each card."""
+        canonical = {
+            str(accelerator).casefold(): str(accelerator)
+            for accelerator in accelerators
+        }
+        priorities = {
+            accelerator: constants.LB_REQUEST_PRIORITY_MIN
+            for accelerator in canonical.values()
+        }
+        if not self._launch_priority_evidence_is_fresh():
+            return priorities
+        saw_valid_profile = False
+        for field in ('queued_compatibility_profiles',
+                      'rejected_compatibility_profiles',
+                      'compatibility_profiles'):
+            profiles = getattr(self, field, ())
+            if not isinstance(profiles, list):
+                continue
+            for profile in profiles:
+                if not isinstance(profile, dict):
+                    continue
+                priority = profile.get('priority')
+                count = profile.get('recent_count', profile.get('count', 0))
+                if (not isinstance(priority, int) or
+                        isinstance(priority, bool) or
+                        not isinstance(count, (int, float)) or
+                        isinstance(count, bool) or count <= 0):
+                    continue
+                saw_valid_profile = True
+                compatible = profile.get('compatible_accelerators')
+                if not isinstance(compatible, (list, tuple)) or not compatible:
+                    matching = list(priorities)
+                else:
+                    matching = [
+                        canonical[str(card).casefold()]
+                        for card in compatible
+                        if str(card).casefold() in canonical
+                    ]
+                if not matching:
+                    continue
+                clamped = max(constants.LB_REQUEST_PRIORITY_MIN,
+                              min(constants.LB_REQUEST_PRIORITY_MAX, priority))
+                for card in matching:
+                    priorities[card] = max(priorities[card], clamped)
+        if not saw_valid_profile:
+            fallback = self.current_launch_priority()
+            return {card: fallback for card in priorities}
+        return priorities
 
     @property
     def unrecoverable_rollout_failure(
@@ -2555,6 +2651,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # profiles, it must be replaced on every authoritative LB report rather
         # than accumulated across the QPS window.
         self.queued_compatibility_profiles: list[dict[str, Any]] = []
+        # Recent rejections are a replaceable gauge used for launch priority.
+        # They do not change the QPS magnitude, which remains derived from the
+        # accepted-arrival window.
+        self.rejected_compatibility_profiles: list[dict[str, Any]] = []
         # False after a catalog transition until a version-matched LB report
         # replaces every exact-card gauge. Incomplete/old reports may still
         # refresh aggregate QPS timestamps but cannot re-arm cleared profiles.
@@ -2595,6 +2695,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         if catalog_changed or not configured_shapes:
             self.compatibility_profiles = []
             self.queued_compatibility_profiles = []
+            self.rejected_compatibility_profiles = []
             self.target_num_replicas_by_accelerator = {}
             self.warm_retention_target_by_accelerator = {}
             self.cold_launch_authority_by_accelerator = {}
@@ -2692,7 +2793,30 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 'count': count,
             })
         self.queued_compatibility_profiles = queued_profiles
+        rejected_profiles: list[dict[str, Any]] = []
+        for profile in request_aggregator_info.get(
+                'rejected_requests_by_compatibility', []):
+            if not isinstance(profile, dict):
+                continue
+            priority = profile.get('priority')
+            accelerators = profile.get('compatible_accelerators')
+            recent_count = profile.get('recent_count', profile.get('count', 1))
+            if (not isinstance(priority, int) or isinstance(priority, bool) or
+                    not isinstance(accelerators, list) or not accelerators or
+                    not isinstance(recent_count, int) or
+                    isinstance(recent_count, bool) or recent_count < 1 or
+                    not all(
+                        isinstance(item, str) and item
+                        for item in accelerators)):
+                continue
+            rejected_profiles.append({
+                'priority': priority,
+                'compatible_accelerators': tuple(accelerators),
+                'recent_count': recent_count,
+            })
+        self.rejected_compatibility_profiles = rejected_profiles
         self._compatibility_demand_complete = True
+        self._launch_priority_report_received_at = time.time()
         cutoff = time.time() - self.qps_window_size
         self.compatibility_profiles = [
             profile for profile in self.compatibility_profiles
@@ -2714,10 +2838,16 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             **profile,
             'compatible_accelerators': list(profile['compatible_accelerators']),
         } for profile in self.queued_compatibility_profiles]
+        states['rejected_compatibility_profiles'] = [{
+            **profile,
+            'compatible_accelerators': list(profile['compatible_accelerators']),
+        } for profile in self.rejected_compatibility_profiles]
         states['compatibility_demand_complete'] = (
             self._compatibility_demand_complete)
         states['configured_accelerator_shapes'] = dict(
             self.configured_accelerator_shapes)
+        states['launch_priority_report_received_at'] = (
+            self._launch_priority_report_received_at)
         return states
 
     def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
@@ -2727,12 +2857,17 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         profiles = dynamic_states.pop('compatibility_profiles', [])
         queued_profiles = dynamic_states.pop('queued_compatibility_profiles',
                                              [])
+        rejected_profiles = dynamic_states.pop(
+            'rejected_compatibility_profiles', [])
         compatibility_complete = bool(
             dynamic_states.pop('compatibility_demand_complete', False))
         source_shapes = dynamic_states.pop('configured_accelerator_shapes', {})
+        priority_report_received_at = dynamic_states.pop(
+            'launch_priority_report_received_at', None)
         super()._load_dynamic_states(dynamic_states)
         self.compatibility_profiles = []
         self.queued_compatibility_profiles = []
+        self.rejected_compatibility_profiles = []
         self.configured_accelerator_shapes = {
             str(card): int(count)
             for card, count in source_shapes.items()
@@ -2749,8 +2884,13 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             'timestamps': [],
             'compatibility_profiles': profiles,
             'queued_requests_by_compatibility': queued_profiles,
+            'rejected_requests_by_compatibility': rejected_profiles,
             'compatibility_demand_complete': compatibility_complete,
         })
+        self._launch_priority_report_received_at = (
+            float(priority_report_received_at)
+            if isinstance(priority_report_received_at, (int, float)) and
+            not isinstance(priority_report_received_at, bool) else None)
 
     def generate_scaling_decisions(
         self,
@@ -4202,6 +4342,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             request_aggregator_info.get('reconcile_generation',
                                         self._reconcile_generation + 1))
         self._report_received_at = current_time
+        self._launch_priority_report_received_at = current_time
         logger.info(f'Concurrency report: in_flight_total='
                     f'{sum(self._in_flight_by_replica_id.values())}, '
                     f'queue_depth={self._queue_depth}, '
@@ -6445,6 +6586,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                   False) is not True and info.replica_id in
                        self._degraded_capacity_since_by_replica_id and
                        self._committed_capacity(info) == 0))
+            launch_priorities_by_accelerator: tuple[tuple[str, int], ...] = ()
+            if use_card_targets:
+                current_priorities = (
+                    self.current_launch_priorities_by_accelerator(
+                        target_by_card))
+                launch_priorities_by_accelerator = tuple(
+                    current_priorities.items())
             return [
                 AutoscalerDecision(
                     AutoscalerDecisionOperator.SCALE_UP,
@@ -6458,8 +6606,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         accelerator_shapes=tuple(
                             self.configured_accelerator_shapes.items())
                         if use_card_targets else (),
-                        replace_unknown_replica_ids=replace_unknown_replica_ids)
-                )
+                        replace_unknown_replica_ids=replace_unknown_replica_ids,
+                        launch_priority=self.current_launch_priority(),
+                        launch_priority_by_accelerator=(
+                            launch_priorities_by_accelerator)))
             ]
         if (not self._fresh_for_tick() or self._upscale_pending or
                 self._logical_card_transition_pending or
@@ -6730,6 +6880,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'unknown_in_flight_replica_ids': sorted(
                 self._unknown_in_flight_replica_ids),
             'report_received_at': self._report_received_at,
+            'launch_priority_report_received_at':
+                self._launch_priority_report_received_at,
             'reconcile_generation': self._reconcile_generation,
             'observed_slots_by_replica_id': self._observed_slots_by_replica_id,
             'unknown_capacity_replica_ids': sorted(
@@ -6864,6 +7016,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         if 'report_received_at' in dynamic_states:
             self._report_received_at = dynamic_states.pop('report_received_at')
+        if 'launch_priority_report_received_at' in dynamic_states:
+            priority_report_received_at = dynamic_states.pop(
+                'launch_priority_report_received_at')
+            self._launch_priority_report_received_at = (
+                float(priority_report_received_at)
+                if isinstance(priority_report_received_at, (int, float)) and
+                not isinstance(priority_report_received_at, bool) else None)
         if 'last_scale_up_wave_at' in dynamic_states:
             self._last_scale_up_wave_at = dynamic_states.pop(
                 'last_scale_up_wave_at')

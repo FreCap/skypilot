@@ -1,0 +1,489 @@
+"""Global admission control for fresh paid SkyServe capacity.
+
+Autoscalers decide how much capacity a service needs. Spot placers decide
+which provider location is cheapest and currently usable. This module owns the
+cross-service limit on unresolved, genuine demand launches into one exact paid
+provider pool.
+"""
+from collections.abc import Iterable
+from collections.abc import Mapping
+import dataclasses
+import enum
+import functools
+import json
+import os
+import time
+import typing
+from typing import Any
+
+from sky import sky_logging
+from sky.adaptors import common as adaptors_common
+from sky.serve import constants
+from sky.serve import spot_placer
+
+if typing.TYPE_CHECKING:
+    from sky.serve import replica_managers
+
+logger = sky_logging.init_logger(__name__)
+serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
+
+_BASE_LIMIT_DEFAULT = 60
+_LEGACY_LOCAL_LIMIT_DEFAULT = 4
+_MAX_LIMIT_DEFAULT = 480
+_BASE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW'
+_MAX_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_MAX_LAUNCH_WINDOW'
+_SUCCESS_TTL_SECONDS_DEFAULT = 10 * 60
+_SUCCESS_TTL_SECONDS_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_LOCATION_SUCCESS_TTL_SECONDS')
+_WAITER_TTL_SECONDS_DEFAULT = 45
+_WAITER_TTL_SECONDS_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_LOCATION_WAITER_TTL_SECONDS')
+_POOL_KEY_VERSION = 1
+_UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
+
+
+class ClaimResult(enum.Enum):
+    """Result of atomically persisting one paid-capacity claim."""
+
+    ACQUIRED = 'acquired'
+    SATURATED = 'saturated'
+    HIGHER_PRIORITY_WAITING = 'higher_priority_waiting'
+    OWNERSHIP_LOST = 'ownership_lost'
+    LEGACY_LOCAL = 'legacy_local'
+
+
+class LaunchOutcome(enum.Enum):
+    """Capacity evidence from one completed paid launch."""
+
+    SUCCESS = 'success'
+    CAPACITY_FAILURE = 'capacity_failure'
+    OTHER_FAILURE = 'other_failure'
+
+
+@dataclasses.dataclass
+class LaunchBudget:
+    """One wave's advisory headroom and exact pool identity."""
+
+    remaining_by_location: dict[spot_placer.Location, int]
+    pool_key_by_location: dict[spot_placer.Location, str]
+    states_by_pool_key: dict[str, dict[str, Any]]
+    globally_managed: bool
+    priority_deferred_pool_keys: set[str] = dataclasses.field(
+        default_factory=set)
+
+
+@dataclasses.dataclass(frozen=True)
+class RampUpdate:
+    """Pure adaptive-limit transition produced from provider feedback."""
+
+    current_limit: int
+    successes_since_resize: int
+    expired: bool
+    failed: bool
+
+
+@functools.cache
+def _parse_positive_int(raw_value: str | None, default: int,
+                        variable: str) -> int:
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning(
+            f'Invalid {variable} value {raw_value!r}; using {default}.')
+        return default
+    return value
+
+
+def base_limit() -> int:
+    """Return the first unresolved paid-capacity cohort size."""
+    return _parse_positive_int(os.environ.get(_BASE_LIMIT_ENV_VAR),
+                               _BASE_LIMIT_DEFAULT, _BASE_LIMIT_ENV_VAR)
+
+
+def legacy_local_limit() -> int:
+    """Return the pre-global per-service window for local SQLite."""
+    return _parse_positive_int(os.environ.get(_BASE_LIMIT_ENV_VAR),
+                               _LEGACY_LOCAL_LIMIT_DEFAULT, _BASE_LIMIT_ENV_VAR)
+
+
+def max_limit() -> int:
+    """Return the largest adaptive unresolved paid-capacity cohort."""
+    configured = _parse_positive_int(os.environ.get(_MAX_LIMIT_ENV_VAR),
+                                     _MAX_LIMIT_DEFAULT, _MAX_LIMIT_ENV_VAR)
+    return max(base_limit(), configured)
+
+
+def success_ttl_seconds() -> int:
+    """Return how long successful feedback keeps an expanded cohort."""
+    return _parse_positive_int(os.environ.get(_SUCCESS_TTL_SECONDS_ENV_VAR),
+                               _SUCCESS_TTL_SECONDS_DEFAULT,
+                               _SUCCESS_TTL_SECONDS_ENV_VAR)
+
+
+def waiter_ttl_seconds() -> int:
+    """Return how long a service's priority heartbeat remains eligible."""
+    return _parse_positive_int(os.environ.get(_WAITER_TTL_SECONDS_ENV_VAR),
+                               _WAITER_TTL_SECONDS_DEFAULT,
+                               _WAITER_TTL_SECONDS_ENV_VAR)
+
+
+def effective_limit(
+    current_limit: int,
+    last_success_at: float | None,
+    *,
+    bootstrap_limit: int,
+    ceiling_limit: int,
+    now: float,
+    ttl_seconds: float,
+) -> tuple[int, bool]:
+    """Clamp and expire one persisted adaptive limit."""
+    effective = max(bootstrap_limit, min(ceiling_limit, int(current_limit)))
+    has_positive_evidence = (effective > bootstrap_limit or
+                             last_success_at is not None)
+    expired = (has_positive_evidence and (last_success_at is None or
+                                          now - last_success_at >= ttl_seconds))
+    return (bootstrap_limit if expired else effective), expired
+
+
+def record_outcomes(
+    current_limit: int,
+    successes_since_resize: int,
+    last_success_at: float | None,
+    outcomes: Iterable[LaunchOutcome],
+    *,
+    bootstrap_limit: int,
+    ceiling_limit: int,
+    now: float,
+    ttl_seconds: float,
+) -> RampUpdate:
+    """Apply genuine launch feedback to one exact pool's adaptive limit."""
+    completed = list(outcomes)
+    if not completed:
+        raise ValueError('At least one paid-capacity outcome is required.')
+    if LaunchOutcome.CAPACITY_FAILURE in completed:
+        return RampUpdate(current_limit=bootstrap_limit,
+                          successes_since_resize=0,
+                          expired=False,
+                          failed=True)
+    successful = sum(outcome == LaunchOutcome.SUCCESS for outcome in completed)
+    if successful == 0:
+        return RampUpdate(current_limit=int(current_limit),
+                          successes_since_resize=max(
+                              0, int(successes_since_resize)),
+                          expired=False,
+                          failed=False)
+
+    current_limit, expired = effective_limit(current_limit,
+                                             last_success_at,
+                                             bootstrap_limit=bootstrap_limit,
+                                             ceiling_limit=ceiling_limit,
+                                             now=now,
+                                             ttl_seconds=ttl_seconds)
+    success_count = (0 if expired else max(0, int(successes_since_resize)))
+    success_count += successful
+    while success_count >= current_limit and current_limit < ceiling_limit:
+        success_count -= current_limit
+        current_limit = min(ceiling_limit, current_limit * 2)
+    if current_limit >= ceiling_limit:
+        success_count = min(success_count, ceiling_limit - 1)
+    return RampUpdate(current_limit=current_limit,
+                      successes_since_resize=success_count,
+                      expired=expired,
+                      failed=False)
+
+
+def _normalized_accelerators(
+    accelerators: Mapping[str, int | float] | None
+) -> list[list[str | int | float]]:
+    if not accelerators:
+        return []
+    normalized = []
+    for name, count in sorted(accelerators.items(),
+                              key=lambda item: item[0].casefold()):
+        normalized_count: int | float = count
+        if isinstance(count, float) and count.is_integer():
+            normalized_count = int(count)
+        normalized.append([str(name).casefold(), normalized_count])
+    return normalized
+
+
+def pool_key(location: spot_placer.Location, *, workspace: str,
+             num_nodes: int) -> str:
+    """Build a stable identity for one exact provider capacity pool."""
+    payload = {
+        'version': _POOL_KEY_VERSION,
+        'workspace': workspace,
+        'cloud': str(location.cloud).casefold(),
+        'region': location.region,
+        'zone': location.zone,
+        'instance_type': location.instance_type,
+        'accelerators': _normalized_accelerators(location.accelerators),
+        'use_spot': location.use_spot,
+        'num_nodes': num_nodes,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def _legacy_local_remaining(
+    placer: spot_placer.SpotPlacer,
+    paid_locations: Iterable[spot_placer.Location],
+    existing_replica_infos: list['replica_managers.ReplicaInfo'],
+) -> dict[spot_placer.Location, int]:
+    remaining = {location: legacy_local_limit() for location in paid_locations}
+    for info in existing_replica_infos:
+        if (getattr(info.status, 'value', info.status)
+                not in _UNRESOLVED_STATUS_VALUES):
+            continue
+        replica_location = info.get_spot_location()
+        if replica_location is None:
+            continue
+        # Local SQLite has no cross-service claim identity to protect. Mirror
+        # the operational rollout resolver so an ambiguous pre-instance-type
+        # row still debits the cheapest compatible pool it would launch on.
+        resolved = placer.resolve_location(replica_location,
+                                           allow_ambiguous_legacy_shape=True)
+        if resolved in remaining:
+            remaining[resolved] = max(0, remaining[resolved] - 1)
+    return remaining
+
+
+def central_authority_available() -> bool:
+    """Whether this process has the PostgreSQL shared-authority backend."""
+    return (serve_state.get_database_engine().dialect.name == 'postgresql')
+
+
+def build_launch_budget(
+    placer: spot_placer.SpotPlacer,
+    *,
+    workspace: str,
+    existing_replica_infos: list['replica_managers.ReplicaInfo'],
+    globally_managed: bool,
+) -> LaunchBudget:
+    """Read one advisory shared-capacity snapshot for all active paid pools."""
+    zero_cost = set(placer.zero_cost_locations())
+    paid_locations = [
+        location for location in placer.active_locations()
+        if location not in zero_cost
+    ]
+    keys = {
+        location: pool_key(location,
+                           workspace=workspace,
+                           num_nodes=getattr(placer, 'num_nodes',
+                                             1)) for location in paid_locations
+    }
+    if not globally_managed or not central_authority_available():
+        return LaunchBudget(remaining_by_location=_legacy_local_remaining(
+            placer, paid_locations, existing_replica_infos),
+                            pool_key_by_location=keys,
+                            states_by_pool_key={},
+                            globally_managed=False)
+
+    now = time.time()
+    states = serve_state.get_paid_capacity_pool_states(
+        list(keys.values()),
+        base_limit=base_limit(),
+        max_limit=max_limit(),
+        now=now,
+        success_ttl_seconds=success_ttl_seconds())
+    remaining = {
+        location: int(states[key]['remaining'])
+        for location, key in keys.items()
+    }
+    logger.debug('Global paid-capacity snapshot: '
+                 f'limits={base_limit()}..{max_limit()}, '
+                 f'pools={len(states)}, remaining='
+                 f'{sorted(state["remaining"] for state in states.values())}.')
+    return LaunchBudget(remaining_by_location=remaining,
+                        pool_key_by_location=keys,
+                        states_by_pool_key=states,
+                        globally_managed=True)
+
+
+def select_location(
+    placer: spot_placer.SpotPlacer,
+    budget: LaunchBudget,
+    *,
+    skip_zero_cost_preference: bool = False,
+    allowed_locations: set[spot_placer.Location] | None = None,
+) -> spot_placer.Location | None:
+    """Select the cheapest location that still has advisory paid headroom."""
+    active = [
+        location for location in placer.active_locations()
+        if allowed_locations is None or location in allowed_locations
+    ]
+    if not active:
+        selection_kwargs: dict[str, Any] = {}
+        if skip_zero_cost_preference:
+            selection_kwargs['skip_zero_cost_preference'] = True
+        if allowed_locations is not None:
+            selection_kwargs['allowed_locations'] = set()
+        return placer.select_next_location(**selection_kwargs)
+    zero_cost = set(placer.zero_cost_locations())
+    active_paid = [location for location in active if location not in zero_cost]
+    available_paid = {
+        location for location in active_paid
+        if budget.remaining_by_location.get(location, 0) > 0
+    }
+    if skip_zero_cost_preference and active_paid and not available_paid:
+        return None
+    candidates = available_paid | {
+        location for location in active if location in zero_cost
+    }
+    if not candidates:
+        return None
+    selected = placer.select_next_location(
+        skip_zero_cost_preference=skip_zero_cost_preference,
+        allowed_locations=candidates)
+    if selected is None or selected in zero_cost:
+        return selected
+    selected_key = budget.pool_key_by_location.get(selected)
+    if selected_key in budget.priority_deferred_pool_keys:
+        return None
+    return selected
+
+
+def defer_for_priority(budget: LaunchBudget | None,
+                       location: spot_placer.Location | None) -> None:
+    """Stop this wave at a priority-deferred pool without enabling spill."""
+    if budget is None or location is None:
+        return
+    key = budget.pool_key_by_location.get(location)
+    if key is not None:
+        budget.priority_deferred_pool_keys.add(key)
+
+
+def debit(budget: LaunchBudget | None,
+          location: spot_placer.Location | None) -> None:
+    """Debit a claim accepted after the advisory snapshot was read."""
+    if budget is None or location not in budget.remaining_by_location:
+        return
+    key = budget.pool_key_by_location.get(location)
+    aliases = [
+        candidate for candidate in budget.remaining_by_location
+        if candidate == location or
+        (key is not None and budget.pool_key_by_location.get(candidate) == key)
+    ]
+    for candidate in aliases:
+        remaining = budget.remaining_by_location[candidate]
+        if remaining > 0:
+            budget.remaining_by_location[candidate] = remaining - 1
+
+
+def exhaust(budget: LaunchBudget | None,
+            location: spot_placer.Location | None) -> None:
+    """Stop this wave from repeatedly racing a saturated exact pool."""
+    if budget is None or location not in budget.remaining_by_location:
+        return
+    key = budget.pool_key_by_location.get(location)
+    for candidate in budget.remaining_by_location:
+        if (candidate == location or
+            (key is not None and
+             budget.pool_key_by_location.get(candidate) == key)):
+            budget.remaining_by_location[candidate] = 0
+
+
+def try_persist_claim(
+    *,
+    service_name: str,
+    service_hash: str | None,
+    controller_owner: tuple[int | None, str | None] | None,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    location: spot_placer.Location,
+    budget: LaunchBudget,
+    priority: int,
+) -> ClaimResult:
+    """Atomically persist a replica row and exact-pool capacity claim."""
+    if not budget.globally_managed or service_hash is None:
+        return ClaimResult.LEGACY_LOCAL
+    key = budget.pool_key_by_location[location]
+    result = serve_state.try_add_replica_with_paid_capacity_claim(
+        service_name,
+        service_hash,
+        replica_id,
+        replica_info,
+        pool_key=key,
+        priority=max(constants.LB_REQUEST_PRIORITY_MIN,
+                     min(constants.LB_REQUEST_PRIORITY_MAX, priority)),
+        base_limit=base_limit(),
+        max_limit=max_limit(),
+        now=time.time(),
+        success_ttl_seconds=success_ttl_seconds(),
+        waiter_ttl_seconds=waiter_ttl_seconds(),
+        expected_controller_owner=controller_owner)
+    return ClaimResult(result)
+
+
+def adopt_existing_claims(
+    *,
+    service_name: str,
+    service_hash: str | None,
+    controller_owner: tuple[int | None, str | None] | None,
+    workspace: str,
+    placer: spot_placer.SpotPlacer | None,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    priority: int,
+) -> bool:
+    """Adopt unresolved legacy rows before recovery re-drives their launches."""
+    if service_hash is None or not central_authority_available():
+        return True
+    zero_cost = set(
+        placer.zero_cost_locations()) if placer is not None else set()
+    claims = []
+    for info in replica_infos:
+        if (getattr(info.status, 'value',
+                    info.status) not in _UNRESOLVED_STATUS_VALUES or
+                getattr(info, 'reserved_fill', False) or
+                getattr(info, 'is_zero_cost', False) or getattr(
+                    info, 'cost_rebalance_for_replica_id', None) is not None):
+            continue
+        existing_key = getattr(info, 'paid_capacity_pool_key', None)
+        if isinstance(existing_key, str):
+            claims.append((info.replica_id, existing_key, priority, info))
+            continue
+        if placer is None:
+            continue
+        replica_location = info.get_spot_location()
+        if replica_location is None:
+            continue
+        location = placer.resolve_location(replica_location)
+        if location is None or location in zero_cost:
+            continue
+        key = pool_key(location,
+                       workspace=workspace,
+                       num_nodes=getattr(placer, 'num_nodes', 1))
+        claims.append((info.replica_id, key, priority, info))
+    return serve_state.adopt_paid_capacity_claims(
+        service_name,
+        service_hash,
+        claims,
+        base_limit=base_limit(),
+        now=time.time(),
+        expected_controller_owner=controller_owner)
+
+
+def persist_completed_launches(
+    *,
+    service_name: str,
+    service_hash: str | None,
+    controller_owner: tuple[int | None, str | None] | None,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+    outcomes: dict[int, LaunchOutcome],
+) -> bool | None:
+    """Persist completed rows and feed claimed outcomes into the ramp."""
+    if service_hash is None or not central_authority_available():
+        return None
+    return serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+        service_name,
+        service_hash,
+        replica_infos,
+        outcomes,
+        base_limit=base_limit(),
+        max_limit=max_limit(),
+        now=time.time(),
+        success_ttl_seconds=success_ttl_seconds(),
+        expected_controller_owner=controller_owner)
