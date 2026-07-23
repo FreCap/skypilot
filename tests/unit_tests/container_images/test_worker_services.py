@@ -1267,6 +1267,181 @@ def test_ec2_canary_malformed_discovered_identity_uses_settling_teardown(
     ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-late'])
 
 
+def test_ec2_canary_persistent_malformed_discovery_preserves_custody(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    operation = dataclasses.replace(
+        operation,
+        child_launch_id=f'ec2:us-west-2:{operation.id}',
+    )
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+
+    malformed = {'State': {'Name': 'running'}}
+    response = {'Reservations': [{'Instances': [malformed]}]}
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = [response] * 4
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
+                        lambda *_args, **_kwargs: ec2)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        (payload, _revision(profile), profile, target, binding, _DIGEST,
+         f'{target.registry}/qualification@{_DIGEST}'))
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 2)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+    failed = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', failed)
+
+    assert not canary_worker_service.run_canary(operation)
+
+    assert ec2.describe_instances.call_count == 4
+    ec2.run_instances.assert_not_called()
+    ec2.terminate_instances.assert_not_called()
+    failed.assert_not_called()
+    assert operation.child_launch_id is not None
+
+
+@pytest.mark.parametrize('malformed', [
+    {
+        'State': {
+            'Name': 'running'
+        }
+    },
+    {
+        'InstanceId': 7,
+        'State': {
+            'Name': 'running'
+        }
+    },
+    {
+        'InstanceId': '',
+        'State': {
+            'Name': 'running'
+        }
+    },
+],
+                         ids=['missing-id', 'non-string-id', 'empty-id'])
+def test_ec2_canary_terminal_child_plus_malformed_discovery_preserves_custody(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        malformed: dict[str, object]) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        return {'Reservations': [{'Instances': list(instances)}]}
+
+    known_running = {
+        'InstanceId': 'i-known',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    known_terminated = {
+        'InstanceId': 'i-known',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        response(known_running),
+        response(known_terminated, malformed),
+        response(known_terminated, malformed),
+        response(known_terminated),
+    )
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': 'arn:aws:iam::123456789012:role/wrong-role',
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    attached = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', attached)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        (payload, _revision(profile), profile, target, binding, _DIGEST,
+         f'{target.registry}/qualification@{_DIGEST}'))
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+    failed = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', failed)
+
+    assert not canary_worker_service.run_canary(operation)
+
+    assert ec2.describe_instances.call_count == 4
+    ec2.run_instances.assert_not_called()
+    ec2.terminate_instances.assert_not_called()
+    failed.assert_not_called()
+    attached.assert_called_once_with(
+        operation.id,
+        operation.lease_token,
+        f'ec2:us-west-2:{operation.id}',
+    )
+
+
+def test_ec2_teardown_resolves_prior_malformed_inventory_after_clean_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = [
+        {
+            'Reservations': []
+        },
+        {
+            'Reservations': []
+        },
+    ]
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 2)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=False,
+        initial_unidentified_child_observed=True)
+
+    assert ec2.describe_instances.call_count == 2
+    ec2.terminate_instances.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ('late_state', 'terminalizes'), [
         ('terminated', True),

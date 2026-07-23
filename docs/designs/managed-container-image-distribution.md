@@ -686,16 +686,30 @@ when AWS returned a nominal response. Cleanup must then replay the stable client
 token or run the full repeated tag-absence settling window; one empty discovery
 cannot terminalize the operation. A child that becomes visible during that
 window is added to the retained set and followed through verified termination.
+An operation-tag inventory is exact absence only when its complete child list is
+empty. Any nonempty record whose `InstanceId` is missing, empty, or non-string is
+unidentifiable child evidence, never absence and never part of an entirely
+identified terminal set. The worker retains this ambiguity from every tag read,
+including discovery, polling, and the immediate `finally` read, and passes it
+into teardown. A clean proof after such a read requires a new complete settling
+window after the latest ambiguity: every observation in that window must contain
+only concrete retained IDs, and the final ID-scoped response must cover that
+entire set in `terminated`; if the inventories are all empty, the window is the
+repeated exact-absence proof. A later malformed inventory restarts that proof,
+which cannot finish inside the current bounded invocation and therefore remains
+successor-owned. This rule also disables the ordinary confirmed-child early
+return when an unidentifiable tagged record has been observed.
 Ambiguity settling consumes every bounded discovery attempt even after the
 currently retained IDs have all reached `terminated`; ordinary confirmed-child
 teardown may still return as soon as exact termination is proved. Every settling
 attempt refreshes the complete operation-tag inventory, retains and terminates
 new IDs, and reads the exact state of the complete retained set. The final
-attempt succeeds only when no child appeared during the whole window, or when
-the exact-state response covers every retained ID and every state is
-`terminated`. A child that appears too late to prove termination makes cleanup
-fail closed, so `CANARY_TEARDOWN_FAILED` preserves the RUNNING operation for a
-successor instead of discarding custody.
+attempt succeeds only when the clean-window requirement is satisfied and either
+no child appeared during that whole window, or the exact-state response covers
+every retained ID and every state is `terminated`. A child that appears too late
+to prove termination, or any unidentifiable child whose clean window is
+incomplete, makes cleanup fail closed, so `CANARY_TEARDOWN_FAILED` preserves the
+RUNNING operation for a successor instead of discarding custody.
 
 Canary intent creation locks the desired profile row and reserves its conservative
 worst-case cost in a UTC daily window before committing the operation. Concurrent
@@ -2683,7 +2697,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   unknown EKS placement only with its exact qualified AMD64 selector, and
   preserving policy-allowed exact-reference direct fallback, plus fresh-launch
   and replay tests that reject a different operation-tagged EC2 child, consume
-  no attestation fields from it, and verify teardown of every observed child;
+  no attestation fields from it, and verify teardown of every observed child,
+  plus persistent malformed-tag and terminated-known-plus-malformed schedules
+  proving that nonempty unidentifiable inventory cannot terminalize or clear the
+  operation owner, while one full clean window can resolve earlier ambiguity;
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;
@@ -3438,3 +3455,17 @@ proof was not. This revision commits the relaxed fixture transaction before
 opening a new default-timeout transaction, asserts the restored 15-second
 ceiling, and only then executes both plan proofs. The acceptance streak remains
 zero.
+
+Codex final-acceptance round 1 at
+`1c3d60891e263ab2bb8db5f56bab05d11e94baa5` returned `RESHAPE`; Fable again
+could not start because its exact-model request returned HTTP 429 with zero
+tokens. Codex re-proved the PostgreSQL bounded-plan repair and the complete
+backend, Dashboard, Helm, Terraform-validation, and 26-check GitHub gates, then
+reproduced one remaining EC2 custody defect. Teardown silently discarded
+nonempty operation-tag records with a missing or non-string `InstanceId`, so a
+persistent malformed child, or a malformed child beside one known terminated
+child, could be certified as absence and clear the durable owner. This revision
+distinguishes exact empty inventory from unidentifiable child evidence, carries
+tag-read ambiguity through teardown, requires a complete clean settling window
+after the latest ambiguity, and preserves the RUNNING operation whenever that
+proof is incomplete. The acceptance streak remains zero.

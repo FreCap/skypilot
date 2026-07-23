@@ -271,11 +271,16 @@ def _instance_id(instance: dict[str, Any]) -> str:
 
 
 def _remember_instance_ids(instances: list[dict[str, Any]],
-                           known_ids: set[str]) -> None:
+                           known_ids: set[str]) -> bool:
+    """Retains concrete IDs and reports any unidentifiable child record."""
+    unidentified_child_observed = False
     for instance in instances:
         value = instance.get('InstanceId')
         if isinstance(value, str) and value:
             known_ids.add(value)
+        else:
+            unidentified_child_observed = True
+    return unidentified_child_observed
 
 
 def _exact_canary_instance(ec2: Any, instance_id: str,
@@ -317,21 +322,38 @@ def _instance_states(ec2: Any, instance_ids: set[str]) -> dict[str, str | None]:
     }
 
 
-def _terminate_ec2_instances(ec2: Any, operation_id: str,
-                             instance_ids: list[str], *,
-                             settle_absence: bool) -> bool:
-    known_ids = set(instance_ids)
+def _terminate_ec2_instances(
+        ec2: Any,
+        operation_id: str,
+        instance_ids: list[str],
+        *,
+        settle_absence: bool,
+        initial_unidentified_child_observed: bool = False) -> bool:
+    known_ids = {
+        instance_id for instance_id in instance_ids
+        if isinstance(instance_id, str) and instance_id
+    }
+    unidentified_child_observed = (initial_unidentified_child_observed or any(
+        not isinstance(instance_id, str) or not instance_id
+        for instance_id in instance_ids))
+    clean_observations_after_ambiguity = 0
     termination_requested: set[str] = set()
     for attempt in range(_EC2_TEARDOWN_ATTEMPTS):
         tagged = _tagged_instances(ec2, operation_id)
-        known_ids.update(
-            str(instance['InstanceId'])
-            for instance in tagged
-            if isinstance(instance.get('InstanceId'), str))
+        unidentified_in_observation = _remember_instance_ids(tagged, known_ids)
+        if unidentified_in_observation:
+            unidentified_child_observed = True
+            clean_observations_after_ambiguity = 0
+        elif unidentified_child_observed:
+            clean_observations_after_ambiguity += 1
+        ambiguity_resolved = (not unidentified_child_observed or
+                              clean_observations_after_ambiguity
+                              >= _EC2_TEARDOWN_ATTEMPTS)
         terminal_ids = {
             str(instance['InstanceId'])
             for instance in tagged
             if isinstance(instance.get('InstanceId'), str) and
+            instance.get('InstanceId') and
             (instance.get('State') or {}).get('Name') == 'terminated'
         }
         to_terminate = sorted(known_ids - termination_requested - terminal_ids)
@@ -343,9 +365,10 @@ def _terminate_ec2_instances(ec2: Any, operation_id: str,
             states = _instance_states(ec2, known_ids)
             all_known_terminated = (set(states) == known_ids and all(
                 state == 'terminated' for state in states.values()))
-            if all_known_terminated and not settle_absence:
+            if (all_known_terminated and not settle_absence and
+                    ambiguity_resolved):
                 return True
-        elif not settle_absence:
+        if not known_ids and not settle_absence and ambiguity_resolved:
             return True
         if attempt == _EC2_TEARDOWN_ATTEMPTS - 1:
             # A full provider-settle window with repeated exact tag absence is
@@ -354,7 +377,8 @@ def _terminate_ec2_instances(ec2: Any, operation_id: str,
             # retained ID and prove all of them terminated. A child appearing
             # too late remains successor-owned cleanup instead of being
             # terminalized as an ordinary qualification failure.
-            return not known_ids or all_known_terminated
+            return (ambiguity_resolved and
+                    (not known_ids or all_known_terminated))
         time.sleep(_EC2_TEARDOWN_POLL_SECONDS)
     return False
 
@@ -402,6 +426,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     ec2: _FencedClient | None = None
     instances: list[dict[str, Any]] = []
     known_instance_ids: set[str] = set()
+    unidentified_tagged_child_observed = False
     instance_id: str | None = None
     launch_attempted = False
     launch_confirmed = False
@@ -425,7 +450,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             'SkyPilotProfile': profile.name,
         }
         instances = _tagged_instances(ec2, operation.id)
-        _remember_instance_ids(instances, known_instance_ids)
+        unidentified_tagged_child_observed |= _remember_instance_ids(
+            instances, known_instance_ids)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
         if instances:
@@ -503,7 +529,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         while time.monotonic() < deadline:
             heartbeat.assert_owned()
             matching_instances = _tagged_instances(ec2, operation.id)
-            _remember_instance_ids(matching_instances, known_instance_ids)
+            unidentified_tagged_child_observed |= _remember_instance_ids(
+                matching_instances, known_instance_ids)
             if len(matching_instances) > 1:
                 raise ValueError('CANARY_DUPLICATE_CHILD')
             if not matching_instances:
@@ -543,14 +570,17 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 raise RuntimeError('EC2 canary teardown authority unavailable.')
             else:
                 live_instances = _tagged_instances(ec2, operation.id)
-                _remember_instance_ids(live_instances, known_instance_ids)
+                unidentified_tagged_child_observed |= _remember_instance_ids(
+                    live_instances, known_instance_ids)
                 teardown_verified = _terminate_ec2_instances(
                     ec2,
                     operation.id,
                     sorted(known_instance_ids),
                     settle_absence=(persisted_child or
                                     ((launch_attempted or bool(instances)) and
-                                     not launch_confirmed)))
+                                     not launch_confirmed)),
+                    initial_unidentified_child_observed=(
+                        unidentified_tagged_child_observed))
         except worker_lease.LeaseLostError:
             raise
         except Exception:  # pylint: disable=broad-except
