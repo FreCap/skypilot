@@ -69,6 +69,20 @@ def _normalize_image_id(
     return image_id
 
 
+def _location_image_fields_from_resources(
+    resources: 'resources_lib.Resources',
+) -> tuple[dict[str | None, str] | None, container_image_models.ContainerImage |
+           None]:
+    image_id = _normalize_image_id(resources.image_id)
+    container_image = resources.container_image
+    if (container_image is not None and container_image._legacy_direct):  # pylint: disable=protected-access
+        assert container_image.ref is not None
+        image_id = dict(image_id or {})
+        image_id['docker'] = container_image.ref
+        container_image = None
+    return image_id, container_image
+
+
 def _preemption_retry_seconds() -> float:
     override = os.environ.get(_PREEMPTION_RETRY_SECONDS_ENV_VAR)
     if override is not None:
@@ -158,7 +172,8 @@ class Location:
     def from_resources(cls, resources: 'resources_lib.Resources') -> 'Location':
         assert resources.cloud is not None, 'Cloud must be specified'
         assert resources.region is not None, 'Region must be specified'
-        image_id = _normalize_image_id(resources.image_id)
+        image_id, container_image = _location_image_fields_from_resources(
+            resources)
         disk_tier = (resources.disk_tier.value
                      if resources.disk_tier is not None else None)
         return cls(resources.cloud,
@@ -167,7 +182,7 @@ class Location:
                    accelerators=resources.accelerators,
                    use_spot=resources.use_spot,
                    image_id=image_id,
-                   container_image=resources.container_image,
+                   container_image=container_image,
                    disk_tier=disk_tier,
                    ephemeral_storage=resources.ephemeral_storage)
 
@@ -481,9 +496,9 @@ def _get_possible_location_from_task(
                         # differently).
                         loc.accelerators = candidate_shape.accelerators
                         loc.use_spot = candidate_shape.use_spot
-                        loc.image_id = _normalize_image_id(
-                            candidate_shape.image_id)
-                        loc.container_image = candidate_shape.container_image
+                        loc.image_id, loc.container_image = (
+                            _location_image_fields_from_resources(
+                                candidate_shape))
                         loc.disk_tier = (candidate_shape.disk_tier.value
                                          if candidate_shape.disk_tier
                                          is not None else None)
