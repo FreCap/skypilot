@@ -2473,6 +2473,8 @@ def get_free_worker_resources(
     pool: str,
     replicas: list['replica_managers.ReplicaInfo'] | None = None,
     cluster_records: dict[str, dict[str, Any] | None] | None = None,
+    resolved_handles: dict[str, backends.CloudVmRayResourceHandle | None] |
+    None = None,
 ) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
@@ -2483,6 +2485,9 @@ def get_free_worker_resources(
         cluster_records: Optional cluster-table snapshot keyed by worker name.
             When provided, the free-resource walk reuses it instead of issuing
             a second batched cluster read.
+        resolved_handles: Optional output mapping keyed by worker name. When
+            provided, each worker's resolved handle is stored for reuse by the
+            caller's post-selection bookkeeping.
 
     Returns:
         Dictionary mapping cluster_name (worker) to free Resources object (or
@@ -2511,6 +2516,8 @@ def get_free_worker_resources(
         cluster_record = cluster_records.get(cluster_name)
         handle = (None if cluster_record is None else
                   replica_info.handle(cluster_record))
+        if resolved_handles is not None:
+            resolved_handles[cluster_name] = handle
         if handle is None or handle.launched_resources is None:
             free_resources[cluster_name] = None
             continue
@@ -2605,12 +2612,16 @@ def get_next_cluster_name(
 
         free_resources = None
         cluster_records = None
+        resolved_handles: dict[str, backends.CloudVmRayResourceHandle |
+                               None] | None = None
         if resource_aware:
             cluster_records = _get_pool_cluster_records(replicas)
+            resolved_handles = {}
             free_resources = get_free_worker_resources(
                 service_name,
                 replicas=replicas,
-                cluster_records=cluster_records)
+                cluster_records=cluster_records,
+                resolved_handles=resolved_handles)
             logger.debug(f'Free resources: {free_resources!r}')
             resource_aware = free_resources is not None
         if resource_aware and free_resources is not None:
@@ -2699,9 +2710,13 @@ def get_next_cluster_name(
         if cluster_records is None:
             handle = replica_info.handle()
         else:
-            cluster_record = cluster_records.get(replica_info.cluster_name)
-            handle = (None if cluster_record is None else
-                      replica_info.handle(cluster_record))
+            handle = None
+            if resolved_handles is not None:
+                handle = resolved_handles.get(replica_info.cluster_name)
+            if handle is None:
+                cluster_record = cluster_records.get(replica_info.cluster_name)
+                handle = (None if cluster_record is None else
+                          replica_info.handle(cluster_record))
         if handle is not None and handle.launched_resources is not None:
             lr = handle.launched_resources
             managed_job_state.set_job_infra(
