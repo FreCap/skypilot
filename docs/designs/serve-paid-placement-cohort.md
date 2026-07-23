@@ -508,9 +508,12 @@ rollback.
 ## Verification Evidence
 
 Pre-PR implementation evidence on 2026-07-23, integrated onto
-`d9b04d5cda0aa94cf9daa658fce808857035c16d`:
+`0c8ef6be33889bba2adf53dd4073a42e552ba7c3`:
 
-- 934 affected unit tests passed sequentially.
+- All 934 affected unit tests passed sequentially before the final upstream
+  merge. After integration, 933 deterministic tests passed; the remaining
+  validator was isolated after its live EKS discovery call hung locally and is
+  retained in the full CI gate.
 - 36 real PostgreSQL authority and migration-chain tests passed, including a
   027 to 026 to 027 cycle.
 - Changed production files passed pylint at 10.00/10.
@@ -518,8 +521,9 @@ Pre-PR implementation evidence on 2026-07-23, integrated onto
 - YAPF, isort, and `git diff --check` completed cleanly.
 - The final exact-tree Opus pass returned `APPROVE` after confirming every
   earlier concurrency, priority, migration, rollout, and test finding was
-  addressed. Its one follow-up YAPF alignment was fixed and the resulting tree
-  was re-approved.
+  addressed. Its one follow-up YAPF alignment was fixed and re-approved. Opus
+  also reviewed the final merge with the new incomplete-fill-shelter fallback
+  and approved the combined compatibility-completeness semantics.
 
 After deployment this section is updated with the merge SHA, published image
 and chart version, Helm revision, migration state, API health, controller
