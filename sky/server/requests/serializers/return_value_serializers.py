@@ -8,6 +8,7 @@ time. This module handles dict -> JSON string serialization at encode() time,
 with version-aware field filtering for backward compatibility.
 """
 from collections.abc import Callable
+import json
 from typing import Any
 
 import orjson
@@ -42,7 +43,13 @@ def get_serializer(name: str) -> Callable[[Any], str]:
 @register_serializer(server_constants.DEFAULT_HANDLER_NAME)
 def default_serializer(return_value: Any) -> str:
     """The default serializer."""
-    return orjson.dumps(return_value).decode('utf-8')
+    try:
+        return orjson.dumps(return_value).decode('utf-8')
+    except TypeError:
+        # orjson rejects some payloads stdlib json accepts, e.g. dict keys
+        # that are legacy (non-compact) unicode objects produced by the
+        # Postgres driver on Python < 3.12.
+        return json.dumps(return_value)
 
 
 @register_serializer('kubernetes_node_info')
