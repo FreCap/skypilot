@@ -203,7 +203,8 @@ class Location:
         # is applied to every any_of entry, so each selected location must
         # strip fields that only another backend supports.
         d['image_id'] = self.image_id
-        d['container_image'] = self.container_image
+        d['container_image'] = (self.container_image.to_yaml_config()
+                                if self.container_image is not None else None)
         d['disk_tier'] = self.disk_tier
         d['ephemeral_storage'] = self.ephemeral_storage
         return d
