@@ -68,6 +68,33 @@ sqlalchemy.Index('serve_placement_events_retention_idx',
 
 logger = sky_logging.init_logger(__name__)
 
+# Every event column except service_hash, as plain string literals. History
+# event dicts must be keyed with these rather than row.keys() or Column.name:
+# the SQLAlchemy/psycopg2 result path hands back column names as str
+# subclasses or legacy unicode objects, which orjson rejects as dict keys
+# when the request result is persisted (leaving the request stuck RUNNING).
+EVENT_FIELDS = (
+    'event_id',
+    'service_name',
+    'request_id',
+    'replica_id',
+    'cluster_name',
+    'attempt_ordinal',
+    'observed_at',
+    'outcome',
+    'provider',
+    'region',
+    'zone',
+    'instance_type',
+    'accelerators',
+    'use_spot',
+    'num_nodes',
+    'hourly_price',
+    'price_source',
+    'error_code',
+    'error_summary',
+)
+
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 _buffer_lock = threading.Lock()
 _request_events: list[dict[str, Any]] = []
@@ -328,9 +355,9 @@ def get_history(
     events = []
     for row in page_rows:
         events.append({
-            key: (row[key].timestamp() if key == 'observed_at' else row[key])
-            for key in row.keys()
-            if key != 'service_hash'
+            field: (
+                row[field].timestamp() if field == 'observed_at' else row[field]
+            ) for field in EVENT_FIELDS
         })
     next_cursor = None
     if has_more and page_rows:

@@ -1590,8 +1590,19 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
         set_clauses.append('return_value = ?')
-        params.append(
-            serializer(_encoded_return_value(name, request_id, result)))
+        # A serializer failure must degrade to a null return value rather
+        # than raise: an exception here escapes the executor wrapper after
+        # its try/except and leaves the row stuck in RUNNING forever (the
+        # same hazard `_encoded_return_value` guards against).
+        try:
+            serialized = serializer(
+                _encoded_return_value(name, request_id, result))
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Serializer for request {request_id} ({name}) '
+                           f'failed; storing None: '
+                           f'{common_utils.format_exception(e)}')
+            serialized = 'null'
+        params.append(serialized)
     if error is not None:
         set_clauses.append('error = ?')
         params.append(orjson.dumps(_build_error_dict(error)).decode('utf-8'))
