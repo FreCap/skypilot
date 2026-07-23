@@ -21,6 +21,14 @@ class TestTransientSshFailurePattern:
                   'connected.')
         assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is not None
 
+    def test_ssm_target_instance_not_found_is_not_transient(self):
+        # A successful EC2 lookup with no instance is stale cluster evidence,
+        # not a momentary SSM transport drop. Let the caller refresh provider
+        # state immediately instead of retrying the same empty lookup.
+        stderr = (
+            'SkyPilot SSM target instance not found for SSH host 10.0.0.1')
+        assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is None
+
     def test_kex_exchange_is_transient(self):
         stderr = ('kex_exchange_identification: Connection closed by remote '
                   'host')

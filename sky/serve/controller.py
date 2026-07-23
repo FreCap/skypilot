@@ -412,19 +412,15 @@ class SkyServeController:
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
-        """Best-effort seed of an autoscaler's zero-cost location set.
+        """Seed known zero-cost identities without blocking controller boot.
 
-        zero_cost_locations() computes per-location costs via the
-        placer's cache, but an UNCACHED Kubernetes location's cost
-        lookup CAN hit the live Kubernetes API (instance-fit check), so
-        a transient API blip in that window can raise. Seeding is
-        therefore best-effort: any failure is logged and swallowed,
-        degrading to the documented pre-seed behavior (empty location
-        set; suppression engages after the first successful poll feeds
-        it) instead of killing controller boot / update_service. The
-        seed only sets the location identity set (no free slots, no
-        snapshot time), and an already-populated set (e.g. loaded from a
-        dump) is never overwritten -- see
+        The placer classifies Kubernetes locations as zero-cost during its
+        construction.  Use only that already-resident cache here: resolving
+        every uncached paid-cloud candidate can exceed the controller startup
+        deadline for large exact-card catalogs.  The seed grants no free slots
+        and records no snapshot time; it only protects the known fill fleet
+        from the first autoscaler tick.  An already-populated set (e.g. loaded
+        from a dump) is never overwritten -- see
         Autoscaler.seed_zero_cost_locations.
         """
         if not autoscaler.reserved_capacity_fill:
@@ -435,12 +431,12 @@ class SkyServeController:
         try:
             autoscaler.seed_zero_cost_locations([
                 location.to_pickleable()
-                for location in placer.zero_cost_locations()
+                for location in placer.cached_zero_cost_locations()
             ])
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to seed zero-cost locations '
-                           '(best-effort; will rely on the first '
-                           'successful poll instead): '
+            logger.warning('Failed to seed cached zero-cost locations '
+                           '(best-effort; will rely on the first successful '
+                           'poll instead): '
                            f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
@@ -2490,10 +2486,14 @@ class SkyServeController:
             configured.sort(key=lambda card: (qps_order.get(
                 card.casefold(), len(qps_order)), card.casefold()))
 
-        # A dynamic placer provides the nominal cached per-machine price of
-        # every configured paid shape. Include temporarily benched locations:
-        # transient availability may delay an exact-card cold launch, but must
-        # never promote a more expensive compatible card into its place.
+        # A dynamic placer may already know the nominal per-machine price of
+        # every configured paid shape. Read only that cache here: this method
+        # runs before the controller health endpoint binds, so resolving an
+        # uncached provider candidate can make large catalogs miss the startup
+        # deadline. Include temporarily benched locations: transient
+        # availability may delay an exact-card cold launch, but must never
+        # promote a more expensive compatible card into its place. An
+        # incomplete cache preserves the deterministic service fallback.
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
             paid_costs: dict[str, float] = {}
@@ -2510,7 +2510,10 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
-                    hourly_cost = float(placer.cost_per_hour(location))
+                    cached_cost = placer.cached_cost_per_hour(location)
+                    if cached_cost is None:
+                        continue
+                    hourly_cost = float(cached_cost)
                 except Exception:  # pylint: disable=broad-except
                     continue
                 if not math.isfinite(hourly_cost) or hourly_cost <= 0:

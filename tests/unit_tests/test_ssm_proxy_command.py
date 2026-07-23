@@ -6,7 +6,6 @@ multi-command string (`export ...; aws ...`) makes the shell exec the
 controller then classifies healthy just-launched replicas as preempted
 (observed live 2026-07-06: `/bin/sh: 1: exec: export: not found`).
 """
-import shlex
 import subprocess
 
 from sky.backends import backend_utils
@@ -27,7 +26,8 @@ SSM_CMD = ('aws ssm start-session --target '
 def test_plain_ssm_command_gets_wrapped():
     wrapped = _upgrade(SSM_CMD)
     assert wrapped.startswith('env AWS_RETRY_MODE=adaptive')
-    assert shlex.quote(SSM_CMD) in wrapped
+    assert 'skypilot_ssm_target=' in wrapped
+    assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE in wrapped  # pylint: disable=protected-access
 
 
 def test_wrapped_form_is_a_single_exec_able_command():
@@ -56,7 +56,43 @@ def test_broken_export_prefixed_form_is_repaired():
     repaired = _upgrade(broken)
     assert repaired.startswith('env AWS_RETRY_MODE=adaptive')
     assert not repaired.startswith('export')
-    assert shlex.quote(SSM_CMD) in repaired
+    assert 'skypilot_ssm_target=' in repaired
+
+
+def test_existing_wrapped_form_gets_empty_target_guard():
+    wrapped = backend_utils._wrap_ssm_proxy_command_with_adaptive_retry(  # pylint: disable=protected-access
+        SSM_CMD)
+    upgraded = _upgrade(wrapped)
+    assert upgraded.startswith('env AWS_RETRY_MODE=adaptive')
+    assert 'skypilot_ssm_target=' in upgraded
+    assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE in upgraded  # pylint: disable=protected-access
+
+
+def test_empty_target_fails_before_start_session():
+    raw = ("aws ssm start-session --target \"$(printf '')\" "
+           '--region us-east-2 --document-name AWS-StartSSHSession '
+           '--parameters portNumber=%p')
+    upgraded = _upgrade(raw).replace('%h', '203.0.113.1').replace('%p', '22')
+    result = subprocess.run(['/bin/sh', '-c', f'exec {upgraded}'],
+                            capture_output=True,
+                            text=True,
+                            check=False)
+    assert result.returncode == 255
+    assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE.replace(  # pylint: disable=protected-access
+        '%h', '203.0.113.1') in result.stderr
+    assert 'Invalid length for parameter Target' not in result.stderr
+
+
+def test_lookup_failure_exit_status_is_preserved():
+    raw = ('aws ssm start-session --target "$(false)" '
+           '--region us-east-2 --document-name AWS-StartSSHSession '
+           '--parameters portNumber=22')
+    result = subprocess.run(['/bin/sh', '-c', f'exec {_upgrade(raw)}'],
+                            capture_output=True,
+                            text=True,
+                            check=False)
+    assert result.returncode == 1
+    assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE not in result.stderr  # pylint: disable=protected-access
 
 
 def test_upgrade_is_idempotent():
