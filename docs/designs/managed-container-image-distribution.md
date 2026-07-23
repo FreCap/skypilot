@@ -1701,7 +1701,15 @@ terminate-on-shutdown path after either success or failure, so a failed pull
 does not consume the entire canary deadline. Console marker inspection accepts
 the exact nonce-bearing marker in the SDK response first, then supports a
 strictly valid base64-encoded response for compatible EC2 API implementations.
-It never loosely decodes malformed console output.
+It never loosely decodes malformed console output. EC2 may expose the stopped
+or terminated instance before posting the transition's buffered console output.
+After the first terminal observation, the worker therefore keeps requesting
+`GetConsoleOutput(Latest=True)` through its fenced provider client for a bounded
+settling window inside the original canary deadline. An empty, partial, or
+marker-free response is not an immediate pull failure. The exact marker
+completes the proof when it appears; exhausting the settling window without the
+marker records `CANARY_PULL_FAILED`. This is qualification-only waiting and
+does not add a blocking operation to ordinary workload deployment.
 An unexpected operation-tagged ID, missing exact child, or tag mismatch can never
 be spliced into evidence. Every child ID observed through launch, replay, polling,
 or cleanup is retained in the teardown set, and an identity mismatch fails only
@@ -2657,7 +2665,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   exact shared EC2 helper-route configuration, plaintext and strict-base64
   console marker responses, malformed console rejection, guest failure
   self-termination, delayed EC2 instance-profile visibility, terminal EC2
-  profile omission after an exact match,
+  profile omission after an exact match, delayed terminal console publication
+  and bounded marker-free console exhaustion,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
   pre/post lease fences, database authorization immediately before both EC2 and

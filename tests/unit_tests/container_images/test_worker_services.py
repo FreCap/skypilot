@@ -55,6 +55,67 @@ def test_ec2_console_marker_supports_sdk_response_shapes(
         output, 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce') is expected
 
 
+def _console_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    clock = [100.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: clock[0])
+    monkeypatch.setattr(
+        canary_worker_service.time, 'sleep',
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(canary_worker_service, '_EC2_CONSOLE_SETTLE_SECONDS',
+                        10)
+    monkeypatch.setattr(canary_worker_service, '_EC2_CONSOLE_POLL_SECONDS', 5)
+    return clock
+
+
+def test_ec2_console_marker_waits_for_delayed_terminal_buffer(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    marker = 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce'
+    ec2.get_console_output.side_effect = ({'Output': ''}, {'Output': marker})
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    assert canary_worker_service._wait_for_console_marker(
+        ec2, 'i-canary', marker, 1000.0, heartbeat)
+
+    assert ec2.get_console_output.call_args_list == [
+        mock.call(InstanceId='i-canary', Latest=True),
+        mock.call(InstanceId='i-canary', Latest=True),
+    ]
+
+
+def test_ec2_console_marker_exhausts_bounded_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    ec2.get_console_output.return_value = {'Output': 'partial boot log'}
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    assert not canary_worker_service._wait_for_console_marker(
+        ec2, 'i-canary', 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce', 1000.0,
+        heartbeat)
+
+    assert clock == [110.0]
+    assert ec2.get_console_output.call_count == 2
+
+
+def test_ec2_console_marker_preserves_original_canary_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    ec2.get_console_output.return_value = {'Output': ''}
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    with pytest.raises(ValueError, match='CANARY_TIMEOUT'):
+        canary_worker_service._wait_for_console_marker(
+            ec2, 'i-canary', 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce', 105.0,
+            heartbeat)
+
+    ec2.get_console_output.assert_called_once_with(InstanceId='i-canary',
+                                                   Latest=True)
+
+
 def _canary_operation(
     *,
     operation_id: str = '00000000-0000-4000-8000-000000000009',

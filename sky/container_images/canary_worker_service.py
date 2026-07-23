@@ -30,6 +30,8 @@ from sky.server import database_migrations
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
 _MAX_QUALIFIED_EKS_NODES = 1000
+_EC2_CONSOLE_SETTLE_SECONDS = 10 * 60
+_EC2_CONSOLE_POLL_SECONDS = 5
 _EC2_TEARDOWN_ATTEMPTS = 60
 _EC2_TEARDOWN_POLL_SECONDS = 5
 _EKS_TEARDOWN_SECONDS = 60
@@ -412,6 +414,30 @@ def _console_has_marker(output: Any, marker: str) -> bool:
     return marker in decoded
 
 
+def _wait_for_console_marker(ec2: Any, instance_id: str, marker: str,
+                             deadline: float,
+                             heartbeat: worker_lease.LeaseHeartbeat) -> bool:
+    """Waits for EC2 to post a terminal child's buffered console output."""
+    settle_deadline = min(
+        deadline,
+        time.monotonic() + _EC2_CONSOLE_SETTLE_SECONDS,
+    )
+    while True:
+        heartbeat.assert_owned()
+        now = time.monotonic()
+        if now >= deadline:
+            raise ValueError('CANARY_TIMEOUT')
+        if now >= settle_deadline:
+            return False
+        output = ec2.get_console_output(InstanceId=instance_id,
+                                        Latest=True).get('Output')
+        if _console_has_marker(output, marker):
+            return True
+        time.sleep(
+            min(_EC2_CONSOLE_POLL_SECONDS,
+                max(0.0, settle_deadline - time.monotonic())))
+
+
 def _run_ec2_canary(operation: catalog_state.OperationRecord,
                     payload: dict[str, Any],
                     revision: topology_state.ProfileRevisionRecord,
@@ -578,9 +604,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                     continue
                 raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if state in ('stopped', 'terminated'):
-                output = ec2.get_console_output(InstanceId=instance_id,
-                                                Latest=True).get('Output')
-                success = _console_has_marker(output, marker)
+                success = _wait_for_console_marker(ec2, instance_id, marker,
+                                                   deadline, heartbeat)
                 break
             time.sleep(_POLL_SECONDS)
         else:
