@@ -3,11 +3,14 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  ec2_canary_enabled = length(var.ami_arns) > 0 || length(var.subnet_arns) > 0
-  instance_resource_arns = [
-    "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:instance/*",
-    "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
-    "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:volume/*",
+  ec2_canary_enabled             = length(var.ami_arns) > 0 || length(var.subnet_arns) > 0
+  instance_resource_arn          = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:instance/*"
+  network_interface_resource_arn = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:network-interface/*"
+  volume_resource_arn            = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:volume/*"
+  created_resource_arns = [
+    local.instance_resource_arn,
+    local.network_interface_resource_arn,
+    local.volume_resource_arn,
   ]
   common_tags = merge(var.tags, {
     "ManagedBy"         = "Terraform"
@@ -81,15 +84,21 @@ data "aws_iam_policy_document" "permissions" {
   dynamic "statement" {
     for_each = local.ec2_canary_enabled ? [1] : []
     content {
-      sid       = "CreateOnlyCatalogTaggedCanaryResources"
+      sid       = "CreateOnlyCatalogTaggedCanaryInstances"
       effect    = "Allow"
       actions   = ["ec2:RunInstances"]
-      resources = local.instance_resource_arns
+      resources = [local.instance_resource_arn]
 
       condition {
         test     = "StringEquals"
         variable = "ec2:InstanceType"
         values   = sort(tolist(var.canary_instance_types))
+      }
+
+      condition {
+        test     = "ArnEquals"
+        variable = "ec2:InstanceProfile"
+        values   = sort(tolist(var.instance_profile_arns))
       }
 
       condition {
@@ -109,10 +118,48 @@ data "aws_iam_policy_document" "permissions" {
   dynamic "statement" {
     for_each = local.ec2_canary_enabled ? [1] : []
     content {
+      sid       = "CreateOnlyCatalogTaggedCanaryVolumes"
+      effect    = "Allow"
+      actions   = ["ec2:RunInstances"]
+      resources = [local.volume_resource_arn]
+
+      condition {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/SkyPilotCatalog"
+        values   = [var.catalog_authority]
+      }
+
+      condition {
+        test     = "StringLike"
+        variable = "aws:RequestTag/SkyPilotCanaryOperation"
+        values   = ["????????-????-????-????-????????????"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.ec2_canary_enabled ? [1] : []
+    content {
+      sid       = "CreateOnlyQualifiedSubnetCanaryNetworkInterfaces"
+      effect    = "Allow"
+      actions   = ["ec2:RunInstances"]
+      resources = [local.network_interface_resource_arn]
+
+      condition {
+        test     = "ArnEquals"
+        variable = "ec2:Subnet"
+        values   = sort(tolist(var.subnet_arns))
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.ec2_canary_enabled ? [1] : []
+    content {
       sid       = "TagOnlyDuringQualifiedCanaryLaunch"
       effect    = "Allow"
       actions   = ["ec2:CreateTags"]
-      resources = local.instance_resource_arns
+      resources = local.created_resource_arns
 
       condition {
         test     = "StringEquals"
@@ -135,7 +182,7 @@ data "aws_iam_policy_document" "permissions" {
       sid       = "ObserveAndTerminateCatalogCanaries"
       effect    = "Allow"
       actions   = ["ec2:GetConsoleOutput", "ec2:TerminateInstances"]
-      resources = [local.instance_resource_arns[0]]
+      resources = [local.instance_resource_arn]
 
       condition {
         test     = "StringEquals"

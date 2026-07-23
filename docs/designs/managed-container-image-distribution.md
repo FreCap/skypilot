@@ -723,11 +723,18 @@ EC2 canary bindings require at least one explicit security group in every
 qualified AMI region. The worker always sends those groups and applies the
 catalog, operation, and profile tag specifications to the instance, every
 created EBS volume, and every created network interface. The generated IAM role
-authorizes `RunInstances` against the exact AMI, subnet, security groups, and
-created resource classes with the required request tags. A separate
-`ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
-not combined with launch conditions. The role never relies on an implicit VPC
-default security group.
+authorizes `RunInstances` against the exact AMI, subnet, security groups,
+instance type, and runtime instance profile. AWS evaluates the created resource
+classes separately. Instance and EBS-volume authorization requires the catalog
+and operation request tags. The implicit network-interface authorization
+context does not expose either those request tags or `ec2:InstanceType`, so its
+separate statement instead requires the exact declared subnet. That statement
+cannot authorize an independent network-interface create: the role has no
+`CreateNetworkInterface` action, and the complete `RunInstances` call must still
+pass every exact image, network, instance, profile, and tagged-resource
+statement. A separate `ec2:CreateTags` statement is limited by
+`ec2:CreateAction=RunInstances`; it is not combined with launch conditions. The
+role never relies on an implicit VPC default security group.
 
 An ECR destination claim executes this fenced algorithm:
 
