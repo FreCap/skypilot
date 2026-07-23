@@ -2210,6 +2210,33 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         self.assertEqual(exact.target_num_replicas_by_accelerator, {'A100': 1})
 
+    def test_inconclusive_zero_cost_card_preserves_service_order(self):
+        a100_zero = types.SimpleNamespace(accelerators={'A100': 1})
+        a100_unpriced = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.known_locations.return_value = [
+            a100_zero, a100_unpriced, l4_location
+        ]
+        placer.cost_per_hour.side_effect = (
+            lambda location: 0.0 if location is a100_zero else float('inf')
+            if location is a100_unpriced else 1.0)
+        autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
+        autoscaler.set_spot_placer(placer)
+        _report(autoscaler,
+                in_flight={},
+                observed_slots={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100', 'L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+
     def test_partial_nominal_prices_preserve_service_order(self):
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
