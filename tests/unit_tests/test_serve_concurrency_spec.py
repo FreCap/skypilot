@@ -133,6 +133,7 @@ def test_yaml_round_trip_preserves_demand_and_wave_policy():
         graceful_drain_async_occupancy=True,
         target_utilization_percentage=90,
         expected_request_duration_seconds=30,
+        provision_lead_time_seconds=540,
         max_scale_up_rate_percentage=20,
         scale_up_rate_min_replicas=10,
         scale_up_rate_period_seconds=60,
@@ -150,6 +151,7 @@ def test_yaml_round_trip_preserves_demand_and_wave_policy():
 
     assert restored.target_utilization_percentage == 90
     assert restored.expected_request_duration_seconds == 30
+    assert restored.provision_lead_time_seconds == 540
     assert restored.max_scale_up_rate_percentage == 20
     assert restored.scale_up_rate_min_replicas == 10
     assert restored.scale_up_rate_period_seconds == 60
@@ -183,6 +185,9 @@ def test_new_defaults_preserve_utilization_and_bound_downscale():
     ('target_utilization_percentage', True),
     ('expected_request_duration_seconds', 0),
     ('expected_request_duration_seconds', float('inf')),
+    ('provision_lead_time_seconds', -1),
+    ('provision_lead_time_seconds', float('inf')),
+    ('provision_lead_time_seconds', True),
     ('max_scale_up_rate_percentage', 0),
     ('scale_up_rate_min_replicas', 0),
     ('scale_up_rate_period_seconds', True),

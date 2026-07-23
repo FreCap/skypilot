@@ -33,6 +33,7 @@ def _spec(knob=1.0,
           replica_unit='physical_backend',
           target_utilization_percentage=100,
           expected_request_duration_seconds=None,
+          provision_lead_time_seconds=None,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
           scale_up_rate_period_seconds=None,
@@ -55,6 +56,7 @@ def _spec(knob=1.0,
         replica_unit=replica_unit,
         target_utilization_percentage=target_utilization_percentage,
         expected_request_duration_seconds=expected_request_duration_seconds,
+        provision_lead_time_seconds=provision_lead_time_seconds,
         max_scale_up_rate_percentage=max_scale_up_rate_percentage,
         scale_up_rate_min_replicas=scale_up_rate_min_replicas,
         scale_up_rate_period_seconds=scale_up_rate_period_seconds,
@@ -503,6 +505,42 @@ class TestTargetMath(unittest.TestCase):
         # 100 * 30/600 + 10 * 30/60 = 10 units of draining work.
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
+
+    def test_provision_lead_shrinks_queue_patience(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=30,
+            provision_lead_time_seconds=540,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }, {
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                })
+
+        self._recompute(autoscaler, [])
+
+        # New capacity starts serving only after the 540-second lead, so
+        # the 600-second timeout leaves a 60-second budget: 100 * 30/60.
+        # The 60-second timeout's budget floors at the request duration
+        # itself: 10 * 30/30.
+        self.assertEqual(autoscaler._weighted_queue_work, 60)
+        self.assertEqual(autoscaler.target_num_replicas, 60)
 
     def test_priority_patience_falls_back_to_aggregate_queue(self):
         autoscaler = _make_autoscaler(
@@ -2889,6 +2927,76 @@ class TestLogicalScalingWaves(unittest.TestCase):
             wall_clock.return_value = 1059.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, 200)
+
+    def test_wave_base_counts_old_version_fleet_during_rollout(self):
+        autoscaler = self._ramped_autoscaler()
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        old_fleet = [_replica(i + 1, version=0) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                old_fleet)
+
+        # Latest-version committed capacity is zero mid-rollout, but the
+        # saturated 100-slot serving fleet is the honest growth base:
+        # budget max(10, 20% of 100) = 20, ceiling 100 + 20. A latest-only
+        # base would freeze the target at 100 for the whole rollout.
+        self.assertEqual(autoscaler.target_num_replicas, 120)
+
+    def test_queue_plateau_sustains_pressure_streak(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler, in_flight={}, queue_depth=1500)
+            _report(autoscaler, in_flight={}, queue_depth=1560)
+            self.assertEqual(autoscaler._pressure_streak, 1)
+            # A queue pinned flat at its cap is saturation, not relief.
+            _report(autoscaler, in_flight={}, queue_depth=1560)
+            self.assertEqual(autoscaler._pressure_streak, 2)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+    def test_draining_queue_resets_pressure_streak(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        _report(autoscaler, in_flight={}, queue_depth=1500)
+        _report(autoscaler, in_flight={}, queue_depth=1560)
+        self.assertEqual(autoscaler._pressure_streak, 1)
+        _report(autoscaler, in_flight={}, queue_depth=900)
+        self.assertEqual(autoscaler._pressure_streak, 0)
+        self.assertFalse(autoscaler._adaptive_scale_up_active())
+
+    def test_small_flat_queue_below_wave_minimum_is_not_pressure(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        _report(autoscaler, in_flight={}, queue_depth=2)
+        _report(autoscaler, in_flight={}, queue_depth=3)
+        self.assertEqual(autoscaler._pressure_streak, 1)
+        # Flat trickle queues below scale_up_rate_min_replicas stay
+        # non-latching so they cannot starve downscale.
+        _report(autoscaler, in_flight={}, queue_depth=3)
+        self.assertEqual(autoscaler._pressure_streak, 0)
 
     def test_floored_handoff_report_cannot_complete_pressure_streak(self):
         autoscaler = self._ramped_autoscaler(

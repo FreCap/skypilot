@@ -48,6 +48,7 @@ class SkyServiceSpec:
         target_concurrency_per_replica: float | None = None,
         target_utilization_percentage: int | None = None,
         expected_request_duration_seconds: float | None = None,
+        provision_lead_time_seconds: float | None = None,
         max_scale_up_rate_percentage: int | None = None,
         scale_up_rate_min_replicas: int | None = None,
         scale_up_rate_period_seconds: int | None = None,
@@ -81,6 +82,7 @@ class SkyServiceSpec:
                 'target_concurrency_per_replica',
                 'target_utilization_percentage',
                 'expected_request_duration_seconds',
+                'provision_lead_time_seconds',
                 'max_scale_up_rate_percentage',
                 'scale_up_rate_min_replicas',
                 'scale_up_rate_period_seconds',
@@ -324,6 +326,15 @@ class SkyServiceSpec:
                     'expected_request_duration_seconds must be a finite '
                     'number > 0. Got: '
                     f'{expected_request_duration_seconds!r}')
+        if (provision_lead_time_seconds is not None and
+            (not isinstance(provision_lead_time_seconds, (int, float)) or
+             isinstance(provision_lead_time_seconds, bool) or
+             not math.isfinite(provision_lead_time_seconds) or
+             provision_lead_time_seconds < 0)):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError('provision_lead_time_seconds must be a finite '
+                                 'number >= 0. Got: '
+                                 f'{provision_lead_time_seconds!r}')
         for name, value in (
             ('scale_up_rate_min_replicas', scale_up_rate_min_replicas),
             ('scale_up_rate_period_seconds', scale_up_rate_period_seconds),
@@ -388,6 +399,7 @@ class SkyServiceSpec:
         logical_scaling_fields = {
             'target_utilization_percentage': target_utilization_percentage,
             'expected_request_duration_seconds': expected_request_duration_seconds,
+            'provision_lead_time_seconds': provision_lead_time_seconds,
             'max_scale_up_rate_percentage': max_scale_up_rate_percentage,
             'scale_up_rate_min_replicas': scale_up_rate_min_replicas,
             'scale_up_rate_period_seconds': scale_up_rate_period_seconds,
@@ -656,6 +668,8 @@ class SkyServiceSpec:
             target_utilization_percentage)
         self._expected_request_duration_seconds: float | None = (
             expected_request_duration_seconds)
+        self._provision_lead_time_seconds: float | None = (
+            provision_lead_time_seconds)
         self._max_scale_up_rate_percentage: int | None = (
             max_scale_up_rate_percentage)
         self._scale_up_rate_min_replicas: int | None = (
@@ -717,6 +731,7 @@ class SkyServiceSpec:
         state.setdefault('_min_replicas_by_accelerator', {})
         state.setdefault('_target_utilization_percentage', None)
         state.setdefault('_expected_request_duration_seconds', None)
+        state.setdefault('_provision_lead_time_seconds', None)
         state.setdefault('_max_scale_up_rate_percentage', None)
         state.setdefault('_scale_up_rate_min_replicas', None)
         state.setdefault('_scale_up_rate_period_seconds', None)
@@ -940,6 +955,7 @@ class SkyServiceSpec:
             service_config['target_concurrency_per_replica'] = None
             service_config['target_utilization_percentage'] = None
             service_config['expected_request_duration_seconds'] = None
+            service_config['provision_lead_time_seconds'] = None
             service_config['max_scale_up_rate_percentage'] = None
             service_config['scale_up_rate_min_replicas'] = None
             service_config['scale_up_rate_period_seconds'] = None
@@ -961,6 +977,7 @@ class SkyServiceSpec:
                 policy_section.get('target_concurrency_per_replica', None))
             for field in ('target_utilization_percentage',
                           'expected_request_duration_seconds',
+                          'provision_lead_time_seconds',
                           'max_scale_up_rate_percentage',
                           'scale_up_rate_min_replicas',
                           'scale_up_rate_period_seconds', 'adaptive_scale_up',
@@ -1176,6 +1193,7 @@ class SkyServiceSpec:
                         self.target_concurrency_per_replica)
         for field in ('target_utilization_percentage',
                       'expected_request_duration_seconds',
+                      'provision_lead_time_seconds',
                       'max_scale_up_rate_percentage',
                       'scale_up_rate_min_replicas',
                       'scale_up_rate_period_seconds', 'adaptive_scale_up',
@@ -1410,6 +1428,10 @@ class SkyServiceSpec:
         return getattr(self, '_expected_request_duration_seconds', None)
 
     @property
+    def provision_lead_time_seconds(self) -> float | None:
+        return getattr(self, '_provision_lead_time_seconds', None)
+
+    @property
     def max_scale_up_rate_percentage(self) -> int | None:
         return getattr(self, '_max_scale_up_rate_percentage', None)
 
@@ -1569,6 +1591,9 @@ class SkyServiceSpec:
             'expected_request_duration_seconds': override.pop(
                 'expected_request_duration_seconds',
                 self._expected_request_duration_seconds),
+            'provision_lead_time_seconds': override.pop(
+                'provision_lead_time_seconds',
+                self._provision_lead_time_seconds),
             'max_scale_up_rate_percentage': override.pop(
                 'max_scale_up_rate_percentage',
                 self._max_scale_up_rate_percentage),
@@ -1628,6 +1653,9 @@ class SkyServiceSpec:
             expected_request_duration_seconds=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['expected_request_duration_seconds']),
+            provision_lead_time_seconds=(
+                None if preserve_legacy_semantics else
+                logical_scaling_values['provision_lead_time_seconds']),
             max_scale_up_rate_percentage=(
                 None if preserve_legacy_semantics else
                 logical_scaling_values['max_scale_up_rate_percentage']),
