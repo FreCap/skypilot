@@ -3248,7 +3248,13 @@ class TestLogicalPendingLaunchAdmission:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[candidate]):
-            assert mgr._queued_logical_launch_fence_holds(1)
+            allowed, reason, admission = (
+                mgr._queued_logical_launch_fence_decision(1))
+        assert allowed
+        assert reason == 'authorized'
+        assert admission is not None
+        assert admission.authorized_ids == frozenset({1})
+        assert 'candidate=(1,' in admission.details
 
     def test_single_card_unpinned_ready_supply_blocks_duplicate(self):
         mgr = self._manager({'L4': 1})
@@ -3266,7 +3272,13 @@ class TestLogicalPendingLaunchAdmission:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[ready, candidate]):
-            assert not mgr._queued_logical_launch_fence_holds(2)
+            allowed, reason, admission = (
+                mgr._queued_logical_launch_fence_decision(2))
+        assert not allowed
+        assert reason == 'replica-not-authorized'
+        assert admission is not None
+        assert admission.authorized_ids == frozenset()
+        assert "baseline={'L4': 1}" in admission.details
 
     def test_multi_card_unpinned_candidate_remains_ambiguous(self):
         mgr = self._manager({'A100': 1})
