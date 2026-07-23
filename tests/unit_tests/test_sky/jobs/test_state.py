@@ -131,6 +131,57 @@ def _get_api_access_token_rows(engine):
     return [(row.job_id, row.token_id) for row in rows]
 
 
+def test_get_job_event_task_contexts_uses_one_slim_query(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 7, 0, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, 7, 1, status=ManagedJobStatus.RUNNING)
+    with engine.begin() as connection:
+        connection.execute(state.job_info_table.insert().values(
+            spot_job_id=7,
+            name='job-name',
+            schedule_state=state.ManagedJobScheduleState.INACTIVE.value,
+            pool='pool-a',
+            dag_yaml_content='large-yaml',
+            original_user_yaml_path='/tmp/should-not-be-read.yaml',
+        ))
+
+    monkeypatch.setattr(
+        'builtins.open', lambda *args, **kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('user yaml path should not be opened')))
+    statements = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(statement.lower())
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        task_contexts = state.get_job_event_task_contexts(7)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert task_contexts == [
+        {
+            'task_id': 0,
+            'task_name': 'task-0',
+            'pool': 'pool-a',
+        },
+        {
+            'task_id': 1,
+            'task_name': 'task-1',
+            'pool': 'pool-a',
+        },
+    ]
+    assert len(statements) == 1, statements
+    sql = statements[0]
+    assert 'metadata' not in sql
+    assert 'dag_yaml_content' not in sql
+    assert 'original_user_yaml_content' not in sql
+    assert 'original_user_yaml_path' not in sql
+
+
 @pytest.mark.asyncio
 async def test_image_recovery_generation_tracks_durable_recovery_epoch(
         _mock_managed_jobs_db_conn):
