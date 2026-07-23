@@ -606,8 +606,10 @@ Reserved capacity is supply, not accelerator identity and not hidden demand.
   card order before projecting any remainder onto free supply, then subtract
   only demand for the same exact card. Demand assigned to L4, for example,
   cannot reduce the shelter for A100 or A100-80GB holdings. If a rolling-update
-  row has no safely attributable exact card, retain the legacy aggregate
-  shelter for that tick rather than guessing or widening accelerator identity.
+  row has no safely attributable exact card, or the per-card demand map is
+  incomplete or does not account for the full final demand target, retain the
+  legacy aggregate shelter for that tick rather than guessing or widening
+  accelerator identity.
 - `max_replicas` is a hard aggregate fill ceiling. Count all old-version nonterminal capacity and reserve the latest-version demand plan before emitting fill launches. At the ceiling, retain the observed free-slot intent for a later control cycle instead of launching overlap.
 
 ## Architecture flow

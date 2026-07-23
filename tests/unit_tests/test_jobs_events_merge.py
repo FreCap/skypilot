@@ -67,7 +67,7 @@ def test_no_merge_when_flag_disabled(monkeypatch):
     def _should_not_be_called(*args, **kwargs):
         raise AssertionError('cluster events should not be read')
 
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         _should_not_be_called)
     monkeypatch.setattr(global_user_state, 'get_cluster_events_by_names',
                         _should_not_be_called)
@@ -89,8 +89,11 @@ def test_merge_orders_newest_first_and_truncates(monkeypatch):
     ]
     monkeypatch.setattr(managed_job_state, 'get_job_events',
                         lambda **kwargs: list(job_events))
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         lambda job_id: [_task()])
+    monkeypatch.setattr(
+        managed_job_state, 'get_managed_job_tasks', lambda job_id:
+        (_ for _ in ()).throw(AssertionError('heavy task accessor used')))
     monkeypatch.setattr(managed_job_utils, 'generate_managed_job_cluster_name',
                         lambda name, job_id: f'{name}-{job_id}')
     cluster_events = [
@@ -146,7 +149,7 @@ def test_pool_jobs_skip_merge(monkeypatch):
     ]
     monkeypatch.setattr(managed_job_state, 'get_job_events',
                         lambda **kwargs: list(job_events))
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         lambda job_id: [_task(pool='my-pool')])
 
     def _should_not_be_called(*args, **kwargs):
@@ -166,7 +169,7 @@ def test_merge_is_best_effort_on_error(monkeypatch):
     ]
     monkeypatch.setattr(managed_job_state, 'get_job_events',
                         lambda **kwargs: list(job_events))
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         lambda job_id: [_task()])
     monkeypatch.setattr(managed_job_utils, 'generate_managed_job_cluster_name',
                         lambda name, job_id: f'{name}-{job_id}')
@@ -188,7 +191,7 @@ def test_no_tasks_skips_merge(monkeypatch):
     ]
     monkeypatch.setattr(managed_job_state, 'get_job_events',
                         lambda **kwargs: list(job_events))
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         lambda job_id: [])
 
     def _should_not_be_called(*args, **kwargs):
@@ -215,7 +218,7 @@ def test_merged_events_match_job_event_timezone(monkeypatch):
     }]
     monkeypatch.setattr(managed_job_state, 'get_job_events',
                         lambda **kwargs: list(job_events))
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
+    monkeypatch.setattr(managed_job_state, 'get_job_event_task_contexts',
                         lambda job_id: [_task()])
     monkeypatch.setattr(managed_job_utils, 'generate_managed_job_cluster_name',
                         lambda name, job_id: f'{name}-{job_id}')
@@ -244,7 +247,7 @@ def test_pipeline_uses_per_task_cluster_name(monkeypatch):
                         lambda **kwargs: list(job_events))
     # Two tasks of the same pipeline: distinct per-task names, shared DAG name.
     monkeypatch.setattr(
-        managed_job_state, 'get_managed_job_tasks', lambda job_id: [
+        managed_job_state, 'get_job_event_task_contexts', lambda job_id: [
             _task(task_name='pipe-0', task_id=0, job_name='pipe'),
             _task(task_name='pipe-1', task_id=1, job_name='pipe'),
         ])

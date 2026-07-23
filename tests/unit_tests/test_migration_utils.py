@@ -38,6 +38,16 @@ def test_safe_alembic_rejects_unknown_migration_mode() -> None:
                                              mode='unsafe')
 
 
+def test_older_rollback_target_accepts_newer_additive_revision(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = mock.Mock()
+    monkeypatch.setattr(migration_utils, 'get_current_alembic_revision',
+                        lambda *_args, **_kwargs: '027')
+
+    assert not migration_utils.needs_upgrade(engine, 'serve_db', '026')
+    migration_utils.verify_alembic_revision(engine, 'serve_db', '026')
+
+
 def test_global_state_create_table_uses_configured_migration_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     engine = sqlalchemy.create_engine('sqlite://')

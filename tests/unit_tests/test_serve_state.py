@@ -10,6 +10,7 @@ leader-aware routing.
 import contextlib
 import json
 import pickle
+import sqlite3
 import types
 
 import pytest
@@ -2667,10 +2668,25 @@ class TestBatchReplicaUpsert:
         assert not serve_state.get_replica_infos('svc')
 
     def test_batch_larger_than_chunk_size(self, _mock_serve_db):
-        n = serve_state._REPLICA_UPSERT_CHUNK_SIZE * 2 + 17
+        chunk_size = (serve_state._SQLITE_MAX_BIND_PARAMS //
+                      len(serve_state.replicas_table.c))
+        n = chunk_size * 2 + 17
         infos = [(i, _replica(i)) for i in range(1, n + 1)]
         serve_state.add_or_update_replicas('svc', infos)
         assert len(serve_state.get_replica_infos('svc')) == n
+
+    def test_batch_respects_legacy_sqlite_bind_limit(self, _mock_serve_db):
+        raw_connection = _mock_serve_db.raw_connection()
+        try:
+            raw_connection.driver_connection.setlimit(
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                serve_state._SQLITE_MAX_BIND_PARAMS)
+        finally:
+            raw_connection.close()
+
+        infos = [(i, _replica(i)) for i in range(1, 91)]
+        serve_state.add_or_update_replicas('svc', infos)
+        assert len(serve_state.get_replica_infos('svc')) == 90
 
 
 class TestGroupedReplicaSnapshot:

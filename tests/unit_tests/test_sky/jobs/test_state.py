@@ -131,6 +131,57 @@ def _get_api_access_token_rows(engine):
     return [(row.job_id, row.token_id) for row in rows]
 
 
+def test_get_job_event_task_contexts_uses_one_slim_query(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 7, 0, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, 7, 1, status=ManagedJobStatus.RUNNING)
+    with engine.begin() as connection:
+        connection.execute(state.job_info_table.insert().values(
+            spot_job_id=7,
+            name='job-name',
+            schedule_state=state.ManagedJobScheduleState.INACTIVE.value,
+            pool='pool-a',
+            dag_yaml_content='large-yaml',
+            original_user_yaml_path='/tmp/should-not-be-read.yaml',
+        ))
+
+    monkeypatch.setattr(
+        'builtins.open', lambda *args, **kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('user yaml path should not be opened')))
+    statements = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(statement.lower())
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        task_contexts = state.get_job_event_task_contexts(7)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert task_contexts == [
+        {
+            'task_id': 0,
+            'task_name': 'task-0',
+            'pool': 'pool-a',
+        },
+        {
+            'task_id': 1,
+            'task_name': 'task-1',
+            'pool': 'pool-a',
+        },
+    ]
+    assert len(statements) == 1, statements
+    sql = statements[0]
+    assert 'metadata' not in sql
+    assert 'dag_yaml_content' not in sql
+    assert 'original_user_yaml_content' not in sql
+    assert 'original_user_yaml_path' not in sql
+
+
 @pytest.mark.asyncio
 async def test_image_recovery_generation_tracks_durable_recovery_epoch(
         _mock_managed_jobs_db_conn):
@@ -517,6 +568,98 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
                                                'default', True),
     }
     assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_state_rows_use_latest_task_only(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    completed_job = state.set_job_info_without_job_id(
+        name='completed',
+        workspace='team-b',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    legacy_job = _insert_job_info(engine)
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    _set_controller_process(engine, completed_job, -202, None)
+
+    for task_id in range(50):
+        _insert_task(
+            engine,
+            active_job,
+            task_id,
+            status=(state.ManagedJobStatus.SUCCEEDED
+                    if task_id == 0 else state.ManagedJobStatus.RUNNING
+                    if task_id == 1 else state.ManagedJobStatus.PENDING),
+        )
+    for task_id in range(30):
+        _insert_task(
+            engine,
+            completed_job,
+            task_id,
+            status=(state.ManagedJobStatus.FAILED
+                    if task_id == 29 else state.ManagedJobStatus.SUCCEEDED),
+        )
+    _insert_task(engine, legacy_job, 0, status=state.ManagedJobStatus.STARTING)
+
+    with _count_sql_statements(engine) as counts:
+        rows = state._fetch_job_cancellation_state_rows(
+            [active_job, completed_job, legacy_job, 999999, active_job])
+
+    assert rows == [
+        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a', 101,
+         1001.5),
+        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b', -202,
+         None),
+        (legacy_job, 0, state.ManagedJobStatus.STARTING.value, None, None,
+         None),
+    ]
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_states_chunking_preserves_snapshots(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    completed_job = state.set_job_info_without_job_id(
+        name='completed',
+        workspace='team-b',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _insert_task(engine, active_job, 0, status=state.ManagedJobStatus.RUNNING)
+    _insert_task(engine,
+                 completed_job,
+                 0,
+                 status=state.ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, completed_job, 1, status=state.ManagedJobStatus.FAILED)
+
+    full = state.get_job_cancellation_states([active_job, completed_job])
+
+    monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+    chunked = state.get_job_cancellation_states(
+        [active_job, completed_job, 999999, active_job])
+
+    assert chunked == full
 
 
 def test_get_job_cancellation_states_empty_input_uses_no_query(

@@ -1744,6 +1744,7 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler = mock.Mock()
         decision_autoscaler.latest_version = 1
         decision_autoscaler.get_decision_interval.return_value = 0
+        decision_autoscaler.current_launch_priority.return_value = 50
 
         def _logical_down(replica_id, generation=7):
             return autoscalers.AutoscalerDecision(
@@ -1787,11 +1788,73 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         assert actuation_calls == [
             mock.call.scale_down_logically_batch([1, 2], 4, 1, 7),
-            mock.call.scale_up_batch([None], expected_version=1),
+            mock.call.scale_up_batch([None],
+                                     expected_version=1,
+                                     launch_priority=50),
             mock.call.scale_down_logically_batch([3], 4, 1, 7),
             mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
             mock.call.scale_down_logically_batch([4], 4, 1, 8),
         ]
+
+    def test_instance_aware_physical_batches_keep_per_card_priority(self):
+        ctrl = _make_controller()
+        spec = types.SimpleNamespace(
+            min_replicas=0,
+            max_replicas=20,
+            num_overprovision=None,
+            target_qps_per_replica={
+                'L4': 1.0,
+                'A100': 2.0,
+            },
+            upscale_delay_seconds=None,
+            downscale_delay_seconds=None,
+        )
+        decision_autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', spec, version=1)
+        l4_override = {'accelerators': {'L4': 1}}
+        a100_override = {'accelerators': {'A100': 1}}
+        decision_autoscaler.generate_scaling_decisions = mock.Mock(
+            return_value=[
+                autoscalers.AutoscalerDecision(
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+                    l4_override),
+                autoscalers.AutoscalerDecision(
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+                    a100_override),
+            ])
+        decision_autoscaler.current_launch_priority = mock.Mock(return_value=50)
+        decision_autoscaler.current_launch_priorities_by_accelerator = (
+            mock.Mock(return_value={
+                'L4': 20,
+                'A100': 50,
+            }))
+        decision_autoscaler.get_decision_interval = mock.Mock(return_value=0)
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_free_reserved_slots_by_accelerator',
+                 return_value={}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        assert ctrl._replica_manager.scale_up_batch.call_args_list == [  # pylint: disable=line-too-long
+            mock.call([l4_override], expected_version=1, launch_priority=20),
+            mock.call([a100_override], expected_version=1, launch_priority=50),
+        ]
+        decision_autoscaler.current_launch_priorities_by_accelerator.assert_called_once_with(  # pylint: disable=line-too-long
+            ['L4', 'A100'])
 
 
 class TestTranslateInFlight:

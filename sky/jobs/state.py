@@ -1,7 +1,6 @@
 """The database for managed jobs status."""
 # TODO(zhwu): maybe use file based status instead of database, so
 # that we can easily switch to a s3-based storage.
-import collections
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Collection
@@ -804,6 +803,35 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
     return jobs
 
 
+def get_job_event_task_contexts(job_id: int) -> list[dict[str, Any]]:
+    """Return the slim per-task fields needed for job-event cluster merges.
+
+    The managed-job event timeline only needs the per-task ``task_id`` /
+    ``task_name`` plus the job-level ``pool`` marker to reconstruct cluster
+    names. Reading the full managed-job task rows here would also decode
+    metadata and may read YAML content from disk, which is unnecessary for
+    this path.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.task_name,
+                job_info_table.c.pool,
+            ).select_from(
+                spot_table.outerjoin(
+                    job_info_table, spot_table.c.spot_job_id ==
+                    job_info_table.c.spot_job_id)).where(
+                        spot_table.c.spot_job_id == job_id).order_by(
+                            spot_table.c.task_id.asc())).fetchall()
+    return [{
+        'task_id': row.task_id,
+        'task_name': row.task_name,
+        'pool': row.pool,
+    } for row in rows]
+
+
 # Cap the ids per ``IN (...)`` so a large refresh never overflows the DB
 # bind-parameter limit (SQLite's default is ~999); see
 # get_jobs_status_check_info.
@@ -1032,49 +1060,74 @@ def get_job_cancellation_states(
     workspace authorization and the controller generation used to choose the
     signal path. Reading those fields together avoids three point queries per
     job and prevents decisions assembled from different lifecycle snapshots.
+    Only the latest task row per job matters for cancellation, so the query
+    keeps the row volume bounded by job count instead of total task count.
     """
     if not job_ids:
         return {}
 
-    unique_job_ids = list(dict.fromkeys(job_ids))
-    engine = _db_manager.get_engine()
-    task_states: dict[int, list[tuple[int, ManagedJobStatus]]] = (
-        collections.defaultdict(list))
-    job_metadata: dict[int, tuple[str | None, int | None, float | None]] = {}
-    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-        query = sqlalchemy.select(
-            spot_table.c.spot_job_id,
-            spot_table.c.task_id,
-            spot_table.c.status,
-            job_info_table.c.workspace,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
-        ).select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    spot_table.c.spot_job_id.in_(chunk)).order_by(
-                        spot_table.c.spot_job_id.asc(),
-                        spot_table.c.task_id.asc())
-        with orm.Session(engine) as session:
-            rows = session.execute(query).fetchall()
-        for job_id, task_id, status, workspace, pid, started_at in rows:
-            task_states[job_id].append((task_id, ManagedJobStatus(status)))
-            job_metadata[job_id] = (workspace, pid, started_at)
-
     snapshots: dict[int, JobCancellationState] = {}
-    for job_id, statuses in task_states.items():
-        _, status = get_latest_task_id_from_statuses(statuses)
-        assert status is not None, job_id
-        workspace, pid, started_at = job_metadata[job_id]
+    for job_id, _, status, workspace, pid, started_at in (
+            _fetch_job_cancellation_state_rows(job_ids)):
         snapshots[job_id] = JobCancellationState(
-            status=status,
+            status=ManagedJobStatus(status),
             workspace=(constants.SKYPILOT_DEFAULT_WORKSPACE
                        if workspace is None else workspace),
             is_legacy_controller=_is_legacy_controller_record(pid, started_at),
         )
     return snapshots
+
+
+def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
+    """Fetch one cancellation-driving task row per requested job.
+
+    Cancellation follows ``get_latest_task_id_from_statuses`` semantics:
+    pick the first non-terminal task if one exists, otherwise the last
+    terminal task.
+    """
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    if not unique_job_ids:
+        return []
+
+    engine = _db_manager.get_engine()
+    rows: list[Any] = []
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+        latest_task_ids = sqlalchemy.select(
+            spot_table.c.spot_job_id.label('spot_job_id'),
+            sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+                sqlalchemy.func.min(
+                    sqlalchemy.case(
+                        (~spot_table.c.status.in_(terminal_status_values),
+                         spot_table.c.task_id),
+                        else_=None)),
+                sqlalchemy.func.max(spot_table.c.task_id),
+            ).label('task_id')).where(
+                spot_table.c.spot_job_id.in_(chunk)).group_by(
+                    spot_table.c.spot_job_id).subquery()
+        query = sqlalchemy.select(
+            latest_task_ids.c.spot_job_id,
+            latest_task_ids.c.task_id,
+            spot_table.c.status,
+            job_info_table.c.workspace,
+            job_info_table.c.controller_pid,
+            job_info_table.c.controller_pid_started_at,
+        ).select_from(
+            latest_task_ids.join(
+                spot_table,
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
+                    spot_table.c.task_id ==
+                    latest_task_ids.c.task_id)).outerjoin(
+                        job_info_table, latest_task_ids.c.spot_job_id ==
+                        job_info_table.c.spot_job_id)).order_by(
+                            latest_task_ids.c.spot_job_id.asc())
+        with orm.Session(engine) as session:
+            rows.extend(session.execute(query).fetchall())
+    return rows
 
 
 def has_jobs_requiring_recovery_grace_wait() -> bool:

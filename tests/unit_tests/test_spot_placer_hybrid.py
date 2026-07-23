@@ -48,6 +48,96 @@ def _make_per_gpu_placer(costs):
     return placer
 
 
+class TestInstanceTypeLocationIdentity:
+    """Exact provider shapes stay distinct across current and legacy rows."""
+
+    def test_same_card_and_region_with_different_instance_types_are_distinct(
+            self):
+        first = make_location('us-east-1', {'L4': 1},
+                              cloud_name='AWS',
+                              instance_type='g6.xlarge')
+        second = make_location('us-east-1', {'L4': 1},
+                               cloud_name='AWS',
+                               instance_type='g6.2xlarge')
+
+        assert first != second
+        assert len({first, second}) == 2
+
+    def test_legacy_missing_instance_type_resolves_when_unambiguous(self):
+        current = make_location('us-east-1', {'L4': 1},
+                                cloud_name='AWS',
+                                instance_type='g6.xlarge')
+        legacy = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+
+        assert make_placer({current: 1.0}).resolve_location(legacy) == current
+
+    def test_legacy_missing_instance_type_is_skipped_when_ambiguous(self):
+        first = make_location('us-east-1', {'L4': 1},
+                              cloud_name='AWS',
+                              instance_type='g6.xlarge')
+        second = make_location('us-east-1', {'L4': 1},
+                               cloud_name='AWS',
+                               instance_type='g6.2xlarge')
+        legacy = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+
+        placer = make_placer({
+            first: 1.0,
+            second: 2.0,
+        })
+
+        assert placer.resolve_location(legacy) is None
+        assert placer.resolve_location(
+            legacy, allow_ambiguous_legacy_shape=True) == first
+        assert placer.is_launch_admissible(legacy, selected_at=100)
+
+    def test_ambiguous_legacy_failure_benches_cheapest_matching_shape(self):
+        first = make_location('us-east-1', {'L4': 1},
+                              cloud_name='AWS',
+                              instance_type='g6.xlarge')
+        second = make_location('us-east-1', {'L4': 1},
+                               cloud_name='AWS',
+                               instance_type='g6.2xlarge')
+        legacy = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        placer = make_placer({first: 1.0, second: 2.0})
+
+        placer.set_preemptive(legacy)
+
+        assert first in placer.preemptive_locations()
+        assert second not in placer.preemptive_locations()
+
+    def test_exact_current_instance_type_resolves(self):
+        current = make_location('us-east-1', {'L4': 1},
+                                cloud_name='AWS',
+                                instance_type='g6.xlarge')
+        equivalent = make_location('us-east-1', {'L4': 1},
+                                   cloud_name='AWS',
+                                   instance_type='g6.xlarge')
+
+        assert make_placer({
+            current: 1.0
+        }).resolve_location(equivalent) == equivalent
+
+    def test_failed_type_can_fall_back_to_sibling_type_in_same_region(self):
+        cheapest = make_location('us-east-1', {'L4': 1},
+                                 cloud_name='AWS',
+                                 instance_type='g6.xlarge')
+        sibling = make_location('us-east-1', {'L4': 1},
+                                cloud_name='AWS',
+                                instance_type='g6.2xlarge')
+        other_region = make_location('us-west-2', {'L4': 1},
+                                     cloud_name='AWS',
+                                     instance_type='g6.xlarge')
+        placer = make_placer({
+            cheapest: 1.0,
+            sibling: 1.1,
+            other_region: 2.0,
+        })
+
+        assert placer.select_next_location() == cheapest
+        placer.set_preemptive(cheapest)
+        assert placer.select_next_location() == sibling
+
+
 class TestZeroCostTierFirst:
     """Free capacity fills completely before any paid launch."""
 
@@ -122,6 +212,8 @@ run: echo hi
         assert {next(iter(loc.accelerators.values())) for loc in locations
                } == {1, 4}
         assert {loc.region for loc in locations} == {'us-east-1'}
+        assert {loc.instance_type for loc in locations
+               } == {'fake-l4-1', 'fake-l4-4'}
 
     def test_live_cluster_catalog_is_never_queried(self, monkeypatch):
         # pylint: disable=import-outside-toplevel
@@ -200,6 +292,8 @@ run: echo hi
                 for location in locations
                 for accelerator, count in (location.accelerators or {}).items()
                } == {('L4', 1), ('L4', 4), ('A10G', 1), ('A10G', 2)}
+        assert {location.instance_type for location in locations
+               } == {'fake-L4-1', 'fake-L4-4', 'fake-A10G-1', 'fake-A10G-2'}
         assert catalog_call.call_count == 2
 
     def test_explicit_instance_type_remains_exact(self, monkeypatch):
