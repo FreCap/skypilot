@@ -804,6 +804,35 @@ def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
     return jobs
 
 
+def get_job_event_task_contexts(job_id: int) -> list[dict[str, Any]]:
+    """Return the slim per-task fields needed for job-event cluster merges.
+
+    The managed-job event timeline only needs the per-task ``task_id`` /
+    ``task_name`` plus the job-level ``pool`` marker to reconstruct cluster
+    names. Reading the full managed-job task rows here would also decode
+    metadata and may read YAML content from disk, which is unnecessary for
+    this path.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.task_name,
+                job_info_table.c.pool,
+            ).select_from(
+                spot_table.outerjoin(
+                    job_info_table, spot_table.c.spot_job_id ==
+                    job_info_table.c.spot_job_id)).where(
+                        spot_table.c.spot_job_id == job_id).order_by(
+                            spot_table.c.task_id.asc())).fetchall()
+    return [{
+        'task_id': row.task_id,
+        'task_name': row.task_name,
+        'pool': row.pool,
+    } for row in rows]
+
+
 # Cap the ids per ``IN (...)`` so a large refresh never overflows the DB
 # bind-parameter limit (SQLite's default is ~999); see
 # get_jobs_status_check_info.

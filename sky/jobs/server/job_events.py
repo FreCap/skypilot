@@ -30,7 +30,7 @@ def _get_job_cluster_names(job_id: int,
     one cluster per task).
     """
     cluster_names: list[str] = []
-    for task in managed_job_state.get_managed_job_tasks(job_id):
+    for task in managed_job_state.get_job_event_task_contexts(job_id):
         if task_id is not None and task.get('task_id') != task_id:
             continue
         if task.get('pool') is not None:
