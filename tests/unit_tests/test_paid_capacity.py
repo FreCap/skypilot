@@ -383,6 +383,33 @@ def test_restart_skips_ambiguous_legacy_instance_type_claim():
     assert adopt.call_args.args[2] == []
 
 
+def test_restart_claim_adoption_never_resolves_provider_costs():
+    zero = make_location('research', {'A100': 1}, cloud_name='Kubernetes')
+    paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({zero: 0.0, paid: 1.0})
+    placer.zero_cost_locations = mock.Mock(
+        side_effect=AssertionError('must not resolve provider costs'))
+    info = _pending_info(1, paid)
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'adopt_paid_capacity_claims',
+                               return_value=True) as adopt:
+        assert paid_capacity.adopt_existing_claims(
+            service_name='svc',
+            service_hash='hash',
+            controller_owner=(1, '10.0.0.1'),
+            workspace='w',
+            placer=placer,
+            replica_infos=[info],
+            priority=20)
+
+    assert len(adopt.call_args.args[2]) == 1
+    placer.zero_cost_locations.assert_not_called()
+
+
 def test_restart_excludes_non_demand_rows_from_claim_adoption():
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     infos = [_pending_info(replica_id, location) for replica_id in range(1, 4)]

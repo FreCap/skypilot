@@ -1,6 +1,6 @@
 # SkyServe exact-accelerator compatibility, priority, and per-card capacity plan
 
-_Created: 2026-07-19. Updated: 2026-07-22._
+_Created: 2026-07-19. Updated: 2026-07-23._
 
 ## Decision summary
 
@@ -28,6 +28,14 @@ Scheduling and scaling follow these rules:
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
 7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. With reserved fill enabled, every fresh broker-granted slot is launched independently of demand while total live and planned capacity remains below the hard `max_replicas` ceiling. The UI shows all three signals.
 8. `A100` and `A100-80GB` are distinct identifiers in validation, queue indexes, metrics, APIs, placement, tests, and UI. Matching may be case-insensitive, but it must never use family, prefix, regex, or memory-suffix normalization.
+9. Controller startup must not perform provider feasibility or pricing lookups
+   while configuring exact-card order, seeding reserved-capacity identities,
+   or adopting recovery claims.
+   Kubernetes locations are already classified as zero-cost when the placer is
+   constructed, and any paid prices already known to the placer may be read
+   directly. If the paid price map is incomplete, startup preserves the
+   explicit service resource order. Candidate-set growth therefore cannot
+   prevent the controller from binding its health endpoint.
 
 The priority rule deliberately means that a flexible priority-50 request remains ahead of a constrained priority-20 request. Within the same numeric priority, however, an `A100`-only request has no fallback and therefore gets the next A100 slot ahead of older flexible `L4/A100/H100` work. This preserves the existing strict-priority contract while protecting scarce-card access among peers.
 
@@ -80,6 +88,32 @@ not evidence that the behavior is active in production.
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
+| Unreleased | Bounded controller startup bootstrap | Configures exact-card order, seeds reserved-capacity identities, and adopts recovery claims from the placer's already-known cost cache instead of resolving paid-provider costs before Uvicorn binds. | Fix-forward for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures after exact instance-shape expansion increased the candidate set from 659 to more than 1,050. |
+
+### Controller startup liveness
+
+Reserved fill needs the zero-cost location identities before the first
+autoscaler tick so a recovered controller cannot mistake live fill capacity
+for surplus and terminate it. This startup seed is identity-only: it grants no
+free slots and records no fresh capacity snapshot.
+
+The placer classifies enumerated Kubernetes locations as zero-cost when it is
+constructed. Controller startup must use only this cached classification and
+already-cached paid prices. It must not resolve uncached paid-provider
+candidates, contact a provider API, or warm the full price cache before binding
+the controller health endpoint. When cached paid prices do not cover every
+configured card, the existing all-or-nothing ordering rule preserves the
+explicit service resource order. Claim recovery conservatively treats an
+uncached location as paid. Background placement and reserved-capacity polling
+retain their resolving cost semantics after the controller is healthy.
+
+Regression coverage must include a large set of uncached paid candidates and
+prove that both pre-bind exact-card configuration and startup seeding use only
+cached values without calling resource feasibility or pricing code. Recovery
+claim adoption must satisfy the same no-resolution rule. Production rollout
+verification requires the exact deployed commit, healthy controller endpoints
+for the one-replica canary and the production fleet, successful load-balancer
+syncs, and continuity of pre-existing ready replicas.
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable

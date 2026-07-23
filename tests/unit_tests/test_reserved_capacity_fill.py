@@ -648,7 +648,7 @@ class TestControllerSeeding(unittest.TestCase):
 
     def _placer(self):
         placer = mock.Mock()
-        placer.zero_cost_locations.return_value = [
+        placer.cached_zero_cost_locations.return_value = [
             spot_placer.Location.from_pickleable(_K8S_KEY)
         ]
         return placer
@@ -679,7 +679,7 @@ class TestControllerSeeding(unittest.TestCase):
         ctrl = self._make_controller(autoscaler, placer)
         ctrl._seed_fill_zero_cost_locations(autoscaler)
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
-        placer.zero_cost_locations.assert_not_called()
+        placer.cached_zero_cost_locations.assert_not_called()
 
     def test_no_placer_does_not_seed(self):
         autoscaler = _make_autoscaler()
@@ -688,13 +688,12 @@ class TestControllerSeeding(unittest.TestCase):
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
 
     def test_seed_failure_is_swallowed_and_leaves_unseeded(self):
-        # The cost path behind zero_cost_locations() can hit the live
-        # Kubernetes API; a blip there must not propagate out of the
-        # seed (it runs inside controller __init__), only degrade to
-        # the pre-seed behavior.
+        # A malformed or incomplete placer during a rolling upgrade must not
+        # propagate out of the seed (it runs inside controller __init__).
         autoscaler = _make_autoscaler()
         placer = mock.Mock()
-        placer.zero_cost_locations.side_effect = ValueError('api blip')
+        placer.cached_zero_cost_locations.side_effect = ValueError(
+            'cache unavailable')
         ctrl = self._make_controller(autoscaler, placer)
         ctrl._seed_fill_zero_cost_locations(autoscaler)  # must not raise
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
@@ -1020,6 +1019,19 @@ class TestZeroCostSelection(unittest.TestCase):
         with mock.patch.object(spot_placer.time, 'time', return_value=1000.0):
             self.placer.set_preemptive(self.k8s)
             self.assertIn(self.k8s, self.placer.zero_cost_locations())
+
+    def test_cached_enumeration_never_prices_uncached_paid_candidates(self):
+        self.placer.location2cost.pop(self.paid)
+        self.placer.location2status.update({
+            _make_location(f'paid-region-{index}', 'paid', use_spot=True):
+                spot_placer.LocationStatus.ACTIVE for index in range(1058)
+        })
+        with mock.patch.object(
+                self.placer,
+                '_get_cost_per_hour_cached',
+                side_effect=AssertionError('must not resolve provider cost')):
+            self.assertEqual(self.placer.cached_zero_cost_locations(),
+                             [self.k8s])
 
     def test_equal_cost_reuses_first_candidate(self):
         other = _make_location('research-ctx-2', 'free')

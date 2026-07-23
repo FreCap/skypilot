@@ -873,8 +873,30 @@ class SpotPlacer:
             return float('inf')
         return self._get_cost_per_hour_cached(resolved)
 
+    def cached_cost_per_hour(self, location: Location) -> float | None:
+        """Return a known cost without resolving resources or provider data.
+
+        Callers that run before the controller health endpoint binds must use
+        this bounded view. ``known_locations()`` returns the exact keys used by
+        ``location2cost``, so no legacy-shape resolution is needed here.
+        """
+        return self.location2cost.get(location)
+
     def preemptive_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
+
+    def cached_zero_cost_locations(self) -> list[Location]:
+        """Return zero-cost locations already known without provider calls.
+
+        Kubernetes locations are classified as zero-cost during placer
+        construction.  Controller boot uses this bounded view to seed the
+        autoscaler before its first tick without resolving every paid-cloud
+        candidate's feasibility and price.
+        """
+        return [
+            location for location in self.location2status
+            if self.location2cost.get(location) == 0
+        ]
 
     def zero_cost_locations(self) -> list[Location]:
         """All zero-cost locations, regardless of bench status.

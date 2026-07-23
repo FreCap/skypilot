@@ -432,8 +432,8 @@ class TestGetRoutingSpec:
         placer = mock.Mock()
         placer.active_locations.return_value = [a100_location]
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: 1.0
-                                            if location is l4_location else 2.0)
+        placer.cached_cost_per_hour.side_effect = (
+            lambda location: 1.0 if location is l4_location else 2.0)
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -460,8 +460,8 @@ class TestGetRoutingSpec:
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.cached_cost_per_hour.side_effect = (
+            lambda location: float('inf') if location is l4_location else 2.0)
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -481,6 +481,41 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
+
+    def test_prebind_accelerator_configuration_never_resolves_provider_cost(
+            self):
+        ctrl = _make_controller()
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.known_locations.return_value = [l4_location, a100_location]
+        placer.cached_cost_per_hour.return_value = None
+        placer.cost_per_hour.side_effect = AssertionError(
+            'pre-bind configuration must not resolve provider cost')
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=placer)
+        ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
+            spec=controller.autoscalers.ConcurrencyAutoscaler)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'A100': 1}),
+        ])
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica=None,
+                         target_concurrency_per_replica=1,
+                         lb_stream_timeout_seconds=120)
+        spec.min_replicas_by_accelerator = {}
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            ctrl._configure_instance_aware_accelerators(  # pylint: disable=protected-access
+                spec)
+            routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+
+        assert routing_spec['configured_accelerators'] == ['L4', 'A100']
+        placer.cost_per_hour.assert_not_called()
+        assert placer.cached_cost_per_hour.call_count == 4
 
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
