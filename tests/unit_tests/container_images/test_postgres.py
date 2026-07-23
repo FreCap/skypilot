@@ -1879,7 +1879,8 @@ def test_inventory_page_rolls_back_if_lease_expires_on_location_lock(
     assert before_location is not None
     claimed = topology_state.claim_inventory_shard(worker_id='copy-1',
                                                    lease_seconds=1,
-                                                   interval_seconds=1)
+                                                   interval_seconds=1,
+                                                   now=100)
     assert claimed is not None and claimed.id == regional.shard_id
     assert claimed.inventory_lease_token is not None
 
@@ -1888,20 +1889,42 @@ def test_inventory_page_rolls_back_if_lease_expires_on_location_lock(
     lock_connection.execute(
         sqlalchemy.select(schema.locations.c.id).where(
             schema.locations.c.id == regional.id).with_for_update()).one()
+    location_update_started = threading.Event()
+    clock_reads = 0
+
+    def database_clock(*, now=None):
+        nonlocal clock_reads
+        if now is not None:
+            return sqlalchemy.literal(now, type_=sqlalchemy.BigInteger())
+        clock_reads += 1
+        value = 100 if clock_reads == 1 else 200
+        return sqlalchemy.literal(value, type_=sqlalchemy.BigInteger())
+
+    def observe_location_update(_connection, _cursor, statement, _parameters,
+                                _context, _executemany):
+        if 'update container_image_locations ' in statement.lower():
+            location_update_started.set()
+
+    monkeypatch.setattr(catalog_state, 'database_epoch_expression',
+                        database_clock)
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            observe_location_update)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(topology_state.record_inventory_page,
                                      claimed.id, claimed.inventory_lease_token,
                                      (regional.runtime_digest,), 'next-page')
-            time.sleep(0.1)
+            assert location_update_started.wait(timeout=10)
             assert not future.done()
-            lock_connection.exec_driver_sql('SELECT pg_sleep(1.2)')
             lock_transaction.commit()
             assert future.result(timeout=10) is None
     finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                observe_location_update)
         if lock_transaction.is_active:
             lock_transaction.rollback()
         lock_connection.close()
+    assert clock_reads >= 2
 
     unchanged_shard = topology_state.get_shard(claimed.id)
     assert unchanged_shard is not None
