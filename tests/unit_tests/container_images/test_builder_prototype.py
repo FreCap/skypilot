@@ -371,12 +371,39 @@ def test_buildx_executor_writes_immutable_cache_tag_once(
     assert output.digest == 'sha256:' + '3' * 64
     assert '--cache-from' in commands[0]
     assert '--cache-to' in commands[0]
+    assert '--provenance=false' in commands[0]
     assert commands[0][-1].endswith('/context')
 
     monkeypatch.setattr(executor, '_reference_exists', lambda reference: True)
     executor.execute(record, spec, tmp_path, manifest, heartbeat=lambda: True)
     assert '--cache-from' in commands[1]
     assert '--cache-to' not in commands[1]
+
+
+def test_multiline_setup_uses_deterministic_heredoc() -> None:
+    raw = _direct_spec()
+    raw['setup'].append({
+        'run': 'python3 -m venv /opt/venv\n'
+               '/opt/venv/bin/python -m pip install boto3\n'
+               'test -x /opt/venv/bin/python',
+        'inputs': [],
+    })
+    spec = builder_prototype.BuildSpec.from_dict(raw)
+
+    first = builder_prototype.BuildKitExecutor._dockerfile(  # pylint: disable=protected-access
+        spec)
+    second = builder_prototype.BuildKitExecutor._dockerfile(  # pylint: disable=protected-access
+        spec)
+
+    assert first == second
+    assert "target=/inputs,readonly <<'SKYPILOT_SETUP_001_" in first
+    assert '\nset -e\npython3 -m venv /opt/venv\n' in first
+    assert '\n/opt/venv/bin/python -m pip install boto3\n' in first
+    delimiter = next(
+        line.rsplit("<<'", 1)[1][:-1]
+        for line in first.splitlines()
+        if "SKYPILOT_SETUP_001_" in line)
+    assert first.splitlines().count(delimiter) == 1
 
 
 def test_buildx_executor_creates_and_bootstraps_missing_builder(

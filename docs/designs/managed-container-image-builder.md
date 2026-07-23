@@ -259,6 +259,13 @@ worker service. It has the following intentionally narrow contract:
 - the explicit execution path creates and bootstraps one named local
   `docker-container` Buildx worker when it does not already exist, so registry
   cache export does not depend on the Docker daemon's image-store setting;
+- multiline setup steps are rendered as deterministic Dockerfile heredocs and
+  run with shell fail-fast behavior; changing those rendering semantics bumps
+  the cache policy version rather than reusing an incompatible cache tag;
+- direct evidence disables BuildKit's implicit provenance wrapper so identical
+  inputs produce the same image-manifest digest. Product provenance remains an
+  explicit, separately addressed and signed publication artifact rather than
+  nondeterministic metadata hidden in the runnable image digest;
 - output is one immutable digest-pinned OCI reference, not a named SkyPilot
   release;
 - the runner has no cancellation recovery or durable state, so it must never
@@ -274,7 +281,9 @@ and digest-pinned reference without returning credentials.
 
 The first live evidence pair uses isolated one-replica Serve services derived
 from `boltz-l4-fleet` and `opendde-10c200s-v4`. Both use Linux AMD64 images in
-one AWS region. A same-region baseline and built-image run measure
+one AWS region. The executable runner may itself run on a disposable CPU worker
+in that registry region; a laptop-side multi-gigabyte pull is not representative
+builder evidence. A same-region baseline and built-image run measure
 replica `time_to_ready_seconds`; image publication time is reported separately
 and is never hidden inside deployment readiness. The target is at least 120
 seconds lower readiness for each service when its existing runtime setup has

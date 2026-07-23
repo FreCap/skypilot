@@ -48,6 +48,7 @@ _STATES = ('PENDING', 'UPLOADING', 'QUEUED', 'BUILDING', 'VERIFYING',
            'PUBLISHING', 'READY', 'FAILED')
 _BUILD_FRONTEND = 'dockerfile.v0'
 _BUILD_FRONTEND_VERSION = 'docker/dockerfile:1.7'
+_CACHE_POLICY_VERSION = 2
 _SECRET_BUILD_ARG = re.compile(
     r'(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY)')
 
@@ -406,7 +407,7 @@ def dependency_cache_key(spec: BuildSpec, manifest: ContextManifest) -> str:
             'build_args': list(spec.build_args),
             'source_mode': spec.source_mode,
             'source': source_payload,
-            'policy_version': 1,
+            'policy_version': _CACHE_POLICY_VERSION,
         }))
 
 
@@ -761,8 +762,19 @@ class BuildKitExecutor:
         for key, _ in spec.build_args:
             lines.append(f'ARG {key}')
         for index, step in enumerate(spec.setup):
-            lines.append('RUN --mount=type=bind,source=.skypilot/steps/'
-                         f'{index:03d},target=/inputs,readonly {step.run}')
+            command_lines = step.run.rstrip('\n').splitlines()
+            delimiter = (
+                f'SKYPILOT_SETUP_{index:03d}_'
+                f'{hashlib.sha256(step.run.encode()).hexdigest()[:16].upper()}')
+            while delimiter in command_lines:
+                delimiter += '_X'
+            lines.extend([
+                'RUN --mount=type=bind,source=.skypilot/steps/'
+                f"{index:03d},target=/inputs,readonly <<'{delimiter}'",
+                'set -e',
+                *command_lines,
+                delimiter,
+            ])
         if spec.source_mode == 'image':
             lines.append('COPY .skypilot/source/ /opt/skypilot/source/')
         return '\n'.join(lines) + '\n'
@@ -819,8 +831,9 @@ class DockerBuildxExecutor:
                 '--file',
                 str(dockerfile_path), '--platform', spec.platform,
                 '--metadata-file',
-                str(metadata_path), '--progress=plain', '--tag', staging_ref,
-                '--push', '--cache-from', f'type=registry,ref={cache_ref}'
+                str(metadata_path), '--progress=plain', '--provenance=false',
+                '--tag', staging_ref, '--push', '--cache-from',
+                f'type=registry,ref={cache_ref}'
             ]
             # A digest-keyed cache tag is written once and then remains
             # read-only. This supports ECR repositories with immutable tags.
