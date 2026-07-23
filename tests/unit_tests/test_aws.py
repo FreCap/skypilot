@@ -902,16 +902,18 @@ def _ssh_credentials_for_proxy_command(monkeypatch, proxy_command):
 
 
 def test_legacy_ssm_proxy_command_upgraded_on_read(monkeypatch):
-    """Pre-adaptive-retry cluster YAMLs keep their old SSM proxy command
-    forever (auth is restored verbatim on re-provision), so the export is
-    prepended at read time."""
+    """Persisted SSM lookups gain retry wrapping and an empty-target guard."""
     legacy = ('aws ssm start-session --target "$(aws ec2 describe-instances '
               '--output text)" --region us-east-1 '
               '--document-name AWS-StartSSHSession --parameters portNumber=%p')
     credentials = _ssh_credentials_for_proxy_command(monkeypatch, legacy)
     upgraded = credentials['ssh_proxy_command']
     assert upgraded.startswith('env AWS_RETRY_MODE=adaptive')
-    assert shlex.quote(legacy) in upgraded
+    inner = shlex.split(upgraded)[-1]
+    assert 'skypilot_ssm_target="$(aws ec2 describe-instances' in inner
+    assert 'if [ -z "$skypilot_ssm_target" ]; then' in inner
+    assert ('exec aws ssm start-session '
+            '--target "$skypilot_ssm_target"') in inner
 
 
 def test_current_ssm_proxy_command_not_double_prefixed(monkeypatch):
