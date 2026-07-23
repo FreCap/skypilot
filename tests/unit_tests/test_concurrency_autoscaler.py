@@ -7,6 +7,7 @@ logical targets divide demand by the per-GPU saturation knob and publish GPU
 slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
+import math
 import threading
 # pylint: disable=protected-access
 import time
@@ -5446,8 +5447,10 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
                                 expected_request_duration_seconds=30,
                                 **kwargs)
 
-    # Bucket index 8 has upper bound 60s; index 7 is 30s.
+    # Bucket index 8 spans (30s, 60s]; its geometric midpoint, which is
+    # what the estimator uses, is sqrt(30*60) = 42.43s.
     _SIXTY_SECOND_BUCKET = 8
+    _SIXTY_SECOND_BUCKET_REPRESENTATIVE = math.sqrt(30.0 * 60.0)
 
     def test_measured_duration_supersedes_config(self):
         autoscaler = self._autoscaler()
@@ -5458,7 +5461,31 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
                 prediction_time_history=_histogram(
                     {self._SIXTY_SECOND_BUCKET: 50}))
 
-        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+        self.assertAlmostEqual(autoscaler.effective_request_duration_seconds,
+                               self._SIXTY_SECOND_BUCKET_REPRESENTATIVE)
+
+    def test_bucket_representative_is_the_geometric_midpoint(self):
+        """Wide log-scale buckets must not inflate the estimate.
+
+        Measured against production: with 97% of requests in the (10s, 30s]
+        bucket, taking the upper bound rather than the midpoint inflated the
+        estimate 1.70x, which would silently oversize every fleet.
+        """
+        bounds = list(constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS)
+
+        # (10, 30] -> sqrt(300), not 30.
+        self.assertAlmostEqual(
+            autoscalers._prediction_bucket_representative(7, bounds),
+            math.sqrt(10.0 * 30.0))
+        # The first bucket starts at zero, where a geometric mean degenerates.
+        self.assertAlmostEqual(
+            autoscalers._prediction_bucket_representative(0, bounds),
+            bounds[0] / 2.0)
+        # The final bucket is unbounded above, so its lower bound is the
+        # only honest floor.
+        self.assertAlmostEqual(
+            autoscalers._prediction_bucket_representative(len(bounds), bounds),
+            bounds[-1])
 
     def test_measured_duration_needs_enough_samples(self):
         autoscaler = self._autoscaler()
@@ -5487,7 +5514,8 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
                 in_flight={},
                 prediction_time_history=_histogram(
                     {self._SIXTY_SECOND_BUCKET: 50}))
-        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+        self.assertAlmostEqual(autoscaler.effective_request_duration_seconds,
+                               self._SIXTY_SECOND_BUCKET_REPRESENTATIVE)
 
         autoscaler._measured_duration_at = (
             time.time() - constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS -
@@ -5620,7 +5648,8 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
         restored = self._autoscaler()
         restored.load_dynamic_states(autoscaler.dump_dynamic_states())
 
-        self.assertEqual(restored.effective_request_duration_seconds, 60.0)
+        self.assertAlmostEqual(restored.effective_request_duration_seconds,
+                               self._SIXTY_SECOND_BUCKET_REPRESENTATIVE)
         self.assertEqual(restored.effective_provision_lead_seconds, 420.0)
 
     def test_measured_values_drive_queue_sizing(self):
@@ -5643,7 +5672,9 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
 
         autoscaler._set_target_num_replicas_with_concurrency_logic([])
 
-        # Measured 60s duration against the 60s budget left by the
-        # configured 540s lead weights every queued request at 1.0, where
-        # the configured 30s duration would have weighted them at 0.5.
-        self.assertEqual(autoscaler._weighted_queue_work, 100)
+        # The measured 42.4s duration exceeds the 60s budget left by the
+        # configured 540s lead by more than half, so each queued request
+        # weighs 42.4/60; the configured 30s would have weighed 0.5.
+        self.assertAlmostEqual(
+            autoscaler._weighted_queue_work,
+            100 * self._SIXTY_SECOND_BUCKET_REPRESENTATIVE / 60.0)
