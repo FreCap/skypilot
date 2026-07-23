@@ -39,6 +39,15 @@ _ACQUIRE_RETRY_INTERVAL_SECONDS = 5
 _RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS = 15
 
 
+def _touch_recovery_signal_file() -> pathlib.Path:
+    """Create the recovery gate file, including its parent directory."""
+    signal_file = pathlib.Path(
+        constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE).expanduser()
+    signal_file.parent.mkdir(parents=True, exist_ok=True)
+    signal_file.touch()
+    return signal_file
+
+
 class ManagedJobRefreshDaemonThread(threading.Thread):
     """Leader-elected thread that runs ha_recovery + ManagedJobEvent.
 
@@ -102,9 +111,7 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # keeps those two concerns from fighting. It also means a raise from
         # acquire() leaves the gate file in place while run() retries, which is
         # what we want (controller starts stay gated until we hold the lock).
-        signal_file = pathlib.Path(
-            constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE).expanduser()
-        signal_file.touch()
+        signal_file = _touch_recovery_signal_file()
 
         if not self._lock.is_locked():
             logger.info(f'Acquiring the consolidation mode lock: {self._lock}')
@@ -180,10 +187,7 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # Re-touch the recovery signal file so no new controllers will be
         # started
         try:
-            signal_file = pathlib.Path(
-                constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE).expanduser()
-            signal_file.parent.mkdir(parents=True, exist_ok=True)
-            signal_file.touch()
+            _touch_recovery_signal_file()
         except OSError:
             logger.warning('Failed to touch recovery signal file on lock-loss')
         # The lock is already released, kill job controllers to avoid split
