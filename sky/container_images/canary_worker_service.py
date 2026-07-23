@@ -31,6 +31,8 @@ _MAX_QUALIFIED_EKS_NODES = 1000
 _EC2_TEARDOWN_SECONDS = 5 * 60
 _EC2_TEARDOWN_ATTEMPTS = 60
 _EC2_TEARDOWN_POLL_SECONDS = 5
+_SPOT_REQUEST_CANCELLABLE_STATES = frozenset({'active', 'disabled', 'open'})
+_SPOT_REQUEST_TERMINAL_STATES = frozenset({'cancelled', 'closed', 'failed'})
 _EKS_TEARDOWN_SECONDS = 60
 _EKS_TEARDOWN_POLL_SECONDS = 2
 _EKS_ABSENCE_SETTLE_SECONDS = kubernetes.API_TIMEOUT + 1
@@ -485,6 +487,54 @@ def _tagged_instances(
     ]
 
 
+def _tagged_spot_requests(ec2: Any, operation_id: str, *,
+                          cleanup_deadline: float) -> list[dict[str, Any]]:
+    """Returns the complete operation-tagged Spot request inventory."""
+    requests: list[dict[str, Any]] = []
+    next_token: str | None = None
+    observed_tokens: set[str] = set()
+    while True:
+        kwargs: dict[str, Any] = {
+            'Filters': [{
+                'Name': 'tag:SkyPilotCanaryOperation',
+                'Values': [operation_id],
+            }],
+            'MaxResults': 1000,
+        }
+        if next_token is not None:
+            kwargs['NextToken'] = next_token
+        response = _cleanup_provider_call(ec2,
+                                          'describe_spot_instance_requests',
+                                          cleanup_deadline, **kwargs)
+        page = response.get('SpotInstanceRequests', [])
+        if (not isinstance(page, list) or
+                not all(isinstance(request, dict) for request in page)):
+            raise ValueError('QUALIFICATION_FAILED')
+        requests.extend(page)
+        raw_next_token = response.get('NextToken')
+        if raw_next_token is None:
+            return requests
+        if (not isinstance(raw_next_token, str) or not raw_next_token or
+                raw_next_token in observed_tokens):
+            raise ValueError('QUALIFICATION_FAILED')
+        observed_tokens.add(raw_next_token)
+        next_token = raw_next_token
+
+
+def _spot_requests_by_id(ec2: Any, request_ids: set[str],
+                         cleanup_deadline: float) -> list[dict[str, Any]]:
+    response = _cleanup_provider_call(
+        ec2,
+        'describe_spot_instance_requests',
+        cleanup_deadline,
+        SpotInstanceRequestIds=sorted(request_ids))
+    requests = response.get('SpotInstanceRequests', [])
+    if (not isinstance(requests, list) or
+            not all(isinstance(request, dict) for request in requests)):
+        raise ValueError('QUALIFICATION_FAILED')
+    return requests
+
+
 def _instance_id(instance: dict[str, Any]) -> str:
     value = instance.get('InstanceId')
     if not isinstance(value, str) or not value:
@@ -503,6 +553,78 @@ def _remember_instance_ids(instances: list[dict[str, Any]],
         else:
             unidentified_child_observed = True
     return unidentified_child_observed
+
+
+def _remember_instance_spot_request_ids(instances: list[dict[str, Any]],
+                                        known_request_ids: set[str]) -> bool:
+    """Retains request IDs exposed by Spot instances."""
+    unidentified_child_observed = False
+    for instance in instances:
+        value = instance.get('SpotInstanceRequestId')
+        if value is None:
+            continue
+        if isinstance(value, str) and value:
+            known_request_ids.add(value)
+        else:
+            unidentified_child_observed = True
+    return unidentified_child_observed
+
+
+def _remember_spot_request_children(requests: list[dict[str, Any]],
+                                    known_request_ids: set[str],
+                                    known_instance_ids: set[str]) -> bool:
+    """Retains both halves of each request-to-instance custody edge."""
+    unidentified_child_observed = False
+    for request in requests:
+        request_id = request.get('SpotInstanceRequestId')
+        if isinstance(request_id, str) and request_id:
+            known_request_ids.add(request_id)
+        else:
+            unidentified_child_observed = True
+        instance_id = request.get('InstanceId')
+        if instance_id is None:
+            continue
+        if isinstance(instance_id, str) and instance_id:
+            known_instance_ids.add(instance_id)
+        else:
+            unidentified_child_observed = True
+    return unidentified_child_observed
+
+
+def _index_exact_spot_requests(
+        requests: list[dict[str, Any]], known_request_ids: set[str],
+        known_instance_ids: set[str]) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Indexes an exact request read and reports incomplete provider state."""
+    unidentified_child_observed = _remember_spot_request_children(
+        requests, known_request_ids, known_instance_ids)
+    requests_by_id: dict[str, dict[str, Any]] = {}
+    for request in requests:
+        request_id = request.get('SpotInstanceRequestId')
+        if (not isinstance(request_id, str) or not request_id or
+                request_id in requests_by_id):
+            unidentified_child_observed = True
+            continue
+        requests_by_id[request_id] = request
+    if set(requests_by_id) != known_request_ids:
+        unidentified_child_observed = True
+    return requests_by_id, unidentified_child_observed
+
+
+def _spot_request_state_sets(
+    requests_by_id: dict[str, dict[str,
+                                   Any]],) -> tuple[set[str], set[str], bool]:
+    cancellable: set[str] = set()
+    terminal: set[str] = set()
+    unidentified_child_observed = False
+    for request_id, request in requests_by_id.items():
+        state = request.get('State')
+        if state in _SPOT_REQUEST_CANCELLABLE_STATES:
+            cancellable.add(request_id)
+        elif state in _SPOT_REQUEST_TERMINAL_STATES:
+            terminal.add(request_id)
+        else:
+            unidentified_child_observed = True
+    return cancellable, terminal, unidentified_child_observed
 
 
 def _exact_canary_instance(
@@ -560,6 +682,8 @@ def _terminate_ec2_instances(ec2: Any,
                              instance_ids: list[str],
                              *,
                              settle_absence: bool,
+                             spot_request_expected: bool = False,
+                             initial_spot_request_ids: list[str] | None = None,
                              initial_unidentified_child_observed: bool = False,
                              cleanup_deadline: float | None = None) -> bool:
     known_ids = {
@@ -569,6 +693,14 @@ def _terminate_ec2_instances(ec2: Any,
     unidentified_child_observed = (initial_unidentified_child_observed or any(
         not isinstance(instance_id, str) or not instance_id
         for instance_id in instance_ids))
+    known_spot_request_ids = {
+        request_id for request_id in (initial_spot_request_ids or [])
+        if isinstance(request_id, str) and request_id
+    }
+    unidentified_child_observed |= any(
+        not isinstance(request_id, str) or not request_id
+        for request_id in (initial_spot_request_ids or []))
+    spot_request_observed = bool(known_spot_request_ids)
     clean_observations_after_ambiguity = 0
     termination_requested: set[str] = set()
     if cleanup_deadline is None:
@@ -585,6 +717,65 @@ def _terminate_ec2_instances(ec2: Any,
         if time.monotonic() >= cleanup_deadline:
             return False
         unidentified_in_observation = _remember_instance_ids(tagged, known_ids)
+        if spot_request_expected:
+            unidentified_in_observation |= (_remember_instance_spot_request_ids(
+                tagged, known_spot_request_ids))
+            try:
+                tagged_requests = _tagged_spot_requests(
+                    ec2, operation_id, cleanup_deadline=cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            if tagged_requests:
+                spot_request_observed = True
+            unidentified_in_observation |= _remember_spot_request_children(
+                tagged_requests, known_spot_request_ids, known_ids)
+        exact_requests_by_id: dict[str, dict[str, Any]] = {}
+        if known_spot_request_ids:
+            try:
+                exact_requests = _spot_requests_by_id(ec2,
+                                                      known_spot_request_ids,
+                                                      cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            exact_requests_by_id, incomplete_exact_inventory = (
+                _index_exact_spot_requests(exact_requests,
+                                           known_spot_request_ids, known_ids))
+            unidentified_in_observation |= incomplete_exact_inventory
+        (cancellable_spot_request_ids, terminal_spot_request_ids,
+         unknown_spot_request_state
+        ) = _spot_request_state_sets(exact_requests_by_id)
+        unidentified_in_observation |= unknown_spot_request_state
+        if cancellable_spot_request_ids:
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                _cleanup_provider_call(
+                    ec2,
+                    'cancel_spot_instance_requests',
+                    cleanup_deadline,
+                    SpotInstanceRequestIds=sorted(cancellable_spot_request_ids))
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                post_cancel_requests = _spot_requests_by_id(
+                    ec2, known_spot_request_ids, cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            exact_requests_by_id, incomplete_exact_inventory = (
+                _index_exact_spot_requests(post_cancel_requests,
+                                           known_spot_request_ids, known_ids))
+            unidentified_in_observation |= incomplete_exact_inventory
+            (_, terminal_spot_request_ids, unknown_spot_request_state
+            ) = _spot_request_state_sets(exact_requests_by_id)
+            unidentified_in_observation |= unknown_spot_request_state
         if unidentified_in_observation:
             unidentified_child_observed = True
             clean_observations_after_ambiguity = 0
@@ -626,10 +817,21 @@ def _terminate_ec2_instances(ec2: Any,
                 return False
             all_known_terminated = (set(states) == known_ids and all(
                 state == 'terminated' for state in states.values()))
-            if (all_known_terminated and not settle_absence and
-                    ambiguity_resolved):
-                return True
-        if not known_ids and not settle_absence and ambiguity_resolved:
+        all_spot_requests_terminal = (
+            not spot_request_expected or
+            (bool(known_spot_request_ids) and
+             terminal_spot_request_ids == known_spot_request_ids))
+        instance_absence_settled = (not settle_absence or
+                                    (spot_request_expected and
+                                     spot_request_observed))
+        spot_request_absence_settled = (not spot_request_expected or
+                                        spot_request_observed)
+        teardown_complete = (ambiguity_resolved and
+                             all_spot_requests_terminal and
+                             (not known_ids or all_known_terminated) and
+                             instance_absence_settled and
+                             spot_request_absence_settled)
+        if teardown_complete:
             return True
         if (attempt == _EC2_TEARDOWN_ATTEMPTS - 1 or
                 time.monotonic() >= cleanup_deadline):
@@ -640,7 +842,9 @@ def _terminate_ec2_instances(ec2: Any,
             # too late remains successor-owned cleanup instead of being
             # terminalized as an ordinary qualification failure.
             return (ambiguity_resolved and
-                    (not known_ids or all_known_terminated))
+                    (not known_ids or all_known_terminated) and
+                    (not spot_request_expected or all_spot_requests_terminal or
+                     not known_spot_request_ids))
         time.sleep(
             min(_EC2_TEARDOWN_POLL_SECONDS,
                 max(0.0, cleanup_deadline - time.monotonic())))
@@ -652,10 +856,10 @@ def _ec2_user_data(reference: str, nonce: str, timeout_seconds: int) -> str:
     return '\n'.join((
         '#!/usr/bin/env bash',
         'set -euo pipefail',
+        "trap 'shutdown -h now' EXIT",
         f'timeout {timeout_seconds} docker pull {shlex.quote(reference)}',
         f'docker image inspect {shlex.quote(reference)} >/dev/null',
         f'echo {shlex.quote(marker)} >/dev/console',
-        'shutdown -h now',
     ))
 
 
@@ -701,6 +905,7 @@ def _run_ec2_canary_inner(
     ec2: _FencedClient | None = None
     instances: list[dict[str, Any]] = []
     known_instance_ids: set[str] = set()
+    known_spot_request_ids: set[str] = set()
     unidentified_tagged_child_observed = False
     instance_id: str | None = None
     launch_attempted = False
@@ -739,6 +944,10 @@ def _run_ec2_canary_inner(
                                       drain_event=drain_event)
         unidentified_tagged_child_observed |= _remember_instance_ids(
             instances, known_instance_ids)
+        if binding.canary_use_spot is True:
+            unidentified_tagged_child_observed |= (
+                _remember_instance_spot_request_ids(instances,
+                                                    known_spot_request_ids))
         _raise_if_draining(drain_event)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
@@ -798,6 +1007,10 @@ def _run_ec2_canary_inner(
                         'InstanceInterruptionBehavior': 'terminate',
                     },
                 }
+                kwargs['TagSpecifications'].append({
+                    'ResourceType': 'spot-instances-request',
+                    'Tags': tags,
+                })
             _raise_if_draining(drain_event)
             deadline = _authorized_launch_deadline(operation,
                                                    child_id,
@@ -838,6 +1051,10 @@ def _run_ec2_canary_inner(
             # full discovery-settling path.
             instance_id = _instance_id(instances[0])
             known_instance_ids.add(instance_id)
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids(instances,
+                                                        known_spot_request_ids))
             launch_confirmed = True
         if instance_id is None:
             instance_id = _instance_id(instances[0])
@@ -851,6 +1068,10 @@ def _run_ec2_canary_inner(
                                                    drain_event=drain_event)
             unidentified_tagged_child_observed |= _remember_instance_ids(
                 matching_instances, known_instance_ids)
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids(matching_instances,
+                                                        known_spot_request_ids))
             _raise_if_draining(drain_event)
             if len(matching_instances) > 1:
                 raise ValueError('CANARY_DUPLICATE_CHILD')
@@ -863,6 +1084,10 @@ def _run_ec2_canary_inner(
                                               expected_tags,
                                               drain_event=drain_event)
             known_instance_ids.add(_instance_id(instance))
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids([instance],
+                                                        known_spot_request_ids))
             _raise_if_draining(drain_event)
             instance_image_id = instance.get('ImageId')
             if instance_image_id != dict(
@@ -914,6 +1139,10 @@ def _run_ec2_canary_inner(
                         unidentified_tagged_child_observed |= (
                             _remember_instance_ids(live_instances,
                                                    known_instance_ids))
+                        if binding.canary_use_spot is True:
+                            unidentified_tagged_child_observed |= (
+                                _remember_instance_spot_request_ids(
+                                    live_instances, known_spot_request_ids))
                         teardown_verified = _terminate_ec2_instances(
                             cleanup_ec2,
                             operation.id,
@@ -921,6 +1150,10 @@ def _run_ec2_canary_inner(
                             settle_absence=(persisted_child or (
                                 (launch_attempted or bool(instances)) and
                                 not launch_confirmed)),
+                            spot_request_expected=(binding.canary_use_spot
+                                                   is True),
+                            initial_spot_request_ids=sorted(
+                                known_spot_request_ids),
                             initial_unidentified_child_observed=(
                                 unidentified_tagged_child_observed),
                             cleanup_deadline=cleanup_deadline)

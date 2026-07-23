@@ -12,6 +12,14 @@ data "aws_partition" "current" {
   provider = aws.home
 }
 
+module "image_canary_account" {
+  source = "../../modules/aws-image-canary-account"
+
+  providers = {
+    aws = aws.home
+  }
+}
+
 locals {
   copy_base_role_name           = "skypilot-image-worker-copy"
   lifecycle_base_role_name      = "skypilot-image-worker-lifecycle"

@@ -644,8 +644,10 @@ handler cannot clear a successor claim or rewind its cursor.
 
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
-and teardown deadline. The canary resource is tagged with operation/profile/
-generation, may exercise only one target/backend, and always auto-terminates. A
+and teardown deadline. Every canary child is tagged with operation/profile/
+generation and may exercise only one target/backend. EC2 guest exit traps request
+shutdown even when pull or inspection fails, while provider teardown remains the
+authoritative removal proof. A
 continuous lease heartbeat starts before credential acquisition. The actual STS,
 EC2, EKS, IAM, and Kubernetes call boundaries synchronously prove ownership both
 before and after each call. A provider create uses a stronger ordered fence.
@@ -668,11 +670,19 @@ create remains RUNNING for successor cleanup and never discards the deterministi
 child identity by terminalizing the operation. EC2 `RunInstances` uses one stable
 operation-derived `ClientToken`, and EKS uses one deterministic namespaced pod
 name, so a lost response or successor replay converges on the same child rather
-than launching a second paid resource. An ambiguous launch response remains
-reclaimable until that idempotent replay identifies the child or bounded
-provider settling proves repeated absence. EC2 cleanup follows the known child
-through `shutting-down` to `terminated`; EKS cleanup accounts for a timed-out
-create that becomes visible after the first delete. A persisted child also
+than launching a second paid resource. A Spot launch tags the
+`spot-instances-request` itself with the same catalog, operation, and profile
+identity. Cleanup discovers the complete tagged request inventory, cancels every
+open, active, or disabled request, retains every associated instance ID before
+and after cancellation, and requires both a terminal request state and exact
+instance termination. Since cancellation does not terminate an already launched
+instance, neither proof can substitute for the other. An ambiguous launch
+response remains reclaimable until the tagged Spot request is cancelled and
+terminal, or bounded provider settling proves repeated absence. On-demand
+ambiguity still requires the complete instance-absence window. EC2 cleanup
+follows every known child through `shutting-down` to `terminated`; EKS cleanup
+accounts for a timed-out create that becomes visible after the first delete. A
+persisted child also
 remains reclaimable if its immutable contract cannot be reloaded, because no
 terminal transition may substitute for provider teardown; an incompatible
 worker rotates that expired queue row without clearing its child identity so a
@@ -722,9 +732,11 @@ charge the previous UTC window.
 EC2 canary bindings require at least one explicit security group in every
 qualified AMI region. The worker always sends those groups and applies the
 catalog, operation, and profile tag specifications to the instance, every
-created EBS volume, and every created network interface. The generated IAM role
-authorizes `RunInstances` against the exact AMI, subnet, security groups, and
-created resource classes with the required request tags. A separate
+created EBS volume, every created network interface, and, for Spot, the request
+itself. The generated IAM role authorizes `RunInstances` against the exact AMI,
+subnet, security groups, and created resource classes with the required request
+tags. It may list Spot requests but may cancel only regional request resources
+carrying the exact catalog ownership tag. A separate
 `ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
 not combined with launch conditions. The role never relies on an implicit VPC
 default security group.
@@ -746,6 +758,18 @@ continues to replay on-demand under its existing idempotent token. Explicit
 `false` is also projected and selects on-demand for a newly staged revision.
 Public config and new snapshots accept only booleans, never the legacy internal
 unspecified value.
+Each compute account applies `aws-image-canary-account` exactly once before
+planning any EC2 canary target. That account-scoped module owns
+`AWSServiceRoleForEC2Spot`; every regional `aws-image-canary-target` requires
+and shares its output instead of racing to create an account-global role. This
+keeps a target ready for the public Spot default even when a staged profile
+revision explicitly selects on-demand. An existing role is imported into the
+account module. If a qualified AMI or snapshot is encrypted with a
+customer-managed KMS key, the regional target module receives that exact key
+ARN and grants the Spot service-linked role only the AWS-documented launch
+operations. AWS-managed EBS keys need no grant. Omitting a required
+customer-managed key makes qualification fail closed; the canary worker never
+receives direct KMS authority.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -1727,13 +1751,15 @@ attestations without the observed architecture are intentionally invalid and
 must be refreshed by a new canary. A pull-only marker or the configured canary
 platform is not architecture evidence. A target cannot use its ordinary
 `delete_authority: disabled` setting to skip qualification cleanup.
-The operation-tag query remains the duplicate detector and teardown inventory,
-but it cannot supply attestation fields. Every polling read must return exactly
-the launched or replay-discovered child ID. The worker then performs an ID-scoped
-`DescribeInstances` read, verifies that same ID and the exact operation, catalog,
-and profile tags, and derives host AMI, architecture, instance profile, and
-lifecycle state from that one response. The observed AMI must equal the qualified
-regional AMI. The console marker is read from that same child.
+The operation-tag instance query remains the duplicate detector and attestation
+inventory, but it cannot supply attestation fields. The independent
+operation-tag Spot-request query is teardown-only custody inventory. Every
+polling instance read must return exactly the launched or replay-discovered child
+ID. The worker then performs an ID-scoped `DescribeInstances` read, verifies that
+same ID and the exact operation, catalog, and profile tags, and derives host AMI,
+architecture, instance profile, and lifecycle state from that one response. The
+observed AMI must equal the qualified regional AMI. The console marker is read
+from that same child.
 An unexpected operation-tagged ID, missing exact child, or tag mismatch can never
 be spliced into evidence. Every child ID observed through launch, replay, polling,
 or cleanup is retained in the teardown set, and an identity mismatch fails only
@@ -2302,8 +2328,13 @@ runtime client, whose fixed one-hour assumed credentials may expire at the
 allowed 3,600-second runtime limit. Ambient credential materialization, STS role
 assumption, and service-client creation all receive the same lease and cleanup
 deadline fence. Teardown checks that deadline immediately before and after every
-preliminary discovery, tag discovery, termination, and exact-state provider
-call. The shared deadline is passed into the provider wrapper. That wrapper
+preliminary discovery, paginated Spot-request discovery, request cancellation,
+post-cancel exact request read, instance termination, and exact-state provider
+call. A cancellation-versus-fulfillment race therefore adds the returned
+instance ID to the retained set before teardown can succeed. A Spot cleanup is
+verified only when every discovered request is `cancelled`, `closed`, or
+`failed`, and every associated or operation-tagged instance is `terminated`.
+The shared deadline is passed into the provider wrapper. That wrapper
 proves the lease first, rechecks the deadline after any blocking heartbeat
 database round trip, and only then invokes the raw SDK call. A call that crosses
 the deadline makes cleanup unverified and no later provider call starts. EKS
@@ -2728,8 +2759,10 @@ CLI or Dashboard locates such a publication for explicit retry.
 3. While old 023 API replicas still serve traffic, confirm they ignore the
    additive 024 tables. Roll every API replica to the new binary, then prove no
    old pod remains before feature activation.
-4. Apply Terraform in one dedicated registry account, import its qualification
-   manifest, and stage the desired profile revision without activating it.
+4. Apply Terraform in one dedicated registry account. In each compute account,
+   apply the account-global Spot bootstrap once, then every regional canary
+   target and any customer-managed AMI KMS grants. Import the qualification
+   manifest and stage the desired profile revision without activating it.
 5. Deploy one copy worker, one lifecycle worker, and one runtime-canary worker
    with separate identities.
 6. Let each worker attest only its own capability, run actual-principal EC2 and
@@ -2809,6 +2842,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   regional-delete, identity-policy, repository-policy, and
   permissions-boundary tests via
   `terraform test -test-directory=terraform-tests`;
+- clean-account Spot service-linked-role planning, existing-role import
+  instructions, regional customer-managed AMI KMS grants, and least-privilege
+  Spot request tag, describe, and cancel policy tests;
 - EC2 instance and EKS kubelet runtime pull-auth refresh tests, preinstalled
   helper/AMI enforcement, homogeneous EKS-node-role validation, multi-cluster
   attestation, no managed-path CLI install/login, plus
@@ -2910,7 +2946,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   EKS creates, slow-host-clock denial after database expiry,
   renewal-crosses-deadline rejection for EC2/EKS, and a
   production failure caller blocked past lease expiry without stale-clock
-  terminalization;
+  terminalization; Spot-specific regressions lose both accepted launch
+  responses, discover an open operation-tagged request with no instance, race
+  fulfillment against cancellation, retain the late instance ID, and require
+  terminal request plus terminated instance proof before terminalization;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
 - source/destination/compute account separation, cross-identity attestation,
@@ -3961,3 +4000,19 @@ new managed-job cancellation attribution, transient-INIT recovery, and recovery
 signal-parent contracts. The second integration does not overlap this feature's
 26-file base-relative diff. All gates are rerun against the actual merge
 candidate.
+
+Codex exact-head review round 12 at
+`795b0e561d3fc7f2af8b44bb7dd21f3671db5826` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort request returned HTTP 429 before inference, so it
+was neither acceptance nor rejection. Codex confirmed the three-state market
+identity contract and all 26 GitHub checks, then independently reproduced two
+Spot activation blockers. A one-time request was not tagged, discovered, or
+cancelled, so two lost accepted `RunInstances` responses could be followed by
+five minutes of empty instance inventory, false teardown success, and a later
+orphan launch. Separately, the generated fresh-account path did not provision
+the mandatory `AWSServiceRoleForEC2Spot` or customer-managed AMI KMS grant.
+This revision makes the request a first-class custody child, proves both request
+and instance teardown across cancellation-versus-fulfillment, adds one
+account-scoped Spot bootstrap and regional conditional KMS grants, and keeps the
+legacy on-demand replay contract unchanged. The acceptance streak remains zero
+until both reviewers accept one immutable repaired head.

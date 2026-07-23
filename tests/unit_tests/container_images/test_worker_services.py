@@ -2107,6 +2107,23 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
                 'InstanceId': 'i-canary'
             }]
         })
+    spot_request = {
+        'SpotInstanceRequestId': 'sir-canary',
+        'InstanceId': 'i-canary',
+        'State': 'active',
+    }
+    cancelled_spot_request = {
+        **spot_request,
+        'State': 'cancelled',
+    }
+    if use_spot:
+        ec2.describe_spot_instance_requests.side_effect = ({
+            'SpotInstanceRequests': [spot_request],
+        }, {
+            'SpotInstanceRequests': [spot_request],
+        }, {
+            'SpotInstanceRequests': [cancelled_spot_request],
+        })
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
     ec2.get_console_output.return_value = {
         'Output': base64.b64encode(marker.encode()).decode()
@@ -2174,12 +2191,20 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
                 'InstanceInterruptionBehavior': 'terminate',
             },
         }
+        assert ec2.cancel_spot_instance_requests.call_args_list == [
+            mock.call(SpotInstanceRequestIds=['sir-canary'])
+        ]
     else:
         assert 'InstanceMarketOptions' not in launch
+        ec2.describe_spot_instance_requests.assert_not_called()
+        ec2.cancel_spot_instance_requests.assert_not_called()
     assert launch['SecurityGroupIds'] == list(
         dict(binding.canary_security_groups)[target.region])
+    expected_resource_types = {'instance', 'volume', 'network-interface'}
+    if use_spot:
+        expected_resource_types.add('spot-instances-request')
     assert {item['ResourceType'] for item in launch['TagSpecifications']
-           } == {'instance', 'volume', 'network-interface'}
+           } == expected_resource_types
     for specification in launch['TagSpecifications']:
         assert {
             tag['Key']: tag['Value'] for tag in specification['Tags']
@@ -2188,9 +2213,163 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotCatalog': 'catalog',
             'SkyPilotProfile': profile.name,
         }
+    assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert acquired_services == ['ec2', 'iam', 'ec2']
     assert len(provider_fences) == 3
     assert all(callable(fence) for fence in provider_fences)
+
+
+def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=True)
+    assert binding.instance_profile is not None
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    empty_instances = {'Reservations': []}
+    terminated_instance = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-racing',
+                'State': {
+                    'Name': 'terminated',
+                },
+            }]
+        }]
+    }
+    ec2 = mock.Mock()
+    ec2.run_instances.side_effect = (
+        TimeoutError('first accepted response lost'),
+        TimeoutError('second accepted response lost'),
+    )
+    ec2.describe_instances.side_effect = (
+        empty_instances,  # Initial operation-tag discovery.
+        empty_instances,  # Immediate cleanup discovery.
+        empty_instances,  # First bounded cleanup observation.
+        terminated_instance,  # Exact racing-instance termination proof.
+    )
+    open_request = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'State': 'open',
+    }
+    cancelled_with_instance = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'InstanceId': 'i-racing',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = ({
+        'SpotInstanceRequests': [open_request],
+    }, {
+        'SpotInstanceRequests': [open_request],
+    }, {
+        'SpotInstanceRequests': [cancelled_with_instance],
+    })
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0],
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+
+    with pytest.raises(TimeoutError, match='second accepted response lost'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    launch = ec2.run_instances.call_args.kwargs
+    assert {
+        specification['ResourceType']
+        for specification in launch['TagSpecifications']
+    } == {
+        'instance',
+        'network-interface',
+        'spot-instances-request',
+        'volume',
+    }
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-racing'])
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-racing'])
+
+
+def test_ec2_spot_cleanup_preserves_custody_until_request_is_terminal(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    active_request = {
+        'SpotInstanceRequestId': 'sir-active',
+        'State': 'active',
+    }
+    ec2.describe_spot_instance_requests.return_value = {
+        'SpotInstanceRequests': [active_request],
+    }
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-active'])
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_tagged_spot_request_discovery_reads_every_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_spot_instance_requests.side_effect = ({
+        'SpotInstanceRequests': [{
+            'SpotInstanceRequestId': 'sir-one',
+        }],
+        'NextToken': 'next-page',
+    }, {
+        'SpotInstanceRequests': [{
+            'SpotInstanceRequestId': 'sir-two',
+        }],
+    })
+
+    requests = canary_worker_service._tagged_spot_requests(
+        ec2, 'operation', cleanup_deadline=300.0)
+
+    assert [request['SpotInstanceRequestId'] for request in requests
+           ] == ['sir-one', 'sir-two']
+    assert ec2.describe_spot_instance_requests.call_args_list == [
+        mock.call(Filters=[{
+            'Name': 'tag:SkyPilotCanaryOperation',
+            'Values': ['operation'],
+        }],
+                  MaxResults=1000),
+        mock.call(Filters=[{
+            'Name': 'tag:SkyPilotCanaryOperation',
+            'Values': ['operation'],
+        }],
+                  MaxResults=1000,
+                  NextToken='next-page'),
+    ]
 
 
 @pytest.mark.parametrize('invalid_instance_id', [None, 7],
@@ -2202,7 +2381,8 @@ def test_ec2_canary_malformed_launch_identity_settles_and_terminates_late_child(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -2283,7 +2463,8 @@ def test_ec2_canary_malformed_discovered_identity_uses_settling_teardown(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -2342,7 +2523,8 @@ def test_ec2_canary_persistent_malformed_discovery_preserves_custody(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -2408,7 +2590,8 @@ def test_ec2_canary_terminal_child_plus_malformed_discovery_preserves_custody(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -2632,7 +2815,8 @@ def test_ec2_ambiguous_settling_consumes_full_window_before_terminalizing(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -2799,7 +2983,8 @@ def test_ec2_canary_rejects_mismatched_tagged_child_and_tears_down_all(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',

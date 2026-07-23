@@ -74,6 +74,29 @@ variable "canary_instance_types" {
   }
 }
 
+variable "spot_service_linked_role_arn" {
+  description = "AWSServiceRoleForEC2Spot ARN from the account bootstrap module. Required for every EC2 target and unused by EKS-only targets."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.spot_service_linked_role_arn == null || can(regex("^arn:[^:]+:iam::[0-9]{12}:role/aws-service-role/spot\\.amazonaws\\.com/AWSServiceRoleForEC2Spot$", var.spot_service_linked_role_arn))
+    error_message = "spot_service_linked_role_arn must identify AWSServiceRoleForEC2Spot."
+  }
+}
+
+variable "spot_customer_managed_kms_key_arns" {
+  description = "Customer-managed regional KMS keys encrypting qualified Spot AMIs or snapshots. The module grants the EC2 Spot service-linked role launch access."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(var.spot_customer_managed_kms_key_arns) <= 64 && alltrue([for arn in var.spot_customer_managed_kms_key_arns : can(regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[0-9A-Za-z-]+$", arn))])
+    error_message = "spot_customer_managed_kms_key_arns must contain at most 64 KMS key ARNs."
+  }
+}
+
 variable "eks_cluster_arns" {
   description = "Exact EKS clusters whose identity the canary worker may verify."
   type        = set(string)
