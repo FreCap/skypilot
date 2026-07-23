@@ -874,9 +874,12 @@ def test_expired_database_authorization_blocks_eks_create_with_slow_host_clock(
     core.create_namespaced_pod.assert_not_called()
 
 
-def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
-        monkeypatch: pytest.MonkeyPatch,
-        profile: models.ManagedRegistryProfile) -> None:
+@pytest.mark.parametrize(('architecture', 'expected_error'),
+                         (('x86_64', None), ('arm64', 'QUALIFICATION_FAILED'),
+                          (None, 'QUALIFICATION_FAILED')))
+def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        architecture: str | None, expected_error: str | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
@@ -898,6 +901,8 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
             'Name': 'stopped'
         },
     }
+    if architecture is not None:
+        instance['Architecture'] = architecture
     terminated_instance = {
         **instance,
         'State': {
@@ -963,11 +968,18 @@ def test_ec2_canary_launch_uses_stable_client_token_and_fenced_clients(
                         lambda *_args, **_kwargs: 1000)
     heartbeat = _OwnedHeartbeat()
 
-    evidence = canary_worker_service._run_ec2_canary(
-        operation, payload, _revision(profile), profile, target, binding,
-        _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
-
-    assert evidence['child_instance_id'] == 'i-canary'
+    if expected_error is None:
+        evidence = canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+        assert evidence['child_instance_id'] == 'i-canary'
+        assert evidence['instance_architecture'] == 'x86_64'
+    else:
+        with pytest.raises(ValueError, match=expected_error):
+            canary_worker_service._run_ec2_canary(
+                operation, payload, _revision(profile), profile, target,
+                binding, _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+                heartbeat)
     assert ec2.run_instances.call_args.kwargs['ClientToken'] == (
         canary_worker_service._ec2_client_token(operation.id))
     assert len(ec2.run_instances.call_args.kwargs['ClientToken']) == 64

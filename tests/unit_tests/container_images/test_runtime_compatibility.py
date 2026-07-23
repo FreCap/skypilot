@@ -21,6 +21,7 @@ from sky.container_images import config
 from sky.container_images import consumers
 from sky.container_images import demand_state
 from sky.container_images import models
+from sky.container_images import placement as image_placement
 from sky.container_images import qualification
 from sky.container_images import runtime
 from sky.container_images import topology_state
@@ -143,6 +144,7 @@ def _active_revision(
             'platform': profile.qualification.canary_platform,
             'runtime_id': 'us-west-2',
             'host_image_id': dict(binding.qualified_node_images)['us-west-2'],
+            'instance_architecture': 'x86_64',
             'instance_profile_arn': models.ec2_instance_profile_arn(binding),
             'actual_principal': binding.principals[0],
         }
@@ -1152,6 +1154,110 @@ def test_ordinary_resources_bypass_image_resolution_before_cloud_access(
         consumer_metadata={})
 
     assert resolved is resources
+
+
+@pytest.mark.parametrize('mode', [
+    models.WorkspaceImageMode.MANAGED_PREFERRED,
+    models.WorkspaceImageMode.MANAGED_REQUIRED,
+])
+@pytest.mark.parametrize('configuration_case',
+                         ['missing', 'disallowed', 'malformed'])
+def test_final_backend_preserves_generic_kubernetes_exact_ref(
+        monkeypatch: pytest.MonkeyPatch, mode: models.WorkspaceImageMode,
+        configuration_case: str) -> None:
+    selected_profile = 'broken-profile'
+    allowed_profiles = (('allowed-profile',) if configuration_case
+                        == 'disallowed' else (selected_profile,))
+    profile_value = {} if configuration_case == 'malformed' else None
+    policy = models.WorkspaceImagePolicy(mode=mode,
+                                         default_profile=selected_profile,
+                                         allowed_profiles=allowed_profiles)
+    resources = resources_lib.Resources(
+        cloud=sky.Kubernetes(),
+        region='generic-context',
+        container_image=models.ContainerImage(
+            ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64,
+            distribution=selected_profile))
+    monkeypatch.setattr(cloud_vm_ray_backend.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+    monkeypatch.setattr(image_placement.config, 'get_workspace_policy',
+                        lambda _workspace: policy)
+
+    def get_nested(path, default_value=None):
+        if tuple(path) == ('container_registries', 'profiles',
+                           selected_profile):
+            return profile_value
+        return default_value
+
+    monkeypatch.setattr(image_placement.config.skypilot_config, 'get_nested',
+                        get_nested)
+
+    def resolve(candidate, placement, **kwargs):
+        assert candidate is resources
+        assert placement.provider == 'kubernetes'
+        assert placement.backend == 'direct'
+        assert kwargs['workspace'] == 'research'
+        return candidate
+
+    resolver = mock.Mock(side_effect=resolve)
+    monkeypatch.setattr(runtime, 'resolve_for_placement', resolver)
+
+    resolved = cloud_vm_ray_backend._resolve_container_image_for_placement(
+        resources,
+        consumer_kind='cluster',
+        consumer_owner='generic-cluster',
+        controller_epoch='cluster:request',
+        controller_sequence=None,
+        allow_epoch_advance=False,
+        consumer_metadata={})
+
+    assert resolved is resources
+    resolver.assert_called_once()
+
+
+def test_final_backend_sanitizes_managed_only_classification_error(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    resources = resources_lib.Resources(cloud=sky.Kubernetes(),
+                                        region='generic-context',
+                                        container_image=models.ContainerImage(
+                                            release='boltz-l4',
+                                            distribution='broken-profile'))
+    monkeypatch.setattr(cloud_vm_ray_backend.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+    monkeypatch.setattr(
+        image_placement.config, 'is_declared_managed_eks_context',
+        mock.Mock(side_effect=ValueError('secret profile configuration value')))
+    resolver = mock.Mock()
+    monkeypatch.setattr(runtime, 'resolve_for_placement', resolver)
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as error:
+        cloud_vm_ray_backend._resolve_container_image_for_placement(
+            resources,
+            consumer_kind='cluster',
+            consumer_owner='managed-cluster',
+            controller_epoch='cluster:request',
+            controller_sequence=None,
+            allow_epoch_advance=False,
+            consumer_metadata={})
+
+    assert 'secret profile configuration value' not in str(error.value)
+    resolver.assert_not_called()
+
+
+def test_ec2_attestation_without_observed_architecture_is_invalid(
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    active = _active_revision(profile, observed_at=100)
+    key = models.profile_attestation_key('runtime', target.name, 'aws_vm',
+                                         binding.fingerprint, target.region)
+    evidence = dict(active.attestations[key])
+    evidence.pop('instance_architecture')
+
+    assert not models.runtime_attestation_matches(
+        profile, target, binding, 'aws_vm', target.region, evidence, as_of=100)
 
 
 def test_one_thousand_service_replicas_share_one_version_target_owner(

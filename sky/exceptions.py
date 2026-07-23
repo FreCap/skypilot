@@ -127,31 +127,50 @@ def deserialize_exception(serialized: Any) -> Exception:
     if isinstance(serialized, str):
         return RuntimeError(serialized)
     if not isinstance(serialized, dict) or 'type' not in serialized:
-        return RuntimeError(f'Server error: {serialized}')
+        return RuntimeError('Server error response is malformed.')
     exception_type = serialized['type']
+    if not isinstance(exception_type, str):
+        return RuntimeError('Server error response is malformed.')
+    args = serialized.get('args', ())
+    if not isinstance(args, (list, tuple)):
+        return RuntimeError('Server error response is malformed.')
+    raw_attributes = serialized.get('attributes', {})
+    if (not isinstance(raw_attributes, dict) or
+            not all(isinstance(key, str) for key in raw_attributes)):
+        return RuntimeError('Server error response is malformed.')
     if hasattr(builtins, exception_type):
         exception_class = getattr(builtins, exception_type)
     else:
         exception_class = globals().get(exception_type, None)
     if exception_class is None:
         # Unknown exception type.
-        return Exception(
-            f'{exception_type}: {serialized.get("message", serialized)}')
-    attributes = dict(serialized.get('attributes', {}))
+        message = serialized.get('message')
+        detail = message if isinstance(message, str) else 'Unknown server error'
+        return Exception(f'{exception_type}: {detail}')
+    if (not isinstance(exception_class, type) or
+            not issubclass(exception_class, BaseException)):
+        return RuntimeError('Server error response is malformed.')
+    attributes = dict(raw_attributes)
     legacy_notes = attributes.pop('__notes__', None)
-    e = exception_class(*serialized.get('args', ()), **attributes)
-    notes = serialized.get('notes', legacy_notes)
-    if (isinstance(notes, list) and
-            all(isinstance(note, str) for note in notes)):
-        add_note = getattr(e, 'add_note', None)
-        if add_note is None:
-            setattr(e, '__notes__', list(notes))
-        else:
-            for note in notes:
-                add_note(note)
-    stacktrace = serialized.get('stacktrace')
-    if stacktrace is not None:
-        setattr(e, 'stacktrace', stacktrace)
+    try:
+        e = exception_class(*args, **attributes)
+        if not isinstance(e, Exception):
+            return RuntimeError('Server error response is malformed.')
+        notes = serialized.get('notes', legacy_notes)
+        if (isinstance(notes, list) and
+                all(isinstance(note, str) for note in notes)):
+            add_note = getattr(e, 'add_note', None)
+            if add_note is None:
+                setattr(e, '__notes__', list(notes))
+            else:
+                for note in notes:
+                    add_note(note)
+        stacktrace = serialized.get('stacktrace')
+        if stacktrace is not None:
+            setattr(e, 'stacktrace', stacktrace)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A malformed wire envelope must never escape the decoder boundary.
+        return RuntimeError('Server error response is malformed.')
     return e
 
 

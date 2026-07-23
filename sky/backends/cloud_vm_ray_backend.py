@@ -49,10 +49,9 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
-from sky.container_images import config as container_image_config
 from sky.container_images import consumers as container_image_consumers
 from sky.container_images import errors as container_image_errors
-from sky.container_images import models as container_image_models
+from sky.container_images import placement as container_image_placement
 from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import storage as storage_lib
@@ -165,47 +164,10 @@ def _resolve_container_image_for_placement(
     """Pins a managed image after optimization and before provisioning."""
     if resources.container_image is None:
         return resources
-    cloud = resources.cloud
-    assert cloud is not None, resources
-    assert resources.region is not None, resources
     workspace = (skypilot_config.get_active_workspace() or
                  constants.SKYPILOT_DEFAULT_WORKSPACE)
-    if isinstance(cloud, clouds.AWS):
-        provider = 'aws'
-        backend = 'aws_vm'
-    elif isinstance(cloud, clouds.Kubernetes):
-        image = resources.container_image
-        assert image is not None, resources
-        if container_image_config.is_declared_managed_eks_context(
-                image, resources.region, workspace):
-            provider = 'aws'
-            backend = 'aws_eks'
-        else:
-            provider = 'kubernetes'
-            backend = 'direct'
-    else:
-        provider = str(cloud).lower()
-        backend = 'direct'
-    architecture = None
-    if resources.instance_type is not None:
-        try:
-            architecture = cloud.get_arch_from_instance_type(
-                resources.instance_type)
-        except NotImplementedError:
-            pass
-    runtime_platform = (
-        container_image_models.runtime_platform_from_architecture(architecture))
-    configured_host_image = None
-    if resources.image_id is not None:
-        configured_host_image = resources.image_id.get(
-            resources.region, resources.image_id.get(None))
-    placement = container_image_models.Placement(
-        provider=provider,
-        region=resources.region,
-        backend=backend,
-        platform=runtime_platform,
-        host_image_id=(configured_host_image))
     try:
+        placement = container_image_placement.classify(resources, workspace)
         return container_image_runtime.resolve_for_placement(
             resources,
             placement,

@@ -356,6 +356,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     launch_confirmed = False
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
     success = False
+    instance_architecture: str | None = None
     actual_profile_arn: str | None = None
     actual_role: str | None = None
     teardown_verified = False
@@ -444,6 +445,9 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             if len(matching_instances) != 1:
                 raise RuntimeError('EC2 canary child disappeared.')
             instance = matching_instances[0]
+            instance_architecture = instance.get('Architecture')
+            if instance_architecture != 'x86_64':
+                raise ValueError('QUALIFICATION_FAILED')
             actual_profile_arn = (instance.get('IamInstanceProfile') or
                                   {}).get('Arn')
             if actual_profile_arn != expected_profile_arn:
@@ -489,6 +493,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         raise ValueError('CANARY_PULL_FAILED')
     assert instance_id is not None
     assert actual_role is not None
+    assert instance_architecture == 'x86_64'
     return {
         'status': 'READY',
         'target': target.name,
@@ -499,6 +504,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         'binding_fingerprint': binding.fingerprint,
         'runtime_digest': digest,
         'host_image_id': dict(binding.qualified_node_images)[target.region],
+        'instance_architecture': instance_architecture,
         'instance_profile_arn': actual_profile_arn,
         'actual_principal': actual_role,
         'child_instance_id': instance_id,

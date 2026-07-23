@@ -899,6 +899,7 @@ def runtime_attestation_matches(
             return False
         return (evidence.get('host_image_id') == dict(
             binding.qualified_node_images).get(target.region) and
+                evidence.get('instance_architecture') == 'x86_64' and
                 evidence.get('instance_profile_arn') == expected_profile_arn and
                 evidence.get('actual_principal') == binding.principals[0])
     if backend != 'aws_eks' or binding.kind != (

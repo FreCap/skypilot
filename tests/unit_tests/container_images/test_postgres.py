@@ -309,6 +309,7 @@ def _activate_profile(
                     evidence.update(
                         host_image_id=dict(
                             binding.qualified_node_images)[target.region],
+                        instance_architecture='x86_64',
                         instance_profile_arn=(
                             models.ec2_instance_profile_arn(binding)),
                         actual_principal=binding.principals[0])

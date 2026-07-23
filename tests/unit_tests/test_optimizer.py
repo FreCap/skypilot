@@ -12,6 +12,7 @@ from sky import optimizer
 from sky import optimizer_candidate_generation
 from sky import resources as resources_lib
 from sky import task as task_lib
+from sky.container_images import models as container_image_models
 
 
 def test_filter_out_blocked_launchable_resources_preserves_order():
@@ -315,13 +316,15 @@ def test_managed_image_direct_fallback_keeps_equal_rank_clouds():
     ((True, 'aws', 'aws_eks'), (False, 'kubernetes', 'direct')))
 def test_kubernetes_image_placement_requires_declared_eks_context(
         declared_eks, provider, backend):
-    resource = types.SimpleNamespace(cloud=clouds.Kubernetes(),
-                                     region='boltz-west',
-                                     container_image=mock.sentinel.image,
-                                     instance_type=None,
-                                     image_id=None)
+    resource = types.SimpleNamespace(
+        cloud=clouds.Kubernetes(),
+        region='boltz-west',
+        container_image=(container_image_models.ContainerImage(
+            ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64)),
+        instance_type=None,
+        image_id=None)
     with mock.patch.object(
-            optimizer_candidate_generation.container_image_config,
+            optimizer_candidate_generation.container_image_placement.config,
             'is_declared_managed_eks_context',
             return_value=declared_eks) as classify:
         placement = optimizer_candidate_generation._managed_image_placement(  # pylint: disable=protected-access
@@ -329,8 +332,77 @@ def test_kubernetes_image_placement_requires_declared_eks_context(
 
     assert placement.provider == provider
     assert placement.backend == backend
-    classify.assert_called_once_with(mock.sentinel.image, 'boltz-west',
+    classify.assert_called_once_with(resource.container_image, 'boltz-west',
                                      'research')
+
+
+@pytest.mark.parametrize('mode', [
+    container_image_models.WorkspaceImageMode.MANAGED_PREFERRED,
+    container_image_models.WorkspaceImageMode.MANAGED_REQUIRED,
+])
+@pytest.mark.parametrize('configuration_case',
+                         ['missing', 'disallowed', 'malformed'])
+def test_kubernetes_exact_ref_preserves_direct_on_profile_classification_error(
+        mode, configuration_case):
+    selected_profile = 'broken-profile'
+    allowed_profiles = (('allowed-profile',) if configuration_case
+                        == 'disallowed' else (selected_profile,))
+    profile_value = {} if configuration_case == 'malformed' else None
+    policy = container_image_models.WorkspaceImagePolicy(
+        mode=mode,
+        default_profile=selected_profile,
+        allowed_profiles=allowed_profiles)
+    resource = types.SimpleNamespace(
+        cloud=clouds.Kubernetes(),
+        region='generic-context',
+        container_image=container_image_models.ContainerImage(
+            ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64,
+            distribution=selected_profile),
+        instance_type=None,
+        image_id=None)
+
+    def get_nested(path, default_value=None):
+        if tuple(path) == ('container_registries', 'profiles',
+                           selected_profile):
+            return profile_value
+        return default_value
+
+    with mock.patch.object(
+            optimizer_candidate_generation.container_image_placement.config,
+            'get_workspace_policy',
+            return_value=policy), mock.patch.object(
+                optimizer_candidate_generation.container_image_placement.config.
+                skypilot_config,
+                'get_nested',
+                side_effect=get_nested):
+        placement = optimizer_candidate_generation._managed_image_placement(  # pylint: disable=protected-access
+            resource, 'research')
+
+    assert placement.provider == 'kubernetes'
+    assert placement.backend == 'direct'
+
+
+@pytest.mark.parametrize('selector', [
+    container_image_models.ContainerImage(release='boltz-l4'),
+    container_image_models.ContainerImage(
+        artifact_id='00000000-0000-4000-8000-000000000001'),
+    container_image_models.ContainerImage(
+        ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64, release='boltz-l4'),
+])
+def test_kubernetes_managed_only_selector_fails_closed_on_profile_error(
+        selector):
+    resource = types.SimpleNamespace(cloud=clouds.Kubernetes(),
+                                     region='generic-context',
+                                     container_image=selector,
+                                     instance_type=None,
+                                     image_id=None)
+    with mock.patch.object(
+            optimizer_candidate_generation.container_image_placement.config,
+            'is_declared_managed_eks_context',
+            side_effect=ValueError('invalid profile')), pytest.raises(
+                ValueError, match='invalid profile'):
+        optimizer_candidate_generation._managed_image_placement(  # pylint: disable=protected-access
+            resource, 'research')
 
 
 def _optimize_ordered_task_with_mock_launchable(dag, launchable_call_indexes):

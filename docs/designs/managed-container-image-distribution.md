@@ -366,6 +366,19 @@ Kubernetes is classified as managed EKS only when its exact selected context is
 declared by an active EKS binding and that binding qualifies the cluster ARN,
 node role, namespace, and node selector. A Kubernetes placement is never
 inferred to be EKS merely because it uses the Kubernetes cloud abstraction.
+Optimizer admission and the final pre-provisioning resolver use one shared
+placement classifier, so candidate ranking and launch cannot disagree. That
+classifier determines architecture and runtime platform before consulting any
+registry profile. For an exact digest-pinned `ref` with no `release` or
+`artifact_id`, a Kubernetes context is generic direct unless configuration can
+positively prove the exact managed EKS binding. Missing, disallowed, or
+malformed profile configuration therefore preserves the exact-ref direct path;
+it is not an image-plane failure on generic Kubernetes. The same configuration
+errors remain fail-closed for `release`, `artifact_id`, and combined managed
+selectors because those requests have no self-contained direct identity. Final
+placement classification executes inside the typed image error boundary, so a
+managed-only classification failure is sanitized consistently with resolver
+failures before reaching request state or logs.
 
 The workspace opt-in is explicit configuration, not task YAML:
 
@@ -1050,6 +1063,14 @@ that typed marker through bounded cause and failover wrappers, then stores a
 fresh built-in error with no inherited traceback. Errors from legacy `image_id`,
 ordinary provisioning, quotas, setup, or user code are not rewritten by the
 image feature.
+Exception-envelope decoding is itself a bounded compatibility boundary. The
+decoder accepts only a string exception type, a list or tuple of positional
+arguments, and a dictionary with string attribute keys. Unknown types retain
+the existing generic fallback, while malformed fields or a constructor that
+rejects the supplied shape return a generic built-in error. Invalid envelopes
+never raise a secondary decoder exception or reflect the complete untrusted
+payload into an error message. Valid Python 3.11 exception notes continue to be
+restored outside constructor keyword arguments.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -1579,7 +1600,15 @@ The fixed digest-pinned `canary_ref` is copied by the copy worker into
 Terraform's non-catalog qualification repository. The canary worker pulls that
 regional digest through the declared runtime identity, and the lifecycle worker
 deletes it through `qualification_delete_authority`. Runtime evidence records
-the fixed `linux/amd64` platform. A target cannot use its ordinary
+the fixed `linux/amd64` platform. An EC2 canary must rediscover its exact tagged
+instance through `DescribeInstances` and observe `Architecture: x86_64` before
+it may publish success. A missing or different architecture fails
+qualification even when the pull marker is present. The resulting attestation
+persists `instance_architecture: x86_64`, and runtime matching requires that
+field together with the qualified AMI and instance profile. Existing preview
+attestations without the observed architecture are intentionally invalid and
+must be refreshed by a new canary. A pull-only marker or the configured canary
+platform is not architecture evidence. A target cannot use its ordinary
 `delete_authority: disabled` setting to skip qualification cleanup.
 
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
@@ -3277,3 +3306,20 @@ age at both metadata and locked admission with typed fallback, adds and validate
 the exact artifact-demand index, removes the three unbounded v0 facets, and
 round-trips exception notes outside constructor kwargs. The acceptance streak
 remains zero until both reviewers accept one immutable repaired head.
+
+Codex final-acceptance round 1 at
+`8b1280a6a68a8852ff9675c8a0b67128109c75d5` returned `RESHAPE`; Fable could
+not start because its zero-token quota probe returned HTTP 429. Codex re-proved
+the complete PostgreSQL, compatibility, Serve, Jobs, Dashboard, Helm, and
+Terraform gates, then reproduced two remaining admission defects. Generic
+Kubernetes exact refs reached profile parsing in both optimizer and final
+backend wrappers before the direct-compatibility guard, so a missing,
+disallowed, or malformed profile could reject a runnable direct image. EC2
+canaries also persisted the configured AMD64 platform without observing the
+launched instance architecture, allowing an ARM64 instance and AMI tuple to
+qualify as `linux/amd64`. The review additionally found that malformed exception
+envelopes could raise secondary decoder errors. This revision centralizes
+placement classification with exact-ref generic-Kubernetes fallback, requires
+observed `x86_64` EC2 canary evidence at qualification and runtime matching, and
+makes exception decoding total over untrusted envelope shapes. The acceptance
+streak remains zero.

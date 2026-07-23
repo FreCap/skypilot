@@ -2,6 +2,8 @@
 
 import pickle
 
+import pytest
+
 from sky import exceptions
 from sky.utils import status_lib
 
@@ -231,6 +233,45 @@ def test_deserialize_partial_dict():
     e = exceptions.deserialize_exception({'type': 'NonExistent'})
     assert isinstance(e, Exception)
     assert 'NonExistent' in str(e)
+
+
+@pytest.mark.parametrize('bad_input', [
+    {
+        'type': 1,
+    },
+    {
+        'type': 'ValueError',
+        'attributes': None,
+    },
+    {
+        'type': 'ValueError',
+        'attributes': [('field', 'value')],
+    },
+    {
+        'type': 'ValueError',
+        'attributes': {
+            1: 'value'
+        },
+    },
+    {
+        'type': 'ValueError',
+        'args': None,
+    },
+    {
+        'type': 'int',
+    },
+    {
+        'type': 'ValueError',
+        'attributes': {
+            'unexpected': True
+        },
+    },
+])
+def test_deserialize_malformed_envelope_never_raises(bad_input):
+    restored = exceptions.deserialize_exception(bad_input)
+
+    assert isinstance(restored, RuntimeError)
+    assert str(restored) == 'Server error response is malformed.'
 
 
 def test_wrap_unsafe_exceptions():
