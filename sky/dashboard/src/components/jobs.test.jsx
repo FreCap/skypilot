@@ -26,6 +26,8 @@ import cachePreloader from '@/lib/cache-preloader';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
 import { getPoolStatus } from '@/data/connectors/jobs';
 import { getCurrentUserInfo } from '@/data/connectors/client';
+import { getUsers } from '@/data/connectors/users';
+import { getWorkspaces } from '@/data/connectors/workspaces';
 
 jest.mock('next/router', () => {
   const router = {
@@ -96,6 +98,9 @@ const deferred = () => {
   });
   return { promise, resolve, reject };
 };
+
+const countCacheReads = (fetcher) =>
+  dashboardCache.get.mock.calls.filter(([fn]) => fn === fetcher).length;
 
 describe('managed jobs page initialization', () => {
   afterEach(() => {
@@ -832,6 +837,156 @@ describe('managed jobs automatic refresh', () => {
       jest.advanceTimersByTime(5000);
     });
     expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
+  });
+
+  it('reuses the cached filter directory across background polls', async () => {
+    jest.useFakeTimers();
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) {
+        return Promise.resolve([{ username: 'alice' }]);
+      }
+      if (fetcher === getWorkspaces) {
+        return Promise.resolve({ default: {} });
+      }
+      return Promise.resolve([]);
+    });
+    const runningBatchResponse = {
+      jobs: [
+        {
+          id: 1,
+          task_id: 0,
+          task_job_id: '1-0',
+          name: 'batch-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+          batch_total_batches: 10,
+          batch_completed_batches: 1,
+        },
+      ],
+      total: 1,
+      totalNoFilter: 1,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    };
+    jobsCacheManager.getPaginatedJobs.mockResolvedValue(runningBatchResponse);
+
+    render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={{ current: null }}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+
+    await screen.findByText('batch-job');
+    await act(async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    const initialUserReads = countCacheReads(getUsers);
+    const initialWorkspaceReads = countCacheReads(getWorkspaces);
+    jobsCacheManager.getPaginatedJobs.mockClear();
+    jobsCacheManager.invalidateCache.mockClear();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+
+    await waitFor(() =>
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1)
+    );
+    expect(jobsCacheManager.invalidateCache).toHaveBeenCalledTimes(1);
+    expect(countCacheReads(getUsers)).toBe(initialUserReads);
+    expect(countCacheReads(getWorkspaces)).toBe(initialWorkspaceReads);
+  });
+
+  it('ignores stale filter directory completions after a newer preload', async () => {
+    const firstUsers = deferred();
+    const firstWorkspaces = deferred();
+    const secondUsers = deferred();
+    const secondWorkspaces = deferred();
+    let userRequests = 0;
+    let workspaceRequests = 0;
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) {
+        userRequests += 1;
+        return userRequests === 1 ? firstUsers.promise : secondUsers.promise;
+      }
+      if (fetcher === getWorkspaces) {
+        workspaceRequests += 1;
+        return workspaceRequests === 1
+          ? firstWorkspaces.promise
+          : secondWorkspaces.promise;
+      }
+      return Promise.resolve([]);
+    });
+    const setValueList = jest.fn();
+    const props = {
+      refreshInterval: 5000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      filters: [],
+      onUserFilter: jest.fn(),
+      onRefresh: jest.fn(),
+      poolsData: [],
+      poolsLoading: false,
+      setValueList,
+      lastFetchedTime: null,
+    };
+
+    const { rerender } = render(
+      <ManagedJobsTable {...props} preloadingComplete={true} />
+    );
+
+    await waitFor(() => expect(countCacheReads(getUsers)).toBe(1));
+    await waitFor(() => expect(countCacheReads(getWorkspaces)).toBe(1));
+
+    rerender(<ManagedJobsTable {...props} preloadingComplete={false} />);
+    rerender(<ManagedJobsTable {...props} preloadingComplete={true} />);
+
+    await waitFor(() => expect(countCacheReads(getUsers)).toBe(2));
+    await waitFor(() => expect(countCacheReads(getWorkspaces)).toBe(2));
+
+    await act(async () => {
+      secondUsers.resolve([{ username: 'fresh-user' }]);
+      secondWorkspaces.resolve({ beta: {} });
+      await Promise.all([secondUsers.promise, secondWorkspaces.promise]);
+    });
+
+    await waitFor(() =>
+      expect(setValueList).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          user: ['fresh-user'],
+          workspace: ['beta'],
+        })
+      )
+    );
+
+    await act(async () => {
+      firstUsers.resolve([{ username: 'stale-user' }]);
+      firstWorkspaces.resolve({ alpha: {} });
+      await Promise.all([firstUsers.promise, firstWorkspaces.promise]);
+    });
+
+    expect(setValueList).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        user: ['fresh-user'],
+        workspace: ['beta'],
+      })
+    );
   });
 });
 
