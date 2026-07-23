@@ -239,3 +239,31 @@ def test_hints_from_multiple_clouds_are_returned_together(cache_db):
 
     hints = capacity_cache.active_service_observations('svc', 'hash-a')['hints']
     assert sorted(hint['cloud'] for hint in hints) == ['aws', 'gcp']
+
+
+def test_no_stored_value_or_key_contains_the_account(cache_db):
+    """The account must not appear in any stored key or value."""
+    del cache_db
+    secret = 'secret-project-1234'
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+    capacity_cache.mark_exhausted(_key(account=secret), observation)
+    capacity_cache.mark_quota_failure(_quota_key(account=secret), observation)
+
+    # Canonical keys are digests, so the identifier is absent from the key.
+    assert secret not in capacity_cache._cache_key(_key(account=secret))
+    assert secret not in capacity_cache._quota_cooldown_cache_key(
+        _quota_key(account=secret))
+
+    for prefix in (capacity_cache._CAPACITY_OBSERVATION_KEY_PREFIX,
+                   capacity_cache._QUOTA_OBSERVATION_KEY_PREFIX):
+        rows = kv_cache.list_active_cache_entries_by_prefix(
+            capacity_cache._service_observation_prefix(prefix, 'svc'), 10)
+        assert rows
+        for key, value, _ in rows:
+            assert secret not in key
+            # canonical_key is embedded in the value, so this also covers it.
+            assert secret not in value
+
+    result = capacity_cache.active_service_observations('svc', 'hash-a')
+    assert secret not in json.dumps(result)
+    assert len(result['hints']) == 2

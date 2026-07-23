@@ -12,6 +12,8 @@ from sky.backends import cloud_vm_ray_backend as backend
 from sky.provision import capacity_cache
 from sky.provision import common as provision_common
 from sky.provision.aws import instance as aws_instance
+from sky.provision.gcp import instance as gcp_instance
+from sky.provision.gcp import instance_utils as gcp_instance_utils
 
 
 class _FakeClientError(Exception):
@@ -598,3 +600,62 @@ def test_gcp_touches_no_cache_entry_point_when_flag_is_off(monkeypatch):
                                                         zones, 1,
                                                         'proj') == set()
     assert not backend._quota_cooldown_is_active(quota_key)
+
+
+def test_gcp_provisioner_sets_requested_count_so_failures_can_cache(
+        monkeypatch):
+    """A GCP bulk-insert failure must prove it covered the whole demand.
+
+    Without `requested_count`, `_failure_requested_full_demand` is False and
+    the failure is silently never cached, making the GCP cache a no-op.
+    """
+    codes = [
+        'VM_MIN_COUNT_NOT_REACHED', 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS'
+    ]
+
+    class _FakeCompute:
+        """Minimal stand-in for the GCP compute resource."""
+
+        STOPPING_STATES: list = []
+        NON_TERMINATED_STATES: list = []
+        PENDING_STATES: list = []
+
+        @classmethod
+        def filter(cls, *args, **kwargs):
+            del args, kwargs
+            return {}
+
+        @classmethod
+        def create_instances(cls, *args, **kwargs):
+            del args, kwargs
+            return ([{'code': code, 'message': code} for code in codes], [])
+
+    monkeypatch.setattr(gcp_instance_utils, 'GCPComputeInstance', _FakeCompute)
+    monkeypatch.setattr(gcp_instance.instance_utils, 'GCPComputeInstance',
+                        _FakeCompute)
+    monkeypatch.setattr(gcp_instance.instance_utils, 'get_node_type',
+                        lambda _: gcp_instance_utils.GCPNodeType.COMPUTE)
+
+    config = provision_common.ProvisionConfig(
+        provider_config={
+            'project_id': 'proj',
+            'availability_zone': 'asia-northeast3-b',
+        },
+        authentication_config={},
+        docker_config={},
+        node_config={},
+        count=2,
+        tags={},
+        resume_stopped_nodes=True,
+        ports_to_open_on_launch=None,
+    )
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        gcp_instance._run_instances('asia-northeast3', 'cluster', config)
+
+    error = exc_info.value
+    assert [entry['code'] for entry in error.errors] == codes
+    # The wiring under test: without this the failure can never be cached.
+    assert error.requested_count == 2
+    assert backend._failure_requested_full_demand(error, 2)
+    assert backend._classify_capacity_error(clouds.GCP(), error) == 'capacity'

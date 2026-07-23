@@ -64,14 +64,23 @@ class ServiceObservation(NamedTuple):
     service_hash: str
 
 
-def _cache_key(key: ResourceKey) -> str:
+def _key_digest(key: ResourceKey | QuotaCooldownKey) -> str:
+    """Hashes a key so no account or project identifier is ever stored.
+
+    Keys are only ever compared for equality, never parsed, so a digest is
+    sufficient. It also keeps the identifier out of the observation values
+    that embed the canonical key.
+    """
     payload = json.dumps(key, separators=(',', ':'))
-    return f'{_CACHE_KEY_PREFIX}{payload}'
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _cache_key(key: ResourceKey) -> str:
+    return f'{_CACHE_KEY_PREFIX}{_key_digest(key)}'
 
 
 def _quota_cooldown_cache_key(key: QuotaCooldownKey) -> str:
-    payload = json.dumps(key, separators=(',', ':'))
-    return f'{_QUOTA_COOLDOWN_KEY_PREFIX}{payload}'
+    return f'{_QUOTA_COOLDOWN_KEY_PREFIX}{_key_digest(key)}'
 
 
 def _service_observation_prefix(prefix: str, service_name: str) -> str:

@@ -118,6 +118,20 @@ the project is what scopes capacity and because it keeps the user's email
 address out of the cache key. An identity with no parseable project yields no
 key, so that demand simply does not participate.
 
+### Marking requires a proven full-demand failure
+
+`mark_exhausted` and `mark_quota_failure` only run when
+`_failure_requested_full_demand` can prove the failure covered every requested
+node, which it reads from `requested_count` on the provisioner error. Only the
+AWS provisioner set that attribute, so GCP failures silently never populated
+either cache and the feature was a no-op end to end.
+
+The GCP bulk-insert path now sets `requested_count` to the number of nodes that
+attempt asked for. The outer API-level handler in `run_instances` deliberately
+leaves it unset: it can fire before any create is attempted, so it cannot prove
+what the failure covered, and an unset value keeps that failure out of the
+cache.
+
 ### Presentation
 
 `active_service_observations` returned hints described as AWS-specific, and the
@@ -127,9 +141,12 @@ so the UI can attribute each row. The observation payload moved to version 2
 and carries an explicit object rather than a positional list, which removes the
 index arithmetic that previously decoded it.
 
-The account is now excluded when the observation is written rather than
-redacted when it is read, so no account or project identifier ever enters an
-observation value.
+The account is excluded when the observation is written rather than redacted
+when it is read, and canonical cache keys are stored as SHA-256 digests rather
+than as their JSON payload. Together those mean no account or project
+identifier enters any stored key or value, not merely that it is absent from
+the returned hint. Keys are only ever compared for equality, never parsed, so a
+digest loses nothing.
 
 This is a visible API shape change on the placement endpoint and is the main
 reason this work was separated from PR #874.
