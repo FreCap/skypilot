@@ -828,9 +828,20 @@ run: echo hi
     def test_superseded_logical_guard_rejects_first_cloud_mutation(
             self, tmp_path):
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            cloud_launch_guard=lambda: (False, 'replica-not-authorized'))
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert 'reason=replica-not-authorized' in str(raised)
+        mock_sdk.launch.assert_not_called()
+        mock_terminate.assert_not_called()
+
+    def test_legacy_boolean_cloud_guard_remains_compatible(self, tmp_path):
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
             tmp_path, [None], cloud_launch_guard=lambda: False)
         assert isinstance(raised,
                           replica_managers._ReplicaLaunchSupersededError)
+        assert 'reason=guard-rejected' in str(raised)
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 

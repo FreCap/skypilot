@@ -335,24 +335,24 @@ class _UnfencedExternalLbLaunchError(RuntimeError):
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
 @context.contextual
-def launch_cluster(replica_id: int,
-                   yaml_content: str,
-                   cluster_name: str,
-                   log_file: str,
-                   replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
-                   replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
-                       int, bool],
-                   resources_override: dict[str, Any] | None = None,
-                   retry_until_up: bool = True,
-                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-                   availability_max_retry: int | None = None,
-                   exact_resources_override: bool = False,
-                   pre_launch_guard: Callable[[], bool] | None = None,
-                   cloud_launch_guard: Callable[[], bool] | None = None,
-                   continue_guard: Callable[[], bool] | None = None,
-                   launch_fence: dict[str, Any] | None = None,
-                   service_spec: 'service_spec.SkyServiceSpec | None' = None,
-                   workspace: str | None = None) -> None:
+def launch_cluster(
+        replica_id: int,
+        yaml_content: str,
+        cluster_name: str,
+        log_file: str,
+        replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
+        replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+        resources_override: dict[str, Any] | None = None,
+        retry_until_up: bool = True,
+        max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+        availability_max_retry: int | None = None,
+        exact_resources_override: bool = False,
+        pre_launch_guard: Callable[[], bool] | None = None,
+        cloud_launch_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+        continue_guard: Callable[[], bool] | None = None,
+        launch_fence: dict[str, Any] | None = None,
+        service_spec: 'service_spec.SkyServiceSpec | None' = None,
+        workspace: str | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -429,6 +429,27 @@ def launch_cluster(replica_id: int,
                            f'{common_utils.format_exception(e)}')
             return False
 
+    def _cloud_guard_decision() -> tuple[bool, str]:
+        """Return a bounded rejection reason across the launch-thread boundary."""
+        if cloud_launch_guard is None:
+            return True, 'not-configured'
+        try:
+            result = cloud_launch_guard()
+        except Exception as e:  # pylint: disable=broad-except
+            reason = f'guard-error-{type(e).__name__}'
+            logger.warning('Failed to verify logical cloud launch authority; '
+                           f'failing closed: reason={reason}.')
+            return False, reason
+        if isinstance(result, bool):
+            return result, 'authorized' if result else 'guard-rejected'
+        if (isinstance(result, tuple) and len(result) == 2 and
+                isinstance(result[0], bool) and isinstance(result[1], str) and
+                result[1] and len(result[1]) <= 128):
+            return result
+        logger.warning('Logical cloud launch guard returned an invalid result; '
+                       'failing closed: reason=invalid-guard-result.')
+        return False, 'invalid-guard-result'
+
     def _cancel_request_for_ownership_loss() -> None:
         ownership_lost.set()
         replica_to_launch_cancelled[replica_id] = True
@@ -489,10 +510,12 @@ def launch_cluster(replica_id: int,
         try:
             if _check_is_cancelled():
                 return
-            if not _guard_allows(cloud_launch_guard):
+            cloud_launch_allowed, cloud_launch_reason = (
+                _cloud_guard_decision())
+            if not cloud_launch_allowed:
                 raise _ReplicaLaunchSupersededError(
                     f'Refusing superseded logical cloud launch for replica '
-                    f'{replica_id}.')
+                    f'{replica_id}: reason={cloud_launch_reason}.')
             # This is the authoritative DB-backed check immediately before
             # every cloud mutation. The shared watchdog event is a second,
             # cheap fence for an already-running request.
@@ -3255,6 +3278,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         # over. Other (transient) launch errors say nothing about the
         # location's capacity, so they keep the default in-place retries.
         availability_max_retry = (1 if location is not None else None)
+        logical_cloud_launch_guard: (Callable[[], bool | tuple[bool, str]] |
+                                     None) = None
+        if (getattr(self, '_uses_logical_replicas', False) and
+                bool(getattr(self, '_logical_exact_accelerator_shapes', {})) and
+                not zero_cost_only and not prior_reserved_fill and
+                cost_rebalance_for_replica_id is None and
+                not prior_unknown_capacity_replacement):
+            logical_cloud_launch_guard = lambda: (
+                self._queued_logical_launch_fence_decision(replica_id)[:2])
         t = thread_utils.SafeThread(
             target=launch_cluster,
             args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
@@ -3265,14 +3297,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'availability_max_retry': availability_max_retry,
                 'exact_resources_override': location is not None,
                 'pre_launch_guard': self._service_is_launch_authorized,
-                'cloud_launch_guard':
-                    (lambda: self._queued_logical_launch_fence_holds(replica_id)
-                     if
-                     (getattr(self, '_uses_logical_replicas', False) and bool(
-                         getattr(self, '_logical_exact_accelerator_shapes', {})
-                     ) and not zero_cost_only and not prior_reserved_fill and
-                      cost_rebalance_for_replica_id is None and
-                      not prior_unknown_capacity_replacement) else None),
+                'cloud_launch_guard': logical_cloud_launch_guard,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence':
                     self._replica_launch_fence_context(launch_version),
@@ -6431,9 +6456,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 pending_launches.append((replica_id, t, info))
                 continue
             if replica_id in superseded_launches:
+                rejection = getattr(t, 'exception', None)
                 logger.info(
                     f'Cleaning up logical replica {replica_id}: its exact-card '
-                    'target was superseded before the first cloud mutation.')
+                    'target was superseded before the first cloud mutation '
+                    f'({rejection}).')
                 self._terminate_replica(replica_id,
                                         sync_down_logs=False,
                                         replica_drain_delay_seconds=0,
