@@ -338,6 +338,26 @@ prewarmed snapshot or lazy data/runtime path. It would not be honest to hide
 that mechanism inside v0 setup-layer builds or to count first-request latency
 as deployment savings.
 
+The Boltz fleet image completed a separate runtime smoke test. Its source
+manifest contained 35 layers and 4,888,012,650 compressed bytes. The prototype
+retained every source layer and added one 212-byte marker layer, producing a
+36-layer, 4,888,012,862-byte manifest. A Spot-first service with dynamic
+on-demand fallback resolved that release and eventually admitted an on-demand
+`g6.2xlarge` after shared launch-budget and Spot-capacity waits. From the start
+of that admitted launch, the instance was up at 24.26 seconds, the managed
+container was up at 204.71 seconds, the cluster was launched at 251.15 seconds,
+and a Python HTTP process in the image passed readiness at 301.20 seconds. The
+provision configuration preserved `credential_helper: ecr-login`.
+
+This was intentionally a secret-free image/runtime smoke test, not a full
+Boltz model-readiness benchmark. The production run block requires four
+deployment secrets that were not present in the benchmark environment. The
+test proves digest resolution, private-registry authentication, cold pull, L4
+container startup, command execution, and readiness. It cannot claim that the
+model initialized or that inference succeeded. Because the build adds no
+meaningful payload beyond its marker, it also has no credible deployment-speed
+claim.
+
 Chart upgrades must merge the new chart defaults before applying the previous
 release's values. Provider-specific environment variables, volume names, and
 mount paths are reserved only when the corresponding native chart credential

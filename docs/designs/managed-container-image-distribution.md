@@ -3582,3 +3582,11 @@ builder's 120-second deployment-speed gate failed. V0 remains an ordinary OCI
 distribution plane. A node-cache, snapshot, lazy snapshotter, or model-data
 locality feature requires a separate design and runtime capability gate rather
 than expansion of this PR.
+
+The Boltz prototype release separately resolved to a 4,888,012,862-byte
+digest-pinned manifest and passed a fresh L4 container/runtime smoke test.
+Its admitted on-demand fallback preserved `credential_helper: ecr-login`,
+started the managed container 204.71 seconds after provisioning began, and
+passed HTTP readiness at 301.20 seconds. The test did not receive the
+production fleet's R2 and payload-encryption secrets, so it proves the managed
+pull and executable image boundary but not model readiness or inference.

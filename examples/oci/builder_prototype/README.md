@@ -70,6 +70,13 @@ validates the builder and managed pull path, but it does not justify a
 faster-deployment claim or broadening this prototype into a data-locality
 system.
 
+The Boltz output was also exercised as a secret-free L4 runtime smoke test.
+The managed 4,888,012,862-byte manifest resolved, authenticated with
+`ecr-login`, pulled cold, started its container, executed Python, and passed an
+HTTP readiness probe. This does not replace a model-readiness or inference test:
+the production fleet's R2 and payload-encryption secrets are required for that
+run block and were unavailable to the benchmark.
+
 This evidence mode is not a release publisher. It has no durable coordinator,
 does not create a SkyPilot release, and must not be used as the production
 publication path.
