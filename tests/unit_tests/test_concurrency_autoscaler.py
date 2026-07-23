@@ -2172,6 +2172,44 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(decisions[0].operator, _SCALE_UP)
         self.assertEqual(decisions[0].target, {'accelerators': {'A100': 1}})
 
+    def test_zero_cost_only_card_does_not_precede_paid_fallback(self):
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.known_locations.return_value = [a100_location, l4_location]
+        placer.cost_per_hour.side_effect = (
+            lambda location: 0.0 if location is a100_location else 1.0)
+
+        flexible = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        flexible.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
+        flexible.set_spot_placer(placer)
+        _report(flexible,
+                in_flight={},
+                observed_slots={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100', 'L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        _decisions(flexible, [])
+
+        self.assertEqual(flexible.target_num_replicas_by_accelerator, {'L4': 1})
+
+        exact = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        exact.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
+        exact.set_spot_placer(placer)
+        _report(exact,
+                in_flight={},
+                observed_slots={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['A100'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        _decisions(exact, [])
+
+        self.assertEqual(exact.target_num_replicas_by_accelerator, {'A100': 1})
+
     def test_partial_nominal_prices_preserve_service_order(self):
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})

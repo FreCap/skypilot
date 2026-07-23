@@ -1775,6 +1775,34 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 1})
 
+    def test_zero_cost_only_card_does_not_precede_paid_fallback(self):
+        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.known_locations.return_value = [a100_location, l4_location]
+        placer.cost_per_hour.side_effect = (
+            lambda location: 0.0 if location is a100_location else 1.0)
+
+        flexible = self._autoscaler(max_replicas=1)
+        flexible.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
+        flexible.set_spot_placer(placer)
+        flexible.compatibility_profiles = self._profiles(50, ['A100', 'L4'])
+        flexible._compatibility_demand_complete = True
+
+        flexible._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(flexible.target_num_replicas_by_accelerator, {'L4': 1})
+
+        exact = self._autoscaler(max_replicas=1)
+        exact.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
+        exact.set_spot_placer(placer)
+        exact.compatibility_profiles = self._profiles(50, ['A100'])
+        exact._compatibility_demand_complete = True
+
+        exact._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(exact.target_num_replicas_by_accelerator, {'A100': 1})
+
     def test_partial_nominal_prices_preserve_service_order(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})

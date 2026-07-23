@@ -160,6 +160,63 @@ def _generate_scale_up_decisions(
     ]
 
 
+def _order_cold_paid_cards(
+    configured_cards: list[str],
+    placer: spot_placer.SpotPlacer | None,
+    configured_gpu_count: typing.Callable[[str], int],
+    location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
+                                                                      int]],
+) -> list[str]:
+    """Order paid-capable cold cards without promoting reserved-only cards."""
+    if placer is None:
+        return list(configured_cards)
+    canonical_by_name = {card.casefold(): card for card in configured_cards}
+    paid_costs: dict[str, float] = {}
+    zero_cost_cards: set[str] = set()
+    unpriced_cards: set[str] = set()
+    try:
+        known_locations = placer.known_locations()
+    except Exception:  # pylint: disable=broad-except
+        return list(configured_cards)
+    for location in known_locations:
+        raw_card, gpu_count = location_gpu_shape(location)
+        card = canonical_by_name.get(raw_card.casefold())
+        if card is None or gpu_count != configured_gpu_count(card):
+            continue
+        try:
+            hourly_cost = float(placer.cost_per_hour(location))
+        except Exception:  # pylint: disable=broad-except
+            unpriced_cards.add(card)
+            continue
+        if not math.isfinite(hourly_cost) or hourly_cost < 0:
+            unpriced_cards.add(card)
+        elif hourly_cost == 0:
+            zero_cost_cards.add(card)
+        else:
+            paid_costs[card] = min(hourly_cost,
+                                   paid_costs.get(card, float('inf')))
+
+    # A card is reserved-only only when every inspected location is free and
+    # no lookup was inconclusive. Exact-card demand and reserved fill still
+    # retain the card; this order governs flexible cold-paid attribution only.
+    reserved_only_cards = {
+        card for card in configured_cards if card in zero_cost_cards and
+        card not in paid_costs and card not in unpriced_cards
+    }
+    paid_or_unpriced_cards = [
+        card for card in configured_cards if card not in reserved_only_cards
+    ]
+    if all(card in paid_costs for card in paid_or_unpriced_cards):
+        service_order = {
+            card: index for index, card in enumerate(configured_cards)
+        }
+        paid_or_unpriced_cards.sort(key=lambda card: (paid_costs.get(
+            card, float('inf')), service_order[card]))
+    return paid_or_unpriced_cards + [
+        card for card in configured_cards if card in reserved_only_cards
+    ]
+
+
 def _generate_scale_down_decisions(
     replica_ids: list[int],
     reason: AutoscalerDecisionReason | None = None,
@@ -2918,38 +2975,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
         """Order cold cards by nominal paid cost, independent of availability."""
-        placer = self._cost_rebalance_spot_placer
-        if placer is None:
-            return list(configured_cards)
-        canonical_by_name = {card.casefold(): card for card in configured_cards}
-        paid_costs: dict[str, float] = {}
-        try:
-            known_locations = placer.known_locations()
-        except Exception:  # pylint: disable=broad-except
-            return list(configured_cards)
-        for location in known_locations:
-            raw_card, gpu_count = self._location_gpu_shape(location)
-            card = canonical_by_name.get(raw_card.casefold())
-            if (card is None or gpu_count != self._configured_gpu_count(card)):
-                continue
-            try:
-                hourly_cost = float(placer.cost_per_hour(location))
-            except Exception:  # pylint: disable=broad-except
-                continue
-            # Zero-cost supply has its own fresh-capacity tier. It must not
-            # make a saturated reserved-only card look like a cold option.
-            if not math.isfinite(hourly_cost) or hourly_cost <= 0:
-                continue
-            paid_costs[card] = min(hourly_cost,
-                                   paid_costs.get(card, float('inf')))
-        if any(card not in paid_costs for card in configured_cards):
-            return list(configured_cards)
-        service_order = {
-            card: index for index, card in enumerate(configured_cards)
-        }
-        return sorted(configured_cards,
-                      key=lambda card:
-                      (paid_costs.get(card, float('inf')), service_order[card]))
+        return _order_cold_paid_cards(configured_cards,
+                                      self._cost_rebalance_spot_placer,
+                                      self._configured_gpu_count,
+                                      self._location_gpu_shape)
 
     def _configured_gpu_count(self, card: str) -> int:
         """Return the service's unique configured GPU count for a card."""
@@ -3883,36 +3912,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
         """Order cold cards by nominal paid cost, independent of availability."""
-        placer = self._cost_rebalance_spot_placer
-        if placer is None:
-            return list(configured_cards)
-        canonical_by_name = {card.casefold(): card for card in configured_cards}
-        paid_costs: dict[str, float] = {}
-        try:
-            known_locations = placer.known_locations()
-        except Exception:  # pylint: disable=broad-except
-            return list(configured_cards)
-        for location in known_locations:
-            raw_card, gpu_count = self._location_gpu_shape(location)
-            card = canonical_by_name.get(raw_card.casefold())
-            if (card is None or gpu_count != self._configured_gpu_count(card)):
-                continue
-            try:
-                hourly_cost = float(placer.cost_per_hour(location))
-            except Exception:  # pylint: disable=broad-except
-                continue
-            if not math.isfinite(hourly_cost) or hourly_cost <= 0:
-                continue
-            paid_costs[card] = min(hourly_cost,
-                                   paid_costs.get(card, float('inf')))
-        if any(card not in paid_costs for card in configured_cards):
-            return list(configured_cards)
-        service_order = {
-            card: index for index, card in enumerate(configured_cards)
-        }
-        return sorted(configured_cards,
-                      key=lambda card:
-                      (paid_costs.get(card, float('inf')), service_order[card]))
+        return _order_cold_paid_cards(configured_cards,
+                                      self._cost_rebalance_spot_placer,
+                                      self._configured_gpu_count,
+                                      self._location_gpu_shape)
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
