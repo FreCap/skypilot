@@ -15,10 +15,12 @@ product requirement is prediction time, not HTTP latency.
 
 Boltz model runtimes emit the exact `boltz.prediction.duration` metric, but the
 SkyPilot API server does not have a provider-independent telemetry query path.
-The established asynchronous replica protocol does return
-`processing_time_ms` in terminal `async_status` responses. Synchronous replicas
-do not return an equivalent duration field, so SkyServe must observe their
-replica execution boundary.
+The established asynchronous replica protocol returns `processing_time_ms` in
+terminal `async_status` responses. Production fast-ack SkyPilot integrations do
+not poll that endpoint through SkyServe, however. They deliver the same terminal
+fields through an out-of-band completion marker. Synchronous replicas do not
+return an equivalent duration field, so SkyServe must observe their replica
+execution boundary.
 
 This design supersedes the previous full HTTP response-time design. It must not
 infer prediction duration from async occupancy, treat a fast async submission
@@ -66,6 +68,10 @@ Known asynchronous actions are `async_predict`, `async_status`,
   ignored.
 - `SUCCEEDED` is `succeeded`. `FAILED`, `EXPIRED`, `CANCELED`, and `CANCELLED`
   are `failed`. `NOT_FOUND` is not a completion.
+- An authenticated `POST /_lb/prediction-completed` with the same nonempty
+  `request_id`, terminal status, and nonnegative finite `processing_time_ms`
+  produces the same sample. This is the completion-marker bridge for fast-ack
+  callers whose terminal event is delivered outside SkyServe.
 - `async_capacity`, `async_cancel`, malformed JSON, missing durations, and
   unknown status values produce no sample.
 
@@ -92,6 +98,7 @@ retries, autoscaling, draining, or controller liveness.
 ```text
 sync upstream dispatch -> terminal upstream headers -> measured duration
 async terminal status  -> processing_time_ms       -> reported duration
+async completion marker -> authenticated callback -> reported duration
                                       |
                                       v
                       LB reporter-minute histogram
@@ -121,6 +128,15 @@ fixed parsing cap is forwarded but not parsed or recorded. A response with
 non-identity content encoding is also forwarded but not parsed, because
 observability must not alter or decompress the proxy's raw response stream.
 The established Boltz async-status response is uncompressed.
+
+The completion callback is registered before the catch-all proxy and remains
+behind the existing data-plane bearer middleware. It accepts only a bounded
+JSON object with `request_id`, `status`, and `processing_time_ms`; it never
+forwards the request to a replica. Callback and `async_status` observations use
+one validation and deduplication function, so a fallback poll and a marker
+callback for the same request still produce one sample per load-balancer
+process. Invalid callback payloads return a client error. Recording failures
+remain observability-only and do not change the caller's completed prediction.
 
 The load balancer keeps a bounded dictionary keyed by observation-minute epoch.
 Each value contains two fixed-length integer arrays, `succeeded` and `failed`.
@@ -227,9 +243,10 @@ The stable-job header short-circuits async action detection. Header-free JSON
 requests only parse action envelopes up to 64 KiB, bounding event-loop work;
 larger bodies are never parsed for observability. After classification, a
 synchronous terminal upstream response performs two monotonic-clock reads, a
-fixed-bound lookup, and one integer increment. Async terminal parsing copies at
-most a small bounded status response and maintains a bounded request-ID set.
-No model input, result, exact duration, route, or identifier is persisted.
+fixed-bound lookup, and one integer increment. Async terminal parsing and
+completion callbacks copy at most a small bounded JSON object and maintain a
+bounded request-ID set. No model input, result, exact duration, route, or
+identifier is persisted.
 
 At steady state, an active load balancer sends one changed minute on each
 20-second controller sync. Persistence remains one compact row per active
@@ -248,6 +265,14 @@ not prediction completions. Changing every model image to return a new sync
 duration header remains a possible future precision improvement, but it would
 not make this SkyPilot rollout useful for current images.
 
+Keeping the `async_predict` connection open until completion was rejected. It
+would turn fast acknowledgements back into multi-minute HTTP requests,
+reintroduce proxy timeout and rollout-drain failure modes, and still need the
+durable marker after a disconnect. The marker already carries the authoritative
+duration and outcome. The platform reports that small terminal event back to
+SkyServe while `async_capacity` remains solely responsible for routing
+availability.
+
 ## Rollout and rollback
 
 Deploy the API server and migration 023 before or with new controllers. The
@@ -255,6 +280,11 @@ schema addition and API fields are backward compatible. New controllers accept
 old load balancers, and new load balancers retain prediction counters until a
 new controller acknowledges them. PostgreSQL failures suppress only new
 samples and produce bounded warnings.
+
+For completion-marker integrations, deploy the additive SkyServe callback
+before enabling the platform reporter. The platform report is best-effort: an
+older or temporarily unavailable load balancer cannot fail or retry the already
+completed prediction. Either side can roll back independently.
 
 Production rollout is complete only after verifying the exact release and Helm
 revision, migration 023, healthy API pods and service controllers, healthy
@@ -275,6 +305,9 @@ decision depends on this history.
 - Test synchronous dispatch timing, retriable and transport failures, async
   acknowledgement exclusion, terminal-status parsing, malformed and oversized
   status bodies, outcome mapping, and request-ID deduplication.
+- Test authenticated completion callbacks, malformed and oversized callback
+  bodies, callback and `async_status` cross-path deduplication, and recording
+  failures that do not affect prediction completion.
 - Test normal sync, old-controller missing acknowledgement, legacy payload
   compatibility, persistence errors, and bounded drain flush.
 - Execute migration 023 against PostgreSQL and verify array constraints,
@@ -285,3 +318,6 @@ decision depends on this history.
   absence of response-time copy and fields.
 - Run focused Serve and PostgreSQL tests, dashboard tests and production build,
   formatter and type checks, and the complete visible PR CI rollup.
+- In the marker-producing platform, test successful and failed marker reports,
+  timeout exclusion, provider routing to the recorded SkyServe service, and
+  best-effort behavior against an unavailable or older load balancer.
