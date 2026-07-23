@@ -335,7 +335,7 @@ spec:
         - name: SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS
           value: {{ .Values.imageLifecycleWorker.livenessDeadlineSeconds | quote }}
         - name: SKYPILOT_IMAGE_RETENTION_SECONDS
-          value: {{ .Values.imageLifecycleWorker.retentionSeconds | quote }}
+          value: {{ .Values.imageLifecycleWorker.retentionSeconds | int64 | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
         {{- if .Values.apiService.dbConnectionSecretName }}

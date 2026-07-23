@@ -53,6 +53,42 @@ def test_source_reader_rejects_multicast_connected_peer_before_tls(
     connected_socket.close.assert_called_once_with()
 
 
+def test_source_reader_allows_private_peer_only_for_exact_trusted_host(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
+    adapter_type = providers._guarded_https_adapter_type((authority,))
+    adapter = adapter_type()
+    pool = adapter.poolmanager.connection_from_url(f'https://{authority}')
+    connection_type = pool.ConnectionCls
+    base_connection_type = connection_type.__mro__[1]
+    connected_socket = mock.Mock()
+    connected_socket.getpeername.return_value = ('10.0.0.10', 443)
+    monkeypatch.setattr(base_connection_type, '_new_conn',
+                        lambda _self: connected_socket)
+
+    connection = connection_type(host=authority)
+    assert connection._new_conn() is connected_socket
+    connected_socket.getpeername.assert_not_called()
+    connected_socket.close.assert_not_called()
+
+    other_socket = mock.Mock()
+    other_socket.getpeername.return_value = ('10.0.0.11', 443)
+    monkeypatch.setattr(base_connection_type, '_new_conn',
+                        lambda _self: other_socket)
+    other_connection = connection_type(host='redirect.example')
+    with pytest.raises(ValueError, match='network destination is not public'):
+        other_connection._new_conn()
+    other_socket.close.assert_called_once_with()
+
+
+def test_source_reader_private_peer_authority_must_match_source() -> None:
+    with pytest.raises(ValueError, match='must match the source'):
+        providers.RegistryV2Source(
+            f'registry.example/repository/image@{_DIGEST}',
+            lambda: None,
+            private_peer_authority='other.example')
+
+
 def test_source_reader_rejects_rebound_private_peer_before_tls(
         monkeypatch: pytest.MonkeyPatch) -> None:
     listener = socket.socket()
@@ -267,7 +303,9 @@ def test_basic_credentials_cannot_cross_to_bearer_realm() -> None:
 
 def test_private_redirect_is_rejected_without_a_second_request() -> None:
     source = providers.RegistryV2Source(
-        f'registry.example/repository/image@{_DIGEST}', lambda: None)
+        f'registry.example/repository/image@{_DIGEST}',
+        lambda: None,
+        private_peer_authority='registry.example')
     response = mock.Mock(
         status_code=307,
         headers={'Location': 'https://169.254.169.254/latest/meta-data'})

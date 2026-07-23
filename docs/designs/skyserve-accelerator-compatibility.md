@@ -400,6 +400,29 @@ PENDING rows that fit the remaining target. Rows launched for reserved fill
 remain governed by the independent broker-grant fence and are not charged to
 this demand budget.
 
+An ordinary unpinned launch has no per-replica resources override before that
+first mutation. When the complete configured catalog contains exactly one
+card, that card is nevertheless authoritative for every such row and is used
+for the budget check. An unpinned row remains unclassifiable and fails closed
+when the catalog contains multiple cards; the controller must not guess which
+optimizer alternative a future launch will select.
+
+A reconciliation generation is an observation stamp, not by itself a semantic
+target change. A queued launch may remain authorized across a newer generation
+only when the fresh current target has the same service version, aggregate
+capacity, exact-card capacities, and accelerator shapes as its stored fence,
+and a new fleet read still includes that replica in the current launch budget.
+Any version, aggregate target, exact-card target, or shape change revokes the
+stored authority. Newly READY or PROVISIONING capacity can also remove the
+candidate even when the target is otherwise unchanged.
+
+Every final-cloud rejection records one stable reason code plus a bounded,
+secret-free summary of the stored/current target, target freshness, card
+budget, and candidate classification. A rejected launch is otherwise
+indistinguishable from a legitimate supersession because both stop before
+`sky.launch`; preserving the exact fail-closed reason is required to prove the
+fence against a live service without weakening it for diagnosis.
+
 This check is restart-safe. A recovered logical controller must not treat all
 durable PENDING demand rows as fresh launch orders. It reconstructs their
 authorization from the first fresh, complete exact-card target it receives;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Callable
 import concurrent.futures
 import contextlib
@@ -23,11 +24,14 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import docker_utils
 from sky.server import database_migrations
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
 _MAX_QUALIFIED_EKS_NODES = 1000
+_EC2_CONSOLE_SETTLE_SECONDS = 10 * 60
+_EC2_CONSOLE_POLL_SECONDS = 5
 _EC2_TEARDOWN_ATTEMPTS = 60
 _EC2_TEARDOWN_POLL_SECONDS = 5
 _EKS_TEARDOWN_SECONDS = 60
@@ -383,16 +387,55 @@ def _terminate_ec2_instances(
     return False
 
 
-def _ec2_user_data(reference: str, nonce: str, timeout_seconds: int) -> str:
+def _ec2_user_data(reference: str, registry: str, nonce: str,
+                   timeout_seconds: int) -> str:
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{nonce}'
     return '\n'.join((
         '#!/usr/bin/env bash',
         'set -euo pipefail',
+        "trap 'shutdown -h now' EXIT",
+        docker_utils.credential_helper_config_cmd(registry),
         f'timeout {timeout_seconds} docker pull {shlex.quote(reference)}',
         f'docker image inspect {shlex.quote(reference)} >/dev/null',
         f'echo {shlex.quote(marker)} >/dev/console',
-        'shutdown -h now',
     ))
+
+
+def _console_has_marker(output: Any, marker: str) -> bool:
+    if not isinstance(output, str):
+        return False
+    if marker in output:
+        return True
+    try:
+        decoded = base64.b64decode(output,
+                                   validate=True).decode(errors='replace')
+    except (binascii.Error, ValueError):
+        return False
+    return marker in decoded
+
+
+def _wait_for_console_marker(ec2: Any, instance_id: str, marker: str,
+                             deadline: float,
+                             heartbeat: worker_lease.LeaseHeartbeat) -> bool:
+    """Waits for EC2 to post a terminal child's buffered console output."""
+    settle_deadline = min(
+        deadline,
+        time.monotonic() + _EC2_CONSOLE_SETTLE_SECONDS,
+    )
+    while True:
+        heartbeat.assert_owned()
+        now = time.monotonic()
+        if now >= deadline:
+            raise ValueError('CANARY_TIMEOUT')
+        if now >= settle_deadline:
+            return False
+        output = ec2.get_console_output(InstanceId=instance_id,
+                                        Latest=True).get('Output')
+        if _console_has_marker(output, marker):
+            return True
+        time.sleep(
+            min(_EC2_CONSOLE_POLL_SECONDS,
+                max(0.0, settle_deadline - time.monotonic())))
 
 
 def _run_ec2_canary(operation: catalog_state.OperationRecord,
@@ -482,7 +525,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'MinCount': 1,
                 'MaxCount': 1,
                 'InstanceInitiatedShutdownBehavior': 'terminate',
-                'UserData': _ec2_user_data(reference, payload['nonce'],
+                'UserData': _ec2_user_data(reference, target.registry,
+                                           payload['nonce'],
                                            payload['timeout_seconds']),
                 'TagSpecifications': [{
                     'ResourceType': resource_type,
@@ -546,17 +590,22 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             instance_architecture = instance.get('Architecture')
             if instance_architecture != 'x86_64':
                 raise ValueError('QUALIFICATION_FAILED')
-            actual_profile_arn = (instance.get('IamInstanceProfile') or
-                                  {}).get('Arn')
-            if actual_profile_arn != expected_profile_arn:
-                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             state = (instance.get('State') or {}).get('Name')
+            observed_profile_arn = (instance.get('IamInstanceProfile') or
+                                    {}).get('Arn')
+            if (observed_profile_arn is not None and
+                    observed_profile_arn != expected_profile_arn):
+                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
+            if observed_profile_arn == expected_profile_arn:
+                actual_profile_arn = observed_profile_arn
+            elif actual_profile_arn is None:
+                if state in ('pending', 'running'):
+                    time.sleep(_POLL_SECONDS)
+                    continue
+                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if state in ('stopped', 'terminated'):
-                output = ec2.get_console_output(InstanceId=instance_id,
-                                                Latest=True).get('Output')
-                if isinstance(output, str):
-                    decoded = base64.b64decode(output).decode(errors='replace')
-                    success = marker in decoded
+                success = _wait_for_console_marker(ec2, instance_id, marker,
+                                                   deadline, heartbeat)
                 break
             time.sleep(_POLL_SECONDS)
         else:

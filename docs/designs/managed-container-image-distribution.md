@@ -457,13 +457,15 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    larger than one batch resumes deterministically without repeating provider
    I/O.
 6. A worker crash or ambiguous source read leaves unbound INSPECTING until its
-   lease expires; another worker then reinspects from the immutable source root. Retry
-   of an unbound pre-inspection failure locks only its publication and requeues
-   inspection. Once bound, retry locks the shared canonical location before
-   dependent publications, returns retained failures to PENDING, and reuses the
-   location. A bound PENDING publication is never eligible for source inspection
-   again; only canonical convergence may finish it. It never creates a second
-   physical copy. Exceeding the per-artifact
+   lease expires; another worker then reinspects from the immutable source root.
+   Retry of an unbound pre-inspection failure locks only its publication and
+   requeues inspection. A terminal pre-inspection failure atomically marks both
+   the publication and its bound operation FAILED, so synchronous waiters cannot
+   remain PENDING after the work has ended. Once bound, retry locks the shared
+   canonical location before dependent publications, returns retained failures
+   to PENDING, and reuses the location. A bound PENDING publication is never
+   eligible for source inspection again; only canonical convergence may finish
+   it. It never creates a second physical copy. Exceeding the per-artifact
    release ceiling is a typed `IMAGE_LIMIT_EXCEEDED` failure rather than a
    source-content validation failure.
 
@@ -475,13 +477,26 @@ and checks the actual connected peer immediately after every TCP connection and
 before TLS, HTTP bytes, or credentials. This closes direct private addresses,
 DNS rebinding, bearer realms, and signed-URL redirects over private, link-local,
 or multicast IPv4 and IPv6 space. Multicast is rejected explicitly instead of
-depending on Python's version-specific `is_global` classification. Basic source
-credentials may authenticate a bearer realm only on the
-same normalized authority. Token requests never follow redirects. A blob may
-follow at most one public HTTPS redirect without forwarding source
-authorization. Manifest, token, config, and blob inspection bodies are streamed
-under explicit byte limits. Private-network source registries require a future
-qualified operator-controlled network policy and are not accepted by v0.
+depending on Python's version-specific `is_global` classification.
+
+One narrow AWS exception supports ECR PrivateLink and private DNS. When and only
+when an `aws_assume_role` source binding matches the source's exact validated
+`<account>.dkr.ecr.<region>.amazonaws.com` authority, the worker may accept a
+private connected peer for that exact registry hostname. The adapter first
+assumes the configured role and mints an ECR token for the same account and
+authority. HTTPS certificate and hostname verification, digest verification,
+lease fencing, body bounds, and disabled proxy inheritance remain mandatory.
+The exception is hostname-exact: a different bearer realm or blob redirect
+still uses the public connected-peer guard and receives no source
+authorization. Thus an AWS service endpoint reached privately is supported, but
+an arbitrary private-network OCI registry is not.
+
+Basic source credentials may authenticate a bearer realm only on the same
+normalized authority. Token requests never follow redirects. A blob may follow
+at most one public HTTPS redirect without forwarding source authorization.
+Manifest, token, config, and blob inspection bodies are streamed under explicit
+byte limits. Other private-network source registries require a future qualified
+operator-controlled network policy and are not accepted by v0.
 
 An existing READY release is immutable. A conflicting digest is rejected. A
 failed replacement never changes another release or any deployment already
@@ -723,11 +738,21 @@ EC2 canary bindings require at least one explicit security group in every
 qualified AMI region. The worker always sends those groups and applies the
 catalog, operation, and profile tag specifications to the instance, every
 created EBS volume, and every created network interface. The generated IAM role
-authorizes `RunInstances` against the exact AMI, subnet, security groups, and
-created resource classes with the required request tags. A separate
-`ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
-not combined with launch conditions. The role never relies on an implicit VPC
-default security group.
+authorizes `RunInstances` against the exact AMI, subnet, security groups,
+instance type, and runtime instance profile. AWS evaluates the created resource
+classes separately. Instance and EBS-volume authorization requires the catalog
+and operation request tags. The implicit network-interface authorization
+context does not expose either those request tags or `ec2:InstanceType`, so its
+separate statement instead requires the exact declared subnet. That statement
+cannot authorize an independent network-interface create: the role has no
+`CreateNetworkInterface` action, and the complete `RunInstances` call must still
+pass every exact image, network, instance, profile, and tagged-resource
+statement. Exact AMI policy resources use EC2's accountless authorization ARN,
+`arn:<partition>:ec2:<region>::image/<ami-id>`; the separately qualified AMI ID,
+observed owner account, and compute-account binding retain ownership identity.
+A separate `ec2:CreateTags` statement is limited by
+`ec2:CreateAction=RunInstances`; it is not combined with launch conditions. The
+role never relies on an implicit VPC default security group.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -1676,6 +1701,30 @@ the launched or replay-discovered child ID. The worker then performs an ID-scope
 and profile tags, and derives host AMI, architecture, instance profile, and
 lifecycle state from that one response. The observed AMI must equal the qualified
 regional AMI. The console marker is read from that same child.
+An absent instance-profile ARN while that exact child is still pending or
+running is retried within the same bounded deadline because EC2 may expose the
+instance before its profile attachment. Once the exact expected ARN is
+observed, it is latched for that same child because EC2 may omit the attachment
+from a later stopped or terminated response. A conflicting nonempty ARN at any
+point, or terminal absence before an exact match was observed, fails
+qualification.
+Before the pull, EC2 canary user data configures the same exact value-free
+`credHelpers[registry] = ecr-login` route used by normal managed workload
+initialization. Merely finding the helper binary in the AMI is not runtime-pull
+evidence. The guest script uses an exit trap to invoke the instance's configured
+terminate-on-shutdown path after either success or failure, so a failed pull
+does not consume the entire canary deadline. Console marker inspection accepts
+the exact nonce-bearing marker in the SDK response first, then supports a
+strictly valid base64-encoded response for compatible EC2 API implementations.
+It never loosely decodes malformed console output. EC2 may expose the stopped
+or terminated instance before posting the transition's buffered console output.
+After the first terminal observation, the worker therefore keeps requesting
+`GetConsoleOutput(Latest=True)` through its fenced provider client for a bounded
+settling window inside the original canary deadline. An empty, partial, or
+marker-free response is not an immediate pull failure. The exact marker
+completes the proof when it appears; exhausting the settling window without the
+marker records `CANARY_PULL_FAILED`. This is qualification-only waiting and
+does not add a blocking operation to ordinary workload deployment.
 An unexpected operation-tagged ID, missing exact child, or tag mismatch can never
 be spliced into evidence. Every child ID observed through launch, replay, polling,
 or cleanup is retained in the teardown set, and an identity mismatch fails only
@@ -2628,6 +2677,11 @@ drained and every image table is empty; it is never part of Helm rollback.
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
+  exact shared EC2 helper-route configuration, plaintext and strict-base64
+  console marker responses, malformed console rejection, guest failure
+  self-termination, delayed EC2 instance-profile visibility, terminal EC2
+  profile omission after an exact match, delayed terminal console publication
+  and bounded marker-free console exhaustion,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
   pre/post lease fences, database authorization immediately before both EC2 and
@@ -3491,3 +3545,48 @@ revision integrates that base's GCP capacity classification, SQLite contention
 retry, and landed exception-compatibility fixes while retaining strict envelope
 shape validation, constructor-safe note serialization, tolerant attribute
 restoration, and sanitized fallbacks. The acceptance streak remains zero.
+
+### Live prototype verification, July 23, 2026
+
+The first managed OpenDDE cold launch reached `READY` in 482.65 seconds, versus
+434.55 seconds for its paired baseline. This is not a performance improvement
+and does not support a faster-deployment claim. Phase logs exposed an
+implementation defect before the image pull: the AWS Ray template omitted the
+resolved `credential_helper: ecr-login` field. The node therefore installed the
+AWS CLI, requested an ECR bearer token, persisted Docker login state, and spent
+about 34 seconds in an authentication path that the qualified host contract is
+designed to avoid. The image pull itself took about 100.8 seconds, and the
+service subsequently staged about 9.9 GB of workload data.
+
+The repair preserves the optional credential-helper field in the rendered AWS
+cluster configuration and has a regression test for both helper-backed and
+ordinary login configurations. A fresh cold launch is required after deploying
+that repair. The remaining image pull, instance bootstrap, and workload-data
+staging must be measured separately; this result does not justify moving a
+lazy OCI snapshotter or a separate model-data distribution plane into v0.
+
+The repair was subsequently deployed from
+`8481a272ee1afea77d9c9d21804a33ab63df9efe`. A fresh direct pull preserved
+`credential_helper: ecr-login`, performed no Docker login or ECR token command,
+and brought the managed container up after about 102.25 seconds of cold image
+pull. A paired Serve comparison used Spot by default with dynamic on-demand
+fallback because all `g6.xlarge` Spot zones were initially exhausted. On the
+same on-demand `g6.xlarge` fallback shape, source-image provision-to-readiness
+was 351.09 seconds and built-image provision-to-readiness was 375.19 seconds.
+The built image was about 24.10 seconds slower. Post-cluster readiness was
+effectively identical, 140.78 versus 141.29 seconds, because both paths still
+staged 10,036,350,627 bytes (9.35 GiB) of workload data.
+
+The credential-helper and concurrent-controller repairs are accepted, but the
+builder's 120-second deployment-speed gate failed. V0 remains an ordinary OCI
+distribution plane. A node-cache, snapshot, lazy snapshotter, or model-data
+locality feature requires a separate design and runtime capability gate rather
+than expansion of this PR.
+
+The Boltz prototype release separately resolved to a 4,888,012,862-byte
+digest-pinned manifest and passed a fresh L4 container/runtime smoke test.
+Its admitted on-demand fallback preserved `credential_helper: ecr-login`,
+started the managed container 204.71 seconds after provisioning began, and
+passed HTTP readiness at 301.20 seconds. The test did not receive the
+production fleet's R2 and payload-encryption secrets, so it proves the managed
+pull and executable image boundary but not model readiness or inference.

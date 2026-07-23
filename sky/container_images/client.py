@@ -28,14 +28,14 @@ def _request(method: str,
              json: dict[str, Any] | None = None,
              params: dict[str, Any] | None = None,
              idempotency_key: str | None = None) -> _T:
-    headers = ({
-        'Idempotency-Key': idempotency_key
-    } if idempotency_key is not None else None)
-    response = server_common.make_authenticated_request(method,
-                                                        path,
-                                                        json=json,
-                                                        params=params,
-                                                        headers=headers)
+    request_kwargs: dict[str, Any] = {
+        'json': json,
+        'params': params,
+    }
+    if idempotency_key is not None:
+        request_kwargs['headers'] = {'Idempotency-Key': idempotency_key}
+    response = server_common.make_authenticated_request(method, path,
+                                                        **request_kwargs)
     if response.status_code >= 400:
         try:
             detail = response.json().get('detail', {})

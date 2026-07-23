@@ -1,0 +1,21 @@
+base: 699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-platform-models@sha256:0eeb88ac2baff70a52240854de1952a1edeb3cbaba3493c42f1d3d59223f6fea
+setup:
+  - run: >-
+      install -D -m 0444 /inputs/marker.txt
+      /opt/skypilot-builder/boltz-l4-fleet
+    inputs:
+      - marker.txt
+context:
+  include:
+    - marker.txt
+source:
+  mode: late_bound
+  include: []
+build_args: {}
+platform: linux/amd64
+output:
+  workspace: default
+  distribution: direct
+  release: boltz-l4-fleet-builder-20260723
+  staging_repository: 699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-platform-models
+  source_auth: null

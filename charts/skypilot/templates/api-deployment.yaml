@@ -22,9 +22,104 @@
 {{- if and $externalLBEnabled (not (empty $lbSyncSecret)) (not (empty $lbSyncKey)) (not (empty $controllerAdminSecret)) (not (empty $controllerAdminKey)) (not $lbDataPlaneAuthEnabled) -}}
 {{- fail "serve.externalLoadBalancer.auth.lbDataPlane is required when serve.externalLoadBalancer.enabled=true" -}}
 {{- end -}}
-{{- $apiReservedEnvNames := list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "DIGITALOCEAN_CREDENTIALS" "ENABLE_SERVICE_ACCOUNTS" "GOOGLE_APPLICATION_CREDENTIALS" "KUBECONFIG" "LAMBDA_API_KEY" "R2_ACCOUNT_ID" "R2_CREDENTIALS" "RUNPOD_API_KEY" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" "VAST_API_KEY" -}}
-{{- $apiReservedVolumeNames := list "aws-config" "aws-config-files" "coreweave-config" "coreweave-credentials" "digitalocean-config" "gcp-config" "gcp-credentials" "kube-config" "lambda-config" "nebius-credentials" "r2-config" "runpod-config" "sky-ephemeral" "skypilot-config" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "slurm-config" "state-volume" "vast-config" -}}
-{{- $apiReservedMountPaths := list "/.config/doctl" "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.aws" "/root/.cloudflare" "/root/.config/doctl" "/root/.config/gcloud" "/root/.config/vastai" "/root/.coreweave" "/root/.coreweave_credentials" "/root/.kube" "/root/.lambda_cloud" "/root/.nebius_credentials" "/root/.runpod" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.slurm" "/root/.ssh" "/root/gcp-cred.json" "/root/sky_logs" "/var/skypilot/config" "/var/skypilot/kubeconfig" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- /* Custom credential wiring is the compatibility path when a native chart
+      credential block is disabled. Reserve provider-owned fields only when the
+      chart will actually emit them. */ -}}
+{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
+{{- if .Values.awsCredentials.enabled -}}
+{{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
+{{- end -}}
+{{- if .Values.digitaloceanCredentials.enabled -}}
+{{- $apiReservedEnvNames = append $apiReservedEnvNames "DIGITALOCEAN_CREDENTIALS" -}}
+{{- end -}}
+{{- if .Values.gcpCredentials.enabled -}}
+{{- $apiReservedEnvNames = append $apiReservedEnvNames "GOOGLE_APPLICATION_CREDENTIALS" -}}
+{{- end -}}
+{{- if .Values.lambdaCredentials.enabled -}}
+{{- $apiReservedEnvNames = append $apiReservedEnvNames "LAMBDA_API_KEY" -}}
+{{- end -}}
+{{- if .Values.r2Credentials.enabled -}}
+{{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "R2_ACCOUNT_ID" "R2_CREDENTIALS") -}}
+{{- end -}}
+{{- if .Values.runpodCredentials.enabled -}}
+{{- $apiReservedEnvNames = append $apiReservedEnvNames "RUNPOD_API_KEY" -}}
+{{- end -}}
+{{- if .Values.vastCredentials.enabled -}}
+{{- $apiReservedEnvNames = append $apiReservedEnvNames "VAST_API_KEY" -}}
+{{- end -}}
+
+{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- if .Values.awsCredentials.enabled -}}
+{{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "aws-config" "aws-config-files") -}}
+{{- end -}}
+{{- if .Values.coreweaveCredentials.enabled -}}
+{{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "coreweave-config" "coreweave-credentials") -}}
+{{- end -}}
+{{- if .Values.digitaloceanCredentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "digitalocean-config" -}}
+{{- end -}}
+{{- if .Values.gcpCredentials.enabled -}}
+{{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "gcp-config" "gcp-credentials") -}}
+{{- end -}}
+{{- if .Values.kubernetesCredentials.useKubeconfig -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "kube-config" -}}
+{{- end -}}
+{{- if .Values.lambdaCredentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "lambda-config" -}}
+{{- end -}}
+{{- if .Values.nebiusCredentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "nebius-credentials" -}}
+{{- end -}}
+{{- if .Values.r2Credentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "r2-config" -}}
+{{- end -}}
+{{- if .Values.runpodCredentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "runpod-config" -}}
+{{- end -}}
+{{- if .Values.slurmCredentials.config -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "slurm-config" -}}
+{{- end -}}
+{{- if .Values.vastCredentials.enabled -}}
+{{- $apiReservedVolumeNames = append $apiReservedVolumeNames "vast-config" -}}
+{{- end -}}
+
+{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- if .Values.awsCredentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.aws" -}}
+{{- end -}}
+{{- if .Values.coreweaveCredentials.enabled -}}
+{{- $apiReservedMountPaths = concat $apiReservedMountPaths (list "/root/.coreweave" "/root/.coreweave_credentials") -}}
+{{- end -}}
+{{- if .Values.digitaloceanCredentials.enabled -}}
+{{- $apiReservedMountPaths = concat $apiReservedMountPaths (list "/.config/doctl" "/root/.config/doctl") -}}
+{{- end -}}
+{{- if .Values.gcpCredentials.enabled -}}
+{{- $apiReservedMountPaths = concat $apiReservedMountPaths (list "/root/.config/gcloud" "/root/gcp-cred.json") -}}
+{{- end -}}
+{{- if or .Values.kubernetesCredentials.useKubeconfig .Values.apiService.sshNodePools -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.kube" -}}
+{{- end -}}
+{{- if and .Values.kubernetesCredentials.useKubeconfig .Values.apiService.sshNodePools -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/var/skypilot/kubeconfig" -}}
+{{- end -}}
+{{- if .Values.lambdaCredentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.lambda_cloud" -}}
+{{- end -}}
+{{- if .Values.nebiusCredentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.nebius_credentials" -}}
+{{- end -}}
+{{- if .Values.r2Credentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.cloudflare" -}}
+{{- end -}}
+{{- if .Values.runpodCredentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.runpod" -}}
+{{- end -}}
+{{- if .Values.slurmCredentials.config -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.slurm" -}}
+{{- end -}}
+{{- if .Values.vastCredentials.enabled -}}
+{{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.config/vastai" -}}
+{{- end -}}
 {{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths) }}
 apiVersion: apps/v1
 kind: Deployment

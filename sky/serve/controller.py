@@ -10,6 +10,7 @@ import hmac
 import logging
 import math
 import os
+import socket
 import threading
 import time
 import traceback
@@ -3530,7 +3531,7 @@ class SkyServeController:
                     logger.error(f'  Traceback: {traceback.format_exc()}')
             time.sleep(self._autoscaler.get_decision_interval())
 
-    def run(self) -> None:
+    def run(self, controller_socket: socket.socket | None = None) -> None:
 
         # Every non-pool service uses the external LB topology. Refuse to boot
         # an externally reachable controller with either auth boundary absent;
@@ -3787,7 +3788,13 @@ class SkyServeController:
                     f'http://{self._host}:{self._port}. PID: {os.getpid()}')
 
         try:
-            uvicorn.run(self._app, host=self._host, port=self._port)
+            if controller_socket is None:
+                uvicorn.run(self._app, host=self._host, port=self._port)
+            else:
+                config = uvicorn.Config(self._app,
+                                        host=self._host,
+                                        port=self._port)
+                uvicorn.Server(config).run(sockets=[controller_socket])
         except BaseException:  # pylint: disable=broad-except
             # The finally below hard-exits, which would otherwise swallow the
             # propagating exception -- log it so a crash-looping controller
@@ -3824,7 +3831,8 @@ def run_controller(service_name: str,
                    service_hash: str | None = None,
                    controller_pid: int | None = None,
                    controller_ip: str | None = None,
-                   enforce_launch_fence: bool = False):
+                   enforce_launch_fence: bool = False,
+                   controller_socket: socket.socket | None = None):
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
@@ -3834,4 +3842,7 @@ def run_controller(service_name: str,
                                     resource_scope, service_hash,
                                     controller_pid, controller_ip,
                                     enforce_launch_fence)
-    controller.run()
+    if controller_socket is None:
+        controller.run()
+    else:
+        controller.run(controller_socket)

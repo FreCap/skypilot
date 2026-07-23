@@ -118,11 +118,14 @@ def _read_bounded_response(
         response.close()
 
 
-@functools.lru_cache(maxsize=1)
-def _guarded_https_adapter_type() -> type[Any]:
+@functools.lru_cache(maxsize=32)
+def _guarded_https_adapter_type(private_peer_hosts: tuple[str, ...] = (
+)) -> type[Any]:
     """Builds a Requests adapter that checks the peer before TLS or HTTP."""
     urllib3 = requests.packages.urllib3
     urllib3_pool = urllib3.connectionpool
+    trusted_private_hosts = frozenset(
+        host.rstrip('.').lower() for host in private_peer_hosts)
 
     class GuardedHttpsConnection(
             urllib3.connection.HTTPSConnection  # type: ignore[name-defined]
@@ -130,11 +133,15 @@ def _guarded_https_adapter_type() -> type[Any]:
         """HTTPS connection that rejects a non-public connected peer."""
 
         def _new_conn(self) -> Any:
-            _require_public_network_address(str(self.host))
+            host = str(self.host).rstrip('.').lower()
+            private_peer_allowed = host in trusted_private_hosts
+            if not private_peer_allowed:
+                _require_public_network_address(host)
             connection = super()._new_conn()
             try:
-                _require_public_network_address(str(
-                    connection.getpeername()[0]))
+                if not private_peer_allowed:
+                    _require_public_network_address(
+                        str(connection.getpeername()[0]))
             except Exception:
                 connection.close()
                 raise
@@ -172,13 +179,13 @@ def _guarded_https_adapter_type() -> type[Any]:
     return GuardedHttpsAdapter
 
 
-def guarded_https_session() -> Any:
+def guarded_https_session(*, private_peer_hosts: tuple[str, ...] = ()) -> Any:
     """Returns a no-proxy HTTPS session with connected-peer validation."""
     session = requests.Session()
     # Environment proxy configuration must not bypass the peer-address guard
     # or become another credential-bearing trust boundary.
     session.trust_env = False
-    session.mount('https://', _guarded_https_adapter_type()())
+    session.mount('https://', _guarded_https_adapter_type(private_peer_hosts)())
     return session
 
 
@@ -211,6 +218,7 @@ class RegistryV2Source:
         *,
         timeout_seconds: int = 60,
         provider_fence: Callable[[], None] | None = None,
+        private_peer_authority: str | None = None,
     ) -> None:
         reference = models.validate_oci_reference(reference,
                                                   'OCI source reference')
@@ -226,6 +234,18 @@ class RegistryV2Source:
                     if '/' in repository else f'library/{repository}')
         else:
             authority = models.normalize_registry_authority(first, 'OCI source')
+        private_peer_hosts: tuple[str, ...] = ()
+        if private_peer_authority is not None:
+            private_peer_authority = models.normalize_registry_authority(
+                private_peer_authority, 'OCI private-peer authority')
+            if private_peer_authority != authority:
+                raise ValueError(
+                    'OCI private-peer authority must match the source.')
+            private_hostname = urllib.parse.urlsplit(
+                f'https://{private_peer_authority}').hostname
+            if private_hostname is None:
+                raise ValueError('OCI private-peer authority is invalid.')
+            private_peer_hosts = (private_hostname.rstrip('.').lower(),)
         self.reference = reference
         self.authority = authority
         self.repository = path
@@ -233,7 +253,8 @@ class RegistryV2Source:
         self._credential_resolver = credential_resolver
         self._timeout_seconds = timeout_seconds
         self._provider_fence = provider_fence
-        self._session = guarded_https_session()
+        self._session = guarded_https_session(
+            private_peer_hosts=private_peer_hosts)
         validate_public_https_destination(f'https://{self.authority}',
                                           'OCI source registry')
 

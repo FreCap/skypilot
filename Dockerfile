@@ -31,6 +31,10 @@ ARG INSTALL_FROM_SOURCE=true
 ARG NEXT_BASE_PATH=/dashboard
 WORKDIR /skypilot
 
+# New Python slim images do not guarantee setuptools is preinstalled. setup.py
+# imports it while replacing the source commit hash, so pin it explicitly.
+RUN python -m pip install --no-cache-dir setuptools==78.1.1
+
 # Run NPM and node install in a separate step for caching.
 RUN if [ "$INSTALL_FROM_SOURCE" = "true" ]; then \
         echo "Installing NPM and Node.js for dashboard build" && \

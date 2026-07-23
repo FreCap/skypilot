@@ -6,7 +6,6 @@ import pytest
 
 from sky.serve import serve_state
 from sky.serve import service
-from sky.utils import common_utils
 from sky.utils import subprocess_utils
 
 _PORT = 20005
@@ -64,7 +63,9 @@ def _setup(monkeypatch,
            owns_row=True,
            events=None):
     monkeypatch.setattr(service.filelock, 'FileLock', _DummyLock)
-    monkeypatch.setattr(common_utils, 'find_free_port', lambda unused: _PORT)
+    controller_socket = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(service, '_reserve_controller_socket', lambda unused:
+                        (controller_socket, _PORT))
     monkeypatch.setattr(serve_state, 'set_service_controller_port_if_owner',
                         lambda name, service_hash, pid, ip, port: owns_row)
     if latest_snapshot is _DEFAULT_SNAPSHOT:
@@ -126,6 +127,49 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
     assert 111 not in killed
     # There is intentionally no in-pod LB process to restart: the stable API
     # proxy resolves the newly published port on its next request.
+
+
+def test_respawn_releases_port_lock_before_readiness_wait(monkeypatch):
+    events = []
+    dead = _FakeProc(False, 111, events=events)
+    replacement = _FakeProc(True, 333)
+    _setup(monkeypatch, new_controller=replacement, events=events)
+
+    class _EventLock:
+        """File-lock double that records its held interval."""
+
+        def __init__(self, *unused_args, **unused_kwargs):
+            pass
+
+        def __enter__(self):
+            events.append('lock_enter')
+            return self
+
+        def __exit__(self, *unused_args):
+            events.append('lock_exit')
+            return False
+
+    controller_socket = SimpleNamespace(
+        close=lambda: events.append('socket_close'))
+    monkeypatch.setattr(service.filelock, 'FileLock', _EventLock)
+    monkeypatch.setattr(
+        service, '_reserve_controller_socket', lambda unused:
+        (events.append('reserve') or controller_socket, _PORT))
+    monkeypatch.setattr(
+        service, '_wait_for_controller_ready',
+        lambda *unused_args, **unused_kwargs: events.append('wait'))
+    monkeypatch.setattr(serve_state, 'set_service_controller_port_if_owner',
+                        lambda *unused_args: events.append('publish') or True)
+
+    assert service._respawn_controller('svc',
+                                       '127.0.0.1',
+                                       dead,
+                                       service_hash=_HASH) == (replacement,
+                                                               _PORT)
+    assert events == [
+        'join', 'lock_enter', 'reserve', 'spawn', 'lock_exit', 'wait',
+        'publish', 'socket_close'
+    ]
 
 
 def test_respawn_port_publish_fences_hash_pid_and_ip(monkeypatch):

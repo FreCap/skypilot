@@ -27,6 +27,10 @@ def main() -> None:
     """Upgrades central schemas before replicas enter verify-only mode."""
     requested_mode = os.environ.get(constants.ENV_VAR_STATE_DB_MIGRATION_MODE,
                                     'upgrade')
+    # Database engine selection consults this marker before honoring the
+    # central PostgreSQL connection URI. Set it in the entrypoint as a
+    # defense-in-depth guarantee even when the process is not chart-launched.
+    os.environ[constants.ENV_VAR_IS_SKYPILOT_SERVER] = 'true'
     os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] = (
         'bootstrap' if requested_mode == 'bootstrap' else 'upgrade')
     initialize_central_databases()

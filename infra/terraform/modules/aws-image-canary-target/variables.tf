@@ -44,10 +44,18 @@ variable "instance_profile_arns" {
 }
 
 variable "ami_arns" {
-  description = "Exact regional AMI ARNs allowed for EC2 canary launches."
+  description = "Exact accountless EC2 image authorization ARNs allowed for canary launches."
   type        = set(string)
 
   default = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.ami_arns :
+      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+::image/ami-[0-9a-f]+$", arn))
+    ])
+    error_message = "ami_arns must use EC2's accountless arn:<partition>:ec2:<region>::image/<ami-id> authorization form."
+  }
 }
 
 variable "subnet_arns" {

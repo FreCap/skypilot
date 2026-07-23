@@ -138,8 +138,11 @@ keeps the two concerns separate:
   slots, and retain their existing zero-cost-only placement fence;
 - configured scale-up waves bound the adopted latest-version target when
   enabled, while `max_replicas` remains the demand-target ceiling;
-- old replicas drain only after ready latest capacity covers them, with busy
-  replicas protected and logical retirements capped per tick;
+- rolling logical fleets drain old replicas incrementally as ready latest
+  capacity covers the same accelerator target, with busy or unknown-card
+  replicas protected and physical retirements capped per tick;
+- physical-backend and blue-green updates still wait for complete
+  latest-version exact-card coverage before draining old replicas;
 - reserved-fill launches remain bounded by broker grants, exact-card free
   supply, demand-reserved claims, and the aggregate hard ceiling.
 
@@ -187,7 +190,10 @@ The rolling-progress regression covers the production deadlock shape:
 - cross-card supply reuse resumes only after no old-version replicas remain;
 - busy old-version A100-family replicas remain retained until their work
   completes without requiring a latest-version A100-family replacement;
-- no old replica drains before latest-version ready coverage exists;
+- no old replica drains before same-card latest-version ready coverage exists;
+- partial latest-version L4 coverage retires only the matching amount of idle
+  old-version L4 capacity instead of waiting for the complete L4 target;
+- latest-version capacity on a different card cannot retire old L4 capacity;
 - fill cannot exceed the broker grant or aggregate ceiling while demand surge
   is pending.
 

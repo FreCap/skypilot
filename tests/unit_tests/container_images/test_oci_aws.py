@@ -708,20 +708,30 @@ def test_service_quota_calls_are_synchronously_provider_fenced(
 def test_ecr_role_acquisition_fences_actual_sts_boundary(
         monkeypatch: pytest.MonkeyPatch) -> None:
     sts = mock.Mock()
-    monkeypatch.setattr(aws.aws_adaptor, 'client', lambda _service: sts)
+    ambient_session = mock.Mock()
+    ambient_session.client.return_value = sts
+    session = mock.Mock(return_value=ambient_session)
+    monkeypatch.setattr(aws.aws_adaptor, 'session', session)
     binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
                                  external_id=None,
                                  session_name='test',
                                  catalog_tag='catalog',
                                  profile_tag='profile')
-    lost = mock.Mock(side_effect=RuntimeError('lease lost at STS boundary'))
+    lost = mock.Mock(side_effect=[
+        None,
+        RuntimeError('lease lost at STS boundary'),
+    ])
 
     with pytest.raises(RuntimeError, match='lease lost at STS boundary'):
         aws.EcrRepository.from_role(binding,
                                     'us-east-1',
                                     'skypilot/images/shard',
                                     provider_fence=lost)
-    lost.assert_called_once_with()
+    session.assert_called_once_with(profile=None)
+    ambient_session.client.assert_called_once_with('sts',
+                                                   region_name='us-east-1')
+    assert lost.call_count == 2
+    lost.assert_has_calls([mock.call(), mock.call()])
     sts.assume_role.assert_not_called()
 
 
