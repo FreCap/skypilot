@@ -15,12 +15,16 @@ The same release also rejects an AWS-only logical-replica service with
 an empty set of YAML Kubernetes candidates as a malformed non-one-GPU set.
 Reserved capacity can be supplied by the broker, so the empty set is valid.
 
+Native container selectors are also copied into persisted replica overrides as
+Python `ContainerImage` objects. PostgreSQL JSON serialization rejects those
+objects before the launch record can be inserted.
+
 ## Behavior contract
 
 - A legacy Docker image keeps its legacy direct-pull provenance through every
   Serve location override and resource copy.
 - A native `container_image` remains a native selector and continues to cross
-  the public validation boundary.
+  the public validation boundary in its JSON-safe YAML representation.
 - Kubernetes fill candidates for logical replicas must each request exactly
   one GPU.
 - An AWS-only task may enable reserved fill because its zero-cost candidates
@@ -37,11 +41,13 @@ not the intended steady state.
 
 1. Encode an internally normalized legacy Docker identity back through the
    legacy `image_id.docker` override when constructing a Serve location.
-2. Apply the one-GPU logical fill check only when submitted Kubernetes fill
+2. Serialize native container selectors in location overrides to the same
+   scalar or dictionary form accepted by task YAML.
+3. Apply the one-GPU logical fill check only when submitted Kubernetes fill
    shapes exist.
-3. Add regression coverage for legacy location resource copies, paid-location
-   cost discovery, AWS-only reserved fill, and non-one-GPU Kubernetes fill
-   rejection.
+4. Add regression coverage for legacy location resource copies, JSON-safe
+   native location overrides, AWS-only reserved fill, and non-one-GPU
+   Kubernetes fill rejection.
 
 ## Rollout
 
