@@ -255,7 +255,12 @@ def _unsupported_direct_locality_rank(image: models.ContainerImage,
         return 0
     if image.distribution is not None:
         return 1
-    policy = config.get_workspace_policy(workspace)
+    try:
+        policy = config.get_workspace_policy(workspace)
+    except (TypeError, ValueError):
+        # A self-contained exact ref remains executable when an unsupported
+        # runtime cannot prove managed policy from a malformed raw snapshot.
+        return 1
     return int(policy.mode != models.WorkspaceImageMode.DIRECT)
 
 

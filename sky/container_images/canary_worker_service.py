@@ -263,6 +263,50 @@ def _tagged_instances(ec2: Any, operation_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _instance_id(instance: dict[str, Any]) -> str:
+    value = instance.get('InstanceId')
+    if not isinstance(value, str) or not value:
+        raise ValueError('QUALIFICATION_FAILED')
+    return value
+
+
+def _remember_instance_ids(instances: list[dict[str, Any]],
+                           known_ids: set[str]) -> None:
+    for instance in instances:
+        value = instance.get('InstanceId')
+        if isinstance(value, str) and value:
+            known_ids.add(value)
+
+
+def _exact_canary_instance(ec2: Any, instance_id: str,
+                           expected_tags: dict[str, str]) -> dict[str, Any]:
+    """Reads all attested EC2 fields from one exact, correctly tagged child."""
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    instances = [
+        instance for reservation in response.get('Reservations', [])
+        for instance in reservation.get('Instances', [])
+    ]
+    if len(instances) != 1 or _instance_id(instances[0]) != instance_id:
+        raise ValueError('QUALIFICATION_FAILED')
+    instance = instances[0]
+    raw_tags = instance.get('Tags')
+    if not isinstance(raw_tags, list):
+        raise ValueError('QUALIFICATION_FAILED')
+    tags: dict[str, str] = {}
+    for raw_tag in raw_tags:
+        if not isinstance(raw_tag, dict):
+            raise ValueError('QUALIFICATION_FAILED')
+        key = raw_tag.get('Key')
+        value = raw_tag.get('Value')
+        if (not isinstance(key, str) or not isinstance(value, str) or
+                key in tags):
+            raise ValueError('QUALIFICATION_FAILED')
+        tags[key] = value
+    if any(tags.get(key) != value for key, value in expected_tags.items()):
+        raise ValueError('QUALIFICATION_FAILED')
+    return instance
+
+
 def _instance_states(ec2: Any, instance_ids: set[str]) -> dict[str, str | None]:
     response = ec2.describe_instances(InstanceIds=sorted(instance_ids))
     return {
@@ -351,11 +395,13 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     deadline: float | None = None
     ec2: _FencedClient | None = None
     instances: list[dict[str, Any]] = []
+    known_instance_ids: set[str] = set()
     instance_id: str | None = None
     launch_attempted = False
     launch_confirmed = False
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
     success = False
+    instance_image_id: str | None = None
     instance_architecture: str | None = None
     actual_profile_arn: str | None = None
     actual_role: str | None = None
@@ -367,7 +413,13 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
 
     try:
         ec2 = _assumed_client(role, 'ec2', target.region, heartbeat)
+        expected_tags = {
+            'SkyPilotCanaryOperation': operation.id,
+            'SkyPilotCatalog': catalog_state.get_catalog_authority_id(),
+            'SkyPilotProfile': profile.name,
+        }
         instances = _tagged_instances(ec2, operation.id)
+        _remember_instance_ids(instances, known_instance_ids)
         launch_confirmed = bool(instances)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
@@ -382,15 +434,9 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             subnet_values = dict(binding.canary_subnets)[target.region]
             index = int(payload['nonce'][:8], 16) % len(subnet_values)
             tags = [{
-                'Key': 'SkyPilotCanaryOperation',
-                'Value': operation.id,
-            }, {
-                'Key': 'SkyPilotCatalog',
-                'Value': catalog_state.get_catalog_authority_id(),
-            }, {
-                'Key': 'SkyPilotProfile',
-                'Value': profile.name,
-            }]
+                'Key': key,
+                'Value': value,
+            } for key, value in expected_tags.items()]
             kwargs: dict[str, Any] = {
                 'ClientToken': _ec2_client_token(operation.id),
                 'ImageId': dict(binding.qualified_node_images)[target.region],
@@ -436,15 +482,26 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 raise RuntimeError(
                     'EC2 canary launch returned no unique child.')
             instances = [launched[0]]
+            _remember_instance_ids(instances, known_instance_ids)
             launch_confirmed = True
-        instance_id = str(instances[0]['InstanceId'])
+        instance_id = _instance_id(instances[0])
         assert deadline is not None
         while time.monotonic() < deadline:
             heartbeat.assert_owned()
             matching_instances = _tagged_instances(ec2, operation.id)
-            if len(matching_instances) != 1:
+            _remember_instance_ids(matching_instances, known_instance_ids)
+            if len(matching_instances) > 1:
+                raise ValueError('CANARY_DUPLICATE_CHILD')
+            if not matching_instances:
                 raise RuntimeError('EC2 canary child disappeared.')
-            instance = matching_instances[0]
+            if _instance_id(matching_instances[0]) != instance_id:
+                raise ValueError('CANARY_DUPLICATE_CHILD')
+            instance = _exact_canary_instance(ec2, instance_id, expected_tags)
+            known_instance_ids.add(_instance_id(instance))
+            instance_image_id = instance.get('ImageId')
+            if instance_image_id != dict(
+                    binding.qualified_node_images)[target.region]:
+                raise ValueError('QUALIFICATION_FAILED')
             instance_architecture = instance.get('Architecture')
             if instance_architecture != 'x86_64':
                 raise ValueError('QUALIFICATION_FAILED')
@@ -472,15 +529,11 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 raise RuntimeError('EC2 canary teardown authority unavailable.')
             else:
                 live_instances = _tagged_instances(ec2, operation.id)
-                known_ids = {
-                    str(item['InstanceId'])
-                    for item in instances + live_instances
-                    if isinstance(item.get('InstanceId'), str)
-                }
+                _remember_instance_ids(live_instances, known_instance_ids)
                 teardown_verified = _terminate_ec2_instances(
                     ec2,
                     operation.id,
-                    sorted(known_ids),
+                    sorted(known_instance_ids),
                     settle_absence=(persisted_child or (launch_attempted and
                                                         not launch_confirmed)))
         except worker_lease.LeaseLostError:
@@ -492,6 +545,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     if not success:
         raise ValueError('CANARY_PULL_FAILED')
     assert instance_id is not None
+    assert instance_image_id is not None
     assert actual_role is not None
     assert instance_architecture == 'x86_64'
     return {
@@ -503,7 +557,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         'runtime_id': payload['runtime_id'],
         'binding_fingerprint': binding.fingerprint,
         'runtime_digest': digest,
-        'host_image_id': dict(binding.qualified_node_images)[target.region],
+        'host_image_id': instance_image_id,
         'instance_architecture': instance_architecture,
         'instance_profile_arn': actual_profile_arn,
         'actual_principal': actual_role,

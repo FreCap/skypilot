@@ -2806,6 +2806,7 @@ def get_config_schema():
                         },
                         'allowed_profiles': {
                             'type': 'array',
+                            'maxItems': 128,
                             'items': {
                                 'type': 'string',
                                 'minLength': 1,

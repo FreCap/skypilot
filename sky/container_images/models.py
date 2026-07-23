@@ -1462,9 +1462,14 @@ class WorkspaceImagePolicy:
         if self.default_profile is not None:
             validate_control_plane_identifier(self.default_profile,
                                               'Workspace default distribution')
+        if len(self.allowed_profiles) > 128:
+            raise ValueError(
+                'Workspace allowed distributions must be at most 128.')
         for profile in self.allowed_profiles:
             validate_control_plane_identifier(profile,
                                               'Workspace allowed distribution')
+        if len(set(self.allowed_profiles)) != len(self.allowed_profiles):
+            raise ValueError('Workspace allowed distributions must be unique.')
         if len(self.publishers) > 256 or len(set(self.publishers)) != len(
                 self.publishers):
             raise ValueError(

@@ -36,7 +36,7 @@ def classify(resources: resources_lib.Resources,
             try:
                 declared_eks = config.is_declared_managed_eks_context(
                     image, resources.region, workspace)
-            except ValueError:
+            except (TypeError, ValueError):
                 if not exact_ref_only:
                     raise
         if declared_eks:

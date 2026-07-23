@@ -379,6 +379,19 @@ selectors because those requests have no self-contained direct identity. Final
 placement classification executes inside the typed image error boundary, so a
 managed-only classification failure is sanitized consistently with resolver
 failures before reaching request state or logs.
+Workspace policy parsing independently validates that `allowed_profiles` and
+`publishers` are bounded collections of strings before normalizing them. It
+therefore reports every malformed collection shape as a value error rather than
+leaking an incidental iterator or hashing exception. The shared classifier can
+preserve the exact-ref generic-Kubernetes fallback even when it receives a raw
+snapshot that bypassed normal configuration-schema validation, while managed-only
+selectors still fail closed. That exact-ref boundary treats both value and type
+errors from configuration-only profile classification as a negative managed-EKS
+proof. Downstream metadata resolution does not then reintroduce the same policy
+failure while computing locality: it keeps the executable direct candidate in
+the conservative managed-fallback rank and returns before managed database or
+profile access. These boundaries do not catch provider, database, or arbitrary
+runtime failures.
 
 The workspace opt-in is explicit configuration, not task YAML:
 
@@ -1610,6 +1623,17 @@ attestations without the observed architecture are intentionally invalid and
 must be refreshed by a new canary. A pull-only marker or the configured canary
 platform is not architecture evidence. A target cannot use its ordinary
 `delete_authority: disabled` setting to skip qualification cleanup.
+The operation-tag query remains the duplicate detector and teardown inventory,
+but it cannot supply attestation fields. Every polling read must return exactly
+the launched or replay-discovered child ID. The worker then performs an ID-scoped
+`DescribeInstances` read, verifies that same ID and the exact operation, catalog,
+and profile tags, and derives host AMI, architecture, instance profile, and
+lifecycle state from that one response. The observed AMI must equal the qualified
+regional AMI. The console marker is read from that same child.
+An unexpected operation-tagged ID, missing exact child, or tag mismatch can never
+be spliced into evidence. Every child ID observed through launch, replay, polling,
+or cleanup is retained in the teardown set, and an identity mismatch fails only
+after all observed children are verified terminated.
 
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
 before any child launch. It is a conservative operator-set ceiling for one run,
@@ -2627,7 +2651,9 @@ drained and every image table is empty; it is never part of Helm rollback.
 - managed-runtime architecture tests rejecting ARM64 and unknown EC2
   placements, rejecting missing or non-AMD64 EKS selectors, accepting an
   unknown EKS placement only with its exact qualified AMD64 selector, and
-  preserving policy-allowed exact-reference direct fallback;
+  preserving policy-allowed exact-reference direct fallback, plus fresh-launch
+  and replay tests that reject a different operation-tagged EC2 child, consume
+  no attestation fields from it, and verify teardown of every observed child;
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;
@@ -3323,3 +3349,21 @@ placement classification with exact-ref generic-Kubernetes fallback, requires
 observed `x86_64` EC2 canary evidence at qualification and runtime matching, and
 makes exception decoding total over untrusted envelope shapes. The acceptance
 streak remains zero.
+
+Codex final-acceptance round 1 at
+`ddf055c7ff84ee1d7452c427b48bc09230dfc534` returned `RESHAPE`; Fable could
+not start because its zero-token quota probe returned HTTP 429. Codex re-proved
+the shared placement, EC2 architecture, exception-envelope, PostgreSQL,
+provider, Dashboard, Helm, and bounded-work contracts, then found one remaining
+qualification identity splice. An operation-tag query could return one different
+instance from the launched or replay-discovered child. Architecture, instance
+profile, and state would come from that instance while the pull marker and
+persisted child ID came from the original child, allowing a mixed authorization
+proof. A production-path probe also showed that an out-of-schema null
+`allowed_profiles` value raised `TypeError`; deployment schema validation made
+that nonblocking in the final verdict, but it violated the classifier's
+independent totality contract. This revision binds every EC2 evidence field and
+tag to one exact child ID, retains all observed IDs through verified teardown,
+validates workspace policy collection shapes before normalization, and preserves
+the direct fallback through downstream locality ranking. The acceptance streak
+remains zero.

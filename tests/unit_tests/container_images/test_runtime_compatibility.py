@@ -1192,15 +1192,46 @@ def test_final_backend_preserves_generic_kubernetes_exact_ref(
     monkeypatch.setattr(image_placement.config.skypilot_config, 'get_nested',
                         get_nested)
 
-    def resolve(candidate, placement, **kwargs):
-        assert candidate is resources
-        assert placement.provider == 'kubernetes'
-        assert placement.backend == 'direct'
-        assert kwargs['workspace'] == 'research'
-        return candidate
+    resolved = cloud_vm_ray_backend._resolve_container_image_for_placement(
+        resources,
+        consumer_kind='cluster',
+        consumer_owner='generic-cluster',
+        controller_epoch='cluster:request',
+        controller_sequence=None,
+        allow_epoch_advance=False,
+        consumer_metadata={})
 
-    resolver = mock.Mock(side_effect=resolve)
-    monkeypatch.setattr(runtime, 'resolve_for_placement', resolver)
+    assert resolved is resources
+    assert resolved.resolved_container_image is None
+
+
+@pytest.mark.parametrize('mode', [
+    models.WorkspaceImageMode.MANAGED_PREFERRED,
+    models.WorkspaceImageMode.MANAGED_REQUIRED,
+])
+def test_final_backend_preserves_exact_ref_on_malformed_policy_collection(
+        monkeypatch: pytest.MonkeyPatch,
+        mode: models.WorkspaceImageMode) -> None:
+    selected_profile = 'gpu-production'
+    resources = resources_lib.Resources(
+        cloud=sky.Kubernetes(),
+        region='generic-context',
+        container_image=models.ContainerImage(
+            ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64))
+    monkeypatch.setattr(cloud_vm_ray_backend.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+
+    def get_nested(path, default_value=None):
+        if tuple(path) == ('workspaces', 'research', 'container_images'):
+            return {
+                'mode': mode.value,
+                'default_profile': selected_profile,
+                'allowed_profiles': None,
+            }
+        return default_value
+
+    monkeypatch.setattr(image_placement.config.skypilot_config, 'get_nested',
+                        get_nested)
 
     resolved = cloud_vm_ray_backend._resolve_container_image_for_placement(
         resources,
@@ -1212,11 +1243,38 @@ def test_final_backend_preserves_generic_kubernetes_exact_ref(
         consumer_metadata={})
 
     assert resolved is resources
-    resolver.assert_called_once()
+    assert resolved.resolved_container_image is None
 
 
-def test_final_backend_sanitizes_managed_only_classification_error(
+def test_final_backend_preserves_exact_ref_on_profile_type_error(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    resources = resources_lib.Resources(
+        cloud=sky.Kubernetes(),
+        region='generic-context',
+        container_image=models.ContainerImage(
+            ref='ghcr.io/boltz/runtime@sha256:' + 'a' * 64))
+    monkeypatch.setattr(cloud_vm_ray_backend.skypilot_config,
+                        'get_active_workspace', lambda: 'research')
+    monkeypatch.setattr(
+        image_placement.config, 'is_declared_managed_eks_context',
+        mock.Mock(side_effect=TypeError('malformed profile collection')))
+
+    resolved = cloud_vm_ray_backend._resolve_container_image_for_placement(
+        resources,
+        consumer_kind='cluster',
+        consumer_owner='generic-cluster',
+        controller_epoch='cluster:request',
+        controller_sequence=None,
+        allow_epoch_advance=False,
+        consumer_metadata={})
+
+    assert resolved is resources
+    assert resolved.resolved_container_image is None
+
+
+@pytest.mark.parametrize('error_type', [ValueError, TypeError])
+def test_final_backend_sanitizes_managed_only_classification_error(
+        monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]) -> None:
     resources = resources_lib.Resources(cloud=sky.Kubernetes(),
                                         region='generic-context',
                                         container_image=models.ContainerImage(
@@ -1226,7 +1284,7 @@ def test_final_backend_sanitizes_managed_only_classification_error(
                         'get_active_workspace', lambda: 'research')
     monkeypatch.setattr(
         image_placement.config, 'is_declared_managed_eks_context',
-        mock.Mock(side_effect=ValueError('secret profile configuration value')))
+        mock.Mock(side_effect=error_type('secret profile configuration value')))
     resolver = mock.Mock()
     monkeypatch.setattr(runtime, 'resolve_for_placement', resolver)
 

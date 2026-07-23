@@ -874,12 +874,75 @@ def test_expired_database_authorization_blocks_eks_create_with_slow_host_clock(
     core.create_namespaced_pod.assert_not_called()
 
 
-@pytest.mark.parametrize(('architecture', 'expected_error'),
-                         (('x86_64', None), ('arm64', 'QUALIFICATION_FAILED'),
-                          (None, 'QUALIFICATION_FAILED')))
-def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
+@pytest.mark.parametrize(('returned_id', 'tags'), [
+    ('i-other', [{
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': 'operation',
+    }, {
+        'Key': 'SkyPilotCatalog',
+        'Value': 'catalog',
+    }, {
+        'Key': 'SkyPilotProfile',
+        'Value': 'profile',
+    }]),
+    ('i-primary', [{
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': 'operation',
+    }, {
+        'Key': 'SkyPilotCatalog',
+        'Value': 'other-catalog',
+    }, {
+        'Key': 'SkyPilotProfile',
+        'Value': 'profile',
+    }]),
+    ('i-primary', [{
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': 'operation',
+    }, {
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': 'operation',
+    }, {
+        'Key': 'SkyPilotCatalog',
+        'Value': 'catalog',
+    }, {
+        'Key': 'SkyPilotProfile',
+        'Value': 'profile',
+    }]),
+    ('i-primary', None),
+])
+def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
+        returned_id: str, tags: list[dict[str, str]] | None) -> None:
+    ec2 = mock.Mock()
+    instance = {'InstanceId': returned_id}
+    if tags is not None:
+        instance['Tags'] = tags
+    ec2.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [instance]
+        }]
+    }
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._exact_canary_instance(
+            ec2, 'i-primary', {
+                'SkyPilotCanaryOperation': 'operation',
+                'SkyPilotCatalog': 'catalog',
+                'SkyPilotProfile': 'profile',
+            })
+
+    ec2.describe_instances.assert_called_once_with(InstanceIds=['i-primary'])
+
+
+@pytest.mark.parametrize(('architecture', 'image_id_case', 'expected_error'),
+                         (('x86_64', 'expected', None),
+                          ('arm64', 'expected', 'QUALIFICATION_FAILED'),
+                          (None, 'expected', 'QUALIFICATION_FAILED'),
+                          ('x86_64', 'other', 'QUALIFICATION_FAILED'),
+                          ('x86_64', None, 'QUALIFICATION_FAILED')))
+def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        architecture: str | None, expected_error: str | None) -> None:
+        architecture: str | None, image_id_case: str | None,
+        expected_error: str | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
@@ -892,8 +955,20 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
         'runtime_id': target.region,
         'timeout_seconds': 900,
     }
+    expected_tags = [{
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': operation.id,
+    }, {
+        'Key': 'SkyPilotCatalog',
+        'Value': 'catalog',
+    }, {
+        'Key': 'SkyPilotProfile',
+        'Value': profile.name,
+    }]
+    tagged_instance = {'InstanceId': 'i-canary'}
     instance = {
         'InstanceId': 'i-canary',
+        'Tags': expected_tags,
         'IamInstanceProfile': {
             'Arn': models.ec2_instance_profile_arn(binding),
         },
@@ -901,6 +976,10 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
             'Name': 'stopped'
         },
     }
+    if image_id_case == 'expected':
+        instance['ImageId'] = dict(binding.qualified_node_images)[target.region]
+    elif image_id_case == 'other':
+        instance['ImageId'] = 'ami-other'
     if architecture is not None:
         instance['Architecture'] = architecture
     terminated_instance = {
@@ -914,7 +993,7 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
         'Reservations': []
     }, {
         'Reservations': [{
-            'Instances': [instance]
+            'Instances': [tagged_instance]
         }]
     }, {
         'Reservations': [{
@@ -922,7 +1001,11 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
         }]
     }, {
         'Reservations': [{
-            'Instances': [instance]
+            'Instances': [tagged_instance]
+        }]
+    }, {
+        'Reservations': [{
+            'Instances': [tagged_instance]
         }]
     }, {
         'Reservations': [{
@@ -973,6 +1056,8 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
             operation, payload, _revision(profile), profile, target, binding,
             _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
         assert evidence['child_instance_id'] == 'i-canary'
+        assert evidence['host_image_id'] == dict(
+            binding.qualified_node_images)[target.region]
         assert evidence['instance_architecture'] == 'x86_64'
     else:
         with pytest.raises(ValueError, match=expected_error):
@@ -986,6 +1071,8 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
     assert ec2.run_instances.call_count == 2
     assert ec2.run_instances.call_args_list[0].kwargs == (
         ec2.run_instances.call_args_list[1].kwargs)
+    assert mock.call(
+        InstanceIds=['i-canary']) in (ec2.describe_instances.call_args_list)
     launch = ec2.run_instances.call_args.kwargs
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
     assert launch['SecurityGroupIds'] == list(
@@ -1001,6 +1088,92 @@ def test_ec2_canary_observes_architecture_and_uses_fenced_clients(
             'SkyPilotProfile': profile.name,
         }
     assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
+
+
+@pytest.mark.parametrize('persisted_child', [False, True],
+                         ids=['fresh-launch', 'replay'])
+def test_ec2_canary_rejects_mismatched_tagged_child_and_tears_down_all(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        persisted_child: bool) -> None:
+    operation = _canary_operation()
+    if persisted_child:
+        operation = dataclasses.replace(
+            operation, child_launch_id=f'ec2:us-west-2:{operation.id}')
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    assert binding.instance_profile is not None
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    primary = {'InstanceId': 'i-primary'}
+    unexpected = {
+        'InstanceId': 'i-other',
+        'ImageId': dict(binding.qualified_node_images)[target.region],
+        'Architecture': 'x86_64',
+        'IamInstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
+        },
+        'State': {
+            'Name': 'stopped'
+        },
+    }
+    terminated = [{
+        'InstanceId': instance_id,
+        'State': {
+            'Name': 'terminated'
+        },
+    } for instance_id in ('i-primary', 'i-other')]
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        if not instances:
+            return {'Reservations': []}
+        return {'Reservations': [{'Instances': list(instances)}]}
+
+    discovery = response(primary) if persisted_child else response()
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        discovery,
+        response(unexpected),
+        response(primary),
+        response(primary, unexpected),
+        response(*terminated),
+    )
+    ec2.run_instances.return_value = {'Instances': [primary]}
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0]
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+
+    with pytest.raises(ValueError, match='CANARY_DUPLICATE_CHILD'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    assert ec2.run_instances.call_count == (0 if persisted_child else 1)
+    ec2.get_console_output.assert_not_called()
+    ec2.terminate_instances.assert_called_once_with(
+        InstanceIds=['i-other', 'i-primary'])
 
 
 def test_eks_canary_fences_clients_and_verifies_teardown(

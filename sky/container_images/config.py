@@ -7,11 +7,29 @@ from sky.container_images import models
 from sky.skylet import constants
 
 DIRECT_PROFILE = 'direct'
+_MAX_WORKSPACE_PROFILES = 128
+_MAX_WORKSPACE_PUBLISHERS = 256
 
 
-def _workspace_policy_config(workspace: str) -> dict[str, Any]:
-    return skypilot_config.get_nested(
-        ('workspaces', workspace, 'container_images'), default_value={}) or {}
+def _workspace_policy_config(workspace: str) -> Any:
+    value = skypilot_config.get_nested(
+        ('workspaces', workspace, 'container_images'), default_value={})
+    return {} if value is None else value
+
+
+def _parse_string_collection(value: Any, subject: str,
+                             max_items: int) -> tuple[str, ...]:
+    """Normalizes one bounded config list without leaking shape errors."""
+    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+        raise ValueError(
+            f'{subject} must be a list of at most {max_items} strings.')
+    if not all(isinstance(item, str) for item in value):
+        raise ValueError(
+            f'{subject} must be a list of at most {max_items} strings.')
+    normalized = tuple(value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f'{subject} must not contain duplicate values.')
+    return normalized
 
 
 def parse_workspace_policy(value: Any) -> models.WorkspaceImagePolicy:
@@ -33,12 +51,18 @@ def parse_workspace_policy(value: Any) -> models.WorkspaceImagePolicy:
          isinstance(retention_weeks, bool) or retention_weeks <= 0)):
         raise ValueError('regional_cache_retention_weeks must be a positive '
                          'integer or null to disable automatic eviction.')
+    allowed_profiles = _parse_string_collection(
+        value.get('allowed_profiles', ()), 'Workspace allowed_profiles',
+        _MAX_WORKSPACE_PROFILES)
+    publishers = _parse_string_collection(value.get('publishers',
+                                                    ()), 'Workspace publishers',
+                                          _MAX_WORKSPACE_PUBLISHERS)
     return models.WorkspaceImagePolicy(
         mode=models.WorkspaceImageMode(
             value.get('mode', models.WorkspaceImageMode.DIRECT.value)),
         default_profile=value.get('default_profile'),
-        allowed_profiles=tuple(value.get('allowed_profiles', ())),
-        publishers=tuple(value.get('publishers', ())),
+        allowed_profiles=allowed_profiles,
+        publishers=publishers,
         locality=models.Locality(
             value.get('locality', models.Locality.PREFER.value)),
         regional_cache_retention_weeks=retention_weeks,
@@ -56,8 +80,9 @@ def get_workspace_policy(
 
 def list_workspace_policies() -> dict[str, models.WorkspaceImagePolicy]:
     """Returns every explicitly configured workspace image policy."""
-    workspaces = skypilot_config.get_nested(
-        ('workspaces',), default_value={}) or {}
+    workspaces = skypilot_config.get_nested(('workspaces',), default_value={})
+    if workspaces is None:
+        workspaces = {}
     if not isinstance(workspaces, dict):
         raise ValueError('SkyPilot workspaces configuration must be an object.')
     policies: dict[str, models.WorkspaceImagePolicy] = {}

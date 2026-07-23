@@ -175,6 +175,24 @@ def test_workspace_policy_defaults_to_unchanged_direct_behavior() -> None:
     assert policy.regional_cache_retention_weeks == 8
 
 
+@pytest.mark.parametrize(('field', 'value'), [
+    ('allowed_profiles', None),
+    ('allowed_profiles', 'gpu-production'),
+    ('allowed_profiles', ['gpu-production', None]),
+    ('allowed_profiles', ['gpu-production', 'gpu-production']),
+    ('allowed_profiles', [f'profile-{index}' for index in range(129)]),
+    ('publishers', None),
+    ('publishers', 'user-id'),
+    ('publishers', ['user-id', {}]),
+    ('publishers', ['user-id', 'user-id']),
+    ('publishers', [f'user-{index}' for index in range(257)]),
+])
+def test_workspace_policy_collections_reject_malformed_shapes_as_value_errors(
+        field: str, value: Any) -> None:
+    with pytest.raises(ValueError):
+        config.parse_workspace_policy({field: value})
+
+
 def test_workspace_policy_selection_and_allowlist(
         monkeypatch: pytest.MonkeyPatch, config_reader) -> None:
     monkeypatch.setattr(config.skypilot_config, 'get_nested', config_reader)
