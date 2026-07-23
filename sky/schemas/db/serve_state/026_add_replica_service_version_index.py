@@ -143,42 +143,118 @@ def _ensure_replica_json_state(bind: sa.engine.Connection) -> None:
                            f'{remaining_count} incomplete row(s).')
 
 
+def _postgres_index_state(bind: sa.engine.Connection,
+                          name: str) -> sa.engine.RowMapping | None:
+    """Returns the complete current-schema shape for one reserved index."""
+    return bind.execute(
+        sa.text("""
+            SELECT table_namespace.nspname AS table_schema,
+                   table_class.relname AS table_name,
+                   index_namespace.nspname AS index_schema,
+                   index_row.indisvalid AS is_valid,
+                   index_row.indisready AS is_ready,
+                   index_row.indisunique AS is_unique,
+                   index_row.indisprimary AS is_primary,
+                   index_row.indisexclusion AS is_exclusion,
+                   index_row.indpred IS NULL AS is_unfiltered,
+                   index_row.indexprs IS NULL AS is_expression_free,
+                   access_method.amname AS access_method,
+                   index_row.indnkeyatts AS key_count,
+                   index_row.indnatts AS attribute_count,
+                   ARRAY(
+                       SELECT pg_get_indexdef(
+                           index_row.indexrelid, key_position, TRUE)
+                       FROM generate_series(
+                           1, index_row.indnkeyatts) AS key_position
+                   ) AS key_columns,
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM unnest(index_row.indoption::smallint[])
+                            AS options(value)
+                       WHERE value <> 0
+                   ) AS has_default_ordering
+            FROM pg_index AS index_row
+            JOIN pg_class AS index_class
+              ON index_class.oid = index_row.indexrelid
+            JOIN pg_namespace AS index_namespace
+              ON index_namespace.oid = index_class.relnamespace
+            JOIN pg_class AS table_class
+              ON table_class.oid = index_row.indrelid
+            JOIN pg_namespace AS table_namespace
+              ON table_namespace.oid = table_class.relnamespace
+            JOIN pg_am AS access_method
+              ON access_method.oid = index_class.relam
+            WHERE index_namespace.nspname = current_schema()
+              AND index_class.relname = :name
+              AND index_class.relkind = 'i'
+            """), {
+            'name': name
+        }).mappings().one_or_none()
+
+
+def _postgres_shape_matches(index: sa.engine.RowMapping,
+                            columns: list[str]) -> bool:
+    return (str(index['table_schema']) == str(index['index_schema']) and
+            str(index['table_name']) == 'replicas' and
+            bool(index['is_valid']) and bool(index['is_ready']) and
+            not bool(index['is_unique']) and not bool(index['is_primary']) and
+            not bool(index['is_exclusion']) and bool(index['is_unfiltered']) and
+            bool(index['is_expression_free']) and
+            str(index['access_method']) == 'btree' and
+            int(index['key_count']) == len(columns) and
+            int(index['attribute_count']) == len(columns) and
+            list(index['key_columns'] or
+                 ()) == columns and bool(index['has_default_ordering']))
+
+
+def _generic_shape_matches(index: dict, columns: list[str]) -> bool:
+    dialect_options = index.get('dialect_options') or {}
+    has_predicate = any(
+        key.endswith('_where') and value is not None
+        for key, value in dialect_options.items())
+    return (list(index.get('column_names') or
+                 ()) == columns and not bool(index.get('unique')) and
+            not has_predicate and not bool(index.get('column_sorting')))
+
+
 def _ensure_index(bind: sa.engine.Connection, name: str,
                   columns: list[str]) -> None:
+    """Creates an exact replica index, repairing only interrupted residue."""
     if bind.dialect.name == 'postgresql':
-        is_valid = bind.execute(
-            sa.text("""
-                SELECT pg_index.indisvalid
-                FROM pg_index
-                JOIN pg_class AS index_class
-                  ON index_class.oid = pg_index.indexrelid
-                JOIN pg_class AS table_class
-                  ON table_class.oid = pg_index.indrelid
-                JOIN pg_namespace
-                  ON pg_namespace.oid = table_class.relnamespace
-                WHERE pg_namespace.nspname = current_schema()
-                  AND table_class.relname = 'replicas'
-                  AND index_class.relname = :name
-                """), {
-                'name': name
-            }).scalar_one_or_none()
-        if is_valid is False:
-            schema = bind.execute(
-                sa.text('SELECT current_schema()')).scalar_one()
-            preparer = bind.dialect.identifier_preparer
-            bind.exec_driver_sql(
-                'DROP INDEX CONCURRENTLY IF EXISTS '
-                f'{preparer.quote(schema)}.{preparer.quote(name)}')
+        index = _postgres_index_state(bind, name)
+        if index is not None:
+            if (str(index['table_schema']) != str(index['index_schema']) or
+                    str(index['table_name']) != 'replicas'):
+                raise RuntimeError(
+                    f'Existing replica index {name!r} belongs to an '
+                    'unexpected table.')
+            if not bool(index['is_valid']) or not bool(index['is_ready']):
+                preparer = bind.dialect.identifier_preparer
+                qualified_name = (
+                    f'{preparer.quote_schema(str(index["index_schema"]))}.'
+                    f'{preparer.quote(name)}')
+                bind.exec_driver_sql(
+                    f'DROP INDEX CONCURRENTLY IF EXISTS {qualified_name}')
+                index = None
+            elif not _postgres_shape_matches(index, columns):
+                raise RuntimeError(
+                    f'Existing replica index {name!r} has an unexpected '
+                    'shape.')
+        if index is not None:
+            return
+    else:
+        indexes = {
+            index['name']: index
+            for index in sa.inspect(bind).get_indexes('replicas')
+        }
+        index = indexes.get(name)
+        if index is not None:
+            if not _generic_shape_matches(index, columns):
+                raise RuntimeError(
+                    f'Existing replica index {name!r} has an unexpected '
+                    'shape.')
+            return
 
-    existing = {
-        index['name']: index
-        for index in sa.inspect(bind).get_indexes('replicas')
-    }
-    if name in existing:
-        if list(existing[name].get('column_names') or []) != columns:
-            raise RuntimeError(
-                f'Existing replica index {name!r} has unexpected columns.')
-        return
     op.create_index(name,
                     'replicas',
                     columns,

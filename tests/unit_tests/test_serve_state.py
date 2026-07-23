@@ -651,7 +651,7 @@ def test_replica_index_migration_rejects_same_name_with_wrong_columns(tmp_path):
     with engine.begin() as connection:
         connection.execute(version_table.insert().values(version_num='025'))
 
-    with pytest.raises(RuntimeError, match='unexpected columns'):
+    with pytest.raises(RuntimeError, match='unexpected shape'):
         migration_utils.safe_alembic_upgrade(engine,
                                              migration_utils.SERVE_DB_NAME,
                                              '026')

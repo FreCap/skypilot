@@ -557,6 +557,41 @@ def test_schema_025_indexes_exact_job_task_identity(tmp_path, monkeypatch):
     assert indexes['ix_spot_job_task'] == ['spot_job_id', 'task_id']
 
 
+def test_schema_025_rejects_same_name_with_wrong_columns(tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "malformed-tasks.db"}')
+    metadata = sqlalchemy.MetaData()
+    spot = sqlalchemy.Table(
+        'spot', metadata,
+        sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spot_job_id', sqlalchemy.Integer),
+        sqlalchemy.Column('task_id', sqlalchemy.Integer),
+        sqlalchemy.Column('status', sqlalchemy.Text))
+    sqlalchemy.Index('ix_spot_job_task', spot.c.status)
+    version = sqlalchemy.Table(
+        'alembic_version_spot_jobs_db', metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True))
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(version.insert().values(version_num='024'))
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    with pytest.raises(RuntimeError, match='unexpected shape'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SPOT_JOBS_DB_NAME,
+                                             '025')
+
+    with engine.connect() as connection:
+        assert connection.execute(sqlalchemy.select(
+            version.c.version_num)).scalar_one() == '024'
+
+
 def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
     upgrade = mock.Mock()

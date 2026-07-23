@@ -622,6 +622,62 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
+    @pytest.mark.parametrize(
+        ('index_name', 'index_ddl'), [
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (replica_id)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             "ON replicas (service_name, version) WHERE status = 'READY'"),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, (version + 0))'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, version) INCLUDE (status)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas (service_name DESC, version)'),
+            ('replicas_service_version_idx',
+             'CREATE UNIQUE INDEX replicas_service_version_idx '
+             'ON replicas (service_name, version)'),
+            ('replicas_service_version_idx',
+             'CREATE INDEX replicas_service_version_idx '
+             'ON replicas USING hash (service_name)'),
+            ('replicas_service_status_idx',
+             'CREATE INDEX replicas_service_status_idx '
+             'ON replicas (status, service_name)'),
+        ],
+        ids=('wrong-columns', 'partial', 'expression', 'included-column',
+             'descending', 'unique', 'wrong-method', 'status-order'))
+    def test_revision_026_rejects_malformed_same_name_indexes(
+            self, pg_server, index_name, index_ddl):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '025')
+            with engine.begin() as connection:
+                preparer = connection.dialect.identifier_preparer
+                connection.exec_driver_sql(
+                    f'DROP INDEX IF EXISTS {preparer.quote(index_name)}')
+                connection.exec_driver_sql(index_ddl)
+
+            with pytest.raises(RuntimeError, match='unexpected shape'):
+                migration_utils.safe_alembic_upgrade(
+                    engine, migration_utils.SERVE_DB_NAME, '026')
+
+            with engine.connect() as connection:
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert revision == '025'
+        finally:
+            engine.dispose()
+
     @pytest.mark.parametrize('preview_workspace_016', [False, True])
     def test_revision_022_reconciles_conflicting_revision_016_layouts(
             self, pg_server, preview_workspace_016):

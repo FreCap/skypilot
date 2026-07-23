@@ -363,6 +363,7 @@ export function ImageDetail() {
 
       try {
         let page;
+        let recoveredStaleCursor = false;
         try {
           page = await getImageArtifactCollection(
             imageId,
@@ -388,10 +389,7 @@ export function ImageDetail() {
             { workspace, limit: 100, cursor: null },
             controller.signal
           );
-          setCollectionNotices((current) => ({
-            ...current,
-            [collection]: `The ${collection} collection changed while paging. Reloaded the first page.`,
-          }));
+          recoveredStaleCursor = true;
         }
 
         if (
@@ -400,6 +398,12 @@ export function ImageDetail() {
           collectionControllers.current[collection] !== controller
         )
           return;
+        if (recoveredStaleCursor) {
+          setCollectionNotices((current) => ({
+            ...current,
+            [collection]: `The ${collection} collection changed while paging. Reloaded the first page.`,
+          }));
+        }
         setRequestState((current) => {
           if (
             current.scope !== scope ||

@@ -6695,11 +6695,138 @@ def _migration_call(engine: sqlalchemy.engine.Engine, function: Any) -> None:
 
 def _schema_engine(base: sqlalchemy.engine.Engine,
                    schema_name: str) -> sqlalchemy.engine.Engine:
-    return sqlalchemy.create_engine(
-        base.url,
-        connect_args={
-            'options': f'-c search_path={schema_name} -c statement_timeout=15000'
-        })
+    # Keep the schema in the URL so migration_utils.get_alembic_config() also
+    # preserves it when Alembic creates its own engine from this engine's URL.
+    url = base.url.update_query_dict(
+        {'options': f'-csearch_path={schema_name} -cstatement_timeout=15000'})
+    return sqlalchemy.create_engine(url)
+
+
+@pytest.mark.parametrize('index_ddl', [
+    ('CREATE INDEX ix_spot_job_task ON spot (status)'),
+    ('CREATE INDEX ix_spot_job_task ON spot '
+     "(spot_job_id, task_id) WHERE status = 'SUCCEEDED'"),
+    ('CREATE INDEX ix_spot_job_task ON spot '
+     '(spot_job_id, (task_id + 0))'),
+    ('CREATE INDEX ix_spot_job_task ON spot '
+     '(spot_job_id, task_id) INCLUDE (status)'),
+    ('CREATE INDEX ix_spot_job_task ON spot '
+     '(spot_job_id DESC, task_id)'),
+    ('CREATE UNIQUE INDEX ix_spot_job_task ON spot '
+     '(spot_job_id, task_id)'),
+    ('CREATE INDEX ix_spot_job_task ON spot '
+     'USING hash (spot_job_id)'),
+],
+                         ids=('wrong-columns', 'partial', 'expression',
+                              'included-column', 'descending', 'unique',
+                              'wrong-method'))
+def test_spot_jobs_revision_025_rejects_malformed_identity_index(
+        postgres_engine, index_ddl: str) -> None:
+    schema_name = f'spot_index_collision_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {schema_name}')
+    engine = _schema_engine(postgres_engine, schema_name)
+    try:
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SPOT_JOBS_DB_NAME,
+                                             '024')
+        with engine.begin() as connection:
+            connection.exec_driver_sql('DROP INDEX IF EXISTS ix_spot_job_task')
+            connection.exec_driver_sql(index_ddl)
+
+        with pytest.raises(RuntimeError, match='unexpected shape'):
+            migration_utils.safe_alembic_upgrade(
+                engine, migration_utils.SPOT_JOBS_DB_NAME, '025')
+
+        with engine.connect() as connection:
+            revision = connection.execute(
+                sqlalchemy.text('SELECT version_num FROM '
+                                'alembic_version_spot_jobs_db')).scalar_one()
+        assert revision == '024'
+    finally:
+        engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {schema_name} CASCADE')
+
+
+def test_spot_jobs_revision_025_repairs_invalid_residue_and_drives_plan(
+        postgres_engine) -> None:
+    schema_name = f'spot_index_repair_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {schema_name}')
+    engine = _schema_engine(postgres_engine, schema_name)
+    try:
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SPOT_JOBS_DB_NAME,
+                                             '024')
+        with engine.begin() as connection:
+            connection.exec_driver_sql('DROP INDEX IF EXISTS ix_spot_job_task')
+            connection.exec_driver_sql('CREATE INDEX ix_spot_job_task '
+                                       'ON spot (spot_job_id, task_id)')
+            connection.execute(
+                sqlalchemy.text(
+                    'UPDATE pg_index '
+                    'SET indisvalid = FALSE, indisready = FALSE '
+                    "WHERE indexrelid = 'ix_spot_job_task'::regclass"))
+
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SPOT_JOBS_DB_NAME,
+                                             '025')
+
+        with engine.begin() as connection:
+            shape = connection.execute(
+                sqlalchemy.text("""
+                    SELECT index_row.indisvalid,
+                           index_row.indisready,
+                           index_row.indpred IS NULL AS unfiltered,
+                           index_row.indexprs IS NULL AS expression_free,
+                           index_row.indnkeyatts,
+                           index_row.indnatts,
+                           access_method.amname
+                    FROM pg_index AS index_row
+                    JOIN pg_class AS index_class
+                      ON index_class.oid = index_row.indexrelid
+                    JOIN pg_am AS access_method
+                      ON access_method.oid = index_class.relam
+                    WHERE index_class.oid = 'ix_spot_job_task'::regclass
+                    """)).one()
+            assert tuple(shape) == (True, True, True, True, 2, 2, 'btree')
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO spot (spot_job_id, task_id, status)
+                    SELECT job_id, task_id, 'SUCCEEDED'
+                    FROM generate_series(1, 1000) AS job_id
+                    CROSS JOIN generate_series(0, 99) AS task_id
+                    """))
+            connection.exec_driver_sql('ANALYZE spot')
+            connection.exec_driver_sql('SET LOCAL enable_seqscan = off')
+            identities = ','.join(
+                f'({job_id}, {job_id % 100})' for job_id in range(1, 251))
+            plan = connection.execute(
+                sqlalchemy.text(
+                    'EXPLAIN (FORMAT JSON, COSTS OFF) '
+                    'SELECT spot_job_id, task_id, status FROM spot '
+                    f'WHERE (spot_job_id, task_id) IN ({identities})')
+            ).scalar_one()
+            revision = connection.execute(
+                sqlalchemy.text('SELECT version_num FROM '
+                                'alembic_version_spot_jobs_db')).scalar_one()
+
+        indexes = {
+            index['name']: index
+            for index in sqlalchemy.inspect(engine).get_indexes('spot')
+        }
+        assert indexes['ix_spot_job_task']['column_names'] == [
+            'spot_job_id', 'task_id'
+        ]
+        assert 'ix_spot_job_task' in json.dumps(plan)
+        assert revision == '025'
+    finally:
+        engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {schema_name} CASCADE')
 
 
 def _schema_shape(engine: sqlalchemy.engine.Engine,

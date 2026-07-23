@@ -519,4 +519,44 @@ describe('Image artifact detail', () => {
     expect(screen.getByText(`sha256:${'b'.repeat(64)}`)).toBeVisible();
     expect(screen.queryByText('late-target')).toBeNull();
   });
+
+  it('drops a late stale-cursor fallback notice after the route changes', async () => {
+    const oldFallback = deferred();
+    const oldDetail = detailFor('workspace-a', 'image-1', 'a');
+    oldDetail.next_cursors.locations = 'stale-next';
+    getImageCapabilities
+      .mockResolvedValueOnce({ workspace: 'workspace-a', publish: false })
+      .mockResolvedValueOnce({ workspace: 'workspace-b', publish: false });
+    getImageArtifactDetail
+      .mockResolvedValueOnce(oldDetail)
+      .mockResolvedValueOnce(detailFor('workspace-b', 'image-2', 'b'));
+    getImageArtifactCollection
+      .mockRejectedValueOnce({ code: 'STALE_IMAGE_CURSOR' })
+      .mockReturnValueOnce(oldFallback.promise);
+    mockRouter.query = { image: 'image-1', workspace: 'workspace-a' };
+
+    const view = render(<ImageDetail />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Next locations page' })
+    );
+    await waitFor(() =>
+      expect(getImageArtifactCollection).toHaveBeenCalledTimes(2)
+    );
+
+    mockRouter.query = { image: 'image-2', workspace: 'workspace-b' };
+    view.rerender(<ImageDetail />);
+    expect(await screen.findByText(`sha256:${'b'.repeat(64)}`)).toBeVisible();
+
+    await act(async () => {
+      oldFallback.resolve({ items: [], next_cursor: null });
+      await oldFallback.promise;
+    });
+
+    expect(
+      screen.queryByText(
+        'The locations collection changed while paging. Reloaded the first page.'
+      )
+    ).toBeNull();
+    expect(screen.getByText(`sha256:${'b'.repeat(64)}`)).toBeVisible();
+  });
 });

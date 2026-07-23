@@ -1334,6 +1334,18 @@ matrix covers upstream 022, 023, and 024 plus managed-preview 022, 023, and 024
 independently. Revision-only verification is safe only because all known same-
 numbered shapes converge through that common successor.
 
+The independent Managed Jobs database advances from revision 024 to 025 with
+the exact `(spot_job_id, task_id)` identity index used by bounded terminal
+consumer reconciliation. On PostgreSQL, companion migrations inspect the
+current-schema catalog rather than treating an index name as proof. The index
+must belong to the expected table, be valid and ready, use nonunique,
+expression-free, unfiltered B-tree keys, contain no included attributes, use
+default ordering, and match the exact ordered columns. An INVALID or not-ready
+same-table residue is dropped concurrently and rebuilt; a valid incompatible
+same-name index fails closed before Alembic can stamp the revision. The same
+exact-shape contract applies to Serve revision 026's status and service-version
+indexes, while SQLite validates every shape available from its inspector.
+
 ## Registry profiles
 
 ### Provider-neutral access contract
@@ -2129,7 +2141,10 @@ identity exactly matches the current route. A route-identity change fences the
 old state during render, before effects run, then aborts old detail and
 collection requests, closes dialogs, and resets scoped navigation. A failed
 replacement request may retain cached data only for the same compound identity;
-it can never restore data or controls from the previous identity.
+it can never restore data or controls from the previous identity. Every
+asynchronous branch checks generation, compound scope, and controller ownership
+before its first state write, including the nested stale-cursor first-page
+fallback and its notice.
 
 Workspace selection is a recoverable navigation transaction. The Dashboard
 hides the old scope before requesting the route change, but owns the
@@ -2516,7 +2531,13 @@ drained and every image table is empty; it is never part of Helm rollback.
   the sole revision-026 head with response and prediction history, quarantine,
   workspace, and exact replica-version lookup intact, plus a predecessor-
   stamped legacy SQLite replica layout proving revision 026 restores the full
-  JSON state and both lookup indexes;
+  JSON state and both lookup indexes. Real-PostgreSQL collision tests reject
+  valid same-name partial, expression, included-column, method, and wrong-column
+  shapes and rebuild only INVALID or not-ready same-table residue;
+- Managed Jobs revision-025 collision tests proving malformed same-name
+  identity indexes fail without advancing the revision, interrupted concurrent
+  residue is rebuilt, the final catalog shape is exact, and a large tuple-IN
+  terminal lookup uses `ix_spot_job_task`;
 - workspace-publication history and operational-profile readiness scale fixtures
   proving the former uses its `(workspace, created_at, id)` keyset index and the
   latter uses both ACTIVE and QUALIFYING partial indexes despite more than 1,001
@@ -3193,3 +3214,16 @@ an unhandled rejected or `false` route replacement, leaving no dependency
 change to restart capabilities. This revision extends request scoping to the
 detail route and treats workspace navigation as a recoverable transaction. The
 acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`294b03e7de41800c5d84d4961fe0d5843824e68a` returned `RESHAPE`; Fable could
+not start because its zero-token quota probe returned HTTP 429. Codex re-proved
+all backend, migration, provider, architecture, bounded-work, Helm, Terraform,
+and Dashboard gates, then reproduced two remaining defects. The nested
+stale-cursor fallback wrote its notice before checking the compound route
+scope, so a late A fallback could annotate artifact B. Managed Jobs revision
+025 also accepted any same-name identity index, allowing Alembic to stamp a
+malformed or partial production shape. This revision fences every asynchronous
+detail state write before mutation and gives both new companion migration heads
+exact PostgreSQL index-shape validation, invalid-residue recovery, collision
+tests, and production-plan evidence. The acceptance streak remains zero.
