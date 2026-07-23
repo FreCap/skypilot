@@ -2191,17 +2191,15 @@ class SkyServeLoadBalancer:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning('Failed to record prediction-time history: %s', e)
 
-    def _record_async_prediction_status(self, body: bytes,
-                                        content_encoding: str) -> None:
-        """Record one terminal async status using its model-reported time."""
-        if content_encoding.strip().lower() not in ('', 'identity'):
-            return
-        try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, ValueError, TypeError):
-            return
+    def _record_async_prediction_payload(self, payload: Any) -> bool:
+        """Validate and record one terminal async completion payload.
+
+        Returns whether the payload is a valid terminal observation. A valid
+        duplicate also returns True so at-least-once completion reporters can
+        treat the endpoint as idempotent.
+        """
         if not isinstance(payload, dict):
-            return
+            return False
         request_id = payload.get('request_id')
         status = payload.get('status')
         outcome = (_ASYNC_TERMINAL_OUTCOMES.get(status) if isinstance(
@@ -2209,17 +2207,75 @@ class SkyServeLoadBalancer:
         duration_ms = payload.get('processing_time_ms')
         if (not isinstance(request_id, str) or not request_id or
                 outcome is None or not isinstance(duration_ms, (int, float)) or
-                isinstance(duration_ms, bool) or
-                not math.isfinite(duration_ms) or duration_ms < 0):
-            return
+                isinstance(duration_ms, bool)):
+            return False
+        try:
+            duration_ms_float = float(duration_ms)
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if not math.isfinite(duration_ms_float) or duration_ms_float < 0:
+            return False
         completed = self._completed_async_prediction_ids
         if request_id in completed:
             completed.move_to_end(request_id)
-            return
-        self._record_prediction_time(float(duration_ms) / 1000.0, outcome)
+            return True
+        self._record_prediction_time(duration_ms_float / 1000.0, outcome)
         completed[request_id] = None
         if len(completed) > constants.LB_ASYNC_PREDICTION_DEDUP_CAP:
             completed.popitem(last=False)
+        return True
+
+    def _record_async_prediction_status(self, body: bytes,
+                                        content_encoding: str) -> bool:
+        """Record one terminal async status using its model-reported time."""
+        if content_encoding.strip().lower() not in ('', 'identity'):
+            return False
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return False
+        return self._record_async_prediction_payload(payload)
+
+    async def _prediction_completed(
+            self, request: fastapi.Request) -> fastapi.Response:
+        """Accept an out-of-band terminal prediction observation."""
+        content_type = request.headers.get('content-type', '')
+        media_type = content_type.partition(';')[0].strip().lower()
+        if media_type != 'application/json':
+            raise fastapi.HTTPException(status_code=415,
+                                        detail='Expected application/json.')
+        content_encoding = request.headers.get('content-encoding', '')
+        if content_encoding.strip().lower() not in ('', 'identity'):
+            raise fastapi.HTTPException(
+                status_code=415,
+                detail='Compressed completion payloads are not supported.')
+        try:
+            content_length = request.headers.get('content-length')
+            if (content_length is not None and int(content_length)
+                    > constants.LB_PREDICTION_COMPLETION_BODY_MAX_BYTES):
+                raise fastapi.HTTPException(status_code=413,
+                                            detail='Payload is too large.')
+        except ValueError:
+            pass
+
+        body = bytearray()
+        async for chunk in request.stream():
+            if (len(body) + len(chunk)
+                    > constants.LB_PREDICTION_COMPLETION_BODY_MAX_BYTES):
+                raise fastapi.HTTPException(status_code=413,
+                                            detail='Payload is too large.')
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Invalid prediction completion payload.') from None
+        if not self._record_async_prediction_payload(payload):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Invalid prediction completion payload.')
+        return fastapi.Response(status_code=204)
 
     def _begin_async_occupancy_attempt_locked(self, url: str,
                                               request: fastapi.Request) -> None:
@@ -4490,6 +4546,10 @@ class SkyServeLoadBalancer:
         self._app.add_api_route('/_lb/capacity',
                                 self._capacity,
                                 methods=['GET'])
+        self._app.add_api_route(
+            constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+            self._prediction_completed,
+            methods=['POST'])
         self._app.add_api_route('/{path:path}',
                                 self._proxy_with_retries,
                                 methods=['GET', 'POST', 'PUT', 'DELETE'])

@@ -118,6 +118,7 @@ LB_RESOURCES_ENV_VAR = 'SKYPILOT_SERVE_LB_RESOURCES_JSON'
 # the route registration and the auth middleware share one source of truth.
 LB_HEALTH_ENDPOINT_PATH = '/_lb/health'
 LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
+LB_PREDICTION_COMPLETION_ENDPOINT_PATH = '/_lb/prediction-completed'
 
 # Hard cap on the number of request timestamps the LB retains between successful
 # controller syncs. The batch is retained (not dropped) across a failed sync so
@@ -196,6 +197,11 @@ LB_ASYNC_ACTION_BODY_MAX_BYTES = 64 * 1024
 # Terminal async status bodies are small JSON objects. Forward larger bodies
 # unchanged, but do not retain them for observability parsing.
 LB_ASYNC_STATUS_BODY_MAX_BYTES = 64 * 1024
+# Completion callbacks carry only request identity, terminal outcome, and model
+# time. Keep their independently consumed request body much smaller than a
+# model input so an authenticated observability caller cannot make the LB retain
+# an unbounded payload.
+LB_PREDICTION_COMPLETION_BODY_MAX_BYTES = 16 * 1024
 # Bound process-local terminal request deduplication independently from request
 # rate and the model runtime's own completed-job cache.
 LB_ASYNC_PREDICTION_DEDUP_CAP = 100_000

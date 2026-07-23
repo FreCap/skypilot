@@ -455,6 +455,9 @@ def _client_with_routes(lb) -> TestClient:
     lb._app.add_api_route(constants.LB_HEALTH_ENDPOINT_PATH,
                           lb._health,
                           methods=['GET'])
+    lb._app.add_api_route(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                          lb._prediction_completed,
+                          methods=['POST'])
 
     async def _proxy(request: fastapi.Request):
         del request
@@ -476,6 +479,105 @@ def test_stack_health_get_exempt_but_proxy_requires_auth(monkeypatch):
     assert client.get('/predict').status_code == 401
     assert client.get('/predict',
                       headers=_edge_auth('s3cret')).status_code == 200
+
+
+def test_prediction_completion_callback_records_and_deduplicates(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    client = _client_with_routes(lb)
+    payload = {
+        'request_id': 'job-1',
+        'status': 'SUCCEEDED',
+        'processing_time_ms': 5000,
+    }
+
+    assert client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                       json=payload).status_code == 401
+    for _ in range(2):
+        response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                               headers=_edge_auth('s3cret'),
+                               json=payload)
+        assert response.status_code == 204
+    # A fallback async_status observation for the same request stays a no-op.
+    assert lb._record_async_prediction_status(
+        b'{"request_id":"job-1","status":"SUCCEEDED",'
+        b'"processing_time_ms":5000}', '')
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_edge_auth('s3cret'),
+                           json={
+                               'request_id': 'job-2',
+                               'status': 'FAILED',
+                               'processing_time_ms': 30000,
+                           })
+    assert response.status_code == 204
+
+    counts = lb._request_aggregator.prediction_time_history_snapshot(
+    )['buckets'][0]['outcome_counts']
+    assert counts['succeeded'][5] == 1
+    assert counts['failed'][7] == 1
+    assert sum(counts['succeeded']) + sum(counts['failed']) == 2
+
+
+@pytest.mark.parametrize('payload', [{}, {
+    'request_id': 'job-1',
+    'status': 'IN_PROGRESS',
+    'processing_time_ms': 1,
+}, {
+    'request_id': 'job-1',
+    'status': 'SUCCEEDED',
+    'processing_time_ms': -1,
+}, {
+    'request_id': 'job-1',
+    'status': 'SUCCEEDED',
+    'processing_time_ms': '1',
+}])
+def test_prediction_completion_callback_rejects_invalid_payload(
+        monkeypatch, payload):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    client = _client_with_routes(_make_lb())
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_edge_auth('s3cret'),
+                           json=payload)
+
+    assert response.status_code == 422
+
+
+def test_prediction_completion_callback_rejects_oversized_body(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    client = _client_with_routes(_make_lb())
+    body = b'x' * (constants.LB_PREDICTION_COMPLETION_BODY_MAX_BYTES + 1)
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers={
+                               **_edge_auth('s3cret'),
+                               'Content-Type': 'application/json',
+                           },
+                           content=body)
+
+    assert response.status_code == 413
+
+
+@pytest.mark.parametrize('headers', [{
+    'Content-Type': 'text/application/jsonish',
+}, {
+    'Content-Type': 'application/json',
+    'Content-Encoding': 'gzip',
+}])
+def test_prediction_completion_callback_rejects_unsupported_encoding(
+        monkeypatch, headers):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    client = _client_with_routes(_make_lb())
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers={
+                               **_edge_auth('s3cret'),
+                               **headers,
+                           },
+                           content=b'{}')
+
+    assert response.status_code == 415
 
 
 def test_stack_consumes_edge_auth_but_preserves_replica_auth(monkeypatch):
