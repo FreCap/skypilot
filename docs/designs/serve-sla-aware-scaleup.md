@@ -33,28 +33,32 @@ Four structural causes:
 
 ## Behavior contract
 
-1. **Burst admission follows authorized capacity.** The load balancer queue
-   limit uses `max(ready_units, min(target_num_replicas, ready_units +
-   provisioning_replicas))` as its unit base, from the existing controller
-   capacity hint. A burst the autoscaler has authorized capacity for waits in
-   queue (bounded by its own timeout) instead of being 503-rejected. When the
-   hint fields are absent (older controller), behavior is unchanged.
-2. **Queue work is weighted by the *remaining* SLA budget after capacity
+1. **Queue work is weighted by the *remaining* SLA budget after capacity
    lands.** With the new `replica_policy.provision_lead_time_seconds` knob
    (default 0 = current behavior), the weight becomes
    `min(1, duration / max(duration, timeout - lead))`. A 600 s-timeout
-   request with a 540 s lead counts as 0.5 replicas, not 0.05.
-3. **The scale-up wave base counts the whole demand-owned fleet.** Budget
-   base and ceiling use non-terminal, non-scale-down, demand-owned capacity
-   across *all* versions. Rolling updates no longer reset ramp speed; the
-   rolling surge/drain machinery still bounds replacement pacing separately.
-4. **Saturation is pressure.** A pressure observation also latches when the
+   request with a 540 s lead counts as 0.5 replicas, not 0.05. This orders
+   capacity ahead of saturation, which on gradually rising load keeps the
+   queue away from its cap entirely.
+2. **The scale-up wave base counts the whole demand-owned fleet.** Budget
+   base and ceiling use non-terminal, non-scale-down capacity across *all*
+   versions. Rolling updates no longer reset ramp speed; the rolling
+   surge/drain machinery still bounds replacement pacing separately.
+3. **Saturation is pressure.** A pressure observation also latches when the
    reported queue depth holds at or above its previous value while at or
    above `scale_up_rate_min_replicas` (a plateaued queue). A draining queue
    still resets the streak, and stable rejection populations deliberately
    remain non-latching to preserve the existing bounded downscale-veto
    behavior; cap and timeout rejections always ride on a deep queue, which
-   the plateau clause covers.
+   the plateau clause covers. Together with (2) this guarantees a saturated
+   flat queue keeps the fleet doubling wave over wave until raw demand or
+   `max_replicas` is reached.
+
+**Queue admission is deliberately unchanged** (operator decision): the load
+balancer queue limit stays `size_per_replica x ready units`. Extending it to
+authorized (target + provisioning) capacity was evaluated and quantified but
+rejected to keep the bounded-queue contract; the numbers are retained below
+for any future revisit.
 
 Downscale behavior, hysteresis, exact-card attribution, reserved fill, and
 the wave limiter's existence are unchanged.
@@ -72,40 +76,52 @@ Validation: with launches broken and scale-down frozen (the actual wedge) the
 simulator reproduces both incidents: queue pinned at exactly
 `10 x ready` (1560 / 2000), fleet frozen, 18-43% rejected.
 
-| scenario (offered) | current | current+cap only | cap+SLA weights (chosen) |
+| scenario (offered) | current | chosen (SLA weights, cap unchanged) | with cap extension (rejected) |
 |---|---|---|---|
-| step burst 400/min, fleet 156 | 9.9% rej | 2.8% rej | **0.1%** |
-| sustained 700/min, fleet 200 | 5.6% | 1.7% | **0.1%** |
-| cold spike 200/min, fleet 10 | 9.8% | 3.1% | **0.2%** |
-| mixed priority burst | 8.5% | 1.9% | **0.0%** |
+| slow ramp 30->400/min over 40 min | 2.4% rej | **0.3%** | 0.0% |
+| fast ramp 30->500/min over 15 min | 8.2% | **2.9%** | 0.0% |
+| step burst 400/min, fleet 156 | 9.9% | **9.6%** | 0.1% |
+| sustained 700/min, fleet 200 | 5.6% | **5.4%** | 0.1% |
+| cold spike 200/min, fleet 10 | 9.8% | **9.6%** | 0.2% |
+| mixed priority burst | 8.5% | **8.2%** | 0.0% |
 | overload > max_replicas throughput | 36.0% | 36.0% | 36.0% |
 
-Cost: the chosen policy spends +8% to +70% replica-hours during burst windows
-only (e.g. 630 vs 469 on the step burst) and is identical at steady state.
-Cap-only (without weight change) leaves 600 s-timeout expiries because the
-fleet stays undersized. Weights-only (without cap change) leaves ~9.6%
-rejections because the cap fires during the provisioning window. Both are
-needed; each alone is insufficient. Removing the wave limiter entirely
-performed the same as keeping it, so it is kept as a safety brake.
+The chosen policy's leverage is on rising load, the shape of both production
+incidents: capacity is ordered ahead of saturation, so the queue never
+reaches its cap (slow ramp peak queue 615 vs 2269 today, mean wait 20 s vs
+109 s). Cost is +8-17% replica-hours during ramp windows only and identical
+at steady state. On an instantaneous step burst the residual is physics:
+ready capacity (and with it the queue cap) cannot grow faster than
+provisioning latency, so the front edge of a true step is shed at the cap
+regardless of sizing policy; the retained-rejection signal then sizes the
+recovery, and the plateau + wave fixes guarantee the ramp completes at the
+configured maximum rate. Removing the wave limiter entirely performed the
+same as keeping it, so it is kept as a safety brake.
 
-Sensitivity (service 60 s, provisioning 8-15 min): chosen policy 1.0-2.3%
-failures vs 8.2-14.5% current. Residual failures there are physically
-unavoidable: when provisioning latency exceeds the SLA budget, reactive
-scaling cannot save a burst's front edge; only warm headroom
-(`min_replicas` / overprovision) or shorter provisioning can. Operators
-should set `expected_request_duration_seconds` honestly (the fleet's 30 s vs
-observed ~45-60 s under-sizes every estimate) and set
+Sensitivity (service 60 s, provisioning 8-15 min): the same ordering holds
+with all failure rates roughly doubled. When provisioning latency exceeds
+the SLA budget, reactive scaling cannot save a burst's front edge; only warm
+headroom (`min_replicas` / overprovision) or shorter provisioning can.
+Operators should set `expected_request_duration_seconds` honestly (the
+fleet's 30 s vs observed ~45-60 s under-sizes every estimate) and set
 `provision_lead_time_seconds` to the observed p75 launch-to-ready time.
 
 ## Alternatives considered
 
+- **Extending the queue cap to authorized capacity.** Eliminates residual
+  step-burst rejections (table above) but changes the bounded-queue
+  admission contract; excluded by operator decision. The evaluation is
+  retained should that tradeoff be revisited.
 - **Full-weight queue work (drain ASAP, ignore deadlines).** Same SLA
   compliance as chosen policy but strictly higher cost (up to +12% more
   replica-hours) and no wait-time benefit. Rejected.
-- **Arrival lead-time cover (size for arrivals expected during provisioning).**
-  Redundant once weights + cap are in place (identical results); a naive
-  version saturates the target at `max_replicas` and quadruples cost.
+- **Arrival-trend extrapolation (project the arrival slope over the
+  provisioning lead).** Bought only 0.1-0.9 points over the chosen policy
+  at equal cost while adding a phantom-demand surface on transient spikes.
   Rejected.
+- **Arrival lead-time cover (size for arrivals expected during provisioning).**
+  Redundant once the SLA weights are in place; a naive version saturates
+  the target at `max_replicas` and quadruples cost. Rejected.
 - **Removing the wave limiter.** Equal outcomes in simulation, but it is the
   only brake against demand-signal glitches mass-launching spot instances.
   Kept.
@@ -122,21 +138,20 @@ Unit tests (all in existing suites):
   map still falls back to raw depth.
 - Wave budget under version skew: old-version fleet of N gives budget base N
   (not 0) and ceiling `N + budget`; scale-down base unchanged.
-- Pressure plateau: flat non-zero queue depth latches an observation; a
-  draining queue does not; recent rejections latch without an increase.
-- LB `_request_queue_limits`: cap grows to authorized units with hint
-  target/provisioning present; absent fields preserve ready-based cap;
-  authorized units never exceed `target_num_replicas`.
+- Pressure plateau: a flat queue at or above `scale_up_rate_min_replicas`
+  latches an observation; a draining queue resets; a flat trickle queue
+  below the floor stays non-latching.
+- Incident regression: a flat saturated queue with committing capacity
+  progresses adaptive waves 120 -> 200 -> 400 -> 800 -> `max_replicas`.
 
-Manual: replay a step burst against a kind cluster service with a low
-`max_replicas`, verify queue holds without 503s while replicas provision and
+Manual: replay a rising-load window against a kind cluster service with a
+low `max_replicas`, verify the target rises ahead of queue saturation and
 that requests dispatch before their priority timeout.
 
 ## Rollout
 
-All changes except the weight knob are default-on behavior fixes. The knob
-defaults to 0 (no sizing change) so other services are unaffected until they
-opt in; boltz-l4-fleet sets `provision_lead_time_seconds: 540` in its next
-fleet update. No API version bump: the capacity hint fields consumed by the
-LB already exist, and old LB + new controller (or the reverse) degrade to
-current behavior.
+The wave-base and plateau fixes are default-on behavior fixes confined to
+the controller's autoscaler. The knob defaults to 0 (no sizing change) so
+other services are unaffected until they opt in; boltz-l4-fleet sets
+`provision_lead_time_seconds: 540` in its next fleet update. No API version
+bump and no load balancer changes.

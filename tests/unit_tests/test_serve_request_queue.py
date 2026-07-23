@@ -252,46 +252,6 @@ def test_dynamic_queue_size_is_capped():
     assert lb._request_queue_limits() == (32, 3000)
 
 
-def test_queue_size_extends_to_authorized_capacity():
-    lb = _make_lb(min_size=0, size_per_replica=3, max_size=3000)
-    lb._load_balancing_policy.set_ready_replicas(
-        [f'http://worker-{i}:8000' for i in range(5)])
-    assert lb._request_queue_limits()[1] == 15
-
-    # A burst the autoscaler authorized waits for provisioning capacity.
-    lb._capacity_hint = {
-        'target_num_replicas': 50,
-        'provisioning_replicas': 20,
-    }
-    assert lb._request_queue_limits()[1] == 75
-
-    # A wedged rollout (target high, nothing provisioning) must not hold
-    # requests for capacity that cannot arrive.
-    lb._capacity_hint = {
-        'target_num_replicas': 1000,
-        'provisioning_replicas': 0,
-    }
-    assert lb._request_queue_limits()[1] == 15
-
-    # A downscale intent below ready capacity never shrinks the queue.
-    lb._capacity_hint = {'target_num_replicas': 2, 'provisioning_replicas': 0}
-    assert lb._request_queue_limits()[1] == 15
-
-    # Malformed hint fields preserve ready-based sizing.
-    lb._capacity_hint = {
-        'target_num_replicas': True,
-        'provisioning_replicas': 'many',
-    }
-    assert lb._request_queue_limits()[1] == 15
-
-    # The configured max_size still caps authorized sizing.
-    lb._capacity_hint = {
-        'target_num_replicas': 5000,
-        'provisioning_replicas': 5000,
-    }
-    assert lb._request_queue_limits()[1] == 3000
-
-
 def test_async_occupancy_clamps_dispatch_limit():
     lb = _make_lb(min_size=0,
                   size_per_replica=3,

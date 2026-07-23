@@ -2945,6 +2945,60 @@ class TestLogicalScalingWaves(unittest.TestCase):
         # base would freeze the target at 100 for the whole rollout.
         self.assertEqual(autoscaler.target_num_replicas, 120)
 
+    def test_saturated_plateau_progresses_adaptive_waves_to_max(self):
+        """Incident regression: a flat saturated queue must keep doubling.
+
+        2026-07-22: the queue pinned at its cap, the strictly-increasing
+        pressure rule disarmed adaptive scale-up, and the latest-only wave
+        base froze the target. With both fixes the fleet ramps
+        130 -> 200 -> 400 -> 800 -> max while the queue stays flat.
+        """
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+        fleet = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            with mock.patch.object(autoscalers.time, 'time',
+                                   return_value=100.0):
+                autoscaler._set_target_num_replicas_with_concurrency_logic(
+                    fleet)
+            # First wave rides the base rate: 100 + max(10, 20% of 100).
+            self.assertEqual(autoscaler.target_num_replicas, 120)
+
+            # The queue holds perfectly flat; saturation arms adaptive.
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+            expected = 100
+            for wave, wave_time in enumerate((161.0, 222.0, 283.0, 344.0)):
+                expected = min(1000, 2 * expected)
+                _report(autoscaler, in_flight={}, queue_depth=2000)
+                with mock.patch.object(autoscalers.time,
+                                       'time',
+                                       return_value=wave_time):
+                    (autoscaler._set_target_num_replicas_with_concurrency_logic(
+                        fleet))
+                self.assertEqual(autoscaler.target_num_replicas, expected,
+                                 f'wave {wave}')
+                # Launched capacity commits (STARTING rows) before the next
+                # wave, so each adaptive wave doubles the fleet.
+                fleet = fleet + [
+                    _replica(len(fleet) + i + 1,
+                             status=serve_state.ReplicaStatus.STARTING)
+                    for i in range(expected - len(fleet))
+                ]
+
     def test_queue_plateau_sustains_pressure_streak(self):
         autoscaler = self._ramped_autoscaler(
             adaptive_scale_up={

@@ -848,7 +848,6 @@ class SkyServeLoadBalancer:
             ready_replicas = len(ready_urls)
             free_slots = None
             queue_capacity_units = ready_replicas
-            capacity_hint = self._capacity_hint or {}
             dispatch_capacity = (ready_replicas *
                                  config['max_concurrency_per_replica'])
             if config.get('use_async_occupancy', False):
@@ -885,26 +884,8 @@ class SkyServeLoadBalancer:
             # concurrency ceiling without double-debiting active dispatches.
             dispatch_limit = min(dispatch_limit,
                                  self._active_request_count + free_slots)
-        # A burst the autoscaler has authorized capacity for should wait in
-        # queue (bounded by its own priority timeout) rather than be
-        # rejected while that capacity provisions. Authorized units are
-        # capped by capacity actually being provisioned, so a rollout whose
-        # launches fail does not balloon the queue with requests no future
-        # capacity can serve. Absent hint fields preserve ready-based
-        # sizing for older controllers.
-        queue_units = queue_capacity_units
-        target_units = capacity_hint.get('target_num_replicas')
-        provisioning_units = capacity_hint.get('provisioning_replicas')
-        if (isinstance(target_units, int) and
-                not isinstance(target_units, bool) and target_units > 0 and
-                isinstance(provisioning_units, int) and
-                not isinstance(provisioning_units, bool) and
-                provisioning_units >= 0):
-            authorized_units = min(target_units,
-                                   queue_capacity_units + provisioning_units)
-            queue_units = max(queue_capacity_units, authorized_units)
         queue_size = max(config['min_size'],
-                         queue_units * config['size_per_replica'])
+                         queue_capacity_units * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
 
     @staticmethod
