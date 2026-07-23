@@ -3954,8 +3954,10 @@ The revised three-state snapshot contract preserves old missing-field
 on-demand replay, while every new profile projects its boolean market policy
 and therefore requires an identity-changing revision. The acceptance streak
 remains zero.
-Before the repaired-head acceptance run, `origin/improvements` advanced
-to `0758b9b32e5828a0befd6cde1fe09dce62e6f605`. Integrating it preserves the
-new managed-job cancellation attribution and transient-INIT recovery contracts
-without changing this feature's 22-file base-relative diff; all gates are rerun
-against that actual merge candidate.
+Before the repaired-head acceptance run, `origin/improvements` first advanced
+to `0758b9b32e5828a0befd6cde1fe09dce62e6f605` and then to
+`742315b8f847b2c414b2a25cf25c30863feb9c82`. Integrating both preserves the
+new managed-job cancellation attribution, transient-INIT recovery, and recovery
+signal-parent contracts. The second integration does not overlap this feature's
+26-file base-relative diff. All gates are rerun against the actual merge
+candidate.
