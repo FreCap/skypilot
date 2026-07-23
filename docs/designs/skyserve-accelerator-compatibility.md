@@ -400,6 +400,15 @@ PENDING rows that fit the remaining target. Rows launched for reserved fill
 remain governed by the independent broker-grant fence and are not charged to
 this demand budget.
 
+A reconciliation generation is an observation stamp, not by itself a semantic
+target change. A queued launch may remain authorized across a newer generation
+only when the fresh current target has the same service version, aggregate
+capacity, exact-card capacities, and accelerator shapes as its stored fence,
+and a new fleet read still includes that replica in the current launch budget.
+Any version, aggregate target, exact-card target, or shape change revokes the
+stored authority. Newly READY or PROVISIONING capacity can also remove the
+candidate even when the target is otherwise unchanged.
+
 This check is restart-safe. A recovered logical controller must not treat all
 durable PENDING demand rows as fresh launch orders. It reconstructs their
 authorization from the first fresh, complete exact-card target it receives;

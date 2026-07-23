@@ -3235,6 +3235,57 @@ class TestLogicalPendingLaunchAdmission:
                                return_value=[candidate, ready]):
             assert not mgr._queued_logical_launch_fence_holds(1)
 
+    def test_final_cloud_guard_accepts_equivalent_newer_generation(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        stored_fence = mgr._logical_target
+        assert stored_fence is not None
+        mgr._replica_to_logical_launch_fence[1] = stored_fence
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, generation=8)
+        mgr._logical_target = (1, 8, 1, (('A100', 1),), stored_fence[4])
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert replica_managers._logical_target_intent_preserved(
+                mgr._logical_target, stored_fence)
+            assert mgr._queued_logical_launch_fence_holds(1)
+
+    def test_final_cloud_guard_rejects_changed_newer_target(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        stored_fence = mgr._logical_target
+        assert stored_fence is not None
+        mgr._replica_to_logical_launch_fence[1] = stored_fence
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, generation=8)
+        mgr._logical_target = (1, 8, 2, (('A100', 2),), stored_fence[4])
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert not mgr._queued_logical_launch_fence_holds(1)
+
+    def test_final_cloud_guard_rejects_older_generation(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        current_fence = mgr._logical_target
+        assert current_fence is not None
+        stored_fence = (current_fence[0], current_fence[1] + 1,
+                        current_fence[2], current_fence[3], current_fence[4])
+        mgr._replica_to_logical_launch_fence[1] = stored_fence
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert not replica_managers._logical_target_intent_preserved(
+                current_fence, stored_fence)
+            assert not mgr._queued_logical_launch_fence_holds(1)
+
 
 class TestLogicalCapacityPlanning:
     """One manager operation packs whole backend shapes to a slot target."""

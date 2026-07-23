@@ -256,6 +256,27 @@ def _logical_target_state_components(
     return version, generation, target_capacity, target_by_card, shapes
 
 
+def _logical_target_intent_preserved(
+    current: LogicalTargetState | None,
+    previous: LogicalTargetState | None,
+) -> bool:
+    """Whether a newer target preserves an earlier fence's exact intent."""
+    current_components = _logical_target_state_components(current)
+    previous_components = _logical_target_state_components(previous)
+    if (current_components is None or previous_components is None or
+            current is None or previous is None or
+            len(current) != len(previous)):
+        return False
+    (current_version, current_generation, current_target, current_by_card,
+     current_shapes) = current_components
+    (previous_version, previous_generation, previous_target, previous_by_card,
+     previous_shapes) = previous_components
+    return (current_generation >= previous_generation and
+            (current_version, current_target, current_by_card, current_shapes)
+            == (previous_version, previous_target, previous_by_card,
+                previous_shapes))
+
+
 def _remove_nonmaterial_replica_config_metadata(config: dict[str, Any]) -> None:
     """Ignore generated metadata that cannot affect a running replica.
 
@@ -6164,7 +6185,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         applicable, current_fence, authorized_ids = (
             self._logical_pending_launch_admission(
                 candidate_replica_id=replica_id))
-        return (applicable and current_fence == fence and
+        return (applicable and
+                _logical_target_intent_preserved(current_fence, fence) and
                 replica_id in authorized_ids)
 
     @with_lock
