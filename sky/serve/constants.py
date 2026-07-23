@@ -527,6 +527,33 @@ ENDPOINT_PROBE_INTERVAL_SECONDS = DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS
 # probe is very time-consuming (33B, 70B, ...).
 DEFAULT_READINESS_PROBE_TIMEOUT_SECONDS = 15
 
+# Adaptive demand estimation. Measured request duration and provisioning
+# lead supersede their configured values once enough live evidence exists,
+# so a stale hand-set number cannot silently mis-size the fleet forever.
+# Seed used while a service has not yet measured its own launch-to-ready
+# time (`initial_provision_lead_time_seconds: auto`). Provisioning a GPU
+# replica takes minutes on every supported cloud, so assuming zero would
+# size the first bursts of a service's life as if capacity were instant.
+AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS = 600.0
+# Sentinel accepted by initial_provision_lead_time_seconds.
+AUTOSCALER_PROVISION_LEAD_AUTO = 'auto'
+# Minimum completed requests before a measured duration is trusted. One
+# decision tick of a small fleet should not redefine the sizing constant.
+AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES = 20
+# Smoothing for the measured-duration EMA. Deliberately slow: sizing must
+# track the workload's central tendency, not one burst of long requests.
+AUTOSCALER_ADAPTIVE_DURATION_EMA_ALPHA = 0.2
+# Minimum observed launch-to-ready samples before a measured lead is
+# trusted, and how many recent samples the quantile is taken over.
+AUTOSCALER_ADAPTIVE_LEAD_MIN_SAMPLES = 5
+AUTOSCALER_ADAPTIVE_LEAD_SAMPLE_CAP = 50
+# Lead quantile. Sizing against the median would leave the slower half of
+# launches arriving after the SLA budget they were sized for.
+AUTOSCALER_ADAPTIVE_LEAD_QUANTILE = 0.75
+# A measurement older than this stops superseding configuration: a service
+# that has been idle for hours must not size from a stale regime.
+AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS = 6 * 60 * 60
+
 # Autoscaler window size in seconds for query per second. We calculate qps by
 # divide the number of queries in last window size by this window size.
 AUTOSCALER_QPS_WINDOW_SIZE_SECONDS = 60

@@ -3468,4 +3468,8 @@ child, could be certified as absence and clear the durable owner. This revision
 distinguishes exact empty inventory from unidentifiable child evidence, carries
 tag-read ambiguity through teardown, requires a complete clean settling window
 after the latest ambiguity, and preserves the RUNNING operation whenever that
-proof is incomplete. The acceptance streak remains zero.
+proof is incomplete. During repair, `origin/improvements` advanced to
+`1bce497a7b`; integrating it preserves the new Serve autoscaling contracts and
+reconciles built-in exception attribute restoration with this feature's
+constructor-safe note serialization and total malformed-envelope decoder. The
+acceptance streak remains zero.

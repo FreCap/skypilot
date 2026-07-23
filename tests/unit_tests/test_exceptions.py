@@ -44,6 +44,20 @@ def test_exception_notes_are_restored_outside_constructor_kwargs():
     assert getattr(restored_legacy, '__notes__') == ['legacy note']
 
 
+def test_builtin_exception_attributes():
+    """Built-in exception attributes are restored after construction."""
+    e = TypeError('test')
+    e.add_note('when serializing a result')
+    e.request_context = {'request_id': 'request-1'}
+
+    deserialized = _serialize_deserialize(e)
+
+    assert isinstance(deserialized, TypeError)
+    assert str(deserialized) == 'test'
+    assert deserialized.__notes__ == ['when serializing a result']
+    assert deserialized.request_context == {'request_id': 'request-1'}
+
+
 def test_execution_control_errors_are_picklable():
     """Retry and pause exceptions preserve their constructor state."""
     retryable = exceptions.ExecutionRetryableError('retry', 'later', 3)
@@ -263,7 +277,7 @@ def test_deserialize_partial_dict():
     {
         'type': 'ValueError',
         'attributes': {
-            'unexpected': True
+            '__traceback__': 'not-a-traceback'
         },
     },
 ])

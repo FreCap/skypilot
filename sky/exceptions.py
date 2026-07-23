@@ -153,7 +153,14 @@ def deserialize_exception(serialized: Any) -> Exception:
     attributes = dict(raw_attributes)
     legacy_notes = attributes.pop('__notes__', None)
     try:
-        e = exception_class(*args, **attributes)
+        if hasattr(builtins, exception_type):
+            # Built-in exception constructors reject keyword arguments. Restore
+            # validated custom attributes after construction instead.
+            e = exception_class(*args)
+            for key, value in attributes.items():
+                setattr(e, key, value)
+        else:
+            e = exception_class(*args, **attributes)
         if not isinstance(e, Exception):
             return RuntimeError('Server error response is malformed.')
         notes = serialized.get('notes', legacy_notes)

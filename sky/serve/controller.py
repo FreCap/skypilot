@@ -1042,6 +1042,11 @@ class SkyServeController:
                     'rejected_in_recent_window_by_priority':
                         effective_request_data.get(
                             'rejected_in_recent_window_by_priority'),
+                    # Measured request durations. The same snapshot the
+                    # controller persists for history also lets the
+                    # autoscaler supersede its configured duration estimate.
+                    'prediction_time_history':
+                        request_data.get('prediction_time_history'),
                     'unique_job_arrivals_60s':
                         effective_request_data.get('unique_job_arrivals_60s'),
                     'unique_job_arrivals_300s':

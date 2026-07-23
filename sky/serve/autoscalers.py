@@ -2308,6 +2308,7 @@ def _revalidate_actuation_target(
     nonretiring_supply: dict[str, int],
     configured_cards: list[str],
     final_target: int,
+    allow_adopted_reassignment: bool = True,
 ) -> dict[str, int]:
     """Build a supply-aware actuator without bypassing target adoption.
 
@@ -2345,6 +2346,13 @@ def _revalidate_actuation_target(
     if remaining < 0 or fill_toward_desired(remaining,
                                             require_backing=False) != 0:
         return {}
+    if not allow_adopted_reassignment:
+        # A mixed-version rollout must preserve the compatibility-owned card
+        # map. Old-version supply cannot prove that a cross-card replacement is
+        # compatible, and moving an adopted unit here can turn a warm
+        # zero-cost card into paid same-card launch authority. Generic
+        # overprovision was assigned above without changing adopted demand.
+        return {card: count for card, count in target.items() if count > 0}
 
     # First replace adopted capacity that is disappearing. This is allowed to
     # create a cold shortage, because retaining the old card would otherwise
@@ -3546,6 +3554,23 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds: float | None = getattr(
             spec, 'expected_request_duration_seconds', None)
+        self.initial_provision_lead_time_seconds: float | str | None = getattr(
+            spec, 'initial_provision_lead_time_seconds', None)
+        self.adaptive_demand_estimation: bool = (getattr(
+            spec, 'adaptive_demand_estimation', True) is not False)
+        # Live demand-estimation state. Both estimators supersede their
+        # configured counterpart only while they hold enough fresh evidence;
+        # configuration remains the fallback and the cold-start value.
+        self._measured_duration_seconds: float | None = None
+        self._measured_duration_samples: int = 0
+        self._measured_duration_at: float | None = None
+        # Cumulative per-bucket counts already folded into the estimate, so
+        # a repeated (unacknowledged) histogram report is not double counted.
+        self._prediction_counts_seen: dict[int, list[int]] = {}
+        self._provision_lead_samples: list[float] = []
+        self._provision_lead_at: float | None = None
+        # Replica rows whose launch-to-ready has already been sampled.
+        self._provision_lead_seen_replica_ids: set[int] = set()
         self.max_scale_up_rate_percentage: int | None = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas: int | None = getattr(
@@ -4057,6 +4082,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._offered_arrival_tracking_saturated = (
             request_aggregator_info.get('offered_arrival_tracking_saturated')
             is True)
+        self._ingest_prediction_time_history(
+            request_aggregator_info.get('prediction_time_history'))
         report_is_floored = request_aggregator_info.get(
             'pressure_report_is_floored') is True
         arrival_60 = self._offered_arrival_count(60)
@@ -4071,6 +4098,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 reasons = tuple(label for label, current, previous in zip(
                     labels, pressure_sample, self._pressure_baseline)
                                 if current > previous)
+                if not reasons:
+                    # A queue pinned flat at its cap is saturation, not
+                    # relief; requiring strictly increasing samples disarms
+                    # adaptive scale-up exactly when overload plateaus.
+                    # Only a draining queue resets the streak. The plateau
+                    # floor keeps a benign flat trickle queue from latching
+                    # pressure indefinitely, and stable rejection
+                    # populations deliberately stay non-latching (bounded
+                    # downscale vetoes) -- cap and timeout rejections always
+                    # ride on a deep queue, which this clause covers.
+                    plateau_floor = max(1, self.scale_up_rate_min_replicas or 1)
+                    if (pressure_sample[0] >= plateau_floor and
+                            pressure_sample[0] >= self._pressure_baseline[0]):
+                        reasons = ('queue_plateau',)
                 if reasons:
                     self._pressure_latched = True
                     self._pressure_reasons = reasons
@@ -4338,7 +4379,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _queue_work(self) -> float:
         if (self.replica_unit != 'logical' or
-                self.expected_request_duration_seconds is None or
+                self.effective_request_duration_seconds is None or
                 not self._queue_timeout_thresholds or
                 self._queue_depth_by_priority is None or
                 sum(self._queue_depth_by_priority.values())
@@ -4347,13 +4388,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # active beside an empty or partial priority map from the new
             # active. Never let the optional map erase that proven queue.
             return float(self._queue_depth)
+        # A queued request must be dispatched before its priority timeout,
+        # and newly authorized capacity only starts serving after the
+        # provisioning lead time. Sizing against the full timeout budget
+        # plans delivery exactly at the deadline assuming instant capacity;
+        # subtracting the lead sizes against the budget that actually
+        # remains once capacity can exist.
+        lead = self.effective_provision_lead_seconds
+        duration = self.effective_request_duration_seconds
         work = 0.0
         for priority, count in self._queue_depth_by_priority.items():
             timeout = self._priority_timeout(priority)
             weight = 1.0
             if timeout is not None:
-                weight = min(1.0,
-                             self.expected_request_duration_seconds / timeout)
+                weight = min(1.0, duration / max(duration, timeout - lead))
             work += count * weight
         return work
 
@@ -4371,7 +4419,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(typing.cast(int, value) for value in values)
 
     def _arrival_work(self) -> float:
-        duration = self.expected_request_duration_seconds
+        duration = self.effective_request_duration_seconds
         if duration is None:
             return 0.0
         if (self._unique_job_arrivals_60s is None or
@@ -4401,7 +4449,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if arrival_gap <= 0:
             return []
 
-        duration = self.expected_request_duration_seconds
+        duration = self.effective_request_duration_seconds
         offered_counts_complete = (duration is not None and
                                    self._unique_job_arrivals_60s is not None and
                                    self._unique_job_arrivals_300s is not None
@@ -4435,6 +4483,167 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return [(priority, compatible, work * scale)
                 for priority, compatible, work in evidence]
 
+    def _adaptive_sample_is_fresh(self, observed_at: float | None) -> bool:
+        if observed_at is None:
+            return False
+        age = time.time() - observed_at
+        # Tolerate a small negative age from clock adjustment rather than
+        # discarding an otherwise usable estimate.
+        return -60.0 <= age <= constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS
+
+    @property
+    def effective_request_duration_seconds(self) -> float | None:
+        """Measured request duration, falling back to configuration.
+
+        Configuration is a hand-set estimate that silently mis-sizes every
+        target it feeds once the workload drifts. A measured duration backed
+        by enough fresh completions is strictly better evidence, so it wins
+        while it holds; otherwise the configured value stands.
+        """
+        if (self.adaptive_demand_estimation and
+                self._measured_duration_seconds is not None and
+                self._measured_duration_samples
+                >= constants.AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES and
+                self._adaptive_sample_is_fresh(self._measured_duration_at)):
+            return self._measured_duration_seconds
+        return self.expected_request_duration_seconds
+
+    @property
+    def configured_provision_lead_seconds(self) -> float:
+        """Resolve the configured seed, including the 'auto' sentinel.
+
+        'auto' (the default) means the service has not declared a lead and
+        wants one measured. Until it has, assume the order of magnitude
+        every supported cloud actually takes to provision a GPU replica:
+        assuming zero would size a young service's first bursts as if
+        capacity were instant.
+        """
+        configured = self.initial_provision_lead_time_seconds
+        if isinstance(configured,
+                      (int, float)) and not isinstance(configured, bool):
+            return float(configured)
+        return constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS
+
+    @property
+    def effective_provision_lead_seconds(self) -> float:
+        """Observed launch-to-ready quantile, falling back to the seed."""
+        if (self.adaptive_demand_estimation and
+                len(self._provision_lead_samples)
+                >= constants.AUTOSCALER_ADAPTIVE_LEAD_MIN_SAMPLES and
+                self._adaptive_sample_is_fresh(self._provision_lead_at)):
+            ordered = sorted(self._provision_lead_samples)
+            index = min(
+                len(ordered) - 1,
+                int(constants.AUTOSCALER_ADAPTIVE_LEAD_QUANTILE * len(ordered)))
+            return ordered[index]
+        return self.configured_provision_lead_seconds
+
+    def _ingest_prediction_time_history(self,
+                                        prediction_time_history: Any) -> None:
+        """Fold newly completed request durations into the EMA.
+
+        The load balancer reports per-minute cumulative histograms and keeps
+        re-reporting a bucket until the controller durably accepts it, so
+        only the positive delta against what this estimator already folded
+        in may contribute.
+        """
+        if not isinstance(prediction_time_history, dict):
+            return
+        if (prediction_time_history.get('histogram_version')
+                != constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION):
+            # Bucket arrays are interpreted by index; a different version
+            # is not comparable and is dropped rather than guessed.
+            return
+        buckets = prediction_time_history.get('buckets')
+        if not isinstance(buckets, list):
+            return
+        bounds = constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS
+        total_new = 0
+        weighted_new = 0.0
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            bucket_start = bucket.get('bucket_start')
+            outcome_counts = bucket.get('outcome_counts')
+            if (not isinstance(bucket_start, int) or
+                    isinstance(bucket_start, bool) or
+                    not isinstance(outcome_counts, dict)):
+                continue
+            # Only successful requests describe how long serving a request
+            # occupies a slot. A fast failure would drag the estimate down
+            # and undersize the fleet.
+            counts = outcome_counts.get('succeeded')
+            if not isinstance(counts, list):
+                continue
+            seen = self._prediction_counts_seen.setdefault(
+                bucket_start, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
+            for index, count in enumerate(counts):
+                if index >= len(seen):
+                    break
+                if (not isinstance(count, int) or isinstance(count, bool) or
+                        count <= seen[index]):
+                    continue
+                delta = count - seen[index]
+                seen[index] = count
+                # Represent a bucket by its upper bound: sizing may run
+                # slightly long, never short. The final implicit bucket has
+                # no upper bound, so it is represented by the last one.
+                representative = bounds[min(index, len(bounds) - 1)]
+                total_new += delta
+                weighted_new += delta * representative
+        if total_new <= 0:
+            return
+        self._prune_prediction_counts_seen()
+        sample = weighted_new / total_new
+        alpha = constants.AUTOSCALER_ADAPTIVE_DURATION_EMA_ALPHA
+        if self._measured_duration_seconds is None:
+            self._measured_duration_seconds = sample
+        else:
+            self._measured_duration_seconds = (
+                (1.0 - alpha) * self._measured_duration_seconds +
+                alpha * sample)
+        self._measured_duration_samples += total_new
+        self._measured_duration_at = time.time()
+
+    def _prune_prediction_counts_seen(self) -> None:
+        """Bound the per-bucket dedup ledger to the freshness window."""
+        cutoff = (time.time() -
+                  constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS)
+        for bucket_start in list(self._prediction_counts_seen):
+            if bucket_start < cutoff:
+                del self._prediction_counts_seen[bucket_start]
+
+    def _observe_provision_leads(
+            self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
+        """Sample launch-to-ready for replicas that just became ready."""
+        live_ids = set()
+        for info in replica_infos:
+            replica_id = info.replica_id
+            live_ids.add(replica_id)
+            if replica_id in self._provision_lead_seen_replica_ids:
+                continue
+            created_at = getattr(info, 'created_at', None)
+            ready_at = getattr(getattr(info, 'status_property', None),
+                               'first_ready_time', None)
+            if (not isinstance(created_at,
+                               (int, float)) or isinstance(created_at, bool) or
+                    not isinstance(ready_at,
+                                   (int, float)) or isinstance(ready_at, bool)):
+                continue
+            lead = ready_at - created_at
+            if lead <= 0:
+                # -1 is the never-ready sentinel; a non-positive span is
+                # not a launch measurement.
+                continue
+            self._provision_lead_seen_replica_ids.add(replica_id)
+            self._provision_lead_samples.append(float(lead))
+            del self._provision_lead_samples[:-constants.
+                                             AUTOSCALER_ADAPTIVE_LEAD_SAMPLE_CAP]
+            self._provision_lead_at = time.time()
+        # Terminated rows can never be sampled again, so the ledger tracks
+        # the live fleet rather than growing for the service's lifetime.
+        self._provision_lead_seen_replica_ids &= live_ids
+
     def _adaptive_scale_up_active(self) -> bool:
         return (self.adaptive_scale_up is not None and
                 self._adaptive_until is not None and
@@ -4442,16 +4651,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _rejected_work(self) -> float:
         """Convert the retained rejection population to concurrent work."""
-        if (self.replica_unit != 'logical' or
-                self.expected_request_duration_seconds is None):
+        duration = self.effective_request_duration_seconds
+        if self.replica_unit != 'logical' or duration is None:
             return float(self._rejected_in_window)
-        retained_work = (self._rejected_in_window *
-                         self.expected_request_duration_seconds /
+        retained_work = (self._rejected_in_window * duration /
                          constants.LB_REJECT_WINDOW_SECONDS)
         if self._rejected_in_recent_window is None:
             return retained_work
-        recent_work = (self._rejected_in_recent_window *
-                       self.expected_request_duration_seconds /
+        recent_work = (self._rejected_in_recent_window * duration /
                        self.qps_window_size)
         return max(retained_work, recent_work)
 
@@ -4497,6 +4704,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 info.status_property, 'is_scale_down', False) is not True and
                 not getattr(info, 'reserved_fill', False)))
 
+    def _nonterminal_committed_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Planned slots across every non-retiring version and launch origin.
+
+        This is the base for the aggregate target CEILING, not for the wave
+        rate. During a rolling update the serving fleet can be entirely
+        old-version, and a latest-only ceiling pins the adopted target
+        below the fleet that is already saturated: growing to meet demand
+        becomes gated behind version replacement progress (observed live at
+        raw target 1000, adopted 50, fleet 156). Replacement pacing itself
+        stays on the latest-version rate base.
+        """
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if (not info.is_terminal and getattr(
+                info.status_property, 'is_scale_down', False) is not True))
+
     def _limit_logical_scale_up(
         self,
         raw_target: int,
@@ -4508,7 +4735,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return raw_target
         if budget == 0:
             return self.target_num_replicas
-        committed = self._latest_committed_logical_capacity(replica_infos)
+        committed = self._nonterminal_committed_logical_capacity(replica_infos)
         return max(self.target_num_replicas, min(raw_target,
                                                  committed + budget))
 
@@ -4532,8 +4759,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # version-specific ceiling. Preserve a fail-closed cooldown
                 # for the remainder of that window.
                 return 0
-            committed = self._latest_committed_logical_capacity(replica_infos)
+            committed = self._nonterminal_committed_logical_capacity(
+                replica_infos)
             return max(0, self._logical_scale_up_wave_ceiling - committed)
+        # The wave RATE stays on latest-version capacity: it also paces
+        # rollout replacement launches, and ramping a new version from its
+        # own committed capacity is a deliberate contract. Only the target
+        # ceiling below counts the whole fleet.
         committed = self._latest_committed_logical_capacity(replica_infos)
         rate_percentage = self.max_scale_up_rate_percentage
         min_replicas = self.scale_up_rate_min_replicas
@@ -4547,13 +4779,25 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._logical_actuation_wave_is_new = True
         return max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
 
-    def _record_logical_scale_up_wave(self, committed: int,
-                                      launch_budget: int | None) -> None:
-        """Open a new wave without burning retained cooldown authority."""
+    def _record_logical_scale_up_wave(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        launch_budget: int | None,
+    ) -> None:
+        """Open a new wave without burning retained cooldown authority.
+
+        The ceiling base is derived here rather than accepted from callers:
+        the retained-cooldown branch of _logical_scale_up_budget spends this
+        ceiling against the same all-version base, and a caller passing a
+        latest-version base would leave the ceiling below that subtrahend,
+        silently zeroing retained authority for the rest of the cooldown.
+        """
         if (launch_budget is None or launch_budget <= 0 or
                 self._logical_actuation_wave_started):
             return
         if self._logical_actuation_wave_is_new:
+            committed = self._nonterminal_committed_logical_capacity(
+                replica_infos)
             self._last_scale_up_wave_at = time.time()
             self._logical_scale_up_wave_ceiling = committed + launch_budget
         self._logical_actuation_wave_started = True
@@ -4564,7 +4808,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> None:
         old_target = self.target_num_replicas
-        committed = (self._latest_committed_logical_capacity(replica_infos)
+        committed = (self._nonterminal_committed_logical_capacity(replica_infos)
                      if self.replica_unit == 'logical' else 0)
         self.target_num_replicas = self._limit_logical_scale_up(
             raw_target, replica_infos)
@@ -4578,7 +4822,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 launch_budget = self._logical_actuation_wave_budget
                 if launch_budget is None:
                     launch_budget = self.target_num_replicas - committed
-                self._record_logical_scale_up_wave(committed, launch_budget)
+                self._record_logical_scale_up_wave(replica_infos, launch_budget)
             else:
                 self._last_scale_up_wave_at = time.time()
         if self.target_num_replicas > old_target:
@@ -4895,11 +5139,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         raw: list[tuple[int, tuple[str, ...], float]] = []
         for profile in self.rejected_compatibility_profiles:
             count = int(profile['count'])
-            if (self.replica_unit != 'logical' or
-                    self.expected_request_duration_seconds is None):
+            duration = self.effective_request_duration_seconds
+            if self.replica_unit != 'logical' or duration is None:
                 work = float(count)
             else:
-                duration = self.expected_request_duration_seconds
                 retained = (count * duration /
                             constants.LB_REJECT_WINDOW_SECONDS)
                 recent = (int(profile.get('recent_count', 0)) * duration /
@@ -4923,6 +5166,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         min_replicas_override: int | None = None,
         use_existing_supply: bool = False,
         pin_running_work: bool = False,
+        use_free_reserved: bool = True,
     ) -> tuple[dict[str, int], bool]:
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
@@ -5020,7 +5264,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             card.casefold(): int(floor)
             for card, floor in self.min_replicas_by_accelerator.items()
         }
-        free_reserved = dict(self.free_reserved_slots_by_accelerator)
+        free_reserved = (dict(self.free_reserved_slots_by_accelerator)
+                         if use_free_reserved else {})
         if self.replica_unit == 'logical':
             free_reserved = {
                 card: count * self._configured_gpu_count(card)
@@ -5203,7 +5448,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 target_ceiling=final_target,
                 min_replicas_override=final_target,
                 use_existing_supply=True,
-                pin_running_work=True))
+                pin_running_work=False,
+                use_free_reserved=False))
         cards = self._configured_cards_from_profiles()
         canonical_by_name = {card.casefold(): card for card in cards}
         nonretiring_supply = {card: 0 for card in cards}
@@ -5218,19 +5464,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             width = (max(1, int(self._replica_capacity(info)))
                      if self.replica_unit == 'logical' else 1)
             nonretiring_supply[card] += width
-        for raw_card, count in self.free_reserved_slots_by_accelerator.items():
-            card = canonical_by_name.get(raw_card.casefold())
-            if card is None:
-                continue
-            width = (self._configured_gpu_count(card)
-                     if self.replica_unit == 'logical' else 1)
-            nonretiring_supply[card] += max(0, int(count)) * width
+        # Broker-reported free slots are opportunities, not materialized
+        # supply. Treating them as backing here can move flexible L4 demand
+        # onto A100 during a rollout. If the research slot then disappears,
+        # the exact-card shortage retries on a paid A100 location. Reserved
+        # fill owns those opportunities independently and carries the
+        # zero-cost-only launch fence; demand actuation may reuse the card only
+        # after a latest-version replica row materializes it.
         target = _revalidate_actuation_target(
             adopted_target=demand_target,
             desired_target=desired_target,
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
-            final_target=final_target)
+            final_target=final_target,
+            allow_adopted_reassignment=not any(
+                not info.is_terminal and info.version != self.latest_version
+                for info in replica_infos))
         if not target and final_target > 0:
             self._logical_card_transition_pending = False
             return {}, False
@@ -5260,9 +5509,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (added_card_slots > 0 and
                 self.max_scale_up_rate_percentage is not None and
                 not self._logical_actuation_wave_started):
-            committed = self._latest_committed_logical_capacity(replica_infos)
             self._record_logical_scale_up_wave(
-                committed, self._logical_actuation_wave_budget)
+                replica_infos, self._logical_actuation_wave_budget)
         return (limited_target, attribution_complete and
                 sum(limited_target.values()) == final_target)
 
@@ -5318,9 +5566,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             arrivals = len(self.request_timestamps)
             if arrivals > 0 and best_capacity > 0:
                 arrival_work = float(arrivals)
-                if self.expected_request_duration_seconds is not None:
-                    arrival_work *= (self.expected_request_duration_seconds /
-                                     self.qps_window_size)
+                duration = self.effective_request_duration_seconds
+                if duration is not None:
+                    arrival_work *= (duration / self.qps_window_size)
                 arrival_floor = self._clip_target_num_replicas(
                     math.ceil(arrival_work / best_capacity))
                 if arrival_floor > self.target_num_replicas:
@@ -5591,6 +5839,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # marrying a blind target to fresh-mode kills. All three
         # consumers read this snapshot instead of re-evaluating.
         self._tick_fresh = self.has_fresh_demand_report()
+        # Sample launch-to-ready before sizing, so a wave that just landed
+        # informs this tick's lead estimate.
+        self._observe_provision_leads(replica_infos)
         self._logical_actuation_wave_is_new = False
         self._logical_actuation_wave_budget = self._logical_scale_up_budget(
             replica_infos)
@@ -5696,6 +5947,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds = getattr(
             spec, 'expected_request_duration_seconds', None)
+        self.initial_provision_lead_time_seconds = getattr(
+            spec, 'initial_provision_lead_time_seconds', None)
+        # Measurements describe the workload, not the spec revision, so an
+        # update keeps them. Disabling the feature must take effect at once.
+        self.adaptive_demand_estimation = (getattr(
+            spec, 'adaptive_demand_estimation', True) is not False)
         self.max_scale_up_rate_percentage = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas = getattr(spec,
@@ -6142,7 +6399,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # transition delta in the first restart tick. Later launch
                 # waves still need to advance the cooldown when they are
                 # authorized, even though that complete map no longer changes.
-                self._record_logical_scale_up_wave(committed, launch_budget)
+                self._record_logical_scale_up_wave(replica_infos, launch_budget)
             replace_unknown_replica_ids = tuple(
                 sorted(info.replica_id
                        for info in latest_nonterminal_replicas
@@ -6342,6 +6599,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                      self._adaptive_until - time.monotonic())
         info.update({
             'replica_unit': self.replica_unit,
+            'adaptive_demand_estimation': self.adaptive_demand_estimation,
+            'effective_request_duration_seconds':
+                self.effective_request_duration_seconds,
+            'effective_provision_lead_seconds':
+                self.effective_provision_lead_seconds,
+            'measured_duration_seconds': self._measured_duration_seconds,
+            'measured_duration_samples': self._measured_duration_samples,
+            'provision_lead_samples': len(self._provision_lead_samples),
             'in_flight_total': in_flight_total,
             'queue_depth': self._queue_depth,
             'queue_depth_by_priority': self._queue_depth_by_priority,
@@ -6413,6 +6678,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'headerless_arrivals_300s': self._headerless_arrivals_300s,
             'offered_arrival_tracking_saturated':
                 self._offered_arrival_tracking_saturated,
+            'measured_duration_seconds': self._measured_duration_seconds,
+            'measured_duration_samples': self._measured_duration_samples,
+            'measured_duration_at': self._measured_duration_at,
+            'provision_lead_samples': list(self._provision_lead_samples),
+            'provision_lead_at': self._provision_lead_at,
             'pressure_baseline': self._pressure_baseline,
             'pressure_latched': self._pressure_latched,
             'pressure_reasons': self._pressure_reasons,
@@ -6465,6 +6735,39 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 dynamic_states.pop('compatibility_profiles'))
         if 'request_timestamps' in dynamic_states:
             self.request_timestamps = dynamic_states.pop('request_timestamps')
+        # Estimator state survives a controller restart: re-learning a
+        # duration from zero would silently fall back to the configured
+        # value for the whole warm-up, which is exactly when a restart
+        # under load can least afford an undersized target.
+        measured_duration = dynamic_states.pop('measured_duration_seconds',
+                                               None)
+        if (isinstance(measured_duration, (int, float)) and
+                not isinstance(measured_duration, bool) and
+                math.isfinite(measured_duration) and measured_duration > 0):
+            self._measured_duration_seconds = float(measured_duration)
+            samples = dynamic_states.pop('measured_duration_samples', 0)
+            self._measured_duration_samples = (
+                int(samples) if isinstance(samples, int) and
+                not isinstance(samples, bool) and samples >= 0 else 0)
+            observed_at = dynamic_states.pop('measured_duration_at', None)
+            self._measured_duration_at = (float(observed_at) if isinstance(
+                observed_at,
+                (int, float)) and not isinstance(observed_at, bool) else None)
+        else:
+            dynamic_states.pop('measured_duration_samples', None)
+            dynamic_states.pop('measured_duration_at', None)
+        lead_samples = dynamic_states.pop('provision_lead_samples', None)
+        if isinstance(lead_samples, list):
+            self._provision_lead_samples = [
+                float(sample)
+                for sample in lead_samples
+                if (isinstance(sample, (int, float)) and not isinstance(
+                    sample, bool) and math.isfinite(sample) and sample > 0)
+            ][-constants.AUTOSCALER_ADAPTIVE_LEAD_SAMPLE_CAP:]
+        lead_at = dynamic_states.pop('provision_lead_at', None)
+        if (isinstance(lead_at, (int, float)) and
+                not isinstance(lead_at, bool)):
+            self._provision_lead_at = float(lead_at)
         if 'in_flight_by_replica_id' in dynamic_states:
             self._in_flight_by_replica_id = dynamic_states.pop(
                 'in_flight_by_replica_id')

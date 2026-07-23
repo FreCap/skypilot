@@ -33,6 +33,8 @@ def _spec(knob=1.0,
           replica_unit='physical_backend',
           target_utilization_percentage=100,
           expected_request_duration_seconds=None,
+          initial_provision_lead_time_seconds=None,
+          adaptive_demand_estimation=None,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
           scale_up_rate_period_seconds=None,
@@ -55,6 +57,9 @@ def _spec(knob=1.0,
         replica_unit=replica_unit,
         target_utilization_percentage=target_utilization_percentage,
         expected_request_duration_seconds=expected_request_duration_seconds,
+        initial_provision_lead_time_seconds=(
+            initial_provision_lead_time_seconds),
+        adaptive_demand_estimation=adaptive_demand_estimation,
         max_scale_up_rate_percentage=max_scale_up_rate_percentage,
         scale_up_rate_min_replicas=scale_up_rate_min_replicas,
         scale_up_rate_period_seconds=scale_up_rate_period_seconds,
@@ -124,7 +129,8 @@ def _report(autoscaler,
             headerless_arrivals_60s=None,
             headerless_arrivals_300s=None,
             arrival_tracking_saturated=False,
-            pressure_report_is_floored=False):
+            pressure_report_is_floored=False,
+            prediction_time_history=None):
     report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
@@ -161,6 +167,8 @@ def _report(autoscaler,
         report['offered_arrival_tracking_saturated'] = True
     if pressure_report_is_floored:
         report['pressure_report_is_floored'] = True
+    if prediction_time_history is not None:
+        report['prediction_time_history'] = prediction_time_history
     autoscaler.collect_request_information(report)
 
 
@@ -479,6 +487,9 @@ class TestTargetMath(unittest.TestCase):
             replica_unit='logical',
             target_utilization_percentage=90,
             expected_request_duration_seconds=30,
+            # Opt out of the assumed provisioning lead to exercise pure
+            # deadline discounting.
+            initial_provision_lead_time_seconds=0,
             lb_request_queue={
                 'timeout_seconds': 20,
                 'timeout_seconds_by_priority': [{
@@ -503,6 +514,78 @@ class TestTargetMath(unittest.TestCase):
         # 100 * 30/600 + 10 * 30/60 = 10 units of draining work.
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
+
+    def test_default_assumed_lead_removes_deadline_discount(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }, {
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                })
+
+        self._recompute(autoscaler, [])
+
+        # The default assumes a 600s provisioning lead, which consumes the
+        # whole 600s timeout budget: every queued request must be planned
+        # for now, not discounted against a deadline that new capacity
+        # cannot meet.
+        self.assertEqual(autoscaler.configured_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+        self.assertEqual(autoscaler._weighted_queue_work, 110)
+
+    def test_provision_lead_shrinks_queue_patience(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=30,
+            initial_provision_lead_time_seconds=540,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }, {
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                })
+
+        self._recompute(autoscaler, [])
+
+        # New capacity starts serving only after the 540-second lead, so
+        # the 600-second timeout leaves a 60-second budget: 100 * 30/60.
+        # The 60-second timeout's budget floors at the request duration
+        # itself: 10 * 30/30.
+        self.assertEqual(autoscaler._weighted_queue_work, 60)
+        self.assertEqual(autoscaler.target_num_replicas, 60)
 
     def test_priority_patience_falls_back_to_aggregate_queue(self):
         autoscaler = _make_autoscaler(
@@ -1344,16 +1427,99 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(_scale_downs(decisions), [])
         scale_ups = _scale_ups(decisions)
         self.assertEqual(len(scale_ups), 1)
+        # The aggregate target is no longer pinned below the old fleet it is
+        # replacing: 57 slots of live work keep the demand target at 57
+        # across the version boundary. Replacement pacing is unchanged and
+        # still owned by launch_budget, which stays at one wave minimum.
         self.assertEqual(
             scale_ups[0].target,
             autoscalers.LogicalScaleTarget(
                 version=2,
                 reconcile_generation=2,
-                target_capacity=10,
+                target_capacity=57,
                 launch_budget=10,
-                target_capacity_by_accelerator=(('L4', 10),),
+                target_capacity_by_accelerator=(('L4', 57),),
                 accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1))))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
+
+    def test_free_reserved_slot_cannot_back_paid_rollout_authority(self):
+        autoscaler = _make_autoscaler(max_replicas=20, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+        })
+        autoscaler.target_num_replicas = 10
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler.set_free_reserved_slots_by_accelerator({'A100': 5})
+
+        old_a100 = [
+            _replica(replica_id, card='A100', version=1)
+            for replica_id in range(1, 6)
+        ]
+        latest_l4 = [
+            _replica(replica_id,
+                     card='L4',
+                     version=2,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for replica_id in range(11, 16)
+        ]
+        replicas = [*old_a100, *latest_l4]
+        _report(autoscaler,
+                in_flight={
+                    replica.replica_id: int(replica.version == 1)
+                    for replica in replicas
+                },
+                observed_slots={replica.replica_id: 1 for replica in old_a100},
+                compatibility_complete=True)
+
+        decisions = autoscaler._generate_logical_scaling_decisions(
+            replicas, latest_l4)
+
+        self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
+                         {'A100': 5})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator,
+                         {'L4': 10})
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 5})
+        target = _scale_ups(decisions)[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'L4': 10})
+
+    def test_rollout_preserves_exact_adopted_card(self):
+        autoscaler = _make_autoscaler(max_replicas=20, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+        })
+        autoscaler.target_num_replicas = 10
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 10}
+        autoscaler._snap_target_on_next_recompute = False
+
+        old_a100 = [
+            _replica(replica_id, card='A100', version=1)
+            for replica_id in range(1, 6)
+        ]
+        latest_l4 = [
+            _replica(replica_id,
+                     card='L4',
+                     version=2,
+                     status=serve_state.ReplicaStatus.PROVISIONING)
+            for replica_id in range(11, 16)
+        ]
+        replicas = [*old_a100, *latest_l4]
+        _report(autoscaler,
+                in_flight={replica.replica_id: 1 for replica in old_a100},
+                observed_slots={replica.replica_id: 1 for replica in old_a100},
+                compatibility_complete=True)
+
+        target, complete = autoscaler._actuation_target_by_accelerator(replicas)
+
+        self.assertTrue(complete)
+        self.assertEqual(target, {'A100': 10})
 
     def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
         autoscaler = _make_autoscaler(max_replicas=20,
@@ -2565,7 +2731,12 @@ class TestLogicalScalingWaves(unittest.TestCase):
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
 
         self.assertEqual(autoscaler._raw_target_num_replicas, 1000)
-        self.assertEqual(autoscaler.target_num_replicas, 50)
+        # The restart baseline is still adopted from the old-version fleet
+        # (50), and saturated demand is no longer deferred behind it: one
+        # wave minimum lands in the same tick. The wave rate itself remains
+        # latest-version based, so this is a bounded +10, not a jump to the
+        # raw target.
+        self.assertEqual(autoscaler.target_num_replicas, 60)
 
     def test_restart_total_excludes_fill_retiring_and_pending_rows(self):
         autoscaler = self._ramped_autoscaler()
@@ -2889,6 +3060,132 @@ class TestLogicalScalingWaves(unittest.TestCase):
             wall_clock.return_value = 1059.0
             autoscaler._set_target_num_replicas_with_concurrency_logic(replicas)
             self.assertEqual(autoscaler.target_num_replicas, 200)
+
+    def test_wave_base_counts_old_version_fleet_during_rollout(self):
+        autoscaler = self._ramped_autoscaler()
+        _report(autoscaler, in_flight={}, queue_depth=1000)
+        old_fleet = [_replica(i + 1, version=0) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            autoscaler._set_target_num_replicas_with_concurrency_logic(
+                old_fleet)
+
+        # Latest-version committed capacity is zero mid-rollout. The target
+        # ceiling counts the saturated 100-slot serving fleet, so the wave
+        # lands at 100 + max(10, 20% of 0) = 110. A latest-only ceiling
+        # would freeze the target at 100 for the whole rollout, which is the
+        # production incident. The wave rate stays latest-version based so
+        # rollout replacement pacing is unchanged.
+        self.assertEqual(autoscaler.target_num_replicas, 110)
+
+    def test_saturated_plateau_progresses_adaptive_waves_to_max(self):
+        """Incident regression: a flat saturated queue must keep doubling.
+
+        2026-07-22: the queue pinned at its cap, the strictly-increasing
+        pressure rule disarmed adaptive scale-up, and the latest-only wave
+        base froze the target. With both fixes the fleet ramps
+        130 -> 200 -> 400 -> 800 -> max while the queue stays flat.
+        """
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+        fleet = [_replica(i + 1) for i in range(100)]
+        autoscaler.target_num_replicas = 100
+        autoscaler._snap_target_on_next_recompute = False
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            with mock.patch.object(autoscalers.time, 'time',
+                                   return_value=100.0):
+                autoscaler._set_target_num_replicas_with_concurrency_logic(
+                    fleet)
+            # First wave rides the base rate: 100 + max(10, 20% of 100).
+            self.assertEqual(autoscaler.target_num_replicas, 120)
+
+            # The queue holds perfectly flat; saturation arms adaptive.
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            _report(autoscaler, in_flight={}, queue_depth=2000)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+            expected = 100
+            for wave, wave_time in enumerate((161.0, 222.0, 283.0, 344.0)):
+                expected = min(1000, 2 * expected)
+                _report(autoscaler, in_flight={}, queue_depth=2000)
+                with mock.patch.object(autoscalers.time,
+                                       'time',
+                                       return_value=wave_time):
+                    (autoscaler._set_target_num_replicas_with_concurrency_logic(
+                        fleet))
+                self.assertEqual(autoscaler.target_num_replicas, expected,
+                                 f'wave {wave}')
+                # Launched capacity commits (STARTING rows) before the next
+                # wave, so each adaptive wave doubles the fleet.
+                fleet = fleet + [
+                    _replica(len(fleet) + i + 1,
+                             status=serve_state.ReplicaStatus.STARTING)
+                    for i in range(expected - len(fleet))
+                ]
+
+    def test_queue_plateau_sustains_pressure_streak(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler, in_flight={}, queue_depth=1500)
+            _report(autoscaler, in_flight={}, queue_depth=1560)
+            self.assertEqual(autoscaler._pressure_streak, 1)
+            # A queue pinned flat at its cap is saturation, not relief.
+            _report(autoscaler, in_flight={}, queue_depth=1560)
+            self.assertEqual(autoscaler._pressure_streak, 2)
+            self.assertTrue(autoscaler._adaptive_scale_up_active())
+
+    def test_draining_queue_resets_pressure_streak(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        _report(autoscaler, in_flight={}, queue_depth=1500)
+        _report(autoscaler, in_flight={}, queue_depth=1560)
+        self.assertEqual(autoscaler._pressure_streak, 1)
+        _report(autoscaler, in_flight={}, queue_depth=900)
+        self.assertEqual(autoscaler._pressure_streak, 0)
+        self.assertFalse(autoscaler._adaptive_scale_up_active())
+
+    def test_small_flat_queue_below_wave_minimum_is_not_pressure(self):
+        autoscaler = self._ramped_autoscaler(
+            adaptive_scale_up={
+                'max_scale_up_rate_percentage': 100,
+                'scale_up_rate_min_replicas': 50,
+                'pressure_observations': 2,
+                'hold_seconds': 120,
+            })
+
+        _report(autoscaler, in_flight={}, queue_depth=2)
+        _report(autoscaler, in_flight={}, queue_depth=3)
+        self.assertEqual(autoscaler._pressure_streak, 1)
+        # Flat trickle queues below scale_up_rate_min_replicas stay
+        # non-latching so they cannot starve downscale.
+        _report(autoscaler, in_flight={}, queue_depth=3)
+        self.assertEqual(autoscaler._pressure_streak, 0)
 
     def test_floored_handoff_report_cannot_complete_pressure_streak(self):
         autoscaler = self._ramped_autoscaler(
@@ -5113,3 +5410,240 @@ class TestSharedGpuShapeResolver(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _histogram(counts_by_index, bucket_start=None, outcome='succeeded'):
+    """Build one LB prediction-time report from {bucket_index: count}."""
+    if bucket_start is None:
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(time.time() // bucket_seconds) * bucket_seconds
+    counts = [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT
+    for index, count in counts_by_index.items():
+        counts[index] = count
+    return {
+        'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
+        'histogram_version': constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+        'buckets': [{
+            'bucket_start': bucket_start,
+            'outcome_counts': {
+                outcome: counts
+            },
+        }],
+    }
+
+
+class TestAdaptiveDemandEstimation(unittest.TestCase):
+    """Measured duration and lead supersede configuration when trusted."""
+
+    @staticmethod
+    def _autoscaler(**kwargs):
+        kwargs.setdefault('adaptive_demand_estimation', True)
+        kwargs.setdefault('initial_provision_lead_time_seconds', 540)
+        return _make_autoscaler(knob=1,
+                                min_replicas=0,
+                                max_replicas=1000,
+                                replica_unit='logical',
+                                expected_request_duration_seconds=30,
+                                **kwargs)
+
+    # Bucket index 8 has upper bound 60s; index 7 is 30s.
+    _SIXTY_SECOND_BUCKET = 8
+
+    def test_measured_duration_supersedes_config(self):
+        autoscaler = self._autoscaler()
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+
+    def test_measured_duration_needs_enough_samples(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 3}))
+
+        # Three completions cannot redefine the sizing constant.
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+        self.assertEqual(autoscaler._measured_duration_samples, 3)
+
+    def test_measured_duration_ignored_when_feature_disabled(self):
+        autoscaler = self._autoscaler(adaptive_demand_estimation=False)
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 540)
+
+    def test_stale_measurement_falls_back_to_config(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 60.0)
+
+        autoscaler._measured_duration_at = (
+            time.time() - constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS -
+            1)
+
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_repeated_histogram_report_is_not_double_counted(self):
+        autoscaler = self._autoscaler()
+        histogram = _histogram({self._SIXTY_SECOND_BUCKET: 50})
+
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+
+        # The load balancer re-reports a bucket until it is durably
+        # accepted; only the delta may count.
+        self.assertEqual(autoscaler._measured_duration_samples, 50)
+
+    def test_histogram_version_mismatch_is_dropped(self):
+        autoscaler = self._autoscaler()
+        histogram = _histogram({self._SIXTY_SECOND_BUCKET: 50})
+        histogram['histogram_version'] = (
+            constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION + 1)
+
+        _report(autoscaler, in_flight={}, prediction_time_history=histogram)
+
+        self.assertEqual(autoscaler._measured_duration_samples, 0)
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_failed_outcomes_do_not_define_service_time(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram({0: 50}, outcome='failed'))
+
+        self.assertEqual(autoscaler._measured_duration_samples, 0)
+        self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_auto_seed_is_used_until_enough_samples(self):
+        autoscaler = self._autoscaler(
+            initial_provision_lead_time_seconds='auto')
+
+        self.assertEqual(autoscaler.effective_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+        autoscaler._observe_provision_leads(replicas)
+
+        # Measurement replaces the assumption once the service has proven
+        # its own launch latency.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 420.0)
+
+    def test_unset_lead_defaults_to_auto_seed(self):
+        autoscaler = self._autoscaler(initial_provision_lead_time_seconds=None)
+
+        self.assertEqual(autoscaler.effective_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+
+    def test_explicit_zero_lead_is_honored(self):
+        autoscaler = self._autoscaler(initial_provision_lead_time_seconds=0)
+
+        # An explicit 0 is a declaration, not an absent value.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 0.0)
+
+    def test_adaptive_estimation_is_on_by_default(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      replica_unit='logical',
+                                      expected_request_duration_seconds=30)
+
+        self.assertTrue(autoscaler.adaptive_demand_estimation)
+
+    def test_measured_lead_supersedes_config(self):
+        autoscaler = self._autoscaler()
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+
+        autoscaler._observe_provision_leads(replicas)
+
+        # Eight samples of 60..480s; the p75 index is 6 -> 420s.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 420.0)
+
+    def test_lead_needs_enough_samples_and_ignores_never_ready(self):
+        autoscaler = self._autoscaler()
+        ready = _replica(1)
+        ready.created_at = 1000.0
+        ready.status_property.first_ready_time = 1600.0
+        never_ready = _replica(2)
+        never_ready.created_at = 1000.0
+        never_ready.status_property.first_ready_time = -1
+
+        autoscaler._observe_provision_leads([ready, never_ready])
+
+        self.assertEqual(autoscaler._provision_lead_samples, [600.0])
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 540)
+
+    def test_lead_sample_is_taken_once_per_replica(self):
+        autoscaler = self._autoscaler()
+        replica = _replica(1)
+        replica.created_at = 1000.0
+        replica.status_property.first_ready_time = 1600.0
+
+        autoscaler._observe_provision_leads([replica])
+        autoscaler._observe_provision_leads([replica])
+
+        self.assertEqual(autoscaler._provision_lead_samples, [600.0])
+
+    def test_estimates_survive_controller_restart(self):
+        autoscaler = self._autoscaler()
+        _report(autoscaler,
+                in_flight={},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+        autoscaler._observe_provision_leads(replicas)
+
+        restored = self._autoscaler()
+        restored.load_dynamic_states(autoscaler.dump_dynamic_states())
+
+        self.assertEqual(restored.effective_request_duration_seconds, 60.0)
+        self.assertEqual(restored.effective_provision_lead_seconds, 420.0)
+
+    def test_measured_values_drive_queue_sizing(self):
+        autoscaler = self._autoscaler(
+            target_utilization_percentage=100,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=100,
+                queue_depth_by_priority={0: 100},
+                prediction_time_history=_histogram(
+                    {self._SIXTY_SECOND_BUCKET: 50}))
+
+        autoscaler._set_target_num_replicas_with_concurrency_logic([])
+
+        # Measured 60s duration against the 60s budget left by the
+        # configured 540s lead weights every queued request at 1.0, where
+        # the configured 30s duration would have weighted them at 0.5.
+        self.assertEqual(autoscaler._weighted_queue_work, 100)
