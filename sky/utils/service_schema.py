@@ -285,6 +285,10 @@ def get_service_schema():
                         'type': 'number',
                         'exclusiveMinimum': 0,
                     },
+                    'provision_lead_time_seconds': {
+                        'type': 'number',
+                        'minimum': 0,
+                    },
                     'max_scale_up_rate_percentage': {
                         'type': 'integer',
                         'minimum': 1,

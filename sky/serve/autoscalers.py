@@ -3546,6 +3546,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds: float | None = getattr(
             spec, 'expected_request_duration_seconds', None)
+        self.provision_lead_time_seconds: float | None = getattr(
+            spec, 'provision_lead_time_seconds', None)
         self.max_scale_up_rate_percentage: int | None = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas: int | None = getattr(
@@ -4071,6 +4073,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 reasons = tuple(label for label, current, previous in zip(
                     labels, pressure_sample, self._pressure_baseline)
                                 if current > previous)
+                if not reasons:
+                    # A queue pinned flat at its cap is saturation, not
+                    # relief; requiring strictly increasing samples disarms
+                    # adaptive scale-up exactly when overload plateaus.
+                    # Only a draining queue resets the streak. The plateau
+                    # floor keeps a benign flat trickle queue from latching
+                    # pressure indefinitely, and stable rejection
+                    # populations deliberately stay non-latching (bounded
+                    # downscale vetoes) -- cap and timeout rejections always
+                    # ride on a deep queue, which this clause covers.
+                    plateau_floor = max(1, self.scale_up_rate_min_replicas or 1)
+                    if (pressure_sample[0] >= plateau_floor and
+                            pressure_sample[0] >= self._pressure_baseline[0]):
+                        reasons = ('queue_plateau',)
                 if reasons:
                     self._pressure_latched = True
                     self._pressure_reasons = reasons
@@ -4347,13 +4363,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # active beside an empty or partial priority map from the new
             # active. Never let the optional map erase that proven queue.
             return float(self._queue_depth)
+        # A queued request must be dispatched before its priority timeout,
+        # and newly authorized capacity only starts serving after the
+        # provisioning lead time. Sizing against the full timeout budget
+        # plans delivery exactly at the deadline assuming instant capacity;
+        # subtracting the lead sizes against the budget that actually
+        # remains once capacity can exist.
+        lead = self.provision_lead_time_seconds or 0.0
+        duration = self.expected_request_duration_seconds
         work = 0.0
         for priority, count in self._queue_depth_by_priority.items():
             timeout = self._priority_timeout(priority)
             weight = 1.0
             if timeout is not None:
-                weight = min(1.0,
-                             self.expected_request_duration_seconds / timeout)
+                weight = min(1.0, duration / max(duration, timeout - lead))
             work += count * weight
         return work
 
@@ -4497,6 +4520,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 info.status_property, 'is_scale_down', False) is not True and
                 not getattr(info, 'reserved_fill', False)))
 
+    def _nonterminal_committed_logical_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Planned slots across every non-retiring version and launch origin.
+
+        This is the base for the aggregate target CEILING, not for the wave
+        rate. During a rolling update the serving fleet can be entirely
+        old-version, and a latest-only ceiling pins the adopted target
+        below the fleet that is already saturated: growing to meet demand
+        becomes gated behind version replacement progress (observed live at
+        raw target 1000, adopted 50, fleet 156). Replacement pacing itself
+        stays on the latest-version rate base.
+        """
+        return sum(
+            max(0, int(self._replica_capacity(info)))
+            for info in replica_infos
+            if (not info.is_terminal and getattr(
+                info.status_property, 'is_scale_down', False) is not True))
+
     def _limit_logical_scale_up(
         self,
         raw_target: int,
@@ -4508,7 +4551,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return raw_target
         if budget == 0:
             return self.target_num_replicas
-        committed = self._latest_committed_logical_capacity(replica_infos)
+        committed = self._nonterminal_committed_logical_capacity(replica_infos)
         return max(self.target_num_replicas, min(raw_target,
                                                  committed + budget))
 
@@ -4532,8 +4575,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # version-specific ceiling. Preserve a fail-closed cooldown
                 # for the remainder of that window.
                 return 0
-            committed = self._latest_committed_logical_capacity(replica_infos)
+            committed = self._nonterminal_committed_logical_capacity(
+                replica_infos)
             return max(0, self._logical_scale_up_wave_ceiling - committed)
+        # The wave RATE stays on latest-version capacity: it also paces
+        # rollout replacement launches, and ramping a new version from its
+        # own committed capacity is a deliberate contract. Only the target
+        # ceiling below counts the whole fleet.
         committed = self._latest_committed_logical_capacity(replica_infos)
         rate_percentage = self.max_scale_up_rate_percentage
         min_replicas = self.scale_up_rate_min_replicas
@@ -4547,13 +4595,25 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._logical_actuation_wave_is_new = True
         return max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
 
-    def _record_logical_scale_up_wave(self, committed: int,
-                                      launch_budget: int | None) -> None:
-        """Open a new wave without burning retained cooldown authority."""
+    def _record_logical_scale_up_wave(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        launch_budget: int | None,
+    ) -> None:
+        """Open a new wave without burning retained cooldown authority.
+
+        The ceiling base is derived here rather than accepted from callers:
+        the retained-cooldown branch of _logical_scale_up_budget spends this
+        ceiling against the same all-version base, and a caller passing a
+        latest-version base would leave the ceiling below that subtrahend,
+        silently zeroing retained authority for the rest of the cooldown.
+        """
         if (launch_budget is None or launch_budget <= 0 or
                 self._logical_actuation_wave_started):
             return
         if self._logical_actuation_wave_is_new:
+            committed = self._nonterminal_committed_logical_capacity(
+                replica_infos)
             self._last_scale_up_wave_at = time.time()
             self._logical_scale_up_wave_ceiling = committed + launch_budget
         self._logical_actuation_wave_started = True
@@ -4564,7 +4624,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> None:
         old_target = self.target_num_replicas
-        committed = (self._latest_committed_logical_capacity(replica_infos)
+        committed = (self._nonterminal_committed_logical_capacity(replica_infos)
                      if self.replica_unit == 'logical' else 0)
         self.target_num_replicas = self._limit_logical_scale_up(
             raw_target, replica_infos)
@@ -4578,7 +4638,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 launch_budget = self._logical_actuation_wave_budget
                 if launch_budget is None:
                     launch_budget = self.target_num_replicas - committed
-                self._record_logical_scale_up_wave(committed, launch_budget)
+                self._record_logical_scale_up_wave(replica_infos, launch_budget)
             else:
                 self._last_scale_up_wave_at = time.time()
         if self.target_num_replicas > old_target:
@@ -5260,9 +5320,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (added_card_slots > 0 and
                 self.max_scale_up_rate_percentage is not None and
                 not self._logical_actuation_wave_started):
-            committed = self._latest_committed_logical_capacity(replica_infos)
             self._record_logical_scale_up_wave(
-                committed, self._logical_actuation_wave_budget)
+                replica_infos, self._logical_actuation_wave_budget)
         return (limited_target, attribution_complete and
                 sum(limited_target.values()) == final_target)
 
@@ -5696,6 +5755,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds = getattr(
             spec, 'expected_request_duration_seconds', None)
+        self.provision_lead_time_seconds = getattr(
+            spec, 'provision_lead_time_seconds', None)
         self.max_scale_up_rate_percentage = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas = getattr(spec,
@@ -6142,7 +6203,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # transition delta in the first restart tick. Later launch
                 # waves still need to advance the cooldown when they are
                 # authorized, even though that complete map no longer changes.
-                self._record_logical_scale_up_wave(committed, launch_budget)
+                self._record_logical_scale_up_wave(replica_infos, launch_budget)
             replace_unknown_replica_ids = tuple(
                 sorted(info.replica_id
                        for info in latest_nonterminal_replicas
