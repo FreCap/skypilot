@@ -1444,6 +1444,45 @@ class TestGetLbReplicaInfo:
         assert infos[0].last_provider_config == {'replica': 1}
         assert infos[1].last_provider_config == {'replica': 2}
 
+    def test_cold_sync_dedupes_shared_cluster_yaml_reads(self):
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ]
+        shared_yaml = '/tmp/shared.yaml'
+        shared_provider = {'provider': {'shared': True}}
+        for info in infos:
+            info.handle = mock.Mock(  # type: ignore[method-assign]
+                return_value=_FakeHandle(info._accelerators, shared_yaml))
+
+        with mock.patch.object(
+                controller.serve_state,
+                'get_service_runtime_snapshot',
+                return_value={'active_versions': [1]}), mock.patch.object(
+                    controller.global_user_state,
+                    'get_clusters_from_names',
+                    return_value={
+                        info.cluster_name: {
+                            'handle': mock.sentinel.handle
+                        } for info in infos
+                    }), mock.patch.object(controller.global_user_state,
+                                          'get_cluster_yaml_dict_multiple',
+                                          return_value=[shared_provider
+                                                       ]) as get_yamls:
+            ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                infos, None)
+
+        get_yamls.assert_called_once_with([shared_yaml])
+        assert infos[0].last_provider_config == {'shared': True}
+        assert infos[1].last_provider_config == {'shared': True}
+
     def test_uses_runtime_snapshot_not_joined_service_read(self):
         ctrl = _make_controller()
         info = _FakeReplicaInfo(1,

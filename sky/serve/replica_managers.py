@@ -7077,8 +7077,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         cluster_records = global_user_state.get_clusters_from_names(
             [info.cluster_name for info in infos])
         handles: dict[int, backends.CloudVmRayResourceHandle] = {}
-        yaml_replica_ids: list[int] = []
-        yaml_paths: list[str] = []
         for info in infos:
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
@@ -7087,19 +7085,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if handle is None:
                 continue
             handles[info.replica_id] = handle
-            cluster_yaml = getattr(handle, 'cluster_yaml', None)
-            if cluster_yaml is not None:
-                yaml_replica_ids.append(info.replica_id)
-                yaml_paths.append(cluster_yaml)
-
-        provider_configs: dict[int, dict[str, Any]] = {}
-        if yaml_paths:
-            yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
-                yaml_paths)
-            provider_configs = {
-                replica_id: config['provider'] for replica_id, config in zip(
-                    yaml_replica_ids, yaml_configs, strict=True)
-            }
+        provider_configs = serve_utils.get_provider_configs_for_handles(handles)
 
         urls: dict[int, str | None] = {}
         for info in infos:

@@ -78,6 +78,43 @@ else:
 
 logger = sky_logging.init_logger(__name__)
 
+
+def get_provider_configs_for_handles(
+        handles_by_key: 'typing.Mapping[Any, Any]'
+) -> dict[Any, dict[str, Any]]:
+    """Fetch provider configs once per unique cluster YAML path.
+
+    Multiple logical replicas can share the same physical cluster and thus the
+    same ``cluster_yaml``.  Serve hot paths only need the parsed ``provider``
+    block, so reuse one batched YAML read per unique path and fan the result
+    back out to every caller key.
+    """
+    yaml_paths: list[str] = []
+    keys_by_yaml: dict[str, list[Any]] = collections.defaultdict(list)
+    for key, handle in handles_by_key.items():
+        cluster_yaml = getattr(handle, 'cluster_yaml', None)
+        if not isinstance(cluster_yaml, str):
+            continue
+        if cluster_yaml not in keys_by_yaml:
+            yaml_paths.append(cluster_yaml)
+        keys_by_yaml[cluster_yaml].append(key)
+
+    if not yaml_paths:
+        return {}
+
+    yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(yaml_paths)
+    provider_configs_by_yaml = {
+        yaml_path: config['provider']
+        for yaml_path, config in zip(yaml_paths, yaml_configs, strict=True)
+    }
+    provider_configs: dict[Any, dict[str, Any]] = {}
+    for yaml_path, keys in keys_by_yaml.items():
+        provider_config = provider_configs_by_yaml[yaml_path]
+        for key in keys:
+            provider_configs[key] = provider_config
+    return provider_configs
+
+
 # Keep the established serve_utils import and pickle identities while the
 # security-sensitive implementation lives in its own low-state module.
 AuthTokenConfigurationError = auth_tokens.AuthTokenConfigurationError

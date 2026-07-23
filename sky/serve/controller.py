@@ -504,8 +504,6 @@ class SkyServeController:
         # records above to collect the YAML paths, then fetch all YAMLs in one
         # query before resolving endpoints.
         uncached_handles: dict[int, Any] = {}
-        yaml_replica_ids: list[int] = []
-        yaml_paths: list[str] = []
         for info in ready_infos:
             if info.replica_id in self._lb_replica_cache:
                 continue
@@ -514,18 +512,8 @@ class SkyServeController:
                 continue
             handle = info.handle(cluster_record)
             uncached_handles[info.replica_id] = handle
-            cluster_yaml = getattr(handle, 'cluster_yaml', None)
-            if cluster_yaml is not None:
-                yaml_replica_ids.append(info.replica_id)
-                yaml_paths.append(cluster_yaml)
-        provider_configs: dict[int, dict[str, Any]] = {}
-        if yaml_paths:
-            yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
-                yaml_paths)
-            provider_configs = {
-                replica_id: config['provider'] for replica_id, config in zip(
-                    yaml_replica_ids, yaml_configs, strict=True)
-            }
+        provider_configs = serve_utils.get_provider_configs_for_handles(
+            uncached_handles)
 
         for info in ready_infos:
             cached = self._lb_replica_cache.get(info.replica_id)
